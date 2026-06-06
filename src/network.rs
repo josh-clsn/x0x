@@ -907,6 +907,19 @@ pub const DIRECT_MESSAGE_STREAM_TYPE: u8 = 0x10;
 /// clean.
 pub const RELAYED_DM_STREAM_TYPE: u8 = 0x11;
 
+/// X0X-0070b: triple shipped on the inbound RelayedDm channel.
+///
+/// 1. `AntPeerId` — the ant-quic PeerId of the *relay* peer (the QUIC
+///    peer that sent us these bytes). Equals the relay's `MachineId`.
+/// 2. `[u8; 32]` — the wire-prefix `AgentId` carried in front of the
+///    postcard body (also the relay's identity; mirrors the direct-DM
+///    prefix shape).
+/// 3. `crate::peer_relay::RelayedDm` — the parsed envelope. The
+///    *original* sender's identity lives inside
+///    `relayed.header.sender_agent_id`, trust-anchored by the header's
+///    ML-DSA-65 signature, not by the wire prefix.
+pub type RelayedDmEvent = (AntPeerId, [u8; 32], crate::peer_relay::RelayedDm);
+
 const CHANNEL_PRESSURE_INFO_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1236,6 +1249,14 @@ pub struct NetworkNode {
     /// Receiver channel for direct messages (separate from gossip).
     direct_tx: mpsc::Sender<(AntPeerId, Bytes)>,
     direct_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(AntPeerId, Bytes)>>>,
+    /// Receiver channel for inbound [`crate::peer_relay::RelayedDm`]
+    /// envelopes (X0X-0070b). Demuxed by [`RELAYED_DM_STREAM_TYPE`] at
+    /// the wire layer; the consumer is the per-agent relay-DM handler
+    /// in [`crate::Agent`]. Capacity is intentionally small — relayed
+    /// DMs only fire on direct-DM failures that cross the relay
+    /// threshold, so steady-state volume is near zero.
+    relayed_dm_tx: mpsc::Sender<RelayedDmEvent>,
+    relayed_dm_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<RelayedDmEvent>>>,
     /// Cached local peer ID (ant-quic PeerId).
     peer_id: AntPeerId,
     /// Bootstrap peer cache for recording connection outcomes.
@@ -1331,6 +1352,11 @@ impl NetworkNode {
         let (recv_membership_tx, recv_membership_rx) = mpsc::channel(GOSSIP_CONTROL_RECV_CAPACITY);
         let (recv_bulk_tx, recv_bulk_rx) = mpsc::channel(GOSSIP_CONTROL_RECV_CAPACITY);
         let (direct_tx, direct_rx) = mpsc::channel(10_000);
+        // X0X-0070b: dedicated low-rate channel for inbound RelayedDm
+        // envelopes. Engages only on the relay-fallback path; steady-state
+        // volume is bounded by the failure-trigger threshold + freshness
+        // window per peer, so 256 is generous.
+        let (relayed_dm_tx, relayed_dm_rx) = mpsc::channel(256);
         let recv_pump_diagnostics = Arc::new(RecvPumpDiagnostics::new());
         let pool_max_connections = if config.max_connections == 0 {
             DEFAULT_MAX_CONNECTIONS as usize
@@ -1355,6 +1381,8 @@ impl NetworkNode {
             recv_pump_diagnostics,
             direct_tx,
             direct_rx: Arc::new(tokio::sync::Mutex::new(direct_rx)),
+            relayed_dm_tx,
+            relayed_dm_rx: Arc::new(tokio::sync::Mutex::new(relayed_dm_rx)),
             peer_id,
             bootstrap_cache,
             connection_pool,
@@ -2421,6 +2449,64 @@ impl NetworkNode {
         rx.recv().await
     }
 
+    /// Receive the next inbound [`crate::peer_relay::RelayedDm`].
+    ///
+    /// Blocks until a relayed DM arrives. Returns:
+    ///
+    /// * `relay_peer_id` — the ant-quic PeerId of the *relay* that
+    ///   forwarded this packet (equals the relay's MachineId).
+    /// * `relay_sender_agent_id` — the AgentId carried in the wire
+    ///   prefix (also the relay's identity; mirrors the direct-DM
+    ///   prefix shape).
+    /// * `relayed` — the typed envelope. The *original* sender is
+    ///   inside `relayed.header.sender_agent_id`, signed by
+    ///   `relayed.header.sender_public_key`.
+    ///
+    /// X0X-0070b: paired with [`RELAYED_DM_STREAM_TYPE`] in
+    /// [`spawn_receiver`](Self::spawn_receiver).
+    pub async fn recv_relayed_dm(&self) -> Option<RelayedDmEvent> {
+        let mut rx = self.relayed_dm_rx.lock().await;
+        rx.recv().await
+    }
+
+    /// Test-only handle to the inbound RelayedDm channel — lets a unit
+    /// test push a synthetic envelope as if it had arrived from the
+    /// wire demuxer, exercising the [`crate::Agent`]'s relay-DM
+    /// listener loop without a second [`NetworkNode`] over QUIC.
+    #[cfg(test)]
+    pub(crate) fn test_relayed_dm_sender(&self) -> mpsc::Sender<RelayedDmEvent> {
+        self.relayed_dm_tx.clone()
+    }
+
+    /// X0X-0070b: inject an inbound direct-DM payload onto the same
+    /// channel that [`spawn_receiver`](Self::spawn_receiver) feeds.
+    ///
+    /// Used by the relay-DM handler's `DeliverLocally` arm to make a
+    /// relayed envelope land on the canonical direct-DM listener
+    /// indistinguishably from a packet that traversed the direct path.
+    /// `peer_id` should be the *original* sender's MachineId-as-PeerId
+    /// (synthesised from `relayed.inner.sender_machine_id`); `payload`
+    /// must follow the existing wire shape
+    /// `[sender_agent_id: 32][application_bytes]` so the listener's
+    /// own AgentId-prefix parse at the consumer site (see
+    /// `crate::Agent`'s direct listener task) succeeds unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError::ConnectionFailed`] if the internal
+    /// `direct_tx` channel is closed (listener gone).
+    pub(crate) async fn inject_inbound_direct(
+        &self,
+        peer_id: AntPeerId,
+        payload: Bytes,
+    ) -> NetworkResult<()> {
+        warn_forward_channel_pressure(&self.direct_tx, peer_id, None, "direct_tx (relay-inject)");
+        self.direct_tx
+            .send((peer_id, payload))
+            .await
+            .map_err(|e| NetworkError::ConnectionFailed(format!("inject direct: {e}")))
+    }
+
     async fn receive_from_gossip_channel(
         rx: &Arc<tokio::sync::Mutex<mpsc::Receiver<GossipPayload>>>,
         diagnostics: &RecvPumpDiagnostics,
@@ -2482,6 +2568,7 @@ impl NetworkNode {
         let recv_bulk_tx = self.recv_bulk_tx.clone();
         let recv_pump_diagnostics = Arc::clone(&self.recv_pump_diagnostics);
         let direct_tx = self.direct_tx.clone();
+        let relayed_dm_tx = self.relayed_dm_tx.clone();
 
         tokio::spawn(async move {
             debug!("NetworkNode receiver task started");
@@ -2539,6 +2626,80 @@ impl NetworkNode {
                             warn_forward_channel_pressure(&direct_tx, peer_id, None, "direct_tx");
                             if let Err(e) = direct_tx.send((peer_id, payload)).await {
                                 error!("Failed to forward direct message: {}", e);
+                                break;
+                            }
+                            continue;
+                        }
+
+                        // X0X-0070b: inbound RelayedDm. Wire format mirrors
+                        // direct-DM at the framing layer:
+                        //   [0x11][relay_sender_agent_id: 32][postcard(RelayedDm)]
+                        // The 32-byte prefix is the *relay's* AgentId (the peer
+                        // that forwarded this packet to us — same identity the
+                        // QUIC peer carries); the *original* sender's identity
+                        // is inside `relayed.header.sender_agent_id` and is
+                        // trust-anchored by the header's ML-DSA-65 signature.
+                        // We pre-parse here so spawn_receiver remains the single
+                        // wire-validation site; downstream sees a typed value.
+                        if type_byte == RELAYED_DM_STREAM_TYPE {
+                            if data.len() < 1 + 32 {
+                                warn!(
+                                    "[1/6 network] dropping undersized RelayedDm frame: {} bytes from peer {:?}",
+                                    data.len(),
+                                    peer_id,
+                                );
+                                continue;
+                            }
+                            // Bound the on-wire size to prevent memory blow-up
+                            // on hostile peers. Inner DmEnvelope is already
+                            // capped by `MAX_DIRECT_PAYLOAD_SIZE`; the +32 +
+                            // 8 KiB allowance covers the relay prefix plus the
+                            // RelayHeader (ML-DSA-65 pubkey 1952 + signature
+                            // 3293 + dst/sender agent ids + timestamps fits
+                            // comfortably under 8 KiB).
+                            if data.len() > crate::direct::MAX_DIRECT_PAYLOAD_SIZE + 32 + 8 * 1024 {
+                                warn!(
+                                    "[1/6 network] dropping oversized RelayedDm: {} bytes from peer {:?} (max: {})",
+                                    data.len(),
+                                    peer_id,
+                                    crate::direct::MAX_DIRECT_PAYLOAD_SIZE + 32 + 8 * 1024,
+                                );
+                                continue;
+                            }
+                            let mut relay_sender_agent_id = [0u8; 32];
+                            relay_sender_agent_id.copy_from_slice(&data[1..33]);
+                            let body = &data[33..];
+                            let relayed = match postcard::from_bytes::<crate::peer_relay::RelayedDm>(
+                                body,
+                            ) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    warn!(
+                                        "[1/6 network] dropping malformed RelayedDm ({} body bytes) from peer {:?}: {}",
+                                        body.len(),
+                                        peer_id,
+                                        e,
+                                    );
+                                    continue;
+                                }
+                            };
+                            debug!(
+                                "[1/6 network] recv RelayedDm: {} body bytes from peer {:?} (relay agent {})",
+                                body.len(),
+                                peer_id,
+                                hex_prefix(&relay_sender_agent_id, 4),
+                            );
+                            warn_forward_channel_pressure(
+                                &relayed_dm_tx,
+                                peer_id,
+                                None,
+                                "relayed_dm_tx",
+                            );
+                            if let Err(e) = relayed_dm_tx
+                                .send((peer_id, relay_sender_agent_id, relayed))
+                                .await
+                            {
+                                error!("Failed to forward RelayedDm: {}", e);
                                 break;
                             }
                             continue;

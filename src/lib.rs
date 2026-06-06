@@ -7507,6 +7507,14 @@ impl AgentBuilder {
         let relay_candidates =
             std::sync::Arc::new(tokio::sync::RwLock::new(parsed_relay_candidates));
 
+        // X0X-0070b: discovery cache is hoisted out of the `Agent` literal so
+        // the relay-DM listener (spawned below) can hold an `Arc` clone of it
+        // without going through `&self` — the listener is a sibling task to
+        // the network receiver, not an `Agent` method.
+        let identity_discovery_cache: std::sync::Arc<
+            tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+        > = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+
         let network = if let Some(config) = self.network_config {
             let node = network::NetworkNode::new(config, bootstrap_cache.clone(), machine_keypair)
                 .await
@@ -7528,6 +7536,21 @@ impl AgentBuilder {
         } else {
             None
         };
+
+        // X0X-0070b: spawn the inbound RelayedDm listener so this Agent can
+        // serve as either the final recipient (DeliverLocally) or the
+        // intermediate relay (Forward) for peers that fell back to the
+        // relay path. Only meaningful when a network is configured —
+        // without one there is nothing to receive on and nothing to
+        // forward to.
+        if let Some(ref net) = network {
+            spawn_relay_dm_listener(
+                std::sync::Arc::clone(net),
+                std::sync::Arc::clone(&peer_relay),
+                std::sync::Arc::clone(&identity_discovery_cache),
+                identity.agent_id(),
+            );
+        }
 
         // Create signing context from agent keypair for message authentication
         let signing_ctx = std::sync::Arc::new(gossip::SigningContext::from_keypair(
@@ -7619,9 +7642,7 @@ impl AgentBuilder {
             gossip_runtime,
             bootstrap_cache,
             gossip_cache_adapter,
-            identity_discovery_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
+            identity_discovery_cache,
             machine_discovery_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
@@ -8154,6 +8175,154 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The name. Three bytes. A palindrome. A philosophy.
 pub const NAME: &str = "x0x";
+
+/// X0X-0070b: drain inbound [`peer_relay::RelayedDm`] envelopes from
+/// the [`network::NetworkNode`] and dispatch via the
+/// [`peer_relay::PeerRelay`] engine. Spawned once per network-configured
+/// [`Agent`] from [`AgentBuilder::build`].
+///
+/// # Per-arm behavior
+///
+/// * [`peer_relay::RelayDisposition::DeliverLocally`] — synthesises the
+///   *original* sender's `MachineId`-as-`PeerId` from
+///   `relayed.inner.sender_machine_id` and re-injects the inner
+///   [`dm::DmEnvelope`] onto the canonical direct-DM channel via
+///   [`network::NetworkNode::inject_inbound_direct`]. The downstream
+///   direct-DM listener cannot distinguish a relayed packet from a
+///   direct one.
+/// * [`peer_relay::RelayDisposition::Forward`] — resolves `dst_agent_id`
+///   to a `MachineId` via the identity-discovery cache, re-encodes the
+///   inner envelope with postcard, and sends it on the standard
+///   direct-DM stream ([`network::DIRECT_MESSAGE_STREAM_TYPE`]). The
+///   wire prefix stamps *our* (the relay's) `AgentId` so the receiving
+///   Agent's binding check at its direct listener (wire `sender_agent_id`
+///   must match the QUIC peer's `MachineId`) passes — trust on the
+///   inner envelope still flows from its embedded ML-DSA-65 signature.
+///   If the destination is not in the discovery cache the forward
+///   drops with a `warn!`.
+/// * [`peer_relay::RelayDisposition::Refuse`] — `debug!` log only.
+///   [`peer_relay::PeerRelay::disposition_for`] already incremented the
+///   appropriate `relay_refused_*` counter as a side effect.
+fn spawn_relay_dm_listener(
+    network: std::sync::Arc<network::NetworkNode>,
+    peer_relay: std::sync::Arc<peer_relay::PeerRelay>,
+    identity_discovery_cache: std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+    >,
+    local_agent_id: identity::AgentId,
+) {
+    tokio::spawn(async move {
+        tracing::info!(target: "x0x::relay", stage = "listener", "relay-DM listener started");
+        loop {
+            let Some((relay_peer_id, _relay_sender_agent_id, relayed)) =
+                network.recv_relayed_dm().await
+            else {
+                tracing::warn!(
+                    target: "x0x::relay",
+                    stage = "listener",
+                    "network.recv_relayed_dm channel closed — listener exiting"
+                );
+                break;
+            };
+
+            let now_ms = dm::now_unix_ms();
+            let disposition = peer_relay.disposition_for(&relayed, &local_agent_id, now_ms);
+
+            match disposition {
+                peer_relay::RelayDisposition::DeliverLocally => {
+                    let sender_machine_id = relayed.inner.sender_machine_id;
+                    let sender_peer_id = ant_quic::PeerId(sender_machine_id);
+                    let inner_wire = match postcard::to_allocvec(&relayed.inner) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "x0x::relay",
+                                stage = "deliver_local",
+                                relay_peer = ?relay_peer_id,
+                                error = %e,
+                                "failed to re-encode inner envelope for local delivery"
+                            );
+                            continue;
+                        }
+                    };
+                    // Wire shape mirrors the direct-DM listener's parse:
+                    //   [sender_agent_id: 32][postcard(DmEnvelope)]
+                    let mut payload = Vec::with_capacity(32 + inner_wire.len());
+                    payload.extend_from_slice(&relayed.inner.sender_agent_id);
+                    payload.extend_from_slice(&inner_wire);
+                    if let Err(e) = network
+                        .inject_inbound_direct(sender_peer_id, bytes::Bytes::from(payload))
+                        .await
+                    {
+                        tracing::warn!(
+                            target: "x0x::relay",
+                            stage = "deliver_local",
+                            relay_peer = ?relay_peer_id,
+                            error = %e,
+                            "DeliverLocally inject onto direct channel failed"
+                        );
+                    }
+                }
+                peer_relay::RelayDisposition::Forward { dst_agent_id } => {
+                    let dst = identity::AgentId(dst_agent_id);
+                    let dst_machine_id = {
+                        let cache = identity_discovery_cache.read().await;
+                        cache.get(&dst).map(|d| d.machine_id)
+                    };
+                    let Some(dst_machine_id) = dst_machine_id else {
+                        tracing::warn!(
+                            target: "x0x::relay",
+                            stage = "forward",
+                            dst = %hex::encode(dst.as_bytes()),
+                            "Forward dropped: dst not in identity-discovery cache"
+                        );
+                        continue;
+                    };
+                    let inner_wire = match postcard::to_allocvec(&relayed.inner) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "x0x::relay",
+                                stage = "forward",
+                                dst = %hex::encode(dst.as_bytes()),
+                                error = %e,
+                                "failed to re-encode inner envelope for forward"
+                            );
+                            continue;
+                        }
+                    };
+                    let dst_peer_id = ant_quic::PeerId(dst_machine_id.0);
+                    if let Err(e) = network
+                        .send_direct_typed(
+                            &dst_peer_id,
+                            local_agent_id.as_bytes(),
+                            network::DIRECT_MESSAGE_STREAM_TYPE,
+                            &inner_wire,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            target: "x0x::relay",
+                            stage = "forward",
+                            dst = %hex::encode(dst.as_bytes()),
+                            error = %e,
+                            "Forward send_direct_typed failed"
+                        );
+                    }
+                }
+                peer_relay::RelayDisposition::Refuse(reason) => {
+                    tracing::debug!(
+                        target: "x0x::relay",
+                        stage = "refuse",
+                        relay_peer = ?relay_peer_id,
+                        reason = ?reason,
+                        "RelayedDm refused"
+                    );
+                }
+            }
+        }
+    });
+}
 
 #[cfg(test)]
 mod tests {
@@ -8897,6 +9066,104 @@ mod tests {
             0,
             "disabled policy must not advance relay_sent"
         );
+    }
+
+    #[tokio::test]
+    async fn relay_dm_listener_refuses_bad_signature_and_ticks_counter() {
+        // Why: the receiver-side surface for X0X-0070b — a single
+        // demux arm + a listener loop that runs `disposition_for` and
+        // dispatches the three arms — depends on the listener actually
+        // draining `network.recv_relayed_dm`. If the spawn ever drops
+        // (forgotten in `AgentBuilder::build`, or the wire/channel
+        // shape drifts) the engine silently stops refusing replays
+        // and forwards, and the bug presents as "relay path is
+        // configured but nothing happens." Pin the end-to-end
+        // channel + loop liveness with the cheapest fully-typed
+        // signal we have: a `RelayedDm` with an obviously-broken
+        // header signature flows through the channel, the listener
+        // consumes it, `disposition_for` returns
+        // `Refuse(BadSignature)`, and the
+        // `relay_refused_bad_signature` counter ticks. Catches any
+        // future channel-rename / spawn-drop / wire-type regression.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut net_cfg = loopback_network_config();
+        net_cfg.peer_relay = network::PeerRelayConfig {
+            enabled: true,
+            fail_threshold: 3,
+            fail_window_ms: 60_000,
+            candidates: Vec::new(),
+        };
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(net_cfg)
+            .build()
+            .await
+            .expect("agent");
+
+        let network = agent
+            .network
+            .as_ref()
+            .expect("agent built with network config");
+        let sender = network.test_relayed_dm_sender();
+
+        let relayed = peer_relay::RelayedDm {
+            header: peer_relay::RelayHeader {
+                version: peer_relay::RelayHeader::VERSION,
+                dst_agent_id: agent.agent_id().0,
+                sender_agent_id: [0x42; 32],
+                // Empty pubkey + signature: header.verify() must fail.
+                sender_public_key: Vec::new(),
+                originated_at_unix_ms: dm::now_unix_ms(),
+                signature: Vec::new(),
+            },
+            inner: dm::DmEnvelope {
+                protocol_version: 1,
+                request_id: [0u8; 16],
+                sender_agent_id: [0x42; 32],
+                sender_machine_id: [0x43; 32],
+                recipient_agent_id: agent.agent_id().0,
+                created_at_unix_ms: 0,
+                expires_at_unix_ms: 0,
+                body: dm::DmBody::Payload(dm::DmPayload {
+                    kem_ciphertext: Vec::new(),
+                    body_nonce: [0u8; 12],
+                    body_ciphertext: Vec::new(),
+                }),
+                signature: Vec::new(),
+            },
+        };
+
+        let relay_peer = ant_quic::PeerId([0xEE; 32]);
+        let relay_wire_sender = [0xEE; 32];
+        sender
+            .send((relay_peer, relay_wire_sender, relayed))
+            .await
+            .expect("relayed_dm channel must accept push");
+
+        // Spin until the listener observes the refusal — bounded so a
+        // regression fails fast rather than timing out the suite.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let snap = agent.peer_relay().stats().snapshot();
+            if snap.relay_refused_bad_signature == 1 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "relay-DM listener did not tick relay_refused_bad_signature within 2s — \
+                     snapshot: {snap:?}"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let snap = agent.peer_relay().stats().snapshot();
+        assert_eq!(snap.relay_refused_bad_signature, 1);
+        assert_eq!(snap.relay_received, 0, "bad-sig path must not deliver");
+        assert_eq!(snap.relay_forwarded, 0, "bad-sig path must not forward");
     }
 
     #[tokio::test]
