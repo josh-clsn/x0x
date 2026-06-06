@@ -813,6 +813,14 @@ fn usize_to_u64_saturating(value: usize) -> u64 {
 /// Stream type byte for direct messages (distinct from gossip: 0, 1, 2).
 pub const DIRECT_MESSAGE_STREAM_TYPE: u8 = 0x10;
 
+/// Stream type byte for application-level relayed DMs (X0X-0070b).
+/// Sits immediately above [`DIRECT_MESSAGE_STREAM_TYPE`] in the
+/// reserved DM region. Older peers without the X0X-0070b receiver
+/// handler hit the "Unknown stream type byte" path at the inbound
+/// parser and drop the frame — wire-additive demux, forward-compat
+/// clean.
+pub const RELAYED_DM_STREAM_TYPE: u8 = 0x11;
+
 const CHANNEL_PRESSURE_INFO_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2257,15 +2265,46 @@ impl NetworkNode {
         sender_agent_id: &[u8; 32],
         payload: &[u8],
     ) -> NetworkResult<()> {
+        self.send_direct_typed(
+            peer_id,
+            sender_agent_id,
+            DIRECT_MESSAGE_STREAM_TYPE,
+            payload,
+        )
+        .await
+    }
+
+    /// Send a direct stream framed with an arbitrary application
+    /// stream-type byte. The wire format is identical to
+    /// [`Self::send_direct`] — `[stream_type][sender_agent_id: 32][payload]`
+    /// — but the first byte is parameterised so callers above the DM
+    /// layer (X0X-0070b's relay-fallback + relay-side forward path) can
+    /// reuse the same connection-pool / push / pool-activity bookkeeping
+    /// without duplicating the wire builder.
+    ///
+    /// `stream_type` MUST NOT collide with reserved values:
+    /// gossip uses `0x00`/`0x01`/`0x02`, the DM region uses `0x10` and
+    /// upwards. See [`DIRECT_MESSAGE_STREAM_TYPE`] +
+    /// [`RELAYED_DM_STREAM_TYPE`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `NetworkError` if the peer is not connected or send fails.
+    pub(crate) async fn send_direct_typed(
+        &self,
+        peer_id: &AntPeerId,
+        sender_agent_id: &[u8; 32],
+        stream_type: u8,
+        payload: &[u8],
+    ) -> NetworkResult<()> {
         self.get_or_connect_pooled_peer(peer_id).await?;
 
-        // Build wire format: [0x10][sender_agent_id: 32 bytes][payload]
+        // Wire format: [stream_type][sender_agent_id: 32 bytes][payload]
         let mut buf = Vec::with_capacity(1 + 32 + payload.len());
-        buf.push(DIRECT_MESSAGE_STREAM_TYPE);
+        buf.push(stream_type);
         buf.extend_from_slice(sender_agent_id);
         buf.extend_from_slice(payload);
 
-        // Send via ant-quic
         let node = self.require_node().await?;
         node.send(peer_id, &buf)
             .await
@@ -2273,7 +2312,8 @@ impl NetworkNode {
         self.note_connection_pool_activity(*peer_id).await;
 
         debug!(
-            "[1/6 network] send_direct: {} bytes to peer {:?}",
+            "[1/6 network] send_direct_typed: stream_type=0x{:02x} {} bytes to peer {:?}",
+            stream_type,
             payload.len(),
             peer_id
         );
