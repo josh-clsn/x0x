@@ -295,6 +295,21 @@ pub enum DmError {
     /// Catch-all for gossip transport errors not classified above.
     #[error("gossip transport error: {0}")]
     PublishFailed(String),
+
+    /// X0X-0070b: the direct path failed and `PeerRelay::needs_relay`
+    /// returned true, but `PeerRelay::select_relay` had no candidate
+    /// to pick (empty or only self / dst). The caller surfaces the
+    /// original direct error; this variant is for internal
+    /// `try_relay_fallback` bookkeeping.
+    #[error("no relay candidate available")]
+    NoRelayCandidate,
+
+    /// X0X-0070b: `PeerRelay::build_relayed_dm` failed, typically a
+    /// signing or domain-separated serialization error. The caller
+    /// surfaces the original direct error; this variant is for
+    /// internal `try_relay_fallback` bookkeeping.
+    #[error("relay envelope build failed: {0}")]
+    RelayBuildFailed(String),
 }
 
 impl From<IdentityError> for DmError {
@@ -327,6 +342,14 @@ pub enum DmPath {
     RawQuic,
     /// Raw-QUIC path with ant-quic receive-pipeline ACK confirmation.
     RawQuicAcked,
+    /// X0X-0070b: delivered via the application-level peer relay
+    /// (`PeerRelay`) after the direct paths failed `fail_threshold`
+    /// times within `fail_window`. `via` is the relay candidate that
+    /// forwarded the inner `DmEnvelope`.
+    Relayed {
+        /// The relay candidate that forwarded the inner envelope.
+        via: AgentId,
+    },
 }
 
 /// Fallback RTT used when no per-peer RTT sample has reached the local cache.

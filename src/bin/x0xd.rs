@@ -14849,6 +14849,7 @@ async fn direct_send(
                 x0x::dm::DmPath::GossipInbox => "gossip_inbox",
                 x0x::dm::DmPath::RawQuic => "raw_quic",
                 x0x::dm::DmPath::RawQuicAcked => "raw_quic_acked",
+                x0x::dm::DmPath::Relayed { .. } => "relayed",
             };
             tracing::debug!(
                 target: "dm.trace",
@@ -14944,6 +14945,12 @@ async fn direct_send(
                 }
                 x0x::dm::DmError::PublishFailed(_) => {
                     (StatusCode::INTERNAL_SERVER_ERROR, "publish_failed")
+                }
+                x0x::dm::DmError::NoRelayCandidate => {
+                    (StatusCode::SERVICE_UNAVAILABLE, "no_relay_candidate")
+                }
+                x0x::dm::DmError::RelayBuildFailed(_) => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "relay_build_failed")
                 }
             };
             tracing::error!("direct_send failed ({err_kind}): {e}");

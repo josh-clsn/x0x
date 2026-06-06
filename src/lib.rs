@@ -3468,6 +3468,7 @@ impl Agent {
                     dm::DmPath::RawQuic => "raw_quic",
                     dm::DmPath::RawQuicAcked => "raw_quic_acked",
                     dm::DmPath::GossipInbox => "gossip_inbox",
+                    dm::DmPath::Relayed { .. } => "relayed",
                 };
                 tracing::debug!(
                     target: "dm.trace",
