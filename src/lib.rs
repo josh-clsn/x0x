@@ -6897,6 +6897,34 @@ impl Agent {
 
     /// Insert a discovered agent into the cache (for testing only).
     ///
+    /// Insert a [`dm::DmCapabilities`] entry for `agent_id` / `machine_id`
+    /// into the local capability store, bypassing the gossip-advert pipeline.
+    ///
+    /// # Visibility
+    ///
+    /// `#[doc(hidden)]` — tests-only seam. Production callers must rely on
+    /// the live capability-advert subscription so the store mirrors what
+    /// the network actually advertises.
+    ///
+    /// # Arguments
+    ///
+    /// * `agent_id` - Subject agent the capabilities apply to.
+    /// * `machine_id` - Subject machine. Used by the store's lookup path
+    ///   to disambiguate when an agent is reachable via multiple machines.
+    /// * `capabilities` - The [`dm::DmCapabilities`] record (KEM public
+    ///   key, gossip-inbox readiness, envelope-size cap, etc.) the sender
+    ///   should treat as authoritative.
+    #[doc(hidden)]
+    pub fn insert_capability_for_testing(
+        &self,
+        agent_id: identity::AgentId,
+        machine_id: identity::MachineId,
+        capabilities: dm::DmCapabilities,
+    ) {
+        self.capability_store
+            .insert(agent_id, machine_id, capabilities);
+    }
+
     /// # Arguments
     ///
     /// * `agent` - The agent entry to insert.
