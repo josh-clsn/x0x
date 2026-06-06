@@ -243,6 +243,91 @@ pub struct NetworkConfig {
     /// and via the `--no-port-mapping` CLI flag.
     #[serde(default = "default_port_mapping_enabled")]
     pub port_mapping_enabled: bool,
+
+    /// X0X-0070b: application-level peer-relay fallback configuration.
+    /// Defaults to disabled (matches `RelayPolicy::default()`); the
+    /// engine only activates when a runtime explicitly opts in via
+    /// `[peer_relay] enabled = true` in TOML.
+    #[serde(default)]
+    pub peer_relay: PeerRelayConfig,
+}
+
+/// X0X-0070b: TOML-shaped configuration for the peer-relay fallback
+/// path. `enabled` is the master gate; the failure trigger
+/// (`fail_threshold` over `fail_window_ms`) controls when a peer is
+/// marked `needs_relay`; `candidates` seeds the candidate set the
+/// engine picks from when falling back. Gossip-announced relay
+/// candidates (future) are merged on top of `candidates` at runtime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerRelayConfig {
+    /// Master gate. Defaults to `false`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Direct-DM failures within `fail_window_ms` before a peer is
+    /// marked `needs_relay`. Defaults to
+    /// [`crate::peer_relay::DEFAULT_FAIL_THRESHOLD`]. Clamped to
+    /// `>= 1` at policy-conversion time so a misconfigured `0` does
+    /// not silently disable the threshold.
+    #[serde(default = "default_peer_relay_fail_threshold")]
+    pub fail_threshold: u32,
+
+    /// Sliding window (milliseconds) over which `fail_threshold` is
+    /// counted. Defaults to
+    /// [`crate::peer_relay::DEFAULT_FAIL_WINDOW`] in milliseconds.
+    #[serde(default = "default_peer_relay_fail_window_ms")]
+    pub fail_window_ms: u64,
+
+    /// Hex-encoded `AgentId`s that act as relay candidates. The MVP
+    /// (X0X-0070b) loads these from TOML; future revisions merge in
+    /// gossip-announced candidates at runtime. Each candidate MUST
+    /// have a directly reachable public address — the relay path
+    /// sends `RelayedDm` to candidates via the same direct-DM
+    /// transport, which requires a healthy direct path between the
+    /// sender and the candidate.
+    #[serde(default)]
+    pub candidates: Vec<String>,
+}
+
+fn default_peer_relay_fail_threshold() -> u32 {
+    crate::peer_relay::DEFAULT_FAIL_THRESHOLD
+}
+
+fn default_peer_relay_fail_window_ms() -> u64 {
+    u64::try_from(crate::peer_relay::DEFAULT_FAIL_WINDOW.as_millis()).unwrap_or(u64::MAX)
+}
+
+impl Default for PeerRelayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            fail_threshold: default_peer_relay_fail_threshold(),
+            fail_window_ms: default_peer_relay_fail_window_ms(),
+            candidates: Vec::new(),
+        }
+    }
+}
+
+impl PeerRelayConfig {
+    /// Convert this TOML-shaped config into a [`crate::peer_relay::RelayPolicy`]
+    /// for the engine. `candidates` is NOT carried in the policy — it
+    /// lives on `Agent` as separately-mutable runtime state populated
+    /// from this config and the gossip-announce subscriber.
+    ///
+    /// `fail_threshold` is clamped to `>= 1` so a misconfigured `0`
+    /// never silently flips the engine into "every failure triggers
+    /// relay". `freshness` is taken from the engine's own default
+    /// since it is not currently surfaced in the TOML schema.
+    #[must_use]
+    pub fn to_policy(&self) -> crate::peer_relay::RelayPolicy {
+        let defaults = crate::peer_relay::RelayPolicy::default();
+        crate::peer_relay::RelayPolicy {
+            enabled: self.enabled,
+            fail_threshold: self.fail_threshold.max(1),
+            fail_window: Duration::from_millis(self.fail_window_ms),
+            freshness: defaults.freshness,
+        }
+    }
 }
 
 fn default_max_connections() -> u32 {
@@ -296,6 +381,7 @@ impl Default for NetworkConfig {
             inbound_allowlist: std::collections::HashSet::new(),
             max_peers_per_ip: 3,
             port_mapping_enabled: true,
+            peer_relay: PeerRelayConfig::default(),
         }
     }
 }
@@ -3213,6 +3299,7 @@ async fn test_mesh_connections_are_bidirectional() {
             inbound_allowlist: std::collections::HashSet::new(),
             max_peers_per_ip: 3,
             port_mapping_enabled: true,
+            peer_relay: PeerRelayConfig::default(),
         };
 
         let node = NetworkNode::new(config, None, None).await.unwrap();
