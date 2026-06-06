@@ -886,6 +886,65 @@ impl EnvelopeBuilder {
             outcome,
         })
     }
+
+    /// Build a fully-signed [`DmEnvelope`] from the raw send-site inputs.
+    ///
+    /// Wraps the four crypto ops every direct-DM send needs — KEM
+    /// encapsulation, AEAD encryption, domain-separated signing-bytes
+    /// build, ML-DSA-65 signature — behind one entry point. The `sign`
+    /// closure receives the signing bytes and returns the signature; in
+    /// production both `dm_send::send_via_gossip` and X0X-0070b's
+    /// `try_relay_fallback` pass a closure backed by
+    /// `gossip::SigningContext::sign`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DmError::EnvelopeConstruction`] if KEM encapsulation,
+    /// AEAD encryption, signing-bytes serialisation, or the `sign`
+    /// closure fail.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_payload_envelope<F>(
+        request_id: [u8; 16],
+        self_agent_id: &AgentId,
+        self_machine_id: &MachineId,
+        recipient_agent_id: &AgentId,
+        recipient_kem_public_key: &[u8],
+        created_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+        payload: Vec<u8>,
+        sign: F,
+    ) -> std::result::Result<DmEnvelope, DmError>
+    where
+        F: FnOnce(&[u8]) -> std::result::Result<Vec<u8>, String>,
+    {
+        let body = Self::build_payload_body(
+            &request_id,
+            self_agent_id.as_bytes(),
+            recipient_agent_id.as_bytes(),
+            created_at_unix_ms,
+            payload,
+            None,
+            recipient_kem_public_key,
+        )
+        .map_err(|e| DmError::EnvelopeConstruction(e.to_string()))?;
+        let mut envelope = DmEnvelope {
+            protocol_version: DM_PROTOCOL_VERSION,
+            request_id,
+            sender_agent_id: *self_agent_id.as_bytes(),
+            sender_machine_id: *self_machine_id.as_bytes(),
+            recipient_agent_id: *recipient_agent_id.as_bytes(),
+            created_at_unix_ms,
+            expires_at_unix_ms,
+            body,
+            signature: Vec::new(),
+        };
+        let signed = envelope
+            .signed_bytes()
+            .map_err(|e| DmError::EnvelopeConstruction(e.to_string()))?;
+        envelope.signature =
+            sign(&signed).map_err(|e| DmError::EnvelopeConstruction(format!("sign: {e}")))?;
+        Ok(envelope)
+    }
 }
 
 // ─── In-flight ACK tracking ────────────────────────────────────────────────
@@ -1117,6 +1176,65 @@ mod tests {
         let tb = dm_inbox_topic(&b);
         assert_eq!(ta1, ta2);
         assert_ne!(ta1, tb);
+    }
+
+    #[tokio::test]
+    async fn build_payload_envelope_produces_verifiable_envelope() {
+        // Why: X0X-0070b's `try_relay_fallback` and
+        // `dm_send::send_via_gossip` both rely on this helper to produce
+        // a fully signed envelope from raw inputs. The whole DM trust
+        // model collapses if the returned envelope does not verify
+        // against the sender's own ML-DSA-65 public key — pin it.
+        use crate::gossip::SigningContext;
+        use crate::groups::kem_envelope::AgentKemKeypair;
+        use crate::identity::{AgentKeypair, MachineKeypair};
+
+        let agent_kp = AgentKeypair::generate().expect("agent keypair");
+        let machine_kp = MachineKeypair::generate().expect("machine keypair");
+        let recipient_kem = AgentKemKeypair::generate().expect("recipient KEM keypair");
+        let signing = SigningContext::from_keypair(&agent_kp);
+
+        let sender = agent_kp.agent_id();
+        let machine = machine_kp.machine_id();
+        let recipient = AgentKeypair::generate()
+            .expect("recipient agent keypair")
+            .agent_id();
+        let now = now_unix_ms();
+        let request_id = [9u8; 16];
+
+        let envelope = EnvelopeBuilder::build_payload_envelope(
+            request_id,
+            &sender,
+            &machine,
+            &recipient,
+            &recipient_kem.public_bytes,
+            now,
+            now + 60_000,
+            b"hello-x0x-0070b".to_vec(),
+            |bytes| signing.sign(bytes).map_err(|e| e.to_string()),
+        )
+        .expect("envelope build");
+
+        assert_eq!(envelope.request_id, request_id);
+        assert_eq!(envelope.sender_agent_id, *sender.as_bytes());
+        assert_eq!(envelope.recipient_agent_id, *recipient.as_bytes());
+        assert!(
+            !envelope.signature.is_empty(),
+            "build_payload_envelope must produce a non-empty signature"
+        );
+        let signed_bytes = envelope.signed_bytes().expect("signed bytes");
+        let sender_pub_bytes = agent_kp.to_bytes().0;
+        let pubkey =
+            ant_quic::MlDsaPublicKey::from_bytes(&sender_pub_bytes).expect("agent pubkey parse");
+        let signature =
+            ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&envelope.signature)
+                .expect("signature parse");
+        ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+            &pubkey,
+            &signed_bytes,
+            &signature,
+        )
+        .expect("envelope signature must verify against the sender's public key");
     }
 
     #[test]

@@ -3089,6 +3089,18 @@ impl Agent {
             .map(|c| c.gossip_inbox && !c.kem_public_key.is_empty())
             .unwrap_or(false);
 
+        // X0X-0070b: seed the relay fallback. Only retain the payload + KEM
+        // key clone when the engine is enabled AND we have a key to seal
+        // a fresh envelope with. With the default disabled policy this
+        // closure never runs — the happy path pays nothing.
+        let relay_seed: Option<(Vec<u8>, Vec<u8>)> = if self.peer_relay.policy().enabled {
+            cap.as_ref()
+                .filter(|c| !c.kem_public_key.is_empty())
+                .map(|c| (payload.clone(), c.kem_public_key.clone()))
+        } else {
+            None
+        };
+
         let rtt_hint_ms = self.dm_peer_rtt_ms(to).await;
         let mut config = config;
         // Direct transport RTT is a valid hint for raw-QUIC work, but it is
@@ -3202,7 +3214,7 @@ impl Agent {
             }
         };
 
-        match &result {
+        match result {
             Ok(receipt) => {
                 self.direct_messaging
                     .record_outgoing_succeeded(*to, receipt.path);
@@ -3212,18 +3224,145 @@ impl Agent {
                 // `direct_recovered_after_relay` exactly once — proving the
                 // fallback is transient.
                 self.peer_relay.record_direct_success(to);
+                Ok(receipt)
             }
-            Err(_) => {
+            Err(direct_err) => {
                 self.direct_messaging.record_outgoing_failed(*to);
                 // X0X-0070b: count this direct-DM failure on the relay engine.
-                // With the default disabled policy this is bookkeeping only —
-                // `needs_relay` returns `false` regardless. With an
-                // opted-in policy the count drives the relay-fallback
-                // decision in commit 5's `try_relay_fallback` hook.
+                // With the default disabled policy `needs_relay` always
+                // returns `false` and the fallback below is skipped. With
+                // an opted-in policy this drives the relay decision.
                 self.peer_relay.record_direct_failure(to);
+                // X0X-0070b: relay fallback. We only attempt it when the
+                // engine says the peer has now crossed `needs_relay`, and
+                // only when we have both a saved payload and a recipient
+                // KEM key — without those the relay envelope can't be
+                // sealed. On ANY relay-side failure we surface the
+                // ORIGINAL direct error so the caller's view stays
+                // consistent with the path that was actually tried.
+                if let Some((saved_payload, kem_pub)) = relay_seed {
+                    if self.peer_relay.needs_relay(to) {
+                        match self.try_relay_fallback(to, saved_payload, &kem_pub).await {
+                            Ok(relay_receipt) => {
+                                self.direct_messaging
+                                    .record_outgoing_succeeded(*to, relay_receipt.path);
+                                return Ok(relay_receipt);
+                            }
+                            Err(relay_err) => {
+                                tracing::debug!(
+                                    target: "x0x::relay",
+                                    recipient = %hex::encode(to.as_bytes()),
+                                    direct_err = %direct_err,
+                                    relay_err = %relay_err,
+                                    "X0X-0070b relay fallback failed; surfacing original direct error"
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(direct_err)
             }
         }
-        result
+    }
+
+    /// X0X-0070b: wrap `payload` in a fresh sealed [`dm::DmEnvelope`] +
+    /// [`peer_relay::RelayedDm`], pick a relay candidate via
+    /// [`peer_relay::PeerRelay::select_relay`], and forward to that candidate
+    /// over the same direct-DM transport using the dedicated
+    /// [`network::RELAYED_DM_STREAM_TYPE`] stream-type. The relay verifies
+    /// the [`peer_relay::RelayHeader`] signature, confirms it is being
+    /// asked to forward (not to be the final recipient), and sends the
+    /// inner envelope on to `to` — one hop only, no re-wrapping.
+    ///
+    /// # Errors
+    ///
+    /// - [`dm::DmError::NoRelayCandidate`] if no third-party candidate
+    ///   exists or the candidate's `MachineId` is not in the discovery
+    ///   cache (we need it to address the QUIC peer).
+    /// - [`dm::DmError::RelayBuildFailed`] if signing the
+    ///   [`peer_relay::RelayHeader`] or parsing the agent secret key
+    ///   fails.
+    /// - [`dm::DmError::EnvelopeConstruction`] if KEM encapsulation /
+    ///   AEAD seal / envelope signature fails (delegates to
+    ///   [`dm::EnvelopeBuilder::build_payload_envelope`]).
+    /// - [`dm::DmError::NoConnectivity`] if no network is configured.
+    /// - [`dm::DmError::PublishFailed`] if the underlying
+    ///   [`network::NetworkNode::send_direct_typed`] send fails.
+    async fn try_relay_fallback(
+        &self,
+        to: &identity::AgentId,
+        payload: Vec<u8>,
+        recipient_kem_public_key: &[u8],
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        let sender = self.identity.agent_id();
+        let candidates = self.relay_candidates.read().await.clone();
+        let Some(relay_agent) = self.peer_relay.select_relay(&candidates, to, &sender) else {
+            return Err(dm::DmError::NoRelayCandidate);
+        };
+
+        let relay_machine_id = {
+            let cache = self.identity_discovery_cache.read().await;
+            cache.get(&relay_agent).map(|e| e.machine_id)
+        };
+        let Some(relay_machine_id) = relay_machine_id else {
+            // We have the relay candidate's agent_id but no machine_id —
+            // can't address the QUIC peer. Treat as "no candidate" so the
+            // caller surfaces the original direct error.
+            return Err(dm::DmError::NoRelayCandidate);
+        };
+
+        let now = dm::now_unix_ms();
+        let expires = now.saturating_add(dm_send::DEFAULT_ENVELOPE_LIFETIME_MS);
+        let request_id = dm_send::fresh_request_id();
+        let signing = gossip::SigningContext::from_keypair(self.identity.agent_keypair());
+        let envelope = dm::EnvelopeBuilder::build_payload_envelope(
+            request_id,
+            &sender,
+            &self.identity.machine_id(),
+            to,
+            recipient_kem_public_key,
+            now,
+            expires,
+            payload,
+            |bytes| signing.sign(bytes).map_err(|e| e.to_string()),
+        )?;
+
+        let (sender_pub_bytes, sender_sec_bytes) = self.identity.agent_keypair().to_bytes();
+        let sender_secret = ant_quic::MlDsaSecretKey::from_bytes(&sender_sec_bytes)
+            .map_err(|e| dm::DmError::RelayBuildFailed(format!("agent secret key: {e:?}")))?;
+        let relayed = self
+            .peer_relay
+            .build_relayed_dm(to, &sender, sender_pub_bytes, now, envelope, |bytes| {
+                ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(&sender_secret, bytes)
+                    .map(|s| s.as_bytes().to_vec())
+                    .map_err(|e| format!("{e:?}"))
+            })
+            .map_err(dm::DmError::RelayBuildFailed)?;
+
+        let wire = postcard::to_allocvec(&relayed).map_err(|e| {
+            dm::DmError::EnvelopeConstruction(format!("relayed envelope postcard: {e}"))
+        })?;
+        let network = self
+            .network
+            .as_ref()
+            .ok_or_else(|| dm::DmError::NoConnectivity("no network for relay send".to_string()))?;
+        let relay_peer_id = ant_quic::PeerId(relay_machine_id.0);
+        network
+            .send_direct_typed(
+                &relay_peer_id,
+                sender.as_bytes(),
+                network::RELAYED_DM_STREAM_TYPE,
+                &wire,
+            )
+            .await
+            .map_err(|e| dm::DmError::PublishFailed(format!("relay send: {e}")))?;
+
+        Ok(dm::DmReceipt {
+            request_id,
+            accepted_at: std::time::Instant::now(),
+            retries_used: 0,
+            path: dm::DmPath::Relayed { via: relay_agent },
+        })
     }
 
     /// X0X-0070b: borrow the application-level peer-relay engine. Runtimes
@@ -8562,6 +8701,201 @@ mod tests {
             agent.peer_relay().tracked_peer_count(),
             0,
             "loopback path must not register with the relay engine"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_relay_fallback_returns_no_candidate_when_list_empty() {
+        // Why: with an enabled policy but zero seeded candidates,
+        // `select_relay` returns `None` and the helper must short-circuit
+        // to `NoRelayCandidate`. Falling through to envelope construction
+        // would burn KEM/AEAD cycles for nothing.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut net_cfg = loopback_network_config();
+        net_cfg.peer_relay = network::PeerRelayConfig {
+            enabled: true,
+            fail_threshold: 3,
+            fail_window_ms: 60_000,
+            candidates: Vec::new(),
+        };
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(net_cfg)
+            .build()
+            .await
+            .expect("agent");
+        let to = identity::AgentId([0xCD; 32]);
+
+        let err = agent
+            .try_relay_fallback(&to, b"payload".to_vec(), &[0u8; 32])
+            .await
+            .expect_err("empty candidate list must short-circuit");
+        assert!(
+            matches!(err, dm::DmError::NoRelayCandidate),
+            "expected NoRelayCandidate, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_relay_fallback_returns_no_candidate_when_machine_id_uncached() {
+        // Why: a seeded candidate AgentId is useless if its MachineId is
+        // not in the identity-discovery cache — we need it to address
+        // the QUIC peer at the wire layer. The helper must treat this
+        // as "no usable candidate" and let the caller surface the
+        // original direct error.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let candidate_hex = hex::encode([0xEE_u8; 32]);
+        let mut net_cfg = loopback_network_config();
+        net_cfg.peer_relay = network::PeerRelayConfig {
+            enabled: true,
+            fail_threshold: 3,
+            fail_window_ms: 60_000,
+            candidates: vec![candidate_hex],
+        };
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(net_cfg)
+            .build()
+            .await
+            .expect("agent");
+        let to = identity::AgentId([0xCD; 32]);
+
+        let err = agent
+            .try_relay_fallback(&to, b"payload".to_vec(), &[0u8; 32])
+            .await
+            .expect_err("uncached candidate must short-circuit");
+        assert!(
+            matches!(err, dm::DmError::NoRelayCandidate),
+            "expected NoRelayCandidate, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_direct_below_threshold_does_not_attempt_relay() {
+        // Why: the engine must wait until the sliding-window failure
+        // count reaches `fail_threshold` before engaging the relay.
+        // A single transport failure must surface the original direct
+        // error AND must not register `relay_sent` on the engine
+        // (proves no fallback attempt fired underneath).
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut net_cfg = loopback_network_config();
+        net_cfg.peer_relay = network::PeerRelayConfig {
+            enabled: true,
+            fail_threshold: 5,
+            fail_window_ms: 60_000,
+            candidates: vec![hex::encode([0xEE_u8; 32])],
+        };
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(net_cfg)
+            .build()
+            .await
+            .expect("agent");
+        let to = identity::AgentId([0xCD; 32]);
+
+        let result = agent
+            .send_direct_with_config(&to, b"first-attempt".to_vec(), dm::DmSendConfig::default())
+            .await;
+        assert!(result.is_err(), "no usable transport — direct send fails");
+        let snap = agent.peer_relay().stats().snapshot();
+        assert_eq!(
+            snap.relay_sent, 0,
+            "below threshold must not engage the relay path"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_direct_above_threshold_without_candidates_surfaces_direct_err() {
+        // Why: the contract for relay-fallback failure is that the
+        // caller sees the ORIGINAL direct error, never the relay-side
+        // bookkeeping error. Pre-load the engine past threshold, then
+        // send to a peer with no usable candidate — the result must
+        // be a direct-transport error, not `NoRelayCandidate`.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut net_cfg = loopback_network_config();
+        net_cfg.peer_relay = network::PeerRelayConfig {
+            enabled: true,
+            fail_threshold: 3,
+            fail_window_ms: 60_000,
+            candidates: Vec::new(),
+        };
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(net_cfg)
+            .build()
+            .await
+            .expect("agent");
+        let to = identity::AgentId([0xCD; 32]);
+
+        // Pre-load the engine past threshold without waiting for live
+        // transport retries.
+        for _ in 0..agent.peer_relay().policy().fail_threshold {
+            agent.peer_relay().record_direct_failure(&to);
+        }
+        assert!(
+            agent.peer_relay().needs_relay(&to),
+            "engine must say the peer now needs a relay"
+        );
+
+        let err = agent
+            .send_direct_with_config(&to, b"x0x-0070b".to_vec(), dm::DmSendConfig::default())
+            .await
+            .expect_err("send must still fail when the relay path has no candidates");
+        assert!(
+            !matches!(err, dm::DmError::NoRelayCandidate),
+            "relay-side errors must not leak — original direct error must surface, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_direct_disabled_policy_does_not_engage_relay_seed() {
+        // Why: with the default disabled policy the relay-seed clone
+        // must not happen — the happy path pays nothing. Even with the
+        // peer manually driven past `fail_threshold` (which would never
+        // happen under a disabled policy in practice, but is a
+        // belt-and-braces check), the engine's `needs_relay` stays
+        // `false` and no fallback fires.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await
+            .expect("agent");
+        let to = identity::AgentId([0xCD; 32]);
+        for _ in 0..10 {
+            agent.peer_relay().record_direct_failure(&to);
+        }
+        assert!(
+            !agent.peer_relay().needs_relay(&to),
+            "disabled policy must never trigger needs_relay"
+        );
+
+        let err = agent
+            .send_direct_with_config(&to, b"x0x-0070b".to_vec(), dm::DmSendConfig::default())
+            .await
+            .expect_err("no network — direct send must fail");
+        assert!(
+            !matches!(err, dm::DmError::NoRelayCandidate),
+            "disabled policy must not surface any relay-side error, got {err:?}"
+        );
+        assert_eq!(
+            agent.peer_relay().stats().snapshot().relay_sent,
+            0,
+            "disabled policy must not advance relay_sent"
         );
     }
 
