@@ -3043,6 +3043,43 @@ mod tests {
     }
 
     #[test]
+    fn peer_relay_to_policy_clamps_zero_threshold_to_one() {
+        // Why: a TOML config with `fail_threshold = 0` would otherwise mean
+        // `entry.recent_failures.len() >= 0` — always true — silently flipping
+        // the engine into "every direct-DM failure triggers a relay" the
+        // moment the operator opts in. Clamping to `>= 1` is the only thing
+        // standing between a typo and a wholesale relay fan-out.
+        let cfg = PeerRelayConfig {
+            enabled: true,
+            fail_threshold: 0,
+            fail_window_ms: 60_000,
+            candidates: Vec::new(),
+        };
+        let policy = cfg.to_policy();
+        assert_eq!(
+            policy.fail_threshold, 1,
+            "fail_threshold = 0 must clamp to 1"
+        );
+        assert!(policy.enabled);
+        assert_eq!(policy.fail_window, Duration::from_millis(60_000));
+    }
+
+    #[test]
+    fn peer_relay_to_policy_preserves_non_zero_threshold() {
+        // Why: the clamp must be a floor, not a rewrite — a legitimate
+        // operator-set threshold (e.g. 5) survives unchanged.
+        let cfg = PeerRelayConfig {
+            enabled: true,
+            fail_threshold: 5,
+            fail_window_ms: 120_000,
+            candidates: Vec::new(),
+        };
+        let policy = cfg.to_policy();
+        assert_eq!(policy.fail_threshold, 5);
+        assert_eq!(policy.fail_window, Duration::from_millis(120_000));
+    }
+
+    #[test]
     fn pool_evicts_after_idle_threshold() {
         let pool = ConnectionPool::new(8, Duration::from_secs(5));
         let now = Instant::now();

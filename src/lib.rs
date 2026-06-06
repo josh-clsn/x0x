@@ -266,6 +266,18 @@ pub struct Agent {
         tokio::sync::Mutex<Option<dm_capability_service::CapabilityAdvertService>>,
     /// Handle for the running DM inbox service.
     dm_inbox_service: tokio::sync::Mutex<Option<dm_inbox::DmInboxService>>,
+    /// X0X-0070b: application-level peer-relay engine. Records direct-DM
+    /// successes and failures so [`peer_relay::PeerRelay::needs_relay`] can
+    /// drive the fallback decision. The engine is **disabled by default**
+    /// (matches [`peer_relay::RelayPolicy::default`]) — it only acts once a
+    /// runtime opts in via `[peer_relay] enabled = true` in the daemon's
+    /// `NetworkConfig` TOML.
+    peer_relay: std::sync::Arc<peer_relay::PeerRelay>,
+    /// X0X-0070b: pre-filtered set of relay candidates the engine picks from
+    /// when the direct path fails. Seeded from `NetworkConfig.peer_relay.candidates`
+    /// at build time; future revisions merge in gossip-announced candidates
+    /// at runtime, hence the `RwLock` for mutable runtime state.
+    relay_candidates: std::sync::Arc<tokio::sync::RwLock<Vec<identity::AgentId>>>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -3191,12 +3203,44 @@ impl Agent {
         };
 
         match &result {
-            Ok(receipt) => self
-                .direct_messaging
-                .record_outgoing_succeeded(*to, receipt.path),
-            Err(_) => self.direct_messaging.record_outgoing_failed(*to),
+            Ok(receipt) => {
+                self.direct_messaging
+                    .record_outgoing_succeeded(*to, receipt.path);
+                // X0X-0070b: every direct-DM success clears the relay engine's
+                // per-peer failure history. A peer that had crossed
+                // `needs_relay` and now recovers a direct path increments
+                // `direct_recovered_after_relay` exactly once — proving the
+                // fallback is transient.
+                self.peer_relay.record_direct_success(to);
+            }
+            Err(_) => {
+                self.direct_messaging.record_outgoing_failed(*to);
+                // X0X-0070b: count this direct-DM failure on the relay engine.
+                // With the default disabled policy this is bookkeeping only —
+                // `needs_relay` returns `false` regardless. With an
+                // opted-in policy the count drives the relay-fallback
+                // decision in commit 5's `try_relay_fallback` hook.
+                self.peer_relay.record_direct_failure(to);
+            }
         }
         result
+    }
+
+    /// X0X-0070b: borrow the application-level peer-relay engine. Runtimes
+    /// use this to read [`peer_relay::RelayStats`] for telemetry and to
+    /// inspect the active [`peer_relay::RelayPolicy`].
+    #[must_use]
+    pub fn peer_relay(&self) -> &peer_relay::PeerRelay {
+        &self.peer_relay
+    }
+
+    /// X0X-0070b: snapshot the current relay candidate set. Returns a
+    /// freshly-cloned vector so the caller never holds the underlying
+    /// `RwLock`. The set is seeded from `NetworkConfig.peer_relay.candidates`
+    /// at build time; the gossip-announce subscriber (a follow-up commit)
+    /// extends it at runtime.
+    pub async fn relay_candidates(&self) -> Vec<identity::AgentId> {
+        self.relay_candidates.read().await.clone()
     }
 
     /// Legacy raw-QUIC direct-send path. Internal fallback only.
@@ -7293,6 +7337,37 @@ impl AgentBuilder {
             Some((pk, sk))
         };
 
+        // X0X-0070b: extract the relay policy + seed candidate list before
+        // `self.network_config` is moved into `NetworkNode::new`. With no
+        // network config the relay engine is built from `PeerRelayConfig::default()`,
+        // which is `enabled = false` — the engine is then inert.
+        let peer_relay_config = self
+            .network_config
+            .as_ref()
+            .map(|cfg| cfg.peer_relay.clone())
+            .unwrap_or_default();
+        let mut parsed_relay_candidates = Vec::with_capacity(peer_relay_config.candidates.len());
+        for hex_str in &peer_relay_config.candidates {
+            let trimmed = hex_str.trim();
+            let bytes = hex::decode(trimmed).map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "invalid relay candidate hex {trimmed:?}: {e}"
+                )))
+            })?;
+            let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "relay candidate must be 32 bytes (got {} bytes)",
+                    v.len()
+                )))
+            })?;
+            parsed_relay_candidates.push(identity::AgentId(arr));
+        }
+        let peer_relay = std::sync::Arc::new(peer_relay::PeerRelay::with_policy(
+            peer_relay_config.to_policy(),
+        ));
+        let relay_candidates =
+            std::sync::Arc::new(tokio::sync::RwLock::new(parsed_relay_candidates));
+
         let network = if let Some(config) = self.network_config {
             let node = network::NetworkNode::new(config, bootstrap_cache.clone(), machine_keypair)
                 .await
@@ -7437,6 +7512,8 @@ impl AgentBuilder {
             recent_delivery_cache: std::sync::Arc::new(dm::RecentDeliveryCache::with_defaults()),
             capability_advert_service: tokio::sync::Mutex::new(None),
             dm_inbox_service: tokio::sync::Mutex::new(None),
+            peer_relay,
+            relay_candidates,
         })
     }
 }
@@ -8359,6 +8436,133 @@ mod tests {
             .direct_messaging()
             .lifecycle_block_reason(&bob.machine_id())
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn agent_peer_relay_defaults_to_disabled_when_unconfigured() {
+        // Why: X0X-0070b's relay engine is opt-in. An Agent built without
+        // any `[peer_relay]` TOML section must come up with the engine
+        // disabled and an empty candidate list — anything else would
+        // engage the fallback for operators who never asked for it.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await
+            .expect("agent");
+        assert!(
+            !agent.peer_relay().policy().enabled,
+            "default Agent must have the relay engine disabled"
+        );
+        assert!(
+            agent.relay_candidates().await.is_empty(),
+            "default Agent must have no relay candidates"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_peer_relay_honors_configured_policy_and_candidates() {
+        // Why: a TOML-configured `[peer_relay]` block must flow through to
+        // a live `PeerRelay` instance on the Agent — enabled flag, fail
+        // trigger, and the seeded candidate list. This is the single
+        // integration seam where an operator's config first takes effect.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let candidate_a = [0xAA_u8; 32];
+        let candidate_b = [0xBB_u8; 32];
+        let mut net_cfg = loopback_network_config();
+        net_cfg.peer_relay = network::PeerRelayConfig {
+            enabled: true,
+            fail_threshold: 7,
+            fail_window_ms: 90_000,
+            candidates: vec![hex::encode(candidate_a), hex::encode(candidate_b)],
+        };
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(net_cfg)
+            .build()
+            .await
+            .expect("agent");
+
+        let policy = agent.peer_relay().policy();
+        assert!(policy.enabled, "configured `enabled = true` must propagate");
+        assert_eq!(policy.fail_threshold, 7);
+        assert_eq!(policy.fail_window, std::time::Duration::from_millis(90_000));
+
+        let candidates = agent.relay_candidates().await;
+        assert_eq!(candidates.len(), 2, "both TOML candidates seeded");
+        assert!(candidates.iter().any(|c| c.0 == candidate_a));
+        assert!(candidates.iter().any(|c| c.0 == candidate_b));
+    }
+
+    #[tokio::test]
+    async fn send_direct_failure_records_failure_on_peer_relay() {
+        // Why: the bookkeeping hook in `send_direct_with_config` is the
+        // single feed into `PeerRelay::needs_relay`. If a transport
+        // failure does not increment the per-peer failure count, the
+        // engine can never decide to engage the relay — the fallback is
+        // dead-on-arrival. With no network configured every raw-QUIC
+        // attempt fails fast, which gives a deterministic test signal.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await
+            .expect("agent");
+        let unreachable = identity::AgentId([0x42; 32]);
+
+        let result = agent
+            .send_direct_with_config(
+                &unreachable,
+                b"x0x-0070b-bookkeeping".to_vec(),
+                dm::DmSendConfig::default(),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "no network configured — direct send must fail"
+        );
+        assert_eq!(
+            agent.peer_relay().tracked_peer_count(),
+            1,
+            "failure must have produced a per-peer relay-engine entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_direct_self_loopback_does_not_disturb_peer_relay() {
+        // Why: the loopback short-circuit at the top of
+        // `send_direct_with_config` returns before the bookkeeping arm.
+        // A self-DM must not count as a "direct success" against the
+        // sender's own AgentId — that would conflate local delivery
+        // with the cross-peer path that actually exercises NAT.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await
+            .expect("agent");
+        let _receipt = agent
+            .send_direct_with_config(
+                &agent.agent_id(),
+                b"loopback".to_vec(),
+                dm::DmSendConfig::default(),
+            )
+            .await
+            .expect("loopback self-DM");
+        assert_eq!(
+            agent.peer_relay().tracked_peer_count(),
+            0,
+            "loopback path must not register with the relay engine"
+        );
     }
 
     #[tokio::test]
