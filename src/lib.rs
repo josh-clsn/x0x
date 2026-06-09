@@ -6185,11 +6185,20 @@ impl Agent {
         // Upgrade our advertised capabilities so peers stop falling back
         // to the raw-QUIC path. The capability advert service watches
         // this channel and republishes immediately on change.
+        //
+        // Use `send_replace`, NOT `send`: `start_dm_inbox` can run before
+        // `start_capability_advert_service` subscribes, so the watch may have
+        // zero receivers at this point. `watch::Sender::send` drops the value
+        // when there are no receivers (returns Err without storing it), which
+        // silently loses the gossip-ready upgrade — the advert then stays
+        // pinned at `pending()` (gossip_inbox=false) for the process lifetime,
+        // every peer caches an "unusable advert" and falls back to raw-QUIC,
+        // which is fatal across NAT. `send_replace` updates the stored value
+        // unconditionally, so the advert service reads the gossip-ready
+        // capability on its first `borrow()` regardless of startup ordering.
         let upgraded =
             dm::DmCapabilities::pending().with_kem_public_key(kem_keypair.public_bytes.clone());
-        if self.dm_capabilities_tx.send(upgraded).is_err() {
-            tracing::debug!("dm_capabilities watch has no receivers; skipping upgrade broadcast");
-        }
+        self.dm_capabilities_tx.send_replace(upgraded);
         tracing::info!("DM inbox service started");
         Ok(())
     }
@@ -8932,6 +8941,34 @@ mod tests {
     fn raw_quic_payload_errors_still_stop_fallback() {
         let err = error::NetworkError::PayloadTooLarge { size: 2, max: 1 };
         assert!(Agent::raw_quic_error_should_stop_fallback(&err, true));
+    }
+
+    // Regression guard for the "unusable advert -> raw-QUIC cross-NAT" bug:
+    // `start_dm_inbox` pushes the gossip-ready capability upgrade onto the
+    // `dm_capabilities` watch, but the capability advert service may not have
+    // subscribed yet (the channel is created with its initial receiver
+    // dropped). `watch::Sender::send` DROPS the value when there are no
+    // receivers, silently losing the upgrade and pinning the advert at
+    // `pending()` (gossip_inbox=false) for the process lifetime. The fix uses
+    // `send_replace`, which stores the value unconditionally so the
+    // late-subscribing advert service reads gossip-ready on first `borrow()`.
+    #[test]
+    fn dm_capability_upgrade_persists_without_receivers() {
+        let (tx, rx0) = tokio::sync::watch::channel(dm::DmCapabilities::pending());
+        drop(rx0); // no receivers, exactly like the AppState watch construction
+        assert!(!tx.borrow().gossip_inbox, "starts at pending");
+
+        // start_dm_inbox upgrade, BEFORE the advert service subscribes.
+        let upgraded = dm::DmCapabilities::pending().with_kem_public_key(vec![1, 2, 3]);
+        tx.send_replace(upgraded);
+
+        // The advert service subscribes afterwards and must read gossip-ready.
+        let rx = tx.subscribe();
+        assert!(
+            rx.borrow().gossip_inbox,
+            "late-subscribing advert service must read the gossip-ready upgrade"
+        );
+        assert!(!rx.borrow().kem_public_key.is_empty());
     }
 
     #[tokio::test]
