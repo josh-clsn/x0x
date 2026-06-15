@@ -165,6 +165,13 @@ pub mod api;
 /// CLI infrastructure and command implementations.
 pub mod cli;
 
+/// The `x0xd` daemon server: configuration, shared state, REST + WebSocket
+/// handlers, background tasks, and the axum serve loop. Use [`daemon::serve`]
+/// to bring the server up in-process and drive it via [`daemon::ServerHandle`]
+/// (e.g. from a mobile FFI crate that cannot supervise a child daemon); the
+/// `x0xd` binary is a thin wrapper over [`daemon::run`].
+pub mod daemon;
+
 // Re-export key gossip types (including new pubsub components)
 pub use gossip::{
     GossipConfig, GossipRuntime, PubSubManager, PubSubMessage, PubSubStats, PubSubStatsSnapshot,
