@@ -116,6 +116,14 @@ pub struct DaemonConfig {
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
 
+    /// Optional explicit root for the agent identity keys (machine.key /
+    /// agent.key / agent.cert). When Some, serve() roots these keys here
+    /// instead of the home dir; used by in-process embedders (the mobile
+    /// FFI) where there is no writable home. Leave None for the normal
+    /// daemon to preserve the ~/.x0x[-<name>]/ default.
+    #[serde(default)]
+    pub identity_dir: Option<PathBuf>,
+
     /// Log level (trace, debug, info, warn, error).
     #[serde(default = "default_log_level")]
     pub log_level: String,
@@ -360,6 +368,7 @@ impl Default for DaemonConfig {
             bind_address: default_bind_address(),
             api_address: default_api_address(),
             data_dir: default_data_dir(),
+            identity_dir: None,
             log_level: default_log_level(),
             log_format: default_log_format(),
             bootstrap_peers: x0x::network::DEFAULT_BOOTSTRAP_PEERS
@@ -1543,6 +1552,31 @@ impl ServerHandle {
     }
 }
 
+/// Resolve the root directory for the agent identity keys (machine.key /
+/// agent.key / agent.cert), encoding the precedence used by [`serve`].
+///
+/// An explicit `config.identity_dir` wins (used by in-process embedders such
+/// as the mobile FFI that have no writable home). Otherwise the historical
+/// behavior is preserved exactly: a named instance roots its keys under
+/// `~/.x0x-<name>/`, and the unnamed default returns `None` so the keys fall
+/// back to the `~/.x0x/` storage default. Returns `Err` only on the named
+/// path when no home directory is available, matching the previous behavior.
+///
+/// Pure (no I/O): callers create the returned directory.
+fn resolve_identity_dir(config: &DaemonConfig) -> Result<Option<PathBuf>> {
+    if let Some(dir) = &config.identity_dir {
+        return Ok(Some(dir.clone()));
+    }
+    match &config.instance_name {
+        Some(name) => Ok(Some(
+            dirs::home_dir()
+                .context("home directory required for instance identity directory")?
+                .join(format!(".x0x-{name}")),
+        )),
+        None => Ok(None),
+    }
+}
+
 /// Bring the x0xd server up in-process and return a [`ServerHandle`].
 ///
 /// This owns everything from agent/state construction through the spawned
@@ -1594,20 +1628,16 @@ pub async fn serve(
         config.bind_address
     };
 
-    // Derive instance-scoped identity directory
-    let identity_dir = match &instance_name {
-        Some(name) => {
-            let dir = dirs::home_dir()
-                .context("home directory required for instance identity directory")?
-                .join(format!(".x0x-{name}"));
-            tokio::fs::create_dir_all(&dir)
-                .await
-                .context("failed to create instance identity directory")?;
-            tracing::info!("Identity directory: {}", dir.display());
-            Some(dir)
-        }
-        None => None,
-    };
+    // Derive the identity directory: an explicit `config.identity_dir` wins
+    // (in-process embedders with no writable home), otherwise the
+    // instance-name default (~/.x0x-<name>/) or None for the unnamed daemon.
+    let identity_dir = resolve_identity_dir(&config)?;
+    if let Some(ref dir) = identity_dir {
+        tokio::fs::create_dir_all(dir)
+            .await
+            .context("failed to create instance identity directory")?;
+        tracing::info!("Identity directory: {}", dir.display());
+    }
 
     // Create agent
     //
@@ -19724,6 +19754,80 @@ mod tests {
         }
         assert_eq!(names, vec![std::ffi::OsString::from("named_groups.json")]);
         Ok(())
+    }
+
+    // WHY: the mobile FFI embeds serve() with a Default config
+    // (instance_name = None) on a device with no writable home dir. Before the
+    // `identity_dir` override, the unnamed path returned None and the agent's
+    // machine.key / agent.key / agent.cert fell back to ~/.x0x/, which is
+    // unwritable on Android and crashed the embed. The override must root all
+    // three keys under the explicit dir, and must NOT regress the two existing
+    // paths the stock daemon and named instances rely on (or they would each
+    // get a brand-new identity on upgrade).
+    #[test]
+    fn identity_dir_override_roots_keys_off_home() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let explicit = dir.path().join("ident");
+
+        // Override set, instance_name = None (the mobile-FFI default config).
+        let config = DaemonConfig {
+            identity_dir: Some(explicit.clone()),
+            instance_name: None,
+            ..DaemonConfig::default()
+        };
+        let resolved = resolve_identity_dir(&config)
+            .expect("resolve must not error when identity_dir is set")
+            .expect("identity_dir override yields Some");
+        assert_eq!(
+            resolved, explicit,
+            "explicit identity_dir must win and root the keys"
+        );
+
+        // The with_machine_key block in serve() joins the key file names onto
+        // this dir, so both keys land under the override, not under home.
+        let home = dirs::home_dir().expect("home dir on test host");
+        let machine_key = resolved.join("machine.key");
+        let agent_key = resolved.join("agent.key");
+        assert!(
+            machine_key.starts_with(&explicit) && agent_key.starts_with(&explicit),
+            "machine.key and agent.key must sit under the override dir"
+        );
+        assert!(
+            !machine_key.starts_with(&home) && !agent_key.starts_with(&home),
+            "override must keep the keys out of the home dir"
+        );
+    }
+
+    #[test]
+    fn identity_dir_unset_preserves_unnamed_and_named_defaults() {
+        // No override, no instance name -> None, so serve() leaves the keys at
+        // the storage default (~/.x0x/). This is the stock-daemon path and must
+        // stay None byte-for-byte to avoid a new identity on upgrade.
+        let unnamed = DaemonConfig {
+            identity_dir: None,
+            instance_name: None,
+            ..DaemonConfig::default()
+        };
+        assert_eq!(
+            resolve_identity_dir(&unnamed).expect("unnamed resolve"),
+            None,
+            "the unnamed default must remain None (preserves ~/.x0x/)"
+        );
+
+        // No override, but a named instance -> the historical ~/.x0x-<name>/.
+        let named = DaemonConfig {
+            identity_dir: None,
+            instance_name: Some("alice".to_string()),
+            ..DaemonConfig::default()
+        };
+        let expected = dirs::home_dir()
+            .expect("home dir on test host")
+            .join(".x0x-alice");
+        assert_eq!(
+            resolve_identity_dir(&named).expect("named resolve"),
+            Some(expected),
+            "a named instance must still root at ~/.x0x-<name>/"
+        );
     }
 
     #[test]
