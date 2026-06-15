@@ -1485,6 +1485,16 @@ impl ServerHandle {
         self.local_addr
     }
 
+    /// The API bearer token an embedder must present
+    /// (`Authorization: Bearer <token>`) to reach this in-process daemon's
+    /// authed endpoints. The companion to [`Self::local_addr`] for an
+    /// in-process HTTP client (e.g. a mobile FFI pointing `fetchit-chat`'s
+    /// x0xd wrapper at this embedded daemon). Loaded or generated from the
+    /// config `data_dir` during bring-up.
+    pub fn api_token(&self) -> &str {
+        &self.state.api_token
+    }
+
     /// A shared handle to the running agent.
     pub fn agent(&self) -> &Arc<Agent> {
         &self.state.agent
