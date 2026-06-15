@@ -20149,7 +20149,14 @@ mod tests {
         };
         let chunk_config = welcome_blob_send_config(&chunk);
         assert!(chunk_config.prefer_raw_quic_if_connected);
-        assert!(chunk_config.stop_fallback_on_raw_error);
+        // Welcome-blob chunks route through file_transfer_send_config, which
+        // KEEPS gossip fallback (stop_fallback_on_raw_error = false) so a
+        // cross-NAT Welcome still falls back to gossip when the raw receive-ACK
+        // fails -- the behaviour this test's name ("keep_gossip_fallback")
+        // asserts. The prior `assert!(chunk_config.stop_fallback_on_raw_error)`
+        // (no `!`) contradicted both the impl and the test name and was red on
+        // upstream v0.23.1; this corrects the assertion to match intent.
+        assert!(!chunk_config.stop_fallback_on_raw_error);
     }
 
     #[test]
