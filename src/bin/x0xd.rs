@@ -2165,6 +2165,10 @@ async fn main() -> Result<()> {
         .route("/groups/:id/requests", get(list_join_requests))
         .route("/groups/:id/requests", post(create_join_request))
         .route(
+            "/groups/:id/join-result/:member",
+            get(get_join_result_inline),
+        )
+        .route(
             "/groups/:id/requests/:request_id/approve",
             post(approve_join_request),
         )
@@ -18285,6 +18289,99 @@ fn join_result_key(group_id: &str, member_agent_id: &str) -> String {
     format!("{group_id}:{member_agent_id}")
 }
 
+/// Set `treekem_welcome_b64` on a `MemberAdded` event (no-op for every
+/// other variant). Used to inline a locally-staged TreeKEM Welcome into
+/// the event that [`get_join_result_inline`] serves.
+fn set_inline_welcome(event: &mut NamedGroupMetadataEvent, welcome_b64: String) {
+    if let NamedGroupMetadataEvent::MemberAdded {
+        treekem_welcome_b64, ..
+    } = event
+    {
+        *treekem_welcome_b64 = Some(welcome_b64);
+    }
+}
+
+/// `GET /groups/:id/join-result/:member` — LOCAL control-plane endpoint
+/// (127.0.0.1-bound + bearer-authed like every route via the router's
+/// auth layer). Returns the staged authoritative `MemberAdded` for a
+/// freshly-admitted member with the TreeKEM Welcome **inlined** from the
+/// local pending-welcomes store.
+///
+/// This exists for the relay-bridged cross-NAT group-join: the owner's
+/// fetch>it client re-injects a bridged `MemberJoined`, x0xd applies it
+/// and stages the `MemberAdded` (welcome by-ref) plus the Welcome blob,
+/// then fetch>it GETs this self-contained inline form and bridges it back
+/// to a NAT'd joiner. The joiner's stock x0xd applies it via the inline
+/// path (no `welcome_ref` fetch), so the dual-NAT Welcome-blob pull —
+/// which neither peer can complete — is avoided entirely.
+///
+/// While the apply is still in flight the staged result or Welcome may be
+/// absent; the handler returns `404` with a distinct `reason` so the
+/// caller polls with backoff rather than bridging a welcome-less event.
+async fn get_join_result_inline(
+    State(state): State<Arc<AppState>>,
+    Path((id, member)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let key = join_result_key(&id, &member);
+    let mut event = {
+        let mut results = state.pending_join_results.write().await;
+        results.retain(|_, p| p.created_at.elapsed() < PENDING_JOIN_RESULT_TTL);
+        match results.get(&key) {
+            Some(p) => p.event.clone(),
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "ok": false, "reason": "join_result_not_staged" })),
+                );
+            }
+        }
+    };
+    // Resolve the Welcome to inline. Already-inline (legacy producer) and
+    // non-TreeKEM groups need no lookup; a `welcome_ref` is resolved from
+    // the local pending-welcomes store.
+    let welcome_id = match &event {
+        NamedGroupMetadataEvent::MemberAdded {
+            treekem_welcome_b64: Some(_),
+            ..
+        }
+        | NamedGroupMetadataEvent::MemberAdded {
+            welcome_ref: None, ..
+        } => None,
+        NamedGroupMetadataEvent::MemberAdded {
+            welcome_ref: Some(w),
+            ..
+        } => Some(w.welcome_id.clone()),
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(
+                    serde_json::json!({ "ok": false, "reason": "staged_event_not_member_added" }),
+                ),
+            );
+        }
+    };
+    if let Some(welcome_id) = welcome_id {
+        let bytes = {
+            let welcomes = state.pending_welcomes.read().await;
+            welcomes.get(&welcome_id).map(|p| p.bytes.clone())
+        };
+        let Some(bytes) = bytes else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "reason": "welcome_not_staged" })),
+            );
+        };
+        set_inline_welcome(
+            &mut event,
+            base64::engine::general_purpose::STANDARD.encode(bytes),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "event": event })),
+    )
+}
+
 async fn stage_join_result(
     state: &AppState,
     group_id: &str,
@@ -19878,6 +19975,45 @@ async fn handle_file_complete(
 mod tests {
     use super::*;
     use x0x::upgrade::manifest::{PlatformAsset, SCHEMA_VERSION};
+
+    #[test]
+    fn set_inline_welcome_sets_member_added_welcome_field() {
+        let mut event = NamedGroupMetadataEvent::MemberAdded {
+            group_id: "g1".into(),
+            revision: 1,
+            actor: "owner".into(),
+            agent_id: "joiner".into(),
+            display_name: None,
+            treekem_commit_b64: Some("commit".into()),
+            treekem_welcome_b64: None,
+            welcome_ref: Some(WelcomeRef {
+                welcome_id: "wid".into(),
+                byte_len: 6,
+                source: "owner".into(),
+            }),
+            treekem_epoch: Some(2),
+            commit: None,
+        };
+        set_inline_welcome(&mut event, "V0VMQ09NRQ==".into());
+        match event {
+            NamedGroupMetadataEvent::MemberAdded {
+                treekem_welcome_b64, ..
+            } => assert_eq!(treekem_welcome_b64.as_deref(), Some("V0VMQ09NRQ==")),
+            other => panic!("expected MemberAdded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_inline_welcome_noop_on_non_member_added() {
+        let mut event = NamedGroupMetadataEvent::GroupDeleted {
+            group_id: "g1".into(),
+            revision: 1,
+            actor: "owner".into(),
+            commit: None,
+        };
+        set_inline_welcome(&mut event, "ignored".into());
+        assert!(matches!(event, NamedGroupMetadataEvent::GroupDeleted { .. }));
+    }
 
     fn manifest_with_version(version: &str) -> ReleaseManifest {
         ReleaseManifest {
