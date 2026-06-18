@@ -11010,6 +11010,13 @@ async fn join_group_via_invite(
                 now_ms,
                 treekem_key_package_b64.as_deref(),
             );
+            // Mesh-independent engine-A capture: surface the minted
+            // joiner-authored member_joined in the join response (exact
+            // gossip-payload bytes + metadata topic) so the relay-bridged
+            // join can read it directly instead of racing the gossip SSE
+            // stream (capture_self_member_joined), which is unreliable when
+            // the joiner's gossip mesh is partial.
+            let mut self_member_joined: Option<serde_json::Value> = None;
             match ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
                 signing_kp.secret_key(),
                 &canonical,
@@ -11030,6 +11037,15 @@ async fn join_group_via_invite(
                         treekem_key_package_b64: treekem_key_package_b64.clone(),
                         signature_b64,
                     };
+                    // Same serialization publish_named_group_metadata_event
+                    // uses for the gossip payload, so event_b64 is
+                    // byte-identical to the gossip-SSE capture's payload.
+                    if let Ok(mj_bytes) = serde_json::to_vec(&event) {
+                        self_member_joined = Some(serde_json::json!({
+                            "topic": info.metadata_topic,
+                            "event_b64": BASE64.encode(&mj_bytes),
+                        }));
+                    }
                     tracing::info!(
                         group_id = %group_id_hex,
                         topic = %info.metadata_topic,
@@ -11141,6 +11157,7 @@ async fn join_group_via_invite(
                     "group_id": group_id_hex,
                     "group_name": invite.group_name,
                     "chat_topic": chat_topic,
+                    "member_joined": self_member_joined,
                 })),
             )
         }
