@@ -526,6 +526,11 @@ async fn named_group_join_returns_inline_member_joined() {
         "decoded member_joined must name the joiner (member_agent_id): {event:?}"
     );
     assert!(
+        event["inviter_agent_id"].as_str().is_some(),
+        "decoded member_joined must name the inviter (inviter_agent_id) — \
+         join_group_bridged needs it to address the bridge to the owner: {event:?}"
+    );
+    assert!(
         event["signature_b64"].as_str().is_some(),
         "decoded member_joined must be signed (signature_b64): {event:?}"
     );
