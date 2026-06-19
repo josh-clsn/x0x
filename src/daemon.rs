@@ -2368,6 +2368,10 @@ pub async fn serve(
         .route("/groups/:id/members", get(get_named_group_members))
         .route("/groups/:id/members", post(add_named_group_member))
         .route(
+            "/groups/:id/apply-metadata-event",
+            post(apply_group_metadata_event),
+        )
+        .route(
             "/groups/:id/members/:agent_id",
             delete(remove_named_group_member),
         )
@@ -2381,7 +2385,7 @@ pub async fn serve(
         .route("/groups/:id/requests", post(create_join_request))
         .route(
             "/groups/:id/join-result/:member",
-            get(get_join_result_inline),
+            get(get_join_result_inline).post(apply_join_result_endpoint),
         )
         .route(
             "/groups/:id/requests/:request_id/approve",
@@ -11188,6 +11192,78 @@ async fn set_group_display_name(
 }
 
 /// POST /groups/:id/members — add a member to the named-group roster.
+/// POST /groups/:id/apply-metadata-event request body.
+#[derive(Debug, Deserialize)]
+struct ApplyMetadataEventRequest {
+    /// Base64-encoded `NamedGroupMetadataEvent` JSON (the bridged event).
+    event_b64: String,
+    /// Hex AgentId of the event author (the joiner / `member_agent_id`).
+    sender_agent_id: String,
+}
+
+/// POST /groups/:id/apply-metadata-event — apply a relay-bridged metadata
+/// event into local group state without gossip. Engine-A owner convergence
+/// when gossip is disabled: `agent.publish` only fans out to remote peers, so
+/// a re-published `MemberJoined` never loops back to the owner's local apply
+/// path and the owner never converges. This is the non-gossip delivery path.
+///
+/// Token-gated by the shared `auth_middleware` like every route. It calls the
+/// same `apply_named_group_metadata_event` the gossip-receive path uses, with
+/// `verified = true`: that flag only clears the racy AgentId→MachineId
+/// identity-cache gate (which a gossip-off owner cannot populate). Every
+/// per-arm authority check still runs unconditionally — ML-DSA signature over
+/// the canonical event bytes, derived-id↔key binding, role cap,
+/// local-is-inviter, single-use invite-secret consume — so a forged event
+/// still fails to apply. A local-delivery shortcut, not a validation bypass.
+/// `:id` is the routing key only; the apply resolves the authoritative group
+/// from the event itself.
+async fn apply_group_metadata_event(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<ApplyMetadataEventRequest>,
+) -> impl IntoResponse {
+    let event_bytes = match BASE64.decode(&req.event_b64) {
+        Ok(b) => b,
+        Err(e) => {
+            return api_error(StatusCode::BAD_REQUEST, format!("invalid event_b64: {e}"));
+        }
+    };
+    let event: NamedGroupMetadataEvent = match serde_json::from_slice(&event_bytes) {
+        Ok(ev) => ev,
+        Err(e) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                format!("invalid metadata event json: {e}"),
+            );
+        }
+    };
+    let sender = match parse_agent_id_hex(&req.sender_agent_id) {
+        Ok(s) => s,
+        Err(e) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                format!("invalid sender_agent_id: {e}"),
+            );
+        }
+    };
+    tracing::debug!(
+        target: "treekem.trace",
+        stage = "apply_metadata_event_endpoint",
+        group_id = %id,
+        sender = %req.sender_agent_id,
+        "engine-A non-gossip local-apply endpoint invoked"
+    );
+    let applied = apply_named_group_metadata_event(&state, event, sender, true).await;
+    if applied {
+        (StatusCode::OK, Json(serde_json::json!({ "applied": true })))
+    } else {
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "applied": false })),
+        )
+    }
+}
+
 async fn add_named_group_member(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -17978,6 +18054,121 @@ async fn get_join_result_inline(
         StatusCode::OK,
         Json(serde_json::json!({ "ok": true, "event": event })),
     )
+}
+
+/// POST /groups/:id/join-result/:member request body.
+#[derive(Debug, Deserialize)]
+struct ApplyJoinResultRequest {
+    /// Base64-encoded `NamedGroupMetadataEvent` JSON — the owner's
+    /// authority-signed `MemberAdded` with the TreeKEM Welcome inlined.
+    event_b64: String,
+    /// Hex AgentId of the join-result sender (the owner / group creator).
+    sender_agent_id: String,
+}
+
+/// POST /groups/:id/join-result/:member — apply a relay-bridged join-result
+/// (the owner's authority-signed `MemberAdded` with inline Welcome) into local
+/// TreeKEM state. Engine-A reverse path under gossip-off: the owner
+/// relay-bridges its staged result to a NAT'd joiner that cannot pull it via
+/// the FetchRequest-DM path. This runs the EXACT checks of the proven
+/// DM-receive path (`handle_join_result_message`'s `Result` arm) — only a
+/// `MemberAdded`, only for this node (member==self), only from the group
+/// creator (sender==creator) — then `apply_named_group_metadata_event` (with
+/// `verified=true`) verifies the signed commit and inserts into
+/// `treekem_groups`, so `poll_join_result_until_treekem_ready` resolves. A
+/// forged result fails the creator check or the commit verify. Token-gated by
+/// the shared auth layer (127.0.0.1 + API token).
+async fn apply_join_result_endpoint(
+    State(state): State<Arc<AppState>>,
+    Path((id, member)): Path<(String, String)>,
+    Json(req): Json<ApplyJoinResultRequest>,
+) -> impl IntoResponse {
+    let event_bytes = match BASE64.decode(&req.event_b64) {
+        Ok(b) => b,
+        Err(e) => {
+            return api_error(StatusCode::BAD_REQUEST, format!("invalid event_b64: {e}"));
+        }
+    };
+    let event: NamedGroupMetadataEvent = match serde_json::from_slice(&event_bytes) {
+        Ok(ev) => ev,
+        Err(e) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                format!("invalid join-result event json: {e}"),
+            );
+        }
+    };
+    let sender = match parse_agent_id_hex(&req.sender_agent_id) {
+        Ok(s) => s,
+        Err(e) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                format!("invalid sender_agent_id: {e}"),
+            );
+        }
+    };
+    // Same authority checks as the DM-receive Result arm
+    // (handle_join_result_message): only a MemberAdded, only for this node,
+    // only from the group creator. The apply then verifies the signed commit.
+    let (group_id, member_agent_id) = match &event {
+        NamedGroupMetadataEvent::MemberAdded {
+            group_id, agent_id, ..
+        } => (group_id.clone(), agent_id.clone()),
+        _ => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "join-result must be MemberAdded".to_owned(),
+            );
+        }
+    };
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    if member_agent_id != local_agent_hex {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "join-result member is not this node".to_owned(),
+        );
+    }
+    let sender_hex = hex::encode(sender.as_bytes());
+    let creator_hex = {
+        let groups = state.named_groups.read().await;
+        groups
+            .get(&group_id)
+            .or_else(|| {
+                groups
+                    .values()
+                    .find(|info| info.stable_group_id() == group_id)
+            })
+            .map(|info| hex::encode(info.creator.as_bytes()))
+    };
+    let Some(creator_hex) = creator_hex else {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "join-result for unknown local group".to_owned(),
+        );
+    };
+    if sender_hex != creator_hex {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "join-result sender is not the group creator".to_owned(),
+        );
+    }
+    let applied = apply_named_group_metadata_event(&state, event, sender, true).await;
+    tracing::debug!(
+        target: "treekem.trace",
+        stage = "apply_join_result_endpoint",
+        group_id = %id,
+        member = %member,
+        applied,
+        "engine-A reverse-path join-result applied via endpoint"
+    );
+    if applied {
+        (StatusCode::OK, Json(serde_json::json!({ "applied": true })))
+    } else {
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "applied": false })),
+        )
+    }
 }
 
 async fn stage_join_result(
