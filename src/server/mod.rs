@@ -209,6 +209,13 @@ pub struct DaemonConfig {
     #[serde(default = "default_port_mapping_enabled")]
     port_mapping_enabled: bool,
 
+    /// X0X-0070b: peer-relay fallback configuration (TOML `[peer_relay]`).
+    /// Defaults to disabled - opt in by setting
+    /// `peer_relay.enabled = true` and listing relay-candidate hex
+    /// agent ids under `peer_relay.candidates`.
+    #[serde(default)]
+    peer_relay: x0x::network::PeerRelayConfig,
+
     /// Update configuration.
     #[serde(default)]
     update: DaemonUpdateConfig,
@@ -458,6 +465,7 @@ impl Default for DaemonConfig {
                 .filter_map(|s| s.parse().ok())
                 .collect(),
             port_mapping_enabled: default_port_mapping_enabled(),
+            peer_relay: x0x::network::PeerRelayConfig::default(),
             update: DaemonUpdateConfig::default(),
             gossip: x0x::gossip::GossipConfig::default(),
             heartbeat_interval_secs: default_heartbeat_interval(),
@@ -1462,6 +1470,7 @@ pub async fn serve_with_options(
         // CLI flag wins over config TOML so operators can override on a
         // single invocation without editing the config file.
         port_mapping_enabled: config.port_mapping_enabled && !cli_no_port_mapping,
+        peer_relay: config.peer_relay.clone(),
     };
 
     let contacts_path = config.data_dir.join("contacts.json");
@@ -15265,6 +15274,7 @@ async fn direct_send(
                 x0x::dm::DmPath::GossipInbox => "gossip_inbox",
                 x0x::dm::DmPath::RawQuic => "raw_quic",
                 x0x::dm::DmPath::RawQuicAcked => "raw_quic_acked",
+                x0x::dm::DmPath::Relayed { .. } => "relayed",
             };
             tracing::debug!(
                 target: "dm.trace",
@@ -15360,6 +15370,12 @@ async fn direct_send(
                 }
                 x0x::dm::DmError::PublishFailed(_) => {
                     (StatusCode::INTERNAL_SERVER_ERROR, "publish_failed")
+                }
+                x0x::dm::DmError::NoRelayCandidate => {
+                    (StatusCode::SERVICE_UNAVAILABLE, "no_relay_candidate")
+                }
+                x0x::dm::DmError::RelayBuildFailed(_) => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "relay_build_failed")
                 }
             };
             tracing::error!("direct_send failed ({err_kind}): {e}");
