@@ -6114,6 +6114,7 @@ fn named_group_metadata_event_kind(event: &NamedGroupMetadataEvent) -> &'static 
     match event {
         NamedGroupMetadataEvent::MemberAdded { .. } => "member_added",
         NamedGroupMetadataEvent::MemberRemoved { .. } => "member_removed",
+        NamedGroupMetadataEvent::MemberReKeyed { .. } => "member_rekeyed",
         NamedGroupMetadataEvent::GroupDeleted { .. } => "group_deleted",
         NamedGroupMetadataEvent::PolicyUpdated { .. } => "policy_updated",
         NamedGroupMetadataEvent::MemberRoleUpdated { .. } => "member_role_updated",
@@ -6200,6 +6201,42 @@ enum NamedGroupMetadataEvent {
         /// TreeKEM epoch after applying `treekem_commit_b64`.
         #[serde(default)]
         treekem_epoch: Option<u64>,
+        #[serde(default)]
+        commit: Option<x0x::groups::GroupStateCommit>,
+    },
+    /// A returning member that lost local TreeKEM state (reinstall / new device
+    /// / data wipe; its agent key persists) is re-keyed in place. The member
+    /// stays roster-active; only its KeyPackage swaps, so the durable roster
+    /// mutation is a *single* metadata commit. The two TreeKEM commits (a remove
+    /// of the stale leaf at epoch N+1, then an add of the fresh KeyPackage at
+    /// epoch N+2) are carried alongside it: existing members apply both in order
+    /// to reach epoch N+2; the returning member bootstraps from the Welcome.
+    MemberReKeyed {
+        group_id: String,
+        revision: u64,
+        actor: String,
+        agent_id: String,
+        display_name: Option<String>,
+        /// Base64 postcard-encoded TreeKEM Commit removing the stale leaf
+        /// (advances existing members to epoch N+1).
+        #[serde(default)]
+        treekem_remove_commit_b64: Option<String>,
+        /// Base64 postcard-encoded TreeKEM Commit adding the fresh KeyPackage
+        /// (advances existing members to epoch N+2).
+        #[serde(default)]
+        treekem_add_commit_b64: Option<String>,
+        /// Base64 postcard-encoded TreeKEM Welcome for the returning member.
+        /// Legacy fallback; new events carry `welcome_ref` instead.
+        #[serde(default)]
+        treekem_welcome_b64: Option<String>,
+        /// Content-addressed pull reference for the returning member's TreeKEM
+        /// Welcome (from the ADD, epoch N+2).
+        #[serde(default)]
+        welcome_ref: Option<WelcomeRef>,
+        /// Final TreeKEM epoch (N+2) after both commits.
+        #[serde(default)]
+        treekem_epoch: Option<u64>,
+        /// The SINGLE roster-mutating metadata commit (KeyPackage swap).
         #[serde(default)]
         commit: Option<x0x::groups::GroupStateCommit>,
     },
@@ -7583,6 +7620,15 @@ fn treekem_membership_event_frontier(
             treekem_epoch,
             commit: Some(commit),
             ..
+        }
+        | NamedGroupMetadataEvent::MemberReKeyed {
+            group_id,
+            revision,
+            actor,
+            agent_id,
+            treekem_epoch,
+            commit: Some(commit),
+            ..
         } => Some(TreeKemMembershipFrontier {
             group_id,
             revision: *revision,
@@ -7616,6 +7662,7 @@ fn treekem_membership_event_key(event: &NamedGroupMetadataEvent) -> Option<Strin
     let kind = match event {
         NamedGroupMetadataEvent::MemberAdded { .. } => "add",
         NamedGroupMetadataEvent::MemberRemoved { .. } => "remove",
+        NamedGroupMetadataEvent::MemberReKeyed { .. } => "rekey",
         NamedGroupMetadataEvent::MemberBanned { .. } => "ban",
         NamedGroupMetadataEvent::JoinRequestApproved { .. } => "approve",
         _ => return None,
@@ -7638,7 +7685,8 @@ fn treekem_membership_event_sort_key(event: &NamedGroupMetadataEvent) -> (u64, u
 
 fn treekem_event_is_local_welcome(event: &NamedGroupMetadataEvent, local_agent_hex: &str) -> bool {
     match event {
-        NamedGroupMetadataEvent::MemberAdded { agent_id, .. } => agent_id == local_agent_hex,
+        NamedGroupMetadataEvent::MemberAdded { agent_id, .. }
+        | NamedGroupMetadataEvent::MemberReKeyed { agent_id, .. } => agent_id == local_agent_hex,
         NamedGroupMetadataEvent::JoinRequestApproved {
             requester_agent_id, ..
         } => requester_agent_id == local_agent_hex,
@@ -7664,6 +7712,14 @@ fn authorized_treekem_membership_event_for_queue(
             actor,
             commit: Some(_),
             treekem_commit_b64: Some(_),
+            treekem_epoch: Some(_),
+            ..
+        } => sender_hex == creator_hex && actor == sender_hex,
+        NamedGroupMetadataEvent::MemberReKeyed {
+            actor,
+            commit: Some(_),
+            treekem_remove_commit_b64: Some(_),
+            treekem_add_commit_b64: Some(_),
             treekem_epoch: Some(_),
             ..
         } => sender_hex == creator_hex && actor == sender_hex,
@@ -7731,6 +7787,15 @@ fn treekem_state_frontier_gap_reason(
     }
     let frontier = treekem_membership_event_frontier(event)?;
     let is_local_welcome = treekem_event_is_local_welcome(event, local_agent_hex);
+    // A re-key carries TWO TreeKEM commits (remove @ N+1, add @ N+2) but a
+    // SINGLE metadata commit (state_revision +1). The existing-member apply arm
+    // processes both commits in order, so an epoch jump of +2 from the current
+    // tree is in-frontier, not a gap.
+    let max_epoch_jump = if matches!(event, NamedGroupMetadataEvent::MemberReKeyed { .. }) {
+        2
+    } else {
+        1
+    };
     if frontier.commit.revision <= info.state_revision || frontier.revision <= info.roster_revision
     {
         return None;
@@ -7745,7 +7810,9 @@ fn treekem_state_frontier_gap_reason(
     }
     if let Some(epoch) = frontier.epoch {
         match local_epoch {
-            Some(local_epoch) if !is_local_welcome && epoch > local_epoch.saturating_add(1) => {
+            Some(local_epoch)
+                if !is_local_welcome && epoch > local_epoch.saturating_add(max_epoch_jump) =>
+            {
                 return Some("treekem_epoch_gap".to_string());
             }
             None if !is_local_welcome => return Some("treekem_not_ready".to_string()),
@@ -8200,6 +8267,7 @@ async fn apply_named_group_metadata_event_inner(
     let group_id = match &event {
         NamedGroupMetadataEvent::MemberAdded { group_id, .. }
         | NamedGroupMetadataEvent::MemberRemoved { group_id, .. }
+        | NamedGroupMetadataEvent::MemberReKeyed { group_id, .. }
         | NamedGroupMetadataEvent::GroupDeleted { group_id, .. }
         | NamedGroupMetadataEvent::PolicyUpdated { group_id, .. }
         | NamedGroupMetadataEvent::MemberRoleUpdated { group_id, .. }
@@ -8511,6 +8579,225 @@ async fn apply_named_group_metadata_event_inner(
                     }
                 }
                 drop(mls_groups);
+            }
+            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
+                return false;
+            }
+            refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
+            save_named_groups(state).await;
+            save_mls_groups(state).await;
+            remember_treekem_membership_event(state, &event_for_log).await;
+            true
+        }
+        NamedGroupMetadataEvent::MemberReKeyed {
+            revision,
+            actor,
+            agent_id,
+            display_name,
+            treekem_remove_commit_b64,
+            treekem_add_commit_b64,
+            treekem_welcome_b64,
+            welcome_ref,
+            treekem_epoch,
+            commit,
+            ..
+        } => {
+            let Some(commit) = commit else {
+                return false;
+            };
+            // Re-key authority is the group creator (the owner emits it on the
+            // returning member's MemberJoined), same as the fresh MemberAdded.
+            if sender_hex != creator_hex || actor != sender_hex {
+                return false;
+            }
+            // TreeKEM re-key: a SINGLE roster-mutating metadata commit (the
+            // member's KeyPackage swaps; it stays Active so the roster_root is
+            // unchanged and the recompute matches the owner's hash via the
+            // security_binding epoch), plus BOTH TreeKEM commits and the Welcome.
+            let treekem_payload = if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+                let Some(remove_b64) = treekem_remove_commit_b64 else {
+                    return false;
+                };
+                let Some(add_b64) = treekem_add_commit_b64 else {
+                    return false;
+                };
+                if treekem_welcome_b64.is_none() && welcome_ref.is_none() {
+                    return false;
+                }
+                let Some(epoch) = treekem_epoch else {
+                    return false;
+                };
+                Some((remove_b64, add_b64, treekem_welcome_b64, welcome_ref, epoch))
+            } else {
+                return false;
+            };
+            let current = info.clone();
+            let next = match apply_stateful_event_to_group(
+                &current,
+                &commit,
+                x0x::groups::ActionKind::AdminOrHigher,
+                |next| {
+                    next.roster_revision = revision.max(next.roster_revision);
+                    if let Some(name) = display_name.clone() {
+                        next.set_display_name(&agent_id, name);
+                    }
+                    if let Some((_, _, _, _, epoch)) = treekem_payload.as_ref() {
+                        next.secret_epoch = *epoch;
+                        next.security_binding = Some(format!("treekem:epoch={epoch}"));
+                    }
+                },
+            ) {
+                Ok(next) => next,
+                Err(e) => {
+                    tracing::debug!(
+                        target: "treekem.trace",
+                        stage = "apply_metadata_event_reject",
+                        reason = "member_rekeyed_state_commit_apply_failed",
+                        group_id = %resolved_group_key,
+                        member = %agent_id,
+                        sender = %sender_hex,
+                        revision,
+                        commit_revision = commit.revision,
+                        local_state_revision = current.state_revision,
+                        local_roster_revision = current.roster_revision,
+                        local_state_hash = %current.state_hash,
+                        commit_prev_state_hash = ?commit.prev_state_hash,
+                        error = %e,
+                    );
+                    return false;
+                }
+            };
+            let Some((remove_b64, add_b64, welcome_b64, welcome_ref, epoch)) = treekem_payload
+            else {
+                return false;
+            };
+            use base64::Engine as _;
+            if agent_id == local_agent_hex {
+                // Joiner-self: the Welcome bootstraps the whole tree at epoch
+                // N+2. The joiner does NOT apply the remove/add commits.
+                let welcome_bytes = if let Some(welcome_b64) = welcome_b64 {
+                    match BASE64.decode(welcome_b64) {
+                        Ok(bytes) => bytes,
+                        Err(_) => return false,
+                    }
+                } else if let Some(welcome_ref) = welcome_ref {
+                    match fetch_treekem_welcome_with_retries(state, &group_id, &welcome_ref).await {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), welcome_id = %welcome_ref.welcome_id, "failed to fetch TreeKEM Welcome blob after retries: {e}");
+                            return false;
+                        }
+                    }
+                } else {
+                    return false;
+                };
+                let group_id_bytes = match hex::decode(&next.mls_group_id) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return false,
+                };
+                let seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+                let prepared =
+                    match x0x::mls::TreeKemMlsGroup::prepare_member(state.agent.agent_id(), &seed) {
+                        Ok(prepared) => prepared,
+                        Err(e) => {
+                            tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to prepare local TreeKEM identity for MemberReKeyed Welcome: {e}");
+                            return false;
+                        }
+                    };
+                let tk = match x0x::mls::TreeKemMlsGroup::join_from_welcome(prepared, &welcome_bytes)
+                {
+                    Ok(group) => group,
+                    Err(e) => {
+                        tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to join TreeKEM group from MemberReKeyed Welcome: {e}");
+                        return false;
+                    }
+                };
+                if tk.epoch() != epoch {
+                    return false;
+                }
+                if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
+                    state,
+                    &resolved_group_key,
+                    next.clone(),
+                    &tk,
+                )
+                .await
+                {
+                    tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to persist TreeKEM snapshot after MemberReKeyed Welcome: {e}");
+                    return false;
+                }
+                state
+                    .treekem_groups
+                    .write()
+                    .await
+                    .insert(resolved_group_key.clone(), Arc::new(tokio::sync::Mutex::new(tk)));
+            } else {
+                // Existing member: apply BOTH TreeKEM commits in order to reach
+                // epoch N+2 (remove → N+1, add → N+2).
+                let remove_bytes = match BASE64.decode(remove_b64) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return false,
+                };
+                let add_bytes = match BASE64.decode(add_b64) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return false,
+                };
+                let group = {
+                    let map = state.treekem_groups.read().await;
+                    map.get(&resolved_group_key).cloned()
+                };
+                if let Some(group) = group {
+                    let mut guard = group.lock().await;
+                    if let Err(e) = guard.process_commit(&remove_bytes) {
+                        tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process TreeKEM MemberReKeyed remove commit: {e}");
+                        return false;
+                    }
+                    if let Err(e) = guard.process_commit(&add_bytes) {
+                        tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process TreeKEM MemberReKeyed add commit: {e}");
+                        return false;
+                    }
+                    if guard.epoch() != epoch {
+                        return false;
+                    }
+                    if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
+                        state,
+                        &resolved_group_key,
+                        next.clone(),
+                        &guard,
+                    )
+                    .await
+                    {
+                        tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to persist TreeKEM snapshot after MemberReKeyed commits: {e}");
+                        return false;
+                    }
+                } else if !info.has_active_member(&local_agent_hex) {
+                    // Pre-Welcome joiner catching up on authority-signed state
+                    // commits for members who joined before it: it has no
+                    // TreeKEM ratchet yet, so it cannot process their commits.
+                    // Applying the signed metadata commit advances the
+                    // roster/state hash for its own later Welcome to validate.
+                    tracing::debug!(
+                        target: "treekem.trace",
+                        stage = "member_rekeyed_pre_welcome_state_only_apply",
+                        group_id = %resolved_group_key,
+                        member = %agent_id,
+                        local = %local_agent_hex,
+                        revision,
+                        epoch,
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "treekem.trace",
+                        stage = "apply_metadata_event_reject",
+                        reason = "member_rekeyed_missing_local_treekem_group",
+                        group_id = %resolved_group_key,
+                        member = %agent_id,
+                        local = %local_agent_hex,
+                        revision,
+                        epoch,
+                    );
+                    return false;
+                }
             }
             if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
                 return false;
@@ -9693,49 +9980,36 @@ async fn apply_named_group_metadata_event_inner(
                 };
                 let mut guard = group.lock().await;
 
-                // Seal BOTH state commits BEFORE mutating the live TreeKEM
-                // tree. seal_commit is fallible (signing); doing both seals
-                // first means the only fallible step left between the two live
-                // tree mutations (remove then add) is add_member itself -- the
-                // same irreducible risk the fresh-add path already carries. A
-                // seal failure here leaves the live tree untouched.
+                // A re-key is ONE roster mutation (the member's KeyPackage
+                // swaps; it stays Active, so the roster_root is unchanged). It
+                // is carried by a SINGLE metadata commit (rev N+1) alongside
+                // BOTH TreeKEM commits (remove @ epoch +1, add @ epoch +2) and
+                // the Welcome from the add. The joiner validates the one commit
+                // against its rejoin base with no revision gap, then bootstraps
+                // from the Welcome; existing members apply both TreeKEM commits
+                // in order. Seal the metadata commit BEFORE touching the live
+                // tree, so a seal failure leaves the tree untouched.
                 let expected1 = guard.epoch().saturating_add(1);
                 let expected2 = expected1.saturating_add(1);
 
-                // Commit 1: roster with the stale KP, sealed at epoch +1.
-                next.roster_revision = next.roster_revision.saturating_add(1);
-                next.secret_epoch = expected1;
-                next.security_binding = Some(format!("treekem:epoch={expected1}"));
-                let commit1 = match next.seal_commit(signing_kp, now_ms) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(
-                            group_id = %LogHexId::group(&resolved_group_key),
-                            member = %LogHexId::agent(&member_agent_id),
-                            "MemberJoined re-key: failed to seal remove commit: {e}"
-                        );
-                        return false;
-                    }
-                };
-                let revision1 = next.roster_revision;
-
-                // Commit 2: roster with the fresh KP, sealed at epoch +2.
+                // The single metadata commit: roster with the fresh KP, sealed
+                // at the FINAL epoch (+2).
                 next.set_member_treekem_key_package(&member_agent_id, new_kp_b64.clone());
                 next.roster_revision = next.roster_revision.saturating_add(1);
                 next.secret_epoch = expected2;
                 next.security_binding = Some(format!("treekem:epoch={expected2}"));
-                let commit2 = match next.seal_commit(signing_kp, now_ms) {
+                let commit = match next.seal_commit(signing_kp, now_ms) {
                     Ok(c) => c,
                     Err(e) => {
                         tracing::warn!(
                             group_id = %LogHexId::group(&resolved_group_key),
                             member = %LogHexId::agent(&member_agent_id),
-                            "MemberJoined re-key: failed to seal add commit: {e}"
+                            "MemberJoined re-key: failed to seal re-key commit: {e}"
                         );
                         return false;
                     }
                 };
-                let revision2 = next.roster_revision;
+                let revision = next.roster_revision;
 
                 // Now mutate the live TreeKEM tree back-to-back: remove the
                 // stale leaf (epoch +1) then add the fresh KeyPackage (epoch +2).
@@ -9803,60 +10077,45 @@ async fn apply_named_group_metadata_event_inner(
                     .groups_diagnostics
                     .record_member_joined(&resolved_group_key);
 
-                // Stage the Welcome from the SECOND (add) commit only — it
-                // carries the joiner's fresh TreeKEM state at epoch +2.
-                let welcome_ref =
-                    Some(stage_treekem_welcome(state, &event_group_id, &member_agent_id, out.welcome).await);
+                // Stage the Welcome from the ADD commit — it carries the
+                // returning member's fresh TreeKEM state at epoch +2.
+                let welcome_ref = Some(
+                    stage_treekem_welcome(state, &event_group_id, &member_agent_id, out.welcome)
+                        .await,
+                );
 
-                // Build + publish + deliver BOTH commits IN ORDER: remove @ +1,
-                // then add @ +2, so existing members' trees advance +1 then +1.
-                let removed_event = NamedGroupMetadataEvent::MemberRemoved {
+                // Build the SINGLE MemberReKeyed event carrying the one metadata
+                // commit plus both TreeKEM commits and the Welcome.
+                let rekeyed_event = NamedGroupMetadataEvent::MemberReKeyed {
                     group_id: event_group_id.clone(),
-                    revision: revision1,
-                    actor: inviter_agent_id.clone(),
-                    agent_id: member_agent_id.clone(),
-                    treekem_commit_b64: Some(BASE64.encode(&tk_remove)),
-                    treekem_epoch: Some(expected1),
-                    commit: Some(commit1),
-                };
-                let added_event = NamedGroupMetadataEvent::MemberAdded {
-                    group_id: event_group_id.clone(),
-                    revision: revision2,
+                    revision,
                     actor: inviter_agent_id.clone(),
                     agent_id: member_agent_id.clone(),
                     display_name: display_name.clone(),
-                    treekem_commit_b64: Some(BASE64.encode(&out.commit)),
+                    treekem_remove_commit_b64: Some(BASE64.encode(&tk_remove)),
+                    treekem_add_commit_b64: Some(BASE64.encode(&out.commit)),
                     treekem_welcome_b64: None,
                     welcome_ref,
                     treekem_epoch: Some(expected2),
-                    commit: Some(commit2),
+                    commit: Some(commit),
                 };
 
-                // Only the ADD is the joiner's poll-able join-result (it carries
-                // the Welcome at epoch +2).
-                stage_join_result(state, &event_group_id, &member_agent_id, added_event.clone())
+                // The returning member polls THIS staged join-result.
+                stage_join_result(state, &event_group_id, &member_agent_id, rekeyed_event.clone())
                     .await;
 
-                publish_named_group_metadata_event(state, &metadata_topic, &removed_event).await;
-                remember_treekem_membership_event(state, &removed_event).await;
-                publish_named_group_metadata_event(state, &metadata_topic, &added_event).await;
-                remember_treekem_membership_event(state, &added_event).await;
+                publish_named_group_metadata_event(state, &metadata_topic, &rekeyed_event).await;
+                remember_treekem_membership_event(state, &rekeyed_event).await;
                 spawn_named_group_event_delivery_to_active_members(
                     state,
                     &next,
-                    &removed_event,
-                    std::slice::from_ref(&member_agent_id),
-                );
-                spawn_named_group_event_delivery_to_active_members(
-                    state,
-                    &next,
-                    &added_event,
+                    &rekeyed_event,
                     std::slice::from_ref(&member_agent_id),
                 );
                 tracing::info!(
                     group_id = %LogHexId::group(&resolved_group_key),
                     member = %LogHexId::agent(&member_agent_id),
-                    "MemberJoined: re-keyed returning member (remove+add, epoch+2)"
+                    "MemberJoined: re-keyed returning member (single commit, epoch+2)"
                 );
                 return false;
             }
@@ -18123,12 +18382,18 @@ fn join_result_key(group_id: &str, member_agent_id: &str) -> String {
 /// other variant). Used to inline a locally-staged TreeKEM Welcome into
 /// the event that [`get_join_result_inline`] serves.
 fn set_inline_welcome(event: &mut NamedGroupMetadataEvent, welcome_b64: String) {
-    if let NamedGroupMetadataEvent::MemberAdded {
-        treekem_welcome_b64,
-        ..
-    } = event
-    {
-        *treekem_welcome_b64 = Some(welcome_b64);
+    match event {
+        NamedGroupMetadataEvent::MemberAdded {
+            treekem_welcome_b64,
+            ..
+        }
+        | NamedGroupMetadataEvent::MemberReKeyed {
+            treekem_welcome_b64,
+            ..
+        } => {
+            *treekem_welcome_b64 = Some(welcome_b64);
+        }
+        _ => {}
     }
 }
 
@@ -18175,8 +18440,19 @@ async fn get_join_result_inline(
         }
         | NamedGroupMetadataEvent::MemberAdded {
             welcome_ref: None, ..
+        }
+        | NamedGroupMetadataEvent::MemberReKeyed {
+            treekem_welcome_b64: Some(_),
+            ..
+        }
+        | NamedGroupMetadataEvent::MemberReKeyed {
+            welcome_ref: None, ..
         } => None,
         NamedGroupMetadataEvent::MemberAdded {
+            welcome_ref: Some(w),
+            ..
+        }
+        | NamedGroupMetadataEvent::MemberReKeyed {
             welcome_ref: Some(w),
             ..
         } => Some(w.welcome_id.clone()),
@@ -18265,11 +18541,14 @@ async fn apply_join_result_endpoint(
     let (group_id, member_agent_id) = match &event {
         NamedGroupMetadataEvent::MemberAdded {
             group_id, agent_id, ..
+        }
+        | NamedGroupMetadataEvent::MemberReKeyed {
+            group_id, agent_id, ..
         } => (group_id.clone(), agent_id.clone()),
         _ => {
             return api_error(
                 StatusCode::BAD_REQUEST,
-                "join-result must be MemberAdded".to_owned(),
+                "join-result must be MemberAdded or MemberReKeyed".to_owned(),
             );
         }
     };
@@ -18343,6 +18622,21 @@ async fn stage_join_result(
             } => (
                 commit.is_some(),
                 treekem_commit_b64.is_some(),
+                treekem_welcome_b64.is_some(),
+                welcome_ref.as_ref().map(|w| w.welcome_id.clone()),
+                *treekem_epoch,
+            ),
+            NamedGroupMetadataEvent::MemberReKeyed {
+                commit,
+                treekem_remove_commit_b64,
+                treekem_add_commit_b64,
+                treekem_welcome_b64,
+                welcome_ref,
+                treekem_epoch,
+                ..
+            } => (
+                commit.is_some(),
+                treekem_remove_commit_b64.is_some() && treekem_add_commit_b64.is_some(),
                 treekem_welcome_b64.is_some(),
                 welcome_ref.as_ref().map(|w| w.welcome_id.clone()),
                 *treekem_epoch,
@@ -18483,9 +18777,12 @@ async fn handle_join_result_message(
             let (group_id, member_agent_id) = match &event {
                 NamedGroupMetadataEvent::MemberAdded {
                     group_id, agent_id, ..
+                }
+                | NamedGroupMetadataEvent::MemberReKeyed {
+                    group_id, agent_id, ..
                 } => (group_id.clone(), agent_id.clone()),
                 _ => {
-                    tracing::warn!("ignoring non-MemberAdded join-result response");
+                    tracing::warn!("ignoring non-join-result response");
                     return;
                 }
             };
