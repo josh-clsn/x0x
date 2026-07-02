@@ -8152,9 +8152,13 @@ async fn apply_named_group_metadata_event_inner(
                 // as the fresh-add path). `consume_issued_invite` has no
                 // already-member guard, so a re-key still requires a valid,
                 // unconsumed, in-window invite.
-                if let Err(reason) =
-                    next.consume_issued_invite(&invite_secret, &member_agent_id, role, ts_ms, now_ms)
-                {
+                if let Err(reason) = next.consume_issued_invite(
+                    &invite_secret,
+                    &member_agent_id,
+                    role,
+                    ts_ms,
+                    now_ms,
+                ) {
                     if reason == "invite_secret_unknown" {
                         state
                             .groups_diagnostics
@@ -8312,8 +8316,10 @@ async fn apply_named_group_metadata_event_inner(
 
                 // Stage the Welcome from the SECOND (add) commit only — it
                 // carries the joiner's fresh TreeKEM state at epoch +2.
-                let welcome_ref =
-                    Some(stage_treekem_welcome(state, &event_group_id, &member_agent_id, out.welcome).await);
+                let welcome_ref = Some(
+                    stage_treekem_welcome(state, &event_group_id, &member_agent_id, out.welcome)
+                        .await,
+                );
 
                 // Build + publish + deliver BOTH commits IN ORDER: remove @ +1,
                 // then add @ +2, so existing members' trees advance +1 then +1.
@@ -8341,8 +8347,13 @@ async fn apply_named_group_metadata_event_inner(
 
                 // Only the ADD is the joiner's poll-able join-result (it carries
                 // the Welcome at epoch +2).
-                stage_join_result(state, &event_group_id, &member_agent_id, added_event.clone())
-                    .await;
+                stage_join_result(
+                    state,
+                    &event_group_id,
+                    &member_agent_id,
+                    added_event.clone(),
+                )
+                .await;
 
                 publish_named_group_metadata_event(state, &metadata_topic, &removed_event).await;
                 remember_treekem_membership_event(state, &removed_event).await;
