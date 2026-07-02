@@ -598,7 +598,11 @@ async fn named_group_join_via_invite() {
 /// `NamedGroupMetadataEvent::MemberJoined` naming the joiner, byte-identical to
 /// what a gossip capture would have yielded.
 #[tokio::test]
-#[ignore]
+#[ignore = "0.26-shaped scenario: the sole-admin DELETE-leave it used to reset for \
+            the rejoin now 409s under ADR-0016 (a live group must keep an active \
+            admin), so the single-daemon leave/rejoin trick cannot run on 0.27. \
+            Needs a two-daemon redesign; until then the inline member_joined \
+            invariant is verified by the cross-NAT two-device join checks."]
 async fn named_group_join_returns_inline_member_joined() {
     use base64::Engine as _;
 
