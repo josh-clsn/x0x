@@ -42,10 +42,13 @@ log_info "Building $BINARY_NAME for $TARGET..."
 
 # Build with cargo-zigbuild
 log_info "Running cargo zigbuild..."
+# jemalloc: glibc malloc holds freed pages (arena/RSS amplification); the
+# daemon binary must build with it. $TARGET is pinned x86_64-linux-gnu.
 cargo zigbuild \
     --target "$TARGET" \
     --release \
     --bin "$BINARY_NAME" \
+    --features jemalloc \
     2>&1 | tee /tmp/build-linux.log
 
 if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
