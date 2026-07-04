@@ -68,6 +68,17 @@ pub const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default stats collection interval.
 pub const DEFAULT_STATS_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Default cap on concurrent inbound unidirectional QUIC streams per
+/// connection. The 50k headroom is the X0X-0063 pubsub ACK-starvation
+/// mitigation (see the ant-quic builder site in `NetworkNode::new`);
+/// per-connection stream state is pre-sized against this bound, so
+/// small public-facing deployments should configure it far lower.
+pub const DEFAULT_MAX_CONCURRENT_UNI_STREAMS: u32 = 50_000;
+
+/// Default capacity of ant-quic's app-facing datagram channel (same
+/// X0X-0063 headroom rationale and the same sizing guidance).
+pub const DEFAULT_DATA_CHANNEL_CAPACITY: usize = 50_000;
+
 /// Default age after which an idle pooled QUIC connection is evicted.
 const CONNECTION_POOL_IDLE_EVICT_AFTER: Duration = Duration::from_secs(300);
 
@@ -244,6 +255,23 @@ pub struct NetworkConfig {
     #[serde(default = "default_port_mapping_enabled")]
     pub port_mapping_enabled: bool,
 
+    /// Cap on concurrent inbound unidirectional QUIC streams per
+    /// connection, passed to ant-quic. Defaults to
+    /// [`DEFAULT_MAX_CONCURRENT_UNI_STREAMS`]. ant-quic pre-sizes
+    /// per-connection stream state against this bound and unread
+    /// inbound streams hold their buffers until closed, so
+    /// public-facing relay deployments should set this far lower
+    /// (TOML `max_concurrent_uni_streams = 256`).
+    #[serde(default = "default_max_concurrent_uni_streams")]
+    pub max_concurrent_uni_streams: u32,
+
+    /// Capacity of ant-quic's app-facing datagram channel. Defaults to
+    /// [`DEFAULT_DATA_CHANNEL_CAPACITY`]; same guidance as
+    /// `max_concurrent_uni_streams` for relay-only deployments
+    /// (TOML `data_channel_capacity = 2048`).
+    #[serde(default = "default_data_channel_capacity")]
+    pub data_channel_capacity: usize,
+
     /// X0X-0070b: application-level peer-relay fallback configuration.
     /// Defaults to disabled (matches `RelayPolicy::default()`); the
     /// engine only activates when a runtime explicitly opts in via
@@ -350,6 +378,14 @@ fn default_max_peers_per_ip() -> u32 {
     3
 }
 
+fn default_max_concurrent_uni_streams() -> u32 {
+    DEFAULT_MAX_CONCURRENT_UNI_STREAMS
+}
+
+fn default_data_channel_capacity() -> usize {
+    DEFAULT_DATA_CHANNEL_CAPACITY
+}
+
 /// Quick check whether the host can bind an IPv6 socket.
 ///
 /// Returns `false` if IPv6 is not available (e.g., containers, VMs,
@@ -381,6 +417,8 @@ impl Default for NetworkConfig {
             inbound_allowlist: std::collections::HashSet::new(),
             max_peers_per_ip: 3,
             port_mapping_enabled: true,
+            max_concurrent_uni_streams: DEFAULT_MAX_CONCURRENT_UNI_STREAMS,
+            data_channel_capacity: DEFAULT_DATA_CHANNEL_CAPACITY,
             peer_relay: PeerRelayConfig::default(),
         }
     }
@@ -1297,27 +1335,22 @@ impl NetworkNode {
         keypair: Option<(ant_quic::MlDsaPublicKey, ant_quic::MlDsaSecretKey)>,
     ) -> NetworkResult<Self> {
         let mut builder = NodeConfig::builder()
-            // Mitigation, not a correctness fix: give ant-quic's bounded
-            // app-facing recv queue enough headroom to match x0x's forwarding
-            // queues during explicit raw receive-ACK stress. This trades memory
-            // for fewer ACK-starvation false negatives; the forwarding channel
-            // pressure warnings below are the operator signal that the system is
-            // leaning on this buffer and needs load shedding or a structural
-            // recv-pump fix.
-            //
-            // X0X-0063 bumped this from 10_000 → 50_000 after the 4 h
-            // confirmatory soak on x0x 0.19.35 (sg 0.5.40, ant-quic 0.27.15)
-            // recorded **1,025,150 high_water_count events on nyc** —
-            // saturation occurring continuously at ~67/s. The 10_000 ceiling
-            // was insufficient once X0X-0061 bumped the saorsa-gossip
-            // PER_PEER_REPUBLISH_TIMEOUT 750 ms → 2500 ms, because each
-            // outbound send task now holds a data_tx slot for up to 2.5 s
-            // (3.3× the prior hold time). 50_000 gives proportional headroom.
-            // This remains a mitigation — under truly sustained overload
+            // Both bounds come from `NetworkConfig` so deployments can size
+            // them to their role. The 50k DEFAULTS are the X0X-0063
+            // ACK-starvation mitigation headroom (4 h soak on x0x 0.19.35
+            // recorded 1,025,150 high_water_count events on nyc after
+            // X0X-0061 stretched PER_PEER_REPUBLISH_TIMEOUT to 2500 ms;
+            // 10_000 was insufficient). That headroom remains a mitigation —
             // backpressure earlier in the pubsub flush_ihave_batches loop is
-            // the proper fix.
-            .data_channel_capacity(50_000)
-            .max_concurrent_uni_streams(50_000);
+            // the proper fix — and it is sized for busy chat nodes with RAM
+            // to spare. Public-facing relay candidates must configure both
+            // far lower: at 50k, per-connection stream tables pre-size to
+            // ~1.5 MB each and unread inbound streams + queued datagrams can
+            // hold hundreds of MB (observed as the 2026-07 relay-droplet
+            // RSS exhaustion; dhat heap census attributed 58% of live heap
+            // to queued inbound datagrams under these bounds).
+            .data_channel_capacity(config.data_channel_capacity)
+            .max_concurrent_uni_streams(config.max_concurrent_uni_streams);
 
         if let Some(bind_addr) = config.bind_addr {
             builder = builder.bind_addr(bind_addr);
@@ -3497,6 +3530,8 @@ async fn test_mesh_connections_are_bidirectional() {
             inbound_allowlist: std::collections::HashSet::new(),
             max_peers_per_ip: 3,
             port_mapping_enabled: true,
+            max_concurrent_uni_streams: DEFAULT_MAX_CONCURRENT_UNI_STREAMS,
+            data_channel_capacity: DEFAULT_DATA_CHANNEL_CAPACITY,
             peer_relay: PeerRelayConfig::default(),
         };
 
@@ -4342,5 +4377,30 @@ mod message_tests {
         assert_eq!(config.connection_timeout, default_connection_timeout());
         assert_eq!(config.stats_interval, default_stats_interval());
         assert_eq!(config.max_peers_per_ip, default_max_peers_per_ip());
+        assert_eq!(
+            config.max_concurrent_uni_streams,
+            default_max_concurrent_uni_streams()
+        );
+        assert_eq!(config.data_channel_capacity, default_data_channel_capacity());
+    }
+
+    #[test]
+    fn transport_bounds_default_when_absent_from_toml() {
+        let config: NetworkConfig = toml::from_str("").expect("empty config parses");
+        assert_eq!(
+            config.max_concurrent_uni_streams,
+            DEFAULT_MAX_CONCURRENT_UNI_STREAMS
+        );
+        assert_eq!(config.data_channel_capacity, DEFAULT_DATA_CHANNEL_CAPACITY);
+    }
+
+    #[test]
+    fn transport_bounds_parse_from_toml() {
+        let config: NetworkConfig = toml::from_str(
+            "max_concurrent_uni_streams = 256\ndata_channel_capacity = 2048\n",
+        )
+        .expect("transport bounds parse");
+        assert_eq!(config.max_concurrent_uni_streams, 256);
+        assert_eq!(config.data_channel_capacity, 2048);
     }
 }
