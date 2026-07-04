@@ -768,6 +768,8 @@ pub async fn serve_with_options(
         // single invocation without editing the config file.
         port_mapping_enabled: config.port_mapping_enabled && !cli_no_port_mapping,
         peer_relay: config.peer_relay.clone(),
+        max_concurrent_uni_streams: config.max_concurrent_uni_streams,
+        data_channel_capacity: config.data_channel_capacity,
     };
 
     let contacts_path = config.data_dir.join("contacts.json");
@@ -9770,6 +9772,15 @@ async fn apply_named_group_metadata_event_inner_serialized(
                     treekem_welcome_b64: None,
                     welcome_ref,
                     treekem_epoch: Some(expected2),
+                    // Bind recovery to the leaf the re-key actually admitted, and
+                    // carry no recovery payloads inline: same shape as the ordinary
+                    // add path, which ships recovery records as their own events.
+                    treekem_key_package_hash: next
+                        .members_v2
+                        .get(&member_agent_id)
+                        .and_then(|member| member.treekem_key_package_hash.clone()),
+                    member_joined_recovery: None,
+                    member_recovery_history: Vec::new(),
                     commit: Some(commit2),
                 };
 
@@ -21339,6 +21350,9 @@ mod tests {
                 source: "owner".into(),
             }),
             treekem_epoch: Some(2),
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
             commit: None,
         };
         set_inline_welcome(&mut event, "V0VMQ09NRQ==".into());

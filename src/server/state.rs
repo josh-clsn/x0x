@@ -239,6 +239,21 @@ pub struct DaemonConfig {
     #[serde(default = "default_port_mapping_enabled")]
     pub(super) port_mapping_enabled: bool,
 
+    /// Cap on concurrent inbound unidirectional QUIC streams advertised per
+    /// connection (TOML `max_concurrent_uni_streams`). Defaults to
+    /// [`x0x::network::DEFAULT_MAX_CONCURRENT_UNI_STREAMS`]; see the
+    /// ant-quic builder site in `NetworkNode::new` for the sizing rationale.
+    #[serde(default = "default_max_concurrent_uni_streams")]
+    pub(super) max_concurrent_uni_streams: u32,
+
+    /// Capacity of ant-quic's app-facing datagram channel (TOML
+    /// `data_channel_capacity`). Defaults to
+    /// [`x0x::network::DEFAULT_DATA_CHANNEL_CAPACITY`], which is sized for a
+    /// chat node; a public-facing relay candidate should set this far lower,
+    /// because the queued inbound datagrams this ceiling permits dominate RSS.
+    #[serde(default = "default_data_channel_capacity")]
+    pub(super) data_channel_capacity: usize,
+
     /// X0X-0070b: peer-relay fallback configuration (TOML `[peer_relay]`).
     /// Defaults to disabled — opt in by setting `peer_relay.enabled = true`
     /// and listing relay-candidate hex agent IDs under
@@ -338,6 +353,14 @@ fn default_bootstrap_peers() -> Vec<SocketAddr> {
         .iter()
         .filter_map(|s| s.parse().ok())
         .collect()
+}
+
+fn default_max_concurrent_uni_streams() -> u32 {
+    crate::network::DEFAULT_MAX_CONCURRENT_UNI_STREAMS
+}
+
+fn default_data_channel_capacity() -> usize {
+    crate::network::DEFAULT_DATA_CHANNEL_CAPACITY
 }
 
 fn default_port_mapping_enabled() -> bool {
@@ -505,6 +528,8 @@ impl Default for DaemonConfig {
             log_format: default_log_format(),
             bootstrap_peers: None,
             port_mapping_enabled: default_port_mapping_enabled(),
+            max_concurrent_uni_streams: default_max_concurrent_uni_streams(),
+            data_channel_capacity: default_data_channel_capacity(),
             peer_relay: x0x::network::PeerRelayConfig::default(),
             update: DaemonUpdateConfig::default(),
             gossip: x0x::gossip::GossipConfig::default(),
