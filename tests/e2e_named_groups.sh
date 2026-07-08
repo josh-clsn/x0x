@@ -524,6 +524,19 @@ else
   fail "D.2: bob decrypt" "got='$GOT' want='$PT_B64' body=${DEC:0:200}"
 fi
 
+# D.2 ★ read-only keyed-status probe. A member who has converged (bob just
+# decrypted, so he holds the live group secret) must report keyed=true with an
+# epoch on GET /secure/self. This is the signal the durable-join resume probe
+# relies on to tell ActiveKeyed (keyed) from ListedButUnkeyed (in the roster but
+# no key yet) WITHOUT decrypting a frame or replaying a join event — so the
+# assertion breaks if the endpoint ever reports a keyless member as keyed.
+SELF_B=$(BGET /groups/$GID_D2_REMOTE/secure/self)
+if [ "$(jf "$SELF_B" "keyed")" = "true" ] && [ -n "$(jf "$SELF_B" "epoch")" ]; then
+  ok "D.2 ★ bob's /secure/self reports keyed=true (epoch=$(jf "$SELF_B" "epoch"))"
+else
+  fail "D.2: bob /secure/self keyed status" "$SELF_B"
+fi
+
 # Now approve Charlie so we have a remaining member for the ban test.
 CREQ_D2=""
 for _ in $(seq 1 15); do

@@ -809,6 +809,13 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         category: "named-groups",
     },
     EndpointDef {
+        method: Method::Get,
+        path: "/groups/:id/secure/self",
+        cli_name: "group secure-self",
+        description: "Read-only self keyed-status + epoch for a group (no state change)",
+        category: "named-groups",
+    },
+    EndpointDef {
         method: Method::Post,
         path: "/groups/:id/secure/reseal",
         cli_name: "group secure-reseal",
