@@ -368,6 +368,11 @@ const COVERED: &[CoveredEndpoint] = &[
         "/groups/$GID_D2_REMOTE/secure/decrypt"
     ),
     covered!(
+        Get,
+        "/groups/:id/secure/self",
+        "/groups/$GID_D2_REMOTE/secure/self"
+    ),
+    covered!(
         Post,
         "/groups/:id/secure/reseal",
         "/groups/$GID_ADV/secure/reseal"

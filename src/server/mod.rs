@@ -1522,6 +1522,7 @@ pub async fn serve_with_options(
         // Phase D.2 — cross-daemon secure encrypt/decrypt.
         .route("/groups/:id/secure/encrypt", post(secure_group_encrypt))
         .route("/groups/:id/secure/decrypt", post(secure_group_decrypt))
+        .route("/groups/:id/secure/self", get(secure_group_self))
         .route("/groups/:id/secure/reseal", post(secure_group_reseal))
         .route(
             "/groups/secure/open-envelope",
@@ -13884,6 +13885,69 @@ async fn secure_group_encrypt(
 /// ciphertext epoch (i.e. they've been rekeyed out, or haven't caught up yet).
 /// A banned peer with a stale secret cannot decrypt new-epoch messages — that
 /// proves the rekey-on-ban semantics.
+/// `GET /groups/:id/secure/self` — read-only self keyed-status + epoch.
+///
+/// Reports whether THIS daemon actually holds the group's live crypto state
+/// (`keyed`), not merely a roster listing, plus the authoritative current
+/// `epoch`. It burns no MLS generation and mutates nothing — a pure read.
+///
+/// Built for two consumers:
+/// - the durable-join resume probe: `keyed=true` ⇒ the joiner has converged
+///   (`ActiveKeyed`); `in_roster && !keyed` ⇒ the Welcome was lost, re-request
+///   it (`ListedButUnkeyed`); `!in_roster` ⇒ the owner has not applied the join
+///   yet (`Absent`). This is the read-only keyed-check that lets the probe
+///   distinguish keyed from listed-but-keyless WITHOUT decrypting a stored
+///   frame or replaying a join event (no single-use-invite re-spend risk).
+/// - the epoch-catch-up consumer: `epoch` (and, once the per-group Commit
+///   sequence is tracked, `last_applied_seq`) to drive a since-seq log fetch.
+async fn secure_group_self(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let (in_roster, roster_epoch, is_treekem, has_legacy_secret) = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(&id) else {
+            return not_found("group not found");
+        };
+        (
+            info.has_active_member(&caller_hex),
+            info.secret_epoch,
+            info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem,
+            info.shared_secret.is_some(),
+        )
+    };
+
+    // Keyed = this daemon holds the live group crypto, not just a roster row.
+    // TreeKEM: presence in `treekem_groups` (populated only once the Welcome is
+    // applied), reporting the live group's authoritative epoch. Legacy
+    // SignedPublic: an in-roster member with the shared secret present. A
+    // roster-listed but not-yet-keyed member (Welcome lost) reports
+    // `keyed=false` — the exact `ListedButUnkeyed` signal the probe needs —
+    // with zero state mutation.
+    let (keyed, epoch) = if is_treekem {
+        let map = state.treekem_groups.read().await;
+        match map.get(&id) {
+            Some(g) => (true, g.lock().await.epoch()),
+            None => (false, roster_epoch),
+        }
+    } else {
+        (in_roster && has_legacy_secret, roster_epoch)
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "keyed": keyed,
+            "in_roster": in_roster,
+            "epoch": epoch,
+            // Reserved for the commit-log epoch-catch-up consumer; the
+            // per-group Commit sequence is not tracked yet, so 0 until it lands.
+            "last_applied_seq": 0,
+        })),
+    )
+}
+
 async fn secure_group_decrypt(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
