@@ -15794,8 +15794,10 @@ async fn secure_group_encrypt(
 ///   yet (`Absent`). This is the read-only keyed-check that lets the probe
 ///   distinguish keyed from listed-but-keyless WITHOUT decrypting a stored
 ///   frame or replaying a join event (no single-use-invite re-spend risk).
-/// - the epoch-catch-up consumer: `epoch` (and, once the per-group Commit
-///   sequence is tracked, `last_applied_seq`) to drive a since-seq log fetch.
+/// - the epoch-catch-up consumer: `epoch`, which its `EpochBehind` detection
+///   reconciles against an inbound frame's `secret_epoch`. (The relay-log fetch
+///   cursor is fetch>it *engine* state, not x0xd state -- x0xd never touches the
+///   relay log -- so no sequence is exposed here.)
 async fn secure_group_self(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -15837,9 +15839,6 @@ async fn secure_group_self(
             "keyed": keyed,
             "in_roster": in_roster,
             "epoch": epoch,
-            // Reserved for the commit-log epoch-catch-up consumer; the
-            // per-group Commit sequence is not tracked yet, so 0 until it lands.
-            "last_applied_seq": 0,
         })),
     )
 }
