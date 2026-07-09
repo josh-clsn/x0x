@@ -8403,7 +8403,16 @@ async fn apply_named_group_metadata_event_inner_serialized(
             let actor_role = info.caller_role(&actor);
             let admin_remove_auth = actor == sender_hex
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
-            let self_leave_auth = sender_hex == agent_id && actor == sender_hex;
+            // Bind self-leave to the ML-DSA-verified commit author, not the
+            // transport `sender_hex` (client-supplied + `verified=true` on the
+            // REST apply paths). A commit is guaranteed present here (early
+            // return above), so `committed_by` is available. This closes a
+            // spoof where a caller sets sender/agent_id/actor = victim and
+            // authors the commit as any member to force the victim's removal,
+            // and is catch-up-tolerant (a relayed self-leave carries the
+            // leaver's committed_by regardless of the forwarding sender).
+            let self_leave_auth =
+                commit.committed_by == agent_id && actor == commit.committed_by;
             if !admin_remove_auth && !self_leave_auth {
                 return false;
             }
