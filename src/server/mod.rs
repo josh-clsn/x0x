@@ -7054,8 +7054,7 @@ async fn apply_named_group_metadata_event_inner(
             // authors the commit as any member to force the victim's removal,
             // and is catch-up-tolerant (a relayed self-leave carries the
             // leaver's committed_by regardless of the forwarding sender).
-            let self_leave_auth =
-                commit.committed_by == agent_id && actor == commit.committed_by;
+            let self_leave_auth = commit.committed_by == agent_id && actor == commit.committed_by;
             if !admin_remove_auth && !self_leave_auth {
                 return false;
             }
@@ -10060,6 +10059,84 @@ struct ApplyMetadataEventRequest {
 /// canonical bytes, derived-id/key binding, role cap, inviter check, single-use
 /// invite-secret consume), so a forged event still fails to apply. `:id` is the
 /// routing key only; the authoritative group is resolved from the event itself.
+/// Variant allowlist for `POST /groups/:id/apply-metadata-event`.
+///
+/// The endpoint applies with the client-supplied `sender_agent_id` marked
+/// `verified = true`. That is sound only where the event's authority does NOT
+/// rest on the sender: commit-bearing variants are gated by
+/// `commit.committed_by` (ML-DSA-verified in `verify_structure`), and
+/// `MemberJoined` is gated by its single-use `invite_secret` + inviter check +
+/// member-is-self. Those pass here.
+///
+/// `SecureShareDelivered` (installs the group shared secret) and
+/// `GroupCardPublished` (caches a card) carry no commit and authorize on the
+/// (spoofable) sender, so a forged `sender_agent_id` could authorize them. No
+/// fetchit path delivers either via this endpoint, so they are rejected. An
+/// allowlist (not a denylist) means any future no-commit variant is refused by
+/// default until it gets its own out-of-band authority.
+fn metadata_event_allowed_on_local_apply(event: &NamedGroupMetadataEvent) -> bool {
+    use NamedGroupMetadataEvent::{
+        GroupDeleted, GroupMetadataUpdated, JoinRequestApproved, JoinRequestCancelled,
+        JoinRequestCreated, JoinRequestRejected, MemberAdded, MemberBanned, MemberJoined,
+        MemberRemoved, MemberRoleUpdated, MemberUnbanned, PolicyUpdated,
+    };
+    // Fail-closed allowlist: enumerate the SAFE variants, reject everything else
+    // (including any variant added upstream in a future rebase, until it is
+    // reviewed and its authority model confirmed). Safe = the event's authority
+    // does not rest on the spoofable `sender_agent_id`:
+    //   - commit-bearing variants -> gated by verify_structure over the commit;
+    //   - MemberJoined -> gated by single-use invite_secret + inviter + self.
+    // Deliberately excluded: SecureShareDelivered and GroupCardPublished (no
+    // commit, sender-authorized; a forged sender could install a group secret /
+    // poison a card). No fetchit path applies those via this endpoint.
+    matches!(
+        event,
+        MemberAdded { .. }
+            | MemberRemoved { .. }
+            | GroupDeleted { .. }
+            | PolicyUpdated { .. }
+            | MemberRoleUpdated { .. }
+            | MemberBanned { .. }
+            | MemberUnbanned { .. }
+            | JoinRequestCreated { .. }
+            | JoinRequestApproved { .. }
+            | JoinRequestRejected { .. }
+            | JoinRequestCancelled { .. }
+            | GroupMetadataUpdated { .. }
+            | MemberJoined { .. }
+    )
+}
+
+#[cfg(test)]
+mod local_apply_allowlist_tests {
+    use super::*;
+
+    #[test]
+    fn secure_share_delivered_is_rejected_on_local_apply() {
+        // The high-severity no-commit variant: installs the group shared secret,
+        // authorized only on the spoofable sender. Constructed directly (all
+        // simple fields) so the test asserts the allowlist classification, not
+        // serde. The ACCEPT side (every membership variant fetchit uses) is
+        // covered by the endpoint integration tests in tests/membership_authority.rs
+        // (a wrongly-rejected legit variant would fail those POST-through tests).
+        // GroupCardPublished (the lower-severity no-commit sibling) is excluded
+        // by inspection: it is absent from the allowlist's explicit arm list.
+        let ev = NamedGroupMetadataEvent::SecureShareDelivered {
+            group_id: "g".to_owned(),
+            recipient: "r".to_owned(),
+            secret_epoch: 1,
+            kem_ciphertext_b64: String::new(),
+            aead_nonce_b64: String::new(),
+            aead_ciphertext_b64: String::new(),
+            actor: "a".to_owned(),
+        };
+        assert!(
+            !metadata_event_allowed_on_local_apply(&ev),
+            "SecureShareDelivered must be rejected on the spoofable local-apply endpoint"
+        );
+    }
+}
+
 async fn apply_group_metadata_event(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -10080,6 +10157,22 @@ async fn apply_group_metadata_event(
             );
         }
     };
+
+    // Variant allowlist for the local-apply endpoint. This endpoint trusts
+    // the client-supplied `sender_agent_id` (verified=true), which is sound
+    // ONLY for events whose authority is bound to the ML-DSA-verified
+    // commit.committed_by (re-checked by verify_structure) or to a single-use
+    // invite_secret (MemberJoined). The no-commit, sender-authorized variants
+    // (SecureShareDelivered installs the group shared secret; GroupCardPublished
+    // caches a card) have no such backstop here, so a forged sender could
+    // authorize them. fetchit never delivers those via this path, so reject
+    // them outright rather than trust the spoofable sender.
+    if !metadata_event_allowed_on_local_apply(&event) {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "event variant not permitted on the local-apply endpoint".to_owned(),
+        );
+    }
     let sender = match parse_agent_id_hex(&req.sender_agent_id) {
         Ok(s) => s,
         Err(e) => {
