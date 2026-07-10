@@ -6834,7 +6834,7 @@ async fn apply_named_group_metadata_event_inner(
                 return false;
             };
             let actor_role = info.caller_role(&actor);
-            let actor_authorized = actor == sender_hex
+            let actor_authorized = actor == commit.committed_by
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
             if !actor_authorized {
                 return false;
@@ -7044,7 +7044,7 @@ async fn apply_named_group_metadata_event_inner(
                 return false;
             };
             let actor_role = info.caller_role(&actor);
-            let admin_remove_auth = actor == sender_hex
+            let admin_remove_auth = actor == commit.committed_by
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
             // Bind self-leave to the ML-DSA-verified commit author, not the
             // transport `sender_hex` (client-supplied + `verified=true` on the
@@ -7272,7 +7272,7 @@ async fn apply_named_group_metadata_event_inner(
                 return false;
             };
             let actor_role = info.caller_role(&actor);
-            let actor_authorized = actor == sender_hex
+            let actor_authorized = actor == commit.committed_by
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
             if !actor_authorized {
                 return false;
@@ -7324,7 +7324,7 @@ async fn apply_named_group_metadata_event_inner(
                 return false;
             };
             let actor_role = info.caller_role(&actor);
-            let actor_authorized = actor == sender_hex
+            let actor_authorized = actor == commit.committed_by
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
             if !actor_authorized {
                 return false;
@@ -7835,7 +7835,7 @@ async fn apply_named_group_metadata_event_inner(
                 return false;
             };
             let actor_role = info.caller_role(&actor);
-            let actor_authorized = actor == sender_hex
+            let actor_authorized = actor == commit.committed_by
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
             if !actor_authorized {
                 return false;
