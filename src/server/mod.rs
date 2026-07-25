@@ -26,10 +26,11 @@ use routes::{
     ack_diagnostics, add_contact, add_machine, add_mls_member, add_named_group_member, add_task,
     agent_info, agent_reachability, agent_sign, agent_user_id_handler, agent_verify,
     agents_by_user_handler, announce_identity, apply_direct_kv_store_delta,
-    apply_named_group_metadata_event, apply_named_group_metadata_event_inner_serialized,
-    apply_upgrade, approve_join_request, ban_group_member, bootstrap_cache_stats,
-    broadcast_current_manifest, cancel_join_request, causal_relay_step, check_upgrade,
-    connect_agent, connect_diagnostics_handler, connect_machine, connectivity_diagnostics,
+    apply_group_metadata_event, apply_join_result_endpoint, apply_named_group_metadata_event,
+    apply_named_group_metadata_event_inner_serialized, apply_upgrade, approve_join_request,
+    ban_group_member, bootstrap_cache_stats, broadcast_current_manifest, cancel_join_request,
+    causal_relay_step, check_upgrade, connect_agent, connect_diagnostics_handler, connect_machine,
+    connectivity_diagnostics,
     create_discovery_subscription, create_group_invite, create_join_request, create_kv_store,
     create_mls_group, create_mls_welcome, create_named_group, create_task_list, delete_contact,
     delete_discovery_subscription, delete_kv_value, delete_machine, direct_connections,
@@ -40,8 +41,9 @@ use routes::{
     file_transfer_status_handler, file_transfers_handler, find_agent, forward_add, forward_list,
     forward_remove, get_a2a_agent_card, get_agent_card, get_constitution, get_constitution_json,
     get_group_card, get_group_public_messages, get_group_state, get_group_state_commits,
-    get_kv_value, get_mls_group, get_named_group, get_named_group_members, gossip_diagnostics,
-    group_membership_lock, groups_diagnostics, handle_file_message, handle_join_result_message,
+    get_join_result_inline, get_kv_value, get_mls_group, get_named_group, get_named_group_members,
+    gossip_diagnostics, group_membership_lock, groups_diagnostics, handle_file_message,
+    handle_join_result_message,
     handle_treekem_catchup_request, handle_treekem_catchup_response, handle_welcome_blob_message,
     health, history_diagnostics, history_list, history_purge, history_search, history_stats,
     identity_revocations, identity_revoke, import_agent_card, import_group_card,
@@ -1378,6 +1380,14 @@ pub async fn serve_with_options(
         .route("/groups/:id/policy", patch(update_group_policy))
         .route("/groups/:id/members", get(get_named_group_members))
         .route("/groups/:id/members", post(add_named_group_member))
+        .route(
+            "/groups/:id/apply-metadata-event",
+            post(apply_group_metadata_event),
+        )
+        .route(
+            "/groups/:id/join-result/:member",
+            get(get_join_result_inline).post(apply_join_result_endpoint),
+        )
         .route(
             "/groups/:id/members/:agent_id",
             delete(remove_named_group_member),

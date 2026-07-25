@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 147,
+  "endpoint_count": 150,
   "endpoints": [
     {
       "category": "status",
@@ -714,6 +714,27 @@
       "description": "Unban a member (admin+)",
       "method": "DELETE",
       "path": "/groups/:id/ban/:agent_id"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group apply-metadata-event",
+      "description": "Apply a relay-delivered group metadata event locally (non-gossip path)",
+      "method": "POST",
+      "path": "/groups/:id/apply-metadata-event"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group join-result",
+      "description": "Staged authoritative MemberAdded with the TreeKEM Welcome inlined",
+      "method": "GET",
+      "path": "/groups/:id/join-result/:member"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group apply-join-result",
+      "description": "Apply a relay-delivered join-result (inline Welcome) into local TreeKEM state",
+      "method": "POST",
+      "path": "/groups/:id/join-result/:member"
     },
     {
       "category": "named-groups",
