@@ -1033,6 +1033,37 @@ enum GroupSub {
         /// Request ID.
         request_id: String,
     },
+    /// Apply a relay-delivered metadata event locally (engine-A control plane).
+    ApplyMetadataEvent {
+        /// Group ID.
+        group_id: String,
+        /// Base64 `NamedGroupMetadataEvent` JSON.
+        #[arg(long)]
+        event_b64: String,
+        /// Hex agent id of the event author.
+        #[arg(long)]
+        sender: String,
+    },
+    /// Fetch the staged join-result for a member, Welcome inlined (engine-A).
+    JoinResult {
+        /// Group ID (stable id the result is keyed by).
+        group_id: String,
+        /// Member agent id (hex).
+        member: String,
+    },
+    /// Apply a relay-delivered join-result into local TreeKEM state (engine-A).
+    ApplyJoinResult {
+        /// Group ID (stable id the result is keyed by).
+        group_id: String,
+        /// Member agent id (hex).
+        member: String,
+        /// Base64 `MemberAdded` event JSON with the Welcome inlined.
+        #[arg(long)]
+        event_b64: String,
+        /// Hex agent id of the delivering sender (the admitting admin).
+        #[arg(long)]
+        sender: String,
+    },
     /// List locally known discoverable groups (optionally filtered by query).
     Discover {
         /// Tag or name substring.
@@ -1784,6 +1815,25 @@ async fn run(
                 group_id,
                 request_id,
             }) => commands::group::cancel_request(&client, &group_id, &request_id).await,
+            Some(GroupSub::ApplyMetadataEvent {
+                group_id,
+                event_b64,
+                sender,
+            }) => {
+                commands::group::apply_metadata_event(&client, &group_id, &event_b64, &sender).await
+            }
+            Some(GroupSub::JoinResult { group_id, member }) => {
+                commands::group::join_result(&client, &group_id, &member).await
+            }
+            Some(GroupSub::ApplyJoinResult {
+                group_id,
+                member,
+                event_b64,
+                sender,
+            }) => {
+                commands::group::apply_join_result(&client, &group_id, &member, &event_b64, &sender)
+                    .await
+            }
             Some(GroupSub::Discover { q }) => {
                 commands::group::discover(&client, q.as_deref()).await
             }
