@@ -294,6 +294,55 @@ pub async fn reject_request(client: &DaemonClient, group_id: &str, request_id: &
     Ok(())
 }
 
+/// `x0x group apply-metadata-event` — POST /groups/:id/apply-metadata-event.
+pub async fn apply_metadata_event(
+    client: &DaemonClient,
+    group_id: &str,
+    event_b64: &str,
+    sender_agent_id: &str,
+) -> Result<()> {
+    client.ensure_running().await?;
+    let body = serde_json::json!({
+        "event_b64": event_b64,
+        "sender_agent_id": sender_agent_id,
+    });
+    let resp = client
+        .post(&format!("/groups/{group_id}/apply-metadata-event"), &body)
+        .await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x group join-result` — GET /groups/:id/join-result/:member.
+pub async fn join_result(client: &DaemonClient, group_id: &str, member: &str) -> Result<()> {
+    client.ensure_running().await?;
+    let resp = client
+        .get(&format!("/groups/{group_id}/join-result/{member}"))
+        .await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x group apply-join-result` — POST /groups/:id/join-result/:member.
+pub async fn apply_join_result(
+    client: &DaemonClient,
+    group_id: &str,
+    member: &str,
+    event_b64: &str,
+    sender_agent_id: &str,
+) -> Result<()> {
+    client.ensure_running().await?;
+    let body = serde_json::json!({
+        "event_b64": event_b64,
+        "sender_agent_id": sender_agent_id,
+    });
+    let resp = client
+        .post(&format!("/groups/{group_id}/join-result/{member}"), &body)
+        .await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
 /// `x0x group cancel-request` — DELETE /groups/:id/requests/:request_id.
 pub async fn cancel_request(client: &DaemonClient, group_id: &str, request_id: &str) -> Result<()> {
     client.ensure_running().await?;
