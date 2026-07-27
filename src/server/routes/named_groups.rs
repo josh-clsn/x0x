@@ -7732,43 +7732,78 @@ pub(in crate::server) async fn join_group_via_invite(
     let invite_stable_group_id = invite.stable_group_id.as_deref().unwrap_or(&group_id_hex);
     let membership_lock = group_membership_lock(&state, &group_id_hex).await;
     let membership_guard = membership_lock.lock().await;
-    {
+    let existing_record = {
         let groups = state.named_groups.read().await;
         if has_withdrawn_group_record(&groups, &group_id_hex)
             || has_withdrawn_group_record(&groups, invite_stable_group_id)
         {
             return api_error(StatusCode::CONFLICT, "group is withdrawn");
         }
-        if groups.contains_key(&group_id_hex)
-            || groups
-                .values()
-                .any(|info| info.mls_group_id == group_id_hex)
-        {
-            // Issue #188: a duplicate/replayed join (retried cmd-DM,
-            // redelivered invite) for a group this node already joined — or
-            // is mid-join on, since the local stub lands in `named_groups`
-            // before TreeKEM convergence completes — is an idempotent
-            // success, not an error. No state is mutated and no MemberJoined
-            // is re-published; the membership lock above serializes the
-            // first-join/replay race.
-            let info = groups.get(&group_id_hex).or_else(|| {
+        groups
+            .get(&group_id_hex)
+            .map(|info| (info, true))
+            .or_else(|| {
                 groups
                     .values()
                     .find(|info| info.mls_group_id == group_id_hex)
-            });
-            if let Some(info) = info {
-                return (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "ok": true,
-                        "already_joined": true,
-                        "group_id": group_id_hex,
-                        "group_name": info.name,
-                        "chat_topic": info.general_chat_topic(),
-                    })),
-                );
-            }
+                    .map(|info| (info, false))
+            })
+            .map(|(info, keyed_by_invite_group_id)| {
+                (
+                    info.name.clone(),
+                    info.general_chat_topic(),
+                    info.stable_group_id().to_string(),
+                    keyed_by_invite_group_id,
+                )
+            })
+    };
+    if let Some((name, chat_topic, stable_id, keyed_by_invite_group_id)) = existing_record {
+        // Issue #188: a duplicate/replayed join (retried cmd-DM, redelivered
+        // invite) for a group this node already JOINED is an idempotent
+        // success: no state is mutated and no MemberJoined is re-published;
+        // the membership lock above serializes the first-join/replay race.
+        //
+        // "Already joined" must mean CONVERGED, though. A TreeKEM join stub
+        // lands in `named_groups` before the authority's Welcome is
+        // accepted, and short-circuiting a retry against that stub orphans
+        // the join permanently: the expected-inviter gate (in-memory, so
+        // lost to restarts and its retention window) stays unarmed, so the
+        // owner's eventual MemberAdded is rejected as
+        // `missing_expected_inviter` — and no fresh MemberJoined reaches an
+        // owner that missed the first announcement. TreeKEM state is
+        // installed only when the Welcome is accepted, so `treekem_groups`
+        // is the convergence signal: an unconverged retry falls through and
+        // re-runs the join. That re-run is safe — the stub rebuild is
+        // deterministic from the invite (same seed → same KeyPackage), and
+        // the applier treats a replayed MemberJoined for an already-active
+        // member as a no-op. Alias records (invite group id matching only
+        // `mls_group_id` under a different key) keep the unconditional
+        // no-op: falling through would re-insert the group under a second
+        // key.
+        let converged = if invite_is_treekem && keyed_by_invite_group_id {
+            let treekem_groups = state.treekem_groups.read().await;
+            treekem_groups.contains_key(&group_id_hex) || treekem_groups.contains_key(&stable_id)
+        } else {
+            // Non-TreeKEM joins complete locally at join time, so any
+            // present record is a real membership.
+            true
+        };
+        if converged {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "already_joined": true,
+                    "group_id": group_id_hex,
+                    "group_name": name,
+                    "chat_topic": chat_topic,
+                })),
+            );
         }
+        tracing::info!(
+            group_id = %LogHexId::group(&group_id_hex),
+            "replayed join for an unconverged TreeKEM stub: re-running join to re-arm the join-result gate and re-announce MemberJoined"
+        );
     }
     let inviter = match parse_agent_id_hex(&invite.inviter) {
         Ok(id) => id,
@@ -13133,9 +13168,20 @@ async fn write_named_groups_json_atomic(path: &FsPath, json: &str) -> std::io::R
     write_result
 }
 
-const PENDING_JOIN_RESULT_TTL: Duration = Duration::from_secs(10 * 60);
+// A day, not minutes: the counterparty in a join is often a phone — locked,
+// backgrounded, offline — so the two halves of the handshake can be hours
+// apart. The joiner keeps polling only for JOIN_RESULT_POLL_TIMEOUT, but the
+// staged result (owner side) and the armed expected-inviter (joiner side)
+// must both outlive that window, or a late half permanently orphans the
+// join: the owner never re-stages for an already-active member, and the
+// joiner rejects a result it no longer expects (`missing_expected_inviter`).
+// Both stores are in-memory (lost to restarts) and re-armed by a retried
+// join, so retention this long costs only bytes, never correctness.
+const PENDING_JOIN_RESULT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 const JOIN_RESULT_POLL_TIMEOUT: Duration = Duration::from_secs(120);
+
+const JOIN_RESULT_INVITER_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 
 const JOIN_RESULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -13162,8 +13208,21 @@ fn validate_join_result_inviter(
     expected_inviter: Option<&str>,
     sender_hex: &str,
     member_added_actor: &str,
+    unconverged_local_stub: bool,
 ) -> Result<(), &'static str> {
     let Some(expected_inviter) = expected_inviter else {
+        // The armed inviter lives in memory only, so a daemon restart
+        // mid-join (an Android app relaunch IS a daemon restart) loses it
+        // while the durable group stub survives. For a join this node
+        // provably asked for — an unconverged local stub — fall back to the
+        // delivery-shape check (the result must be delivered by its own
+        // author); the MemberAdded commit's full authority verification
+        // (ML-DSA against the stub's base roster) remains the real gate
+        // downstream, so a forged result still fails to apply. Without a
+        // stub, or once converged, an unarmed result stays rejected.
+        if unconverged_local_stub && sender_hex == member_added_actor {
+            return Ok(());
+        }
         return Err("missing_expected_inviter");
     };
     if sender_hex != expected_inviter {
@@ -13175,6 +13234,35 @@ fn validate_join_result_inviter(
     Ok(())
 }
 
+/// True when `event_group_id` names a locally-known group that has NOT
+/// completed TreeKEM convergence — i.e. a join stub this node created by
+/// asking to join, still waiting on the authority's Welcome. Feeds the
+/// unarmed-fallback arm of [`validate_join_result_inviter`].
+async fn unconverged_local_stub_for_join_result(state: &AppState, event_group_id: &str) -> bool {
+    let (exists, mls_group_id, stable_group_id) = {
+        let groups = state.named_groups.read().await;
+        match groups.get(event_group_id).or_else(|| {
+            groups
+                .values()
+                .find(|info| info.stable_group_id() == event_group_id)
+        }) {
+            Some(info) => (
+                true,
+                info.mls_group_id.clone(),
+                info.stable_group_id().to_string(),
+            ),
+            None => (false, String::new(), String::new()),
+        }
+    };
+    if !exists {
+        return false;
+    }
+    let treekem_groups = state.treekem_groups.read().await;
+    !(treekem_groups.contains_key(event_group_id)
+        || treekem_groups.contains_key(&mls_group_id)
+        || treekem_groups.contains_key(&stable_group_id))
+}
+
 fn record_expected_join_result_inviter(state: &AppState, key: String, inviter_agent_id: String) {
     let Ok(mut expected) = state.expected_join_result_inviters.lock() else {
         tracing::warn!(
@@ -13182,7 +13270,7 @@ fn record_expected_join_result_inviter(state: &AppState, key: String, inviter_ag
         );
         return;
     };
-    expected.retain(|_, pending| pending.created_at.elapsed() < JOIN_RESULT_POLL_TIMEOUT);
+    expected.retain(|_, pending| pending.created_at.elapsed() < JOIN_RESULT_INVITER_RETENTION);
     expected.insert(
         key,
         ExpectedJoinResultInviter {
@@ -13199,7 +13287,7 @@ fn expected_join_result_inviter(state: &AppState, key: &str) -> Option<String> {
         );
         return None;
     };
-    expected.retain(|_, pending| pending.created_at.elapsed() < JOIN_RESULT_POLL_TIMEOUT);
+    expected.retain(|_, pending| pending.created_at.elapsed() < JOIN_RESULT_INVITER_RETENTION);
     expected
         .get(key)
         .map(|pending| pending.inviter_agent_id.clone())
@@ -13468,9 +13556,13 @@ pub(in crate::server) async fn apply_join_result_endpoint(
     // runs — not a creator gate.
     let expected_key = join_result_key(&group_id, &member_agent_id);
     let expected_inviter = expected_join_result_inviter(state.as_ref(), &expected_key);
-    if let Err(reason) =
-        validate_join_result_inviter(expected_inviter.as_deref(), &sender_hex, &actor)
-    {
+    let unconverged_stub = unconverged_local_stub_for_join_result(state.as_ref(), &group_id).await;
+    if let Err(reason) = validate_join_result_inviter(
+        expected_inviter.as_deref(),
+        &sender_hex,
+        &actor,
+        unconverged_stub,
+    ) {
         return api_error(
             StatusCode::FORBIDDEN,
             format!("join-result sender rejected: {reason}"),
@@ -13737,10 +13829,13 @@ pub(in crate::server) async fn handle_join_result_message(
             }
             let expected_key = join_result_key(&group_id, &member_agent_id);
             let expected_inviter = expected_join_result_inviter(state.as_ref(), &expected_key);
+            let unconverged_stub =
+                unconverged_local_stub_for_join_result(state.as_ref(), &group_id).await;
             if let Err(reason) = validate_join_result_inviter(
                 expected_inviter.as_deref(),
                 &sender_hex,
                 &inviter_agent_id,
+                unconverged_stub,
             ) {
                 tracing::warn!(
                     group_id = %LogHexId::group(&group_id),
@@ -18486,18 +18581,49 @@ mod tests {
         let other = "22".repeat(32);
 
         assert_eq!(
-            validate_join_result_inviter(None, &expected, &expected).unwrap_err(),
+            validate_join_result_inviter(None, &expected, &expected, false).unwrap_err(),
             "missing_expected_inviter"
         );
         assert_eq!(
-            validate_join_result_inviter(Some(&expected), &other, &expected).unwrap_err(),
+            validate_join_result_inviter(Some(&expected), &other, &expected, false).unwrap_err(),
             "unexpected_sender"
         );
         assert_eq!(
-            validate_join_result_inviter(Some(&expected), &expected, &other).unwrap_err(),
+            validate_join_result_inviter(Some(&expected), &expected, &other, false).unwrap_err(),
             "unexpected_actor"
         );
-        assert!(validate_join_result_inviter(Some(&expected), &expected, &expected).is_ok());
+        assert!(validate_join_result_inviter(Some(&expected), &expected, &expected, false).is_ok());
+    }
+
+    #[test]
+    fn unarmed_join_result_falls_back_to_stub_authority_only_for_unconverged_stubs() {
+        // The armed expected-inviter is in-memory: a joiner daemon restart
+        // mid-join (every Android app relaunch) loses it while the durable
+        // group stub survives. The owner's (re-served) result must still be
+        // acceptable for a join this node provably asked for — an
+        // unconverged local stub — where the fallback is delivery-shape
+        // (result delivered by its own author) plus the MemberAdded
+        // commit's full ML-DSA authority verification downstream. Without
+        // a stub, or with a sender that is not the commit's author, an
+        // unarmed result stays rejected.
+        let author = "33".repeat(32);
+        let relayer = "44".repeat(32);
+
+        assert!(validate_join_result_inviter(None, &author, &author, true).is_ok());
+        assert_eq!(
+            validate_join_result_inviter(None, &relayer, &author, true).unwrap_err(),
+            "missing_expected_inviter"
+        );
+        assert_eq!(
+            validate_join_result_inviter(None, &author, &author, false).unwrap_err(),
+            "missing_expected_inviter"
+        );
+        // The fallback never weakens ARMED validation: a mismatched sender
+        // is still rejected even for an unconverged stub.
+        assert_eq!(
+            validate_join_result_inviter(Some(&author), &relayer, &author, true).unwrap_err(),
+            "unexpected_sender"
+        );
     }
 
     #[test]
@@ -20656,6 +20782,167 @@ mod tests {
         assert_eq!(post_hash, pre_hash, "GroupInfo state hash preserved");
         assert_eq!(post_epoch, pre_epoch, "TreeKEM epoch preserved");
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn replayed_join_for_unconverged_treekem_stub_rearms_and_reannounces() -> Result<()> {
+        // A joiner whose first TreeKEM join never converged (owner slow to
+        // admit, joiner daemon restarted, relay bridge lost) retries with the
+        // same invite. Treating that retry as the issue-#188 idempotent no-op
+        // orphans the join permanently: the expected-inviter gate (in-memory,
+        // restart- and TTL-lossy) stays unarmed so the owner's eventual
+        // MemberAdded+Welcome is rejected as `missing_expected_inviter`, and
+        // no fresh MemberJoined reaches an owner that missed the first one.
+        // A retry against an UNCONVERGED stub must re-run the join; only a
+        // CONVERGED group keeps the idempotent `already_joined` no-op.
+        let (authority, _authority_dir) = secure_endpoint_test_state().await?;
+        let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+        let group_id = "7e".repeat(32);
+        let authority_id = authority.agent.agent_id();
+        let mut authority_info = x0x::groups::GroupInfo::with_policy(
+            "unconverged stub retry".to_string(),
+            String::new(),
+            authority_id,
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        authority_info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        authority_info.shared_secret = None;
+        authority_info.recompute_state_hash();
+
+        let mut invite = x0x::groups::invite::SignedInvite::new(
+            group_id.clone(),
+            authority_info.name.clone(),
+            &authority_id,
+            3600,
+        );
+        populate_invite_base_state_from_group_info(&mut invite, &authority_info);
+        let invite_link = invite.encode_link().expect("invite encodes under budget");
+        let parsed = x0x::groups::invite::SignedInvite::from_link(&invite_link)
+            .map_err(|e| anyhow::anyhow!("decode fixture invite: {e}"))?;
+        assert_eq!(
+            parsed.secure_plane,
+            Some(x0x::mls::SecureGroupPlane::TreeKem),
+            "fixture invite must exercise the TreeKEM join lane"
+        );
+        let stable_group_id = authority_info.stable_group_id().to_string();
+        let joiner_hex = hex::encode(joiner.agent.agent_id().as_bytes());
+        let expected_key = join_result_key(&stable_group_id, &joiner_hex);
+        let inviter_hex = hex::encode(authority_id.as_bytes());
+
+        // First join: creates the local stub and arms the gate.
+        let response = join_group_via_invite(
+            State(Arc::clone(&joiner)),
+            Json(JoinGroupRequest {
+                invite: invite_link.clone(),
+                display_name: None,
+            }),
+        )
+        .await
+        .into_response();
+        let (status, body) = response_json(response).await?;
+        assert_eq!(status, StatusCode::OK, "first join accepted, body: {body}");
+        assert!(
+            body["member_joined"].is_object(),
+            "first join surfaces the inline member_joined, body: {body}"
+        );
+
+        // The join never converges (no Welcome applied) and the daemon
+        // restarts: the in-memory expected-inviter arming is gone.
+        joiner
+            .expected_join_result_inviters
+            .lock()
+            .expect("expected-inviter map poisoned")
+            .clear();
+        NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+            .lock()
+            .expect("publish-attempt recorder poisoned")
+            .clear();
+
+        // Retry with the same invite against the unconverged stub.
+        let response = join_group_via_invite(
+            State(Arc::clone(&joiner)),
+            Json(JoinGroupRequest {
+                invite: invite_link.clone(),
+                display_name: None,
+            }),
+        )
+        .await
+        .into_response();
+        let (status, body) = response_json(response).await?;
+        assert_eq!(status, StatusCode::OK, "retry accepted, body: {body}");
+        assert_ne!(
+            body["already_joined"], true,
+            "retry against an unconverged stub must re-run the join, not no-op, body: {body}"
+        );
+        assert!(
+            body["member_joined"].is_object(),
+            "retry surfaces a fresh inline member_joined for the relay lane, body: {body}"
+        );
+        assert_eq!(
+            expected_join_result_inviter(joiner.as_ref(), &expected_key).as_deref(),
+            Some(inviter_hex.as_str()),
+            "retry re-arms the expected-inviter gate lost to the restart"
+        );
+        assert!(
+            !NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+                .lock()
+                .expect("publish-attempt recorder poisoned")
+                .is_empty(),
+            "retry re-announces MemberJoined so the owner can re-admit"
+        );
+
+        // Once converged (Welcome accepted installs TreeKEM state), the same
+        // replay becomes the issue-#188 idempotent no-op again.
+        let group_id_bytes = hex::decode(&group_id)?;
+        let seed = agent_treekem_seed(joiner.agent.as_ref(), &group_id_bytes);
+        let converged =
+            x0x::mls::TreeKemMlsGroup::create(group_id_bytes, joiner.agent.agent_id(), &seed)?;
+        joiner
+            .treekem_groups
+            .write()
+            .await
+            .insert(group_id.clone(), Arc::new(Mutex::new(converged)));
+        NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+            .lock()
+            .expect("publish-attempt recorder poisoned")
+            .clear();
+        let response = join_group_via_invite(
+            State(Arc::clone(&joiner)),
+            Json(JoinGroupRequest {
+                invite: invite_link,
+                display_name: None,
+            }),
+        )
+        .await
+        .into_response();
+        let (status, body) = response_json(response).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["already_joined"], true,
+            "converged replay stays the idempotent no-op, body: {body}"
+        );
+        assert!(
+            NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+                .lock()
+                .expect("publish-attempt recorder poisoned")
+                .is_empty(),
+            "converged replay must not re-publish MemberJoined"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn join_handshake_state_outlives_a_slow_counterparty() {
+        // The other half of a join is often a phone that admits (or reads its
+        // result) minutes-to-hours later. If either side's handshake state
+        // only lives as long as the joiner's active poll window, a late half
+        // orphans the join: the owner never re-stages for an already-active
+        // member, and the joiner rejects a result it no longer expects
+        // (`missing_expected_inviter`). Keep both retentions far above the
+        // poll window.
+        assert!(JOIN_RESULT_INVITER_RETENTION >= JOIN_RESULT_POLL_TIMEOUT.saturating_mul(60));
+        assert!(PENDING_JOIN_RESULT_TTL >= JOIN_RESULT_POLL_TIMEOUT.saturating_mul(60));
     }
 
     fn direct_send_test_request(agent_id: String, payload: String) -> DirectSendRequest {
