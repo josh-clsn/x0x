@@ -2538,6 +2538,19 @@ impl Agent {
     /// unit tests). Exposed through `GET /diagnostics/gossip` on x0xd so
     /// that E2E harnesses can assert zero drops between publish and
     /// subscriber delivery.
+    /// Apply the leaf relay policy to this agent's gossip runtime.
+    ///
+    /// A leaf publishes, receives, and relays for its own topics but stops
+    /// relaying for topics no local subscriber wants — the duty whose cost
+    /// scales with the whole network rather than this node's use. No-op when
+    /// the agent has no gossip runtime. See
+    /// `saorsa_gossip_pubsub::PlumtreePubSub::set_leaf_mode`.
+    pub fn set_leaf_mode(&self, enabled: bool) {
+        if let Some(rt) = self.gossip_runtime.as_ref() {
+            rt.pubsub().set_leaf_mode(enabled);
+        }
+    }
+
     #[must_use]
     pub fn gossip_stats(&self) -> Option<gossip::PubSubStatsSnapshot> {
         self.gossip_runtime.as_ref().map(|rt| rt.pubsub().stats())

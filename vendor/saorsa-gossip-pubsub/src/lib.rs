@@ -40,7 +40,7 @@ use saorsa_gossip_types::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
@@ -3591,9 +3591,49 @@ pub struct PlumtreePubSub<T: GossipTransport + 'static> {
     /// thresholds are not yet wired into mesh-selection or admission
     /// decisions (that integration is X0X-0071b).
     peer_scoring: Arc<peer_scoring::PeerScoring>,
+    /// fetch>it leaf policy: when set, this node stops acting as a
+    /// pass-through relay for topics it has no local subscriber for.
+    ///
+    /// Default `false` — stock behaviour, every node forwards everything so
+    /// messages propagate through intermediate hops. Metered devices
+    /// (phones, laptops on hotspots) set it: forwarding strangers' traffic
+    /// is what made one test phone push gigabytes a day. See
+    /// [`Self::set_leaf_mode`] for the exact contract and its limits.
+    leaf_mode: Arc<AtomicBool>,
 }
 
 impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
+    /// Enable or disable the fetch>it leaf policy (default: disabled).
+    ///
+    /// A leaf keeps full first-party behaviour — it publishes, and it
+    /// receives and delivers everything on topics it subscribed to. What it
+    /// stops doing is *relaying on behalf of the network*: for a topic with
+    /// no live local subscriber it will not re-broadcast an EAGER payload to
+    /// its own mesh, and it will not spend an IWANT pulling a payload it has
+    /// no one to deliver to.
+    ///
+    /// # Limits (deliberate, and load-bearing to understand)
+    ///
+    /// This is a *send-side* policy. The wire protocol here carries only
+    /// `Eager`/`IHave`/`IWant`/`AntiEntropy` — there is no PRUNE frame, so a
+    /// node cannot tell its peers "stop pushing this topic at me". Inbound
+    /// EAGER for unsubscribed topics therefore still arrives, and only
+    /// declines indirectly as peers' own mesh maintenance demotes a node
+    /// that never forwards. Cutting inbound outright needs a wire addition
+    /// negotiated on both sides.
+    ///
+    /// Full nodes must leave this off: a network of leaves cannot propagate
+    /// messages past their subscribers.
+    pub fn set_leaf_mode(&self, enabled: bool) {
+        self.leaf_mode.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Whether the leaf policy is active. See [`Self::set_leaf_mode`].
+    #[must_use]
+    pub fn leaf_mode(&self) -> bool {
+        self.leaf_mode.load(Ordering::Relaxed)
+    }
+
     /// Create a new Plumtree pub/sub instance
     ///
     /// # Arguments
@@ -3667,6 +3707,7 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             peer_health_oracle: Arc::new(StdRwLock::new(None)),
             admission: Arc::new(admission::AdmissionControl::new()),
             peer_scoring: Arc::new(peer_scoring::PeerScoring::new()),
+            leaf_mode: Arc::new(AtomicBool::new(false)),
         };
 
         if start_background_tasks {
@@ -5319,13 +5360,27 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
             self.peer_scoring.note_mesh_join(topic, from);
         }
 
-        // Forward to eager_peers (except sender)
-        let eager_peers: Vec<PeerId> = state
-            .eager_peers
-            .iter()
-            .filter(|&&p| p != from)
-            .copied()
-            .collect();
+        // Forward to eager_peers (except sender). A leaf does not relay for
+        // topics nobody here is listening to — that pass-through duty is the
+        // bulk of a metered device's upload. Locally prune the sender too:
+        // it keeps our own mesh from treating this topic as eager. (We
+        // cannot stop the sender from pushing; see `set_leaf_mode`.)
+        let passthrough_for_leaf = self.leaf_mode.load(Ordering::Relaxed)
+            && !state.has_live_subscribers();
+        let eager_peers: Vec<PeerId> = if passthrough_for_leaf {
+            if state.prune_peer(from) {
+                self.stage_stats.record_prune();
+                self.peer_scoring.record_mesh_pruned(topic, from);
+            }
+            Vec::new()
+        } else {
+            state
+                .eager_peers
+                .iter()
+                .filter(|&&p| p != from)
+                .copied()
+                .collect()
+        };
 
         // Batch msg_id to pending_ihave for lazy_peers
         state.pending_ihave.push(msg_id);
@@ -5411,9 +5466,20 @@ impl<T: GossipTransport + 'static> PlumtreePubSub<T> {
 
         let mut requested = Vec::new();
 
+        // A leaf does not pull payloads it has no one to deliver to: an
+        // IWANT here would fetch a full message purely to relay it onward,
+        // which is the duty leaves opt out of. Announcements for subscribed
+        // topics are still requested normally.
+        let leaf_skips_pull =
+            self.leaf_mode.load(Ordering::Relaxed) && !state.has_live_subscribers();
+
         for msg_id in msg_ids {
             // Skip if we have it
             if state.has_message(&msg_id) {
+                continue;
+            }
+
+            if leaf_skips_pull {
                 continue;
             }
 
@@ -7072,6 +7138,79 @@ mod tests {
         let transport = test_transport().await;
         let signing_key = test_signing_key();
         let _pubsub = PlumtreePubSub::new(peer_id, transport, signing_key);
+    }
+
+    /// Relaying for the whole network is the default and must stay that way:
+    /// a network of leaves cannot propagate messages past their own
+    /// subscribers. Only a metered device opts out.
+    #[tokio::test]
+    async fn leaf_mode_is_off_unless_asked_for() {
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            test_peer_id(1),
+            test_transport().await,
+            test_signing_key(),
+            false,
+        );
+        assert!(!pubsub.leaf_mode(), "stock nodes relay for the network");
+        pubsub.set_leaf_mode(true);
+        assert!(pubsub.leaf_mode());
+        pubsub.set_leaf_mode(false);
+        assert!(!pubsub.leaf_mode(), "leaf policy is reversible at runtime");
+    }
+
+    /// The leaf contract, stated as behaviour: a topic WE subscribed to is
+    /// unaffected (we still relay for our own conversations, so our peers'
+    /// messages reach the rest of the group); a topic with no local
+    /// subscriber is where a leaf stops carrying freight. Forwarding is
+    /// keyed on `has_live_subscribers`, so a closed receiver flips a topic
+    /// to unsubscribed exactly as an explicit unsubscribe would.
+    #[tokio::test]
+    async fn leaf_forwards_only_for_topics_with_live_subscribers() {
+        let pubsub = PlumtreePubSub::new_with_task_control(
+            test_peer_id(1),
+            test_transport().await,
+            test_signing_key(),
+            false,
+        );
+        pubsub.set_leaf_mode(true);
+
+        let mine = TopicId::new([1u8; 32]);
+        let strangers = TopicId::new([2u8; 32]);
+        // `subscribe` registers asynchronously; `subscribe_ready` awaits the
+        // registration. The leaf gate reads subscriber state on the inbound
+        // hot path, so the test must observe the settled state, not the race.
+        let rx = pubsub.subscribe_ready(mine).await;
+
+        {
+            let mut topics = pubsub.topics.write_topic(&mine).await;
+            let state = topics.entry(mine).or_insert_with(TopicState::new);
+            assert!(
+                state.has_live_subscribers(),
+                "a subscribed topic must read as subscribed -- this is the \
+                 signal the leaf forward gate keys on"
+            );
+        }
+        {
+            let mut topics = pubsub.topics.write_topic(&strangers).await;
+            let state = topics.entry(strangers).or_insert_with(TopicState::new);
+            assert!(
+                !state.has_live_subscribers(),
+                "a topic we never subscribed to carries no local subscriber, \
+                 so a leaf must not relay it"
+            );
+        }
+
+        // Dropping the receiver retires the topic: the leaf stops relaying
+        // for a conversation nobody is listening to anymore.
+        drop(rx);
+        {
+            let mut topics = pubsub.topics.write_topic(&mine).await;
+            let state = topics.entry(mine).or_insert_with(TopicState::new);
+            assert!(
+                !state.has_live_subscribers(),
+                "a dropped subscription must retire the topic for the leaf gate"
+            );
+        }
     }
 
     #[tokio::test]
