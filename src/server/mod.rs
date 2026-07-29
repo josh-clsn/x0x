@@ -663,12 +663,24 @@ pub async fn serve_with_options(
         ensure_named_group_listeners(Arc::clone(&state), &group_id).await;
     }
 
-    // P0-1: subscribe to the global group discovery topic so remote public
-    // groups populate the local card cache without manual import.
-    bg_tasks.extend(spawn_global_discovery_listener(Arc::clone(&state)).await);
-    // Phase C.2: load persisted shard subscriptions and re-subscribe with
-    // staggered jitter to avoid anti-entropy storms.
-    bg_tasks.extend(spawn_directory_resubscribe(Arc::clone(&state)).await);
+    if config.leaf_mode {
+        // Leaf mode: the global discovery topic, directory tag shards, and
+        // the global public-message fallback (below) are network-serving
+        // duties whose traffic scales with the whole mesh — a metered
+        // device opts out. First-party surfaces (own groups, own inbox,
+        // contact channels) are unaffected.
+        tracing::info!(
+            "leaf mode: skipping global discovery, directory shard, and \
+             global public-message subscriptions"
+        );
+    } else {
+        // P0-1: subscribe to the global group discovery topic so remote public
+        // groups populate the local card cache without manual import.
+        bg_tasks.extend(spawn_global_discovery_listener(Arc::clone(&state)).await);
+        // Phase C.2: load persisted shard subscriptions and re-subscribe with
+        // staggered jitter to avoid anti-entropy storms.
+        bg_tasks.extend(spawn_directory_resubscribe(Arc::clone(&state)).await);
+    }
     // Restart-amnesia fix: load the persisted task-list/kv-store subscription
     // manifest now (before REST handlers can mutate it) — the actual
     // re-create/re-join runs after `join_network` in the join task below.
@@ -678,7 +690,12 @@ pub async fn serve_with_options(
     bg_tasks.extend(spawn_listed_to_contacts_listener(Arc::clone(&state)).await);
     // Phase E: subscribe to a stable global SignedPublic message fallback so
     // first messages are not dependent on a brand-new per-group topic tree.
-    bg_tasks.extend(spawn_global_public_message_listener(Arc::clone(&state)).await);
+    // Leaf nodes skip it (see the leaf-mode block above): it is a shared
+    // whole-network topic, and fetch>it-style leafs use private per-group
+    // messaging, not the public first-message fallback.
+    if !config.leaf_mode {
+        bg_tasks.extend(spawn_global_public_message_listener(Arc::clone(&state)).await);
+    }
 
     // Re-publish our own discoverable group cards after startup so late joiners
     // pick them up.
@@ -746,6 +763,7 @@ pub async fn serve_with_options(
         dm_inbox_exec_route_tx,
         dm_inbox_group_public_route_tx,
         dm_inbox_kv_store_delta_route_tx,
+        config.leaf_mode,
     )));
 
     // Restart-amnesia fix: re-register every persisted task-list/kv-store
@@ -1612,15 +1630,17 @@ async fn start_dm_inbox_when_gossip_ready(
     exec_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     group_public_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     kv_store_delta_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
+    leaf_mode: bool,
 ) {
     for attempt in 1..=DM_INBOX_START_MAX_ATTEMPTS {
-        let dm_inbox_config = x0x::dm_inbox::DmInboxConfig::default()
+        let mut dm_inbox_config = x0x::dm_inbox::DmInboxConfig::default()
             .with_typed_payload_route(x0x::exec::EXEC_DM_PREFIX, exec_route_tx.clone())
             .with_typed_payload_route(
                 GROUP_PUBLIC_MESSAGE_DM_PREFIX,
                 group_public_route_tx.clone(),
             )
             .with_typed_payload_route(KV_STORE_DELTA_DM_PREFIX, kv_store_delta_route_tx.clone());
+        dm_inbox_config.skip_legacy_bus = leaf_mode;
         match agent
             .start_dm_inbox(Arc::clone(&kem_keypair), dm_inbox_config)
             .await
