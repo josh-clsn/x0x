@@ -354,6 +354,17 @@ impl PubSubManager {
         })
     }
 
+    /// Apply the leaf relay policy to the underlying PlumTree (default off).
+    ///
+    /// A leaf still publishes, receives, and relays for its OWN topics; it
+    /// stops relaying for topics no local subscriber wants. See
+    /// `PlumtreePubSub::set_leaf_mode` for the contract and its limit (it is
+    /// send-side only — the wire has no PRUNE frame, so inbound still
+    /// arrives). Set from `DaemonConfig::leaf_mode`.
+    pub fn set_leaf_mode(&self, enabled: bool) {
+        self.plumtree.set_leaf_mode(enabled);
+    }
+
     /// Snapshot of drop-detection counters for the gossip pipeline.
     ///
     /// Surfaced at `GET /diagnostics/gossip` — deltas between stages are the

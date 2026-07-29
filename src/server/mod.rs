@@ -669,9 +669,17 @@ pub async fn serve_with_options(
         // duties whose traffic scales with the whole mesh — a metered
         // device opts out. First-party surfaces (own groups, own inbox,
         // contact channels) are unaffected.
+        //
+        // The subscription trim alone is only part of the cost: PlumTree
+        // nodes also relay EAGER payloads for topics they never subscribed
+        // to (pass-through, so messages propagate past intermediate hops).
+        // Measured 2026-07-28, that pass-through traffic dominated. This
+        // turns it off for unsubscribed topics too.
+        state.agent.set_leaf_mode(true);
         tracing::info!(
             "leaf mode: skipping global discovery, directory shard, and \
-             global public-message subscriptions"
+             global public-message subscriptions; not relaying pass-through \
+             topics"
         );
     } else {
         // P0-1: subscribe to the global group discovery topic so remote public
