@@ -232,6 +232,19 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub bootstrap_peers: Option<Vec<SocketAddr>>,
 
+    /// Leaf mode for metered or battery-constrained devices (phones,
+    /// laptops on hotspots). A leaf node keeps every first-party surface —
+    /// its own DM inbox, its own groups, contact channels, the full REST
+    /// API — but opts out of network-serving gossip duties whose traffic
+    /// scales with the whole network rather than this node's use: the
+    /// shared legacy DM bus, the global group-discovery topic, persisted
+    /// directory tag-shard subscriptions, and the global public-message
+    /// fallback. Protocol-compatible with full nodes: a leaf is
+    /// indistinguishable from a node that simply never joined those
+    /// topics. Default `false` (full mesh duty).
+    #[serde(default)]
+    pub leaf_mode: bool,
+
     /// X0X-0062 reviewer P2 #2: enable or disable ant-quic's best-effort
     /// UPnP IGD port-mapping. Default `true` (matches ant-quic). Set to
     /// `false` in the daemon TOML (`port_mapping_enabled = false`) or via
@@ -592,6 +605,7 @@ impl Default for DaemonConfig {
             forward: x0x::forward::ForwardConfig::default(),
             network_id: None,
             zero_peer_restart_secs: None,
+            leaf_mode: false,
         }
     }
 }
@@ -879,6 +893,22 @@ mod tests {
         let cfg: DaemonConfig =
             toml::from_str("network_id = 'x0x.testnet'").expect("network_id TOML parses");
         assert_eq!(cfg.network_id.as_deref(), Some("x0x.testnet"));
+    }
+
+    #[test]
+    fn leaf_mode_defaults_off_and_parses_from_toml() {
+        // Full mesh duty must stay the default: leaf mode drops
+        // network-serving subscriptions, and an existing deployment that
+        // upgrades without touching its config must keep serving.
+        let cfg: DaemonConfig =
+            toml::from_str("bind_address = '[::]:5483'").expect("minimal TOML parses");
+        assert!(!cfg.leaf_mode);
+        assert!(!DaemonConfig::default().leaf_mode);
+
+        // A metered device opts in with one key.
+        let cfg: DaemonConfig =
+            toml::from_str("leaf_mode = true").expect("leaf_mode TOML parses");
+        assert!(cfg.leaf_mode);
     }
 
     // The two canonical messages enforced by `InstanceName::try_from`.
