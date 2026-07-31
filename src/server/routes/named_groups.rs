@@ -6076,11 +6076,356 @@ async fn apply_named_group_metadata_event_inner_serialized(
                 return false;
             }
 
-            // 7. Idempotent — if the joiner is already active, a replayed
-            //    MemberJoined after the inviter committed the add is a no-op and
-            //    must not consume any fresh invite record.
+            // 7. Already-active joiner. Two cases:
+            //    a) Genuine replay — a MemberJoined that arrives after the
+            //       inviter already committed the add. No-op; must not consume
+            //       a fresh invite.
+            //    b) Returning-member re-key — the member reinstalled / lost
+            //       local TreeKEM state and re-issues MemberJoined with a NEW
+            //       KeyPackage + a fresh single-use invite. They stay
+            //       roster-active but keyless until we re-key. Perform an MLS
+            //       remove+add at the current epoch so they receive a fresh
+            //       Welcome. Self-authorized: MemberJoined is signed by the
+            //       joiner agent key, and the fresh admin-issued invite gate
+            //       still applies.
             if info.has_active_member(&member_agent_id) {
-                return false;
+                let stored_kp_b64 = info
+                    .members_v2
+                    .get(&member_agent_id)
+                    .and_then(|m| m.treekem_key_package_b64.clone());
+                let is_rekey = info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+                    && match (&stored_kp_b64, &treekem_key_package_b64) {
+                        // A NEW KeyPackage from an active member signals a
+                        // returning member that lost local TreeKEM state.
+                        (Some(stored), Some(incoming)) => stored != incoming,
+                        _ => false,
+                    };
+                if !is_rekey {
+                    // Genuine replay / no new KeyPackage: no-op, consume nothing.
+                    return false;
+                }
+
+                let signing_kp = state.agent.identity().agent_keypair();
+                let now_ms = now_millis_u64();
+                let mut next = info.clone();
+
+                // Authorization: consume the fresh single-use invite (same gate
+                // as the fresh-add path). `consume_issued_invite` has no
+                // already-member guard, so a re-key still requires a valid,
+                // unconsumed, in-window invite.
+                if let Err(reason) = next.consume_issued_invite(
+                    &invite_secret,
+                    &member_agent_id,
+                    role,
+                    ts_ms,
+                    now_ms,
+                ) {
+                    if reason == "invite_secret_unknown" {
+                        state
+                            .groups_diagnostics
+                            .record_member_joined_rejected_invite_secret_unknown(
+                                &resolved_group_key,
+                            );
+                    }
+                    tracing::debug!(
+                        group_id = %LogHexId::group(&resolved_group_key),
+                        member = %LogHexId::agent(&member_agent_id),
+                        reason,
+                        "MemberJoined re-key: invite validation failed"
+                    );
+                    return false;
+                }
+
+                // Decode the stored (stale) and incoming (fresh) KeyPackages.
+                let Some(stored_kp_b64) = stored_kp_b64 else {
+                    return false;
+                };
+                let stored_kp_bytes = match BASE64.decode(&stored_kp_b64) {
+                    Ok(b) => b,
+                    Err(_) => return false,
+                };
+                let Some(new_kp_b64) = treekem_key_package_b64.clone() else {
+                    return false;
+                };
+                let new_kp_bytes = match BASE64.decode(&new_kp_b64) {
+                    Ok(b) => b,
+                    Err(_) => return false,
+                };
+                let member_id = match parse_agent_id_hex(&member_agent_id) {
+                    Ok(id) => id,
+                    Err(_) => return false,
+                };
+
+                // The incoming member-signed join event doubles as the recovery
+                // record for the FRESH KeyPackage (same construction as the
+                // fresh-add path) — it feeds the add commit's security binding
+                // and, attested, the member key-package recovery cache.
+                let rekey_recovery = NamedGroupMetadataEvent::MemberJoined {
+                    group_id: group_id.clone(),
+                    stable_group_id: stable_group_id.clone(),
+                    member_agent_id: member_agent_id.clone(),
+                    member_public_key_b64: member_public_key_b64.clone(),
+                    role,
+                    display_name: display_name.clone(),
+                    inviter_agent_id: inviter_agent_id.clone(),
+                    invite_secret: invite_secret.clone(),
+                    ts_ms,
+                    treekem_key_package_b64: Some(new_kp_b64.clone()),
+                    recovery_authority_agent_id: None,
+                    recovery_authority_public_key_b64: None,
+                    recovery_authority_signature_b64: None,
+                    recovery_authority_commit: None,
+                    signature_b64: signature_b64.clone(),
+                };
+
+                let group = {
+                    let map = state.treekem_groups.read().await;
+                    map.get(&resolved_group_key).cloned()
+                };
+                let Some(group) = group else {
+                    return false;
+                };
+                let mut guard = group.lock().await;
+                let rollback_snapshot = match guard.to_snapshot_bytes() {
+                    Ok(snapshot) => snapshot,
+                    Err(e) => {
+                        tracing::warn!(
+                            group_id = %LogHexId::group(&resolved_group_key),
+                            member = %LogHexId::agent(&member_agent_id),
+                            "MemberJoined re-key: failed to snapshot TreeKEM group: {e}"
+                        );
+                        return false;
+                    }
+                };
+
+                // Seal BOTH state commits BEFORE mutating the live TreeKEM
+                // tree. seal_commit is fallible (signing); doing both seals
+                // first means the only fallible steps left between the two
+                // live tree mutations are the mutations themselves, and those
+                // roll back from the snapshot above.
+                let expected1 = guard.epoch().saturating_add(1);
+                let expected2 = expected1.saturating_add(1);
+
+                // Commit 1: roster with the stale KP removed, sealed at
+                // epoch +1. Removes carry the plain epoch binding.
+                next.roster_revision = next.roster_revision.saturating_add(1);
+                next.secret_epoch = expected1;
+                next.security_binding = Some(format!("treekem:epoch={expected1}"));
+                let commit1 = match next.seal_commit(signing_kp, now_ms) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(
+                            group_id = %LogHexId::group(&resolved_group_key),
+                            member = %LogHexId::agent(&member_agent_id),
+                            "MemberJoined re-key: failed to seal remove commit: {e}"
+                        );
+                        return false;
+                    }
+                };
+                let revision1 = next.roster_revision;
+
+                // Commit 2: roster with the fresh KP, sealed at epoch +2 with
+                // the recovery binding (same discipline as the fresh-add path).
+                next.set_member_treekem_key_package(&member_agent_id, new_kp_b64.clone());
+                next.roster_revision = next.roster_revision.saturating_add(1);
+                next.secret_epoch = expected2;
+                let Some(binding) = treekem_recovery_security_binding(expected2, &rekey_recovery)
+                else {
+                    return false;
+                };
+                next.security_binding = Some(binding);
+                let commit2 = match next.seal_commit(signing_kp, now_ms) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(
+                            group_id = %LogHexId::group(&resolved_group_key),
+                            member = %LogHexId::agent(&member_agent_id),
+                            "MemberJoined re-key: failed to seal add commit: {e}"
+                        );
+                        return false;
+                    }
+                };
+                let revision2 = next.roster_revision;
+
+                // Now mutate the live TreeKEM tree back-to-back: remove the
+                // stale leaf (epoch +1) then add the fresh KeyPackage
+                // (epoch +2). Any failure restores the pre-re-key snapshot.
+                let tk_remove = match guard.remove_member_verified(member_id, &stored_kp_bytes) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(
+                            group_id = %LogHexId::group(&resolved_group_key),
+                            member = %LogHexId::agent(&member_agent_id),
+                            "MemberJoined re-key: remove_member_verified failed: {e}"
+                        );
+                        return false;
+                    }
+                };
+                if guard.epoch() != expected1 {
+                    rollback_treekem_group_after_failed_install(
+                        state,
+                        &resolved_group_key,
+                        &info,
+                        &rollback_snapshot,
+                        &mut guard,
+                        "member_rekey_remove",
+                    );
+                    return false;
+                }
+                let out = match guard.add_member(member_id, &new_kp_bytes) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        rollback_treekem_group_after_failed_install(
+                            state,
+                            &resolved_group_key,
+                            &info,
+                            &rollback_snapshot,
+                            &mut guard,
+                            "member_rekey_add",
+                        );
+                        tracing::warn!(
+                            group_id = %LogHexId::group(&resolved_group_key),
+                            member = %LogHexId::agent(&member_agent_id),
+                            "MemberJoined re-key: add_member failed: {e}"
+                        );
+                        return false;
+                    }
+                };
+                if guard.epoch() != expected2 {
+                    rollback_treekem_group_after_failed_install(
+                        state,
+                        &resolved_group_key,
+                        &info,
+                        &rollback_snapshot,
+                        &mut guard,
+                        "member_rekey_add",
+                    );
+                    return false;
+                }
+
+                // Persist ONCE after both commits, then expose the roster.
+                if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
+                    state,
+                    &resolved_group_key,
+                    next.clone(),
+                    &guard,
+                )
+                .await
+                {
+                    rollback_treekem_group_after_failed_install(
+                        state,
+                        &resolved_group_key,
+                        &info,
+                        &rollback_snapshot,
+                        &mut guard,
+                        "member_rekey_persist",
+                    );
+                    tracing::error!(
+                        group_id = %LogHexId::group(&resolved_group_key),
+                        "MemberJoined re-key: failed to persist TreeKEM snapshot: {e}"
+                    );
+                    return false;
+                }
+                let metadata_topic = next.metadata_topic.clone();
+                let event_group_id = next.stable_group_id().to_string();
+                if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
+                    return false;
+                }
+                save_named_groups(state).await;
+                state
+                    .groups_diagnostics
+                    .record_member_joined(&resolved_group_key);
+
+                // Attest + cache the fresh KeyPackage's recovery record against
+                // the ADD commit so a future removal of this member works from
+                // the re-keyed leaf, not the stale one.
+                match attest_member_joined_recovery_event(&rekey_recovery, signing_kp, &commit2) {
+                    Ok(attested) => {
+                        cache_treekem_member_key_package(
+                            state,
+                            join_result_key(&group_id, &member_agent_id),
+                            attested,
+                            true,
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            group_id = %LogHexId::group(&resolved_group_key),
+                            "MemberJoined re-key: failed to attest recovery record: {e}"
+                        );
+                    }
+                }
+
+                // Stage the Welcome from the SECOND (add) commit only — it
+                // carries the joiner's fresh TreeKEM state at epoch +2.
+                let welcome_ref = Some(
+                    stage_treekem_welcome(state, &event_group_id, &member_agent_id, out.welcome)
+                        .await,
+                );
+
+                // Build + publish + deliver BOTH commits IN ORDER: remove @ +1,
+                // then add @ +2, so existing members' trees advance +1 then +1.
+                let removed_event = NamedGroupMetadataEvent::MemberRemoved {
+                    group_id: event_group_id.clone(),
+                    revision: revision1,
+                    actor: inviter_agent_id.clone(),
+                    agent_id: member_agent_id.clone(),
+                    treekem_commit_b64: Some(BASE64.encode(&tk_remove)),
+                    treekem_epoch: Some(expected1),
+                    commit: Some(commit1),
+                };
+                let added_event = NamedGroupMetadataEvent::MemberAdded {
+                    group_id: event_group_id.clone(),
+                    revision: revision2,
+                    actor: inviter_agent_id.clone(),
+                    agent_id: member_agent_id.clone(),
+                    display_name: display_name.clone(),
+                    treekem_commit_b64: Some(BASE64.encode(&out.commit)),
+                    treekem_welcome_b64: None,
+                    welcome_ref,
+                    treekem_epoch: Some(expected2),
+                    treekem_key_package_hash: next
+                        .members_v2
+                        .get(&member_agent_id)
+                        .and_then(|member| member.treekem_key_package_hash.clone()),
+                    member_joined_recovery: None,
+                    member_recovery_history: Vec::new(),
+                    commit: Some(commit2),
+                };
+
+                // Only the ADD is the joiner's poll-able join-result (it
+                // carries the Welcome at epoch +2).
+                stage_join_result(
+                    state,
+                    &event_group_id,
+                    &member_agent_id,
+                    added_event.clone(),
+                )
+                .await;
+
+                publish_named_group_metadata_event(state, &metadata_topic, &removed_event).await;
+                remember_treekem_membership_event(state, &removed_event).await;
+                publish_named_group_metadata_event(state, &metadata_topic, &added_event).await;
+                remember_treekem_membership_event(state, &added_event).await;
+                spawn_named_group_event_delivery_to_active_members(
+                    state,
+                    &next,
+                    &removed_event,
+                    std::slice::from_ref(&member_agent_id),
+                );
+                spawn_named_group_event_delivery_to_active_members(
+                    state,
+                    &next,
+                    &added_event,
+                    std::slice::from_ref(&member_agent_id),
+                );
+                tracing::info!(
+                    group_id = %LogHexId::group(&resolved_group_key),
+                    member = %LogHexId::agent(&member_agent_id),
+                    "MemberJoined: re-keyed returning member (remove+add, epoch+2)"
+                );
+                return true;
             }
 
             // 8. Build the authoritative committed add on a clone first. If
