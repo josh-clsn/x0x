@@ -861,8 +861,7 @@ mod tests {
         assert!(!DaemonConfig::default().leaf_mode);
 
         // A metered device opts in with one key.
-        let cfg: DaemonConfig =
-            toml::from_str("leaf_mode = true").expect("leaf_mode TOML parses");
+        let cfg: DaemonConfig = toml::from_str("leaf_mode = true").expect("leaf_mode TOML parses");
         assert!(cfg.leaf_mode);
     }
 
