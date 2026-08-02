@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 150,
+  "endpoint_count": 152,
   "endpoints": [
     {
       "category": "status",
@@ -161,6 +161,20 @@
       "description": "Bootstrap peer cache stats",
       "method": "GET",
       "path": "/network/bootstrap-cache"
+    },
+    {
+      "category": "network",
+      "cli_name": "mesh join",
+      "description": "Dial the gossip mesh (bootstrap phases)",
+      "method": "POST",
+      "path": "/mesh/join"
+    },
+    {
+      "category": "network",
+      "cli_name": "mesh quiesce",
+      "description": "Disconnect all mesh peers without stopping the daemon",
+      "method": "POST",
+      "path": "/mesh/quiesce"
     },
     {
       "category": "network",

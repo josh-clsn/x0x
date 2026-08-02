@@ -52,13 +52,13 @@ use routes::{
     list_machines, list_mls_groups, list_named_groups, list_revocations, list_task_lists,
     list_tasks, load_causal_approval_queue, load_named_groups, load_predecessor_relay_outbox,
     load_treekem_member_key_packages, machine_for_agent_handler, machines_by_user_handler,
-    mls_decrypt, mls_encrypt, named_group_metadata_event_group_id, named_group_metadata_event_kind,
-    network_status, now_millis_u64, peer_health_handler, peers, pin_machine, presence,
-    presence_find, presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
-    publish_group_card_to_discovery, put_kv_value, quick_trust, recover_treekem_named_journals,
-    reject_join_request, remove_mls_member, remove_named_group_member,
-    replay_pending_causal_approvals, restore_treekem_groups, revoke_contact,
-    run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
+    mesh_join, mesh_quiesce, mls_decrypt, mls_encrypt, named_group_metadata_event_group_id,
+    named_group_metadata_event_kind, network_status, now_millis_u64, peer_health_handler, peers,
+    pin_machine, presence, presence_find, presence_foaf, presence_online, presence_status,
+    probe_peer_handler, publish, publish_group_card_to_discovery, put_kv_value, quick_trust,
+    recover_treekem_named_journals, reject_join_request, remove_mls_member,
+    remove_named_group_member, replay_pending_causal_approvals, restore_treekem_groups,
+    revoke_contact, run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
     save_named_groups_checked, save_named_groups_checked_unlocked,
     save_predecessor_relay_outbox_unlocked, seal_group_state, secure_group_decrypt,
     secure_group_encrypt, secure_group_reseal, secure_open_envelope_adversarial,
@@ -841,6 +841,7 @@ pub async fn serve_with_options(
     let join_agent = Arc::clone(&agent);
     let rendezvous_enabled = config.rendezvous_enabled;
     let rendezvous_validity_ms = config.rendezvous_validity_ms;
+    let defer_mesh_join = config.defer_mesh_join;
 
     // Start the DM inbox as soon as join_network has created the gossip
     // runtime. join_network may keep working through slow bootstrap/cache
@@ -880,7 +881,18 @@ pub async fn serve_with_options(
         crdt_subscriptions::rehydrate(crdt_rehydrate_state).await;
     }));
     bg_tasks.push(tokio::spawn(async move {
-        match join_agent.join_network().await {
+        // Infra (gossip runtime + listeners) always starts, even when the
+        // mesh dial is deferred: a quiesced embedder still serves every
+        // local surface and must be ready for a later `POST /mesh/join`.
+        if let Err(e) = join_agent.start_network_infra().await {
+            tracing::error!("Failed to start network infra: {e}");
+            return;
+        }
+        if defer_mesh_join {
+            tracing::info!("mesh join deferred (defer_mesh_join): POST /mesh/join to dial");
+            return;
+        }
+        match join_agent.dial_bootstrap().await {
             Ok(()) => {
                 tracing::info!("Network joined");
                 if rendezvous_enabled {
@@ -1498,6 +1510,9 @@ pub async fn serve_with_options(
         // Upgrade
         .route("/upgrade", get(check_upgrade))
         .route("/upgrade/apply", post(apply_upgrade))
+        // Runtime mesh membership (no-teardown mesh flips for embedders)
+        .route("/mesh/join", post(mesh_join))
+        .route("/mesh/quiesce", post(mesh_quiesce))
         // Network diagnostics
         .route("/network/bootstrap-cache", get(bootstrap_cache_stats))
         .route("/diagnostics/connectivity", get(connectivity_diagnostics))

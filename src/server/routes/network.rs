@@ -136,6 +136,46 @@ pub(in crate::server) async fn peers(State(state): State<Arc<AppState>>) -> impl
     }
 }
 
+/// POST /mesh/join — dial the gossip mesh at runtime (bootstrap phases).
+///
+/// The mesh-on half of the no-teardown mesh flip: embedders (the fetch>it
+/// mobile shell) serve once with `defer_mesh_join = true` and dial here when
+/// the user goes mesh-on, instead of re-serving the daemon — re-serving
+/// orphaned saorsa-gossip-pubsub tasks (no shutdown API) into a hot failure
+/// loop. The dial is spawned, not awaited: the bootstrap phases retry with
+/// 10/15 s backoff rounds and can take tens of seconds, far too long to hold
+/// a control-plane request open. `/network/status` shows the resulting peer
+/// count.
+pub(in crate::server) async fn mesh_join(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let agent = Arc::clone(&state.agent);
+    tokio::spawn(async move {
+        if let Err(e) = agent.dial_bootstrap().await {
+            tracing::error!("mesh join failed: {e}");
+        }
+    });
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "status": "dialing" })),
+    )
+}
+
+/// POST /mesh/quiesce — disconnect every mesh peer; the daemon stays up.
+///
+/// The mesh-off half of the no-teardown mesh flip (see `mesh_join`). Awaited
+/// directly: the sweep is a bounded loop over currently connected peers, not
+/// a dial schedule. Returns the number of peers disconnected.
+pub(in crate::server) async fn mesh_quiesce(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    match state.agent.quiesce_mesh().await {
+        Ok(disconnected) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "disconnected": disconnected })),
+        ),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
+    }
+}
+
 /// GET /network/bootstrap-cache — bootstrap peer cache statistics.
 pub(in crate::server) async fn bootstrap_cache_stats(
     State(state): State<Arc<AppState>>,

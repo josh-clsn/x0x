@@ -39,3 +39,8 @@ GET /gui
 
 # ── Admin/daemon — intentionally absent from end-user GUI ──
 POST /shutdown
+
+# ── Runtime mesh flips — embedder control surface (fetch>it mobile shell
+# flips mesh mode over REST); not a browser-GUI concern ──
+POST /mesh/join
+POST /mesh/quiesce

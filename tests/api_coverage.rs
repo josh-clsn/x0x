@@ -79,6 +79,8 @@ const COVERED: &[CoveredEndpoint] = &[
     // ── Network (cont.) ─────────────────────────────────────────────────
     covered!(Get, "/network/status", daemon_api_network_status),
     covered!(Get, "/network/bootstrap-cache", daemon_api_bootstrap_cache),
+    covered!(Post, "/mesh/join", daemon_api_mesh_join),
+    covered!(Post, "/mesh/quiesce", daemon_api_mesh_quiesce),
     covered!(
         Get,
         "/diagnostics/connectivity",
