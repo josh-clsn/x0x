@@ -6913,13 +6913,35 @@ impl Agent {
     /// Failed connections are retried after a delay to allow stale
     /// connections on remote nodes to expire.
     ///
+    /// Equivalent to [`start_network_infra`](Agent::start_network_infra)
+    /// followed by [`dial_bootstrap`](Agent::dial_bootstrap). Embedders that
+    /// flip mesh mode at runtime call the two halves separately.
+    ///
     /// If the agent was not configured with a network, this method
     /// succeeds gracefully (nothing to join).
     pub async fn join_network(&self) -> error::Result<()> {
-        let Some(network) = self.network.as_ref() else {
+        self.start_network_infra().await?;
+        self.dial_bootstrap().await
+    }
+
+    /// Start the network-serving infrastructure without dialing any peer:
+    /// the gossip runtime plus the identity, network-event, direct, and
+    /// stream-accept listeners.
+    ///
+    /// Split out of [`join_network`](Agent::join_network) so an embedder can
+    /// bring every local surface up once and decide separately whether — and
+    /// when — to dial the mesh. One-shot: listeners and the runtime register
+    /// here exactly once per agent; later mesh flips go through
+    /// [`dial_bootstrap`](Agent::dial_bootstrap) /
+    /// [`quiesce_mesh`](Agent::quiesce_mesh) only.
+    ///
+    /// If the agent was not configured with a network, this method
+    /// succeeds gracefully (nothing to start).
+    pub async fn start_network_infra(&self) -> error::Result<()> {
+        if self.network.is_none() {
             tracing::debug!("join_network called but no network configured");
             return Ok(());
-        };
+        }
 
         if let Some(ref runtime) = self.gossip_runtime {
             runtime.start().await.map_err(|e| {
@@ -6940,6 +6962,27 @@ impl Agent {
         self.start_network_event_listener();
         self.start_direct_listener();
         self.start_stream_accept_loop();
+        Ok(())
+    }
+
+    /// Dial the mesh: the bootstrap phases (cached coordinators, cached
+    /// peers, hardcoded bootstrap rounds), the membership-overlay join,
+    /// presence seeding/beacons, identity announcement, and the capability
+    /// advert service.
+    ///
+    /// Dial-only — no listener or gossip-runtime re-registration happens
+    /// here, so it is safe to call again later to re-join the mesh after
+    /// [`quiesce_mesh`](Agent::quiesce_mesh): pure dialing on top of the
+    /// infrastructure [`start_network_infra`](Agent::start_network_infra)
+    /// already started.
+    ///
+    /// If the agent was not configured with a network, this method
+    /// succeeds gracefully (nothing to dial).
+    pub async fn dial_bootstrap(&self) -> error::Result<()> {
+        let Some(network) = self.network.as_ref() else {
+            tracing::debug!("dial_bootstrap called but no network configured");
+            return Ok(());
+        };
 
         let bootstrap_nodes = network.config().bootstrap_nodes.clone();
 
@@ -7246,6 +7289,52 @@ impl Agent {
         }
 
         Ok(())
+    }
+
+    /// Disconnect every connected mesh peer without stopping anything —
+    /// mesh-off for embedders.
+    ///
+    /// The fetch>it mobile shell used to flip mesh mode by tearing down and
+    /// re-serving the in-process daemon. saorsa-gossip-pubsub 0.5.67 spawns
+    /// unstructured tokio tasks with no shutdown API, so the torn-down
+    /// instance left pubsub tasks hot-looping "ANTI_ENTROPY per-peer send
+    /// failed: node not initialized" (~1000/sec), starving the app. Here the
+    /// daemon, gossip runtime, and pubsub tasks all stay up — no
+    /// orphaned-task corpse is possible — and mesh-off is expressed purely
+    /// at the connection layer:
+    ///
+    /// - [`network::DisconnectReason::Admin`] writes a bounded (120 s)
+    ///   reconnect-suppression tombstone, so the peer-lifecycle listeners do
+    ///   not immediately redial the swept peers;
+    /// - leaf-mode gates already stop announcement and proactive redials;
+    /// - contacts still return via explicit demand (per-send dials), and a
+    ///   full re-join is one [`dial_bootstrap`](Agent::dial_bootstrap) away.
+    ///
+    /// Returns the number of peers disconnected. Individual disconnect
+    /// failures are logged and skipped — the sweep never aborts.
+    pub async fn quiesce_mesh(&self) -> error::Result<usize> {
+        let Some(network) = self.network.as_ref() else {
+            return Ok(0);
+        };
+
+        let peers = network.connected_peers().await;
+        let mut disconnected = 0usize;
+        for peer in peers {
+            match network
+                .disconnect_with_reason(&peer, network::DisconnectReason::Admin)
+                .await
+            {
+                Ok(()) => disconnected += 1,
+                Err(e) => {
+                    tracing::debug!(
+                        peer = %hex::encode(peer.0),
+                        "quiesce_mesh: disconnect failed: {e}"
+                    );
+                }
+            }
+        }
+        tracing::info!(disconnected, "quiesce_mesh: swept mesh connections");
+        Ok(disconnected)
     }
 
     /// Clone the shared capability store.
@@ -12761,6 +12850,23 @@ mod tests {
         } else {
             addr
         }
+    }
+
+    /// Mesh-off must be a safe no-op on an agent that never had a network:
+    /// the fetch>it shell calls `quiesce_mesh` unconditionally when the user
+    /// flips mesh mode, including before any network was configured.
+    #[tokio::test]
+    async fn quiesce_mesh_without_network_is_zero() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await
+            .expect("agent");
+
+        assert_eq!(agent.quiesce_mesh().await.expect("quiesce"), 0);
     }
 
     #[tokio::test]

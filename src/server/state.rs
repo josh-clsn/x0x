@@ -244,6 +244,16 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub leaf_mode: bool,
 
+    /// Serve without dialing the mesh. The gossip runtime, listeners, and
+    /// every local surface start normally, but the bootstrap dial phases
+    /// are skipped until `POST /mesh/join`. For embedders (the fetch>it
+    /// mobile shell) that flip mesh mode at runtime: re-serving to change
+    /// mode orphaned saorsa-gossip-pubsub tasks (no shutdown API) into a
+    /// hot failure loop, so mode changes must not tear the daemon down.
+    /// Default `false` (dial at startup, the daemon's historical behavior).
+    #[serde(default)]
+    pub defer_mesh_join: bool,
+
     /// X0X-0062 reviewer P2 #2: enable or disable ant-quic's best-effort
     /// UPnP IGD port-mapping. Default `true` (matches ant-quic). Set to
     /// `false` in the daemon TOML (`port_mapping_enabled = false`) or via
@@ -605,6 +615,7 @@ impl Default for DaemonConfig {
             network_id: None,
             zero_peer_restart_secs: None,
             leaf_mode: false,
+            defer_mesh_join: false,
         }
     }
 }
@@ -863,6 +874,21 @@ mod tests {
         // A metered device opts in with one key.
         let cfg: DaemonConfig = toml::from_str("leaf_mode = true").expect("leaf_mode TOML parses");
         assert!(cfg.leaf_mode);
+    }
+
+    #[test]
+    fn daemon_config_defer_mesh_join_defaults_false() {
+        // Dial-at-startup must stay the default: every existing deployment
+        // upgrades without a config change and still joins the mesh. Only an
+        // embedder that flips mesh mode at runtime opts in with one key.
+        assert!(!DaemonConfig::default().defer_mesh_join);
+
+        let cfg: DaemonConfig = toml::from_str("").expect("empty TOML parses");
+        assert!(!cfg.defer_mesh_join);
+
+        let cfg: DaemonConfig =
+            toml::from_str("defer_mesh_join = true").expect("defer_mesh_join TOML parses");
+        assert!(cfg.defer_mesh_join);
     }
 
     // The two canonical messages enforced by `InstanceName::try_from`.
