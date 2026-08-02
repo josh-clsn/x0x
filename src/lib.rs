@@ -262,6 +262,11 @@ pub struct Agent {
     >,
     /// Ensures identity discovery listener is spawned once.
     identity_listener_started: std::sync::atomic::AtomicBool,
+    /// Leaf-mode marker mirrored by [`Agent::set_leaf_mode`] for the
+    /// connection-maintenance paths (proactive reconnect, announcement
+    /// auto-connect). Shared so the long-lived listener tasks observe
+    /// flips made after they spawn.
+    leaf_mode: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// How often to re-announce identity (seconds).
     heartbeat_interval_secs: u64,
     /// How long before a cache entry is filtered out (seconds).
@@ -2546,6 +2551,8 @@ impl Agent {
     /// the agent has no gossip runtime. See
     /// `saorsa_gossip_pubsub::PlumtreePubSub::set_leaf_mode`.
     pub fn set_leaf_mode(&self, enabled: bool) {
+        self.leaf_mode
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
         if let Some(rt) = self.gossip_runtime.as_ref() {
             rt.pubsub().set_leaf_mode(enabled);
         }
@@ -6080,6 +6087,7 @@ impl Agent {
             None => None,
         };
         let cache = std::sync::Arc::clone(&self.identity_discovery_cache);
+        let listener_leaf_mode = std::sync::Arc::clone(&self.leaf_mode);
         let authenticated_machine_bindings =
             std::sync::Arc::clone(&self.authenticated_machine_bindings);
         let machine_cache = std::sync::Arc::clone(&self.machine_discovery_cache);
@@ -6736,7 +6744,8 @@ impl Agent {
                         // record an attempt) while the tombstone is live.
                         let suppressed = net.is_reconnect_suppressed(announcement.machine_id.0);
                         let connected = net.is_connected(&ant_peer).await;
-                        if announcement_should_auto_connect(suppressed, connected) {
+                        let leaf = listener_leaf_mode.load(std::sync::atomic::Ordering::Relaxed);
+                        if announcement_should_auto_connect(leaf, suppressed, connected) {
                             auto_connect_attempts
                                 .insert(announcement.agent_id, std::time::Instant::now());
                             let net = std::sync::Arc::clone(net);
@@ -8332,6 +8341,8 @@ impl Agent {
         // Clones for the lifecycle watcher task (Task 1 moves the originals).
         let lifecycle_machine_cache = std::sync::Arc::clone(&machine_cache);
         let lifecycle_reconnects = std::sync::Arc::clone(&active_reconnects);
+        let event_leaf_mode = std::sync::Arc::clone(&self.leaf_mode);
+        let lifecycle_leaf_mode = std::sync::Arc::clone(&self.leaf_mode);
         self.spawn_tracked(async move {
             let mut rx = network.subscribe();
             tracing::info!("Network event reconciliation listener started");
@@ -8440,7 +8451,11 @@ impl Agent {
                         // shutdown carry a non-transport reason and must never
                         // be redialed — otherwise proactive reconnect undoes a
                         // security/eviction decision (final review P1).
-                        if reason.reconnect_eligible() {
+                        if reason.reconnect_eligible()
+                            && proactive_reconnect_allowed(
+                                event_leaf_mode.load(std::sync::atomic::Ordering::Relaxed),
+                            )
+                        {
                             schedule_reconnect(
                                 std::sync::Arc::clone(&network),
                                 std::sync::Arc::clone(&machine_cache),
@@ -8509,7 +8524,11 @@ impl Agent {
                         // this is the second event stream the review flagged.
                         // Genuine transport closes leave no tombstone and are
                         // reconnect-eligible (the named-node restart path).
-                        if !lifecycle_network.is_reconnect_suppressed(peer_id.0) {
+                        if !lifecycle_network.is_reconnect_suppressed(peer_id.0)
+                            && proactive_reconnect_allowed(
+                                lifecycle_leaf_mode.load(std::sync::atomic::Ordering::Relaxed),
+                            )
+                        {
                             schedule_reconnect(
                                 std::sync::Arc::clone(&lifecycle_network),
                                 std::sync::Arc::clone(&lifecycle_machine_cache),
@@ -9615,8 +9634,28 @@ const RECONNECT_FAILURE_COOLDOWN: std::time::Duration = std::time::Duration::fro
 /// silently reconnected (which would undo the security/eviction decision), and
 /// `false` when the peer is already connected. Extracted as a pure predicate so
 /// the security invariant is unit-testable independently of the gossip stack.
-fn announcement_should_auto_connect(reconnect_suppressed: bool, already_connected: bool) -> bool {
-    !reconnect_suppressed && !already_connected
+fn announcement_should_auto_connect(
+    leaf_mode: bool,
+    reconnect_suppressed: bool,
+    already_connected: bool,
+) -> bool {
+    !leaf_mode && !reconnect_suppressed && !already_connected
+}
+
+/// Whether this node runs proactive post-disconnect reconnects.
+///
+/// A leaf (metered / battery-constrained device) must not maintain the mesh.
+/// Every proactive redial drives the full multi-strategy dial (direct
+/// IPv4/IPv6, hole-punch, MASQUE relay tunnel) against peers that are
+/// usually unreachable from behind the leaf's NAT, and the aggregate across
+/// all remembered peers is a sustained connection storm: measured live on a
+/// phone, it trampled a consumer router's NAT table hard enough to starve an
+/// unrelated chat WebSocket on the same network down to ~1 s connection
+/// lifetimes. A leaf reconnects on demand instead — the startup join phases,
+/// ant-quic's mDNS LAN auto-connect, the per-send `connect_to_agent` path,
+/// and the engine-A relay bridge cover delivery while the mesh stays quiet.
+fn proactive_reconnect_allowed(leaf_mode: bool) -> bool {
+    !leaf_mode
 }
 
 /// Minimum interval between auto-connect dials to the same announcing agent.
@@ -10615,6 +10654,7 @@ impl AgentBuilder {
                 std::collections::HashMap::new(),
             )),
             identity_listener_started: std::sync::atomic::AtomicBool::new(false),
+            leaf_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             heartbeat_interval_secs: self
                 .heartbeat_interval_secs
                 .unwrap_or(IDENTITY_HEARTBEAT_INTERVAL_SECS),
@@ -14505,21 +14545,42 @@ mod tests {
         let suppressed = alice_network.is_reconnect_suppressed(bob_id);
         let connected = alice_network.is_connected(&bob_peer).await;
         assert!(
-            !announcement_should_auto_connect(suppressed, connected),
+            !announcement_should_auto_connect(false, suppressed, connected),
             "a suppressed peer's announcement must not trigger auto-connect"
         );
     }
 
     /// The auto-connect predicate only dials an un-suppressed, not-yet-connected
-    /// peer. Encodes the security invariant directly: suppression always wins,
-    /// and an already-connected peer is never redundantly dialed.
+    /// peer on a non-leaf node. Encodes two invariants directly: suppression
+    /// always wins (security), and a leaf never mesh-dials on announcements —
+    /// every announcing agent in the network would otherwise pull a dial from
+    /// every leaf, and the aggregate is the connection storm that starved the
+    /// chat WebSocket on a shared consumer router.
     #[test]
     fn announcement_auto_connect_predicate_truth_table() {
-        // (suppressed, connected) -> should_dial
-        assert!(announcement_should_auto_connect(false, false));
-        assert!(!announcement_should_auto_connect(false, true));
-        assert!(!announcement_should_auto_connect(true, false));
-        assert!(!announcement_should_auto_connect(true, true));
+        // (leaf, suppressed, connected) -> should_dial
+        assert!(announcement_should_auto_connect(false, false, false));
+        assert!(!announcement_should_auto_connect(false, false, true));
+        assert!(!announcement_should_auto_connect(false, true, false));
+        assert!(!announcement_should_auto_connect(false, true, true));
+        // A leaf never auto-connects, regardless of the other inputs.
+        assert!(!announcement_should_auto_connect(true, false, false));
+        assert!(!announcement_should_auto_connect(true, false, true));
+        assert!(!announcement_should_auto_connect(true, true, false));
+        assert!(!announcement_should_auto_connect(true, true, true));
+    }
+
+    /// A leaf must not run proactive post-disconnect reconnects; a non-leaf
+    /// must keep them. WHY: proactive redials from a leaf drive multi-strategy
+    /// NAT traversal against mostly-unreachable peers, and the aggregate storm
+    /// tramples consumer-router NAT state (measured starving an unrelated
+    /// WebSocket on the same network to ~1 s lifetimes). Delivery still holds
+    /// mesh-quiet via startup join, mDNS LAN auto-connect, on-demand dials,
+    /// and the engine-A relay bridge.
+    #[test]
+    fn leaf_suppresses_proactive_reconnect() {
+        assert!(proactive_reconnect_allowed(false));
+        assert!(!proactive_reconnect_allowed(true));
     }
 
     /// The per-agent auto-connect rate limit must allow a first-ever dial
