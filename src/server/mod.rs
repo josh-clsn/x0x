@@ -50,12 +50,12 @@ use routes::{
     named_group_metadata_event_kind, network_status, peer_health_handler, peers, pin_machine,
     presence, presence_find, presence_foaf, presence_online, presence_status, probe_peer_handler,
     publish, publish_group_card_to_discovery, put_kv_value, quick_trust,
-    recover_treekem_named_journals, reject_join_request, remove_mls_member,
-    remove_named_group_member, restore_treekem_groups, revoke_contact, run_fallback_github_poll,
-    run_gossip_update_listener, run_startup_update_check, seal_group_state, secure_group_decrypt,
-    secure_group_encrypt, secure_group_reseal, secure_open_envelope_adversarial,
-    send_group_public_message, set_group_display_name, shutdown_handler,
-    spawn_directory_resubscribe, spawn_global_discovery_listener,
+    reconcile_treekem_self_leave_rekeys_all_groups, recover_treekem_named_journals,
+    reject_join_request, remove_mls_member, remove_named_group_member, restore_treekem_groups,
+    revoke_contact, run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
+    seal_group_state, secure_group_decrypt, secure_group_encrypt, secure_group_reseal,
+    secure_open_envelope_adversarial, send_group_public_message, set_group_display_name,
+    shutdown_handler, spawn_directory_resubscribe, spawn_global_discovery_listener,
     spawn_global_public_message_listener, spawn_listed_to_contacts_listener, status,
     streams_diagnostics, subscribe, unban_group_member, unpin_machine, unsubscribe, update_contact,
     update_group_policy, update_member_role, update_named_group, update_task, withdraw_group_state,
@@ -792,6 +792,17 @@ pub async fn serve_with_options(
     let crdt_rehydrate_state = Arc::clone(&state);
     bg_tasks.push(tokio::spawn(async move {
         crdt_subscriptions::rehydrate(crdt_rehydrate_state).await;
+    }));
+    // ADR-0014 §4 lazy catch-up. A self-leave publishes no TreeKEM commit, so
+    // if this node was down when a member left, the departed member's leaf is
+    // still live and they can still read group traffic. The rekey is owed by
+    // durable state, not by the event we missed, so replay it here rather than
+    // leaving the window open until the next unrelated group commit. Runs after
+    // snapshot restore and needs no network — deliberately not sequenced behind
+    // the mesh dial.
+    let leave_rekey_state = Arc::clone(&state);
+    bg_tasks.push(tokio::spawn(async move {
+        reconcile_treekem_self_leave_rekeys_all_groups(&leave_rekey_state).await;
     }));
     bg_tasks.push(tokio::spawn(async move {
         // Infra (gossip runtime + listeners) always starts, even when the

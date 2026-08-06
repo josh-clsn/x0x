@@ -5058,6 +5058,25 @@ async fn apply_named_group_metadata_event_inner_serialized(
             let _ =
                 prune_treekem_cache_member(state, &resolved_group_key, &agent_id, "member_removed")
                     .await;
+            // ADR-0014 §2: a self-leave carries no commit, so the member who
+            // just left still holds a live ratchet-tree leaf and keeps reading
+            // group traffic until a remaining member rotates them out. Hand
+            // that to the designated committer. Deferred to its own task
+            // because the membership guard is held for the rest of this apply
+            // and the rekey has to take it; on every node that is not the
+            // designated committer this is a cheap no-op.
+            if self_leave_auth {
+                let rekey_state = Arc::clone(state);
+                let rekey_group = resolved_group_key.clone();
+                tokio::spawn(async move {
+                    let _ = reconcile_treekem_self_leave_rekeys(
+                        &rekey_state,
+                        &rekey_group,
+                        "observed_self_leave",
+                    )
+                    .await;
+                });
+            }
             true
         }
         NamedGroupMetadataEvent::GroupDeleted {
@@ -9563,6 +9582,14 @@ async fn leave_treekem_group(
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     remember_treekem_membership_event(&state, &event).await;
+    // Deliver directly as well as over gossip, exactly as admin removal does.
+    // Gossip alone loses this event often enough to matter: a remaining member
+    // who misses the leave stays at the old roster revision, so when the
+    // designated committer's responsive rekey arrives it reads as a revision
+    // gap and is queued instead of applied — leaving that member unable to
+    // decrypt at the new epoch. Harmless before the rekey existed (nothing
+    // advanced, so nobody fell behind); load-bearing now.
+    spawn_named_group_event_delivery_to_active_members(&state, &next, &event, &[]);
 
     (
         StatusCode::OK,
@@ -9744,6 +9771,208 @@ async fn remove_treekem_named_group_member(
             "members": named_group_member_values(&next),
         })),
     )
+}
+
+/// ADR-0014 §2/§4: issue the responsive TreeKEM rekey that a self-leave leaves
+/// owed, and return how many rotations were committed.
+///
+/// A self-leave publishes a roster-only `MemberRemoved` — `treekem_commit_b64:
+/// None`, no epoch advance — because RFC-9420 forbids the leaver from
+/// committing their own removal. Until a *remaining* member commits it, the
+/// departed member's leaf is still in the ratchet tree, so they keep deriving
+/// every epoch secret the group produces and can read its traffic. An
+/// adversarial leaver simply keeps a copy of their TreeKEM state; the local
+/// wipe on their own daemon is hygiene for a cooperating client, not a security
+/// property. This is what actually closes that window.
+///
+/// Three properties make it safe to run from anywhere:
+///
+/// - **Single committer.** Only `designated_rekey_committer` acts, so
+///   concurrent observation by several members still yields one commit at the
+///   epoch rather than a pile-up of duelling ones.
+/// - **Driven from persisted state.** The trigger is "a non-active roster entry
+///   whose KeyPackage still resolves to a live leaf", which survives a restart,
+///   so a leave observed while the committer was down is repaired when it next
+///   comes up rather than staying open indefinitely.
+/// - **Idempotent.** The commit blanks the leaf, so a repeat pass sees nothing
+///   owed. Applying the same leave twice yields one epoch advance, not two.
+///
+/// Each rotation reuses the admin-remove wire shape verbatim, so receivers take
+/// the existing `admin_remove_auth` apply branch and no new protocol is added.
+async fn reconcile_treekem_self_leave_rekeys(
+    state: &Arc<AppState>,
+    group_key: &str,
+    reason: &str,
+) -> usize {
+    use base64::Engine as _;
+
+    let membership_lock = group_membership_lock(state, group_key).await;
+    let _membership_guard = membership_lock.lock().await;
+
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let holders = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(group_key) else {
+            return 0;
+        };
+        if info.withdrawn || info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem {
+            return 0;
+        }
+        if info.designated_rekey_committer().as_deref() != Some(local_agent_hex.as_str()) {
+            return 0;
+        }
+        info.treekem_leaf_holders_not_active()
+    };
+    if holders.is_empty() {
+        return 0;
+    }
+
+    let Some(group) = state.treekem_groups.read().await.get(group_key).cloned() else {
+        // No loaded tree: nothing can be rotated here. The next startup pass
+        // retries once snapshots are restored.
+        tracing::debug!(
+            group_id = %LogHexId::group(group_key),
+            reason,
+            "self-leave rekey deferred: TreeKEM group not loaded"
+        );
+        return 0;
+    };
+
+    let signing_kp = state.agent.identity().agent_keypair();
+    let mut rotated = 0usize;
+    for (departed_hex, kp_b64) in holders {
+        let Ok(departed_agent) = parse_agent_id_hex(&departed_hex) else {
+            continue;
+        };
+        let Ok(kp_bytes) = BASE64.decode(&kp_b64) else {
+            continue;
+        };
+
+        let (mut next, metadata_topic, event_group_id) = {
+            let groups = state.named_groups.read().await;
+            let Some(info) = groups.get(group_key) else {
+                break;
+            };
+            (
+                info.clone(),
+                info.metadata_topic.clone(),
+                info.stable_group_id().to_string(),
+            )
+        };
+
+        let mut guard = group.lock().await;
+        // Already rotated out (admin remove, or an earlier pass): nothing owed.
+        if !guard.has_leaf_for_key_package(&kp_bytes) {
+            continue;
+        }
+        let treekem_epoch = guard.epoch().saturating_add(1);
+        next.roster_revision = next.roster_revision.saturating_add(1);
+        let revision = next.roster_revision;
+        next.remove_member(&departed_hex, Some(local_agent_hex.clone()));
+        next.secret_epoch = treekem_epoch;
+        next.security_binding = Some(format!("treekem:epoch={treekem_epoch}"));
+        let commit = match next.seal_commit(signing_kp, now_millis_u64()) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    group_id = %LogHexId::group(group_key),
+                    member = %LogHexId::agent(&departed_hex),
+                    "self-leave rekey seal failed: {e}"
+                );
+                continue;
+            }
+        };
+        let treekem_commit = match guard.remove_member_verified(departed_agent, &kp_bytes) {
+            Ok(commit) => commit,
+            Err(e) => {
+                tracing::warn!(
+                    group_id = %LogHexId::group(group_key),
+                    member = %LogHexId::agent(&departed_hex),
+                    "self-leave rekey remove_member_verified failed: {e}"
+                );
+                continue;
+            }
+        };
+        if guard.epoch() != treekem_epoch {
+            tracing::error!(
+                group_id = %LogHexId::group(group_key),
+                "self-leave rekey epoch did not advance as expected"
+            );
+            continue;
+        }
+        if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
+            state,
+            group_key,
+            next.clone(),
+            &guard,
+        )
+        .await
+        {
+            tracing::error!(
+                group_id = %LogHexId::group(group_key),
+                "failed to persist TreeKEM snapshot after self-leave rekey: {e}"
+            );
+            continue;
+        }
+        drop(guard);
+
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_key.to_string(), next.clone());
+        save_named_groups(state).await;
+        save_mls_groups(state).await;
+        let _ = prune_treekem_cache_member(state, group_key, &departed_hex, reason).await;
+
+        let event = NamedGroupMetadataEvent::MemberRemoved {
+            group_id: event_group_id,
+            revision,
+            actor: local_agent_hex.clone(),
+            agent_id: departed_hex.clone(),
+            treekem_commit_b64: Some(
+                base64::engine::general_purpose::STANDARD.encode(treekem_commit),
+            ),
+            treekem_epoch: Some(treekem_epoch),
+            commit: Some(commit),
+        };
+        publish_named_group_metadata_event(state, &metadata_topic, &event).await;
+        remember_treekem_membership_event(state, &event).await;
+        // Deliberately not delivered to the departed member: they left
+        // voluntarily and their local state is already torn down.
+        spawn_named_group_event_delivery_to_active_members(state, &next, &event, &[]);
+        maybe_publish_group_card_after_state_change(state, group_key).await;
+
+        tracing::info!(
+            group_id = %LogHexId::group(group_key),
+            member = %LogHexId::agent(&departed_hex),
+            epoch = treekem_epoch,
+            reason,
+            "issued responsive TreeKEM rekey after self-leave"
+        );
+        rotated = rotated.saturating_add(1);
+    }
+    rotated
+}
+
+/// Startup half of the ADR-0014 §4 lazy catch-up: sweep every group for
+/// rotations owed to a departure this node did not witness live (it was down,
+/// or was not yet the designated committer when the member left).
+pub(in crate::server) async fn reconcile_treekem_self_leave_rekeys_all_groups(
+    state: &Arc<AppState>,
+) {
+    let group_keys: Vec<String> = state.named_groups.read().await.keys().cloned().collect();
+    for group_key in group_keys {
+        let rotated =
+            reconcile_treekem_self_leave_rekeys(state, &group_key, "startup_catchup").await;
+        if rotated > 0 {
+            tracing::info!(
+                group_id = %LogHexId::group(&group_key),
+                rotated,
+                "startup catch-up closed pending self-leave rekeys"
+            );
+        }
+    }
 }
 
 /// GET /groups/:id/state — Phase D.3: inspect the stable-identity +
@@ -22083,5 +22312,215 @@ mod tests {
         let on_disk = tokio::fs::read_to_string(path).await?;
         let parsed: BTreeMap<String, serde_json::Value> = serde_json::from_str(&on_disk)?;
         Ok(parsed.into_keys().collect())
+    }
+
+    /// Stage a TreeKEM group holding a member who has already self-left: the
+    /// roster records the departure but, as a self-leave carries no commit, the
+    /// leaf is still live and the epoch has not moved. Returns the departed
+    /// member's hex id, their KeyPackage, and the shared group handle.
+    async fn staged_self_leave(
+        state: &Arc<AppState>,
+        group_id: &str,
+        committer: AgentId,
+    ) -> Result<(String, Vec<u8>, Arc<Mutex<x0x::mls::TreeKemMlsGroup>>)> {
+        use base64::Engine as _;
+
+        let group_id_bytes = hex::decode(group_id)?;
+        let local = state.agent.agent_id();
+        let local_hex = hex::encode(local.as_bytes());
+        let local_seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+        let mut group =
+            x0x::mls::TreeKemMlsGroup::create(group_id_bytes.clone(), local, &local_seed)?;
+
+        let leaver = AgentId([0x6b; 32]);
+        let leaver_hex = hex::encode(leaver.as_bytes());
+        let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(leaver, &[0x6b; 32])?;
+        let leaver_kp = prepared.key_package_bytes().to_vec();
+        group.add_member(leaver, &leaver_kp)?;
+
+        let mut info = treekem_metadata_group_info(committer, group_id, group_id);
+        let committer_hex = hex::encode(committer.as_bytes());
+        if committer != local {
+            info.add_member(
+                local_hex,
+                x0x::groups::GroupRole::Member,
+                Some(committer_hex.clone()),
+                None,
+            );
+        }
+        info.add_member(
+            leaver_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(committer_hex),
+            None,
+        );
+        info.set_member_treekem_key_package(
+            &leaver_hex,
+            base64::engine::general_purpose::STANDARD.encode(&leaver_kp),
+        );
+        // The self-leave exactly as a remaining member applies it: roster-only,
+        // no TreeKEM commit, epoch untouched.
+        info.remove_member(&leaver_hex, Some(leaver_hex.clone()));
+        info.secret_epoch = group.epoch();
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info);
+
+        let group = Arc::new(Mutex::new(group));
+        state
+            .treekem_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), Arc::clone(&group));
+        assert!(
+            group.lock().await.has_leaf_for_key_package(&leaver_kp),
+            "precondition: a self-leave leaves the departed leaf live"
+        );
+        Ok((leaver_hex, leaver_kp, group))
+    }
+
+    /// The gap ADR-0014 left open. The crypto that excludes a departed member
+    /// already worked — an admin remove rotates them out fine. What was missing
+    /// was anything *triggering* it after a voluntary leave: the empirical
+    /// three-arm run polled a fully-online group 30 times over five minutes and
+    /// saw the epoch pinned at 2 the whole way, while the leaver's restored
+    /// snapshot read post-departure traffic in the clear.
+    #[tokio::test]
+    async fn self_leave_advances_the_epoch_and_rotates_the_leaver_out() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id_storage = "6a".repeat(32);
+        let group_id = group_id_storage.as_str();
+        let local = state.agent.agent_id();
+        let (leaver_hex, leaver_kp, group) = staged_self_leave(&state, group_id, local).await?;
+        let epoch_before = group.lock().await.epoch();
+
+        NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+            .lock()
+            .expect("publish-attempt recorder poisoned")
+            .clear();
+
+        let rotated = reconcile_treekem_self_leave_rekeys(&state, group_id, "test").await;
+
+        assert_eq!(rotated, 1, "the designated committer must issue the rekey");
+        assert_eq!(
+            group.lock().await.epoch(),
+            epoch_before.saturating_add(1),
+            "a self-leave must advance the group epoch — a roster-only fix leaves the leaver reading"
+        );
+        assert!(
+            !group.lock().await.has_leaf_for_key_package(&leaver_kp),
+            "the departed member's leaf must be blanked, not merely marked Removed"
+        );
+        let groups = state.named_groups.read().await;
+        let info = groups.get(group_id).expect("group retained");
+        assert_eq!(
+            info.secret_epoch,
+            epoch_before.saturating_add(1),
+            "the published roster must bind to the new epoch"
+        );
+        drop(groups);
+        assert!(
+            NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+                .lock()
+                .expect("publish-attempt recorder poisoned")
+                .iter()
+                .any(|(_, gid)| gid == group_id),
+            "remaining members must be told, or they cannot converge to the new epoch"
+        );
+        assert!(!leaver_hex.is_empty());
+        Ok(())
+    }
+
+    /// Re-applying the same leave must not commit twice. Each extra commit is
+    /// another epoch the rest of the group has to converge on, and a pile-up is
+    /// how this subsystem wedges.
+    #[tokio::test]
+    async fn repeated_self_leave_yields_one_epoch_advance_not_two() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id_storage = "6c".repeat(32);
+        let group_id = group_id_storage.as_str();
+        let local = state.agent.agent_id();
+        let (_leaver_hex, _kp, group) = staged_self_leave(&state, group_id, local).await?;
+        let epoch_before = group.lock().await.epoch();
+
+        let first = reconcile_treekem_self_leave_rekeys(&state, group_id, "test-first").await;
+        let epoch_after_first = group.lock().await.epoch();
+        let second = reconcile_treekem_self_leave_rekeys(&state, group_id, "test-repeat").await;
+
+        assert_eq!(first, 1, "the first pass owes one rotation");
+        assert_eq!(second, 0, "the second pass owes nothing");
+        assert_eq!(
+            epoch_after_first,
+            epoch_before.saturating_add(1),
+            "one advance"
+        );
+        assert_eq!(
+            group.lock().await.epoch(),
+            epoch_after_first,
+            "a repeat pass must not advance the epoch again"
+        );
+        Ok(())
+    }
+
+    /// Every remaining member observes the same self-leave. Only the designated
+    /// committer may act on it — if all of them did, they would each commit at
+    /// the same epoch and the group would wedge on duelling commits.
+    #[tokio::test]
+    async fn a_member_who_is_not_the_designated_committer_does_not_rekey() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id_storage = "6d".repeat(32);
+        let group_id = group_id_storage.as_str();
+        // The group's admin/creator is someone else, so this node is a plain
+        // member and must stay out of the way.
+        let other_admin = AgentId([0x01; 32]);
+        let (_leaver_hex, leaver_kp, group) =
+            staged_self_leave(&state, group_id, other_admin).await?;
+        let epoch_before = group.lock().await.epoch();
+
+        let rotated = reconcile_treekem_self_leave_rekeys(&state, group_id, "test").await;
+
+        assert_eq!(rotated, 0, "a non-designated member must not commit");
+        assert_eq!(
+            group.lock().await.epoch(),
+            epoch_before,
+            "a bystander must not advance the epoch"
+        );
+        assert!(
+            group.lock().await.has_leaf_for_key_package(&leaver_kp),
+            "the rotation is still owed — by the designated committer, not this node"
+        );
+        Ok(())
+    }
+
+    /// ADR-0014 §4. If the rekey only ever fired on the live event, a leave
+    /// that happened while the committer was down would never rotate and the
+    /// hole would stay open indefinitely. The trigger is reconstructed from
+    /// persisted roster state instead, so coming back up closes it.
+    #[tokio::test]
+    async fn a_leave_missed_while_down_is_rekeyed_on_the_next_startup_pass() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id_storage = "6e".repeat(32);
+        let group_id = group_id_storage.as_str();
+        let local = state.agent.agent_id();
+        // No live event is delivered here at all — this is the state a daemon
+        // finds on disk after being offline for the departure.
+        let (_leaver_hex, leaver_kp, group) = staged_self_leave(&state, group_id, local).await?;
+        let epoch_before = group.lock().await.epoch();
+
+        reconcile_treekem_self_leave_rekeys_all_groups(&state).await;
+
+        assert_eq!(
+            group.lock().await.epoch(),
+            epoch_before.saturating_add(1),
+            "the startup sweep must close a rekey owed from an unwitnessed leave"
+        );
+        assert!(
+            !group.lock().await.has_leaf_for_key_package(&leaver_kp),
+            "the departed leaf must be gone after catch-up"
+        );
+        Ok(())
     }
 }
