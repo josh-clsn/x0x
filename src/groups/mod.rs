@@ -1106,6 +1106,69 @@ impl GroupInfo {
             .map(|m| m.agent_id.clone())
     }
 
+    /// The single member responsible for committing the responsive TreeKEM
+    /// rekey that follows a self-leave (ADR-0014 §2/§3).
+    ///
+    /// A self-leaver cannot rotate themselves out — RFC-9420 forbids the
+    /// committer of a Remove from being the removed member — so a *remaining*
+    /// member must author the rotation. If every remaining member reacted, they
+    /// would all commit at the same epoch and the group would wedge on duelling
+    /// commits, which is what `group_membership_locks` exists to prevent. So
+    /// exactly one is designated.
+    ///
+    /// Selection is a total order over **replicated roster state**, never over
+    /// liveness: every node computes the same answer from the same roster
+    /// without observing who is online, so there is no race and no timeout to
+    /// tune. ADR-0014 §3 names the owner; `Owner` is a legacy role that
+    /// ADR-0016 §3 made unassignable, so groups created since then have none
+    /// and would otherwise never rekey. The lowest agent-id hex among active
+    /// admins is the deterministic fallback — this also covers an owner who
+    /// self-leaves, which would otherwise leave nobody to rotate them out.
+    ///
+    /// Returns `None` only for a group with no active admin, which cannot
+    /// happen while `last_admin_self_leave_precheck_error` holds.
+    #[must_use]
+    pub fn designated_rekey_committer(&self) -> Option<String> {
+        self.owner_agent_id().or_else(|| {
+            self.members_v2
+                .values()
+                .filter(|m| m.is_active() && m.role.at_least(GroupRole::Admin))
+                .map(|m| m.agent_id.clone())
+                .min()
+        })
+    }
+
+    /// Roster entries that are no longer active but whose TreeKEM KeyPackage
+    /// still binds them to a ratchet-tree leaf — the members a responsive rekey
+    /// still owes a rotation.
+    ///
+    /// `remove_member` is a soft delete, so a departed member's KeyPackage
+    /// survives on the retained entry and is durable in `named-groups.json`.
+    /// That is what makes the ADR-0014 §4 lazy catch-up possible at all: the
+    /// designated committer can reconstruct, from persisted state alone, both
+    /// *that* a rotation is owed and the KeyPackage needed to perform it — so a
+    /// leave observed while the committer was down is still repaired when it
+    /// next comes up.
+    ///
+    /// Whether the leaf is genuinely still present is confirmed against the
+    /// ratchet tree by the caller; this is the roster half only. Sorted by
+    /// agent-id hex so repeated passes rotate in a stable order.
+    #[must_use]
+    pub fn treekem_leaf_holders_not_active(&self) -> Vec<(String, String)> {
+        let mut holders: Vec<(String, String)> = self
+            .members_v2
+            .values()
+            .filter(|m| !m.is_active())
+            .filter_map(|m| {
+                m.treekem_key_package_b64
+                    .clone()
+                    .map(|kp| (m.agent_id.clone(), kp))
+            })
+            .collect();
+        holders.sort_by(|a, b| a.0.cmp(&b.0));
+        holders
+    }
+
     /// Default chat topic for the group ("general" room).
     #[must_use]
     pub fn general_chat_topic(&self) -> String {
@@ -1461,5 +1524,119 @@ mod tests {
     #[test]
     fn default_invite_max_role_is_member() {
         assert_eq!(default_invite_max_role(), GroupRole::Member);
+    }
+
+    /// Every remaining member observes the same self-leave. If each reacted,
+    /// they would all commit at the same epoch and wedge the group on duelling
+    /// commits — so selection must resolve to exactly one, and must do it from
+    /// state every node already agrees on rather than from who reacts first.
+    #[test]
+    fn rekey_committer_is_one_member_every_node_agrees_on() {
+        let mut info = GroupInfo::new("T".into(), String::new(), agent(1), "aa".repeat(16));
+        let creator = hex::encode([1u8; 32]);
+        let admin_low = hex::encode([2u8; 32]);
+        let admin_high = hex::encode([9u8; 32]);
+        info.add_member(admin_high.clone(), GroupRole::Admin, None, None);
+        info.add_member(admin_low.clone(), GroupRole::Admin, None, None);
+        info.add_member(hex::encode([5u8; 32]), GroupRole::Member, None, None);
+
+        let expected = [creator, admin_low, admin_high]
+            .into_iter()
+            .min()
+            .expect("three admins");
+        assert_eq!(
+            info.designated_rekey_committer(),
+            Some(expected),
+            "lowest active admin id wins — a total order, so every node picks the same one"
+        );
+    }
+
+    /// ADR-0014 §3 names the owner, but ADR-0016 §3 made `Owner` a legacy role
+    /// that cannot be assigned, so groups created since then have none. If
+    /// selection stopped at the owner, those groups would never rekey and the
+    /// leave hole would stay open forever.
+    #[test]
+    fn rekey_committer_falls_back_when_no_owner_exists() {
+        let mut info = GroupInfo::new("T".into(), String::new(), agent(1), "aa".repeat(16));
+        assert_eq!(info.owner_agent_id(), None, "modern groups have no Owner");
+        assert_eq!(
+            info.designated_rekey_committer(),
+            Some(hex::encode([1u8; 32])),
+            "an ownerless group must still designate a committer"
+        );
+
+        // A legacy owner, when one exists, takes precedence over admin order.
+        let owner = hex::encode([7u8; 32]);
+        info.add_member(owner.clone(), GroupRole::Member, None, None);
+        info.set_member_role(&owner, GroupRole::Owner);
+        assert_eq!(info.designated_rekey_committer(), Some(owner));
+    }
+
+    /// An owner who self-leaves would otherwise leave nobody to rotate them
+    /// out — the departed member would keep reading the group indefinitely.
+    #[test]
+    fn rekey_committer_survives_the_owner_leaving() {
+        let mut info = GroupInfo::new("T".into(), String::new(), agent(1), "aa".repeat(16));
+        let owner = hex::encode([7u8; 32]);
+        let admin = hex::encode([3u8; 32]);
+        info.add_member(owner.clone(), GroupRole::Member, None, None);
+        info.set_member_role(&owner, GroupRole::Owner);
+        info.add_member(admin.clone(), GroupRole::Admin, None, None);
+        assert_eq!(info.designated_rekey_committer(), Some(owner.clone()));
+
+        info.remove_member(&owner, Some(owner.clone()));
+        let next = info
+            .designated_rekey_committer()
+            .expect("a remaining admin must take over");
+        assert_ne!(
+            next, owner,
+            "the departed owner cannot rotate themselves out"
+        );
+        assert_eq!(next, hex::encode([1u8; 32]).min(admin));
+    }
+
+    /// The lazy catch-up has to be reconstructible after a restart, so the
+    /// departed member's KeyPackage must survive their removal. It does,
+    /// because `remove_member` is a soft delete — that retention is what the
+    /// whole owner-offline path depends on.
+    #[test]
+    fn departed_member_keypackage_survives_removal_for_catchup() {
+        let mut info = GroupInfo::new("T".into(), String::new(), agent(1), "aa".repeat(16));
+        let leaver = hex::encode([4u8; 32]);
+        info.add_member(leaver.clone(), GroupRole::Member, None, None);
+        info.set_member_treekem_key_package(&leaver, "kp-leaver".to_string());
+        assert!(
+            info.treekem_leaf_holders_not_active().is_empty(),
+            "an active member is owed nothing"
+        );
+
+        info.remove_member(&leaver, Some(leaver.clone()));
+        assert_eq!(
+            info.treekem_leaf_holders_not_active(),
+            vec![(leaver, "kp-leaver".to_string())],
+            "the KeyPackage needed to rotate the leaf must outlive the roster removal"
+        );
+    }
+
+    /// The returning-member re-key path (tail commit 5c52013) works on members
+    /// who are still roster-active. Catch-up must not treat them as departed
+    /// and rotate them straight back out.
+    #[test]
+    fn returning_member_is_never_a_rekey_candidate() {
+        let mut info = GroupInfo::new("T".into(), String::new(), agent(1), "aa".repeat(16));
+        let returner = hex::encode([6u8; 32]);
+        info.add_member(returner.clone(), GroupRole::Member, None, None);
+        info.set_member_treekem_key_package(&returner, "stale-kp".to_string());
+        // Reinstall: same active entry, brand-new KeyPackage.
+        info.set_member_treekem_key_package(&returner, "fresh-kp".to_string());
+
+        assert!(
+            info.has_active_member(&returner),
+            "a returning member stays roster-active throughout the re-key"
+        );
+        assert!(
+            info.treekem_leaf_holders_not_active().is_empty(),
+            "an active member must never be picked up as a departed leaf holder"
+        );
     }
 }
