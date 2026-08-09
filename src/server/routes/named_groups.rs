@@ -27061,8 +27061,7 @@ mod tests {
         assert_departure_wiped_treekem_state(&f.state, &f.aliases(), "treekem self-leave").await;
         for path in ["direct", "delayed"] {
             assert!(
-                member_removed_delivery_recipients(&f.stable_group_id, path)
-                    .contains(&f.peer_hex),
+                member_removed_delivery_recipients(&f.stable_group_id, path).contains(&f.peer_hex),
                 "the leave event must still be direct-delivered ({path}) to the remaining member"
             );
         }
@@ -27146,7 +27145,11 @@ mod tests {
                 .into_response(),
         )
         .await?;
-        assert_eq!(status, StatusCode::OK, "local-only drop must succeed: {body}");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "local-only drop must succeed: {body}"
+        );
         assert_eq!(
             body.get("local_only").and_then(serde_json::Value::as_bool),
             Some(true),
