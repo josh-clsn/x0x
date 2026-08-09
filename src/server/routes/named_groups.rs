@@ -26879,6 +26879,273 @@ mod tests {
         Ok(())
     }
 
+    struct DepartureFixture {
+        state: Arc<AppState>,
+        _dir: tempfile::TempDir,
+        group_id: String,
+        stable_group_id: String,
+        peer_kp: x0x::identity::AgentKeypair,
+        peer_hex: String,
+    }
+
+    impl DepartureFixture {
+        /// The keys a departure has to clear. The roster is keyed by the local
+        /// group id; the TreeKEM caches are keyed by the stable id.
+        fn aliases(&self) -> [&str; 2] {
+            [self.group_id.as_str(), self.stable_group_id.as_str()]
+        }
+    }
+
+    /// Issue #376: a group holding the in-memory TreeKEM material a departure
+    /// must leave nothing of. `local_active` selects the departure path under
+    /// test: an active member self-leaves or is removed, a non-member drops
+    /// local-only. When the local node is active a second Admin is seated so
+    /// its own removal still satisfies the last-admin invariant.
+    async fn departure_fixture(
+        group_byte: u8,
+        plane: x0x::mls::SecureGroupPlane,
+        local_active: bool,
+    ) -> Result<DepartureFixture> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = format!("{group_byte:02x}").repeat(32);
+        let stable_group_id = format!("{:02x}", group_byte.wrapping_add(1)).repeat(32);
+        let local = state.agent.agent_id();
+        let local_hex = hex::encode(local.as_bytes());
+        let peer_kp = x0x::identity::AgentKeypair::generate()?;
+        let peer = peer_kp.agent_id();
+        let peer_hex = hex::encode(peer.as_bytes());
+        let creator = if local_active { local } else { peer };
+        let mut info = treekem_metadata_group_info(creator, &group_id, &stable_group_id);
+        info.secure_plane = plane;
+        if plane == x0x::mls::SecureGroupPlane::Gss {
+            info.security_binding = Some("gss:epoch=0".to_string());
+        }
+        if local_active {
+            info.add_member(
+                peer_hex.clone(),
+                x0x::groups::GroupRole::Admin,
+                Some(local_hex.clone()),
+                None,
+            );
+        }
+        info.recompute_state_hash();
+        assert_eq!(
+            info.has_active_member(&local_hex),
+            local_active,
+            "fixture must model the requested local membership"
+        );
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        // Both surfaces are keyed by the STABLE group id — see
+        // `remember_treekem_membership_event` and
+        // `queue_treekem_membership_event`, which key on the event's group id.
+        // That is exactly why a roster-keyed piecemeal teardown misses them.
+        let retained = NamedGroupMetadataEvent::MemberAdded {
+            group_id: stable_group_id.clone(),
+            revision: 2,
+            actor: hex::encode(creator.as_bytes()),
+            agent_id: peer_hex.clone(),
+            display_name: None,
+            treekem_commit_b64: Some("Yw==".to_string()),
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: Some(2),
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
+            commit: Some(fake_group_state_commit(
+                &stable_group_id,
+                2,
+                &hex::encode(creator.as_bytes()),
+            )),
+        };
+        state.treekem_event_log.write().await.insert(
+            stable_group_id.clone(),
+            VecDeque::from(vec![retained.clone()]),
+        );
+        state.treekem_pending_events.write().await.insert(
+            stable_group_id.clone(),
+            VecDeque::from(vec![PendingTreeKemMetadataEvent {
+                event: retained,
+                sender: peer,
+                queued_at: Instant::now(),
+            }]),
+        );
+
+        Ok(DepartureFixture {
+            state,
+            _dir,
+            group_id,
+            stable_group_id,
+            peer_kp,
+            peer_hex,
+        })
+    }
+
+    /// Issue #376: a departed node holds no group material. The event log is
+    /// the membership history itself, so retaining it after departure is the
+    /// retention root-cause behind the #363 catch-up leak.
+    async fn assert_departure_wiped_treekem_state(
+        state: &AppState,
+        aliases: &[&str],
+        context: &str,
+    ) {
+        {
+            let logs = state.treekem_event_log.read().await;
+            for alias in aliases {
+                assert!(
+                    !logs.contains_key(*alias),
+                    "{context}: treekem_event_log still holds {alias} after departure"
+                );
+            }
+        }
+        let pending = state.treekem_pending_events.read().await;
+        for alias in aliases {
+            assert!(
+                !pending.contains_key(*alias),
+                "{context}: treekem_pending_events still holds {alias} after departure"
+            );
+        }
+    }
+
+    /// Recipients recorded for a `MemberRemoved` direct delivery of `group_id`
+    /// on the given path ("direct" or "delayed").
+    fn member_removed_delivery_recipients(group_id: &str, path: &str) -> Vec<String> {
+        NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST
+            .lock()
+            .expect("delivery recorder poisoned")
+            .iter()
+            .filter(|(_, gid, kind, recorded)| {
+                gid == group_id && *kind == "member_removed" && *recorded == path
+            })
+            .map(|(recipient, _, _, _)| recipient.clone())
+            .collect()
+    }
+
+    /// Issue #376: the TreeKEM self-leave tore down the roster entry, the card
+    /// cache, the live group and the at-rest persistence but left the in-memory
+    /// membership event log behind — and then re-appended the leave event to
+    /// it. Departure must clear it, without suppressing the direct delivery
+    /// that remaining members rely on to close the roster-revision gap.
+    #[tokio::test]
+    async fn self_leave_wipes_treekem_event_log() -> Result<()> {
+        let f = departure_fixture(0x66, x0x::mls::SecureGroupPlane::TreeKem, true).await?;
+        NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST
+            .lock()
+            .expect("delivery recorder poisoned")
+            .clear();
+
+        let (status, body) = response_json(
+            leave_group(State(Arc::clone(&f.state)), Path(f.group_id.clone()))
+                .await
+                .into_response(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "self-leave must succeed: {body}");
+
+        assert_departure_wiped_treekem_state(&f.state, &f.aliases(), "treekem self-leave").await;
+        for path in ["direct", "delayed"] {
+            assert!(
+                member_removed_delivery_recipients(&f.stable_group_id, path)
+                    .contains(&f.peer_hex),
+                "the leave event must still be direct-delivered ({path}) to the remaining member"
+            );
+        }
+        Ok(())
+    }
+
+    /// Issue #376: the GSS leave path has its own piecemeal teardown with the
+    /// same gap.
+    #[tokio::test]
+    async fn gss_leave_wipes_treekem_event_log() -> Result<()> {
+        let f = departure_fixture(0x68, x0x::mls::SecureGroupPlane::Gss, true).await?;
+
+        let (status, body) = response_json(
+            leave_group(State(Arc::clone(&f.state)), Path(f.group_id.clone()))
+                .await
+                .into_response(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "GSS leave must succeed: {body}");
+
+        assert_departure_wiped_treekem_state(&f.state, &f.aliases(), "gss leave").await;
+        Ok(())
+    }
+
+    /// Issue #376: an admin-authored removal of this node is a departure too —
+    /// the apply arm dropped the roster entry and exited the subscriber while
+    /// keeping the group's membership history in memory.
+    #[tokio::test]
+    async fn member_removed_self_wipes_treekem_event_log() -> Result<()> {
+        let f = departure_fixture(0x6a, x0x::mls::SecureGroupPlane::Gss, true).await?;
+        let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+
+        let mut committed = f
+            .state
+            .named_groups
+            .read()
+            .await
+            .get(&f.group_id)
+            .cloned()
+            .context("fixture group is present")?;
+        committed.roster_revision = committed.roster_revision.saturating_add(1);
+        let revision = committed.roster_revision;
+        committed.remove_member(&local_hex, Some(f.peer_hex.clone()));
+        let commit = committed.seal_commit(&f.peer_kp, 1_000)?;
+        let event = NamedGroupMetadataEvent::MemberRemoved {
+            group_id: f.stable_group_id.clone(),
+            revision,
+            actor: f.peer_hex.clone(),
+            agent_id: local_hex,
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: None,
+            commit: Some(commit),
+        };
+
+        let applied =
+            apply_named_group_metadata_event(&f.state, event, f.peer_kp.agent_id(), true, None)
+                .await;
+        assert!(
+            applied.accepted && applied.should_exit,
+            "an admin removal of this node must apply and exit the subscriber"
+        );
+        assert!(
+            !f.state.named_groups.read().await.contains_key(&f.group_id),
+            "the removed node must drop its roster entry"
+        );
+
+        assert_departure_wiped_treekem_state(&f.state, &f.aliases(), "member removed self").await;
+        Ok(())
+    }
+
+    /// Issue #376: the local-only drop (this node holds group state it is not
+    /// an active member of) is the third path that kept the event log.
+    #[tokio::test]
+    async fn local_only_drop_wipes_treekem_event_log() -> Result<()> {
+        let f = departure_fixture(0x6c, x0x::mls::SecureGroupPlane::TreeKem, false).await?;
+
+        let (status, body) = response_json(
+            leave_group(State(Arc::clone(&f.state)), Path(f.group_id.clone()))
+                .await
+                .into_response(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "local-only drop must succeed: {body}");
+        assert_eq!(
+            body.get("local_only").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "the fixture must exercise the LocalOnlyDrop disposition: {body}"
+        );
+
+        assert_departure_wiped_treekem_state(&f.state, &f.aliases(), "local-only drop").await;
+        Ok(())
+    }
+
     /// Issue #205: a promoted admin missing a member's TreeKEM KeyPackage
     /// recovers it from this node's cached, self-signed `MemberJoined` and the
     /// removal-path resolver returns it. The cache mirrors what a node holds
