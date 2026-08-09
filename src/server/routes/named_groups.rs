@@ -2255,10 +2255,12 @@ fn spawn_named_group_event_delivery_to_active_members(
 }
 
 async fn stop_named_group_metadata_listener(state: &AppState, group_id: &str) {
-    let handle = state.group_metadata_tasks.write().await.remove(group_id);
-    if let Some(handle) = handle {
-        handle.abort();
-    }
+    // Shares `abort_group_listener_tasks` so the self-abort footgun removed
+    // from the teardown cannot return through this door: every current caller
+    // is an HTTP task, but a listener-driven caller would otherwise truncate
+    // itself here exactly as the teardown used to.
+    let aliases = HashSet::from([group_id.to_string()]);
+    abort_group_listener_tasks(&state.group_metadata_tasks, &aliases).await;
 }
 
 fn apply_stateful_event_to_group<F>(
@@ -5789,6 +5791,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event(
     // Calling replay inside _serialized while the non-reentrant guard is held
     // re-enters the same mutex → deadlock (Kimi blocker 1).
     let mut replay_group_id: Option<String> = None;
+    let event_group_id = named_group_metadata_event_group_id(&event).to_string();
     let applied = apply_named_group_metadata_event_inner_serialized(
         state,
         event,
@@ -5805,7 +5808,61 @@ pub(in crate::server) async fn apply_named_group_metadata_event(
     if let Some(gid) = replay_group_id {
         replay_pending_causal_approvals(state, &gid).await;
     }
+    ensure_listeners_after_local_admission(state, &event_group_id, applied.accepted).await;
     applied
+}
+
+/// Issue #376: re-run the listener ensure when an apply admits the LOCAL agent
+/// into a group whose listeners were refused earlier.
+///
+/// `ensure_named_group_listeners` runs at four entry points only — startup,
+/// create, join and card import — never after an apply. That was harmless
+/// while every locally-held group was listener-eligible, but the ban gate
+/// changed it: a banned member can still redeem a fresh invite (the invite
+/// carries the authority roster verbatim, tombstones included, and the
+/// `MemberJoined` admission chain has no ban gate), so its local stub marks
+/// *itself* banned and the ensure at join time refuses both listeners. The
+/// authority's `MemberAdded` then arrives over direct delivery and flips the
+/// entry to Active — leaving an active member with zero subscriptions until
+/// the next daemon restart. Re-ensuring here closes that window.
+///
+/// Called after `_serialized` returns, so the per-group membership guard is
+/// already released: `ensure_named_group_listeners` takes `named_groups.read()`
+/// plus the task maps, and must not nest under that guard. Both spawners are
+/// idempotent, so the common no-op case costs one map lookup.
+///
+/// Returns a boxed future rather than being an `async fn` because this closes a
+/// type-level cycle: `ensure_named_group_listeners` spawns the metadata
+/// listener, whose receive loop calls back into this apply path. The compiler
+/// cannot infer auto-traits around that loop, so the `Send` bound is declared
+/// here instead. The runtime recursion is depth-1 — the spawned listener
+/// registers itself under this key before processing anything, so its own
+/// applies find the entry present and the inner ensure returns immediately.
+fn ensure_listeners_after_local_admission<'a>(
+    state: &'a Arc<AppState>,
+    event_group_id: &'a str,
+    accepted: bool,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        if !accepted {
+            return;
+        }
+        let resolved = {
+            let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+            let groups = state.named_groups.read().await;
+            groups
+                .iter()
+                .find(|(key, info)| {
+                    (key.as_str() == event_group_id || info.stable_group_id() == event_group_id)
+                        && info.has_active_member(&local_agent_hex)
+                        && named_group_listeners_allowed(info, &local_agent_hex)
+                })
+                .map(|(key, _)| key.clone())
+        };
+        if let Some(group_id) = resolved {
+            ensure_named_group_listeners(Arc::clone(state), &group_id).await;
+        }
+    })
 }
 
 async fn apply_named_group_metadata_event_inner(
@@ -5820,6 +5877,7 @@ async fn apply_named_group_metadata_event_inner(
     // Only when allow_queue is true (suppressed during replay itself to
     // prevent recursion).
     let mut replay_group_id: Option<String> = None;
+    let event_group_id = named_group_metadata_event_group_id(&event).to_string();
     let applied = apply_named_group_metadata_event_inner_serialized(
         state,
         event,
@@ -5838,6 +5896,7 @@ async fn apply_named_group_metadata_event_inner(
             replay_pending_causal_approvals(state, &gid).await;
         }
     }
+    ensure_listeners_after_local_admission(state, &event_group_id, applied.accepted).await;
     applied
 }
 
@@ -6716,7 +6775,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 None
             };
             let current = info.clone();
-            let Ok(next) = apply_stateful_event_to_group(
+            let Ok(mut next) = apply_stateful_event_to_group(
                 &current,
                 &commit,
                 x0x::groups::ActionKind::AdminOrHigher,
@@ -6742,6 +6801,17 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // A node cannot apply the commit that bans it; its own teardown
             // runs after the roster mutation below (issue #376).
             let treekem_payload = if banned_self { None } else { treekem_payload };
+            if banned_self {
+                // Issue #376: the roster entry survives as the Banned
+                // tombstone, so it is the one departure that persists a
+                // `GroupInfo` for a group this node has left — and it carries
+                // the 32-byte GSS group key into `named_groups.json`. Neither
+                // branch above clears it here: the TreeKEM ban route sends
+                // `secret_epoch: None`, and the GSS branch only clears on a
+                // strict epoch advance. Same treatment as the withdrawn
+                // tombstone: the record stays, the key material goes.
+                clear_group_info_key_material(&mut next);
+            }
             if let Some((commit_b64, epoch)) = treekem_payload {
                 use base64::Engine as _;
                 let commit_bytes = match BASE64.decode(commit_b64) {
@@ -6788,6 +6858,13 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 // roster entry survives, the #363 `no_local_group` catch-up
                 // refusal never fires here, so clearing the retained history is
                 // the only thing stopping a banned node from serving it.
+                //
+                // `replay_pending_causal_approvals`, driven after this apply
+                // returns, can still drain a queued GSS `JoinRequestApproved`
+                // and re-seed `group_card_cache` for the group. That is bounded
+                // and holds no key material, and the event log is NOT re-seeded
+                // because replay applies with `allow_queue = false`, which skips
+                // `remember_treekem_membership_event`.
                 wipe_local_group_crypto_material(
                     state,
                     &resolved_group_key,
@@ -8306,18 +8383,49 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
     }
 }
 
-/// Issue #376: a ban keeps its roster entry (the tombstone must stay visible),
-/// so unlike every other departure the group stays eligible for gossip
-/// listeners — the banned node re-subscribed here and again on every restart,
-/// rebuilding the membership history its teardown had just wiped.
+/// Whether this node may hold gossip listeners for `info` at all.
+///
+/// `withdrawn` is terminal. A ban is the one departure that keeps its roster
+/// entry — the tombstone has to stay visible to the user and to the rejoin
+/// path — so without this gate the banned node re-subscribes on every ensure
+/// and on every restart, rebuilding the membership history its teardown just
+/// wiped. Having a roster entry, it also never trips the #363 `no_local_group`
+/// catch-up refusal that protects the other departure paths.
 ///
 /// Deliberately "the local agent is banned", NOT "the local agent is not
 /// active": a joiner legitimately holds a group it is not yet a member of, and
 /// its listeners must keep running or the join never converges. Re-admission
 /// after an un-ban arrives over the re-invite / Welcome direct-delivery path,
 /// which does not depend on these topic subscriptions.
-fn local_agent_is_banned(state: &AppState, info: &x0x::groups::GroupInfo) -> bool {
-    info.is_banned(&hex::encode(state.agent.agent_id().as_bytes()))
+///
+/// Split out as a pure function so the decision is unit-testable: in-process
+/// test agents have no gossip runtime, so `Agent::subscribe` fails and an
+/// assertion on the spawned-task map cannot tell a refusal apart from a failed
+/// subscribe.
+fn named_group_listeners_allowed(info: &x0x::groups::GroupInfo, local_agent_hex: &str) -> bool {
+    !info.withdrawn && !info.is_banned(local_agent_hex)
+}
+
+/// The metadata topic this node should listen on for `info`, if any.
+fn named_group_metadata_listener_topic(
+    info: &x0x::groups::GroupInfo,
+    local_agent_hex: &str,
+) -> Option<String> {
+    named_group_listeners_allowed(info, local_agent_hex).then(|| info.metadata_topic.clone())
+}
+
+/// The public-message topic key this node should listen on for `info`, if any.
+///
+/// Same terminality rules as the metadata listener, plus the `MlsEncrypted`
+/// gate matching `GET /groups/:id/messages`, which rejects those groups
+/// outright rather than serving a plaintext history.
+fn named_group_public_listener_key(
+    info: &x0x::groups::GroupInfo,
+    local_agent_hex: &str,
+) -> Option<String> {
+    (named_group_listeners_allowed(info, local_agent_hex)
+        && info.policy.confidentiality != x0x::groups::GroupConfidentiality::MlsEncrypted)
+        .then(|| info.stable_group_id().to_string())
 }
 
 async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &str) {
@@ -8331,14 +8439,11 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
     }
 
     let metadata_topic = {
+        let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
         let groups = state.named_groups.read().await;
-        groups.get(group_id).and_then(|g| {
-            if g.withdrawn || local_agent_is_banned(&state, g) {
-                None
-            } else {
-                Some(g.metadata_topic.clone())
-            }
-        })
+        groups
+            .get(group_id)
+            .and_then(|g| named_group_metadata_listener_topic(g, &local_agent_hex))
     };
     let Some(metadata_topic) = metadata_topic else {
         return;
@@ -8374,11 +8479,21 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
                 }
             }
         }
-        state_for_task
-            .group_metadata_tasks
-            .write()
-            .await
-            .remove(&task_group_id);
+        // Deregister only our own registration. Since the teardown stopped
+        // aborting the calling task this tail is always reached, so a blind
+        // remove could evict a NEWER handle registered between the teardown's
+        // abort pass and here (a concurrent re-invite re-ensuring listeners),
+        // leaving that listener live but untracked and the next ensure
+        // spawning a duplicate.
+        {
+            let mut tasks = state_for_task.group_metadata_tasks.write().await;
+            if tasks
+                .get(&task_group_id)
+                .is_some_and(|handle| Some(handle.id()) == tokio::task::try_id())
+            {
+                tasks.remove(&task_group_id);
+            }
+        }
     });
 
     state
@@ -8405,17 +8520,11 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
 pub(in crate::server) async fn ensure_named_group_listeners(state: Arc<AppState>, group_id: &str) {
     ensure_named_group_metadata_listener(Arc::clone(&state), group_id).await;
     let public_topic_key = {
+        let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
         let groups = state.named_groups.read().await;
-        groups.get(group_id).and_then(|info| {
-            if info.withdrawn
-                || local_agent_is_banned(&state, info)
-                || info.policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted
-            {
-                None
-            } else {
-                Some(info.stable_group_id().to_string())
-            }
-        })
+        groups
+            .get(group_id)
+            .and_then(|info| named_group_public_listener_key(info, &local_agent_hex))
     };
     if let Some(stable_id) = public_topic_key {
         spawn_public_message_listener(state, stable_id).await;
@@ -9887,6 +9996,11 @@ pub(in crate::server) async fn spawn_global_public_message_listener(
 /// listener. The spawned task owns only the receive loop.
 async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
     {
+        // Issue #376: `GET /groups/:id/messages` calls this directly, bypassing
+        // `ensure_named_group_listeners`, so the eligibility gate has to live
+        // here too — otherwise a banned node on a public-read group
+        // re-subscribes and re-populates `public_messages` after its teardown.
+        let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
         let groups = state.named_groups.read().await;
         if groups
             .get(&group_id)
@@ -9895,7 +10009,7 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
                     .values()
                     .find(|info| info.stable_group_id() == group_id.as_str())
             })
-            .is_some_and(|info| info.withdrawn)
+            .is_some_and(|info| named_group_public_listener_key(info, &local_agent_hex).is_none())
         {
             return;
         }
@@ -27253,20 +27367,62 @@ mod tests {
     /// every restart and rebuilt the log it had just been banned from.
     #[tokio::test]
     async fn member_banned_self_wipes_treekem_event_log() -> Result<()> {
-        let f = departure_fixture(0x70, x0x::mls::SecureGroupPlane::Gss, true).await?;
-        let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+        assert_ban_of_local_member_leaves_nothing(0x70, x0x::mls::SecureGroupPlane::Gss).await
+    }
 
-        let mut committed = f
-            .state
-            .named_groups
-            .read()
-            .await
-            .get(&f.group_id)
-            .cloned()
-            .context("fixture group is present")?;
+    /// Issue #376: the TreeKEM plane takes the same ban path but reaches it
+    /// through the `treekem_payload` shadow — a node cannot process the commit
+    /// that removes it from the tree. Without the shadow this apply decodes the
+    /// commit and rejects, so the teardown never runs at all.
+    #[tokio::test]
+    async fn member_banned_self_wipes_treekem_event_log_on_treekem_plane() -> Result<()> {
+        assert_ban_of_local_member_leaves_nothing(0x72, x0x::mls::SecureGroupPlane::TreeKem).await
+    }
+
+    /// Drive an admin-authored ban of this node on `plane` and assert the full
+    /// departure contract: history wiped, group key gone, tombstone kept, and
+    /// the group no longer listener-eligible.
+    async fn assert_ban_of_local_member_leaves_nothing(
+        group_byte: u8,
+        plane: x0x::mls::SecureGroupPlane,
+    ) -> Result<()> {
+        let f = departure_fixture(group_byte, plane, true).await?;
+        let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+        let treekem = plane == x0x::mls::SecureGroupPlane::TreeKem;
+        if treekem {
+            // Without a live TreeKEM group `current_treekem_epoch` is None and
+            // every TreeKEM membership event is queued as `treekem_not_ready`
+            // before it can reach the ban arm.
+            let group_id_bytes = hex::decode(&f.group_id)?;
+            let seed = agent_treekem_seed(f.state.agent.as_ref(), &group_id_bytes);
+            let live =
+                x0x::mls::TreeKemMlsGroup::create(group_id_bytes, f.state.agent.agent_id(), &seed)?;
+            f.state
+                .treekem_groups
+                .write()
+                .await
+                .insert(f.group_id.clone(), Arc::new(Mutex::new(live)));
+        }
+
+        // The GSS group key. The ban keeps its roster entry, so unless it is
+        // cleared explicitly this 32-byte secret is persisted to
+        // `named_groups.json` on the banned node.
+        let mut committed = {
+            let mut groups = f.state.named_groups.write().await;
+            let info = groups
+                .get_mut(&f.group_id)
+                .context("fixture group is present")?;
+            info.shared_secret = Some(vec![7u8; 32]);
+            info.clone()
+        };
         committed.roster_revision = committed.roster_revision.saturating_add(1);
         let revision = committed.roster_revision;
         committed.ban_member(&local_hex, Some(f.peer_hex.clone()));
+        if treekem {
+            // Mirror the apply's TreeKEM branch so the sealed commit matches.
+            committed.secret_epoch = 1;
+            committed.security_binding = Some("treekem:epoch=1".to_string());
+        }
         let commit = committed.seal_commit(&f.peer_kp, 1_000)?;
         let event = NamedGroupMetadataEvent::MemberBanned {
             group_id: f.stable_group_id.clone(),
@@ -27274,8 +27430,10 @@ mod tests {
             actor: f.peer_hex.clone(),
             agent_id: local_hex.clone(),
             secret_epoch: None,
-            treekem_commit_b64: None,
-            treekem_epoch: None,
+            // Deliberately undecodable: with the shadow in place the banned
+            // node must never reach the decode.
+            treekem_commit_b64: treekem.then(|| "Yw==".to_string()),
+            treekem_epoch: treekem.then_some(1),
             commit: Some(commit),
         };
 
@@ -27295,21 +27453,182 @@ mod tests {
                 info.is_banned(&local_hex),
                 "the ban tombstone must be retained so the user still sees it"
             );
+            assert!(
+                info.shared_secret.is_none(),
+                "the group key must not survive on the banned node"
+            );
+            assert!(
+                named_group_metadata_listener_topic(info, &local_hex).is_none()
+                    && named_group_public_listener_key(info, &local_hex).is_none(),
+                "a banned node must be refused both listeners; the retained roster entry \
+                 otherwise re-subscribes it on every ensure and every restart"
+            );
         }
 
         assert_departure_wiped_treekem_state(&f.state, &f.aliases(), "member banned self").await;
+        Ok(())
+    }
 
-        // The retained tombstone must not keep this node subscribed: the
-        // listener-ensure predicate skipped only `withdrawn` groups, so a
-        // banned node re-joined the metadata topic here and on every restart.
-        ensure_named_group_metadata_listener(Arc::clone(&f.state), &f.group_id).await;
+    /// Issue #376: the listener eligibility rules, asserted directly.
+    ///
+    /// These are pure because the in-process test agent has no gossip runtime:
+    /// `Agent::subscribe` fails, so `ensure_named_group_metadata_listener`
+    /// registers no task whatever the predicate decides, and an assertion on
+    /// the task map cannot tell a refusal from a failed subscribe. (Verified:
+    /// the earlier task-map assertion still passed with the ban check deleted.)
+    #[tokio::test]
+    async fn named_group_listener_eligibility_rules() -> Result<()> {
+        let f = departure_fixture(0x74, x0x::mls::SecureGroupPlane::Gss, true).await?;
+        let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+        let mut base = f
+            .state
+            .named_groups
+            .read()
+            .await
+            .get(&f.group_id)
+            .cloned()
+            .context("fixture group is present")?;
+        // The fixture preset is PrivateSecure (MlsEncrypted), which has no
+        // public-message listener at all; relax it so the ban/withdrawn rules
+        // are observable on BOTH listeners rather than passing vacuously on a
+        // group that never had the public one.
+        base.policy.confidentiality = x0x::groups::GroupConfidentiality::SignedPublic;
+
         assert!(
-            !f.state
-                .group_metadata_tasks
-                .read()
-                .await
-                .contains_key(&f.group_id),
-            "a banned node must not re-subscribe to the group's metadata topic"
+            named_group_metadata_listener_topic(&base, &local_hex).is_some()
+                && named_group_public_listener_key(&base, &local_hex).is_some(),
+            "an active member must hold both listeners"
+        );
+
+        // A joiner holds the group before it is a member; refusing here would
+        // strand the join, which is why the gate is "banned", not "inactive".
+        let mut joiner = base.clone();
+        joiner.remove_member(&local_hex, None);
+        assert!(
+            !joiner.has_active_member(&local_hex),
+            "fixture models a not-yet-active local agent"
+        );
+        assert!(
+            named_group_metadata_listener_topic(&joiner, &local_hex).is_some()
+                && named_group_public_listener_key(&joiner, &local_hex).is_some(),
+            "a joiner that is not yet an active member must keep its listeners"
+        );
+
+        let mut banned = base.clone();
+        banned.ban_member(&local_hex, None);
+        assert!(
+            named_group_metadata_listener_topic(&banned, &local_hex).is_none()
+                && named_group_public_listener_key(&banned, &local_hex).is_none(),
+            "a banned local agent must be refused both listeners"
+        );
+
+        let mut withdrawn = base.clone();
+        withdrawn.withdrawn = true;
+        assert!(
+            named_group_metadata_listener_topic(&withdrawn, &local_hex).is_none()
+                && named_group_public_listener_key(&withdrawn, &local_hex).is_none(),
+            "a withdrawn group must be refused both listeners"
+        );
+
+        // The ban is scoped to THIS agent: another member's ban is irrelevant.
+        let mut peer_banned = base.clone();
+        peer_banned.ban_member(&f.peer_hex, None);
+        assert!(
+            named_group_metadata_listener_topic(&peer_banned, &local_hex).is_some(),
+            "another member's ban must not silence this node"
+        );
+
+        let mut encrypted = base.clone();
+        encrypted.policy.confidentiality = x0x::groups::GroupConfidentiality::MlsEncrypted;
+        assert!(
+            named_group_metadata_listener_topic(&encrypted, &local_hex).is_some()
+                && named_group_public_listener_key(&encrypted, &local_hex).is_none(),
+            "MlsEncrypted groups keep metadata but publish no plaintext history"
+        );
+        Ok(())
+    }
+
+    /// Issue #376: a banned member can still redeem a fresh invite — the invite
+    /// carries the authority roster verbatim (only key material is stripped)
+    /// and the `MemberJoined` admission chain has no ban gate — so its local
+    /// stub marks itself banned and the join-time ensure refuses both
+    /// listeners. The authority's `MemberAdded` then flips it Active over
+    /// direct delivery, and nothing re-ran the ensure: an active member with no
+    /// subscriptions until the next restart.
+    ///
+    /// Limitation, stated honestly: with no gossip runtime the spawn itself is
+    /// unobservable here, so this pins the transition that must trigger the
+    /// re-ensure (banned+refused -> active+eligible across one apply) and that
+    /// the apply completes. The decision itself is pinned by
+    /// `named_group_listener_eligibility_rules`.
+    #[tokio::test]
+    async fn readmitted_banned_member_becomes_listener_eligible() -> Result<()> {
+        let f = departure_fixture(0x76, x0x::mls::SecureGroupPlane::Gss, true).await?;
+        let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+
+        // The re-invited stub: the authority's roster still carries this node's
+        // Banned tombstone, so the join-time ensure refused both listeners.
+        let mut committed = {
+            let mut groups = f.state.named_groups.write().await;
+            let info = groups
+                .get_mut(&f.group_id)
+                .context("fixture group is present")?;
+            info.ban_member(&local_hex, Some(f.peer_hex.clone()));
+            info.recompute_state_hash();
+            info.clone()
+        };
+        assert!(
+            named_group_metadata_listener_topic(&committed, &local_hex).is_none(),
+            "precondition: the re-invited stub is listener-ineligible"
+        );
+
+        committed.roster_revision = committed.roster_revision.saturating_add(1);
+        let revision = committed.roster_revision;
+        committed.add_member(
+            local_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(f.peer_hex.clone()),
+            None,
+        );
+        let commit = committed.seal_commit(&f.peer_kp, 1_000)?;
+        let event = NamedGroupMetadataEvent::MemberAdded {
+            group_id: f.stable_group_id.clone(),
+            revision,
+            actor: f.peer_hex.clone(),
+            agent_id: local_hex.clone(),
+            display_name: None,
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
+            commit: Some(commit),
+        };
+
+        let applied =
+            apply_named_group_metadata_event(&f.state, event, f.peer_kp.agent_id(), true, None)
+                .await;
+        assert!(
+            applied.accepted,
+            "the authority's re-admission must apply on the re-invited node"
+        );
+
+        let groups = f.state.named_groups.read().await;
+        let info = groups
+            .get(&f.group_id)
+            .context("the re-admitted group must stay on the roster")?;
+        assert!(
+            info.has_active_member(&local_hex),
+            "re-admission must clear the local Banned tombstone"
+        );
+        // Metadata only: the fixture preset is MlsEncrypted, which has no
+        // public-message listener. The metadata listener is the load-bearing
+        // one here — it is what the ban silenced.
+        assert!(
+            named_group_metadata_listener_topic(info, &local_hex).is_some(),
+            "a re-admitted member must become listener-eligible again"
         );
         Ok(())
     }
