@@ -5397,7 +5397,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     if sender_hex != request.requester_agent_id {
         return;
     }
-    let (authorized, log_keys) = {
+    let (authorized, sender_departed, log_keys) = {
         let groups = state.named_groups.read().await;
         if let Some((key, info)) = groups.get_key_value(&request.group_id).or_else(|| {
             groups
@@ -5414,9 +5414,15 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
             ];
             keys.sort();
             keys.dedup();
-            (info.has_active_member(&sender_hex), keys)
+            (
+                info.has_active_member(&sender_hex),
+                info.members_v2
+                    .get(&sender_hex)
+                    .is_some_and(|member| !member.is_active()),
+                keys,
+            )
         } else {
-            (false, vec![request.group_id.clone()])
+            (false, false, vec![request.group_id.clone()])
         }
     };
     let target_of_cached_add = {
@@ -5435,16 +5441,27 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
             })
         })
     };
-    if !authorized && !target_of_cached_add {
-        tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %sender_hex, "rejecting unauthorized TreeKEM catch-up request");
+    // Issue #363: the cached add alone is not proof of membership — a removal
+    // prunes only the remover's cache, so every other peer keeps naming the
+    // departed member forever. A non-active roster entry means this node knows
+    // the sender left and it loses catch-up service; no entry at all is a
+    // bootstrap joiner this node has only ever seen through the cached add.
+    if !authorized && (sender_departed || !target_of_cached_add) {
+        tracing::warn!(
+            group_id = %LogHexId::group(&request.group_id),
+            requester = %sender_hex,
+            reason = if sender_departed { "departed_member" } else { "not_a_member" },
+            "rejecting unauthorized TreeKEM catch-up request"
+        );
         return;
     }
     // Issue #205: member-keyed TreeKEM KeyPackage fetch. The requester is a
     // promoted admin missing a member's key package; serve this node's cached,
     // self-signed `MemberJoined` for the target (this node witnessed the join).
     // The same gates apply (verified DM, sender == requester, active member or
-    // target-of-cached-add). The requester authenticates the package via the
-    // embedded ML-DSA-65 signature in `apply_recovered_member_key_package`.
+    // non-departed target-of-cached-add). The requester authenticates the
+    // package via the embedded ML-DSA-65 signature in
+    // `apply_recovered_member_key_package`.
     if let Some(response) = member_keyed_treekem_catchup_response(state, &log_keys, &request).await
     {
         let payload = match serde_json::to_vec(&response) {
@@ -26623,6 +26640,140 @@ mod tests {
         assert!(
             verify_member_joined_key_package_event(&response.events[0]),
             "returned key package retains a valid member signature"
+        );
+        Ok(())
+    }
+
+    /// Build a serving peer whose TreeKEM event log still names `subject_hex`
+    /// in a cached `MemberAdded`. This models the peer that was never told
+    /// about a later departure: `prune_treekem_cache_member` only prunes the
+    /// remover's own cache.
+    async fn cached_add_catchup_fixture(
+        group_byte: u8,
+        subject_hex: &str,
+    ) -> Result<(Arc<AppState>, tempfile::TempDir, String)> {
+        let (state, dir) = secure_endpoint_test_state().await?;
+        let group_id = format!("{group_byte:02x}").repeat(32);
+        let stable_group_id = format!("{:02x}", group_byte.wrapping_add(1)).repeat(32);
+        let creator = state.agent.agent_id();
+        let creator_hex = hex::encode(creator.as_bytes());
+        let info = treekem_metadata_group_info(creator, &group_id, &stable_group_id);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+        let cached_add = NamedGroupMetadataEvent::MemberAdded {
+            group_id: group_id.clone(),
+            revision: 2,
+            actor: creator_hex.clone(),
+            agent_id: subject_hex.to_string(),
+            display_name: None,
+            treekem_commit_b64: Some("Yw==".to_string()),
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: Some(2),
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
+            commit: Some(fake_group_state_commit(&group_id, 2, &creator_hex)),
+        };
+        state
+            .treekem_event_log
+            .write()
+            .await
+            .insert(group_id.clone(), VecDeque::from(vec![cached_add]));
+        Ok((state, dir, group_id))
+    }
+
+    /// Drive one catch-up request and report how many outbound DMs the handler
+    /// attempted: a refusal returns before any send, a served request always
+    /// attempts one (the offline test agent then fails the send).
+    async fn treekem_catchup_send_attempts(
+        state: &Arc<AppState>,
+        sender: &AgentId,
+        group_id: &str,
+    ) -> u64 {
+        let outgoing = || {
+            state
+                .agent
+                .direct_messaging()
+                .diagnostics_snapshot()
+                .stats
+                .outgoing_send_total
+        };
+        let before = outgoing();
+        let request = TreeKemCatchupRequest {
+            message_type: "treekem_catchup_request".to_string(),
+            group_id: group_id.to_string(),
+            requester_agent_id: hex::encode(sender.as_bytes()),
+            from_revision: 0,
+            from_treekem_epoch: 0,
+            current_state_hash: String::new(),
+            missing_prev_state_hash: None,
+            target_member_id: None,
+            limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+        };
+        handle_treekem_catchup_request(state, sender, true, request).await;
+        outgoing().saturating_sub(before)
+    }
+
+    /// Issue #363: a removed member is still named by this peer's cached
+    /// `MemberAdded`, but the roster records the departure. Catch-up must be
+    /// refused — otherwise a departed member keeps pulling the group's
+    /// membership event stream from every peer whose cache was never pruned.
+    #[tokio::test]
+    async fn treekem_catchup_refuses_departed_member_with_cached_add() -> Result<()> {
+        let departed = x0x::identity::AgentKeypair::generate()?;
+        let departed_id = departed.agent_id();
+        let departed_hex = hex::encode(departed_id.as_bytes());
+        let (state, _dir, group_id) = cached_add_catchup_fixture(0x5c, &departed_hex).await?;
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_id).expect("fixture group is present");
+            info.add_member(
+                departed_hex.clone(),
+                x0x::groups::GroupRole::Member,
+                None,
+                None,
+            );
+            info.remove_member(&departed_hex, None);
+            assert!(
+                !info.has_active_member(&departed_hex),
+                "fixture models a departed member"
+            );
+        }
+
+        assert_eq!(
+            treekem_catchup_send_attempts(&state, &departed_id, &group_id).await,
+            0,
+            "a departed member must not be served from a stale cached add"
+        );
+        Ok(())
+    }
+
+    /// Issue #363: the bootstrap path must not regress. A joiner this peer has
+    /// only ever seen through the cached add has no roster entry at all, and
+    /// is still served.
+    #[tokio::test]
+    async fn treekem_catchup_serves_bootstrap_joiner_with_cached_add() -> Result<()> {
+        let joiner = x0x::identity::AgentKeypair::generate()?;
+        let joiner_id = joiner.agent_id();
+        let joiner_hex = hex::encode(joiner_id.as_bytes());
+        let (state, _dir, group_id) = cached_add_catchup_fixture(0x5e, &joiner_hex).await?;
+        {
+            let groups = state.named_groups.read().await;
+            let info = groups.get(&group_id).expect("fixture group is present");
+            assert!(
+                !info.members_v2.contains_key(&joiner_hex),
+                "fixture models a joiner with no roster entry"
+            );
+        }
+
+        assert_eq!(
+            treekem_catchup_send_attempts(&state, &joiner_id, &group_id).await,
+            1,
+            "a bootstrap joiner named by a cached add is still served"
         );
         Ok(())
     }
