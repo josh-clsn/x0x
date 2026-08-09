@@ -6738,21 +6738,11 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             ) else {
                 return ApplyMetadataResult::REJECTED;
             };
-            let cache_aliases = treekem_cache_group_aliases(state, &resolved_group_key).await;
             let banned_self = agent_id == local_agent_hex;
-            if banned_self {
-                state
-                    .treekem_groups
-                    .write()
-                    .await
-                    .remove(&resolved_group_key);
-                remove_treekem_persistence_for_group_id(
-                    state,
-                    &resolved_group_key,
-                    "member_banned_self",
-                )
-                .await;
-            } else if let Some((commit_b64, epoch)) = treekem_payload {
+            // A node cannot apply the commit that bans it; its own teardown
+            // runs after the roster mutation below (issue #376).
+            let treekem_payload = if banned_self { None } else { treekem_payload };
+            if let Some((commit_b64, epoch)) = treekem_payload {
                 use base64::Engine as _;
                 let commit_bytes = match BASE64.decode(commit_b64) {
                     Ok(bytes) => bytes,
@@ -6790,8 +6780,21 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             *replay_group_id = Some(resolved_group_key.clone());
             remember_treekem_membership_event(state, &event_for_log).await;
             if banned_self {
-                let _ =
-                    prune_treekem_cache_groups(state, &cache_aliases, "member_banned_self").await;
+                // Issue #376: a ban is a departure, and the only one that keeps
+                // its roster entry — the Banned tombstone must stay visible to
+                // the user and to the rejoin path. Wipe after the card-cache
+                // refresh and `remember_treekem_membership_event` above, both of
+                // which would otherwise re-seed what this clears. Because the
+                // roster entry survives, the #363 `no_local_group` catch-up
+                // refusal never fires here, so clearing the retained history is
+                // the only thing stopping a banned node from serving it.
+                wipe_local_group_crypto_material(
+                    state,
+                    &resolved_group_key,
+                    Some(next.stable_group_id()),
+                    "member_banned_self",
+                )
+                .await;
             } else {
                 let _ = prune_treekem_cache_member(
                     state,
@@ -8303,6 +8306,20 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
     }
 }
 
+/// Issue #376: a ban keeps its roster entry (the tombstone must stay visible),
+/// so unlike every other departure the group stays eligible for gossip
+/// listeners — the banned node re-subscribed here and again on every restart,
+/// rebuilding the membership history its teardown had just wiped.
+///
+/// Deliberately "the local agent is banned", NOT "the local agent is not
+/// active": a joiner legitimately holds a group it is not yet a member of, and
+/// its listeners must keep running or the join never converges. Re-admission
+/// after an un-ban arrives over the re-invite / Welcome direct-delivery path,
+/// which does not depend on these topic subscriptions.
+fn local_agent_is_banned(state: &AppState, info: &x0x::groups::GroupInfo) -> bool {
+    info.is_banned(&hex::encode(state.agent.agent_id().as_bytes()))
+}
+
 async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &str) {
     if state
         .group_metadata_tasks
@@ -8316,7 +8333,7 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
     let metadata_topic = {
         let groups = state.named_groups.read().await;
         groups.get(group_id).and_then(|g| {
-            if g.withdrawn {
+            if g.withdrawn || local_agent_is_banned(&state, g) {
                 None
             } else {
                 Some(g.metadata_topic.clone())
@@ -8391,6 +8408,7 @@ pub(in crate::server) async fn ensure_named_group_listeners(state: Arc<AppState>
         let groups = state.named_groups.read().await;
         groups.get(group_id).and_then(|info| {
             if info.withdrawn
+                || local_agent_is_banned(&state, info)
                 || info.policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted
             {
                 None
@@ -11589,22 +11607,6 @@ async fn wipe_local_group_crypto_material(
         }
     }
     {
-        let mut tasks = state.group_metadata_tasks.write().await;
-        for alias in &aliases {
-            if let Some(handle) = tasks.remove(alias) {
-                handle.abort();
-            }
-        }
-    }
-    {
-        let mut tasks = state.public_message_tasks.write().await;
-        for alias in &aliases {
-            if let Some(handle) = tasks.remove(alias) {
-                handle.abort();
-            }
-        }
-    }
-    {
         let mut join_results = state.pending_join_results.write().await;
         join_results.retain(|key, pending| {
             !join_result_key_matches_any_group_alias(key, &aliases)
@@ -11651,6 +11653,38 @@ async fn wipe_local_group_crypto_material(
 
     for alias in &aliases {
         remove_treekem_persistence_for_group_id(state, alias, reason).await;
+    }
+
+    // The listener aborts run LAST, and never against the calling task. The
+    // metadata listener registers its own `JoinHandle` here under the roster
+    // key and then drives the apply that reaches this teardown, so a blind
+    // abort is a self-abort: tokio defers it to the next yield and everything
+    // still to do — including the `remove_file` loop above, which erases
+    // private TreeKEM key material — is dropped with the future. Keeping both
+    // aborts at the end means no future reordering can lose a teardown step
+    // this way, whichever step happens to yield first.
+    abort_group_listener_tasks(&state.group_metadata_tasks, &aliases).await;
+    abort_group_listener_tasks(&state.public_message_tasks, &aliases).await;
+}
+
+/// Deregister and abort the listener tasks recorded for `aliases`, skipping the
+/// task currently executing.
+///
+/// Dropping the map entry is correct for our own task too — the listener loop
+/// it belongs to exits on the `should_exit` result of the apply that called
+/// this teardown, and its own tail no longer needs to deregister itself.
+async fn abort_group_listener_tasks(
+    tasks: &RwLock<HashMap<String, tokio::task::JoinHandle<()>>>,
+    aliases: &HashSet<String>,
+) {
+    let current = tokio::task::try_id();
+    let mut tasks = tasks.write().await;
+    for alias in aliases {
+        if let Some(handle) = tasks.remove(alias) {
+            if current != Some(handle.id()) {
+                handle.abort();
+            }
+        }
     }
 }
 
@@ -11852,6 +11886,12 @@ async fn leave_treekem_group(
     // last, after the event is published and handed to delivery: each
     // per-recipient send is a detached task holding its own `Arc<Agent>` and a
     // pre-serialized payload, so the task aborts here cannot cancel it.
+    //
+    // Two side effects are intended, per ADR-0012 "a left group leaves nothing
+    // behind locally", and apply to every departure routed through this
+    // teardown: the group's local public-message history is dropped, and an
+    // in-flight `stream_welcome_blob` this node was serving stalls when its ack
+    // slot goes (the joiner retries against another member).
     wipe_local_group_crypto_material(&state, &id, Some(&event_group_id), "treekem_leave").await;
 
     (
