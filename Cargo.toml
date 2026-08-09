@@ -181,7 +181,7 @@ strip = "none"
 # Rust symbols without needing the .dwo files shipped alongside.
 split-debuginfo = "off"
 
-# fetch>it leaf relay policy: vendored pristine 0.5.67 plus the leaf
+# fetch>it leaf relay policy: vendored pristine 0.5.68 plus the leaf
 # passthrough gate (see vendor/saorsa-gossip-pubsub, commit history).
 # Upstream carries no way to opt a metered device out of relaying for the
 # whole network, which cost one test phone 129GB in a month.
