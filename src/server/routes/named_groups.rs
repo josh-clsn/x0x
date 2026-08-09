@@ -7686,18 +7686,18 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 };
                 let stored_kp_bytes = match BASE64.decode(&stored_kp_b64) {
                     Ok(b) => b,
-                    Err(_) => return false,
+                    Err(_) => return ApplyMetadataResult::REJECTED,
                 };
                 let Some(new_kp_b64) = treekem_key_package_b64.clone() else {
                     return ApplyMetadataResult::REJECTED;
                 };
                 let new_kp_bytes = match BASE64.decode(&new_kp_b64) {
                     Ok(b) => b,
-                    Err(_) => return false,
+                    Err(_) => return ApplyMetadataResult::REJECTED,
                 };
                 let member_id = match parse_agent_id_hex(&member_agent_id) {
                     Ok(id) => id,
-                    Err(_) => return false,
+                    Err(_) => return ApplyMetadataResult::REJECTED,
                 };
 
                 // The incoming member-signed join event doubles as the recovery
