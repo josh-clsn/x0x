@@ -5397,7 +5397,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     if sender_hex != request.requester_agent_id {
         return;
     }
-    let (authorized, sender_departed, log_keys) = {
+    let group_authority = {
         let groups = state.named_groups.read().await;
         if let Some((key, info)) = groups.get_key_value(&request.group_id).or_else(|| {
             groups
@@ -5414,16 +5414,30 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
             ];
             keys.sort();
             keys.dedup();
-            (
+            Some((
                 info.has_active_member(&sender_hex),
                 info.members_v2
                     .get(&sender_hex)
                     .is_some_and(|member| !member.is_active()),
                 keys,
-            )
+            ))
         } else {
-            (false, false, vec![request.group_id.clone()])
+            None
         }
+    };
+    // Issue #363: serving requires the local group roster. A node that leaves
+    // drops its `named_groups` entry but keeps the in-memory TreeKEM event log
+    // — only the withdrawn-tombstone path wipes it — so a roster-less log is a
+    // departed node's residue, with no authority over the group's membership
+    // history. Remaining members are backfilled by live members instead.
+    let Some((authorized, sender_departed, log_keys)) = group_authority else {
+        tracing::warn!(
+            group_id = %LogHexId::group(&request.group_id),
+            requester = %sender_hex,
+            reason = "no_local_group",
+            "rejecting unauthorized TreeKEM catch-up request"
+        );
+        return;
     };
     let target_of_cached_add = {
         let logs = state.treekem_event_log.read().await;
@@ -26693,6 +26707,7 @@ mod tests {
         state: &Arc<AppState>,
         sender: &AgentId,
         group_id: &str,
+        target_member_id: Option<String>,
     ) -> u64 {
         let outgoing = || {
             state
@@ -26711,7 +26726,7 @@ mod tests {
             from_treekem_epoch: 0,
             current_state_hash: String::new(),
             missing_prev_state_hash: None,
-            target_member_id: None,
+            target_member_id,
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
         };
         handle_treekem_catchup_request(state, sender, true, request).await;
@@ -26745,9 +26760,95 @@ mod tests {
         }
 
         assert_eq!(
-            treekem_catchup_send_attempts(&state, &departed_id, &group_id).await,
+            treekem_catchup_send_attempts(&state, &departed_id, &group_id, None).await,
             0,
             "a departed member must not be served from a stale cached add"
+        );
+        Ok(())
+    }
+
+    /// Issue #363: `ban_member` tombstones through `or_insert_with`, so a
+    /// banned peer can hold a roster entry it never held as an active member.
+    /// Banned is non-active, so the cached add must not serve it either.
+    #[tokio::test]
+    async fn treekem_catchup_refuses_banned_member_with_cached_add() -> Result<()> {
+        let banned = x0x::identity::AgentKeypair::generate()?;
+        let banned_id = banned.agent_id();
+        let banned_hex = hex::encode(banned_id.as_bytes());
+        let (state, _dir, group_id) = cached_add_catchup_fixture(0x60, &banned_hex).await?;
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_id).expect("fixture group is present");
+            info.ban_member(&banned_hex, None);
+            assert!(info.is_banned(&banned_hex), "fixture models a banned peer");
+        }
+
+        assert_eq!(
+            treekem_catchup_send_attempts(&state, &banned_id, &group_id, None).await,
+            0,
+            "a banned peer must not be served from a stale cached add"
+        );
+        Ok(())
+    }
+
+    /// Issue #363: the member-keyed KeyPackage response is composed after the
+    /// authorization gate, so a departed member must not reach it either — the
+    /// single choke point has to cover both serve branches.
+    #[tokio::test]
+    async fn treekem_catchup_refuses_departed_member_keyed_request() -> Result<()> {
+        let departed = x0x::identity::AgentKeypair::generate()?;
+        let departed_id = departed.agent_id();
+        let departed_hex = hex::encode(departed_id.as_bytes());
+        let (state, _dir, group_id) = cached_add_catchup_fixture(0x62, &departed_hex).await?;
+        let target_hex = {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_id).expect("fixture group is present");
+            info.add_member(
+                departed_hex.clone(),
+                x0x::groups::GroupRole::Member,
+                None,
+                None,
+            );
+            info.remove_member(&departed_hex, None);
+            hex::encode(state.agent.agent_id().as_bytes())
+        };
+
+        assert_eq!(
+            treekem_catchup_send_attempts(&state, &departed_id, &group_id, Some(target_hex)).await,
+            0,
+            "a departed member must not reach the member-keyed KeyPackage serve"
+        );
+        Ok(())
+    }
+
+    /// Issue #363: a node that left the group removes its `named_groups` entry
+    /// but keeps the in-memory TreeKEM event log (only the withdrawn-tombstone
+    /// path wipes it). Without the roster it has no authority to serve that
+    /// log's membership history to anyone — including a peer its stale cached
+    /// add still names.
+    #[tokio::test]
+    async fn treekem_catchup_refuses_serve_without_local_group() -> Result<()> {
+        let requester = x0x::identity::AgentKeypair::generate()?;
+        let requester_id = requester.agent_id();
+        let requester_hex = hex::encode(requester_id.as_bytes());
+        let (state, _dir, group_id) = cached_add_catchup_fixture(0x64, &requester_hex).await?;
+        // Model the local departure: `leave` drops the roster entry and leaves
+        // the event log behind.
+        state.named_groups.write().await.remove(&group_id);
+        assert!(
+            state
+                .treekem_event_log
+                .read()
+                .await
+                .get(&group_id)
+                .is_some_and(|events| !events.is_empty()),
+            "the departed node still holds the cached add"
+        );
+
+        assert_eq!(
+            treekem_catchup_send_attempts(&state, &requester_id, &group_id, None).await,
+            0,
+            "a node without the group roster must not serve its residual log"
         );
         Ok(())
     }
@@ -26771,7 +26872,7 @@ mod tests {
         }
 
         assert_eq!(
-            treekem_catchup_send_attempts(&state, &joiner_id, &group_id).await,
+            treekem_catchup_send_attempts(&state, &joiner_id, &group_id, None).await,
             1,
             "a bootstrap joiner named by a cached add is still served"
         );
