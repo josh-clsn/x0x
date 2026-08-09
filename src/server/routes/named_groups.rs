@@ -6456,6 +6456,19 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 save_mls_groups(state).await;
                 let _ =
                     prune_treekem_cache_groups(state, &cache_aliases, "member_removed_self").await;
+                // Issue #376: being removed is a departure. The teardown above
+                // is keyed by the local group id, so the stable-id-keyed
+                // TreeKEM event log and pending-event queue stayed resident on
+                // a node that is no longer in the group. The `replay_group_id`
+                // set above still drives `replay_pending_causal_approvals`
+                // after this returns; post-wipe that replay is a no-op.
+                wipe_local_group_crypto_material(
+                    state,
+                    &resolved_group_key,
+                    Some(next.stable_group_id()),
+                    "member_removed_self",
+                )
+                .await;
                 return ApplyMetadataResult::ACCEPTED_EXIT;
             }
             if let Some((commit_b64, _epoch)) = treekem_payload {
@@ -11705,32 +11718,17 @@ async fn drop_local_named_group_state(
     ) {
         return false;
     }
+    // Pruned with the aliases resolved *before* the roster mutation, which is
+    // the only point a third alias reachable only through the roster entry is
+    // still discoverable; the wipe below re-resolves and covers `id` plus
+    // `stable_group_id` unconditionally.
     let _ = prune_treekem_cache_groups(state, &cache_aliases, reason).await;
-    {
-        let mut cache = state.group_card_cache.write().await;
-        cache.remove(id);
-        if let Some(stable_group_id) = stable_group_id {
-            cache.remove(stable_group_id);
-        }
-    }
-    {
-        let mut mls_groups = state.mls_groups.write().await;
-        mls_groups.remove(id);
-        if let Some(stable_group_id) = stable_group_id {
-            mls_groups.remove(stable_group_id);
-        }
-    }
-    {
-        let mut treekem_groups = state.treekem_groups.write().await;
-        treekem_groups.remove(id);
-        if let Some(stable_group_id) = stable_group_id {
-            treekem_groups.remove(stable_group_id);
-        }
-    }
-    remove_treekem_persistence_for_group_id(state, id, reason).await;
-    if let Some(stable_group_id) = stable_group_id {
-        remove_treekem_persistence_for_group_id(state, stable_group_id, reason).await;
-    }
+    // Issue #376: this used to tear down the card cache, the MLS/TreeKEM
+    // groups and the at-rest persistence one key at a time, leaving the
+    // stable-id-keyed TreeKEM event log and pending-event queue resident on a
+    // node that no longer holds the group. The shared teardown clears every
+    // alias of all of it, so a dropped group leaves no material behind.
+    wipe_local_group_crypto_material(state, id, stable_group_id, reason).await;
     save_mls_groups(state).await;
     stop_named_group_metadata_listener(state, id).await;
     if let Some(stable_group_id) = stable_group_id {
@@ -11829,7 +11827,7 @@ async fn leave_treekem_group(
     save_mls_groups(&state).await;
 
     let event = NamedGroupMetadataEvent::MemberRemoved {
-        group_id: event_group_id,
+        group_id: event_group_id.clone(),
         revision,
         actor: local_agent_hex.clone(),
         agent_id: local_agent_hex,
@@ -11848,6 +11846,13 @@ async fn leave_treekem_group(
     // decrypt at the new epoch. Harmless before the rekey existed (nothing
     // advanced, so nobody fell behind); load-bearing now.
     spawn_named_group_event_delivery_to_active_members(&state, &next, &event, &[]);
+    // Issue #376: the teardown above is keyed by the local group id and leaves
+    // the stable-id-keyed material behind — including the membership event log
+    // `remember_treekem_membership_event` just re-appended this leave to. Wipe
+    // last, after the event is published and handed to delivery: each
+    // per-recipient send is a detached task holding its own `Arc<Agent>` and a
+    // pre-serialized payload, so the task aborts here cannot cancel it.
+    wipe_local_group_crypto_material(&state, &id, Some(&event_group_id), "treekem_leave").await;
 
     (
         StatusCode::OK,
@@ -12583,7 +12588,7 @@ pub(in crate::server) async fn leave_group(
         }
     };
     let event = NamedGroupMetadataEvent::MemberRemoved {
-        group_id: event_group_id,
+        group_id: event_group_id.clone(),
         revision,
         actor: local_agent_hex.clone(),
         agent_id: local_agent_hex.clone(),
@@ -12624,6 +12629,8 @@ pub(in crate::server) async fn leave_group(
     let mut cache = state.group_card_cache.write().await;
     prune_expired_group_cards(&mut cache, now_millis_u64());
     cache.remove(&id);
+    // Released before the shared teardown below, which takes the same lock.
+    drop(cache);
     state.mls_groups.write().await.remove(&id);
     // ADR-0012: drop the live TreeKEM group and wipe at-rest TreeKEM
     // persistence (snapshot plus replay journal, both containing private key
@@ -12632,6 +12639,10 @@ pub(in crate::server) async fn leave_group(
     // (NotFound is ignored).
     state.treekem_groups.write().await.remove(&id);
     remove_treekem_persistence_for_group_id(&state, &id, "leave_group").await;
+    // Issue #376: everything above is keyed by the local group id. The TreeKEM
+    // event log and pending-event queue are keyed by the STABLE id, so they
+    // survived this teardown on a node that had just left the group.
+    wipe_local_group_crypto_material(&state, &id, Some(&event_group_id), "leave_group").await;
     save_mls_groups(&state).await;
     stop_named_group_metadata_listener(&state, &id).await;
 
