@@ -27092,30 +27092,7 @@ mod tests {
     #[tokio::test]
     async fn member_removed_self_wipes_treekem_event_log() -> Result<()> {
         let f = departure_fixture(0x6a, x0x::mls::SecureGroupPlane::Gss, true).await?;
-        let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
-
-        let mut committed = f
-            .state
-            .named_groups
-            .read()
-            .await
-            .get(&f.group_id)
-            .cloned()
-            .context("fixture group is present")?;
-        committed.roster_revision = committed.roster_revision.saturating_add(1);
-        let revision = committed.roster_revision;
-        committed.remove_member(&local_hex, Some(f.peer_hex.clone()));
-        let commit = committed.seal_commit(&f.peer_kp, 1_000)?;
-        let event = NamedGroupMetadataEvent::MemberRemoved {
-            group_id: f.stable_group_id.clone(),
-            revision,
-            actor: f.peer_hex.clone(),
-            agent_id: local_hex,
-            treekem_commit_b64: None,
-            treekem_epoch: None,
-            secret_epoch: None,
-            commit: Some(commit),
-        };
+        let event = admin_removes_local_event(&f).await?;
 
         let applied =
             apply_named_group_metadata_event(&f.state, event, f.peer_kp.agent_id(), true, None)
@@ -27130,6 +27107,170 @@ mod tests {
         );
 
         assert_departure_wiped_treekem_state(&f.state, &f.aliases(), "member removed self").await;
+        Ok(())
+    }
+
+    /// The co-admin's signed `MemberRemoved` naming this node, sealed against
+    /// the fixture's committed state.
+    async fn admin_removes_local_event(f: &DepartureFixture) -> Result<NamedGroupMetadataEvent> {
+        let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+        let mut committed = f
+            .state
+            .named_groups
+            .read()
+            .await
+            .get(&f.group_id)
+            .cloned()
+            .context("fixture group is present")?;
+        committed.roster_revision = committed.roster_revision.saturating_add(1);
+        let revision = committed.roster_revision;
+        committed.remove_member(&local_hex, Some(f.peer_hex.clone()));
+        let commit = committed.seal_commit(&f.peer_kp, 1_000)?;
+        Ok(NamedGroupMetadataEvent::MemberRemoved {
+            group_id: f.stable_group_id.clone(),
+            revision,
+            actor: f.peer_hex.clone(),
+            agent_id: local_hex,
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: None,
+            commit: Some(commit),
+        })
+    }
+
+    /// Issue #376: the metadata listener registers its own `JoinHandle` in
+    /// `group_metadata_tasks` under the roster key and then drives the very
+    /// apply that reaches the teardown — so aborting that map entry blindly is
+    /// a self-abort. Tokio defers it to the next yield, and every teardown step
+    /// after the abort is then dropped with the future: the pending Welcome
+    /// blobs (sealed key material) and the at-rest TreeKEM persistence both
+    /// survive on a node that just left the group. Drive the apply from inside
+    /// a registered task and assert the TAIL of the wipe ran.
+    #[tokio::test]
+    async fn member_removed_self_wipe_survives_listener_self_abort() -> Result<()> {
+        let f = departure_fixture(0x6e, x0x::mls::SecureGroupPlane::Gss, true).await?;
+
+        // Keyed by the STABLE id: the apply arm's own piecemeal removal is
+        // keyed by the roster key, so only the wipe's tail deletes this file.
+        let snapshot = treekem_snapshot_path_for_drop(&f.state, &f.stable_group_id)
+            .context("stable group id must map to a snapshot path")?;
+        tokio::fs::write(&snapshot, b"treekem-snapshot").await?;
+        f.state.pending_welcomes.write().await.insert(
+            "welcome-376".to_string(),
+            PendingWelcome {
+                group_id: f.stable_group_id.clone(),
+                joiner_agent: f.peer_hex.clone(),
+                bytes: vec![1, 2, 3],
+                created_at: Instant::now(),
+            },
+        );
+
+        let event = admin_removes_local_event(&f).await?;
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let state_for_task = Arc::clone(&f.state);
+        let sender = f.peer_kp.agent_id();
+        let handle = tokio::spawn(async move {
+            if start_rx.await.is_err() {
+                return;
+            }
+            let applied =
+                apply_named_group_metadata_event(&state_for_task, event, sender, true, None).await;
+            // The real listener loops back to `sub.recv().await` here, so a
+            // deferred self-abort lands on this yield rather than earlier.
+            tokio::task::yield_now().await;
+            if applied.accepted && applied.should_exit {
+                let _ = done_tx.send(());
+            }
+        });
+        f.state
+            .group_metadata_tasks
+            .write()
+            .await
+            .insert(f.group_id.clone(), handle);
+        start_tx
+            .send(())
+            .map_err(|()| anyhow::anyhow!("apply task exited before it was started"))?;
+        let task_survived = done_rx.await.is_ok();
+
+        let snapshot_removed = !tokio::fs::try_exists(&snapshot).await?;
+        let welcomes_dropped = f.state.pending_welcomes.read().await.is_empty();
+        assert!(
+            snapshot_removed && welcomes_dropped && task_survived,
+            "the teardown must complete on the task that runs it: \
+             snapshot_removed={snapshot_removed} welcomes_dropped={welcomes_dropped} \
+             task_survived={task_survived}"
+        );
+        Ok(())
+    }
+
+    /// Issue #376: a ban is the fifth departure. Unlike the others the roster
+    /// entry is deliberately KEPT (tombstoned Banned) so the user and the
+    /// rejoin path can still see it — which is exactly why the #363
+    /// `no_local_group` refusal never fires for a banned node, and why the
+    /// retained history had to be wiped explicitly. The surviving roster entry
+    /// also kept the metadata listener eligible, so the node re-subscribed on
+    /// every restart and rebuilt the log it had just been banned from.
+    #[tokio::test]
+    async fn member_banned_self_wipes_treekem_event_log() -> Result<()> {
+        let f = departure_fixture(0x70, x0x::mls::SecureGroupPlane::Gss, true).await?;
+        let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+
+        let mut committed = f
+            .state
+            .named_groups
+            .read()
+            .await
+            .get(&f.group_id)
+            .cloned()
+            .context("fixture group is present")?;
+        committed.roster_revision = committed.roster_revision.saturating_add(1);
+        let revision = committed.roster_revision;
+        committed.ban_member(&local_hex, Some(f.peer_hex.clone()));
+        let commit = committed.seal_commit(&f.peer_kp, 1_000)?;
+        let event = NamedGroupMetadataEvent::MemberBanned {
+            group_id: f.stable_group_id.clone(),
+            revision,
+            actor: f.peer_hex.clone(),
+            agent_id: local_hex.clone(),
+            secret_epoch: None,
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            commit: Some(commit),
+        };
+
+        let applied =
+            apply_named_group_metadata_event(&f.state, event, f.peer_kp.agent_id(), true, None)
+                .await;
+        assert!(
+            applied.accepted && applied.should_exit,
+            "the ban must apply and exit the subscriber"
+        );
+        {
+            let groups = f.state.named_groups.read().await;
+            let info = groups
+                .get(&f.group_id)
+                .context("a banned group must stay on the roster")?;
+            assert!(
+                info.is_banned(&local_hex),
+                "the ban tombstone must be retained so the user still sees it"
+            );
+        }
+
+        assert_departure_wiped_treekem_state(&f.state, &f.aliases(), "member banned self").await;
+
+        // The retained tombstone must not keep this node subscribed: the
+        // listener-ensure predicate skipped only `withdrawn` groups, so a
+        // banned node re-joined the metadata topic here and on every restart.
+        ensure_named_group_metadata_listener(Arc::clone(&f.state), &f.group_id).await;
+        assert!(
+            !f.state
+                .group_metadata_tasks
+                .read()
+                .await
+                .contains_key(&f.group_id),
+            "a banned node must not re-subscribe to the group's metadata topic"
+        );
         Ok(())
     }
 
