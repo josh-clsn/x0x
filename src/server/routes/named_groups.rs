@@ -7875,7 +7875,6 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
                     return ApplyMetadataResult::REJECTED;
                 }
-                save_named_groups(state).await;
                 state
                     .groups_diagnostics
                     .record_member_joined(&resolved_group_key);
@@ -7917,6 +7916,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     agent_id: member_agent_id.clone(),
                     treekem_commit_b64: Some(BASE64.encode(&tk_remove)),
                     treekem_epoch: Some(expected1),
+                    secret_epoch: None,
                     commit: Some(commit1),
                 };
                 let added_event = NamedGroupMetadataEvent::MemberAdded {
@@ -12145,7 +12145,6 @@ async fn reconcile_treekem_self_leave_rekeys(
             .write()
             .await
             .insert(group_key.to_string(), next.clone());
-        save_named_groups(state).await;
         save_mls_groups(state).await;
         let _ = prune_treekem_cache_member(state, group_key, &departed_hex, reason).await;
 
@@ -12158,6 +12157,7 @@ async fn reconcile_treekem_self_leave_rekeys(
                 base64::engine::general_purpose::STANDARD.encode(treekem_commit),
             ),
             treekem_epoch: Some(treekem_epoch),
+            secret_epoch: None,
             commit: Some(commit),
         };
         publish_named_group_metadata_event(state, &metadata_topic, &event).await;
@@ -19000,7 +19000,9 @@ pub(in crate::server) async fn apply_group_metadata_event(
         sender = %req.sender_agent_id,
         "non-gossip local-apply endpoint invoked"
     );
-    let applied = apply_named_group_metadata_event(&state, event, sender, true).await;
+    let applied = apply_named_group_metadata_event(&state, event, sender, true, None)
+        .await
+        .accepted;
     if applied {
         (StatusCode::OK, Json(serde_json::json!({ "applied": true })))
     } else {
@@ -19210,7 +19212,9 @@ pub(in crate::server) async fn apply_join_result_endpoint(
             format!("join-result sender rejected: {reason}"),
         );
     }
-    let applied = apply_named_group_metadata_event(&state, event, sender, true).await;
+    let applied = apply_named_group_metadata_event(&state, event, sender, true, None)
+        .await
+        .accepted;
     if applied {
         clear_expected_join_result_inviter(state.as_ref(), &expected_key);
     }
@@ -29172,7 +29176,7 @@ mod tests {
                 .lock()
                 .expect("publish-attempt recorder poisoned")
                 .iter()
-                .any(|(_, gid)| gid == group_id),
+                .any(|(_, gid, _)| gid == group_id),
             "remaining members must be told, or they cannot converge to the new epoch"
         );
         assert!(!leaver_hex.is_empty());
