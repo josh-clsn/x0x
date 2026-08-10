@@ -5815,21 +5815,25 @@ pub(in crate::server) async fn apply_named_group_metadata_event(
 /// Issue #376: re-run the listener ensure when an apply admits the LOCAL agent
 /// into a group whose listeners were refused earlier.
 ///
-/// `ensure_named_group_listeners` runs at four entry points only — startup,
-/// create, join and card import — never after an apply. That was harmless
-/// while every locally-held group was listener-eligible, but the ban gate
-/// changed it: a banned member can still redeem a fresh invite (the invite
-/// carries the authority roster verbatim, tombstones included, and the
-/// `MemberJoined` admission chain has no ban gate), so its local stub marks
+/// Besides startup, create, join and card import, `ensure_named_group_listeners`
+/// is also driven here — from both apply wrappers and, for the same-task exit
+/// case, from the metadata listener's own tail (FIX A). That coverage matters
+/// because of the ban gate: a banned member can still redeem a fresh invite
+/// (the invite carries the authority roster verbatim, tombstones included, and
+/// the `MemberJoined` admission chain has no ban gate), so its local stub marks
 /// *itself* banned and the ensure at join time refuses both listeners. The
-/// authority's `MemberAdded` then arrives over direct delivery and flips the
-/// entry to Active — leaving an active member with zero subscriptions until
-/// the next daemon restart. Re-ensuring here closes that window.
+/// authority's `MemberAdded` then arrives and flips the entry to Active — over
+/// direct delivery (a shared task, no per-group listener registered, so this
+/// wrapper-site call spawns it), or on this group's own metadata listener
+/// (whose still-registered handle makes this call a no-op — the listener tail
+/// re-subscribes instead). Either way the re-admitted member is subscribed
+/// without waiting for a restart.
 ///
 /// Called after `_serialized` returns, so the per-group membership guard is
 /// already released: `ensure_named_group_listeners` takes `named_groups.read()`
 /// plus the task maps, and must not nest under that guard. Both spawners are
-/// idempotent, so the common no-op case costs one map lookup.
+/// idempotent, so the common no-op case is a `named_groups` scan plus a task-map
+/// lookup per spawner.
 ///
 /// Returns a boxed future rather than being an `async fn` because this closes a
 /// type-level cycle: `ensure_named_group_listeners` spawns the metadata
@@ -6840,10 +6844,32 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     return ApplyMetadataResult::REJECTED;
                 }
             }
-            if !matches!(
-                persist_named_group_info(state, &resolved_group_key, next.clone()).await,
-                Ok(AtomicWriteOutcome::Durable)
-            ) {
+            let persisted = if banned_self {
+                // Issue #376 (FIX D): `clear_group_info_key_material` cleared the
+                // 32-byte GSS key on `next`, but a single-slot persist would
+                // leave the sibling alias of a converged dual-alias group still
+                // carrying it. Persist the cleared record under every alias, as
+                // the withdrawn-tombstone path does — but WITHOUT setting
+                // withdrawn, so the Banned tombstone stays visible.
+                let stable_group_id = next.stable_group_id().to_string();
+                persist_named_groups_mutation(state, |groups| {
+                    let mut aliases = collect_same_stable_group_aliases(
+                        groups,
+                        &resolved_group_key,
+                        Some(&stable_group_id),
+                    );
+                    aliases.insert(resolved_group_key.clone());
+                    aliases.insert(stable_group_id.clone());
+                    for alias in &aliases {
+                        groups.insert(alias.clone(), next.clone());
+                    }
+                    true
+                })
+                .await
+            } else {
+                persist_named_group_info(state, &resolved_group_key, next.clone()).await
+            };
+            if !matches!(persisted, Ok(AtomicWriteOutcome::Durable)) {
                 return ApplyMetadataResult::REJECTED;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
@@ -8429,11 +8455,15 @@ fn named_group_public_listener_key(
 }
 
 async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &str) {
+    // A registered-but-finished handle is a listener whose subscription ended
+    // (e.g. `sub.recv()` returned None); treating it as present would block
+    // re-subscription forever, so a finished entry counts as absent (#376).
     if state
         .group_metadata_tasks
         .read()
         .await
-        .contains_key(group_id)
+        .get(group_id)
+        .is_some_and(|handle| !handle.is_finished())
     {
         return;
     }
@@ -8460,6 +8490,10 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
     let state_for_task = Arc::clone(&state);
     let handle = tokio::spawn(async move {
         let mut shutdown_rx = state_for_task.shutdown_notify.subscribe();
+        // Track a membership-driven exit so the tail can re-evaluate its own
+        // eligibility (#376, FIX A). A shutdown or a closed subscription does
+        // not qualify — only an apply that returned `should_exit`.
+        let mut membership_exit = false;
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => break,
@@ -8475,7 +8509,10 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
                         msg.raw_envelope.as_deref(),
                     )
                     .await;
-                    if apply_result.should_exit { break; }
+                    if apply_result.should_exit {
+                        membership_exit = true;
+                        break;
+                    }
                 }
             }
         }
@@ -8494,13 +8531,35 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
                 tasks.remove(&task_group_id);
             }
         }
+        // FIX A (#376): the wrapper-site re-ensure ran while THIS handle was
+        // still registered, so for a `should_exit` on our own task it no-op'd
+        // on our own entry and re-subscription would otherwise wait for a later
+        // apply on a different task or a restart. Now that we have deregistered,
+        // re-evaluate eligibility for ourselves: a re-admit (still active +
+        // listener-allowed) re-subscribes exactly one new listener — which
+        // registers before processing, so its own applies find the entry and do
+        // not recurse — while a genuine departure (left / removed / banned →
+        // ineligible) resolves to nothing and spawns none.
+        if membership_exit {
+            ensure_listeners_after_local_admission(&state_for_task, &task_group_id, true).await;
+        }
     });
 
-    state
+    // FIX C (#376): the check→subscribe→insert window lets two ensures both
+    // spawn. A plain `insert` DROPS (detaches) the loser, leaving an orphan
+    // listener invisible to `abort_group_listener_tasks` — the one that could
+    // re-seed `treekem_event_log` after a ban. Abort the displaced handle. The
+    // `try_id` guard is a cheap guard against the impossible self-eviction.
+    if let Some(prev) = state
         .group_metadata_tasks
         .write()
         .await
-        .insert(group_id, handle);
+        .insert(group_id, handle)
+    {
+        if Some(prev.id()) != tokio::task::try_id() {
+            prev.abort();
+        }
+    }
 }
 
 /// Spawn every gossip listener a member needs for a named group.
@@ -10015,8 +10074,13 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
         }
     }
     {
+        // A finished handle is a listener whose subscription ended; count it as
+        // absent so a dead entry cannot block re-subscription forever (#376).
         let tasks = state.public_message_tasks.read().await;
-        if tasks.contains_key(&group_id) {
+        if tasks
+            .get(&group_id)
+            .is_some_and(|handle| !handle.is_finished())
+        {
             return;
         }
     }
@@ -10030,6 +10094,7 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
     };
     let state_for_listener = Arc::clone(&state);
     let group_id_for_listener = group_id.clone();
+    let task_group_id = group_id.clone();
     let topic_for_log = topic.clone();
     let mut shutdown_rx = state.shutdown_notify.subscribe();
     let handle = tokio::spawn(async move {
@@ -10058,12 +10123,32 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
                 }
             }
         }
+        // FIX B (#376): deregister our own registration on exit — mirroring the
+        // metadata listener's tail — so a subscription that ends (recv None)
+        // does not leave a dead handle that every later ensure short-circuits
+        // on. Remove only when the stored handle is still ours.
+        {
+            let mut tasks = state_for_listener.public_message_tasks.write().await;
+            if tasks
+                .get(&task_group_id)
+                .is_some_and(|handle| Some(handle.id()) == tokio::task::try_id())
+            {
+                tasks.remove(&task_group_id);
+            }
+        }
     });
-    state
+    // FIX C (#376): abort the handle displaced by a racing spawn rather than
+    // dropping (detaching) it, so no orphan public listener survives untracked.
+    if let Some(prev) = state
         .public_message_tasks
         .write()
         .await
-        .insert(group_id, handle);
+        .insert(group_id, handle)
+    {
+        if Some(prev.id()) != tokio::task::try_id() {
+            prev.abort();
+        }
+    }
 }
 
 /// POST /groups/:id/invite — generate an invite link (admin+; body optional).
@@ -27406,14 +27491,27 @@ mod tests {
 
         // The GSS group key. The ban keeps its roster entry, so unless it is
         // cleared explicitly this 32-byte secret is persisted to
-        // `named_groups.json` on the banned node.
+        // `named_groups.json` on the banned node. Seed it on BOTH aliases of a
+        // converged dual-alias group (local id + stable id): a single-slot
+        // clear would leave the sibling alias still carrying the key (FIX D).
         let mut committed = {
             let mut groups = f.state.named_groups.write().await;
             let info = groups
                 .get_mut(&f.group_id)
                 .context("fixture group is present")?;
             info.shared_secret = Some(vec![7u8; 32]);
-            info.clone()
+            let info = info.clone();
+            // GSS only: seed the stable-id sibling with the key too, so the
+            // per-alias assertion catches a single-slot clear. Not on the
+            // TreeKEM plane — a second entry under the stable id would change
+            // group resolution away from the local id the live TreeKEM group is
+            // keyed under, stranding this test's epoch precondition.
+            if !treekem {
+                let mut sibling = info.clone();
+                sibling.shared_secret = Some(vec![7u8; 32]);
+                groups.insert(f.stable_group_id.clone(), sibling);
+            }
+            info
         };
         committed.roster_revision = committed.roster_revision.saturating_add(1);
         let revision = committed.roster_revision;
@@ -27430,8 +27528,9 @@ mod tests {
             actor: f.peer_hex.clone(),
             agent_id: local_hex.clone(),
             secret_epoch: None,
-            // Deliberately undecodable: with the shadow in place the banned
-            // node must never reach the decode.
+            // An invalid commit ("Yw==" decodes but is not a TreeKEM commit):
+            // with the shadow in place the banned node must never reach the
+            // decode/process, so a valid one is unnecessary.
             treekem_commit_b64: treekem.then(|| "Yw==".to_string()),
             treekem_epoch: treekem.then_some(1),
             commit: Some(commit),
@@ -27454,15 +27553,23 @@ mod tests {
                 "the ban tombstone must be retained so the user still sees it"
             );
             assert!(
-                info.shared_secret.is_none(),
-                "the group key must not survive on the banned node"
-            );
-            assert!(
                 named_group_metadata_listener_topic(info, &local_hex).is_none()
                     && named_group_public_listener_key(info, &local_hex).is_none(),
                 "a banned node must be refused both listeners; the retained roster entry \
                  otherwise re-subscribes it on every ensure and every restart"
             );
+            // FIX D: the key must be gone on EVERY alias present, not just the
+            // resolved one — a single-slot clear leaves the sibling holding the
+            // secret. The GSS variant seeds both aliases; the TreeKEM variant
+            // has only the local-id entry, so this checks whatever is present.
+            for alias in f.aliases() {
+                if let Some(entry) = groups.get(alias) {
+                    assert!(
+                        entry.shared_secret.is_none(),
+                        "the group key must not survive on the banned node (alias {alias})"
+                    );
+                }
+            }
         }
 
         assert_departure_wiped_treekem_state(&f.state, &f.aliases(), "member banned self").await;
