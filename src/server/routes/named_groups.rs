@@ -5496,6 +5496,34 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         }
         return;
     }
+    // Issue #378: the regular event-log serve below is a peer-driven amplifier —
+    // each request forces a full log read, filter/sort, JSON serialization, and
+    // a DM send, all at no cost to the requester. Throttle repeat serves per
+    // (requester, group, revision, epoch). The key carries the requester's
+    // advancing frontier, so a joiner paging sequentially through a long log
+    // presents a fresh key for every page and is never starved; only duplicate
+    // re-requests of an already-served page inside the window are dropped. The
+    // member-keyed serve (#205) returns above this point, so multi-member key-
+    // package recovery — many distinct targets at one frontier — is unaffected.
+    let serve_throttle_key = format!(
+        "serve:{}:{}:{}:{}",
+        request.group_id, sender_hex, request.from_revision, request.from_treekem_epoch
+    );
+    {
+        let mut throttle = state.treekem_catchup_throttle.write().await;
+        if throttle
+            .get(&serve_throttle_key)
+            .is_some_and(|last| last.elapsed() < TREEKEM_CATCHUP_THROTTLE)
+        {
+            tracing::debug!(
+                group_id = %LogHexId::group(&request.group_id),
+                requester = %sender_hex,
+                "throttling duplicate TreeKEM catch-up page request"
+            );
+            return;
+        }
+        throttle.insert(serve_throttle_key, Instant::now());
+    }
     let mut events = {
         let logs = state.treekem_event_log.read().await;
         let mut events = Vec::new();
@@ -27160,6 +27188,89 @@ mod tests {
             treekem_catchup_send_attempts(&state, &joiner_id, &group_id, None).await,
             1,
             "a bootstrap joiner named by a cached add is still served"
+        );
+        Ok(())
+    }
+
+    /// Same as [`treekem_catchup_send_attempts`] but drives a specific page
+    /// frontier so a test can separate distinct advancing pages (a joiner
+    /// syncing a long log) from duplicate re-requests of the same page.
+    async fn treekem_catchup_page_send_attempts(
+        state: &Arc<AppState>,
+        sender: &AgentId,
+        group_id: &str,
+        from_revision: u64,
+    ) -> u64 {
+        let outgoing = || {
+            state
+                .agent
+                .direct_messaging()
+                .diagnostics_snapshot()
+                .stats
+                .outgoing_send_total
+        };
+        let before = outgoing();
+        let request = TreeKemCatchupRequest {
+            message_type: "treekem_catchup_request".to_string(),
+            group_id: group_id.to_string(),
+            requester_agent_id: hex::encode(sender.as_bytes()),
+            from_revision,
+            from_treekem_epoch: 0,
+            current_state_hash: String::new(),
+            missing_prev_state_hash: None,
+            target_member_id: None,
+            limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+        };
+        handle_treekem_catchup_request(state, sender, true, request).await;
+        outgoing().saturating_sub(before)
+    }
+
+    /// Issue #378: the regular event-log serve is a peer-driven amplifier. A
+    /// verified peer that re-requests the *same* catch-up page in a tight loop
+    /// must be served at most once per throttle window — otherwise each request
+    /// forces a full event-log read, filter/sort, JSON serialization, and a DM
+    /// send with no cost to the requester.
+    #[tokio::test]
+    async fn treekem_catchup_page_throttles_duplicate_page_burst() -> Result<()> {
+        let joiner = x0x::identity::AgentKeypair::generate()?;
+        let joiner_id = joiner.agent_id();
+        let joiner_hex = hex::encode(joiner_id.as_bytes());
+        let (state, _dir, group_id) = cached_add_catchup_fixture(0x70, &joiner_hex).await?;
+
+        // Ten identical requests for the same page (from_revision 0). Before the
+        // throttle every one is served; after it, only the first is.
+        let mut served = 0;
+        for _ in 0..10 {
+            served += treekem_catchup_page_send_attempts(&state, &joiner_id, &group_id, 0).await;
+        }
+        assert_eq!(
+            served, 1,
+            "a burst of identical catch-up-page requests must be served at most once per window"
+        );
+        Ok(())
+    }
+
+    /// Issue #378 regression guard: the throttle keys on the advancing page
+    /// frontier, so a joiner paging sequentially through a long log presents a
+    /// fresh key for every page and is never starved. Distinct advancing pages
+    /// must each be served even when issued back-to-back inside one window.
+    #[tokio::test]
+    async fn treekem_catchup_page_allows_sequential_paging() -> Result<()> {
+        let joiner = x0x::identity::AgentKeypair::generate()?;
+        let joiner_id = joiner.agent_id();
+        let joiner_hex = hex::encode(joiner_id.as_bytes());
+        let (state, _dir, group_id) = cached_add_catchup_fixture(0x72, &joiner_hex).await?;
+
+        // A joiner advancing one revision at a time through the log. Every page
+        // is a distinct frontier, so every page is served, back-to-back.
+        let mut served = 0;
+        for revision in 0..8 {
+            served +=
+                treekem_catchup_page_send_attempts(&state, &joiner_id, &group_id, revision).await;
+        }
+        assert_eq!(
+            served, 8,
+            "distinct advancing catch-up pages must all be served — a legitimate joiner is not starved"
         );
         Ok(())
     }
