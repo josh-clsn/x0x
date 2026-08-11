@@ -5409,6 +5409,16 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
             if info.withdrawn {
                 return;
             }
+            // Issue #384: a locally-banned node wiped its own TreeKEM material
+            // (#376) and holds no authority over this group's membership
+            // history. The #363 `no_local_group` refusal cannot fire because
+            // the retained Banned tombstone keeps the roster entry, so gate the
+            // serve on local-ban explicitly — even if the event log were
+            // re-seeded, a banned node must never serve catch-up.
+            let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+            if info.is_banned(&local_agent_hex) {
+                return;
+            }
             let mut keys = vec![
                 request.group_id.clone(),
                 key.clone(),
@@ -5802,6 +5812,20 @@ pub(in crate::server) async fn group_membership_lock(
     )
 }
 
+/// Issue #384: the metadata events that legitimately re-admit THIS node into a
+/// group it is locally banned from — a `MemberAdded` or `MemberUnbanned` naming
+/// this agent. Both transition the local roster entry out of `Banned`, lifting
+/// the #376 tombstone; the apply arms still verify the authority commit before
+/// mutating, so this only decides which events are allowed to reach them. Every
+/// other event for a banned group is a re-seed attempt and must be refused.
+fn metadata_event_readmits_local(event: &NamedGroupMetadataEvent, local_agent_hex: &str) -> bool {
+    match event {
+        NamedGroupMetadataEvent::MemberAdded { agent_id, .. }
+        | NamedGroupMetadataEvent::MemberUnbanned { agent_id, .. } => agent_id == local_agent_hex,
+        _ => false,
+    }
+}
+
 pub(in crate::server) async fn apply_named_group_metadata_event(
     state: &Arc<AppState>,
     event: NamedGroupMetadataEvent,
@@ -6117,6 +6141,26 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
         return ApplyMetadataResult::REJECTED;
     }
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    // Issue #384: once THIS node is locally banned for a group, #376 wiped its
+    // crypto material and history but kept the Banned tombstone. It must not
+    // re-seed or re-key that wiped state from any further metadata event — a
+    // hostile or stale peer could otherwise restore the group's crypto, roster
+    // and event-log history, undoing the wipe. The one exception is an event
+    // that re-admits us (a `MemberAdded`/`MemberUnbanned` naming this agent),
+    // which the arm below verifies against the signed authority commit before
+    // lifting the tombstone. Mirrors the `withdrawn` gate above.
+    if info.is_banned(&local_agent_hex) && !metadata_event_readmits_local(&event, &local_agent_hex)
+    {
+        tracing::debug!(
+            target: "treekem.trace",
+            stage = "apply_metadata_event_reject",
+            reason = "local_agent_banned",
+            event = event_kind,
+            group_id = %resolved_group_key,
+            sender = %sender_hex,
+        );
+        return ApplyMetadataResult::REJECTED;
+    }
     if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
         && treekem_metadata_event_requires_phase3(&event)
     {
@@ -27890,6 +27934,225 @@ mod tests {
         assert!(
             named_group_metadata_listener_topic(info, &local_hex).is_some(),
             "a re-admitted member must become listener-eligible again"
+        );
+        Ok(())
+    }
+
+    /// Issue #384: drive a real admin-authored self-ban on a fresh GSS fixture
+    /// so the local node reaches the #376 banned+wiped state — crypto/history
+    /// gone, Banned tombstone kept. Returns the fixture so a follow-on event can
+    /// be applied against the genuinely-wiped state.
+    async fn banned_and_wiped_gss_fixture(group_byte: u8) -> Result<DepartureFixture> {
+        let f = departure_fixture(group_byte, x0x::mls::SecureGroupPlane::Gss, true).await?;
+        let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+        let mut committed = f
+            .state
+            .named_groups
+            .read()
+            .await
+            .get(&f.group_id)
+            .cloned()
+            .context("fixture group is present")?;
+        committed.roster_revision = committed.roster_revision.saturating_add(1);
+        let revision = committed.roster_revision;
+        committed.ban_member(&local_hex, Some(f.peer_hex.clone()));
+        let commit = committed.seal_commit(&f.peer_kp, 1_000)?;
+        let event = NamedGroupMetadataEvent::MemberBanned {
+            group_id: f.stable_group_id.clone(),
+            revision,
+            actor: f.peer_hex.clone(),
+            agent_id: local_hex.clone(),
+            secret_epoch: None,
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            commit: Some(commit),
+        };
+        let applied =
+            apply_named_group_metadata_event(&f.state, event, f.peer_kp.agent_id(), true, None)
+                .await;
+        assert!(applied.accepted, "the admin self-ban must apply");
+        assert!(
+            f.state
+                .named_groups
+                .read()
+                .await
+                .get(&f.group_id)
+                .context("banned group stays on the roster")?
+                .is_banned(&local_hex),
+            "the Banned tombstone must survive the wipe"
+        );
+        assert_departure_wiped_treekem_state(&f.state, &f.aliases(), "banned+wiped precondition")
+            .await;
+        Ok(f)
+    }
+
+    /// Issue #384 (gap 1): once THIS node is locally banned for a group, the
+    /// #376 wipe cleared its crypto and history but kept the Banned tombstone.
+    /// The apply path must refuse any further metadata event for that group that
+    /// does NOT re-admit us — otherwise a hostile or stale admin re-seeds the
+    /// wiped state (here: an authority-signed `MemberAdded` for a THIRD member
+    /// repopulates `treekem_event_log`, restoring the very history #376 wiped).
+    #[tokio::test]
+    async fn banned_local_apply_refuses_hostile_reseed() -> Result<()> {
+        let f = banned_and_wiped_gss_fixture(0x88).await?;
+        let third = x0x::identity::AgentKeypair::generate()?;
+        let third_hex = hex::encode(third.agent_id().as_bytes());
+
+        let mut committed = f
+            .state
+            .named_groups
+            .read()
+            .await
+            .get(&f.group_id)
+            .cloned()
+            .context("banned group is present")?;
+        committed.roster_revision = committed.roster_revision.saturating_add(1);
+        let revision = committed.roster_revision;
+        committed.add_member(
+            third_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(f.peer_hex.clone()),
+            None,
+        );
+        let commit = committed.seal_commit(&f.peer_kp, 2_000)?;
+        let hostile = NamedGroupMetadataEvent::MemberAdded {
+            group_id: f.stable_group_id.clone(),
+            revision,
+            actor: f.peer_hex.clone(),
+            agent_id: third_hex.clone(),
+            display_name: None,
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
+            commit: Some(commit),
+        };
+
+        let applied =
+            apply_named_group_metadata_event(&f.state, hostile, f.peer_kp.agent_id(), true, None)
+                .await;
+        assert!(
+            !applied.accepted,
+            "a locally-banned node must refuse a metadata event that does not re-admit it"
+        );
+        assert_departure_wiped_treekem_state(
+            &f.state,
+            &f.aliases(),
+            "hostile re-seed refused while banned",
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Issue #384 (anti-regression): the gap-1 gate must NOT block a legitimate
+    /// re-admission. A prior round regressed rejoin (a re-invited previously
+    /// banned member could not receive until restart). An authority-signed
+    /// `MemberAdded` naming THIS agent lifts the Banned tombstone and must still
+    /// apply on the banned+wiped node — this is the distinction the gate turns
+    /// on: it refuses re-seeds but admits the event that re-admits us.
+    #[tokio::test]
+    async fn banned_local_apply_admits_authority_readmission() -> Result<()> {
+        let f = banned_and_wiped_gss_fixture(0x8a).await?;
+        let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+
+        let mut committed = f
+            .state
+            .named_groups
+            .read()
+            .await
+            .get(&f.group_id)
+            .cloned()
+            .context("banned group is present")?;
+        committed.roster_revision = committed.roster_revision.saturating_add(1);
+        let revision = committed.roster_revision;
+        committed.add_member(
+            local_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(f.peer_hex.clone()),
+            None,
+        );
+        let commit = committed.seal_commit(&f.peer_kp, 2_000)?;
+        let readmit = NamedGroupMetadataEvent::MemberAdded {
+            group_id: f.stable_group_id.clone(),
+            revision,
+            actor: f.peer_hex.clone(),
+            agent_id: local_hex.clone(),
+            display_name: None,
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
+            commit: Some(commit),
+        };
+
+        let applied =
+            apply_named_group_metadata_event(&f.state, readmit, f.peer_kp.agent_id(), true, None)
+                .await;
+        assert!(
+            applied.accepted,
+            "the authority's re-admission must still apply on a banned+wiped node"
+        );
+        // The self-ban tombstoned every alias (#376 FIX D dual-alias persist);
+        // the re-admission commit carries the stable id, so it resolves to and
+        // clears the tombstone on whichever alias the applier picks. Assert the
+        // re-admission took effect on the resolved alias — the point is that the
+        // gate admitted it, not which alias key it landed under.
+        let groups = f.state.named_groups.read().await;
+        let readmitted = f
+            .aliases()
+            .into_iter()
+            .filter_map(|alias| groups.get(alias))
+            .find(|info| info.has_active_member(&local_hex))
+            .context("re-admission must clear the local Banned tombstone")?;
+        assert!(
+            named_group_metadata_listener_topic(readmitted, &local_hex).is_some(),
+            "a re-admitted member must become listener-eligible again"
+        );
+        Ok(())
+    }
+
+    /// Issue #384 (gap 2): the catch-up serve path never checked local-ban. The
+    /// #376 wipe clears the event log, but the retained Banned tombstone means
+    /// the #363 `no_local_group` refusal never fires — so if the log is ever
+    /// re-seeded (a residual entry, or a re-seed slipping past gap 1), a banned
+    /// node would still serve the group's membership history. A banned node must
+    /// refuse to serve catch-up outright.
+    #[tokio::test]
+    async fn banned_local_refuses_catchup_serve() -> Result<()> {
+        let requester = x0x::identity::AgentKeypair::generate()?;
+        let requester_id = requester.agent_id();
+        let requester_hex = hex::encode(requester_id.as_bytes());
+        let (state, _dir, group_id) = cached_add_catchup_fixture(0x8c, &requester_hex).await?;
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_id).expect("fixture group is present");
+            info.ban_member(&local_hex, None);
+            assert!(
+                info.is_banned(&local_hex),
+                "fixture models a banned local node"
+            );
+        }
+        assert!(
+            state
+                .treekem_event_log
+                .read()
+                .await
+                .get(&group_id)
+                .is_some_and(|events| !events.is_empty()),
+            "precondition: a residual/re-seeded log survives on the banned node"
+        );
+
+        assert_eq!(
+            treekem_catchup_send_attempts(&state, &requester_id, &group_id, None).await,
+            0,
+            "a locally-banned node must refuse to serve catch-up"
         );
         Ok(())
     }
