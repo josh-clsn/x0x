@@ -19619,11 +19619,31 @@ async fn stage_join_result(
     );
 }
 
+/// Issue #377: every arm below authorizes on `sender`, and on the raw-QUIC
+/// direct path the sender AgentId is a self-asserted 32-byte wire prefix — only
+/// the `MachineId` is authenticated by the QUIC handshake. `verified` is the
+/// transport's assertion that the claimed AgentId→MachineId binding was
+/// confirmed, so without it `sender_hex == member_agent_id` and
+/// `validate_join_result_inviter` compare against an attacker-chosen string.
+/// Mirrors `handle_treekem_catchup_request` / `_response` and the direct
+/// metadata listener, which already carry `msg.verified` into their gates.
+/// Gossip-inbox and loopback deliveries always set `verified`, so this only
+/// rejects raw-QUIC senders we cannot bind; the join-result poll loop re-issues
+/// the fetch once the identity announcement lands, and a gossip-isolated joiner
+/// has the token-gated `POST /groups/:id/join-result/:member` path.
 pub(in crate::server) async fn handle_join_result_message(
     state: &Arc<AppState>,
     sender: &AgentId,
+    verified: bool,
     msg: JoinResultMessage,
 ) {
+    if !verified {
+        tracing::warn!(
+            sender = %LogHexId::agent(&hex::encode(sender.as_bytes())),
+            "ignoring join-result message from unverified sender"
+        );
+        return;
+    }
     match msg {
         JoinResultMessage::FetchRequest {
             group_id,
@@ -20091,11 +20111,24 @@ async fn fetch_treekem_welcome(
     Ok(received)
 }
 
+/// Issue #377: same gate as [`handle_join_result_message`]. Every arm
+/// authorizes on `sender` alone — `pending.joiner_agent == sender_hex` decides
+/// who may pull a group's TreeKEM Welcome blob, and `receive.source ==
+/// sender_hex` decides who may offer, chunk or abort an in-flight fetch — so an
+/// unverified (attacker-chosen) AgentId makes all of them vacuous.
 pub(in crate::server) async fn handle_welcome_blob_message(
     state: &Arc<AppState>,
     sender: &AgentId,
+    verified: bool,
     msg: WelcomeBlobMessage,
 ) {
+    if !verified {
+        tracing::warn!(
+            sender = %LogHexId::agent(&hex::encode(sender.as_bytes())),
+            "ignoring TreeKEM Welcome blob message from unverified sender"
+        );
+        return;
+    }
     match msg {
         WelcomeBlobMessage::FetchRequest {
             group_id,
@@ -20429,6 +20462,7 @@ mod tests {
     mod adr0028_sidecar_recovery_controls;
     mod cache_hardening_followup;
     mod pr291_restart_marker_matrix;
+    mod sec377_dm_verified_gate;
     fn fake_group_state_commit(
         group_id: &str,
         revision: u64,

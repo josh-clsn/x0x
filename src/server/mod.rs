@@ -1125,7 +1125,8 @@ pub async fn serve_with_options(
                     len = msg.payload.len(),
                     verified = msg.verified,
                 );
-                handle_join_result_message(&join_result_state, &msg.sender, join_msg).await;
+                handle_join_result_message(&join_result_state, &msg.sender, msg.verified, join_msg)
+                    .await;
             }
         }));
     }
@@ -1149,7 +1150,8 @@ pub async fn serve_with_options(
                     len = msg.payload.len(),
                     verified = msg.verified,
                 );
-                handle_welcome_blob_message(&welcome_state, &msg.sender, welcome_msg).await;
+                handle_welcome_blob_message(&welcome_state, &msg.sender, msg.verified, welcome_msg)
+                    .await;
             }
         }));
     }
