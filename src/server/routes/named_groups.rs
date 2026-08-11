@@ -7739,6 +7739,14 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 );
                 return ApplyMetadataResult::REJECTED;
             }
+            // Canonicalize the roster identity to the lowercase hex derived from
+            // the verified public key. Step 4 accepts the wire value only
+            // case-insensitively, but every `members_v2` key and lookup uses
+            // canonical lowercase hex; storing or propagating a mixed-case id
+            // would key the member off-canonical (unfindable by canonical id,
+            // and — via the published MemberAdded's `agent_id` — desyncing the
+            // roster_root that downstream receivers commit against).
+            let member_agent_id = derived;
 
             // 5. Invite-join v1 is strictly role-capped. The joiner signs
             //    the role, but the invite itself grants only Member; accepting
@@ -29911,6 +29919,109 @@ mod tests {
         assert!(
             apply_recovered_member_key_package(&later_state, &prior_recovery).await,
             "later joiner installs a separately delivered historical recovery record"
+        );
+        Ok(())
+    }
+
+    /// Security regression (#379): the `MemberJoined` apply path validated the
+    /// joiner-supplied AgentId hex case-INSENSITIVELY (step 4's
+    /// `eq_ignore_ascii_case`) but then inserted the RAW wire hex as the
+    /// `members_v2` map key. Every other roster lookup keys on canonical
+    /// lowercase hex, so a mixed-case join produced an entry unfindable by the
+    /// canonical id — the member was silently roster-desynced. An accepted
+    /// joiner MUST be keyed by the canonical lowercase hex derived from the
+    /// verified public key, and the non-canonical wire hex must not appear as a
+    /// key.
+    #[tokio::test]
+    async fn member_joined_mixed_case_agent_id_stored_under_canonical_lowercase_key() -> Result<()>
+    {
+        let fixture = member_joined_treekem_fixture(0xc1, 0xc2).await?;
+        let state = &fixture.state;
+        let group_id = fixture.group_id.clone();
+        let stable_group_id = fixture.stable_group_id.clone();
+        let inviter_hex = hex::encode(state.agent.agent_id().as_bytes());
+
+        // A fresh joiner. Its canonical AgentId hex is lowercase; we publish a
+        // MIXED-CASE hex on the wire and sign over THAT value, so the joiner's
+        // self-signature still verifies (step 3) and the case-insensitive
+        // derived-id check (step 4) still accepts the wire value.
+        let joiner_kp = x0x::identity::AgentKeypair::generate()?;
+        let joiner_id = joiner_kp.agent_id();
+        let canonical_hex = hex::encode(joiner_id.as_bytes());
+        let mixed_case_hex = canonical_hex.to_ascii_uppercase();
+        assert_ne!(
+            mixed_case_hex, canonical_hex,
+            "uppercasing must actually change the hex (it must contain a-f digits)"
+        );
+
+        let invite_secret = "mixed-case-join-invite".to_string();
+        let now_ms = now_millis_u64();
+        {
+            let mut groups = state.named_groups.write().await;
+            groups
+                .get_mut(&group_id)
+                .expect("group exists")
+                .record_issued_invite(
+                    invite_secret.clone(),
+                    now_ms / 1_000,
+                    0,
+                    x0x::groups::GroupRole::Member,
+                );
+        }
+
+        let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(joiner_id, &[0xc3; 32])?;
+        let kp_b64 = BASE64.encode(prepared.key_package_bytes());
+        let public_key_b64 = BASE64.encode(joiner_kp.public_key().as_bytes());
+        let canonical = canonical_member_joined_bytes(
+            &group_id,
+            Some(&stable_group_id),
+            &mixed_case_hex,
+            &public_key_b64,
+            x0x::groups::GroupRole::Member,
+            None,
+            &inviter_hex,
+            &invite_secret,
+            now_ms,
+            Some(&kp_b64),
+        );
+        let signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            joiner_kp.secret_key(),
+            &canonical,
+        )
+        .map_err(|e| anyhow::anyhow!("sign mixed-case MemberJoined: {e:?}"))?;
+        let join = NamedGroupMetadataEvent::MemberJoined {
+            group_id: group_id.clone(),
+            stable_group_id: Some(stable_group_id.clone()),
+            member_agent_id: mixed_case_hex.clone(),
+            member_public_key_b64: public_key_b64,
+            role: x0x::groups::GroupRole::Member,
+            display_name: None,
+            inviter_agent_id: inviter_hex,
+            invite_secret,
+            ts_ms: now_ms,
+            treekem_key_package_b64: Some(kp_b64),
+            recovery_authority_agent_id: None,
+            recovery_authority_public_key_b64: None,
+            recovery_authority_signature_b64: None,
+            recovery_authority_commit: None,
+            signature_b64: BASE64.encode(signature.as_bytes()),
+        };
+
+        let result = apply_named_group_metadata_event(state, join, joiner_id, true, None).await;
+        assert!(
+            result.accepted,
+            "a validly signed invite-join must be accepted by the local inviter"
+        );
+
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&group_id).expect("group exists");
+        assert!(
+            info.has_active_member(&canonical_hex),
+            "joiner must be findable by the canonical lowercase AgentId hex"
+        );
+        assert!(
+            !info.members_v2.contains_key(&mixed_case_hex),
+            "roster must not be keyed by the non-canonical wire hex"
         );
         Ok(())
     }
