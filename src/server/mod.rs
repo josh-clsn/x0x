@@ -1102,7 +1102,7 @@ pub async fn serve_with_options(
                 else {
                     continue; // not a file message
                 };
-                handle_file_message(&file_state, &msg.sender, file_msg).await;
+                handle_file_message(&file_state, &msg.sender, msg.verified, file_msg).await;
             }
         }));
     }

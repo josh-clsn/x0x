@@ -20463,6 +20463,7 @@ mod tests {
     mod cache_hardening_followup;
     mod pr291_restart_marker_matrix;
     mod sec377_dm_verified_gate;
+    mod sec393_file_verified_gate;
     fn fake_group_state_commit(
         group_id: &str,
         revision: u64,
