@@ -28157,6 +28157,90 @@ mod tests {
         Ok(())
     }
 
+    /// Issue #385: the `SecureShareDelivered` equal-epoch reseal is the fourth
+    /// way the #376 wipe could be undone. Once THIS node is locally banned,
+    /// #376 cleared `shared_secret` (`clear_group_info_key_material`) but kept
+    /// the Banned tombstone and the epoch. The reseal arm accepts an equal-epoch
+    /// envelope precisely when `shared_secret.is_none()` — exactly the
+    /// banned+wiped state — and its own terminality recheck
+    /// (`ensure_named_group_key_material_install_allowed`) only refuses
+    /// WITHDRAWN groups, not banned ones. So the #384 apply gate — which admits
+    /// only an event that re-admits us, and `SecureShareDelivered` re-admits no
+    /// one — is the SOLE thing that refuses this reseal.
+    ///
+    /// This is a regression/characterization test: it passes on ac5accb (#384)
+    /// because that gate rejects the event before it reaches the reseal arm. It
+    /// has teeth — a genuine equal-epoch envelope sealed to the banned node's
+    /// OWN ML-KEM key would reach the install and restore `shared_secret` if the
+    /// gate were removed (nothing else stops it), so removing #384's gate turns
+    /// this red. It locks in coverage of the `SecureShareDelivered` path
+    /// specifically, which #384's own tests (a `MemberAdded` re-seed and a
+    /// catch-up serve) did not exercise.
+    #[tokio::test]
+    async fn banned_node_reseal_does_not_restore_shared_secret() -> Result<()> {
+        let f = banned_and_wiped_gss_fixture(0x8e).await?;
+        let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+
+        // Read the genuinely banned+wiped state: no secret, epoch retained.
+        let (wire_group_id, epoch) = {
+            let groups = f.state.named_groups.read().await;
+            let info = groups.get(&f.group_id).context("banned group is present")?;
+            assert!(
+                info.is_banned(&local_hex),
+                "precondition: local node is banned"
+            );
+            assert_eq!(
+                info.shared_secret, None,
+                "precondition: #376 wiped the shared secret"
+            );
+            (info.stable_group_id().to_string(), info.secret_epoch)
+        };
+
+        // Seal a REAL envelope carrying a fresh secret to the banned node's own
+        // ML-KEM public key, at the SAME epoch the wiped state still records —
+        // the exact equal-epoch reseal the arm accepts when `shared_secret` is
+        // absent, sealed the same way the ban hot path seals to survivors.
+        let reseal_secret = [0x5a_u8; 32];
+        let aad = secure_share_aad(&wire_group_id, &local_hex, epoch);
+        let (kem_ct, aead_nonce, aead_ct) =
+            x0x::groups::kem_envelope::seal_group_secret_to_recipient(
+                &f.state.agent_kem_keypair.public_bytes,
+                &aad,
+                &reseal_secret,
+            )?;
+        let reseal = NamedGroupMetadataEvent::SecureShareDelivered {
+            group_id: wire_group_id,
+            recipient: local_hex.clone(),
+            secret_epoch: epoch,
+            kem_ciphertext_b64: BASE64.encode(&kem_ct),
+            aead_nonce_b64: BASE64.encode(aead_nonce),
+            aead_ciphertext_b64: BASE64.encode(&aead_ct),
+            actor: f.peer_hex.clone(),
+        };
+
+        let applied =
+            apply_named_group_metadata_event(&f.state, reseal, f.peer_kp.agent_id(), true, None)
+                .await;
+        assert!(
+            !applied.accepted,
+            "a locally-banned node must refuse an equal-epoch SecureShareDelivered reseal"
+        );
+
+        let groups = f.state.named_groups.read().await;
+        let info = groups
+            .get(&f.group_id)
+            .context("banned group stays on the roster")?;
+        assert_eq!(
+            info.shared_secret, None,
+            "the equal-epoch reseal must not re-install shared_secret on a banned node"
+        );
+        assert!(
+            info.is_banned(&local_hex),
+            "the Banned tombstone must survive the refused reseal"
+        );
+        Ok(())
+    }
+
     /// Issue #376: the local-only drop (this node holds group state it is not
     /// an active member of) is the third path that kept the event log.
     #[tokio::test]
