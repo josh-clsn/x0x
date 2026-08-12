@@ -6578,9 +6578,29 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     "member_removed_self",
                 )
                 .await;
+                // Issue #386 (mirror of #376 FIX D): removing only the resolved
+                // alias leaves the sibling alias of a converged dual-alias group
+                // resident in named_groups.json. The startup re-subscribe loop
+                // iterates every named_groups key (`ensure_named_group_listeners`),
+                // so that surviving alias rejoins the group's gossip topics on
+                // restart. Drop the roster entry under EVERY alias. Unlike the
+                // Banned tombstone the ban path retains, a removal keeps no
+                // entry, so every alias goes.
+                let stable_group_id = next.stable_group_id().to_string();
                 if !matches!(
                     persist_named_groups_mutation(state, |groups| {
-                        groups.remove(&resolved_group_key).is_some()
+                        let mut aliases = collect_same_stable_group_aliases(
+                            groups,
+                            &resolved_group_key,
+                            Some(&stable_group_id),
+                        );
+                        aliases.insert(resolved_group_key.clone());
+                        aliases.insert(stable_group_id.clone());
+                        let mut removed_any = false;
+                        for alias in &aliases {
+                            removed_any |= groups.remove(alias).is_some();
+                        }
+                        removed_any
                     })
                     .await,
                     Ok(AtomicWriteOutcome::Durable)
@@ -27638,6 +27658,65 @@ mod tests {
              snapshot_removed={snapshot_removed} welcomes_dropped={welcomes_dropped} \
              task_survived={task_survived}"
         );
+        Ok(())
+    }
+
+    /// Issue #386: a converged named group can be resident under more than one
+    /// alias — the per-instance mls id AND the stable group id. The
+    /// `removed_self` teardown dropped the roster entry under only the resolved
+    /// alias, so a sibling alias survived in `named_groups.json`. That is the
+    /// exact key the startup re-subscribe loop iterates
+    /// (`server/mod.rs`: every `named_groups` key -> `ensure_named_group_listeners`),
+    /// so on restart the surviving alias re-subscribes the node to the gossip
+    /// topics of a group it was removed from — rejoining a mesh it had left.
+    /// Mirror #376 FIX D: drop the roster entry under EVERY alias so no alias
+    /// survives to re-subscribe. Unlike the ban, a removal keeps no tombstone,
+    /// so every alias goes. The single-alias common case stays covered by
+    /// `member_removed_self_wipes_treekem_event_log`.
+    #[tokio::test]
+    async fn member_removed_self_drops_every_alias() -> Result<()> {
+        let f = departure_fixture(0x74, x0x::mls::SecureGroupPlane::Gss, true).await?;
+
+        // Model the converged dual-alias group: the same GroupInfo is resident
+        // under both the mls id (`f.group_id`) and the stable id
+        // (`f.stable_group_id`). Seeding the sibling makes the resolved alias
+        // the stable id, so a single-slot removal leaves the mls-id alias
+        // behind — the surviving key the restart re-subscribe loop keys on.
+        {
+            let mut groups = f.state.named_groups.write().await;
+            let sibling = groups
+                .get(&f.group_id)
+                .context("fixture group is present")?
+                .clone();
+            groups.insert(f.stable_group_id.clone(), sibling);
+        }
+
+        let event = admin_removes_local_event(&f).await?;
+        let applied =
+            apply_named_group_metadata_event(&f.state, event, f.peer_kp.agent_id(), true, None)
+                .await;
+        assert!(
+            applied.accepted && applied.should_exit,
+            "an admin removal of this node must apply and exit the subscriber"
+        );
+
+        {
+            let groups = f.state.named_groups.read().await;
+            for alias in f.aliases() {
+                assert!(
+                    !groups.contains_key(alias),
+                    "removed_self must drop every roster alias; the surviving alias \
+                     {alias} would re-subscribe the group's gossip topics on restart"
+                );
+            }
+        }
+
+        assert_departure_wiped_treekem_state(
+            &f.state,
+            &f.aliases(),
+            "member removed self dual-alias",
+        )
+        .await;
         Ok(())
     }
 
