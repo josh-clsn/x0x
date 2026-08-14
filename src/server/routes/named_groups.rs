@@ -11951,6 +11951,11 @@ async fn wipe_local_group_crypto_material(
         }
     }
 
+    // #390: the staging sidecar must record the wipe, or a restart would
+    // resurrect the departed/banned group's staged join-results — exactly
+    // the re-seed class #384 closed for roster state.
+    persist_join_result_staging(state).await;
+
     for alias in &aliases {
         remove_treekem_persistence_for_group_id(state, alias, reason).await;
     }
@@ -19193,6 +19198,235 @@ fn staging_entry_fresh(created_at_ms: u64, ttl: Duration, now_ms: u64) -> bool {
     now_ms.saturating_sub(created_at_ms) < ttl.as_millis() as u64
 }
 
+/// #390: versioned sidecar for the join-result staging stores. One file for
+/// both maps: they are written by the same staging sites, served together,
+/// and wiped together on departure/ban, so a single atomic write keeps them
+/// mutually consistent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JoinResultStagingSidecar {
+    version: u32,
+    #[serde(default)]
+    join_results: HashMap<String, PendingJoinResult>,
+    #[serde(default)]
+    welcomes: HashMap<String, PendingWelcome>,
+}
+
+const JOIN_RESULT_STAGING_SIDECAR_VERSION: u32 = 1;
+
+/// Loader bound: staged entries beyond this per-map cap are dropped
+/// oldest-first. Joins are rare and TTL-pruned, so a real daemon never nears
+/// it; the cap only bounds a corrupted or hand-crafted sidecar.
+const JOIN_RESULT_STAGING_MAX_ENTRIES: usize = 256;
+
+/// #390: persist both staging maps — persistence lock (P) then data read
+/// locks (Q), mirroring the ADR-0028 sidecars. Callers that already hold a
+/// staging map's write lock MUST drop it first.
+pub(in crate::server) async fn save_join_result_staging(
+    state: &AppState,
+) -> std::io::Result<AtomicWriteOutcome> {
+    let _persistence_guard = state.join_result_staging_persistence_lock.lock().await;
+    let json_result = {
+        let results = state.pending_join_results.read().await;
+        let welcomes = state.pending_welcomes.read().await;
+        let sidecar = JoinResultStagingSidecar {
+            version: JOIN_RESULT_STAGING_SIDECAR_VERSION,
+            join_results: results.clone(),
+            welcomes: welcomes.clone(),
+        };
+        serde_json::to_string(&sidecar)
+            .map_err(|e| std::io::Error::other(format!("serialize join-result staging: {e}")))
+    };
+    let json = match json_result {
+        Ok(json) => json,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "#390: join-result staging serialization failed before replacement"
+            );
+            return Ok(AtomicWriteOutcome::NotReplaced);
+        }
+    };
+    write_named_groups_json_atomic(&state.join_result_staging_path, &json).await
+}
+
+/// Log-and-continue wrapper for the staging save: durability here is an
+/// upgrade over the pre-#390 in-memory-only behavior, never a reason to fail
+/// the staging call itself.
+async fn persist_join_result_staging(state: &AppState) {
+    if let Err(error) = save_join_result_staging(state).await {
+        tracing::warn!(%error, "#390: failed to persist join-result staging sidecar");
+    }
+}
+
+/// #390: restore the staging maps at boot. Lenient by design — this is
+/// best-effort delivery state, not causal-integrity state. A missing file is
+/// a clean start; an unreadable or wrong-version file is set aside as
+/// `.corrupt` (evidence preserved, the next save writes fresh); entries are
+/// TTL-pruned and capped before they reach memory so a stale or oversized
+/// sidecar cannot resurrect unbounded state. Runs before the group listeners
+/// spawn, and the departure/ban wipe re-saves post-wipe, so a banned group's
+/// staging never survives a restart (#384 invariant).
+pub(in crate::server) async fn load_join_result_staging(state: &AppState) {
+    let path = state.join_result_staging_path.clone();
+    let raw = match tokio::fs::read(&path).await {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                path = %path.display(),
+                "#390: cannot read join-result staging sidecar; starting empty"
+            );
+            return;
+        }
+    };
+    let sidecar: JoinResultStagingSidecar = match serde_json::from_slice(&raw) {
+        Ok(sidecar) => sidecar,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                path = %path.display(),
+                "#390: join-result staging sidecar unreadable; setting aside as .corrupt"
+            );
+            set_aside_corrupt_staging_sidecar(&path).await;
+            return;
+        }
+    };
+    if sidecar.version != JOIN_RESULT_STAGING_SIDECAR_VERSION {
+        tracing::error!(
+            version = sidecar.version,
+            path = %path.display(),
+            "#390: unsupported join-result staging sidecar version; setting aside as .corrupt"
+        );
+        set_aside_corrupt_staging_sidecar(&path).await;
+        return;
+    }
+    let now_ms = now_millis_u64();
+    let mut join_results = sidecar.join_results;
+    join_results
+        .retain(|_, p| staging_entry_fresh(p.created_at_ms, PENDING_JOIN_RESULT_TTL, now_ms));
+    let mut welcomes = sidecar.welcomes;
+    welcomes.retain(|_, p| staging_entry_fresh(p.created_at_ms, PENDING_WELCOME_TTL, now_ms));
+    cap_staging_oldest_first(&mut join_results, |p| p.created_at_ms);
+    cap_staging_oldest_first(&mut welcomes, |p| p.created_at_ms);
+    let (results_len, welcomes_len) = (join_results.len(), welcomes.len());
+    *state.pending_join_results.write().await = join_results;
+    *state.pending_welcomes.write().await = welcomes;
+    if results_len > 0 || welcomes_len > 0 {
+        tracing::info!(
+            join_results = results_len,
+            welcomes = welcomes_len,
+            "#390: restored staged join-results from sidecar"
+        );
+    }
+}
+
+async fn set_aside_corrupt_staging_sidecar(path: &FsPath) {
+    let mut corrupt = path.as_os_str().to_owned();
+    corrupt.push(".corrupt");
+    if let Err(error) = tokio::fs::rename(path, &corrupt).await {
+        tracing::warn!(%error, "#390: failed to set aside corrupt staging sidecar");
+    }
+}
+
+/// Drop oldest entries beyond [`JOIN_RESULT_STAGING_MAX_ENTRIES`].
+fn cap_staging_oldest_first<V>(map: &mut HashMap<String, V>, created_at_ms: impl Fn(&V) -> u64) {
+    if map.len() <= JOIN_RESULT_STAGING_MAX_ENTRIES {
+        return;
+    }
+    let mut stamps: Vec<(u64, String)> = map
+        .iter()
+        .map(|(key, value)| (created_at_ms(value), key.clone()))
+        .collect();
+    stamps.sort_unstable();
+    let excess = map.len() - JOIN_RESULT_STAGING_MAX_ENTRIES;
+    for (_, key) in stamps.into_iter().take(excess) {
+        map.remove(&key);
+    }
+}
+
+/// #390: on daemon start, re-arm the join-result poll for every locally
+/// known group whose join never converged before the previous shutdown — the
+/// poll task dies with the process and nothing else on the joiner
+/// re-requests the Welcome (an app relaunch mid-join is a daemon restart).
+///
+/// Unconverged means: TreeKEM plane — the group is known but no TreeKEM
+/// state is installed under any alias (roster-listed-or-stubbed, keyless);
+/// GSS plane — the local roster does not list this agent (#297 repair case).
+/// The re-armed poll targets the group OWNER: the recorded inviter pin died
+/// with the previous process, the owner is the staging authority both
+/// delivery lanes serve from, and the receive path still runs the full
+/// inviter + authority-commit verification, so a wrong guess can reject but
+/// never forge. A group whose staged result no longer exists anywhere polls
+/// harmlessly at the backoff cap until the 24h horizon lapses.
+///
+/// Returns the re-armed group ids so startup logging and tests observe the
+/// decision without any network traffic.
+pub(in crate::server) async fn respawn_unconverged_join_polls(state: Arc<AppState>) -> Vec<String> {
+    let self_agent = state.agent.agent_id();
+    let self_hex = hex::encode(self_agent.as_bytes());
+    struct Candidate {
+        group_id: String,
+        mls_group_id: String,
+        stable_group_id: String,
+        creator: AgentId,
+        is_treekem: bool,
+        self_in_roster: bool,
+    }
+    let candidates: Vec<Candidate> = {
+        let groups = state.named_groups.read().await;
+        groups
+            .iter()
+            .map(|(group_id, info)| Candidate {
+                group_id: group_id.clone(),
+                mls_group_id: info.mls_group_id.clone(),
+                stable_group_id: info.stable_group_id().to_string(),
+                creator: info.creator,
+                is_treekem: info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem,
+                self_in_roster: info.has_member(&self_hex),
+            })
+            .collect()
+    };
+    let mut respawned = Vec::new();
+    for candidate in candidates {
+        let unconverged = if candidate.is_treekem {
+            let treekem = state.treekem_groups.read().await;
+            !(treekem.contains_key(&candidate.group_id)
+                || treekem.contains_key(&candidate.mls_group_id)
+                || treekem.contains_key(&candidate.stable_group_id))
+        } else {
+            !candidate.self_in_roster
+        };
+        if !unconverged {
+            continue;
+        }
+        // Our own group: we are the authority, there is no counterparty to
+        // poll.
+        if candidate.creator == self_agent {
+            continue;
+        }
+        let owner = candidate.creator;
+        let poll_state = Arc::clone(&state);
+        let poll_group = candidate.group_id.clone();
+        let poll_event_group = candidate.stable_group_id;
+        let poll_member = self_hex.clone();
+        let await_treekem = candidate.is_treekem;
+        tokio::spawn(async move {
+            poll_join_result_until_membership_confirmed(
+                poll_state,
+                poll_group,
+                poll_event_group,
+                owner,
+                poll_member,
+                await_treekem,
+            )
+            .await;
+        });
+        respawned.push(candidate.group_id);
+    }
+    respawned
+}
+
 /// #390: BOTH planes poll for as long as the authority keeps the staged
 /// `MemberAdded` commit (`PENDING_JOIN_RESULT_TTL`). The old 120s TreeKEM
 /// give-up predates the staged stores surviving restarts: it silently
@@ -19452,7 +19686,8 @@ pub(in crate::server) async fn get_join_result_inline(
     let mut event = {
         let now_ms = now_millis_u64();
         let mut results = state.pending_join_results.write().await;
-        results.retain(|_, p| staging_entry_fresh(p.created_at_ms, PENDING_JOIN_RESULT_TTL, now_ms));
+        results
+            .retain(|_, p| staging_entry_fresh(p.created_at_ms, PENDING_JOIN_RESULT_TTL, now_ms));
         match results.get(&key) {
             Some(p) => p.event.clone(),
             None => {
@@ -19729,6 +19964,8 @@ async fn stage_join_result(
             created_at_ms: now_ms,
         },
     );
+    let pending_count = results.len();
+    drop(results);
     tracing::debug!(
         target: "treekem.trace",
         stage = "stage_join_result",
@@ -19741,8 +19978,9 @@ async fn stage_join_result(
         has_inline_welcome,
         welcome_ref = ?welcome_ref_id,
         treekem_epoch = ?treekem_epoch,
-        pending_count = results.len(),
+        pending_count,
     );
+    persist_join_result_staging(state).await;
 }
 
 /// Issue #377: every arm below authorizes on `sender`, and on the raw-QUIC
@@ -20081,6 +20319,8 @@ async fn stage_treekem_welcome(
         staging_entry_fresh(pending.created_at_ms, PENDING_WELCOME_TTL, now_ms)
     });
     welcomes.insert(welcome_id.clone(), pending);
+    drop(welcomes);
+    persist_join_result_staging(state).await;
     WelcomeRef {
         welcome_id,
         byte_len,
@@ -20591,6 +20831,7 @@ mod tests {
     mod adr0028_row6_recovery_controls;
     mod adr0028_sidecar_recovery_controls;
     mod cache_hardening_followup;
+    mod join_result_390_staging;
     mod pr291_restart_marker_matrix;
     mod sec377_dm_verified_gate;
     mod sec393_file_verified_gate;
@@ -21270,6 +21511,8 @@ mod tests {
             completed_relay_tombstones: RwLock::new(HashMap::new()),
             causal_approval_queue_path: treekem_dir.join("causal_approval_queue.json"),
             predecessor_relay_outbox_path: treekem_dir.join("predecessor_relay_outbox.json"),
+            join_result_staging_path: data_dir.join("pending_join_results.json"),
+            join_result_staging_persistence_lock: Mutex::new(()),
             treekem_member_key_packages,
             treekem_event_log: RwLock::new(HashMap::new()),
             treekem_catchup_throttle: RwLock::new(HashMap::new()),
@@ -30077,7 +30320,10 @@ mod tests {
         assert_eq!(join_result_poll_delay(7), Duration::from_secs(256));
         assert_eq!(join_result_poll_delay(8), JOIN_RESULT_POLL_BACKOFF_CAP);
         assert_eq!(join_result_poll_delay(31), JOIN_RESULT_POLL_BACKOFF_CAP);
-        assert_eq!(join_result_poll_delay(u32::MAX), JOIN_RESULT_POLL_BACKOFF_CAP);
+        assert_eq!(
+            join_result_poll_delay(u32::MAX),
+            JOIN_RESULT_POLL_BACKOFF_CAP
+        );
     }
 
     fn direct_send_test_request(agent_id: String, payload: String) -> DirectSendRequest {
