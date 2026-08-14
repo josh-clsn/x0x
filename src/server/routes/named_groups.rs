@@ -627,6 +627,19 @@ pub(in crate::server) struct TreeKemCatchupResponse {
     group_id: String,
     events: Vec<NamedGroupMetadataEvent>,
     truncated: bool,
+    /// #398: which member `target_member_key_package_b64` belongs to — an
+    /// echo of the request's `target_member_id`. `#[serde(default)]` keeps
+    /// responses from old daemons parseable and old daemons ignore it.
+    #[serde(default)]
+    target_member_id: Option<String>,
+    /// #398: roster-fallback KeyPackage for `target_member_id`, served when
+    /// the join-event cache misses — a genesis/base-roster member (the group
+    /// creator above all) never emitted a `MemberJoined`, so the cache can
+    /// never hold one and an invited admin could never ban them. The
+    /// requester trusts it only after blake3(b64) matches the
+    /// authority-anchored `treekem_key_package_hash` it already holds.
+    #[serde(default)]
+    target_member_key_package_b64: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5383,11 +5396,25 @@ async fn member_keyed_treekem_catchup_response(
         .find_for_member(log_keys, target_member_id)
         .await
         .filter(|event| verify_authority_attested_member_joined_recovery(&info, event));
+    // #398: the join-event cache can never hold a genesis/base-roster member
+    // (no MemberJoined ever existed), so on a cache miss fall back to this
+    // roster's full KeyPackage. Integrity is the requester's job: it accepts
+    // the package only when blake3(b64) matches the authority-anchored hash
+    // it already holds, so a hostile responder can substitute nothing.
+    let target_member_key_package_b64 = if event.is_none() {
+        info.members_v2
+            .get(target_member_id)
+            .and_then(current_member_treekem_key_package)
+    } else {
+        None
+    };
     Some(TreeKemCatchupResponse {
         message_type: "treekem_catchup_response".to_string(),
         group_id: request.group_id.clone(),
         events: event.into_iter().collect(),
         truncated: false,
+        target_member_id: Some(target_member_id.clone()),
+        target_member_key_package_b64,
     })
 }
 
@@ -5565,6 +5592,8 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         group_id: request.group_id.clone(),
         events,
         truncated,
+        target_member_id: None,
+        target_member_key_package_b64: None,
     };
     let payload = match serde_json::to_vec(&response) {
         Ok(payload) => payload,
@@ -5580,6 +5609,86 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     {
         tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %sender_hex, "failed to send TreeKEM catch-up response: {e}");
     }
+}
+
+/// #398: store a roster-fallback KeyPackage delivered by a targeted member
+/// catch-up. Trust anchor: the local roster's existing
+/// `treekem_key_package_hash` — blake3 over the base64 string, the exact
+/// convention `set_member_treekem_key_package` writes — which arrived under
+/// authority-signed group state. A package that does not match the anchor,
+/// or a member with no anchor at all, is refused; an already-complete entry
+/// is left untouched. Returns whether the roster now holds the full package.
+async fn apply_targeted_member_key_package(
+    state: &Arc<AppState>,
+    group_id: &str,
+    member_agent_id: &str,
+    kp_b64: &str,
+) -> bool {
+    let received_hash = blake3::hash(kp_b64.as_bytes()).to_hex().to_string();
+    let membership_lock = group_membership_lock(state, group_id).await;
+    let _membership_guard = membership_lock.lock().await;
+    let stored = {
+        let mut groups = state.named_groups.write().await;
+        let key = if groups.contains_key(group_id) {
+            group_id.to_string()
+        } else {
+            match groups
+                .iter()
+                .find(|(_, info)| info.stable_group_id() == group_id)
+                .map(|(key, _)| key.clone())
+            {
+                Some(key) => key,
+                None => return false,
+            }
+        };
+        let Some(info) = groups.get_mut(&key) else {
+            return false;
+        };
+        let Some(member) = info.members_v2.get(member_agent_id) else {
+            tracing::debug!(
+                group_id = %LogHexId::group(group_id),
+                member = %LogHexId::agent(member_agent_id),
+                "#398: targeted KeyPackage for an unknown roster member; ignoring"
+            );
+            return false;
+        };
+        if member.treekem_key_package_b64.is_some() {
+            return true;
+        }
+        match member.treekem_key_package_hash.as_deref() {
+            Some(anchor) if anchor.eq_ignore_ascii_case(&received_hash) => {
+                info.set_member_treekem_key_package(member_agent_id, kp_b64.to_string());
+                true
+            }
+            Some(_) => {
+                tracing::warn!(
+                    group_id = %LogHexId::group(group_id),
+                    member = %LogHexId::agent(member_agent_id),
+                    "#398: targeted KeyPackage does not match the locally-anchored hash; refusing"
+                );
+                false
+            }
+            None => {
+                tracing::debug!(
+                    group_id = %LogHexId::group(group_id),
+                    member = %LogHexId::agent(member_agent_id),
+                    "#398: no local KeyPackage hash anchor for member; refusing unverifiable package"
+                );
+                false
+            }
+        }
+    };
+    if stored {
+        if let Err(error) = save_named_groups_checked(state).await {
+            tracing::warn!(%error, "#398: failed to persist roster after targeted KeyPackage store");
+        }
+        tracing::info!(
+            group_id = %LogHexId::group(group_id),
+            member = %LogHexId::agent(member_agent_id),
+            "#398: stored roster-fallback KeyPackage for targeted member"
+        );
+    }
+    stored
 }
 
 pub(in crate::server) async fn handle_treekem_catchup_response(
@@ -5619,6 +5728,18 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         );
         return;
     };
+    // #398: a targeted member-key catch-up may carry a roster-fallback
+    // KeyPackage instead of a cached join event — the only lane that can
+    // recover a genesis/base-roster member's package (they never emitted a
+    // MemberJoined). Verified against the locally-held authority-anchored
+    // hash before it is trusted, so the sender gate above plus the hash
+    // anchor bound what a peer can inject.
+    if let (Some(target), Some(kp_b64)) = (
+        response.target_member_id.as_deref(),
+        response.target_member_key_package_b64.as_deref(),
+    ) {
+        apply_targeted_member_key_package(state, &response.group_id, target, kp_b64).await;
+    }
     let was_truncated = response.truncated;
     let mut events = response.events;
     events.sort_by_key(treekem_membership_event_sort_key);
@@ -20876,6 +20997,7 @@ mod tests {
     mod adr0028_row6_recovery_controls;
     mod adr0028_sidecar_recovery_controls;
     mod cache_hardening_followup;
+    mod genesis_kp_catchup_398;
     mod join_result_390_staging;
     mod pr291_restart_marker_matrix;
     mod sec377_dm_verified_gate;
@@ -27030,6 +27152,8 @@ mod tests {
             group_id: "aa".to_string(),
             events: Vec::new(),
             truncated: false,
+            target_member_id: None,
+            target_member_key_package_b64: None,
         };
         let encoded = serde_json::to_value(&response).expect("catch-up response serializes");
         assert_eq!(encoded["message_type"], "treekem_catchup_response");
@@ -30879,6 +31003,8 @@ mod tests {
             group_id: fixture.stable_group_id.clone(),
             events: vec![fixture.event.clone()],
             truncated: false,
+            target_member_id: None,
+            target_member_key_package_b64: None,
         };
         let unauthorized = x0x::identity::AgentKeypair::generate()?;
         handle_treekem_catchup_response(state, &unauthorized.agent_id(), true, response.clone())

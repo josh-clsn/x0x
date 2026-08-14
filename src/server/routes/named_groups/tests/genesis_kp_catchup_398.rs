@@ -1,0 +1,183 @@
+//! #398 — a genesis/base-roster member's TreeKEM KeyPackage must be
+//! recoverable by an invited admin.
+//!
+//! The targeted member-key catch-up served only from the cached
+//! `MemberJoined` store, and the group creator never emitted a
+//! `MemberJoined` — so every response came back empty, the requester's
+//! removal pre-check 424'd (`member_key_package_pending`) forever, and an
+//! invited admin could never ban a genesis member (found live in the
+//! gov-trio device test). These controls drive the roster-fallback serve
+//! lane and the hash-anchored requester-side apply.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use super::*;
+
+const FAKE_KP_B64: &str = "ZmFrZS10cmVla2VtLWtleS1wYWNrYWdlLWJ5dGVz";
+
+fn group_with_creator_kp(
+    creator: AgentId,
+    kp_b64: Option<&str>,
+) -> (x0x::groups::GroupInfo, String) {
+    let creator_hex = hex::encode(creator.as_bytes());
+    let mut info = x0x::groups::GroupInfo::with_policy(
+        "g398".to_string(),
+        "d".to_string(),
+        creator,
+        "ee".repeat(16),
+        x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
+    );
+    if let Some(kp) = kp_b64 {
+        info.set_member_treekem_key_package(&creator_hex, kp.to_string());
+    }
+    (info, creator_hex)
+}
+
+/// The serve half: with the join-event cache empty (the permanent state for
+/// a genesis member), the targeted response must carry the roster-fallback
+/// KeyPackage and echo the target member id.
+#[tokio::test]
+async fn targeted_catchup_serves_roster_fallback_for_genesis_member() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let creator = x0x::identity::AgentKeypair::generate()?.agent_id();
+    let (info, creator_hex) = group_with_creator_kp(creator, Some(FAKE_KP_B64));
+    let group_id = info.mls_group_id.clone();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), info);
+
+    let request = TreeKemCatchupRequest {
+        message_type: "treekem_catchup_request".to_string(),
+        group_id: group_id.clone(),
+        requester_agent_id: "bb".repeat(32),
+        from_revision: 1,
+        from_treekem_epoch: 0,
+        current_state_hash: String::new(),
+        missing_prev_state_hash: None,
+        target_member_id: Some(creator_hex.clone()),
+        limit: 8,
+    };
+    let response = member_keyed_treekem_catchup_response(&state, &[group_id], &request)
+        .await
+        .expect("targeted request against a known group must produce a response");
+    assert!(
+        response.events.is_empty(),
+        "no MemberJoined ever existed for a genesis member"
+    );
+    assert_eq!(
+        response.target_member_id.as_deref(),
+        Some(creator_hex.as_str())
+    );
+    assert_eq!(
+        response.target_member_key_package_b64.as_deref(),
+        Some(FAKE_KP_B64),
+        "the roster-fallback lane must serve the full KeyPackage"
+    );
+    Ok(())
+}
+
+/// A member whose roster entry has no full package on the RESPONDER either
+/// yields no fallback — the response degrades to the old empty shape.
+#[tokio::test]
+async fn targeted_catchup_serves_nothing_without_roster_package() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let creator = x0x::identity::AgentKeypair::generate()?.agent_id();
+    let (info, creator_hex) = group_with_creator_kp(creator, None);
+    let group_id = info.mls_group_id.clone();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), info);
+
+    let request = TreeKemCatchupRequest {
+        message_type: "treekem_catchup_request".to_string(),
+        group_id: group_id.clone(),
+        requester_agent_id: "bb".repeat(32),
+        from_revision: 1,
+        from_treekem_epoch: 0,
+        current_state_hash: String::new(),
+        missing_prev_state_hash: None,
+        target_member_id: Some(creator_hex),
+        limit: 8,
+    };
+    let response = member_keyed_treekem_catchup_response(&state, &[group_id], &request)
+        .await
+        .expect("response still produced");
+    assert!(response.target_member_key_package_b64.is_none());
+    Ok(())
+}
+
+/// The apply half: a fallback package matching the locally-anchored hash is
+/// stored, after which the removal pre-check resolves instead of 424ing.
+#[tokio::test]
+async fn targeted_kp_applies_on_hash_match_and_unblocks_removal() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let creator = x0x::identity::AgentKeypair::generate()?.agent_id();
+    let (mut info, creator_hex) = group_with_creator_kp(creator, None);
+    // The invite-derived state: hash anchor only, no package bytes — the
+    // exact phone-side roster shape from the device test.
+    let anchor = blake3::hash(FAKE_KP_B64.as_bytes()).to_hex().to_string();
+    info.set_member_treekem_key_package_hash(&creator_hex, anchor);
+    let group_id = info.mls_group_id.clone();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), info);
+
+    assert!(
+        apply_targeted_member_key_package(&state, &group_id, &creator_hex, FAKE_KP_B64).await,
+        "a hash-matching fallback package must be stored"
+    );
+    let resolved = resolve_member_treekem_kp_for_removal(&state, &group_id, &creator_hex)
+        .await
+        .expect("removal pre-check must now resolve the package");
+    assert_eq!(resolved, FAKE_KP_B64);
+    Ok(())
+}
+
+/// A package that does not match the anchor is refused and nothing is
+/// stored — a hostile responder cannot substitute its own key material.
+#[tokio::test]
+async fn targeted_kp_refuses_hash_mismatch() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let creator = x0x::identity::AgentKeypair::generate()?.agent_id();
+    let (mut info, creator_hex) = group_with_creator_kp(creator, None);
+    info.set_member_treekem_key_package_hash(
+        &creator_hex,
+        blake3::hash(b"a different package").to_hex().to_string(),
+    );
+    let group_id = info.mls_group_id.clone();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), info);
+
+    assert!(!apply_targeted_member_key_package(&state, &group_id, &creator_hex, FAKE_KP_B64).await);
+    let groups = state.named_groups.read().await;
+    let member = groups[&group_id].members_v2.get(&creator_hex).unwrap();
+    assert!(member.treekem_key_package_b64.is_none(), "nothing stored");
+    Ok(())
+}
+
+/// A member with no local hash anchor is unverifiable — refuse rather than
+/// trust a bare peer-supplied package.
+#[tokio::test]
+async fn targeted_kp_refuses_without_local_anchor() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let creator = x0x::identity::AgentKeypair::generate()?.agent_id();
+    let (info, creator_hex) = group_with_creator_kp(creator, None);
+    let group_id = info.mls_group_id.clone();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), info);
+
+    assert!(!apply_targeted_member_key_package(&state, &group_id, &creator_hex, FAKE_KP_B64).await);
+    Ok(())
+}
