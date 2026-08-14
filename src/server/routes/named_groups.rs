@@ -5408,6 +5408,13 @@ async fn member_keyed_treekem_catchup_response(
     } else {
         None
     };
+    tracing::info!(
+        group_id = %LogHexId::group(&request.group_id),
+        target = %LogHexId::agent(target_member_id),
+        cache_event = event.is_some(),
+        roster_fallback = target_member_key_package_b64.is_some(),
+        "#398: serving targeted member-key catch-up"
+    );
     Some(TreeKemCatchupResponse {
         message_type: "treekem_catchup_response".to_string(),
         group_id: request.group_id.clone(),
@@ -5697,6 +5704,19 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     verified: bool,
     response: TreeKemCatchupResponse,
 ) {
+    // #398 lane visibility: this handler's gates otherwise drop targeted
+    // responses without a trace, which made a dead member-key heal
+    // indistinguishable from one that never arrived.
+    if response.target_member_id.is_some() {
+        tracing::info!(
+            group_id = %LogHexId::group(&response.group_id),
+            sender = %LogHexId::agent(&hex::encode(sender.as_bytes())),
+            verified,
+            has_target_kp = response.target_member_key_package_b64.is_some(),
+            events = response.events.len(),
+            "#398: targeted TreeKEM catch-up response received"
+        );
+    }
     if !verified || response.message_type != "treekem_catchup_response" {
         return;
     }
@@ -5738,7 +5758,14 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         response.target_member_id.as_deref(),
         response.target_member_key_package_b64.as_deref(),
     ) {
-        apply_targeted_member_key_package(state, &response.group_id, target, kp_b64).await;
+        let stored =
+            apply_targeted_member_key_package(state, &response.group_id, target, kp_b64).await;
+        tracing::info!(
+            group_id = %LogHexId::group(&response.group_id),
+            target = %LogHexId::agent(target),
+            stored,
+            "#398: targeted KeyPackage apply attempted"
+        );
     }
     let was_truncated = response.truncated;
     let mut events = response.events;
