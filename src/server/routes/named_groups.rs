@@ -619,6 +619,16 @@ pub(in crate::server) struct TreeKemCatchupRequest {
     #[serde(default)]
     target_member_id: Option<String>,
     limit: usize,
+    /// #398: self-authenticating signer for member-keyed requests. A
+    /// phone-embedded engine's identity announcement rarely converges onto
+    /// fleet discovery caches, so its raw-QUIC DMs arrive with
+    /// `verified == false` and the #377 gates drop them. The carried agent
+    /// public key is self-certifying (`AgentId` is derived from it) and the
+    /// signature binds [`member_keyed_request_sign_input`], giving the
+    /// responder proof the claimed requester authored this request without
+    /// any discovery state. `#[serde(default)]` keeps old peers parseable.
+    #[serde(default)]
+    signed_by: Option<CatchupSigner>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -640,6 +650,83 @@ pub(in crate::server) struct TreeKemCatchupResponse {
     /// authority-anchored `treekem_key_package_hash` it already holds.
     #[serde(default)]
     target_member_key_package_b64: Option<String>,
+    /// #398: self-authenticating signer for targeted responses — the
+    /// responder's counterpart to the request's `signed_by`, binding
+    /// [`member_keyed_response_sign_input`] so a requester whose transport
+    /// cannot verify the responder still gets a provable origin for the
+    /// hash-anchored KeyPackage apply. `#[serde(default)]` keeps old peers
+    /// parseable.
+    #[serde(default)]
+    signed_by: Option<CatchupSigner>,
+}
+
+/// #398: ML-DSA-65 signer attachment for the member-keyed TreeKEM catch-up
+/// wire. `AgentId` is derived from the agent public key, so the carried key
+/// is self-certifying against the claimed agent id (the same construction
+/// [`identity_announcement_has_direct_agent_origin`] relies on); the
+/// signature covers a domain-separated canonical input, never the raw JSON.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(in crate::server) struct CatchupSigner {
+    /// Raw ML-DSA-65 agent public key bytes, base64.
+    public_key_b64: String,
+    /// ML-DSA-65 signature over the canonical input, base64.
+    signature_b64: String,
+}
+
+/// Canonical signing input for a member-keyed catch-up request. NUL-joined
+/// with a versioned domain tag: hex agent ids and group ids cannot contain
+/// NUL, so the encoding is injective.
+fn member_keyed_request_sign_input(group_id: &str, requester: &str, target: &str) -> Vec<u8> {
+    format!("x0x.treekem.member-key-catchup.request.v1\0{group_id}\0{requester}\0{target}")
+        .into_bytes()
+}
+
+/// Canonical signing input for a targeted catch-up response. `kp_hash_hex`
+/// is `blake3(kp_b64)` (empty string when no fallback package is carried),
+/// binding the signature to the exact key material served.
+fn member_keyed_response_sign_input(group_id: &str, target: &str, kp_hash_hex: &str) -> Vec<u8> {
+    format!("x0x.treekem.member-key-catchup.response.v1\0{group_id}\0{target}\0{kp_hash_hex}")
+        .into_bytes()
+}
+
+/// Verify that [`CatchupSigner`] proves `claimed_agent_hex` authored
+/// `input`: the carried public key must derive the claimed `AgentId` and
+/// the signature must verify over `input`. Refuses (false) on any decode
+/// or verification failure.
+fn catchup_signer_matches(signer: &CatchupSigner, claimed_agent_hex: &str, input: &[u8]) -> bool {
+    let Ok(pk_bytes) = BASE64.decode(&signer.public_key_b64) else {
+        return false;
+    };
+    let Ok(sig_bytes) = BASE64.decode(&signer.signature_b64) else {
+        return false;
+    };
+    let Ok(pk) = ant_quic::MlDsaPublicKey::from_bytes(&pk_bytes) else {
+        return false;
+    };
+    let derived = hex::encode(x0x::identity::AgentId::from_public_key(&pk).as_bytes());
+    if !derived.eq_ignore_ascii_case(claimed_agent_hex) {
+        return false;
+    }
+    let Ok(sig) = ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&sig_bytes)
+    else {
+        return false;
+    };
+    ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(&pk, input, &sig).is_ok()
+}
+
+/// Sign `input` with this node's agent keypair for the catch-up wire.
+/// Returns `None` (and the message goes out unsigned, exactly the pre-#398
+/// shape) if signing fails.
+fn build_catchup_signer(state: &AppState, input: &[u8]) -> Option<CatchupSigner> {
+    let identity = state.agent.identity();
+    let keypair = identity.agent_keypair();
+    let signature =
+        ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(keypair.secret_key(), input)
+            .ok()?;
+    Some(CatchupSigner {
+        public_key_b64: BASE64.encode(keypair.public_key().as_bytes()),
+        signature_b64: BASE64.encode(signature.as_bytes()),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4406,6 +4493,7 @@ async fn request_treekem_catchup_for_gap(
             missing_prev_state_hash: frontier.commit.prev_state_hash.clone(),
             target_member_id: None,
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+            signed_by: None,
         };
         let payload = match serde_json::to_vec(&request) {
             Ok(payload) => payload,
@@ -5415,6 +5503,14 @@ async fn member_keyed_treekem_catchup_response(
         roster_fallback = target_member_key_package_b64.is_some(),
         "#398: serving targeted member-key catch-up"
     );
+    let kp_hash_hex = target_member_key_package_b64
+        .as_deref()
+        .map(|kp| blake3::hash(kp.as_bytes()).to_hex().to_string())
+        .unwrap_or_default();
+    let signed_by = build_catchup_signer(
+        state,
+        &member_keyed_response_sign_input(&request.group_id, target_member_id, &kp_hash_hex),
+    );
     Some(TreeKemCatchupResponse {
         message_type: "treekem_catchup_response".to_string(),
         group_id: request.group_id.clone(),
@@ -5422,6 +5518,7 @@ async fn member_keyed_treekem_catchup_response(
         truncated: false,
         target_member_id: Some(target_member_id.clone()),
         target_member_key_package_b64,
+        signed_by,
     })
 }
 
@@ -5431,7 +5528,30 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     verified: bool,
     request: TreeKemCatchupRequest,
 ) {
-    if !verified || request.message_type != "treekem_catchup_request" {
+    if request.message_type != "treekem_catchup_request" {
+        return;
+    }
+    // #398: a member-keyed request may prove its own origin via the carried
+    // signer when the transport could not verify the sender (a
+    // phone-embedded engine has no discovery presence on fleet caches, so
+    // its raw-QUIC DMs are permanently `verified == false`). The signature
+    // binds (group, requester, target) under a versioned domain tag and the
+    // key is self-certifying against the requester id, so this admits
+    // exactly the sender-authenticity the transport flag would have. All
+    // membership gates below still apply unchanged.
+    let member_keyed_signed_ok = match (&request.target_member_id, &request.signed_by) {
+        (Some(target), Some(signer)) => catchup_signer_matches(
+            signer,
+            &request.requester_agent_id,
+            &member_keyed_request_sign_input(
+                &request.group_id,
+                &request.requester_agent_id,
+                target,
+            ),
+        ),
+        _ => false,
+    };
+    if !verified && !member_keyed_signed_ok {
         return;
     }
     let sender_hex = hex::encode(sender.as_bytes());
@@ -5601,6 +5721,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         truncated,
         target_member_id: None,
         target_member_key_package_b64: None,
+        signed_by: None,
     };
     let payload = match serde_json::to_vec(&response) {
         Ok(payload) => payload,
@@ -5717,9 +5838,35 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
             "#398: targeted TreeKEM catch-up response received"
         );
     }
-    if !verified || response.message_type != "treekem_catchup_response" {
+    if response.message_type != "treekem_catchup_response" {
         return;
     }
+    // #398: a targeted response may self-authenticate via the carried signer
+    // when the transport could not verify the sender (the mirror of the
+    // request-side gate). The signature binds the served KeyPackage's blake3
+    // digest, and the apply below additionally demands a match against the
+    // locally-anchored hash — an unverified-but-signed response is admitted
+    // ONLY into that doubly-checked lane; the membership-event path keeps
+    // requiring transport verification (#377).
+    let targeted_signed_ok = match (&response.target_member_id, &response.signed_by) {
+        (Some(target), Some(signer)) => {
+            let kp_hash_hex = response
+                .target_member_key_package_b64
+                .as_deref()
+                .map(|kp| blake3::hash(kp.as_bytes()).to_hex().to_string())
+                .unwrap_or_default();
+            catchup_signer_matches(
+                signer,
+                &hex::encode(sender.as_bytes()),
+                &member_keyed_response_sign_input(&response.group_id, target, &kp_hash_hex),
+            )
+        }
+        _ => false,
+    };
+    if !verified && !targeted_signed_ok {
+        return;
+    }
+    let targeted_only = !verified;
     let sender_hex = hex::encode(sender.as_bytes());
     {
         let revocation_set = state.agent.revocation_set();
@@ -5766,6 +5913,12 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
             stored,
             "#398: targeted KeyPackage apply attempted"
         );
+    }
+    if targeted_only {
+        // #377: membership events from an unverified transport are never
+        // applied — the signed lane above covers only the hash-anchored
+        // KeyPackage heal.
+        return;
     }
     let was_truncated = response.truncated;
     let mut events = response.events;
@@ -5818,6 +5971,7 @@ async fn request_treekem_catchup_page(state: &Arc<AppState>, group_id: &str, pee
         missing_prev_state_hash: None,
         target_member_id: None,
         limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+        signed_by: None,
     };
     let payload = match serde_json::to_vec(&request) {
         Ok(payload) => payload,
@@ -5911,6 +6065,10 @@ async fn request_member_key_package_catchup(
             missing_prev_state_hash: None,
             target_member_id: Some(member_agent_id.to_string()),
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+            signed_by: build_catchup_signer(
+                state,
+                &member_keyed_request_sign_input(group_id, &local_agent_hex, member_agent_id),
+            ),
         };
         let payload = match serde_json::to_vec(&request) {
             Ok(payload) => payload,
@@ -27170,6 +27328,7 @@ mod tests {
             missing_prev_state_hash: Some("state-2".to_string()),
             target_member_id: None,
             limit: 8,
+            signed_by: None,
         };
         let encoded = serde_json::to_value(&request).expect("catch-up request serializes");
         assert_eq!(encoded["message_type"], "treekem_catchup_request");
@@ -27181,6 +27340,7 @@ mod tests {
             truncated: false,
             target_member_id: None,
             target_member_key_package_b64: None,
+            signed_by: None,
         };
         let encoded = serde_json::to_value(&response).expect("catch-up response serializes");
         assert_eq!(encoded["message_type"], "treekem_catchup_response");
@@ -27544,6 +27704,7 @@ mod tests {
             missing_prev_state_hash: None,
             target_member_id: Some(fixture.member_hex.clone()),
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+            signed_by: None,
         };
         let log_keys = vec![fixture.group_id.clone(), fixture.stable_group_id.clone()];
         let response = member_keyed_treekem_catchup_response(&restarted, &log_keys, &request)
@@ -27628,6 +27789,7 @@ mod tests {
             missing_prev_state_hash: None,
             target_member_id,
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+            signed_by: None,
         };
         handle_treekem_catchup_request(state, sender, true, request).await;
         outgoing().saturating_sub(before)
@@ -27807,6 +27969,7 @@ mod tests {
             missing_prev_state_hash: None,
             target_member_id: None,
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+            signed_by: None,
         };
         handle_treekem_catchup_request(state, sender, true, request).await;
         outgoing().saturating_sub(before)
@@ -29344,6 +29507,7 @@ mod tests {
             missing_prev_state_hash: None,
             target_member_id: Some(member_hex.clone()),
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+            signed_by: None,
         };
         let log_keys = vec![group_id.clone(), stable_group_id.clone()];
         let response = member_keyed_treekem_catchup_response(&restarted, &log_keys, &request)
@@ -29516,6 +29680,7 @@ mod tests {
             missing_prev_state_hash: None,
             target_member_id: Some(member_hex.clone()),
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+            signed_by: None,
         };
         let log_keys = vec![group_id.clone(), stable_group_id];
         let response = member_keyed_treekem_catchup_response(&w_state, &log_keys, &request)
@@ -31032,6 +31197,7 @@ mod tests {
             truncated: false,
             target_member_id: None,
             target_member_key_package_b64: None,
+            signed_by: None,
         };
         let unauthorized = x0x::identity::AgentKeypair::generate()?;
         handle_treekem_catchup_response(state, &unauthorized.agent_id(), true, response.clone())

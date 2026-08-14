@@ -58,6 +58,7 @@ async fn targeted_catchup_serves_roster_fallback_for_genesis_member() -> Result<
         missing_prev_state_hash: None,
         target_member_id: Some(creator_hex.clone()),
         limit: 8,
+        signed_by: None,
     };
     let response = member_keyed_treekem_catchup_response(&state, &[group_id], &request)
         .await
@@ -102,6 +103,7 @@ async fn targeted_catchup_serves_nothing_without_roster_package() -> Result<()> 
         missing_prev_state_hash: None,
         target_member_id: Some(creator_hex),
         limit: 8,
+        signed_by: None,
     };
     let response = member_keyed_treekem_catchup_response(&state, &[group_id], &request)
         .await
@@ -161,6 +163,83 @@ async fn targeted_kp_refuses_hash_mismatch() -> Result<()> {
     let groups = state.named_groups.read().await;
     let member = groups[&group_id].members_v2.get(&creator_hex).unwrap();
     assert!(member.treekem_key_package_b64.is_none(), "nothing stored");
+    Ok(())
+}
+
+/// The signer attachment proves the claimed agent authored the canonical
+/// input: right key + right input accepted; wrong claimed id, tampered
+/// input, and garbage signatures all refused.
+#[tokio::test]
+async fn catchup_signer_verifies_and_refuses() -> Result<()> {
+    let kp = x0x::identity::AgentKeypair::generate()?;
+    let agent_hex = hex::encode(kp.agent_id().as_bytes());
+    let input = member_keyed_request_sign_input("g", &agent_hex, "t");
+    let signature =
+        ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(kp.secret_key(), &input)
+            .expect("sign");
+    let signer = CatchupSigner {
+        public_key_b64: BASE64.encode(kp.public_key().as_bytes()),
+        signature_b64: BASE64.encode(signature.as_bytes()),
+    };
+    assert!(catchup_signer_matches(&signer, &agent_hex, &input));
+    assert!(
+        !catchup_signer_matches(&signer, &"ab".repeat(32), &input),
+        "key does not derive the claimed agent id"
+    );
+    assert!(
+        !catchup_signer_matches(
+            &signer,
+            &agent_hex,
+            &member_keyed_request_sign_input("g", &agent_hex, "other")
+        ),
+        "signature does not cover a different input"
+    );
+    let garbage = CatchupSigner {
+        public_key_b64: signer.public_key_b64.clone(),
+        signature_b64: BASE64.encode([7u8; 64]),
+    };
+    assert!(!catchup_signer_matches(&garbage, &agent_hex, &input));
+    Ok(())
+}
+
+/// The serve half attaches a signer that verifies against the responder's
+/// own agent id and binds the served package's blake3 digest — the shape
+/// the requester-side gate demands before an unverified-transport apply.
+#[tokio::test]
+async fn targeted_response_carries_valid_signer() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let creator = x0x::identity::AgentKeypair::generate()?.agent_id();
+    let (info, creator_hex) = group_with_creator_kp(creator, Some(FAKE_KP_B64));
+    let group_id = info.mls_group_id.clone();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), info);
+
+    let request = TreeKemCatchupRequest {
+        message_type: "treekem_catchup_request".to_string(),
+        group_id: group_id.clone(),
+        requester_agent_id: "bb".repeat(32),
+        from_revision: 1,
+        from_treekem_epoch: 0,
+        current_state_hash: String::new(),
+        missing_prev_state_hash: None,
+        target_member_id: Some(creator_hex.clone()),
+        limit: 8,
+        signed_by: None,
+    };
+    let response = member_keyed_treekem_catchup_response(&state, &[group_id.clone()], &request)
+        .await
+        .expect("response");
+    let signer = response.signed_by.expect("targeted responses are signed");
+    let responder_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let kp_hash = blake3::hash(FAKE_KP_B64.as_bytes()).to_hex().to_string();
+    assert!(catchup_signer_matches(
+        &signer,
+        &responder_hex,
+        &member_keyed_response_sign_input(&group_id, &creator_hex, &kp_hash),
+    ));
     Ok(())
 }
 
