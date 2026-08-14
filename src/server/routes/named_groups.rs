@@ -5496,13 +5496,16 @@ async fn member_keyed_treekem_catchup_response(
     // roster's full KeyPackage. Integrity is the requester's job: it accepts
     // the package only when blake3(b64) matches the authority-anchored hash
     // it already holds, so a hostile responder can substitute nothing.
-    let target_member_key_package_b64 = if event.is_none() {
-        info.members_v2
-            .get(target_member_id)
-            .and_then(current_member_treekem_key_package)
-    } else {
-        None
-    };
+    // Served ALONGSIDE any cached event, not only on a cache miss: an
+    // unverified-transport requester (a phone) can only trust the
+    // hash-anchored roster package — its #377 posture drops cached events —
+    // so a cache hit without the fallback left it permanently unhealed
+    // (observed live in the gov-group ban drill). Verified requesters keep
+    // preferring the event lane; the extra field costs one roster lookup.
+    let target_member_key_package_b64 = info
+        .members_v2
+        .get(target_member_id)
+        .and_then(current_member_treekem_key_package);
     tracing::info!(
         group_id = %LogHexId::group(&request.group_id),
         target = %LogHexId::agent(target_member_id),
