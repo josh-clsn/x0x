@@ -418,10 +418,14 @@ pub(in crate::server) struct WelcomeRef {
     source: String,
 }
 
-#[derive(Debug, Clone)]
+/// Wall-clock (`now_millis_u64`) rather than `Instant` so the entry survives
+/// a daemon restart via the join-result sidecar (#390): TTLs must keep
+/// counting across process lifetimes, and `Instant` neither serializes nor
+/// spans them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(in crate::server) struct PendingJoinResult {
     event: NamedGroupMetadataEvent,
-    created_at: Instant,
+    created_at_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -430,12 +434,13 @@ pub(in crate::server) struct ExpectedJoinResultInviter {
     created_at: Instant,
 }
 
-#[derive(Debug, Clone)]
+/// Wall-clock for the same sidecar-restart reason as [`PendingJoinResult`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(in crate::server) struct PendingWelcome {
     group_id: String,
     joiner_agent: String,
     bytes: Vec<u8>,
-    created_at: Instant,
+    created_at_ms: u64,
 }
 
 pub(in crate::server) struct PendingWelcomeReceive {
@@ -6350,12 +6355,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                             Err(_) => return ApplyMetadataResult::REJECTED,
                         }
                     } else if let Some(welcome_ref) = welcome_ref {
-                        match fetch_treekem_welcome_with_retries(state, &group_id, &welcome_ref)
-                            .await
-                        {
+                        match fetch_treekem_welcome(state, &group_id, &welcome_ref).await {
                             Ok(bytes) => bytes,
                             Err(e) => {
-                                tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), welcome_id = %welcome_ref.welcome_id, "failed to fetch TreeKEM Welcome blob after retries: {e}");
+                                tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), welcome_id = %welcome_ref.welcome_id, "failed to fetch TreeKEM Welcome blob (bounded attempt; the join-result poll re-drives): {e}");
                                 return ApplyMetadataResult::REJECTED;
                             }
                         }
@@ -7298,12 +7301,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                             Err(_) => return ApplyMetadataResult::REJECTED,
                         }
                     } else if let Some(welcome_ref) = welcome_ref {
-                        match fetch_treekem_welcome_with_retries(state, &group_id, &welcome_ref)
-                            .await
-                        {
+                        match fetch_treekem_welcome(state, &group_id, &welcome_ref).await {
                             Ok(bytes) => bytes,
                             Err(e) => {
-                                tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), welcome_id = %welcome_ref.welcome_id, "failed to fetch TreeKEM Welcome blob after retries: {e}");
+                                tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), welcome_id = %welcome_ref.welcome_id, "failed to fetch TreeKEM Welcome blob (bounded attempt; the join-result poll re-drives): {e}");
                                 return ApplyMetadataResult::REJECTED;
                             }
                         }
@@ -19176,48 +19177,69 @@ async fn write_named_groups_json_atomic(
 
 // A day, not minutes: the counterparty in a join is often a phone — locked,
 // backgrounded, offline — so the two halves of the handshake can be hours
-// apart. The joiner keeps polling only for JOIN_RESULT_POLL_TIMEOUT, but the
-// staged result (owner side) and the armed expected-inviter (joiner side)
-// must both outlive that window, or a late half permanently orphans the
-// join: the owner never re-stages for an already-active member, and the
-// joiner rejects a result it no longer expects (`missing_expected_inviter`).
-// Both stores are in-memory (lost to restarts) and re-armed by a retried
-// join, so retention this long costs only bytes, never correctness.
+// apart. The staged result (owner side) and the armed expected-inviter
+// (joiner side) must both outlive the poll window, or a late half permanently
+// orphans the join: the owner never re-stages for an already-active member,
+// and the joiner rejects a result it no longer expects
+// (`missing_expected_inviter`). The staged stores persist to the join-result
+// sidecar (#390) and TTLs count in wall-clock ms, so retention spans daemon
+// restarts.
 const PENDING_JOIN_RESULT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
-const JOIN_RESULT_POLL_TIMEOUT: Duration = Duration::from_secs(120);
+/// True while a wall-clock-stamped staging entry is inside `ttl`. A stamp in
+/// the future (clock stepped back between restarts) reads as fresh, matching
+/// the ADR-0028 sidecars' skew tolerance.
+fn staging_entry_fresh(created_at_ms: u64, ttl: Duration, now_ms: u64) -> bool {
+    now_ms.saturating_sub(created_at_ms) < ttl.as_millis() as u64
+}
 
-/// Non-TreeKEM joins have no TreeKEM Welcome to converge on, so their repair
-/// poll runs for as long as the authority keeps the staged `MemberAdded`
-/// commit (`PENDING_JOIN_RESULT_TTL`): a commit missed during the join window
-/// stays pullable for the whole staging lifetime (#297).
-const NON_TREEKEM_JOIN_RESULT_POLL_TIMEOUT: Duration = PENDING_JOIN_RESULT_TTL;
+/// #390: BOTH planes poll for as long as the authority keeps the staged
+/// `MemberAdded` commit (`PENDING_JOIN_RESULT_TTL`). The old 120s TreeKEM
+/// give-up predates the staged stores surviving restarts: it silently
+/// orphaned any join whose Welcome delivery outlived two minutes of mesh
+/// trouble, which the LAN-fleet reproof hit on every unhealthy-mesh join.
+/// The poll now backs off (`join_result_poll_delay`) instead of burning a
+/// fixed 2s interval for a day.
+const JOIN_RESULT_POLL_HORIZON: Duration = PENDING_JOIN_RESULT_TTL;
 
 /// Retention for recorded expected join-result inviters. Must cover the
-/// longest join-result poll window so late roster-repair responses are still
-/// accepted instead of rejected as `missing_expected_inviter`.
-///
-/// This is a single retention for ALL planes, so pinning it to the non-TreeKEM
-/// window also widens TreeKEM pins from 120s to 600s. That is deliberate and
-/// harmless: a TreeKEM poll clears its own pin at `JOIN_RESULT_POLL_TIMEOUT`,
-/// so the longer retention only affects entries whose poll task died without
-/// clearing. A pin authorizes nothing on its own — it names the one inviter
-/// whose `MemberAdded` this joiner will consider, and the event still goes
+/// join-result poll horizon so late roster-repair responses are still
+/// accepted instead of rejected as `missing_expected_inviter`. A pin
+/// authorizes nothing on its own — it names the one inviter whose
+/// `MemberAdded` this joiner will consider, and the event still goes
 /// through `apply_named_group_metadata_event`.
-const EXPECTED_JOIN_RESULT_INVITER_TTL: Duration = NON_TREEKEM_JOIN_RESULT_POLL_TIMEOUT;
+const EXPECTED_JOIN_RESULT_INVITER_TTL: Duration = JOIN_RESULT_POLL_HORIZON;
 
 const JOIN_RESULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-const PENDING_WELCOME_TTL: Duration = Duration::from_secs(10 * 60);
+/// Ceiling for the poll's exponential backoff: frequent enough that a mesh
+/// recovery converges the join within minutes, rare enough that a day-long
+/// horizon costs ~300 sends instead of 43 200.
+const JOIN_RESULT_POLL_BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
 
-const WELCOME_FETCH_TIMEOUT: Duration = Duration::from_secs(90);
+/// Delay before poll attempt `attempt` (0-based): 2s, 4s, 8s, … capped at
+/// [`JOIN_RESULT_POLL_BACKOFF_CAP`]. Pure, so the schedule is unit-testable.
+fn join_result_poll_delay(attempt: u32) -> Duration {
+    JOIN_RESULT_POLL_INTERVAL
+        .saturating_mul(1u32 << attempt.min(16))
+        .min(JOIN_RESULT_POLL_BACKOFF_CAP)
+}
 
-const WELCOME_FETCH_RETRY_DELAYS: [Duration; 4] = [
-    Duration::ZERO,
-    Duration::from_secs(5),
-    Duration::from_secs(20),
-    Duration::from_secs(60),
-];
+/// #390: matches `PENDING_JOIN_RESULT_TTL`. The old 10-minute welcome TTL
+/// under a 24h join-result TTL left a window where the owner served a
+/// `MemberAdded` whose `welcome_ref` resolved to nothing (`welcome_not_staged`
+/// on the inline path, "unknown blob" on the native path) — an orphaned join
+/// with no repair short of a fresh invite + re-key.
+const PENDING_WELCOME_TTL: Duration = PENDING_JOIN_RESULT_TTL;
+
+/// #390: one bounded attempt. The Welcome pull runs inside
+/// `apply_named_group_metadata_event` while the per-group membership guard is
+/// held, inside the sequential join-result DM listener — the old 90s × 4-try
+/// ladder pinned that lane for up to ~7.5 minutes on an unhealthy mesh,
+/// evicting queued DMs and outliving the poll window. Retry cadence belongs
+/// to `poll_join_result_until_membership_confirmed`, which re-delivers the
+/// event and re-enters this fetch on its own backoff.
+const WELCOME_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn welcome_id_for_bytes(bytes: &[u8]) -> String {
     hex::encode(blake3::hash(bytes).as_bytes())
@@ -19428,8 +19450,9 @@ pub(in crate::server) async fn get_join_result_inline(
 ) -> impl IntoResponse {
     let key = join_result_key(&id, &member);
     let mut event = {
+        let now_ms = now_millis_u64();
         let mut results = state.pending_join_results.write().await;
-        results.retain(|_, p| p.created_at.elapsed() < PENDING_JOIN_RESULT_TTL);
+        results.retain(|_, p| staging_entry_fresh(p.created_at_ms, PENDING_JOIN_RESULT_TTL, now_ms));
         match results.get(&key) {
             Some(p) => p.event.clone(),
             None => {
@@ -19694,13 +19717,16 @@ async fn stage_join_result(
             ),
             _ => (false, false, false, None, None),
         };
+    let now_ms = now_millis_u64();
     let mut results = state.pending_join_results.write().await;
-    results.retain(|_, pending| pending.created_at.elapsed() < PENDING_JOIN_RESULT_TTL);
+    results.retain(|_, pending| {
+        staging_entry_fresh(pending.created_at_ms, PENDING_JOIN_RESULT_TTL, now_ms)
+    });
     results.insert(
         key.clone(),
         PendingJoinResult {
             event,
-            created_at: Instant::now(),
+            created_at_ms: now_ms,
         },
     );
     tracing::debug!(
@@ -19763,8 +19789,11 @@ pub(in crate::server) async fn handle_join_result_message(
             }
             let key = join_result_key(&group_id, &member_agent_id);
             let (event, pending_count) = {
+                let now_ms = now_millis_u64();
                 let mut results = state.pending_join_results.write().await;
-                results.retain(|_, pending| pending.created_at.elapsed() < PENDING_JOIN_RESULT_TTL);
+                results.retain(|_, pending| {
+                    staging_entry_fresh(pending.created_at_ms, PENDING_JOIN_RESULT_TTL, now_ms)
+                });
                 (
                     results.get(&key).map(|pending| pending.event.clone()),
                     results.len(),
@@ -19905,18 +19934,18 @@ pub(in crate::server) async fn handle_join_result_message(
 }
 
 /// Poll the join authority for the authoritative join result until the join
-/// is locally confirmed, re-requesting the staged `MemberAdded` commit every
-/// `JOIN_RESULT_POLL_INTERVAL`.
+/// is locally confirmed, re-requesting the staged `MemberAdded` commit on the
+/// `join_result_poll_delay` backoff for up to `JOIN_RESULT_POLL_HORIZON`.
 ///
 /// Confirmation depends on the secure plane: TreeKEM joins (`await_treekem`)
 /// converge once the TreeKEM group is installed, i.e. the Welcome carried by
 /// the join result has been processed. Non-TreeKEM joins have no key schedule
 /// to converge; they converge once the local roster lists the joiner as an
-/// active member, and poll for the longer
-/// `NON_TREEKEM_JOIN_RESULT_POLL_TIMEOUT` so a `MemberAdded` commit missed
-/// during the join window (e.g. a gossip connection dropping right after the
-/// join was accepted) is repaired instead of leaving the joiner permanently
-/// absent from its own roster and write-locked with a 403 (#297).
+/// active member, repairing a `MemberAdded` commit missed during the join
+/// window instead of leaving the joiner permanently absent from its own
+/// roster and write-locked with a 403 (#297). Both planes share the staged
+/// stores' 24h horizon (#390); the loop is re-armed after a daemon restart by
+/// `respawn_unconverged_join_polls`.
 async fn poll_join_result_until_membership_confirmed(
     state: Arc<AppState>,
     group_id: String,
@@ -19925,13 +19954,33 @@ async fn poll_join_result_until_membership_confirmed(
     member_agent_id: String,
     await_treekem: bool,
 ) {
-    let timeout = if await_treekem {
-        JOIN_RESULT_POLL_TIMEOUT
-    } else {
-        NON_TREEKEM_JOIN_RESULT_POLL_TIMEOUT
-    };
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = tokio::time::Instant::now() + JOIN_RESULT_POLL_HORIZON;
+    poll_join_result_until_deadline(
+        state,
+        group_id,
+        event_group_id,
+        inviter,
+        member_agent_id,
+        await_treekem,
+        deadline,
+    )
+    .await;
+}
+
+/// [`poll_join_result_until_membership_confirmed`] with an injectable
+/// deadline, so tests can drive the give-up path without the 24h horizon.
+#[allow(clippy::too_many_arguments)]
+async fn poll_join_result_until_deadline(
+    state: Arc<AppState>,
+    group_id: String,
+    event_group_id: String,
+    inviter: AgentId,
+    member_agent_id: String,
+    await_treekem: bool,
+    deadline: tokio::time::Instant,
+) {
     let expected_key = join_result_key(&event_group_id, &member_agent_id);
+    let mut attempt: u32 = 0;
     let mut timed_out = true;
     while tokio::time::Instant::now() < deadline {
         let confirmed = if await_treekem {
@@ -19997,12 +20046,18 @@ async fn poll_join_result_until_membership_confirmed(
                 payload_hash = %payload_hash,
             );
         }
-        tokio::time::sleep(JOIN_RESULT_POLL_INTERVAL).await;
+        tokio::time::sleep(join_result_poll_delay(attempt)).await;
+        attempt = attempt.saturating_add(1);
+    }
+    if timed_out {
+        // #390: leave the expected-inviter pin armed. It carries its own
+        // 24h TTL, and a result that lands after the horizon must still
+        // apply — clearing it here orphaned late deliveries as
+        // `missing_expected_inviter`.
+        tracing::warn!(group_id = %LogHexId::group(&group_id), member = %LogHexId::agent(&member_agent_id), await_treekem, "timed out polling authority for join result; membership remains unconfirmed");
+        return;
     }
     clear_expected_join_result_inviter(state.as_ref(), &expected_key);
-    if timed_out {
-        tracing::warn!(group_id = %LogHexId::group(&group_id), member = %LogHexId::agent(&member_agent_id), await_treekem, "timed out polling authority for join result; membership remains unconfirmed");
-    }
 }
 
 async fn stage_treekem_welcome(
@@ -20014,14 +20069,17 @@ async fn stage_treekem_welcome(
     let welcome_id = welcome_id_for_bytes(&bytes);
     let byte_len = bytes.len() as u64;
     let source = hex::encode(state.agent.agent_id().as_bytes());
+    let now_ms = now_millis_u64();
     let pending = PendingWelcome {
         group_id: group_id.to_string(),
         joiner_agent: joiner_agent.to_string(),
         bytes,
-        created_at: Instant::now(),
+        created_at_ms: now_ms,
     };
     let mut welcomes = state.pending_welcomes.write().await;
-    welcomes.retain(|_, pending| pending.created_at.elapsed() < PENDING_WELCOME_TTL);
+    welcomes.retain(|_, pending| {
+        staging_entry_fresh(pending.created_at_ms, PENDING_WELCOME_TTL, now_ms)
+    });
     welcomes.insert(welcome_id.clone(), pending);
     WelcomeRef {
         welcome_id,
@@ -20090,37 +20148,9 @@ async fn cleanup_welcome_fetch_state(state: &Arc<AppState>, welcome_id: &str) {
         .remove(welcome_id);
 }
 
-async fn fetch_treekem_welcome_with_retries(
-    state: &Arc<AppState>,
-    group_id: &str,
-    welcome_ref: &WelcomeRef,
-) -> std::result::Result<Vec<u8>, String> {
-    let mut last_error = None;
-    for (attempt, delay) in WELCOME_FETCH_RETRY_DELAYS.iter().enumerate() {
-        if !delay.is_zero() {
-            tokio::time::sleep(*delay).await;
-        }
-        match fetch_treekem_welcome(state, group_id, welcome_ref).await {
-            Ok(bytes) => return Ok(bytes),
-            Err(e) => {
-                tracing::warn!(
-                    target: "welcome.trace",
-                    stage = "fetch_retry_failed",
-                    group_id,
-                    welcome_id = %welcome_ref.welcome_id,
-                    attempt,
-                    next_delay_ms = ?WELCOME_FETCH_RETRY_DELAYS
-                        .get(attempt + 1)
-                        .map(|d| d.as_millis() as u64),
-                    error = %e,
-                );
-                last_error = Some(e);
-            }
-        }
-    }
-    Err(last_error.unwrap_or_else(|| "TreeKEM Welcome fetch did not run".to_string()))
-}
-
+/// #390: single bounded attempt — see [`WELCOME_FETCH_TIMEOUT`]. The caller
+/// holds the per-group membership guard inside the sequential join-result DM
+/// listener, so in-place retry ladders belong to the outer poll, never here.
 async fn fetch_treekem_welcome(
     state: &Arc<AppState>,
     group_id: &str,
@@ -20312,7 +20342,7 @@ async fn handle_welcome_fetch_request(
         tracing::warn!(welcome_id, "Welcome fetch for unknown blob");
         return;
     };
-    if pending.created_at.elapsed() >= PENDING_WELCOME_TTL {
+    if !staging_entry_fresh(pending.created_at_ms, PENDING_WELCOME_TTL, now_millis_u64()) {
         state.pending_welcomes.write().await.remove(&welcome_id);
         return;
     }
@@ -21357,6 +21387,52 @@ mod tests {
         assert!(
             expected_join_result_inviter(state.as_ref(), &expected_key).is_none(),
             "expected-inviter pin must be dropped when the repair poll stops"
+        );
+        Ok(())
+    }
+
+    /// Why: #390 — the poll's give-up used to clear the expected-inviter pin,
+    /// so a join result landing after the poll window was rejected as
+    /// `missing_expected_inviter` and the join stayed orphaned for good. A
+    /// timed-out poll must leave the pin armed; the pin's own 24h TTL bounds
+    /// its lifetime, and it authorizes nothing by itself.
+    #[tokio::test]
+    async fn timed_out_join_result_poll_leaves_expected_inviter_armed() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let (info, _owner_hex) = sole_owner_group();
+        let group_id = info.mls_group_id.clone();
+        let event_group_id = info.stable_group_id().to_string();
+        let joiner_hex = "bb".repeat(32);
+        let inviter = x0x::identity::AgentKeypair::generate()?.agent_id();
+        let expected_key = join_result_key(&event_group_id, &joiner_hex);
+        record_expected_join_result_inviter(
+            state.as_ref(),
+            expected_key.clone(),
+            hex::encode(inviter.as_bytes()),
+        );
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        // Deadline already elapsed: the loop body never runs and the poll
+        // gives up at once — the shortest reproduction of an exhausted
+        // horizon with the join still unconverged.
+        poll_join_result_until_deadline(
+            Arc::clone(&state),
+            group_id,
+            event_group_id,
+            inviter,
+            joiner_hex,
+            false,
+            tokio::time::Instant::now(),
+        )
+        .await;
+
+        assert!(
+            expected_join_result_inviter(state.as_ref(), &expected_key).is_some(),
+            "a timed-out poll must leave the pin armed for late join results"
         );
         Ok(())
     }
@@ -27618,7 +27694,7 @@ mod tests {
                 group_id: f.stable_group_id.clone(),
                 joiner_agent: f.peer_hex.clone(),
                 bytes: vec![1, 2, 3],
-                created_at: Instant::now(),
+                created_at_ms: now_millis_u64(),
             },
         );
 
@@ -29978,13 +30054,30 @@ mod tests {
     fn join_handshake_state_outlives_a_slow_counterparty() {
         // The other half of a join is often a phone that admits (or reads its
         // result) minutes-to-hours later. If either side's handshake state
-        // only lives as long as the joiner's active poll window, a late half
-        // orphans the join: the owner never re-stages for an already-active
-        // member, and the joiner rejects a result it no longer expects
-        // (`missing_expected_inviter`). Keep both retentions far above the
-        // poll window.
-        assert!(EXPECTED_JOIN_RESULT_INVITER_TTL >= JOIN_RESULT_POLL_TIMEOUT.saturating_mul(60));
-        assert!(PENDING_JOIN_RESULT_TTL >= JOIN_RESULT_POLL_TIMEOUT.saturating_mul(60));
+        // lived shorter than the poll horizon, a late half orphans the join:
+        // the owner never re-stages for an already-active member, and the
+        // joiner rejects a result it no longer expects
+        // (`missing_expected_inviter`). #390 pins all three to the same 24h
+        // horizon — including the Welcome blob, whose old 10-minute TTL was
+        // the orphaned-`welcome_ref` window.
+        assert!(EXPECTED_JOIN_RESULT_INVITER_TTL >= JOIN_RESULT_POLL_HORIZON);
+        assert!(PENDING_JOIN_RESULT_TTL >= JOIN_RESULT_POLL_HORIZON);
+        assert!(PENDING_WELCOME_TTL >= PENDING_JOIN_RESULT_TTL);
+    }
+
+    #[test]
+    fn join_result_poll_backoff_ramps_and_caps() {
+        // #390: the poll runs for a day, so its cadence must decay — 2s, 4s,
+        // 8s… — and cap at JOIN_RESULT_POLL_BACKOFF_CAP so a mesh recovery
+        // still converges within minutes. A shift past the cap must neither
+        // overflow nor shrink.
+        assert_eq!(join_result_poll_delay(0), Duration::from_secs(2));
+        assert_eq!(join_result_poll_delay(1), Duration::from_secs(4));
+        assert_eq!(join_result_poll_delay(2), Duration::from_secs(8));
+        assert_eq!(join_result_poll_delay(7), Duration::from_secs(256));
+        assert_eq!(join_result_poll_delay(8), JOIN_RESULT_POLL_BACKOFF_CAP);
+        assert_eq!(join_result_poll_delay(31), JOIN_RESULT_POLL_BACKOFF_CAP);
+        assert_eq!(join_result_poll_delay(u32::MAX), JOIN_RESULT_POLL_BACKOFF_CAP);
     }
 
     fn direct_send_test_request(agent_id: String, payload: String) -> DirectSendRequest {
