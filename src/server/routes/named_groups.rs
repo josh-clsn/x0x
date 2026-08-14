@@ -4416,7 +4416,7 @@ async fn request_treekem_catchup_for_gap(
         };
         if let Err(e) = state
             .agent
-            .send_direct_with_config(&peer, payload, direct_message_send_config())
+            .send_direct_with_config(&peer, payload, named_group_direct_delivery_config())
             .await
         {
             tracing::debug!(group_id = %group_id, peer = %peer_hex, "TreeKEM catch-up request failed: {e}");
@@ -5538,7 +5538,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         };
         if let Err(e) = state
             .agent
-            .send_direct_with_config(sender, payload, direct_message_send_config())
+            .send_direct_with_config(sender, payload, named_group_direct_delivery_config())
             .await
         {
             tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %sender_hex, "failed to send member-keyed TreeKEM catch-up response: {e}");
@@ -5611,7 +5611,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     };
     if let Err(e) = state
         .agent
-        .send_direct_with_config(sender, payload, direct_message_send_config())
+        .send_direct_with_config(sender, payload, named_group_direct_delivery_config())
         .await
     {
         tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %sender_hex, "failed to send TreeKEM catch-up response: {e}");
@@ -5828,7 +5828,7 @@ async fn request_treekem_catchup_page(state: &Arc<AppState>, group_id: &str, pee
     };
     if let Err(e) = state
         .agent
-        .send_direct_with_config(peer, payload, direct_message_send_config())
+        .send_direct_with_config(peer, payload, named_group_direct_delivery_config())
         .await
     {
         tracing::debug!(group_id = %group_id, peer = %hex::encode(peer.as_bytes()), "paged TreeKEM catch-up request failed: {e}");
@@ -5921,7 +5921,7 @@ async fn request_member_key_package_catchup(
         };
         if let Err(e) = state
             .agent
-            .send_direct_with_config(&peer, payload, direct_message_send_config())
+            .send_direct_with_config(&peer, payload, named_group_direct_delivery_config())
             .await
         {
             tracing::debug!(group_id = %group_id, member = %LogHexId::agent(&member_agent_id), peer = %candidate_hex, "member-keyed TreeKEM catch-up request failed: {e}");
