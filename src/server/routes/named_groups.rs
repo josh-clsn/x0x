@@ -10797,7 +10797,7 @@ pub(in crate::server) async fn join_group_via_invite(
                     state_for_poll,
                     group_id_for_poll,
                     event_group_id_for_poll,
-                    inviter,
+                    vec![inviter],
                     member_for_poll,
                     invite_is_treekem,
                 )
@@ -19345,6 +19345,45 @@ fn cap_staging_oldest_first<V>(map: &mut HashMap<String, V>, created_at_ms: impl
     }
 }
 
+/// #390 (cross-review): who a boot-time re-armed poll may ask for the
+/// staged join-result, or `None` when the group must not be polled at all.
+///
+/// Only the admin that authored the invite ever stages the join-result (the
+/// `local_is_inviter` gate in the `MemberJoined` apply arm), and after a
+/// restart the joiner no longer knows which admin that was — so EVERY
+/// active admin is polled (creator included). Only the true inviter holds
+/// the staged result and replies, and the receive path's author-delivered
+/// fallback plus the authority-commit verification still gate the reply, so
+/// a wrong guess can miss but never forge.
+///
+/// `None` for: a withdrawn tombstone; a group this agent is locally BANNED
+/// from (the Banned tombstone deliberately survives departure — re-polling
+/// the banning admin would be indefinite unwanted traffic and a liveness
+/// beacon to the party that removed us); and our own group (we are an
+/// authority, there is no counterparty).
+fn respawn_poll_targets(
+    info: &x0x::groups::GroupInfo,
+    self_agent: &AgentId,
+    self_hex: &str,
+) -> Option<Vec<AgentId>> {
+    if info.withdrawn || info.is_banned(self_hex) {
+        return None;
+    }
+    if info.creator == *self_agent {
+        return None;
+    }
+    let mut targets: Vec<AgentId> = info
+        .active_members()
+        .filter(|member| member.role.at_least(x0x::groups::GroupRole::Admin))
+        .filter_map(|member| parse_agent_id_hex(&member.agent_id).ok())
+        .filter(|id| id != self_agent)
+        .collect();
+    if !targets.contains(&info.creator) {
+        targets.push(info.creator);
+    }
+    Some(targets)
+}
+
 /// #390: on daemon start, re-arm the join-result poll for every locally
 /// known group whose join never converged before the previous shutdown — the
 /// poll task dies with the process and nothing else on the joiner
@@ -19353,12 +19392,9 @@ fn cap_staging_oldest_first<V>(map: &mut HashMap<String, V>, created_at_ms: impl
 /// Unconverged means: TreeKEM plane — the group is known but no TreeKEM
 /// state is installed under any alias (roster-listed-or-stubbed, keyless);
 /// GSS plane — the local roster does not list this agent (#297 repair case).
-/// The re-armed poll targets the group OWNER: the recorded inviter pin died
-/// with the previous process, the owner is the staging authority both
-/// delivery lanes serve from, and the receive path still runs the full
-/// inviter + authority-commit verification, so a wrong guess can reject but
-/// never forge. A group whose staged result no longer exists anywhere polls
-/// harmlessly at the backoff cap until the 24h horizon lapses.
+/// Poll targets and exclusions are [`respawn_poll_targets`]'s decision. A
+/// group whose staged result no longer exists anywhere polls harmlessly at
+/// the backoff cap until the 24h horizon lapses.
 ///
 /// Returns the re-armed group ids so startup logging and tests observe the
 /// decision without any network traffic.
@@ -19369,7 +19405,7 @@ pub(in crate::server) async fn respawn_unconverged_join_polls(state: Arc<AppStat
         group_id: String,
         mls_group_id: String,
         stable_group_id: String,
-        creator: AgentId,
+        targets: Vec<AgentId>,
         is_treekem: bool,
         self_in_roster: bool,
     }
@@ -19377,13 +19413,19 @@ pub(in crate::server) async fn respawn_unconverged_join_polls(state: Arc<AppStat
         let groups = state.named_groups.read().await;
         groups
             .iter()
-            .map(|(group_id, info)| Candidate {
-                group_id: group_id.clone(),
-                mls_group_id: info.mls_group_id.clone(),
-                stable_group_id: info.stable_group_id().to_string(),
-                creator: info.creator,
-                is_treekem: info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem,
-                self_in_roster: info.has_member(&self_hex),
+            .filter_map(|(group_id, info)| {
+                let targets = respawn_poll_targets(info, &self_agent, &self_hex)?;
+                if targets.is_empty() {
+                    return None;
+                }
+                Some(Candidate {
+                    group_id: group_id.clone(),
+                    mls_group_id: info.mls_group_id.clone(),
+                    stable_group_id: info.stable_group_id().to_string(),
+                    targets,
+                    is_treekem: info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem,
+                    self_in_roster: info.has_member(&self_hex),
+                })
             })
             .collect()
     };
@@ -19400,23 +19442,18 @@ pub(in crate::server) async fn respawn_unconverged_join_polls(state: Arc<AppStat
         if !unconverged {
             continue;
         }
-        // Our own group: we are the authority, there is no counterparty to
-        // poll.
-        if candidate.creator == self_agent {
-            continue;
-        }
-        let owner = candidate.creator;
         let poll_state = Arc::clone(&state);
         let poll_group = candidate.group_id.clone();
         let poll_event_group = candidate.stable_group_id;
         let poll_member = self_hex.clone();
         let await_treekem = candidate.is_treekem;
+        let targets = candidate.targets;
         tokio::spawn(async move {
             poll_join_result_until_membership_confirmed(
                 poll_state,
                 poll_group,
                 poll_event_group,
-                owner,
+                targets,
                 poll_member,
                 await_treekem,
             )
@@ -20188,7 +20225,7 @@ async fn poll_join_result_until_membership_confirmed(
     state: Arc<AppState>,
     group_id: String,
     event_group_id: String,
-    inviter: AgentId,
+    targets: Vec<AgentId>,
     member_agent_id: String,
     await_treekem: bool,
 ) {
@@ -20197,7 +20234,7 @@ async fn poll_join_result_until_membership_confirmed(
         state,
         group_id,
         event_group_id,
-        inviter,
+        targets,
         member_agent_id,
         await_treekem,
         deadline,
@@ -20207,12 +20244,17 @@ async fn poll_join_result_until_membership_confirmed(
 
 /// [`poll_join_result_until_membership_confirmed`] with an injectable
 /// deadline, so tests can drive the give-up path without the 24h horizon.
+/// `targets` is usually the single known inviter; a boot-time re-arm passes
+/// every active admin because only the (no-longer-known) inviter holds the
+/// staged result — non-holders ignore the fetch, so extra targets cost one
+/// small DM per tick and can never serve a wrong result past the receive
+/// path's verification.
 #[allow(clippy::too_many_arguments)]
 async fn poll_join_result_until_deadline(
     state: Arc<AppState>,
     group_id: String,
     event_group_id: String,
-    inviter: AgentId,
+    targets: Vec<AgentId>,
     member_agent_id: String,
     await_treekem: bool,
     deadline: tokio::time::Instant,
@@ -20254,35 +20296,38 @@ async fn poll_join_result_until_deadline(
             group_id = %group_id,
             event_group_id = %event_group_id,
             member = %member_agent_id,
+            targets = targets.len(),
             payload_len,
             payload_hash = %payload_hash,
         );
-        if let Err(e) = state
-            .agent
-            .send_direct_with_config(&inviter, payload, direct_message_send_config())
-            .await
-        {
-            tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch attempt failed: {e}");
-            tracing::debug!(
-                target: "treekem.trace",
-                stage = "fetch_request_send_err",
-                group_id = %group_id,
-                event_group_id = %event_group_id,
-                member = %member_agent_id,
-                payload_len,
-                payload_hash = %payload_hash,
-                error = %e,
-            );
-        } else {
-            tracing::debug!(
-                target: "treekem.trace",
-                stage = "fetch_request_send_ok",
-                group_id = %group_id,
-                event_group_id = %event_group_id,
-                member = %member_agent_id,
-                payload_len,
-                payload_hash = %payload_hash,
-            );
+        for target in &targets {
+            if let Err(e) = state
+                .agent
+                .send_direct_with_config(target, payload.clone(), direct_message_send_config())
+                .await
+            {
+                tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch attempt failed: {e}");
+                tracing::debug!(
+                    target: "treekem.trace",
+                    stage = "fetch_request_send_err",
+                    group_id = %group_id,
+                    event_group_id = %event_group_id,
+                    member = %member_agent_id,
+                    payload_len,
+                    payload_hash = %payload_hash,
+                    error = %e,
+                );
+            } else {
+                tracing::debug!(
+                    target: "treekem.trace",
+                    stage = "fetch_request_send_ok",
+                    group_id = %group_id,
+                    event_group_id = %event_group_id,
+                    member = %member_agent_id,
+                    payload_len,
+                    payload_hash = %payload_hash,
+                );
+            }
         }
         tokio::time::sleep(join_result_poll_delay(attempt)).await;
         attempt = attempt.saturating_add(1);
@@ -21591,7 +21636,7 @@ mod tests {
                 poll_state,
                 poll_group_id,
                 event_group_id,
-                inviter,
+                vec![inviter],
                 poll_member,
                 false,
             )
@@ -21666,7 +21711,7 @@ mod tests {
             Arc::clone(&state),
             group_id,
             event_group_id,
-            inviter,
+            vec![inviter],
             joiner_hex,
             false,
             tokio::time::Instant::now(),

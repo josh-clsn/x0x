@@ -222,6 +222,23 @@ async fn respawn_targets_only_unconverged_foreign_groups() -> Result<()> {
         x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
     );
     g3.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+    // G5: locally BANNED — the tombstone deliberately survives departure
+    // and both planes read as unconverged, but re-polling the banning admin
+    // is unwanted indefinite traffic. Must never be re-armed (cross-review
+    // finding 2).
+    let (mut g5, owner5_hex) = sole_owner_group();
+    g5.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+    g5.add_member(
+        self_hex.clone(),
+        x0x::groups::GroupRole::Member,
+        Some(owner5_hex.clone()),
+        None,
+    );
+    g5.ban_member(&self_hex, Some(owner5_hex));
+    // G6: withdrawn tombstone — the membership ended; nothing to repair.
+    let (mut g6, _o6) = sole_owner_group();
+    g6.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+    g6.withdrawn = true;
 
     {
         let mut groups = state.named_groups.write().await;
@@ -229,6 +246,8 @@ async fn respawn_targets_only_unconverged_foreign_groups() -> Result<()> {
         groups.insert("g2".to_string(), g2);
         groups.insert("g3".to_string(), g3);
         groups.insert("g4".to_string(), g4);
+        groups.insert("g5".to_string(), g5);
+        groups.insert("g6".to_string(), g6);
     }
 
     let mut respawned = respawn_unconverged_join_polls(Arc::clone(&state)).await;
@@ -236,7 +255,62 @@ async fn respawn_targets_only_unconverged_foreign_groups() -> Result<()> {
     assert_eq!(
         respawned,
         vec!["g1".to_string(), "g4".to_string()],
-        "only the unconverged foreign-owned groups get a re-armed poll"
+        "only the unconverged foreign-owned groups get a re-armed poll; \
+         own/converged/banned/withdrawn groups must all be skipped"
     );
+    Ok(())
+}
+
+/// Why (cross-review finding 1): only the admin that authored the invite
+/// stages the join-result, and after a restart the joiner no longer knows
+/// which admin that was — the creator alone is the WRONG target whenever
+/// the inviter was a different admin. The re-arm must therefore target
+/// every active admin (creator included), so the true inviter is always
+/// among the polled peers.
+#[tokio::test]
+async fn respawn_poll_targets_include_every_active_admin() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let self_agent = state.agent.agent_id();
+    let self_hex = hex::encode(self_agent.as_bytes());
+
+    let (mut info, creator_hex) = sole_owner_group();
+    info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+    // A second admin — the plausible actual inviter post-restart.
+    let admin_b = x0x::identity::AgentKeypair::generate()?.agent_id();
+    let admin_b_hex = hex::encode(admin_b.as_bytes());
+    info.add_member(
+        admin_b_hex.clone(),
+        x0x::groups::GroupRole::Admin,
+        Some(creator_hex.clone()),
+        None,
+    );
+    // A plain member must NOT be polled.
+    let member_c_hex = "dd".repeat(32);
+    info.add_member(
+        member_c_hex.clone(),
+        x0x::groups::GroupRole::Member,
+        Some(creator_hex.clone()),
+        None,
+    );
+
+    let targets = respawn_poll_targets(&info, &self_agent, &self_hex)
+        .expect("foreign unbanned group must yield poll targets");
+    let target_hexes: Vec<String> = targets
+        .iter()
+        .map(|id| hex::encode(id.as_bytes()))
+        .collect();
+    assert!(
+        target_hexes.contains(&admin_b_hex),
+        "the non-creator admin (the possible inviter) must be polled"
+    );
+    assert!(
+        target_hexes.contains(&creator_hex),
+        "the creator stays a target"
+    );
+    assert!(
+        !target_hexes.contains(&member_c_hex),
+        "plain members are never join-result authorities"
+    );
+    assert_eq!(targets.len(), 2, "no duplicate or extraneous targets");
     Ok(())
 }
