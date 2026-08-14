@@ -5468,6 +5468,13 @@ async fn member_keyed_treekem_catchup_response(
     request: &TreeKemCatchupRequest,
 ) -> Option<TreeKemCatchupResponse> {
     let target_member_id = request.target_member_id.as_ref()?;
+    // Cross-review hardening: never build (or sign) a response over an
+    // attacker-shaped target string — a valid agent id is 64 hex chars, and
+    // refusing anything else kills the partial signing oracle over the
+    // response's canonical input.
+    if parse_agent_id_hex(target_member_id).is_err() {
+        return None;
+    }
     let info = {
         let groups = state.named_groups.read().await;
         groups
@@ -5539,18 +5546,19 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     // key is self-certifying against the requester id, so this admits
     // exactly the sender-authenticity the transport flag would have. All
     // membership gates below still apply unchanged.
-    let member_keyed_signed_ok = match (&request.target_member_id, &request.signed_by) {
-        (Some(target), Some(signer)) => catchup_signer_matches(
-            signer,
-            &request.requester_agent_id,
-            &member_keyed_request_sign_input(
-                &request.group_id,
+    let member_keyed_signed_ok = !verified
+        && match (&request.target_member_id, &request.signed_by) {
+            (Some(target), Some(signer)) => catchup_signer_matches(
+                signer,
                 &request.requester_agent_id,
-                target,
+                &member_keyed_request_sign_input(
+                    &request.group_id,
+                    &request.requester_agent_id,
+                    target,
+                ),
             ),
-        ),
-        _ => false,
-    };
+            _ => false,
+        };
     if !verified && !member_keyed_signed_ok {
         return;
     }
@@ -5647,6 +5655,23 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     // non-departed target-of-cached-add). The requester authenticates the
     // package via the embedded ML-DSA-65 signature in
     // `apply_recovered_member_key_package`.
+    // Cross-review hardening: the member-keyed serve deliberately returns
+    // before the #378 page-serve throttle (multi-target recovery), which
+    // left replayed signed requests driving unthrottled serves. A
+    // per-(group, requester, target) entry closes that without starving
+    // multi-target heals; the requester's own send throttle is 5s too, so a
+    // legitimate retry is never blocked.
+    if let Some(target) = request.target_member_id.as_deref() {
+        let throttle_key = format!("{}:mk-serve:{}:{}", request.group_id, sender_hex, target);
+        let mut throttle = state.treekem_catchup_throttle.write().await;
+        if throttle
+            .get(&throttle_key)
+            .is_some_and(|last| last.elapsed() < TREEKEM_CATCHUP_THROTTLE)
+        {
+            return;
+        }
+        throttle.insert(throttle_key, Instant::now());
+    }
     if let Some(response) = member_keyed_treekem_catchup_response(state, &log_keys, &request).await
     {
         let payload = match serde_json::to_vec(&response) {
@@ -5848,21 +5873,22 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     // locally-anchored hash — an unverified-but-signed response is admitted
     // ONLY into that doubly-checked lane; the membership-event path keeps
     // requiring transport verification (#377).
-    let targeted_signed_ok = match (&response.target_member_id, &response.signed_by) {
-        (Some(target), Some(signer)) => {
-            let kp_hash_hex = response
-                .target_member_key_package_b64
-                .as_deref()
-                .map(|kp| blake3::hash(kp.as_bytes()).to_hex().to_string())
-                .unwrap_or_default();
-            catchup_signer_matches(
-                signer,
-                &hex::encode(sender.as_bytes()),
-                &member_keyed_response_sign_input(&response.group_id, target, &kp_hash_hex),
-            )
-        }
-        _ => false,
-    };
+    let targeted_signed_ok = !verified
+        && match (&response.target_member_id, &response.signed_by) {
+            (Some(target), Some(signer)) => {
+                let kp_hash_hex = response
+                    .target_member_key_package_b64
+                    .as_deref()
+                    .map(|kp| blake3::hash(kp.as_bytes()).to_hex().to_string())
+                    .unwrap_or_default();
+                catchup_signer_matches(
+                    signer,
+                    &hex::encode(sender.as_bytes()),
+                    &member_keyed_response_sign_input(&response.group_id, target, &kp_hash_hex),
+                )
+            }
+            _ => false,
+        };
     if !verified && !targeted_signed_ok {
         return;
     }

@@ -244,6 +244,152 @@ async fn targeted_response_carries_valid_signer() -> Result<()> {
     Ok(())
 }
 
+/// Build a valid signer over `input` for `kp`.
+fn signer_for(kp: &x0x::identity::AgentKeypair, input: &[u8]) -> CatchupSigner {
+    let signature =
+        ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(kp.secret_key(), input)
+            .expect("sign");
+    CatchupSigner {
+        public_key_b64: BASE64.encode(kp.public_key().as_bytes()),
+        signature_b64: BASE64.encode(signature.as_bytes()),
+    }
+}
+
+/// Request gate: an unverified-transport member-keyed request with a valid
+/// signer is admitted (observable: the member-keyed serve throttle entry is
+/// taken), while the same request without a signer is dropped at the gate.
+#[tokio::test]
+async fn request_gate_admits_signed_and_drops_unsigned_when_unverified() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let kp = x0x::identity::AgentKeypair::generate()?;
+    let creator = kp.agent_id();
+    let (info, creator_hex) = group_with_creator_kp(creator, Some(FAKE_KP_B64));
+    let group_id = info.mls_group_id.clone();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), info);
+
+    let target = "cc".repeat(32);
+    let mut request = TreeKemCatchupRequest {
+        message_type: "treekem_catchup_request".to_string(),
+        group_id: group_id.clone(),
+        requester_agent_id: creator_hex.clone(),
+        from_revision: 1,
+        from_treekem_epoch: 0,
+        current_state_hash: String::new(),
+        missing_prev_state_hash: None,
+        target_member_id: Some(target.clone()),
+        limit: 8,
+        signed_by: None,
+    };
+    handle_treekem_catchup_request(&state, &creator, false, request.clone()).await;
+    let throttle_key = format!("{group_id}:mk-serve:{creator_hex}:{target}");
+    assert!(
+        !state
+            .treekem_catchup_throttle
+            .read()
+            .await
+            .contains_key(&throttle_key),
+        "unsigned unverified request must be dropped before the serve lane"
+    );
+
+    request.signed_by = Some(signer_for(
+        &kp,
+        &member_keyed_request_sign_input(&group_id, &creator_hex, &target),
+    ));
+    handle_treekem_catchup_request(&state, &creator, false, request).await;
+    assert!(
+        state
+            .treekem_catchup_throttle
+            .read()
+            .await
+            .contains_key(&throttle_key),
+        "signed unverified request must reach the member-keyed serve lane"
+    );
+    Ok(())
+}
+
+/// Response gate: an unverified-transport targeted response with a valid
+/// signer is admitted into the hash-anchored KeyPackage apply — the full
+/// phone-side heal in miniature — and, per the #377 posture, leaves no
+/// trace of membership-event processing (`targeted_only` returns before
+/// the events loop; the pending-event queue stays empty).
+#[tokio::test]
+async fn response_gate_applies_signed_kp_without_touching_events() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let kp = x0x::identity::AgentKeypair::generate()?;
+    let creator = kp.agent_id();
+    let (mut info, creator_hex) = group_with_creator_kp(creator, None);
+    let anchor = blake3::hash(FAKE_KP_B64.as_bytes()).to_hex().to_string();
+    info.set_member_treekem_key_package_hash(&creator_hex, anchor);
+    let group_id = info.mls_group_id.clone();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), info);
+
+    let kp_hash = blake3::hash(FAKE_KP_B64.as_bytes()).to_hex().to_string();
+    let mut response = TreeKemCatchupResponse {
+        message_type: "treekem_catchup_response".to_string(),
+        group_id: group_id.clone(),
+        events: vec![NamedGroupMetadataEvent::GroupMetadataUpdated {
+            group_id: group_id.clone(),
+            revision: 99,
+            actor: creator_hex.clone(),
+            name: Some("hijacked".to_string()),
+            description: None,
+            commit: None,
+        }],
+        truncated: false,
+        target_member_id: Some(creator_hex.clone()),
+        target_member_key_package_b64: Some(FAKE_KP_B64.to_string()),
+        signed_by: None,
+    };
+
+    // Unsigned + unverified: dropped at the gate — nothing stored.
+    handle_treekem_catchup_response(&state, &creator, false, response.clone()).await;
+    {
+        let groups = state.named_groups.read().await;
+        assert!(
+            groups[&group_id].members_v2[&creator_hex]
+                .treekem_key_package_b64
+                .is_none(),
+            "unsigned unverified response must not store"
+        );
+    }
+
+    response.signed_by = Some(signer_for(
+        &kp,
+        &member_keyed_response_sign_input(&group_id, &creator_hex, &kp_hash),
+    ));
+    handle_treekem_catchup_response(&state, &creator, false, response).await;
+    let groups = state.named_groups.read().await;
+    assert_eq!(
+        groups[&group_id].members_v2[&creator_hex]
+            .treekem_key_package_b64
+            .as_deref(),
+        Some(FAKE_KP_B64),
+        "signed unverified response must reach the anchored apply"
+    );
+    assert_eq!(
+        groups[&group_id].name, "g398",
+        "membership events from an unverified transport must not apply"
+    );
+    assert!(
+        state
+            .treekem_pending_events
+            .read()
+            .await
+            .get(&group_id)
+            .is_none_or(|q| q.is_empty()),
+        "targeted-only handling must not queue events either"
+    );
+    Ok(())
+}
+
 /// A member with no local hash anchor is unverifiable — refuse rather than
 /// trust a bare peer-supplied package.
 #[tokio::test]
