@@ -229,9 +229,10 @@ async fn targeted_response_carries_valid_signer() -> Result<()> {
         limit: 8,
         signed_by: None,
     };
-    let response = member_keyed_treekem_catchup_response(&state, &[group_id.clone()], &request)
-        .await
-        .expect("response");
+    let response =
+        member_keyed_treekem_catchup_response(&state, std::slice::from_ref(&group_id), &request)
+            .await
+            .expect("response");
     let signer = response.signed_by.expect("targeted responses are signed");
     let responder_hex = hex::encode(state.agent.agent_id().as_bytes());
     let kp_hash = blake3::hash(FAKE_KP_B64.as_bytes()).to_hex().to_string();
