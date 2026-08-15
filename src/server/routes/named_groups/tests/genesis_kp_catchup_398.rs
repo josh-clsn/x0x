@@ -390,6 +390,50 @@ async fn response_gate_applies_signed_kp_without_touching_events() -> Result<()>
     Ok(())
 }
 
+/// The join-result wire's signer acceptance: a fetch signed by the member
+/// it names is admitted; wrong signer identity, wrong input binding, and
+/// unsigned messages are all refused — same matrix as the catch-up wire.
+#[tokio::test]
+async fn join_result_signer_matrix() -> Result<()> {
+    let kp = x0x::identity::AgentKeypair::generate()?;
+    let member_hex = hex::encode(kp.agent_id().as_bytes());
+
+    let signed_fetch = JoinResultMessage::FetchRequest {
+        group_id: "g".to_string(),
+        member_agent_id: member_hex.clone(),
+        signed_by: Some(signer_for(
+            &kp,
+            &join_result_fetch_sign_input("g", &member_hex),
+        )),
+    };
+    assert!(join_result_signed_ok(&signed_fetch, &member_hex));
+    assert!(
+        !join_result_signed_ok(&signed_fetch, &"ab".repeat(32)),
+        "signer must prove the transport-claimed sender"
+    );
+
+    let unsigned_fetch = JoinResultMessage::FetchRequest {
+        group_id: "g".to_string(),
+        member_agent_id: member_hex.clone(),
+        signed_by: None,
+    };
+    assert!(!join_result_signed_ok(&unsigned_fetch, &member_hex));
+
+    let cross_group = JoinResultMessage::FetchRequest {
+        group_id: "other".to_string(),
+        member_agent_id: member_hex.clone(),
+        signed_by: Some(signer_for(
+            &kp,
+            &join_result_fetch_sign_input("g", &member_hex),
+        )),
+    };
+    assert!(
+        !join_result_signed_ok(&cross_group, &member_hex),
+        "signature is bound to the group id"
+    );
+    Ok(())
+}
+
 /// A member with no local hash anchor is unverifiable — refuse rather than
 /// trust a bare peer-supplied package.
 #[tokio::test]

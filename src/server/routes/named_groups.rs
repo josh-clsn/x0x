@@ -735,10 +735,70 @@ pub(in crate::server) enum JoinResultMessage {
     FetchRequest {
         group_id: String,
         member_agent_id: String,
+        /// #398/#397: self-authenticating signer — a phone-embedded engine
+        /// has no discovery presence on fleet caches, so its raw-QUIC polls
+        /// arrive `verified == false` and were dropped at the gate, leaving
+        /// the joiner keyless forever. Same construction as
+        /// [`CatchupSigner`] on the catch-up wire. `#[serde(default)]`
+        /// keeps old peers parseable.
+        #[serde(default)]
+        signed_by: Option<CatchupSigner>,
     },
     Result {
         event: Box<NamedGroupMetadataEvent>,
+        /// #398/#397: the responder's counterpart signer. The event's real
+        /// authorization is its authority-signed commit (verified at
+        /// apply) plus the expected-inviter check; this signer only
+        /// restores the sender-authenticity the transport flag would have
+        /// carried.
+        #[serde(default)]
+        signed_by: Option<CatchupSigner>,
     },
+}
+
+/// Canonical signing input for a join-result fetch. NUL-joined with a
+/// versioned domain tag; hex ids cannot contain NUL, so it is injective.
+fn join_result_fetch_sign_input(group_id: &str, member: &str) -> Vec<u8> {
+    format!("x0x.treekem.join-result.fetch.v1\0{group_id}\0{member}").into_bytes()
+}
+
+/// Canonical signing input for a join-result result, binding which
+/// (group, member) join this result answers.
+fn join_result_result_sign_input(group_id: &str, member: &str) -> Vec<u8> {
+    format!("x0x.treekem.join-result.result.v1\0{group_id}\0{member}").into_bytes()
+}
+
+/// #398/#397: does `msg` carry a signer proving the transport-claimed
+/// `sender_hex` authored it? Mirrors the catch-up wire's alternative to
+/// transport verification; all authorization gates downstream are
+/// unchanged. Refuses (false) on unsigned messages and non-MemberAdded
+/// results.
+fn join_result_signed_ok(msg: &JoinResultMessage, sender_hex: &str) -> bool {
+    match msg {
+        JoinResultMessage::FetchRequest {
+            group_id,
+            member_agent_id,
+            signed_by: Some(signer),
+        } => catchup_signer_matches(
+            signer,
+            sender_hex,
+            &join_result_fetch_sign_input(group_id, member_agent_id),
+        ),
+        JoinResultMessage::Result {
+            event,
+            signed_by: Some(signer),
+        } => match event.as_ref() {
+            NamedGroupMetadataEvent::MemberAdded {
+                group_id, agent_id, ..
+            } => catchup_signer_matches(
+                signer,
+                sender_hex,
+                &join_result_result_sign_input(group_id, agent_id),
+            ),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 pub(in crate::server) fn named_group_metadata_event_kind(
@@ -20402,7 +20462,7 @@ pub(in crate::server) async fn handle_join_result_message(
     verified: bool,
     msg: JoinResultMessage,
 ) {
-    if !verified {
+    if !verified && !join_result_signed_ok(&msg, &hex::encode(sender.as_bytes())) {
         tracing::warn!(
             sender = %LogHexId::agent(&hex::encode(sender.as_bytes())),
             "ignoring join-result message from unverified sender"
@@ -20413,6 +20473,7 @@ pub(in crate::server) async fn handle_join_result_message(
         JoinResultMessage::FetchRequest {
             group_id,
             member_agent_id,
+            signed_by: _,
         } => {
             let sender_hex = hex::encode(sender.as_bytes());
             tracing::debug!(
@@ -20459,8 +20520,13 @@ pub(in crate::server) async fn handle_join_result_message(
                 event = named_group_metadata_event_kind(&event),
                 pending_count,
             );
+            let response_signer = build_catchup_signer(
+                state,
+                &join_result_result_sign_input(&group_id, &member_agent_id),
+            );
             let response = JoinResultMessage::Result {
                 event: Box::new(event),
+                signed_by: response_signer,
             };
             let payload = match serde_json::to_vec(&response) {
                 Ok(payload) => payload,
@@ -20505,7 +20571,10 @@ pub(in crate::server) async fn handle_join_result_message(
                 );
             }
         }
-        JoinResultMessage::Result { event } => {
+        JoinResultMessage::Result {
+            event,
+            signed_by: _,
+        } => {
             let event = *event;
             tracing::debug!(
                 target: "treekem.trace",
@@ -20644,6 +20713,10 @@ async fn poll_join_result_until_deadline(
         let request = JoinResultMessage::FetchRequest {
             group_id: event_group_id.clone(),
             member_agent_id: member_agent_id.clone(),
+            signed_by: build_catchup_signer(
+                &state,
+                &join_result_fetch_sign_input(&event_group_id, &member_agent_id),
+            ),
         };
         let payload = match serde_json::to_vec(&request) {
             Ok(payload) => payload,
@@ -26895,6 +26968,7 @@ mod tests {
         let request = JoinResultMessage::FetchRequest {
             group_id: "aa".repeat(32),
             member_agent_id: "bb".repeat(32),
+            signed_by: None,
         };
         let payload = serde_json::to_vec(&request);
         assert!(payload.is_ok(), "join-result fetch request serializes");
@@ -26923,6 +26997,7 @@ mod tests {
                 member_recovery_history: Vec::new(),
                 commit: None,
             }),
+            signed_by: None,
         };
         let result_payload = serde_json::to_vec(&result);
         assert!(result_payload.is_ok(), "join-result response serializes");

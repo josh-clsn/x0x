@@ -68,6 +68,7 @@ async fn join_result_fetch_request_requires_verified_sender() -> Result<()> {
     let fetch = JoinResultMessage::FetchRequest {
         group_id: group_id.to_string(),
         member_agent_id: local_hex.clone(),
+        signed_by: None,
     };
 
     // Unverified: the AgentId is attacker-chosen, so the member check is
