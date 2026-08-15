@@ -5675,15 +5675,44 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         }
         throttle.insert(throttle_key, Instant::now());
     }
-    if let Some(response) = member_keyed_treekem_catchup_response(state, &log_keys, &request).await
+    if let Some(mut response) =
+        member_keyed_treekem_catchup_response(state, &log_keys, &request).await
     {
-        let payload = match serde_json::to_vec(&response) {
+        let mut payload = match serde_json::to_vec(&response) {
             Ok(payload) => payload,
             Err(e) => {
                 tracing::warn!(group_id = %LogHexId::group(&request.group_id), "failed to serialize member-keyed TreeKEM catch-up response: {e}");
                 return;
             }
         };
+        // Cached event + roster fallback + signer together can exceed the DM
+        // payload cap (observed live: 57768 > 49152, which made the response
+        // unsendable and left the phone permanently 424ing). The roster
+        // fallback is the part every requester can use — the signer covers
+        // only (group, target, blake3(kp)), so dropping the event keeps the
+        // signature valid — while the event lane needs a transport-verified
+        // requester anyway, and those recover it from the next paged serve.
+        if payload.len() > x0x::dm::MAX_PAYLOAD_BYTES && !response.events.is_empty() {
+            let dropped = response.events.len();
+            response.events.clear();
+            response.truncated = true;
+            match serde_json::to_vec(&response) {
+                Ok(smaller) => {
+                    tracing::info!(
+                        group_id = %LogHexId::group(&request.group_id),
+                        requester = %sender_hex,
+                        dropped_events = dropped,
+                        bytes = smaller.len(),
+                        "#398: oversize targeted response — kept roster fallback, dropped cached events"
+                    );
+                    payload = smaller;
+                }
+                Err(e) => {
+                    tracing::warn!(group_id = %LogHexId::group(&request.group_id), "failed to re-serialize trimmed member-keyed TreeKEM catch-up response: {e}");
+                    return;
+                }
+            }
+        }
         if let Err(e) = state
             .agent
             .send_direct_with_config(sender, payload, named_group_direct_delivery_config())
