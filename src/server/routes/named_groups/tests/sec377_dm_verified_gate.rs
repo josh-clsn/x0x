@@ -158,3 +158,102 @@ async fn welcome_blob_offer_requires_verified_sender() -> Result<()> {
 
     Ok(())
 }
+
+/// The transport-verified bypass admits ONLY self-authenticating shapes.
+/// A phone-embedded engine has no discovery presence, so its events always
+/// arrive `verified=false`; shapes whose apply arms re-prove authorship
+/// cryptographically must reach those arms (a self-delivered original join,
+/// admin moderation with a signed state commit), and everything else must
+/// keep failing closed at the gate (#377).
+#[test]
+fn transport_verified_bypass_admits_only_self_authenticating_shapes() {
+    let dummy_commit = x0x::groups::GroupStateCommit {
+        group_id: "g".to_string(),
+        revision: 1,
+        prev_state_hash: None,
+        roster_root: String::new(),
+        policy_hash: String::new(),
+        public_meta_hash: String::new(),
+        security_binding: None,
+        state_hash: String::new(),
+        withdrawn: false,
+        committed_by: "aa".repeat(32),
+        committed_at: 1,
+        signer_public_key: String::new(),
+        signature: String::new(),
+    };
+    let member_joined = |recovery: Option<String>| NamedGroupMetadataEvent::MemberJoined {
+        group_id: "g".to_string(),
+        stable_group_id: None,
+        member_agent_id: "bb".repeat(32),
+        member_public_key_b64: String::new(),
+        role: x0x::groups::GroupRole::Member,
+        display_name: None,
+        inviter_agent_id: "aa".repeat(32),
+        invite_secret: "s".to_string(),
+        ts_ms: 1,
+        treekem_key_package_b64: None,
+        recovery_authority_agent_id: None,
+        recovery_authority_public_key_b64: None,
+        recovery_authority_signature_b64: recovery,
+        recovery_authority_commit: None,
+        signature_b64: String::new(),
+    };
+    assert!(metadata_event_bypasses_transport_verified(&member_joined(
+        None
+    )));
+    assert!(
+        !metadata_event_bypasses_transport_verified(&member_joined(Some("x".to_string()))),
+        "the recovery-courier shape trusts the transport sender claim and must stay gated"
+    );
+
+    let banned =
+        |commit: Option<x0x::groups::GroupStateCommit>| NamedGroupMetadataEvent::MemberBanned {
+            group_id: "g".to_string(),
+            revision: 1,
+            actor: "aa".repeat(32),
+            agent_id: "bb".repeat(32),
+            secret_epoch: None,
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            commit,
+        };
+    assert!(metadata_event_bypasses_transport_verified(&banned(Some(
+        dummy_commit.clone()
+    ))));
+    assert!(!metadata_event_bypasses_transport_verified(&banned(None)));
+
+    assert!(metadata_event_bypasses_transport_verified(
+        &NamedGroupMetadataEvent::MemberUnbanned {
+            group_id: "g".to_string(),
+            revision: 1,
+            actor: "aa".repeat(32),
+            agent_id: "bb".repeat(32),
+            commit: Some(dummy_commit.clone()),
+        }
+    ));
+    assert!(metadata_event_bypasses_transport_verified(
+        &NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: "g".to_string(),
+            revision: 1,
+            actor: "aa".repeat(32),
+            agent_id: "bb".repeat(32),
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(dummy_commit),
+        }
+    ));
+
+    assert!(
+        !metadata_event_bypasses_transport_verified(
+            &NamedGroupMetadataEvent::GroupMetadataUpdated {
+                group_id: "g".to_string(),
+                revision: 1,
+                actor: "aa".repeat(32),
+                name: Some("x".to_string()),
+                description: None,
+                commit: None,
+            }
+        ),
+        "non-self-authenticating events keep the #377 fail-closed gate"
+    );
+}

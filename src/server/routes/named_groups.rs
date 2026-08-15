@@ -6255,6 +6255,36 @@ fn metadata_event_readmits_local(event: &NamedGroupMetadataEvent, local_agent_he
     }
 }
 
+/// Event shapes whose apply arms are fully self-authenticating, so the racy
+/// transport `verified` annotation (AgentId→MachineId discovery-cache binding)
+/// may be skipped. Every shape here re-proves authorship cryptographically
+/// inside its arm; see the block comment at the gate for the per-shape
+/// arguments. Everything else fails closed on `verified` (#377).
+fn metadata_event_bypasses_transport_verified(event: &NamedGroupMetadataEvent) -> bool {
+    matches!(
+        event,
+        NamedGroupMetadataEvent::GroupDeleted {
+            commit: Some(_),
+            ..
+        } | NamedGroupMetadataEvent::MemberRemoved {
+            commit: Some(_),
+            ..
+        } | NamedGroupMetadataEvent::MemberJoined {
+            recovery_authority_signature_b64: None,
+            ..
+        } | NamedGroupMetadataEvent::MemberBanned {
+            commit: Some(_),
+            ..
+        } | NamedGroupMetadataEvent::MemberUnbanned {
+            commit: Some(_),
+            ..
+        } | NamedGroupMetadataEvent::MemberRoleUpdated {
+            commit: Some(_),
+            ..
+        }
+    )
+}
+
 pub(in crate::server) async fn apply_named_group_metadata_event(
     state: &Arc<AppState>,
     event: NamedGroupMetadataEvent,
@@ -6447,16 +6477,25 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
     // DM `sender_hex` is reliable regardless of the cache, so bypassing
     // `verified` does not weaken membership authorization — only the racy cache
     // annotation is skipped.
-    let bypass_verified = matches!(
-        event,
-        NamedGroupMetadataEvent::GroupDeleted {
-            commit: Some(_),
-            ..
-        } | NamedGroupMetadataEvent::MemberRemoved {
-            commit: Some(_),
-            ..
-        }
-    );
+    // The additional bypass shapes below are equally self-authenticating, and
+    // they are the lanes a phone-embedded engine (no discovery presence, so
+    // never `verified`) needs when its gossip mesh is unhealthy and events
+    // arrive over direct/bridged delivery instead:
+    // - `MemberJoined` without a recovery attestation is the self-delivered
+    //   original join: the arm requires sender == member, verifies the
+    //   joiner's ML-DSA signature over the canonical bytes (which include the
+    //   invite secret), and requires the AgentId derived from the embedded
+    //   public key to equal the claimed member — so a valid event proves the
+    //   transport sender holds the member's key and the invite. The
+    //   recovery-courier shape (attestation present) keeps requiring
+    //   `verified`: its sender-is-active-member check trusts the transport
+    //   sender claim.
+    // - `MemberBanned` / `MemberUnbanned` / `MemberRoleUpdated` with a commit
+    //   are admin actions: the arms require actor == sender with an
+    //   Admin-or-higher role in the LOCAL roster and validate the signed
+    //   state commit via `apply_stateful_event_to_group`, whose
+    //   revision-anchored chain also refuses replays of stale commits.
+    let bypass_verified = metadata_event_bypasses_transport_verified(&event);
     if !verified && !bypass_verified {
         tracing::debug!(
             target: "treekem.trace",
