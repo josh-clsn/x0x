@@ -16879,9 +16879,26 @@ fn treekem_snapshot_envelope_matches_info(
     envelope: &TreeKemSnapshotEnvelope,
     info: &x0x::groups::GroupInfo,
 ) -> bool {
-    envelope.state_revision == info.state_revision
-        && envelope.state_hash == info.state_hash
-        && envelope.security_binding == info.security_binding
+    // `security_binding` (the TreeKEM/MLS epoch) is the crypto-relevant seal.
+    // There is exactly one snapshot file per group, overwritten in place on
+    // every crypto operation (including per-message ratchet re-seals), so the
+    // on-disk snapshot is always the freshest tree for the group — the epoch is
+    // NOT a fine-grained tree hash, it is a rekey counter. A matching epoch
+    // therefore confirms no rekey advanced `info` past what the snapshot last
+    // captured; a rekey persisted to `info` without re-sealing the snapshot
+    // leaves the epochs unequal and is still refused here.
+    //
+    // `state_revision`/`state_hash` are metadata-plane commitments that advance
+    // for roster-only governance (role changes, ban/unban tombstones) which
+    // never touch the TreeKEM tree, so the snapshot is legitimately not
+    // re-sealed for them. Requiring exact equality there bricked groups on
+    // restart after any such governance action (#399) — the snapshot read
+    // "behind" the metadata and the group refused to load. Only refuse a
+    // snapshot that is *ahead* of the durable metadata; the metadata may lead
+    // the last-sealed snapshot, but a snapshot ahead of it signals a
+    // rolled-back / inconsistent named-groups record.
+    envelope.security_binding == info.security_binding
+        && envelope.state_revision <= info.state_revision
 }
 
 async fn persist_treekem_snapshot_bytes(
@@ -26208,7 +26225,7 @@ mod tests {
     }
 
     #[test]
-    fn treekem_snapshot_envelope_binding_detects_mismatch() {
+    fn treekem_snapshot_envelope_binding_tracks_epoch_not_roster_metadata() {
         let mut info = x0x::groups::GroupInfo::with_policy(
             "secure".to_string(),
             String::new(),
@@ -26220,17 +26237,53 @@ mod tests {
         info.state_revision = 7;
         info.state_hash = "hash-a".to_string();
         info.security_binding = Some("treekem:epoch=3".to_string());
+        // The snapshot was sealed when the group was at revision 7 / epoch 3.
         let envelope = TreeKemSnapshotEnvelope {
             version: TREEKEM_DAEMON_SNAPSHOT_VERSION,
-            state_revision: info.state_revision,
-            state_hash: info.state_hash.clone(),
-            security_binding: info.security_binding.clone(),
+            state_revision: 7,
+            state_hash: "hash-a".to_string(),
+            security_binding: Some("treekem:epoch=3".to_string()),
             snapshot: b"snapshot".to_vec(),
         };
         assert!(treekem_snapshot_envelope_matches_info(&envelope, &info));
 
+        // #399: a roster-only governance action (role change, ban/unban
+        // tombstone) advances `state_revision` + `state_hash` on the
+        // named-group info but never touches the TreeKEM tree, so the snapshot
+        // is not re-sealed. The epoch is unchanged, so the snapshot is still
+        // the correct tree and MUST restore — the old exact-equality check
+        // bricked the group here, refusing to load it after any governance
+        // action until it was manually repaired.
+        info.state_revision = 9;
         info.state_hash = "hash-b".to_string();
-        assert!(!treekem_snapshot_envelope_matches_info(&envelope, &info));
+        assert!(
+            treekem_snapshot_envelope_matches_info(&envelope, &info),
+            "#399: roster-only metadata advance must not brick snapshot restore"
+        );
+
+        // A crypto rekey advanced the epoch on the info without re-sealing the
+        // snapshot: the tree is genuinely stale and MUST still be refused.
+        let mut rekeyed = info.clone();
+        rekeyed.security_binding = Some("treekem:epoch=4".to_string());
+        assert!(
+            !treekem_snapshot_envelope_matches_info(&envelope, &rekeyed),
+            "epoch divergence must still refuse a crypto-stale snapshot"
+        );
+
+        // A snapshot AHEAD of the durable metadata (same epoch, higher
+        // revision) signals a rolled-back / inconsistent named_groups.json and
+        // is refused defensively.
+        let ahead = TreeKemSnapshotEnvelope {
+            version: TREEKEM_DAEMON_SNAPSHOT_VERSION,
+            state_revision: info.state_revision + 1,
+            state_hash: "hash-b".to_string(),
+            security_binding: Some("treekem:epoch=3".to_string()),
+            snapshot: b"snapshot".to_vec(),
+        };
+        assert!(
+            !treekem_snapshot_envelope_matches_info(&ahead, &info),
+            "a snapshot ahead of the durable metadata must be refused"
+        );
     }
 
     #[test]
