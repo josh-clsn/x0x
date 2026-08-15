@@ -431,6 +431,49 @@ async fn join_result_signer_matrix() -> Result<()> {
         !join_result_signed_ok(&cross_group, &member_hex),
         "signature is bound to the group id"
     );
+
+    let member_added = NamedGroupMetadataEvent::MemberAdded {
+        group_id: "g".to_string(),
+        revision: 1,
+        actor: "11".repeat(32),
+        agent_id: member_hex.clone(),
+        display_name: None,
+        treekem_commit_b64: None,
+        treekem_welcome_b64: None,
+        welcome_ref: None,
+        treekem_epoch: None,
+        treekem_key_package_hash: None,
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
+        commit: None,
+    };
+    let signed_result = JoinResultMessage::Result {
+        event: Box::new(member_added),
+        signed_by: Some(signer_for(
+            &kp,
+            &join_result_result_sign_input("g", &member_hex),
+        )),
+    };
+    assert!(join_result_signed_ok(&signed_result, &member_hex));
+
+    let non_member_added = JoinResultMessage::Result {
+        event: Box::new(NamedGroupMetadataEvent::GroupMetadataUpdated {
+            group_id: "g".to_string(),
+            revision: 1,
+            actor: member_hex.clone(),
+            name: Some("x".to_string()),
+            description: None,
+            commit: None,
+        }),
+        signed_by: Some(signer_for(
+            &kp,
+            &join_result_result_sign_input("g", &member_hex),
+        )),
+    };
+    assert!(
+        !join_result_signed_ok(&non_member_added, &member_hex),
+        "only MemberAdded results are signable — other events must ride the verified path"
+    );
     Ok(())
 }
 

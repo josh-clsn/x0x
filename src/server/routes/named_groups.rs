@@ -20487,6 +20487,22 @@ pub(in crate::server) async fn handle_join_result_message(
                 tracing::warn!(group_id = %LogHexId::group(&group_id), sender = %LogHexId::agent(&sender_hex), member = %LogHexId::agent(&member_agent_id), "ignoring unauthorized join-result fetch");
                 return;
             }
+            // Signed fetches are replayable for the staging TTL, and the serve
+            // pays an ML-DSA sign plus a locked staging sweep per request. The
+            // per-(group, member) entry mirrors the mk-serve throttle; the
+            // joiner's poll backoff is coarser than the window, so a
+            // legitimate retry is never blocked.
+            let throttle_key = format!("{group_id}:jr-serve:{sender_hex}");
+            {
+                let mut throttle = state.treekem_catchup_throttle.write().await;
+                if throttle
+                    .get(&throttle_key)
+                    .is_some_and(|last| last.elapsed() < TREEKEM_CATCHUP_THROTTLE)
+                {
+                    return;
+                }
+                throttle.insert(throttle_key, Instant::now());
+            }
             let key = join_result_key(&group_id, &member_agent_id);
             let (event, pending_count) = {
                 let now_ms = now_millis_u64();
