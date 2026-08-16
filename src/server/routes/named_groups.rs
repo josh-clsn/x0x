@@ -426,6 +426,16 @@ pub(in crate::server) struct WelcomeRef {
 pub(in crate::server) struct PendingJoinResult {
     event: NamedGroupMetadataEvent,
     created_at_ms: u64,
+    /// When the owner positively observed this join-result reaching the
+    /// joiner (an acked direct send, or a completed inline/bridged
+    /// serve). `None` = never delivered — the owner-side truth behind the
+    /// members endpoint's `pending_welcome` flag: a staged-but-undelivered
+    /// joiner must render as "joining…", never as a silently keyless full
+    /// member (family-smoke find 2026-08-16). `serde(default)` keeps
+    /// pre-field sidecars loading (they read as undelivered and clear on
+    /// the entry's own TTL at worst).
+    #[serde(default)]
+    delivered_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -9530,7 +9540,43 @@ pub(in crate::server) async fn get_named_group_members(
     let Some(info) = groups.get(&id) else {
         return not_found("group not found");
     };
-    let members = named_group_member_values(info);
+    let mut members = named_group_member_values(info);
+    let stable = info.stable_group_id().to_string();
+    drop(groups);
+    // `pending_welcome`: a member whose staged join-result was never
+    // positively delivered is keyless and mute no matter what the roster
+    // says — the shell must render "joining…", not a full member row
+    // (family-smoke find 2026-08-16).
+    {
+        let member_ids: Vec<String> = members
+            .iter()
+            .filter_map(|m| {
+                m.get("agent_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            })
+            .collect();
+        let member_refs: Vec<&str> = member_ids.iter().map(String::as_str).collect();
+        let results = state.pending_join_results.read().await;
+        let pending = pending_welcome_member_set(
+            &results,
+            &[id.as_str(), stable.as_str()],
+            &member_refs,
+            now_millis_u64(),
+        );
+        for m in &mut members {
+            let agent = m
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            if let (Some(obj), Some(agent)) = (m.as_object_mut(), agent) {
+                obj.insert(
+                    "pending_welcome".to_string(),
+                    serde_json::Value::Bool(pending.contains(&agent)),
+                );
+            }
+        }
+    }
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -20000,6 +20046,50 @@ fn join_result_key(group_id: &str, member_agent_id: &str) -> String {
     format!("{group_id}:{member_agent_id}")
 }
 
+/// The members of a group whose staged join-result exists, is fresh, and
+/// has never been positively delivered — the set the members endpoint
+/// surfaces as `pending_welcome` so a shell can render "joining…" instead
+/// of a silently keyless full member. `group_keys` carries every id the
+/// staging may have keyed under (canonical + stable alias).
+fn pending_welcome_member_set(
+    results: &HashMap<String, PendingJoinResult>,
+    group_keys: &[&str],
+    member_agent_ids: &[&str],
+    now_ms: u64,
+) -> std::collections::HashSet<String> {
+    let mut pending = std::collections::HashSet::new();
+    for member in member_agent_ids {
+        for gk in group_keys {
+            if let Some(entry) = results.get(&join_result_key(gk, member)) {
+                if entry.delivered_at_ms.is_none()
+                    && staging_entry_fresh(entry.created_at_ms, PENDING_JOIN_RESULT_TTL, now_ms)
+                {
+                    pending.insert((*member).to_string());
+                    break;
+                }
+            }
+        }
+    }
+    pending
+}
+
+/// Mark the staged join-result under `key` positively delivered (an acked
+/// direct send, or a completed inline/bridged serve) and persist the
+/// sidecar, so `pending_welcome` clears for that member. Idempotent; a
+/// missing or already-stamped entry writes nothing.
+async fn mark_join_result_delivered(state: &AppState, key: &str) {
+    {
+        let mut results = state.pending_join_results.write().await;
+        match results.get_mut(key) {
+            Some(p) if p.delivered_at_ms.is_none() => {
+                p.delivered_at_ms = Some(now_millis_u64());
+            }
+            _ => return,
+        }
+    }
+    persist_join_result_staging(state).await;
+}
+
 fn validate_join_result_inviter(
     expected_inviter: Option<&str>,
     sender_hex: &str,
@@ -20250,6 +20340,10 @@ pub(in crate::server) async fn get_join_result_inline(
         };
         set_inline_welcome(&mut event, BASE64.encode(bytes));
     }
+    // A completed inline serve is a positive delivery observation (the
+    // bridged fetch is joiner-driven and relay-acked): clear the member's
+    // pending_welcome.
+    mark_join_result_delivered(&state, &key).await;
     (
         StatusCode::OK,
         Json(serde_json::json!({ "ok": true, "event": event })),
@@ -20479,6 +20573,7 @@ async fn stage_join_result(
         PendingJoinResult {
             event,
             created_at_ms: now_ms,
+            delivered_at_ms: None,
         },
     );
     let pending_count = results.len();
@@ -20641,6 +20736,9 @@ pub(in crate::server) async fn handle_join_result_message(
                     payload_len,
                     payload_hash = %payload_hash,
                 );
+                // The send only reports Ok on a recipient ACK, so this is
+                // a positive delivery: clear the member's pending_welcome.
+                mark_join_result_delivered(state, &key).await;
             }
         }
         JoinResultMessage::Result {
@@ -26222,6 +26320,104 @@ mod tests {
             snapshot: b"snapshot".to_vec(),
         })?);
         Ok(bytes)
+    }
+
+    /// `pending_welcome` truth (family-smoke find 2026-08-16): a joiner
+    /// whose staged join-result was never positively delivered sat in the
+    /// owner's roster as a full "active" member while being keyless and
+    /// mute — the owner had NO signal. The members endpoint now flags
+    /// exactly the staged-fresh-undelivered set; delivered or TTL-stale
+    /// entries clear the flag.
+    #[test]
+    fn pending_welcome_flags_only_staged_fresh_undelivered_members() {
+        fn staged(delivered: Option<u64>, created_at_ms: u64) -> PendingJoinResult {
+            PendingJoinResult {
+                event: NamedGroupMetadataEvent::GroupDeleted {
+                    group_id: "g".into(),
+                    revision: 1,
+                    actor: "a".repeat(64),
+                    commit: None,
+                },
+                created_at_ms,
+                delivered_at_ms: delivered,
+            }
+        }
+        let now: u64 = 100_000_000;
+        let gid = "11".repeat(32);
+        let stable = "22".repeat(32);
+        let undelivered = "aa".repeat(32);
+        let delivered = "bb".repeat(32);
+        let stale = "cc".repeat(32);
+        let keyless_via_alias = "dd".repeat(32);
+        let never_staged = "ee".repeat(32);
+        let mut results = HashMap::new();
+        results.insert(
+            join_result_key(&gid, &undelivered),
+            staged(None, now - 5_000),
+        );
+        results.insert(
+            join_result_key(&gid, &delivered),
+            staged(Some(now - 1_000), now - 5_000),
+        );
+        results.insert(
+            join_result_key(&gid, &stale),
+            staged(None, now - PENDING_JOIN_RESULT_TTL.as_millis() as u64 - 1),
+        );
+        // Staged under the group's OTHER alias (stable vs mls id).
+        results.insert(
+            join_result_key(&stable, &keyless_via_alias),
+            staged(None, now - 5_000),
+        );
+
+        let members = [
+            undelivered.as_str(),
+            delivered.as_str(),
+            stale.as_str(),
+            keyless_via_alias.as_str(),
+            never_staged.as_str(),
+        ];
+        let set =
+            pending_welcome_member_set(&results, &[gid.as_str(), stable.as_str()], &members, now);
+        assert!(set.contains(&undelivered), "staged+fresh+undelivered flags");
+        assert!(
+            set.contains(&keyless_via_alias),
+            "alias-keyed staging flags"
+        );
+        assert!(!set.contains(&delivered), "positively delivered clears");
+        assert!(!set.contains(&stale), "TTL-stale staging clears");
+        assert!(!set.contains(&never_staged), "never staged never flags");
+    }
+
+    /// Sidecar back-compat: entries persisted before `delivered_at_ms`
+    /// existed must deserialize as undelivered rather than fail the whole
+    /// sidecar load.
+    #[test]
+    fn pending_join_result_sidecar_backcompat_defaults_undelivered() {
+        let old = r#"{"event":{"kind":"group_deleted","group_id":"g","revision":1,"actor":"a"},"created_at_ms":7}"#;
+        let parsed: std::result::Result<PendingJoinResult, _> = serde_json::from_str(old);
+        if let Ok(p) = parsed {
+            assert_eq!(p.delivered_at_ms, None);
+            assert_eq!(p.created_at_ms, 7);
+        } else {
+            // The event enum's serde shape may not match this literal —
+            // round-trip instead: serialize a current entry, strip the new
+            // field, re-parse.
+            let entry = PendingJoinResult {
+                event: NamedGroupMetadataEvent::GroupDeleted {
+                    group_id: "g".into(),
+                    revision: 1,
+                    actor: "a".repeat(64),
+                    commit: None,
+                },
+                created_at_ms: 7,
+                delivered_at_ms: Some(9),
+            };
+            let mut v = serde_json::to_value(&entry).unwrap();
+            v.as_object_mut().unwrap().remove("delivered_at_ms");
+            let p: PendingJoinResult = serde_json::from_value(v).unwrap();
+            assert_eq!(p.delivered_at_ms, None);
+            assert_eq!(p.created_at_ms, 7);
+        }
     }
 
     #[test]

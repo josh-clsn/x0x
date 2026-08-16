@@ -112,6 +112,7 @@ async fn expired_staging_entries_are_not_restored() -> Result<()> {
     let entry = |created_at_ms: u64| PendingJoinResult {
         event: member_added_with_welcome_ref("g", &member_hex, &inviter_hex, None),
         created_at_ms,
+        delivered_at_ms: None,
     };
     let welcome = |created_at_ms: u64| PendingWelcome {
         group_id: "g".to_string(),
