@@ -89,8 +89,10 @@ pub async fn mesh_join(client: &DaemonClient) -> Result<()> {
 
 /// `x0x mesh quiesce` — POST /mesh/quiesce
 ///
-/// Disconnects every mesh peer without stopping the daemon. Prints the
-/// number of peers disconnected.
+/// Disconnects every mesh peer without stopping the daemon and LATCHES
+/// the mesh off: inbound connections are rejected, gossip-plane sends
+/// are dropped, and reappearing peers are re-swept until `x0x mesh join`
+/// lifts the latch. Prints the number of peers disconnected.
 pub async fn mesh_quiesce(client: &DaemonClient) -> Result<()> {
     client.ensure_running().await?;
     let resp = client.post_empty("/mesh/quiesce").await?;

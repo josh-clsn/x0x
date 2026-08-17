@@ -218,7 +218,7 @@ Notes:
 | GET | `/network/status` | `x0x network status` | NAT and connectivity diagnostics |
 | GET | `/network/bootstrap-cache` | `x0x network cache` | Bootstrap cache stats |
 | POST | `/mesh/join` | `x0x mesh join` | Dial the gossip mesh (bootstrap phases); returns immediately with `status: "dialing"` |
-| POST | `/mesh/quiesce` | `x0x mesh quiesce` | Disconnect all mesh peers without stopping the daemon; returns `disconnected` count |
+| POST | `/mesh/quiesce` | `x0x mesh quiesce` | Disconnect all mesh peers and latch the mesh off (inbound rejected, gossip sends dropped, reappearing peers re-swept) until `/mesh/join`; returns `disconnected` count |
 | GET | `/peers/:peer_id/health` | `x0x peer health <peer_id>` | Connection health snapshot for a peer |
 | POST | `/peers/:peer_id/probe` | `x0x peer probe <peer_id>` | Active `probe_peer` liveness + RTT check |
 | GET | `/peers/events` | `x0x peer events` | SSE stream of peer lifecycle events |

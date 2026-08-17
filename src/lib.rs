@@ -6990,10 +6990,40 @@ impl Agent {
     /// If the agent was not configured with a network, this method
     /// succeeds gracefully (nothing to dial).
     pub async fn dial_bootstrap(&self) -> error::Result<()> {
+        // For a direct caller, "request time" is entry time.
+        let epoch = self.mesh_transition_epoch();
+        self.dial_bootstrap_superseding(epoch).await
+    }
+
+    /// [`dial_bootstrap`](Agent::dial_bootstrap) with an explicit request
+    /// time: `requested_at_epoch` is the [`Agent::mesh_transition_epoch`]
+    /// captured when the mesh-on command was issued. If a quiesce
+    /// transitioned after that capture, the quiesce wins — the dial is
+    /// skipped and the latch stays held. Lets the spawned `/mesh/join`
+    /// task carry its issue time across the spawn boundary, so a stale
+    /// join can never silently undo a newer mesh-off on a metered link.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`dial_bootstrap`](Agent::dial_bootstrap)'s errors; a
+    /// superseded dial is `Ok(())`.
+    pub async fn dial_bootstrap_superseding(&self, requested_at_epoch: u64) -> error::Result<()> {
         let Some(network) = self.network.as_ref() else {
             tracing::debug!("dial_bootstrap called but no network configured");
             return Ok(());
         };
+
+        // Mesh-on: lift the quiesce latch first so the accept loop and the
+        // gossip transport are open by the time bootstrap peers connect —
+        // unless a newer quiesce owns the state, in which case this
+        // command is stale and must not dial.
+        if !network.unlatch_mesh_if_current(requested_at_epoch) {
+            tracing::info!(
+                requested_at_epoch,
+                "dial_bootstrap superseded by a newer mesh quiesce; staying latched"
+            );
+            return Ok(());
+        }
 
         let bootstrap_nodes = network.config().bootstrap_nodes.clone();
 
@@ -7302,8 +7332,9 @@ impl Agent {
         Ok(())
     }
 
-    /// Disconnect every connected mesh peer without stopping anything —
-    /// mesh-off for embedders.
+    /// Mesh-off for embedders: latch the network quiesced, disconnect every
+    /// connected mesh peer, and keep it that way until
+    /// [`dial_bootstrap`](Agent::dial_bootstrap) lifts the latch.
     ///
     /// The fetch>it mobile shell used to flip mesh mode by tearing down and
     /// re-serving the in-process daemon. saorsa-gossip-pubsub 0.5.67 spawns
@@ -7311,15 +7342,25 @@ impl Agent {
     /// instance left pubsub tasks hot-looping "ANTI_ENTROPY per-peer send
     /// failed: node not initialized" (~1000/sec), starving the app. Here the
     /// daemon, gossip runtime, and pubsub tasks all stay up — no
-    /// orphaned-task corpse is possible — and mesh-off is expressed purely
-    /// at the connection layer:
+    /// orphaned-task corpse is possible — and mesh-off is enforced as a
+    /// *state* at the network layer (a one-shot sweep alone proved
+    /// insufficient: the overlay redialed the phone back into the mesh
+    /// within minutes — the Aug 2026 metered-data burn):
     ///
+    /// - the quiesce latch makes the accept loop reject every inbound
+    ///   connection and the gossip transport drop every gossip-plane frame
+    ///   (SWIM, shuffles, presence beacons, identity announces,
+    ///   anti-entropy) — see `NetworkNode::set_mesh_quiesced`;
     /// - [`network::DisconnectReason::Admin`] writes a bounded (120 s)
     ///   reconnect-suppression tombstone, so the peer-lifecycle listeners do
     ///   not immediately redial the swept peers;
+    /// - a tracked re-sweep task disconnects any peer that reappears (e.g.
+    ///   via a demand dial) every [`QUIESCE_RESWEEP_SECS`] while the latch
+    ///   holds, which also keeps the swept peers' tombstones fresh;
     /// - leaf-mode gates already stop announcement and proactive redials;
-    /// - contacts still return via explicit demand (per-send dials), and a
-    ///   full re-join is one [`dial_bootstrap`](Agent::dial_bootstrap) away.
+    /// - contacts still return via explicit demand (per-send dials — the DM
+    ///   plane is not gated), and a full re-join is one
+    ///   [`dial_bootstrap`](Agent::dial_bootstrap) away.
     ///
     /// Returns the number of peers disconnected. Individual disconnect
     /// failures are logged and skipped — the sweep never aborts.
@@ -7328,24 +7369,67 @@ impl Agent {
             return Ok(0);
         };
 
-        let peers = network.connected_peers().await;
-        let mut disconnected = 0usize;
-        for peer in peers {
-            match network
-                .disconnect_with_reason(&peer, network::DisconnectReason::Admin)
-                .await
-            {
-                Ok(()) => disconnected += 1,
-                Err(e) => {
-                    tracing::debug!(
-                        peer = %hex::encode(peer.0),
-                        "quiesce_mesh: disconnect failed: {e}"
-                    );
+        // Latch BEFORE the sweep so a peer reconnecting mid-sweep is already
+        // rejected at accept and silenced at the gossip transport. `None`
+        // means an earlier quiesce already latched — its re-sweep task is
+        // still running and owns the state; this call just re-sweeps.
+        //
+        // The re-sweep task is spawned BEFORE the first sweep awaits:
+        // this method runs inside an axum handler future, and a client
+        // disconnect mid-sweep drops that future — the latch must never be
+        // left held with no re-sweep task behind it (the task's own first
+        // tick is a full period out, so the ordering costs nothing). The
+        // task exits the moment its epoch stops owning the latch, so mesh
+        // flapping cannot accumulate duplicates.
+        if let Some(epoch) = network.latch_mesh_quiesced() {
+            let network = std::sync::Arc::clone(network);
+            let shutdown = self.shutdown_token.clone();
+            self.spawn_tracked(async move {
+                let period = std::time::Duration::from_secs(QUIESCE_RESWEEP_SECS);
+                let mut tick =
+                    tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+                loop {
+                    tokio::select! {
+                        () = shutdown.cancelled() => break,
+                        _ = tick.tick() => {}
+                    }
+                    if !network.quiesce_epoch_current(epoch) {
+                        break;
+                    }
+                    let swept = sweep_mesh_peers(&network).await;
+                    if swept > 0 {
+                        tracing::info!(
+                            swept,
+                            "quiesce_mesh: re-sweep disconnected reappeared peers"
+                        );
+                    }
                 }
-            }
+            });
         }
+
+        let disconnected = sweep_mesh_peers(network).await;
         tracing::info!(disconnected, "quiesce_mesh: swept mesh connections");
         Ok(disconnected)
+    }
+
+    /// Whether the mesh-off latch set by [`quiesce_mesh`](Agent::quiesce_mesh)
+    /// currently holds (`false` when no network is configured).
+    #[must_use]
+    pub fn mesh_quiesced(&self) -> bool {
+        self.network
+            .as_ref()
+            .is_some_and(|network| network.mesh_quiesced())
+    }
+
+    /// The current mesh-transition epoch (0 when no network is configured).
+    /// Capture at mesh-on request time and pass to
+    /// [`dial_bootstrap_superseding`](Agent::dial_bootstrap_superseding) so
+    /// a join that crosses a spawn boundary carries its issue time along.
+    #[must_use]
+    pub fn mesh_transition_epoch(&self) -> u64 {
+        self.network
+            .as_ref()
+            .map_or(0, |network| network.mesh_transition_epoch())
     }
 
     /// Clone the shared capability store.
@@ -9729,6 +9813,39 @@ fn announcement_should_auto_connect(
     already_connected: bool,
 ) -> bool {
     !leaf_mode && !reconnect_suppressed && !already_connected
+}
+
+/// Cadence of the quiesce re-sweep task ([`Agent::quiesce_mesh`]): while the
+/// quiesce latch holds, any peer that reappears (a demand dial, or an inbound
+/// that raced the latch) is disconnected again this often. Long enough that
+/// an explicit per-send demand dial completes comfortably, short enough that
+/// a stray connection can't feed metered gossip for long — and each sweep
+/// re-stamps the swept peers' 120 s Admin tombstones, so they stay
+/// continuously suppressed while quiesced.
+const QUIESCE_RESWEEP_SECS: u64 = 60;
+
+/// Disconnect every connected peer with [`network::DisconnectReason::Admin`],
+/// returning how many disconnected. Individual failures are logged and
+/// skipped — the sweep never aborts. Shared by [`Agent::quiesce_mesh`]'s
+/// initial sweep and its re-sweep task.
+async fn sweep_mesh_peers(network: &network::NetworkNode) -> usize {
+    let peers = network.connected_peers().await;
+    let mut disconnected = 0usize;
+    for peer in peers {
+        match network
+            .disconnect_with_reason(&peer, network::DisconnectReason::Admin)
+            .await
+        {
+            Ok(()) => disconnected += 1,
+            Err(e) => {
+                tracing::debug!(
+                    peer = %hex::encode(peer.0),
+                    "quiesce_mesh: disconnect failed: {e}"
+                );
+            }
+        }
+    }
+    disconnected
 }
 
 /// Whether this node runs proactive post-disconnect reconnects.
@@ -12949,6 +13066,8 @@ mod tests {
             .expect("agent");
 
         assert_eq!(agent.quiesce_mesh().await.expect("quiesce"), 0);
+        // No network configured → nothing to latch; the accessor stays false.
+        assert!(!agent.mesh_quiesced());
     }
 
     #[tokio::test]

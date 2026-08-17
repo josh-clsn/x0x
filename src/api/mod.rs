@@ -225,7 +225,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Post,
         path: "/mesh/quiesce",
         cli_name: "mesh quiesce",
-        description: "Disconnect all mesh peers without stopping the daemon",
+        description: "Disconnect all mesh peers and latch the mesh off until mesh join",
         category: "network",
     },
     EndpointDef {

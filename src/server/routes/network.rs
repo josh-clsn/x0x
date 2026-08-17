@@ -113,6 +113,7 @@ pub(in crate::server) async fn network_status(
             "coordination_sessions": status.coordination_sessions,
             "avg_rtt_ms": status.avg_rtt.as_millis() as u64,
             "uptime_secs": status.uptime.as_secs(),
+            "mesh_quiesced": state.agent.mesh_quiesced(),
         })),
     )
 }
@@ -148,8 +149,13 @@ pub(in crate::server) async fn peers(State(state): State<Arc<AppState>>) -> impl
 /// count.
 pub(in crate::server) async fn mesh_join(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let agent = Arc::clone(&state.agent);
+    // Capture the request time HERE, not inside the spawned task: a
+    // /mesh/quiesce that lands between this handler returning and the
+    // task's first poll must win, or a stale join would silently undo a
+    // fresh mesh-off on a metered link.
+    let requested_at_epoch = agent.mesh_transition_epoch();
     tokio::spawn(async move {
-        if let Err(e) = agent.dial_bootstrap().await {
+        if let Err(e) = agent.dial_bootstrap_superseding(requested_at_epoch).await {
             tracing::error!("mesh join failed: {e}");
         }
     });
