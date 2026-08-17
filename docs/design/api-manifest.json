@@ -172,7 +172,7 @@
     {
       "category": "network",
       "cli_name": "mesh quiesce",
-      "description": "Disconnect all mesh peers without stopping the daemon",
+      "description": "Disconnect all mesh peers and latch the mesh off until mesh join",
       "method": "POST",
       "path": "/mesh/quiesce"
     },
