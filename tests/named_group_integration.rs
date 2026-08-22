@@ -586,6 +586,171 @@ async fn named_group_join_via_invite() {
 }
 
 // ===========================================================================
+// 5b. Join returns the joiner's minted member_joined inline
+// ===========================================================================
+
+/// The `/groups/join` handler must return the joiner's own minted
+/// `member_joined` event inline in the response, so a relay-delivered join can
+/// read it directly instead of racing the gossip SSE stream (which starves
+/// whenever the joiner's gossip mesh has not formed, the cold/NAT case this
+/// targets). Asserts the join response carries `member_joined { topic,
+/// event_b64 }` and that `event_b64` base64-decodes to a signed
+/// `NamedGroupMetadataEvent::MemberJoined` naming the joiner, byte-identical to
+/// what a gossip capture would have yielded.
+#[tokio::test]
+#[ignore]
+async fn named_group_join_returns_inline_member_joined() {
+    use base64::Engine as _;
+
+    let d = daemon().await;
+    let (group_id, _) = create_group(&d, "MemberJoined Group", "", Some("Alice")).await;
+
+    // Mint an invite, then leave so the rejoin exercises the full
+    // invite/join codepath on this single-daemon suite.
+    let invite_resp: Value = authed_client(&d)
+        .post(d.url(&format!("/groups/{group_id}/invite")))
+        .json(&serde_json::json!({"expiry_secs": 3600}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let invite_link = invite_resp["invite_link"].as_str().unwrap().to_string();
+
+    let leave_r = authed_client(&d)
+        .delete(d.url(&format!("/groups/{group_id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(leave_r.status(), StatusCode::OK);
+
+    let join_r: Value = authed_client(&d)
+        .post(d.url("/groups/join"))
+        .json(&serde_json::json!({
+            "invite": invite_link,
+            "display_name": "Bob"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(join_r["ok"], true, "join response: {join_r:?}");
+
+    // Invariant: member_joined is present inline, not null.
+    let mj = &join_r["member_joined"];
+    assert!(
+        mj.is_object(),
+        "join response must carry inline member_joined, got: {join_r:?}"
+    );
+    assert!(
+        mj["topic"].as_str().is_some(),
+        "member_joined.topic must be a string: {mj:?}"
+    );
+    let event_b64 = mj["event_b64"]
+        .as_str()
+        .expect("member_joined.event_b64 must be a string");
+
+    // event_b64 must decode to the exact gossip-payload bytes: a signed
+    // MemberJoined event naming the joiner.
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(event_b64)
+        .expect("member_joined.event_b64 must be valid base64");
+    let event: Value = serde_json::from_slice(&bytes)
+        .expect("member_joined.event_b64 must decode to a JSON event");
+    assert_eq!(
+        event["event"], "member_joined",
+        "decoded event must be a member_joined: {event:?}"
+    );
+    assert!(
+        event["member_agent_id"].as_str().is_some(),
+        "decoded member_joined must name the joiner (member_agent_id): {event:?}"
+    );
+    assert!(
+        event["inviter_agent_id"].as_str().is_some(),
+        "decoded member_joined must name the inviter (inviter_agent_id), \
+         which a relay-delivered join needs to address the owner: {event:?}"
+    );
+    assert!(
+        event["signature_b64"].as_str().is_some(),
+        "decoded member_joined must be signed (signature_b64): {event:?}"
+    );
+
+    // Cleanup
+    authed_client(&d)
+        .delete(d.url(&format!("/groups/{group_id}")))
+        .send()
+        .await
+        .unwrap();
+}
+
+// ===========================================================================
+// 5c. Relay-delivered apply endpoints (engine-A): validation arms
+// ===========================================================================
+
+/// `POST /groups/:id/apply-metadata-event` must reject a body whose
+/// `event_b64` is not valid base64 with `400` — the non-gossip local-apply
+/// path validates before touching group state, so a malformed relay delivery
+/// can never partially apply.
+#[tokio::test]
+#[ignore]
+async fn apply_metadata_event_endpoint_rejects_invalid_event() {
+    let d = daemon().await;
+    let gid = "aa".repeat(32);
+    let r = authed_client(&d)
+        .post(d.url(&format!("/groups/{gid}/apply-metadata-event")))
+        .json(&serde_json::json!({
+            "event_b64": "not-base64!!!",
+            "sender_agent_id": "bb".repeat(32),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+}
+
+/// `GET /groups/:id/join-result/:member` must answer `404` with the distinct
+/// `join_result_not_staged` reason when nothing is staged, so a relay caller
+/// polls with backoff instead of relaying a welcome-less event.
+#[tokio::test]
+#[ignore]
+async fn join_result_inline_get_404_when_not_staged() {
+    let d = daemon().await;
+    let gid = "cc".repeat(32);
+    let member = "dd".repeat(32);
+    let r = authed_client(&d)
+        .get(d.url(&format!("/groups/{gid}/join-result/{member}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["reason"], "join_result_not_staged", "body: {body:?}");
+}
+
+/// `POST /groups/:id/join-result/:member` must reject a malformed
+/// relay-delivered join-result with `400` before any state is touched.
+#[tokio::test]
+#[ignore]
+async fn apply_join_result_endpoint_rejects_invalid_event() {
+    let d = daemon().await;
+    let gid = "ee".repeat(32);
+    let member = "ff".repeat(32);
+    let r = authed_client(&d)
+        .post(d.url(&format!("/groups/{gid}/join-result/{member}")))
+        .json(&serde_json::json!({
+            "event_b64": "@@not-base64@@",
+            "sender_agent_id": "ab".repeat(32),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+}
+
+// ===========================================================================
 // 6. Display Name
 // ===========================================================================
 
