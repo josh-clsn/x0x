@@ -180,3 +180,13 @@ strip = "none"
 # Embed debuginfo in the binary so gdb / perf on remote VPS can resolve
 # Rust symbols without needing the .dwo files shipped alongside.
 split-debuginfo = "off"
+
+# fetch>it leaf relay policy + ADR-012 wire-compat: vendored pristine 0.5.71
+# plus the leaf passthrough gate and a default-off v2-header emit gate (see
+# vendor/saorsa-gossip-pubsub, commit history). Upstream carries no way to opt
+# a metered device out of relaying for the whole network (cost one test phone
+# 129GB in a month), and stock 0.5.71 emits the ADR-012 v2 header
+# unconditionally, which pre-0.5.71 peers cannot decode — the gate keeps the
+# fleet on v1 wire format until every node runs a v2-capable build.
+[patch.crates-io]
+saorsa-gossip-pubsub = { path = "vendor/saorsa-gossip-pubsub" }
