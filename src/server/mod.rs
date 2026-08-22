@@ -72,6 +72,7 @@ use routes::{
     list_task_lists, list_tasks, listener_restart_context, load_causal_approval_queue,
     load_named_groups_merged, load_predecessor_relay_outbox, load_requester_offer_outbox,
     load_treekem_member_key_packages, machine_for_agent_handler, machines_by_user_handler,
+    mesh_join, mesh_quiesce,
     migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
     named_group_metadata_event_group_id, named_group_metadata_event_kind, network_status,
     now_millis_u64, owner_agents, owner_agents_issue, owner_agents_revoke, owner_riders_issue,
@@ -642,7 +643,9 @@ pub async fn serve_with_options(
     let mut builder = Agent::builder()
         .with_network_config(network_config)
         .with_gossip_config(gossip_config)
-        .with_skip_legacy_dm_bus(config.skip_legacy_dm_bus)
+        // #501 is an independent opt-in upstream; leaf mode implies it too.
+        // See `DaemonConfig::skips_legacy_dm_bus`.
+        .with_skip_legacy_dm_bus(config.skips_legacy_dm_bus())
         .with_peer_cache_dir(cache_dir)
         .with_contact_store_path(&contacts_path)
         .with_history(history_config)
@@ -1510,12 +1513,42 @@ pub async fn serve_with_options(
         }
     }
 
-    // P0-1: subscribe to the global group discovery topic so remote public
-    // groups populate the local card cache without manual import.
-    bg_tasks.extend(spawn_global_discovery_listener(Arc::clone(&state)).await);
-    // Phase C.2: load persisted shard subscriptions and re-subscribe with
-    // staggered jitter to avoid anti-entropy storms.
-    bg_tasks.extend(spawn_directory_resubscribe(Arc::clone(&state)).await);
+    // ADR-012 wire-compat: v2 (payload-covering) gossip headers are emitted
+    // only when the config opts in. Stock 0.5.71 emits v2 unconditionally,
+    // which pre-0.5.71 peers cannot decode — the vendored gate defaults to
+    // the v1 wire format so a mixed fleet keeps interoperating; flip
+    // `gossip_emit_v2 = true` only once every node runs a v2-capable build.
+    saorsa_gossip_pubsub::set_emit_v2_headers(config.gossip_emit_v2);
+    if config.gossip_emit_v2 {
+        tracing::info!("gossip: emitting ADR-012 v2 (payload-covering) headers");
+    }
+
+    if config.leaf_mode {
+        // Leaf mode: the global discovery topic, directory tag shards, and
+        // the global public-message fallback (below) are network-serving
+        // duties whose traffic scales with the whole mesh — a metered
+        // device opts out. First-party surfaces (own groups, own inbox,
+        // contact channels) are unaffected.
+        //
+        // The subscription trim alone is only part of the cost: PlumTree
+        // nodes also relay EAGER payloads for topics they never subscribed
+        // to (pass-through, so messages propagate past intermediate hops).
+        // Measured 2026-07-28, that pass-through traffic dominated. This
+        // turns it off for unsubscribed topics too.
+        state.agent.set_leaf_mode(true);
+        tracing::info!(
+            "leaf mode: skipping global discovery, directory shard, \
+             global public-message and legacy DM bus subscriptions; not \
+             relaying pass-through topics"
+        );
+    } else {
+        // P0-1: subscribe to the global group discovery topic so remote public
+        // groups populate the local card cache without manual import.
+        bg_tasks.extend(spawn_global_discovery_listener(Arc::clone(&state)).await);
+        // Phase C.2: load persisted shard subscriptions and re-subscribe with
+        // staggered jitter to avoid anti-entropy storms.
+        bg_tasks.extend(spawn_directory_resubscribe(Arc::clone(&state)).await);
+    }
     // Restart-amnesia fix: load the persisted task-list/kv-store subscription
     // manifest now (before REST handlers can mutate it) — the actual
     // re-create/re-join runs after `join_network` in the join task below.
@@ -1525,7 +1558,12 @@ pub async fn serve_with_options(
     bg_tasks.extend(spawn_listed_to_contacts_listener(Arc::clone(&state)).await);
     // Phase E: subscribe to a stable global SignedPublic message fallback so
     // first messages are not dependent on a brand-new per-group topic tree.
-    bg_tasks.extend(spawn_global_public_message_listener(Arc::clone(&state)).await);
+    // Leaf nodes skip it (see the leaf-mode block above): it is a shared
+    // whole-network topic, and fetch>it-style leafs use private per-group
+    // messaging, not the public first-message fallback.
+    if !config.leaf_mode {
+        bg_tasks.extend(spawn_global_public_message_listener(Arc::clone(&state)).await);
+    }
 
     // Invite-auth #468/#469 (design v6 E2d / v7 F1): the member-certificate
     // bridge. `cert_events_rx` was subscribed before the AppState groups
@@ -1594,6 +1632,7 @@ pub async fn serve_with_options(
     let join_agent = Arc::clone(&agent);
     let rendezvous_enabled = config.rendezvous_enabled;
     let rendezvous_validity_ms = config.rendezvous_validity_ms;
+    let defer_mesh_join = config.defer_mesh_join;
 
     // Start the DM inbox as soon as join_network has created the gossip
     // runtime. join_network may keep working through slow bootstrap/cache
@@ -1636,7 +1675,18 @@ pub async fn serve_with_options(
         crdt_subscriptions::rehydrate(crdt_rehydrate_state).await;
     }));
     bg_tasks.push(tokio::spawn(async move {
-        match join_agent.join_network().await {
+        // Infra (gossip runtime + listeners) always starts, even when the
+        // mesh dial is deferred: a quiesced embedder still serves every
+        // local surface and must be ready for a later `POST /mesh/join`.
+        if let Err(e) = join_agent.start_network_infra().await {
+            tracing::error!("Failed to start network infra: {e}");
+            return;
+        }
+        if defer_mesh_join {
+            tracing::info!("mesh join deferred (defer_mesh_join): POST /mesh/join to dial");
+            return;
+        }
+        match join_agent.dial_bootstrap().await {
             Ok(()) => {
                 tracing::info!("Network joined");
                 if rendezvous_enabled {
@@ -2539,6 +2589,9 @@ pub async fn serve_with_options(
         // Upgrade
         .route("/upgrade", get(check_upgrade))
         .route("/upgrade/apply", post(apply_upgrade))
+        // Runtime mesh membership (no-teardown mesh flips for embedders)
+        .route("/mesh/join", post(mesh_join))
+        .route("/mesh/quiesce", post(mesh_quiesce))
         // Network diagnostics
         .route("/network/bootstrap-cache", get(bootstrap_cache_stats))
         .route("/diagnostics/connectivity", get(connectivity_diagnostics))
