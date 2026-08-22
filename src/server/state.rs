@@ -800,6 +800,15 @@ pub(super) struct AppState {
         RwLock<HashMap<String, PublicGroupBootstrapObligation>>,
     /// ADR 0030 §5: disk location for the bootstrap outbox sidecar.
     pub(super) public_group_bootstrap_outbox_path: PathBuf,
+    /// #390: disk location for the join-result staging sidecar
+    /// (`pending_join_results` + `pending_welcomes`). Staged results must
+    /// survive an authority restart or the joiner's Welcome is lost for good
+    /// — a replayed `MemberJoined` for an already-active member is rejected,
+    /// so nothing re-stages it.
+    pub(super) join_result_staging_path: PathBuf,
+    /// Serializes snapshot-and-write of the join-result staging sidecar
+    /// (same P→Q lock order as the ADR-0028 persistence locks).
+    pub(super) join_result_staging_persistence_lock: Mutex<()>,
     /// Serializes snapshot-and-write of the causal approval queue sidecar so
     /// an older snapshot cannot rename over a newer conflict tombstone.
     pub(super) causal_approval_queue_persistence_lock: Mutex<()>,
