@@ -129,6 +129,25 @@ const DEFERRED: &[(Method, &str, &str)] = &[
     // Presence events are used globally by the GUI via WebSocket
     // rather than the named-groups discovery path.
     // (nothing here — kept for future additions)
+    // Engine-A relay-delivered join lane: machine-to-machine control
+    // plane driven by client apps bridging events for gossip-isolated
+    // peers. Never a browser action; the browser GUI joins via the
+    // normal invite path.
+    (
+        Method::Post,
+        "/groups/:id/apply-metadata-event",
+        "engine-A control plane; client apps bridge events, not a browser action",
+    ),
+    (
+        Method::Get,
+        "/groups/:id/join-result/:member",
+        "engine-A control plane; client apps poll staged join-results, not a browser action",
+    ),
+    (
+        Method::Post,
+        "/groups/:id/join-result/:member",
+        "engine-A control plane; client apps push bridged join-results, not a browser action",
+    ),
 ];
 
 /// One observed `api(...)` call: the first-argument expression text

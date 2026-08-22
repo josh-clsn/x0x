@@ -1306,6 +1306,27 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         request: RequestSpec::None,
     },
     EndpointDef {
+        method: Method::Post,
+        path: "/groups/:id/apply-metadata-event",
+        cli_name: "group apply-metadata-event",
+        description: "Apply a relay-delivered group metadata event locally (non-gossip path)",
+        category: "named-groups",
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/groups/:id/join-result/:member",
+        cli_name: "group join-result",
+        description: "Staged authoritative MemberAdded with the TreeKEM Welcome inlined",
+        category: "named-groups",
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/groups/:id/join-result/:member",
+        cli_name: "group apply-join-result",
+        description: "Apply a relay-delivered join-result (inline Welcome) into local TreeKEM state",
+        category: "named-groups",
+    },
+    EndpointDef {
         method: Method::Get,
         path: "/groups/:id/requests",
         cli_name: "group requests",
