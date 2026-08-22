@@ -377,6 +377,20 @@ impl TreeKemMlsGroup {
         self.remove_leaf_for_member(member, leaf)
     }
 
+    /// True if `key_package` still occupies a live leaf in the ratchet tree.
+    ///
+    /// This is the ground truth for "has this member actually been rotated
+    /// out": a roster can mark someone Removed while their leaf is still in
+    /// the tree — which is exactly the ADR-0014 self-leave gap, where the
+    /// leaver keeps deriving epoch secrets until a remaining member commits
+    /// the removal. Callers use it to decide whether a responsive rekey is
+    /// still owed without provoking a failed `remove_member_verified`.
+    #[must_use]
+    pub fn has_leaf_for_key_package(&self, key_package: &[u8]) -> bool {
+        decode::<KeyPackage>(key_package, "expected member key package")
+            .is_ok_and(|kp| self.inner.find_leaf_by_key_package(&kp).is_some())
+    }
+
     fn remove_leaf_for_member(&mut self, member: AgentId, leaf: u32) -> Result<Vec<u8>> {
         let commit = self
             .inner
@@ -834,5 +848,118 @@ mod tests {
         let mut g = TreeKemMlsGroup::create(b"room".to_vec(), agent(1), &seed(1)).expect("create");
         let err = g.remove_member(agent(9)).unwrap_err();
         assert!(matches!(err, MlsError::MemberNotInGroup(_)));
+    }
+
+    /// ADR-0014's acceptance criterion, at the layer that actually enforces it.
+    ///
+    /// A self-leave publishes no commit, so the leaver's leaf stays live and
+    /// their retained key material keeps working. The daemon wiping the
+    /// leaver's own disk is hygiene for a cooperating client — an adversarial
+    /// leaver keeps a snapshot, which is precisely what `restore` reconstructs
+    /// here. What must exclude them is the responsive rekey a *remaining*
+    /// member commits, and the exclusion has to be cryptographic: the empirical
+    /// three-arm run confirmed the admin-remove control rejects at the ratchet
+    /// (`Invalid epoch`), not at any authorization gate, because the departed
+    /// member's own roster still lists them as active. So this asserts on
+    /// `process_commit` and `decrypt_message`, never on a roster check.
+    #[test]
+    fn departed_member_snapshot_cannot_read_past_the_responsive_rekey() {
+        let (alice_id, bob_id, carol_id) = (agent(1), agent(2), agent(3));
+        let mut alice =
+            TreeKemMlsGroup::create(b"leave-rekey".to_vec(), alice_id, &seed(1)).expect("create");
+        let bob_prepared = TreeKemMlsGroup::prepare_member(bob_id, &seed(2)).expect("bob prepare");
+        let bob_kp = bob_prepared.key_package_bytes().to_vec();
+        let bob_add = alice.add_member(bob_id, &bob_kp).expect("add bob");
+        let mut bob =
+            TreeKemMlsGroup::join_from_welcome(bob_prepared, &bob_add.welcome).expect("bob joins");
+
+        let carol_prepared =
+            TreeKemMlsGroup::prepare_member(carol_id, &seed(3)).expect("carol prepare");
+        let carol_kp = carol_prepared.key_package_bytes().to_vec();
+        let carol_add = alice.add_member(carol_id, &carol_kp).expect("add carol");
+        bob.process_commit(&carol_add.commit)
+            .expect("bob follows carol's add");
+        let mut carol = TreeKemMlsGroup::join_from_welcome(carol_prepared, &carol_add.welcome)
+            .expect("carol joins");
+
+        // The adversarial leaver's copy, taken while still a member.
+        let bob_snapshot = bob
+            .to_snapshot_bytes()
+            .expect("bob snapshots pre-departure");
+        let epoch_at_departure = alice.epoch();
+
+        // Self-leave itself carries no commit — the roster drops Bob and the
+        // epoch does not move. Bob's leaf is still in the tree.
+        assert!(
+            alice.has_leaf_for_key_package(&bob_kp),
+            "self-leave alone must leave the leaf live — that is the gap being closed"
+        );
+
+        // The responsive rekey: a remaining member commits the removal.
+        let rekey_commit = alice
+            .remove_member_verified(bob_id, &bob_kp)
+            .expect("designated committer rotates the departed leaf");
+        assert_eq!(
+            alice.epoch(),
+            epoch_at_departure.saturating_add(1),
+            "the responsive rekey must advance the epoch; a roster-only fix would not"
+        );
+        carol
+            .process_commit(&rekey_commit)
+            .expect("remaining member converges to the new epoch");
+
+        // THE security assertion: Bob's retained pre-departure state cannot
+        // follow the group forward.
+        let mut bob_restored =
+            TreeKemMlsGroup::restore(&bob_snapshot, bob_id, &seed(2)).expect("restore bob's copy");
+        assert!(
+            bob_restored.process_commit(&rekey_commit).is_err(),
+            "a departed member's retained TreeKEM state must not process the rekey commit"
+        );
+
+        // ...and therefore cannot read what the group says next.
+        let post_departure = alice
+            .encrypt_message(b"after bob left")
+            .expect("group keeps talking");
+        assert!(
+            bob_restored.decrypt_message(&post_departure).is_err(),
+            "a departed member must not decrypt post-rekey traffic"
+        );
+        assert_eq!(
+            carol
+                .decrypt_message(&post_departure)
+                .expect("remaining member still reads the group"),
+            b"after bob left",
+            "the rekey must not lock out the members who stayed"
+        );
+    }
+
+    /// The rekey is driven off "is this KeyPackage still on a live leaf", so
+    /// that probe is what makes repeated passes idempotent: once the rotation
+    /// lands there is nothing left to find, and a second pass commits nothing.
+    #[test]
+    fn leaf_probe_flips_once_the_member_is_rotated_out() {
+        let (alice_id, bob_id) = (agent(1), agent(2));
+        let mut alice =
+            TreeKemMlsGroup::create(b"probe".to_vec(), alice_id, &seed(1)).expect("create");
+        let bob = TreeKemMlsGroup::prepare_member(bob_id, &seed(2)).expect("prepare");
+        let bob_kp = bob.key_package_bytes().to_vec();
+        alice.add_member(bob_id, &bob_kp).expect("add bob");
+
+        assert!(
+            alice.has_leaf_for_key_package(&bob_kp),
+            "an active member's KeyPackage resolves to a leaf"
+        );
+        alice
+            .remove_member_verified(bob_id, &bob_kp)
+            .expect("rotate bob out");
+        assert!(
+            !alice.has_leaf_for_key_package(&bob_kp),
+            "after rotation the probe must report nothing owed, or catch-up would loop"
+        );
+        assert!(
+            !alice.has_leaf_for_key_package(b"not a key package"),
+            "undecodable bytes are not a live leaf"
+        );
     }
 }
