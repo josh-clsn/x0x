@@ -1,4 +1,4 @@
-# GUI named-groups parity report — 37 endpoints total
+# GUI named-groups parity report — 40 endpoints total
   WIRED     POST /groups
   WIRED     GET /groups
   WIRED     GET /groups/:id
@@ -20,6 +20,9 @@
   WIRED     PATCH /groups/:id/members/:agent_id/role
   WIRED     POST /groups/:id/ban/:agent_id
   WIRED     DELETE /groups/:id/ban/:agent_id
+  DEFERRED  POST /groups/:id/apply-metadata-event  // engine-A control plane; client apps bridge events, not a browser action
+  DEFERRED  GET /groups/:id/join-result/:member  // engine-A control plane; client apps poll staged join-results, not a browser action
+  DEFERRED  POST /groups/:id/join-result/:member  // engine-A control plane; client apps push bridged join-results, not a browser action
   WIRED     GET /groups/:id/requests
   WIRED     POST /groups/:id/requests
   WIRED     POST /groups/:id/requests/:request_id/approve
@@ -37,4 +40,4 @@
   DEFERRED  POST /groups/:id/secure/reseal  // secure-plane primitive; server-side rekey on approve/ban
   DEFERRED  POST /groups/secure/open-envelope  // adversarial test endpoint, not a user-facing action
 
-Coverage: 25/37 wired; 12 deferred; 0 missing
+Coverage: 25/40 wired; 15 deferred; 0 missing
