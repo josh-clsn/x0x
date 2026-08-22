@@ -17399,7 +17399,10 @@ mod tests {
         // The original session's inbound accept can record_success after
         // the PolicyRejection close (accept() already yielded). Wait until
         // that bookkeeping is idle so it is not blamed on the refused seams.
-        let stabilize_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        // The quiet window must comfortably out-wait the accept task's
+        // detached bookkeeping: at 150ms this raced stragglers on loaded
+        // hosts (observed 2-4/5 locally) and blamed them on the seams below.
+        let stabilize_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut successes_before = cache
             .get_peer(&bob_peer)
             .await
@@ -17418,7 +17421,7 @@ mod tests {
             if now_count != successes_before {
                 successes_before = now_count;
                 last_change = tokio::time::Instant::now();
-            } else if last_change.elapsed() >= std::time::Duration::from_millis(150) {
+            } else if last_change.elapsed() >= std::time::Duration::from_millis(750) {
                 break;
             }
         }
@@ -17432,41 +17435,75 @@ mod tests {
         // Id seams refuse pre-socket — deterministic: the gate runs before
         // any transport work, so the refusal itself must carry the
         // suppression reason.
-        for (seam, err) in [
-            (
-                "connect_peer",
-                alice_network
-                    .connect_peer(bob_peer)
-                    .await
-                    .expect_err("connect_peer must refuse a suppressed peer"),
-            ),
-            (
-                "connect_peer_with_addrs",
-                alice_network
-                    .connect_peer_with_addrs(bob_peer, vec![bob_addr])
-                    .await
-                    .expect_err("connect_peer_with_addrs must refuse a suppressed peer"),
-            ),
-            (
-                "connect_cached_peer",
-                alice_network
-                    .connect_cached_peer(bob_peer)
-                    .await
-                    .expect_err("connect_cached_peer must refuse a suppressed peer"),
-            ),
-            (
-                "connect_addr",
-                alice_network
-                    .connect_addr(bob_addr)
-                    .await
-                    .expect_err("connect_addr must refuse a suppressed answered id"),
-            ),
-        ] {
-            assert!(
-                err.to_string().contains("reconnect-suppressed"),
-                "{seam}: refusal must come from the dial gate, got: {err}"
-            );
+        //
+        // Invariant C is asserted with a BRACKETED count: capture
+        // immediately before the battery, run all four seams, capture
+        // immediately after, require zero delta. A background writer
+        // outside these seams (probed live: the count is flat ACROSS the
+        // four seams even in runs where it moved — ant-quic's own
+        // bootstrap-cache bookkeeping for the still-answering peer is the
+        // suspect, and no fixed quiet window reliably out-waits it) can
+        // land a stray success between captures, so a dirty window is
+        // retried; a seam-authored recording dirties EVERY window and
+        // still fails.
+        let mut clean_pass = false;
+        for _bracket_attempt in 0..3 {
+            let before = cache
+                .get_peer(&bob_peer)
+                .await
+                .expect("bob cached")
+                .stats
+                .success_count;
+            for (seam, err) in [
+                (
+                    "connect_peer",
+                    alice_network
+                        .connect_peer(bob_peer)
+                        .await
+                        .expect_err("connect_peer must refuse a suppressed peer"),
+                ),
+                (
+                    "connect_peer_with_addrs",
+                    alice_network
+                        .connect_peer_with_addrs(bob_peer, vec![bob_addr])
+                        .await
+                        .expect_err("connect_peer_with_addrs must refuse a suppressed peer"),
+                ),
+                (
+                    "connect_cached_peer",
+                    alice_network
+                        .connect_cached_peer(bob_peer)
+                        .await
+                        .expect_err("connect_cached_peer must refuse a suppressed peer"),
+                ),
+                (
+                    "connect_addr",
+                    alice_network
+                        .connect_addr(bob_addr)
+                        .await
+                        .expect_err("connect_addr must refuse a suppressed answered id"),
+                ),
+            ] {
+                assert!(
+                    err.to_string().contains("reconnect-suppressed"),
+                    "{seam}: refusal must come from the dial gate, got: {err}"
+                );
+            }
+            let after = cache
+                .get_peer(&bob_peer)
+                .await
+                .expect("bob cached")
+                .stats
+                .success_count;
+            if after == before {
+                clean_pass = true;
+                break;
+            }
         }
+        assert!(
+            clean_pass,
+            "refused dials must not record a cache success (no clean bracket in 3 attempts)"
+        );
 
         // No seam produced a PeerConnected for bob.
         while let Ok(event) = events.try_recv() {
@@ -17493,11 +17530,10 @@ mod tests {
             set_at_before,
             "refused dials must not refresh the tombstone (set_at write-once)"
         );
-        let cached_after = cache.get_peer(&bob_peer).await.expect("bob still cached");
-        assert_eq!(
-            cached_after.stats.success_count, successes_before,
-            "refused dials must not record a cache success"
-        );
+        // Invariant C (no cache success from refused dials) is asserted by
+        // the bracketed battery above; re-reading the counter here would
+        // race the same out-of-seam background writer for no added proof.
+        let _ = successes_before;
 
         // Invariant B: gossip toward the suppressed peer is held — reported
         // success like the plane-pending hold, but nothing reaches the wire,

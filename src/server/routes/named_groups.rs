@@ -28735,11 +28735,18 @@ pub(in crate::server) mod tests {
     }
 
     #[test]
-    fn public_group_messages_prefer_receive_acked_raw_quic_with_gossip_fallback() {
+    fn public_group_messages_ride_the_gossip_inbox_lane_not_raw_quic() {
         let config = group_public_message_direct_delivery_config();
 
-        assert!(config.prefer_raw_quic_if_connected);
-        assert!(!config.require_gossip);
+        // fetch>it deviation from upstream #310's raw-preferred setting:
+        // GROUP_PUBLIC_MESSAGE_DM_PREFIX has no raw-QUIC receiver (only the
+        // typed route on the gossip-lane subscription loop strips it), so a
+        // raw-winning unicast is discarded while the transport receive-ack
+        // reports Ok to the sender. Until a direct.rs receiver exists, this
+        // config MUST force the gossip-inbox lane — flipping these two
+        // asserts back without one reintroduces silent group-post loss.
+        assert!(!config.prefer_raw_quic_if_connected);
+        assert!(config.require_gossip);
         assert!(!config.stop_fallback_on_raw_error);
         // #310 shortens THIS path's first attempt only. Durable DMs and
         // roster/control events still use the 8s named-group default —
