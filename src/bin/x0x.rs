@@ -113,6 +113,11 @@ enum Commands {
         #[command(subcommand)]
         sub: NetworkSub,
     },
+    /// Runtime mesh membership: dial or quiesce without stopping the daemon.
+    Mesh {
+        #[command(subcommand)]
+        sub: MeshSub,
+    },
     /// Peer-level observability (ant-quic 0.27 surface).
     Peer {
         #[command(subcommand)]
@@ -420,6 +425,17 @@ enum NetworkSub {
     Status,
     /// Bootstrap peer cache stats.
     Cache,
+}
+
+/// Runtime mesh membership. Embedders flip mesh mode by dialing/quiescing at
+/// runtime instead of tearing down and re-serving the daemon (re-serving
+/// orphans saorsa-gossip-pubsub tasks, which have no shutdown API).
+#[derive(Subcommand)]
+enum MeshSub {
+    /// Dial the gossip mesh (bootstrap phases).
+    Join,
+    /// Disconnect all mesh peers without stopping the daemon.
+    Quiesce,
 }
 
 /// Peer subcommands (ant-quic 0.27 surface).
@@ -1506,6 +1522,10 @@ async fn run(
             NetworkSub::Status => commands::network::network_status(&client).await,
             NetworkSub::Cache => commands::network::bootstrap_cache(&client).await,
         },
+        Commands::Mesh { sub } => match sub {
+            MeshSub::Join => commands::network::mesh_join(&client).await,
+            MeshSub::Quiesce => commands::network::mesh_quiesce(&client).await,
+        },
         Commands::Peer { sub } => match sub {
             PeerSub::Probe {
                 peer_id,
@@ -2080,6 +2100,8 @@ x0x (v{VERSION})
 |   +-- peers              Connected gossip peers
 |   +-- network status     NAT type, connectivity diagnostics
 |   +-- network cache      Bootstrap peer cache stats
+|   +-- mesh join          Dial the gossip mesh (bootstrap phases)
+|   +-- mesh quiesce       Disconnect all mesh peers (daemon stays up)
 |
 +-- Presence
 |   +-- presence online    Online agents (network view, non-blocked)

@@ -183,6 +183,14 @@ pub struct DmInboxConfig {
     pub silent_reject: bool,
     /// Prefix-routed payloads that should bypass generic DirectMessaging fan-out.
     pub typed_payload_routes: Vec<DmTypedPayloadRoute>,
+    /// Leaf mode: do NOT subscribe to [`DM_BUS_TOPIC`], the shared legacy
+    /// transport topic every subscriber re-broadcasts for the whole network.
+    /// On a metered device that subscription is the dominant bandwidth cost
+    /// (it carries every gossip-path DM in the network, not just ours);
+    /// per-recipient inbox delivery — the modern path every current sender
+    /// uses — is unaffected. Default `false`: full nodes keep the bus so
+    /// rolling upgrades from older daemons still deliver.
+    pub skip_legacy_bus: bool,
 }
 
 impl std::fmt::Debug for DmInboxConfig {
@@ -190,6 +198,7 @@ impl std::fmt::Debug for DmInboxConfig {
         f.debug_struct("DmInboxConfig")
             .field("silent_reject", &self.silent_reject)
             .field("typed_payload_routes", &self.typed_payload_routes.len())
+            .field("skip_legacy_bus", &self.skip_legacy_bus)
             .finish()
     }
 }
@@ -291,6 +300,9 @@ pub struct DmTypedPayload {
 
 pub struct DmInboxService {
     handles: Vec<JoinHandle<()>>,
+    /// Subscription-loop count at spawn; `handles` also carries the
+    /// durable-ACK worker, which is not a listener.
+    listeners: usize,
     topic: String,
 }
 
@@ -361,7 +373,12 @@ impl DmInboxService {
         let subscription = pubsub
             .subscribe_topic_id(topic.clone(), dm_inbox_topic(&self_agent_id))
             .await;
-        let legacy_subscription = pubsub.subscribe(DM_BUS_TOPIC.to_string()).await;
+        let legacy_subscription = if config.skip_legacy_bus {
+            tracing::info!("leaf mode: skipping legacy DM bus subscription");
+            None
+        } else {
+            Some(pubsub.subscribe(DM_BUS_TOPIC.to_string()).await)
+        };
         let (ack_publisher, ack_worker) =
             spawn_durable_ack_publisher(Arc::clone(&pubsub), Arc::clone(&dm));
 
@@ -386,19 +403,35 @@ impl DmInboxService {
 
         let primary_handle =
             spawn_subscription_loop(topic.clone(), false, subscription, pipeline.clone());
-        let legacy_handle = spawn_subscription_loop(
-            DM_BUS_TOPIC.to_string(),
-            true,
-            legacy_subscription,
-            pipeline,
-        );
+        let mut handles = vec![primary_handle];
+        if let Some(legacy_subscription) = legacy_subscription {
+            handles.push(spawn_subscription_loop(
+                DM_BUS_TOPIC.to_string(),
+                true,
+                legacy_subscription,
+                pipeline,
+            ));
+        }
+
+        let listeners = handles.len();
+        // Aborting the worker drops its JoinSet, which aborts all owned
+        // route publications. A graceful channel close drains them.
+        handles.push(ack_worker);
 
         Ok(Self {
-            // Aborting the worker drops its JoinSet, which aborts all owned
-            // route publications. A graceful channel close drains them.
-            handles: vec![primary_handle, legacy_handle, ack_worker],
+            handles,
+            listeners,
             topic,
         })
+    }
+
+    /// Number of live subscription loops: 2 with the legacy bus, 1 in leaf
+    /// mode. Counted at spawn (the durable-ACK worker in `handles` is not a
+    /// listener). Exists so tests can assert the leaf contract without
+    /// reaching into private state.
+    #[must_use]
+    pub fn listener_count(&self) -> usize {
+        self.listeners
     }
 
     #[must_use]
@@ -1870,6 +1903,15 @@ mod tests {
     use crate::identity::{AgentKeypair, MachineKeypair};
     use crate::network::{NetworkConfig, NetworkNode};
     use std::time::Duration;
+
+    /// Full nodes must keep the legacy bus by default: it is what lets a
+    /// rolling upgrade from an older daemon (which still SENDS on the bus)
+    /// deliver. Leaf devices opt out explicitly because the bus carries the
+    /// whole network's DM traffic, not just theirs.
+    #[test]
+    fn legacy_bus_stays_on_unless_leaf_opts_out() {
+        assert!(!DmInboxConfig::default().skip_legacy_bus);
+    }
 
     fn test_keypair() -> AgentKeypair {
         AgentKeypair::generate().expect("keygen")

@@ -75,6 +75,31 @@ pub async fn bootstrap_cache(client: &DaemonClient) -> Result<()> {
     client.run_get("/network/bootstrap-cache").await
 }
 
+/// `x0x mesh join` — POST /mesh/join
+///
+/// Dials the gossip mesh at runtime. The daemon spawns the bootstrap dial
+/// phases in the background and responds immediately (`status: "dialing"`);
+/// check `x0x network status` for the resulting peer count.
+pub async fn mesh_join(client: &DaemonClient) -> Result<()> {
+    client.ensure_running().await?;
+    let resp = client.post_empty("/mesh/join").await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x mesh quiesce` — POST /mesh/quiesce
+///
+/// Disconnects every mesh peer without stopping the daemon and LATCHES
+/// the mesh off: inbound connections are rejected, gossip-plane sends
+/// are dropped, and reappearing peers are re-swept until `x0x mesh join`
+/// lifts the latch. Prints the number of peers disconnected.
+pub async fn mesh_quiesce(client: &DaemonClient) -> Result<()> {
+    client.ensure_running().await?;
+    let resp = client.post_empty("/mesh/quiesce").await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
 /// `x0x diagnostics connectivity` — GET /diagnostics/connectivity
 ///
 /// Prints the ant-quic NodeStatus snapshot as JSON. Includes UPnP port-mapping
@@ -316,6 +341,26 @@ async fn bootstrap_cache_returns_mock_response() {
         "bootstrap_cache should succeed: {:?}",
         result
     );
+}
+
+#[tokio::test]
+async fn mesh_join_returns_mock_response() {
+    let mock_resp = serde_json::json!({"ok": true, "status": "dialing"});
+    let (url, _shutdown) = start_mock_server(mock_resp).await;
+    let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+
+    let result = mesh_join(&client).await;
+    assert!(result.is_ok(), "mesh_join should succeed: {:?}", result);
+}
+
+#[tokio::test]
+async fn mesh_quiesce_returns_mock_response() {
+    let mock_resp = serde_json::json!({"ok": true, "disconnected": 3});
+    let (url, _shutdown) = start_mock_server(mock_resp).await;
+    let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+
+    let result = mesh_quiesce(&client).await;
+    assert!(result.is_ok(), "mesh_quiesce should succeed: {:?}", result);
 }
 
 #[tokio::test]

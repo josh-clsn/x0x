@@ -215,6 +215,20 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         category: "network",
     },
     EndpointDef {
+        method: Method::Post,
+        path: "/mesh/join",
+        cli_name: "mesh join",
+        description: "Dial the gossip mesh (bootstrap phases)",
+        category: "network",
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/mesh/quiesce",
+        cli_name: "mesh quiesce",
+        description: "Disconnect all mesh peers and latch the mesh off until mesh join",
+        category: "network",
+    },
+    EndpointDef {
         method: Method::Get,
         path: "/diagnostics/connectivity",
         cli_name: "diagnostics connectivity",

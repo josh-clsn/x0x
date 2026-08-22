@@ -34,7 +34,7 @@ use saorsa_gossip_transport::GossipStreamType;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, RwLock, Semaphore};
@@ -1632,6 +1632,24 @@ pub struct NetworkNode {
     /// never receives another packet/connection. (Note: ant-quic frees the bound
     /// UDP socket only on process exit — saorsa-labs/ant-quic#196.)
     background_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Mesh-off latch for embedders (`Agent::quiesce_mesh`). While `true` the
+    /// accept loop rejects *every* inbound connection (not just tombstoned
+    /// peers — per-peer suppressions are bounded to 120 s and never covered
+    /// never-seen peers) and [`GossipTransport::send_to_peer`] drops all
+    /// gossip-plane frames, silencing SWIM probes, shuffles, presence
+    /// beacons, identity announces, and anti-entropy in one place. The DM
+    /// plane ([`Self::send_with_receive_ack`], [`Self::probe_peer`]) is
+    /// deliberately untouched: explicit per-send demand dials still work.
+    /// Cleared by `Agent::dial_bootstrap` (the `/mesh/join` path).
+    mesh_quiesced: Arc<AtomicBool>,
+    /// Mesh-transition epoch, bumped on every latch/unlatch transition.
+    /// Guards the control plane only — hot-path readers use
+    /// [`Self::mesh_quiesced`] — so that mesh commands are ordered: a
+    /// mesh-on that was issued before a quiesce transitioned can be
+    /// detected as stale and refused ([`Self::unlatch_mesh_if_current`]),
+    /// and the re-sweep task can tell when a newer transition superseded
+    /// the latch it was spawned for ([`Self::quiesce_epoch_current`]).
+    mesh_transitions: Arc<Mutex<u64>>,
 }
 
 impl NetworkNode {
@@ -1796,6 +1814,8 @@ impl NetworkNode {
             plane_peers: Arc::new(Mutex::new(HashMap::new())),
             plane_cleared_at: Arc::new(Mutex::new(HashMap::new())),
             background_tasks: Arc::new(Mutex::new(Vec::new())),
+            mesh_quiesced: Arc::new(AtomicBool::new(false)),
+            mesh_transitions: Arc::new(Mutex::new(0)),
         };
 
         let receiver = network_node.spawn_receiver();
@@ -3080,6 +3100,78 @@ impl NetworkNode {
         Ok(())
     }
 
+    /// Latch the mesh quiesced (see the [`Self::mesh_quiesced`] field docs
+    /// for exactly what the latch gates).
+    ///
+    /// Transitions are epoch-ordered under [`Self::mesh_transitions`] so a
+    /// stale mesh-on command can never undo a newer quiesce (see
+    /// [`Self::unlatch_mesh_if_current`]). Returns `Some(epoch)` when this
+    /// call performed the false→true transition — the caller owns spawning
+    /// the re-sweep task for that epoch — and `None` when already latched.
+    pub fn latch_mesh_quiesced(&self) -> Option<u64> {
+        let mut epoch = match self.mesh_transitions.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if self.mesh_quiesced.load(Ordering::Relaxed) {
+            return None;
+        }
+        *epoch += 1;
+        self.mesh_quiesced.store(true, Ordering::Relaxed);
+        Some(*epoch)
+    }
+
+    /// The current mesh-transition epoch. Mesh-on requesters capture this at
+    /// request time and pass it to [`Self::unlatch_mesh_if_current`], so a
+    /// command that crosses a spawn boundary carries its issue time along.
+    #[must_use]
+    pub fn mesh_transition_epoch(&self) -> u64 {
+        match self.mesh_transitions.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    /// Lift the mesh-off latch iff no newer transition happened since
+    /// `requested_at_epoch` was captured. Returns whether the caller may
+    /// dial the mesh: `false` means a quiesce newer than the request owns
+    /// the state and the mesh-on command must abort. (An unrelated newer
+    /// mesh-ON transition returns `true` — joining is idempotent.)
+    pub fn unlatch_mesh_if_current(&self, requested_at_epoch: u64) -> bool {
+        let mut epoch = match self.mesh_transitions.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if *epoch == requested_at_epoch {
+            if self.mesh_quiesced.load(Ordering::Relaxed) {
+                *epoch += 1;
+                self.mesh_quiesced.store(false, Ordering::Relaxed);
+            }
+            true
+        } else {
+            !self.mesh_quiesced.load(Ordering::Relaxed)
+        }
+    }
+
+    /// Whether the latch set at `epoch` still owns the quiesced state. The
+    /// re-sweep task checks this each tick and exits the moment any newer
+    /// transition happens, so mesh flapping can never accumulate duplicate
+    /// re-sweep tasks.
+    #[must_use]
+    pub fn quiesce_epoch_current(&self, epoch: u64) -> bool {
+        let current = match self.mesh_transitions.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        };
+        current == epoch && self.mesh_quiesced.load(Ordering::Relaxed)
+    }
+
+    /// Returns `true` while the mesh-off latch is set.
+    #[must_use]
+    pub fn mesh_quiesced(&self) -> bool {
+        self.mesh_quiesced.load(Ordering::Relaxed)
+    }
+
     /// Gossip-plane gate (issue #206).
     ///
     /// Returns `true` when gossip traffic with `peer` is plane-allowed:
@@ -3146,6 +3238,14 @@ impl NetworkNode {
     /// transport-connected peer with a live suppression tombstone is
     /// excluded even inside the transient accept-to-close window.
     pub(crate) async fn gossip_plane_peers(&self) -> Vec<AntPeerId> {
+        // Mesh-off latch: a quiesced node exposes an empty gossip plane, so
+        // every overlay view (PlumTree eager sets, membership keepalives,
+        // CRDT sync targets) sheds it in one place. Belt-and-braces with the
+        // send/receive gates — demand-dialed DM connections stay usable but
+        // never surface as gossip peers.
+        if self.mesh_quiesced() {
+            return Vec::new();
+        }
         let mut admitted = Vec::new();
         for peer in self.send_ready_peers().await {
             if self.peer_admission(&peer).await == PeerAdmission::Admitted {
@@ -3994,6 +4094,23 @@ impl NetworkNode {
                             continue;
                         }
 
+                        // Mesh-off latch, receive side: the accept loop stops
+                        // NEW inbound connections, but a DM-plane connection
+                        // opened by a demand dial can still carry gossip
+                        // stream types, and those bytes are metered traffic
+                        // that would seed overlay/plane state the quiesced
+                        // node is shedding. DM bytes (0x10/0x11) above stay
+                        // untouched — that is the whole point of the latch.
+                        if GossipStreamType::from_byte(type_byte).is_some()
+                            && plane_node.mesh_quiesced()
+                        {
+                            debug!(
+                                "[1/6 network] recv: dropping gossip frame from {:?} — mesh quiesced",
+                                peer_id
+                            );
+                            continue;
+                        }
+
                         // Issue #206: gossip-plane gate. Peers that are not
                         // plane-cleared (hello outstanding, legacy grace not
                         // yet elapsed) may not carry gossip traffic in either
@@ -4100,6 +4217,7 @@ impl NetworkNode {
         let reconnect_suppressions = Arc::clone(&self.reconnect_suppressions);
         let connection_pool = Arc::clone(&self.connection_pool);
         let inbound_allowlist = self.config.inbound_allowlist.clone();
+        let mesh_quiesced = Arc::clone(&self.mesh_quiesced);
 
         tokio::spawn(async move {
             debug!("NetworkNode accept loop started");
@@ -4116,6 +4234,26 @@ impl NetworkNode {
 
                 match node_ref.accept().await {
                     Some(peer_conn) => {
+                        // Mesh-off latch: reject every inbound connection while
+                        // quiesced. Per-peer tombstones are not enough here —
+                        // they are bounded to 120 s and never cover peers we
+                        // have not swept, so without this gate the overlay
+                        // simply redials the quiesced node back into the mesh
+                        // (observed as the Aug 2026 metered-data burn).
+                        if mesh_quiesced.load(Ordering::Relaxed) {
+                            debug!(
+                                "Rejecting inbound connection from {:?} (mesh quiesced)",
+                                peer_conn.peer_id
+                            );
+                            if let Err(e) = node_ref.disconnect(&peer_conn.peer_id).await {
+                                debug!(
+                                    "disconnect of quiesced-rejected inbound peer {:?} failed: {}",
+                                    peer_conn.peer_id, e
+                                );
+                            }
+                            continue;
+                        }
+
                         // Reject peers not in inbound allowlist (when configured)
                         if !inbound_allowlist.is_empty()
                             && !inbound_allowlist.contains(&peer_conn.peer_id.0)
@@ -4516,6 +4654,28 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
     ) -> anyhow::Result<()> {
         let ant_peer = gossip_to_ant_peer_id(&peer);
 
+        // Mesh-off latch: drop every gossip-plane frame while quiesced.
+        // This is the single choke point for all saorsa-gossip emitters —
+        // SWIM probes, HyParView shuffles, presence beacons, identity
+        // announces, anti-entropy digests, and eager-push all funnel
+        // through here, so one gate silences them without touching the
+        // DM plane (`send_with_receive_ack` / `probe_peer`). Reported as
+        // success: gossip is loss-tolerant, and erroring would put every
+        // overlay crate into its failure/retry paths. Skipping the
+        // pool-activity note below is deliberate — gossip chatter must
+        // not keep an otherwise-idle connection alive on a metered link.
+        // Node-wide state is checked before the per-peer verdicts below:
+        // cheapest test first, and it reads in scope order.
+        if self.mesh_quiesced.load(Ordering::Relaxed) {
+            debug!(
+                "[1/6 network] send: dropping {:?} ({} bytes) to {:?} — mesh quiesced",
+                stream_type,
+                data.len(),
+                peer
+            );
+            return Ok(());
+        }
+
         // Issue #292 invariant B: no gossip stream is opened toward a
         // reconnect-suppressed peer. Reported as success for the same
         // reason as the plane-pending hold below — the peer is already
@@ -4650,6 +4810,13 @@ pub enum DisconnectReason {
     PoolEviction,
     /// Explicit operator/API teardown of an otherwise-healthy connection.
     Admin,
+    /// Local mesh-off latch swept this peer. Not a security or capacity
+    /// decision: an explicit demand dial (per-send `connect_to_agent`) and a
+    /// later `dial_bootstrap` must still reach the peer. The quiesce latch,
+    /// not a tombstone, is what keeps the mesh quiet — a tombstone here
+    /// would trip the issue-#292 outbound dial gate and break
+    /// DMs-while-quiesced and the mesh re-join dial.
+    Quiesce,
     /// The peer's identity was revoked. Never redial.
     Revocation,
     /// Local node shutdown. Redial is meaningless (the node is going away);
@@ -4673,7 +4840,11 @@ impl DisconnectReason {
     fn suppression_ttl(self) -> Option<Duration> {
         match self {
             // Transport closes are reconnect-eligible; never tombstoned.
-            Self::Transport => Some(Duration::ZERO),
+            // Quiesce sweeps are latch-owned: the mesh-off latch (not a
+            // tombstone) suppresses the mesh, so demand dials and the
+            // re-join dial stay open (issue #292 invariant C must not see
+            // quiesce-authored tombstones).
+            Self::Transport | Self::Quiesce => Some(Duration::ZERO),
             // Security-relevant: permanent suppression.
             Self::PolicyRejection | Self::Revocation | Self::Shutdown => None,
             // Capacity/operator intent: outlive the bounded reconnect backoff
@@ -4967,6 +5138,111 @@ mod tests {
         assert_eq!(peer_id.to_bytes().len(), 32);
 
         // Test close() method
+        assert!(node.close().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn mesh_quiesce_latch_gates_gossip_transport() {
+        let config = NetworkConfig::default();
+        let node = NetworkNode::new(config, None, None).await.unwrap();
+        let peer = ant_to_gossip_peer_id(&test_ant_peer(7));
+        let frame = bytes::Bytes::from_static(b"probe");
+
+        // Default: not quiesced, and a gossip send to an unconnected peer
+        // reaches the node and fails (peer not found).
+        assert!(!node.mesh_quiesced());
+        let unquiesced_send = node
+            .send_to_peer(
+                peer,
+                saorsa_gossip_transport::GossipStreamType::Membership,
+                frame.clone(),
+            )
+            .await;
+        assert!(unquiesced_send.is_err());
+
+        // Latching returns the owning epoch exactly once (spawn-once
+        // contract for the re-sweep task) and flips the observable state.
+        let epoch = node
+            .latch_mesh_quiesced()
+            .expect("first latch owns an epoch");
+        assert!(node.mesh_quiesced());
+        assert!(node.latch_mesh_quiesced().is_none());
+        assert!(node.quiesce_epoch_current(epoch));
+
+        // While quiesced the same send is dropped at the transport choke
+        // point: reported Ok (gossip is loss-tolerant), node never reached.
+        let quiesced_send = node
+            .send_to_peer(
+                peer,
+                saorsa_gossip_transport::GossipStreamType::Membership,
+                frame.clone(),
+            )
+            .await;
+        assert!(quiesced_send.is_ok());
+
+        // A mesh-on issued BEFORE the quiesce transitioned is stale: it must
+        // not lift the latch, and the latch's epoch keeps ownership.
+        assert!(!node.unlatch_mesh_if_current(epoch - 1));
+        assert!(node.mesh_quiesced());
+        assert!(node.quiesce_epoch_current(epoch));
+
+        // A mesh-on issued at the current epoch lifts the latch, bumps the
+        // epoch (the re-sweep task sees its ownership end), and restores
+        // the un-quiesced transport behavior.
+        assert!(node.unlatch_mesh_if_current(node.mesh_transition_epoch()));
+        assert!(!node.mesh_quiesced());
+        assert!(!node.quiesce_epoch_current(epoch));
+        let lifted_send = node
+            .send_to_peer(
+                peer,
+                saorsa_gossip_transport::GossipStreamType::Membership,
+                frame,
+            )
+            .await;
+        assert!(lifted_send.is_err());
+
+        // Re-joining while already unlatched is idempotent even against a
+        // stale epoch — only a NEWER QUIESCE refuses a join.
+        assert!(node.unlatch_mesh_if_current(0));
+
+        assert!(node.close().await.is_ok());
+    }
+
+    /// A quiesce sweep must leave NO reconnect-suppression tombstone: the
+    /// latch, not a tombstone, keeps the mesh quiet. Post-#292 a tombstone
+    /// also refuses OUTBOUND demand dials (`dial_gated`), so an `Admin`-style
+    /// tombstone here would silently break DMs-while-quiesced and the
+    /// `/mesh/join` re-dial — the exact regression this test guards.
+    #[tokio::test]
+    async fn quiesce_sweep_writes_no_tombstone_and_keeps_demand_dials_open() {
+        let config = NetworkConfig::default();
+        let node = NetworkNode::new(config, None, None).await.unwrap();
+        let quiesced_peer = test_ant_peer(21);
+        let admin_peer = test_ant_peer(22);
+
+        node.suppress_reconnect(quiesced_peer.0, DisconnectReason::Quiesce);
+        node.suppress_reconnect(admin_peer.0, DisconnectReason::Admin);
+
+        assert!(
+            node.reconnect_suppression_set_at(quiesced_peer.0).is_none(),
+            "Quiesce must not write a suppression tombstone"
+        );
+        assert!(
+            node.reconnect_suppression_set_at(admin_peer.0).is_some(),
+            "Admin keeps its bounded tombstone (issue #292 stay-down)"
+        );
+
+        // Invariant C stays intact for real tombstones while quiesce-swept
+        // peers remain demand-dialable.
+        assert!(
+            node.dial_gated(&quiesced_peer, "peer").is_ok(),
+            "a quiesce-swept peer must stay reachable via demand dial"
+        );
+        assert!(
+            node.dial_gated(&admin_peer, "peer").is_err(),
+            "an Admin-swept peer must stay dial-gated"
+        );
+
         assert!(node.close().await.is_ok());
     }
 
