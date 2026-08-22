@@ -794,14 +794,20 @@
       "cli_name": "mesh join",
       "description": "Dial the gossip mesh (bootstrap phases)",
       "method": "POST",
-      "path": "/mesh/join"
+      "path": "/mesh/join",
+      "request": {
+        "kind": "none"
+      }
     },
     {
       "category": "network",
       "cli_name": "mesh quiesce",
       "description": "Disconnect all mesh peers and latch the mesh off until mesh join",
       "method": "POST",
-      "path": "/mesh/quiesce"
+      "path": "/mesh/quiesce",
+      "request": {
+        "kind": "none"
+      }
     },
     {
       "category": "network",
@@ -2322,21 +2328,58 @@
       "cli_name": "group apply-metadata-event",
       "description": "Apply a relay-delivered group metadata event locally (non-gossip path)",
       "method": "POST",
-      "path": "/groups/:id/apply-metadata-event"
+      "path": "/groups/:id/apply-metadata-event",
+      "request": {
+        "fields": [
+          {
+            "cli": "default",
+            "in": "body",
+            "name": "event_b64",
+            "required": true
+          },
+          {
+            "cli": "--sender",
+            "in": "body",
+            "name": "sender_agent_id",
+            "required": true
+          }
+        ],
+        "kind": "fields"
+      }
     },
     {
       "category": "named-groups",
       "cli_name": "group join-result",
       "description": "Staged authoritative MemberAdded with the TreeKEM Welcome inlined",
       "method": "GET",
-      "path": "/groups/:id/join-result/:member"
+      "path": "/groups/:id/join-result/:member",
+      "request": {
+        "kind": "none"
+      }
     },
     {
       "category": "named-groups",
       "cli_name": "group apply-join-result",
       "description": "Apply a relay-delivered join-result (inline Welcome) into local TreeKEM state",
       "method": "POST",
-      "path": "/groups/:id/join-result/:member"
+      "path": "/groups/:id/join-result/:member",
+      "request": {
+        "fields": [
+          {
+            "cli": "default",
+            "in": "body",
+            "name": "event_b64",
+            "required": true
+          },
+          {
+            "cli": "--sender",
+            "in": "body",
+            "name": "sender_agent_id",
+            "required": true
+          }
+        ],
+        "kind": "fields"
+      }
     },
     {
       "category": "named-groups",

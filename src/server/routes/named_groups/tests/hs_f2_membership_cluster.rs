@@ -1471,6 +1471,9 @@ async fn drive_joiner_welcome_install(
     handle_welcome_blob_message(
         joiner_state,
         owner_id,
+        // The harness drives the blob lane in-process on behalf of the
+        // owner's verified transport (#393 gate).
+        true,
         x0x::server::routes::named_groups::WelcomeBlobMessage::Offer {
             group_id,
             welcome_id: welcome_ref.welcome_id.clone(),
@@ -1487,6 +1490,9 @@ async fn drive_joiner_welcome_install(
         handle_welcome_blob_message(
             joiner_state,
             owner_id,
+            // The harness drives the blob lane in-process on behalf of the
+            // owner's verified transport (#393 gate).
+            true,
             x0x::server::routes::named_groups::WelcomeBlobMessage::Chunk {
                 welcome_id: welcome_ref.welcome_id.clone(),
                 sequence,
@@ -1498,6 +1504,9 @@ async fn drive_joiner_welcome_install(
     handle_welcome_blob_message(
         joiner_state,
         owner_id,
+        // The harness drives the blob lane in-process on behalf of the
+        // owner's verified transport (#393 gate).
+        true,
         x0x::server::routes::named_groups::WelcomeBlobMessage::Complete {
             welcome_id: welcome_ref.welcome_id.clone(),
         },

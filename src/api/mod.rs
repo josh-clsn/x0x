@@ -600,6 +600,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "mesh join",
         description: "Dial the gossip mesh (bootstrap phases)",
         category: "network",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Post,
@@ -607,6 +608,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "mesh quiesce",
         description: "Disconnect all mesh peers and latch the mesh off until mesh join",
         category: "network",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -1311,6 +1313,10 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group apply-metadata-event",
         description: "Apply a relay-delivered group metadata event locally (non-gossip path)",
         category: "named-groups",
+        request: RequestSpec::Fields(&[
+            RequestField::body("event_b64", true),
+            RequestField::body_as("sender_agent_id", true, "--sender"),
+        ]),
     },
     EndpointDef {
         method: Method::Get,
@@ -1318,6 +1324,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group join-result",
         description: "Staged authoritative MemberAdded with the TreeKEM Welcome inlined",
         category: "named-groups",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Post,
@@ -1325,6 +1332,10 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group apply-join-result",
         description: "Apply a relay-delivered join-result (inline Welcome) into local TreeKEM state",
         category: "named-groups",
+        request: RequestSpec::Fields(&[
+            RequestField::body("event_b64", true),
+            RequestField::body_as("sender_agent_id", true, "--sender"),
+        ]),
     },
     EndpointDef {
         method: Method::Get,

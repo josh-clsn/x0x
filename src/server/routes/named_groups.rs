@@ -445,14 +445,28 @@ pub(in crate::server) struct WelcomeRef {
     source: String,
 }
 
-#[derive(Debug, Clone)]
+/// Wall-clock (`now_millis_u64`) rather than `Instant` so the entry survives
+/// a daemon restart via the join-result sidecar (#390): TTLs must keep
+/// counting across process lifetimes, and `Instant` neither serializes nor
+/// spans them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(in crate::server) struct PendingJoinResult {
     event: NamedGroupMetadataEvent,
     /// #458 r5: the OWNER-SIGNED head attestation captured at stage time
     /// (owner installs only) — the joiner's CAS anchor binding the staged
     /// terminal to the authority's real current head.
     head_attestation: Option<HeadAttestation>,
-    created_at: Instant,
+    created_at_ms: u64,
+    /// When the owner positively observed this join-result reaching the
+    /// joiner (an acked direct send, or a completed inline/bridged
+    /// serve). `None` = never delivered — the owner-side truth behind the
+    /// members endpoint's `pending_welcome` flag: a staged-but-undelivered
+    /// joiner must render as "joining…", never as a silently keyless full
+    /// member (family-smoke find 2026-08-16). `serde(default)` keeps
+    /// pre-field sidecars loading (they read as undelivered and clear on
+    /// the entry's own TTL at worst).
+    #[serde(default)]
+    delivered_at_ms: Option<u64>,
 }
 
 /// #458 r5 (security): the CAS anchor for chain-verified adoption. An
@@ -574,12 +588,13 @@ pub(in crate::server) struct ExpectedJoinResultInviter {
     created_at: Instant,
 }
 
-#[derive(Debug, Clone)]
+/// Wall-clock for the same sidecar-restart reason as [`PendingJoinResult`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(in crate::server) struct PendingWelcome {
     group_id: String,
     joiner_agent: String,
     bytes: Vec<u8>,
-    created_at: Instant,
+    created_at_ms: u64,
 }
 
 pub(in crate::server) struct PendingWelcomeReceive {
@@ -758,6 +773,16 @@ pub(in crate::server) struct TreeKemCatchupRequest {
     #[serde(default)]
     target_member_id: Option<String>,
     limit: usize,
+    /// #398: self-authenticating signer for member-keyed requests. A
+    /// phone-embedded engine's identity announcement rarely converges onto
+    /// fleet discovery caches, so its raw-QUIC DMs arrive with
+    /// `verified == false` and the #377 gates drop them. The carried agent
+    /// public key is self-certifying (`AgentId` is derived from it) and the
+    /// signature binds [`member_keyed_request_sign_input`], giving the
+    /// responder proof the claimed requester authored this request without
+    /// any discovery state. `#[serde(default)]` keeps old peers parseable.
+    #[serde(default)]
+    signed_by: Option<CatchupSigner>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -766,6 +791,96 @@ pub(in crate::server) struct TreeKemCatchupResponse {
     group_id: String,
     events: Vec<NamedGroupMetadataEvent>,
     truncated: bool,
+    /// #398: which member `target_member_key_package_b64` belongs to — an
+    /// echo of the request's `target_member_id`. `#[serde(default)]` keeps
+    /// responses from old daemons parseable and old daemons ignore it.
+    #[serde(default)]
+    target_member_id: Option<String>,
+    /// #398: roster-fallback KeyPackage for `target_member_id`, served when
+    /// the join-event cache misses — a genesis/base-roster member (the group
+    /// creator above all) never emitted a `MemberJoined`, so the cache can
+    /// never hold one and an invited admin could never ban them. The
+    /// requester trusts it only after blake3(b64) matches the
+    /// authority-anchored `treekem_key_package_hash` it already holds.
+    #[serde(default)]
+    target_member_key_package_b64: Option<String>,
+    /// #398: self-authenticating signer for targeted responses — the
+    /// responder's counterpart to the request's `signed_by`, binding
+    /// [`member_keyed_response_sign_input`] so a requester whose transport
+    /// cannot verify the responder still gets a provable origin for the
+    /// hash-anchored KeyPackage apply. `#[serde(default)]` keeps old peers
+    /// parseable.
+    #[serde(default)]
+    signed_by: Option<CatchupSigner>,
+}
+
+/// #398: ML-DSA-65 signer attachment for the member-keyed TreeKEM catch-up
+/// wire. `AgentId` is derived from the agent public key, so the carried key
+/// is self-certifying against the claimed agent id (the same construction
+/// [`identity_announcement_has_direct_agent_origin`] relies on); the
+/// signature covers a domain-separated canonical input, never the raw JSON.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(in crate::server) struct CatchupSigner {
+    /// Raw ML-DSA-65 agent public key bytes, base64.
+    public_key_b64: String,
+    /// ML-DSA-65 signature over the canonical input, base64.
+    signature_b64: String,
+}
+
+/// Canonical signing input for a member-keyed catch-up request. NUL-joined
+/// with a versioned domain tag: hex agent ids and group ids cannot contain
+/// NUL, so the encoding is injective.
+fn member_keyed_request_sign_input(group_id: &str, requester: &str, target: &str) -> Vec<u8> {
+    format!("x0x.treekem.member-key-catchup.request.v1\0{group_id}\0{requester}\0{target}")
+        .into_bytes()
+}
+
+/// Canonical signing input for a targeted catch-up response. `kp_hash_hex`
+/// is `blake3(kp_b64)` (empty string when no fallback package is carried),
+/// binding the signature to the exact key material served.
+fn member_keyed_response_sign_input(group_id: &str, target: &str, kp_hash_hex: &str) -> Vec<u8> {
+    format!("x0x.treekem.member-key-catchup.response.v1\0{group_id}\0{target}\0{kp_hash_hex}")
+        .into_bytes()
+}
+
+/// Verify that [`CatchupSigner`] proves `claimed_agent_hex` authored
+/// `input`: the carried public key must derive the claimed `AgentId` and
+/// the signature must verify over `input`. Refuses (false) on any decode
+/// or verification failure.
+fn catchup_signer_matches(signer: &CatchupSigner, claimed_agent_hex: &str, input: &[u8]) -> bool {
+    let Ok(pk_bytes) = BASE64.decode(&signer.public_key_b64) else {
+        return false;
+    };
+    let Ok(sig_bytes) = BASE64.decode(&signer.signature_b64) else {
+        return false;
+    };
+    let Ok(pk) = ant_quic::MlDsaPublicKey::from_bytes(&pk_bytes) else {
+        return false;
+    };
+    let derived = hex::encode(x0x::identity::AgentId::from_public_key(&pk).as_bytes());
+    if !derived.eq_ignore_ascii_case(claimed_agent_hex) {
+        return false;
+    }
+    let Ok(sig) = ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&sig_bytes)
+    else {
+        return false;
+    };
+    ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(&pk, input, &sig).is_ok()
+}
+
+/// Sign `input` with this node's agent keypair for the catch-up wire.
+/// Returns `None` (and the message goes out unsigned, exactly the pre-#398
+/// shape) if signing fails.
+fn build_catchup_signer(state: &AppState, input: &[u8]) -> Option<CatchupSigner> {
+    let identity = state.agent.identity();
+    let keypair = identity.agent_keypair();
+    let signature =
+        ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(keypair.secret_key(), input)
+            .ok()?;
+    Some(CatchupSigner {
+        public_key_b64: BASE64.encode(keypair.public_key().as_bytes()),
+        signature_b64: BASE64.encode(signature.as_bytes()),
+    })
 }
 
 /// Authenticated direct-channel bootstrap for a newly-added member of a
@@ -796,6 +911,14 @@ pub(in crate::server) enum JoinResultMessage {
         /// for diagnostics/CAS logging on the responder.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base_state_hash: Option<String>,
+        /// #398/#397: self-authenticating signer — a phone-embedded engine
+        /// has no discovery presence on fleet caches, so its raw-QUIC polls
+        /// arrive `verified == false` and were dropped at the gate, leaving
+        /// the joiner keyless forever. Same construction as
+        /// [`CatchupSigner`] on the catch-up wire. `#[serde(default)]`
+        /// keeps old peers parseable.
+        #[serde(default)]
+        signed_by: Option<CatchupSigner>,
     },
     Result {
         event: Box<NamedGroupMetadataEvent>,
@@ -813,7 +936,61 @@ pub(in crate::server) enum JoinResultMessage {
         /// result (owner installs only) — the joiner's CAS anchor.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         head_attestation: Option<Box<HeadAttestation>>,
+        /// #398/#397: the responder's counterpart signer. The event's real
+        /// authorization is its authority-signed commit (verified at
+        /// apply) plus the expected-inviter check; this signer only
+        /// restores the sender-authenticity the transport flag would have
+        /// carried.
+        #[serde(default)]
+        signed_by: Option<CatchupSigner>,
     },
+}
+
+/// Canonical signing input for a join-result fetch. NUL-joined with a
+/// versioned domain tag; hex ids cannot contain NUL, so it is injective.
+fn join_result_fetch_sign_input(group_id: &str, member: &str) -> Vec<u8> {
+    format!("x0x.treekem.join-result.fetch.v1\0{group_id}\0{member}").into_bytes()
+}
+
+/// Canonical signing input for a join-result result, binding which
+/// (group, member) join this result answers.
+fn join_result_result_sign_input(group_id: &str, member: &str) -> Vec<u8> {
+    format!("x0x.treekem.join-result.result.v1\0{group_id}\0{member}").into_bytes()
+}
+
+/// #398/#397: does `msg` carry a signer proving the transport-claimed
+/// `sender_hex` authored it? Mirrors the catch-up wire's alternative to
+/// transport verification; all authorization gates downstream are
+/// unchanged. Refuses (false) on unsigned messages and non-MemberAdded
+/// results.
+fn join_result_signed_ok(msg: &JoinResultMessage, sender_hex: &str) -> bool {
+    match msg {
+        JoinResultMessage::FetchRequest {
+            group_id,
+            member_agent_id,
+            signed_by: Some(signer),
+            ..
+        } => catchup_signer_matches(
+            signer,
+            sender_hex,
+            &join_result_fetch_sign_input(group_id, member_agent_id),
+        ),
+        JoinResultMessage::Result {
+            event,
+            signed_by: Some(signer),
+            ..
+        } => match event.as_ref() {
+            NamedGroupMetadataEvent::MemberAdded {
+                group_id, agent_id, ..
+            } => catchup_signer_matches(
+                signer,
+                sender_hex,
+                &join_result_result_sign_input(group_id, agent_id),
+            ),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 pub(in crate::server) fn named_group_metadata_event_kind(
@@ -2697,10 +2874,12 @@ pub(in crate::server) fn validate_public_group_bootstrap(
 pub(in crate::server) const MAX_BOOTSTRAP_INSTALLED_GROUPS: usize = 256;
 
 async fn stop_named_group_metadata_listener(state: &AppState, group_id: &str) {
-    let handle = state.group_metadata_tasks.write().await.remove(group_id);
-    if let Some(handle) = handle {
-        handle.abort();
-    }
+    // Shares `abort_group_listener_tasks` so the self-abort footgun removed
+    // from the teardown cannot return through this door: every current caller
+    // is an HTTP task, but a listener-driven caller would otherwise truncate
+    // itself here exactly as the teardown used to.
+    let aliases = HashSet::from([group_id.to_string()]);
+    abort_group_listener_tasks(&state.group_metadata_tasks, &aliases).await;
 }
 
 /// #458 r5c: run `enforce_last_admin_invariant` over a folded roster
@@ -6175,6 +6354,7 @@ async fn request_treekem_catchup_for_gap(
             missing_prev_state_hash: frontier.commit.prev_state_hash.clone(),
             target_member_id: None,
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+            signed_by: None,
         };
         let payload = match serde_json::to_vec(&request) {
             Ok(payload) => payload,
@@ -6185,7 +6365,7 @@ async fn request_treekem_catchup_for_gap(
         };
         if let Err(e) = state
             .agent
-            .send_direct_with_config(&peer, payload, direct_message_send_config())
+            .send_direct_with_config(&peer, payload, named_group_direct_delivery_config())
             .await
         {
             tracing::debug!(group_id = %group_id, peer = %peer_hex, "TreeKEM catch-up request failed: {e}");
@@ -7157,6 +7337,13 @@ async fn member_keyed_treekem_catchup_response(
     request: &TreeKemCatchupRequest,
 ) -> Option<TreeKemCatchupResponse> {
     let target_member_id = request.target_member_id.as_ref()?;
+    // Cross-review hardening: never build (or sign) a response over an
+    // attacker-shaped target string — a valid agent id is 64 hex chars, and
+    // refusing anything else kills the partial signing oracle over the
+    // response's canonical input.
+    if parse_agent_id_hex(target_member_id).is_err() {
+        return None;
+    }
     let info = {
         let groups = state.named_groups.read().await;
         groups
@@ -7173,11 +7360,44 @@ async fn member_keyed_treekem_catchup_response(
         .find_for_member(log_keys, target_member_id)
         .await
         .filter(|event| verify_authority_attested_member_joined_recovery(&info, event));
+    // #398: the join-event cache can never hold a genesis/base-roster member
+    // (no MemberJoined ever existed), so on a cache miss fall back to this
+    // roster's full KeyPackage. Integrity is the requester's job: it accepts
+    // the package only when blake3(b64) matches the authority-anchored hash
+    // it already holds, so a hostile responder can substitute nothing.
+    // Served ALONGSIDE any cached event, not only on a cache miss: an
+    // unverified-transport requester (a phone) can only trust the
+    // hash-anchored roster package — its #377 posture drops cached events —
+    // so a cache hit without the fallback left it permanently unhealed
+    // (observed live in the gov-group ban drill). Verified requesters keep
+    // preferring the event lane; the extra field costs one roster lookup.
+    let target_member_key_package_b64 = info
+        .members_v2
+        .get(target_member_id)
+        .and_then(current_member_treekem_key_package);
+    tracing::info!(
+        group_id = %LogHexId::group(&request.group_id),
+        target = %LogHexId::agent(target_member_id),
+        cache_event = event.is_some(),
+        roster_fallback = target_member_key_package_b64.is_some(),
+        "#398: serving targeted member-key catch-up"
+    );
+    let kp_hash_hex = target_member_key_package_b64
+        .as_deref()
+        .map(|kp| blake3::hash(kp.as_bytes()).to_hex().to_string())
+        .unwrap_or_default();
+    let signed_by = build_catchup_signer(
+        state,
+        &member_keyed_response_sign_input(&request.group_id, target_member_id, &kp_hash_hex),
+    );
     Some(TreeKemCatchupResponse {
         message_type: "treekem_catchup_response".to_string(),
         group_id: request.group_id.clone(),
         events: event.into_iter().collect(),
         truncated: false,
+        target_member_id: Some(target_member_id.clone()),
+        target_member_key_package_b64,
+        signed_by,
     })
 }
 
@@ -7187,14 +7407,38 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     verified: bool,
     request: TreeKemCatchupRequest,
 ) {
-    if !verified || request.message_type != "treekem_catchup_request" {
+    if request.message_type != "treekem_catchup_request" {
+        return;
+    }
+    // #398: a member-keyed request may prove its own origin via the carried
+    // signer when the transport could not verify the sender (a
+    // phone-embedded engine has no discovery presence on fleet caches, so
+    // its raw-QUIC DMs are permanently `verified == false`). The signature
+    // binds (group, requester, target) under a versioned domain tag and the
+    // key is self-certifying against the requester id, so this admits
+    // exactly the sender-authenticity the transport flag would have. All
+    // membership gates below still apply unchanged.
+    let member_keyed_signed_ok = !verified
+        && match (&request.target_member_id, &request.signed_by) {
+            (Some(target), Some(signer)) => catchup_signer_matches(
+                signer,
+                &request.requester_agent_id,
+                &member_keyed_request_sign_input(
+                    &request.group_id,
+                    &request.requester_agent_id,
+                    target,
+                ),
+            ),
+            _ => false,
+        };
+    if !verified && !member_keyed_signed_ok {
         return;
     }
     let sender_hex = hex::encode(sender.as_bytes());
     if sender_hex != request.requester_agent_id {
         return;
     }
-    let (authorized, log_keys) = {
+    let group_authority = {
         let groups = state.named_groups.read().await;
         if let Some((key, info)) = groups.get_key_value(&request.group_id).or_else(|| {
             groups
@@ -7204,6 +7448,16 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
             if info.withdrawn {
                 return;
             }
+            // Issue #384: a locally-banned node wiped its own TreeKEM material
+            // (#376) and holds no authority over this group's membership
+            // history. The #363 `no_local_group` refusal cannot fire because
+            // the retained Banned tombstone keeps the roster entry, so gate the
+            // serve on local-ban explicitly — even if the event log were
+            // re-seeded, a banned node must never serve catch-up.
+            let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+            if info.is_banned(&local_agent_hex) {
+                return;
+            }
             let mut keys = vec![
                 request.group_id.clone(),
                 key.clone(),
@@ -7211,10 +7465,30 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
             ];
             keys.sort();
             keys.dedup();
-            (info.has_active_member(&sender_hex), keys)
+            Some((
+                info.has_active_member(&sender_hex),
+                info.members_v2
+                    .get(&sender_hex)
+                    .is_some_and(|member| !member.is_active()),
+                keys,
+            ))
         } else {
-            (false, vec![request.group_id.clone()])
+            None
         }
+    };
+    // Issue #363: serving requires the local group roster. A node that leaves
+    // drops its `named_groups` entry but keeps the in-memory TreeKEM event log
+    // — only the withdrawn-tombstone path wipes it — so a roster-less log is a
+    // departed node's residue, with no authority over the group's membership
+    // history. Remaining members are backfilled by live members instead.
+    let Some((authorized, sender_departed, log_keys)) = group_authority else {
+        tracing::warn!(
+            group_id = %LogHexId::group(&request.group_id),
+            requester = %sender_hex,
+            reason = "no_local_group",
+            "rejecting unauthorized TreeKEM catch-up request"
+        );
+        return;
     };
     let target_of_cached_add = {
         let logs = state.treekem_event_log.read().await;
@@ -7232,33 +7506,118 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
             })
         })
     };
-    if !authorized && !target_of_cached_add {
-        tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %sender_hex, "rejecting unauthorized TreeKEM catch-up request");
+    // Issue #363: the cached add alone is not proof of membership — a removal
+    // prunes only the remover's cache, so every other peer keeps naming the
+    // departed member forever. A non-active roster entry means this node knows
+    // the sender left and it loses catch-up service; no entry at all is a
+    // bootstrap joiner this node has only ever seen through the cached add.
+    if !authorized && (sender_departed || !target_of_cached_add) {
+        tracing::warn!(
+            group_id = %LogHexId::group(&request.group_id),
+            requester = %sender_hex,
+            reason = if sender_departed { "departed_member" } else { "not_a_member" },
+            "rejecting unauthorized TreeKEM catch-up request"
+        );
         return;
     }
     // Issue #205: member-keyed TreeKEM KeyPackage fetch. The requester is a
     // promoted admin missing a member's key package; serve this node's cached,
     // self-signed `MemberJoined` for the target (this node witnessed the join).
     // The same gates apply (verified DM, sender == requester, active member or
-    // target-of-cached-add). The requester authenticates the package via the
-    // embedded ML-DSA-65 signature in `apply_recovered_member_key_package`.
-    if let Some(response) = member_keyed_treekem_catchup_response(state, &log_keys, &request).await
+    // non-departed target-of-cached-add). The requester authenticates the
+    // package via the embedded ML-DSA-65 signature in
+    // `apply_recovered_member_key_package`.
+    // Cross-review hardening: the member-keyed serve deliberately returns
+    // before the #378 page-serve throttle (multi-target recovery), which
+    // left replayed signed requests driving unthrottled serves. A
+    // per-(group, requester, target) entry closes that without starving
+    // multi-target heals; the requester's own send throttle is 5s too, so a
+    // legitimate retry is never blocked.
+    if let Some(target) = request.target_member_id.as_deref() {
+        let throttle_key = format!("{}:mk-serve:{}:{}", request.group_id, sender_hex, target);
+        let mut throttle = state.treekem_catchup_throttle.write().await;
+        if throttle
+            .get(&throttle_key)
+            .is_some_and(|last| last.elapsed() < TREEKEM_CATCHUP_THROTTLE)
+        {
+            return;
+        }
+        throttle.insert(throttle_key, Instant::now());
+    }
+    if let Some(mut response) =
+        member_keyed_treekem_catchup_response(state, &log_keys, &request).await
     {
-        let payload = match serde_json::to_vec(&response) {
+        let mut payload = match serde_json::to_vec(&response) {
             Ok(payload) => payload,
             Err(e) => {
                 tracing::warn!(group_id = %LogHexId::group(&request.group_id), "failed to serialize member-keyed TreeKEM catch-up response: {e}");
                 return;
             }
         };
+        // Cached event + roster fallback + signer together can exceed the DM
+        // payload cap (observed live: 57768 > 49152, which made the response
+        // unsendable and left the phone permanently 424ing). The roster
+        // fallback is the part every requester can use — the signer covers
+        // only (group, target, blake3(kp)), so dropping the event keeps the
+        // signature valid — while the event lane needs a transport-verified
+        // requester anyway, and those recover it from the next paged serve.
+        if payload.len() > x0x::dm::MAX_PAYLOAD_BYTES && !response.events.is_empty() {
+            let dropped = response.events.len();
+            response.events.clear();
+            response.truncated = true;
+            match serde_json::to_vec(&response) {
+                Ok(smaller) => {
+                    tracing::info!(
+                        group_id = %LogHexId::group(&request.group_id),
+                        requester = %sender_hex,
+                        dropped_events = dropped,
+                        bytes = smaller.len(),
+                        "#398: oversize targeted response — kept roster fallback, dropped cached events"
+                    );
+                    payload = smaller;
+                }
+                Err(e) => {
+                    tracing::warn!(group_id = %LogHexId::group(&request.group_id), "failed to re-serialize trimmed member-keyed TreeKEM catch-up response: {e}");
+                    return;
+                }
+            }
+        }
         if let Err(e) = state
             .agent
-            .send_direct_with_config(sender, payload, direct_message_send_config())
+            .send_direct_with_config(sender, payload, named_group_direct_delivery_config())
             .await
         {
             tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %sender_hex, "failed to send member-keyed TreeKEM catch-up response: {e}");
         }
         return;
+    }
+    // Issue #378: the regular event-log serve below is a peer-driven amplifier —
+    // each request forces a full log read, filter/sort, JSON serialization, and
+    // a DM send, all at no cost to the requester. Throttle repeat serves per
+    // (requester, group, revision, epoch). The key carries the requester's
+    // advancing frontier, so a joiner paging sequentially through a long log
+    // presents a fresh key for every page and is never starved; only duplicate
+    // re-requests of an already-served page inside the window are dropped. The
+    // member-keyed serve (#205) returns above this point, so multi-member key-
+    // package recovery — many distinct targets at one frontier — is unaffected.
+    let serve_throttle_key = format!(
+        "serve:{}:{}:{}:{}",
+        request.group_id, sender_hex, request.from_revision, request.from_treekem_epoch
+    );
+    {
+        let mut throttle = state.treekem_catchup_throttle.write().await;
+        if throttle
+            .get(&serve_throttle_key)
+            .is_some_and(|last| last.elapsed() < TREEKEM_CATCHUP_THROTTLE)
+        {
+            tracing::debug!(
+                group_id = %LogHexId::group(&request.group_id),
+                requester = %sender_hex,
+                "throttling duplicate TreeKEM catch-up page request"
+            );
+            return;
+        }
+        throttle.insert(serve_throttle_key, Instant::now());
     }
     let mut events = {
         let logs = state.treekem_event_log.read().await;
@@ -7286,6 +7645,9 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         group_id: request.group_id.clone(),
         events,
         truncated,
+        target_member_id: None,
+        target_member_key_package_b64: None,
+        signed_by: None,
     };
     let payload = match serde_json::to_vec(&response) {
         Ok(payload) => payload,
@@ -7296,11 +7658,91 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     };
     if let Err(e) = state
         .agent
-        .send_direct_with_config(sender, payload, direct_message_send_config())
+        .send_direct_with_config(sender, payload, named_group_direct_delivery_config())
         .await
     {
         tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %sender_hex, "failed to send TreeKEM catch-up response: {e}");
     }
+}
+
+/// #398: store a roster-fallback KeyPackage delivered by a targeted member
+/// catch-up. Trust anchor: the local roster's existing
+/// `treekem_key_package_hash` — blake3 over the base64 string, the exact
+/// convention `set_member_treekem_key_package` writes — which arrived under
+/// authority-signed group state. A package that does not match the anchor,
+/// or a member with no anchor at all, is refused; an already-complete entry
+/// is left untouched. Returns whether the roster now holds the full package.
+async fn apply_targeted_member_key_package(
+    state: &Arc<AppState>,
+    group_id: &str,
+    member_agent_id: &str,
+    kp_b64: &str,
+) -> bool {
+    let received_hash = blake3::hash(kp_b64.as_bytes()).to_hex().to_string();
+    let membership_lock = group_membership_lock(state, group_id).await;
+    let _membership_guard = membership_lock.lock().await;
+    let stored = {
+        let mut groups = state.named_groups.write().await;
+        let key = if groups.contains_key(group_id) {
+            group_id.to_string()
+        } else {
+            match groups
+                .iter()
+                .find(|(_, info)| info.stable_group_id() == group_id)
+                .map(|(key, _)| key.clone())
+            {
+                Some(key) => key,
+                None => return false,
+            }
+        };
+        let Some(info) = groups.get_mut(&key) else {
+            return false;
+        };
+        let Some(member) = info.members_v2.get(member_agent_id) else {
+            tracing::debug!(
+                group_id = %LogHexId::group(group_id),
+                member = %LogHexId::agent(member_agent_id),
+                "#398: targeted KeyPackage for an unknown roster member; ignoring"
+            );
+            return false;
+        };
+        if member.treekem_key_package_b64.is_some() {
+            return true;
+        }
+        match member.treekem_key_package_hash.as_deref() {
+            Some(anchor) if anchor.eq_ignore_ascii_case(&received_hash) => {
+                info.set_member_treekem_key_package(member_agent_id, kp_b64.to_string());
+                true
+            }
+            Some(_) => {
+                tracing::warn!(
+                    group_id = %LogHexId::group(group_id),
+                    member = %LogHexId::agent(member_agent_id),
+                    "#398: targeted KeyPackage does not match the locally-anchored hash; refusing"
+                );
+                false
+            }
+            None => {
+                tracing::debug!(
+                    group_id = %LogHexId::group(group_id),
+                    member = %LogHexId::agent(member_agent_id),
+                    "#398: no local KeyPackage hash anchor for member; refusing unverifiable package"
+                );
+                false
+            }
+        }
+    };
+    if stored {
+        if let Err(error) = save_named_groups_checked(state).await {
+            tracing::warn!(%error, "#398: failed to persist roster after targeted KeyPackage store");
+        }
+        tracing::info!(
+            group_id = %LogHexId::group(group_id),
+            member = %LogHexId::agent(member_agent_id),
+            "#398: stored roster-fallback KeyPackage for targeted member"
+        );
+    }
+    stored
 }
 
 pub(in crate::server) async fn handle_treekem_catchup_response(
@@ -7309,9 +7751,49 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     verified: bool,
     response: TreeKemCatchupResponse,
 ) {
-    if !verified || response.message_type != "treekem_catchup_response" {
+    // #398 lane visibility: this handler's gates otherwise drop targeted
+    // responses without a trace, which made a dead member-key heal
+    // indistinguishable from one that never arrived.
+    if response.target_member_id.is_some() {
+        tracing::info!(
+            group_id = %LogHexId::group(&response.group_id),
+            sender = %LogHexId::agent(&hex::encode(sender.as_bytes())),
+            verified,
+            has_target_kp = response.target_member_key_package_b64.is_some(),
+            events = response.events.len(),
+            "#398: targeted TreeKEM catch-up response received"
+        );
+    }
+    if response.message_type != "treekem_catchup_response" {
         return;
     }
+    // #398: a targeted response may self-authenticate via the carried signer
+    // when the transport could not verify the sender (the mirror of the
+    // request-side gate). The signature binds the served KeyPackage's blake3
+    // digest, and the apply below additionally demands a match against the
+    // locally-anchored hash — an unverified-but-signed response is admitted
+    // ONLY into that doubly-checked lane; the membership-event path keeps
+    // requiring transport verification (#377).
+    let targeted_signed_ok = !verified
+        && match (&response.target_member_id, &response.signed_by) {
+            (Some(target), Some(signer)) => {
+                let kp_hash_hex = response
+                    .target_member_key_package_b64
+                    .as_deref()
+                    .map(|kp| blake3::hash(kp.as_bytes()).to_hex().to_string())
+                    .unwrap_or_default();
+                catchup_signer_matches(
+                    signer,
+                    &hex::encode(sender.as_bytes()),
+                    &member_keyed_response_sign_input(&response.group_id, target, &kp_hash_hex),
+                )
+            }
+            _ => false,
+        };
+    if !verified && !targeted_signed_ok {
+        return;
+    }
+    let targeted_only = !verified;
     let sender_hex = hex::encode(sender.as_bytes());
     {
         let revocation_set = state.agent.revocation_set();
@@ -7340,6 +7822,31 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         );
         return;
     };
+    // #398: a targeted member-key catch-up may carry a roster-fallback
+    // KeyPackage instead of a cached join event — the only lane that can
+    // recover a genesis/base-roster member's package (they never emitted a
+    // MemberJoined). Verified against the locally-held authority-anchored
+    // hash before it is trusted, so the sender gate above plus the hash
+    // anchor bound what a peer can inject.
+    if let (Some(target), Some(kp_b64)) = (
+        response.target_member_id.as_deref(),
+        response.target_member_key_package_b64.as_deref(),
+    ) {
+        let stored =
+            apply_targeted_member_key_package(state, &response.group_id, target, kp_b64).await;
+        tracing::info!(
+            group_id = %LogHexId::group(&response.group_id),
+            target = %LogHexId::agent(target),
+            stored,
+            "#398: targeted KeyPackage apply attempted"
+        );
+    }
+    if targeted_only {
+        // #377: membership events from an unverified transport are never
+        // applied — the signed lane above covers only the hash-anchored
+        // KeyPackage heal.
+        return;
+    }
     let was_truncated = response.truncated;
     let mut events = response.events;
     events.sort_by_key(treekem_membership_event_sort_key);
@@ -7391,6 +7898,7 @@ async fn request_treekem_catchup_page(state: &Arc<AppState>, group_id: &str, pee
         missing_prev_state_hash: None,
         target_member_id: None,
         limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+        signed_by: None,
     };
     let payload = match serde_json::to_vec(&request) {
         Ok(payload) => payload,
@@ -7401,7 +7909,7 @@ async fn request_treekem_catchup_page(state: &Arc<AppState>, group_id: &str, pee
     };
     if let Err(e) = state
         .agent
-        .send_direct_with_config(peer, payload, direct_message_send_config())
+        .send_direct_with_config(peer, payload, named_group_direct_delivery_config())
         .await
     {
         tracing::debug!(group_id = %group_id, peer = %hex::encode(peer.as_bytes()), "paged TreeKEM catch-up request failed: {e}");
@@ -7484,6 +7992,10 @@ async fn request_member_key_package_catchup(
             missing_prev_state_hash: None,
             target_member_id: Some(member_agent_id.to_string()),
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+            signed_by: build_catchup_signer(
+                state,
+                &member_keyed_request_sign_input(group_id, &local_agent_hex, member_agent_id),
+            ),
         };
         let payload = match serde_json::to_vec(&request) {
             Ok(payload) => payload,
@@ -7494,7 +8006,7 @@ async fn request_member_key_package_catchup(
         };
         if let Err(e) = state
             .agent
-            .send_direct_with_config(&peer, payload, direct_message_send_config())
+            .send_direct_with_config(&peer, payload, named_group_direct_delivery_config())
             .await
         {
             tracing::debug!(group_id = %group_id, member = %LogHexId::agent(&member_agent_id), peer = %candidate_hex, "member-keyed TreeKEM catch-up request failed: {e}");
@@ -7538,6 +8050,50 @@ pub(in crate::server) async fn group_membership_lock(
     )
 }
 
+/// Issue #384: the metadata events that legitimately re-admit THIS node into a
+/// group it is locally banned from — a `MemberAdded` or `MemberUnbanned` naming
+/// this agent. Both transition the local roster entry out of `Banned`, lifting
+/// the #376 tombstone; the apply arms still verify the authority commit before
+/// mutating, so this only decides which events are allowed to reach them. Every
+/// other event for a banned group is a re-seed attempt and must be refused.
+fn metadata_event_readmits_local(event: &NamedGroupMetadataEvent, local_agent_hex: &str) -> bool {
+    match event {
+        NamedGroupMetadataEvent::MemberAdded { agent_id, .. }
+        | NamedGroupMetadataEvent::MemberUnbanned { agent_id, .. } => agent_id == local_agent_hex,
+        _ => false,
+    }
+}
+
+/// Event shapes whose apply arms are fully self-authenticating, so the racy
+/// transport `verified` annotation (AgentId→MachineId discovery-cache binding)
+/// may be skipped. Every shape here re-proves authorship cryptographically
+/// inside its arm; see the block comment at the gate for the per-shape
+/// arguments. Everything else fails closed on `verified` (#377).
+fn metadata_event_bypasses_transport_verified(event: &NamedGroupMetadataEvent) -> bool {
+    matches!(
+        event,
+        NamedGroupMetadataEvent::GroupDeleted {
+            commit: Some(_),
+            ..
+        } | NamedGroupMetadataEvent::MemberRemoved {
+            commit: Some(_),
+            ..
+        } | NamedGroupMetadataEvent::MemberJoined {
+            recovery_authority_signature_b64: None,
+            ..
+        } | NamedGroupMetadataEvent::MemberBanned {
+            commit: Some(_),
+            ..
+        } | NamedGroupMetadataEvent::MemberUnbanned {
+            commit: Some(_),
+            ..
+        } | NamedGroupMetadataEvent::MemberRoleUpdated {
+            commit: Some(_),
+            ..
+        }
+    )
+}
+
 pub(in crate::server) async fn apply_named_group_metadata_event(
     state: &Arc<AppState>,
     event: NamedGroupMetadataEvent,
@@ -7555,6 +8111,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event(
     // Calling replay inside _serialized while the non-reentrant guard is held
     // re-enters the same mutex → deadlock (Kimi blocker 1).
     let mut replay_group_id: Option<String> = None;
+    let event_group_id = named_group_metadata_event_group_id(&event).to_string();
     let applied = apply_named_group_metadata_event_inner_serialized(
         state,
         event,
@@ -7571,7 +8128,65 @@ pub(in crate::server) async fn apply_named_group_metadata_event(
     if let Some(gid) = replay_group_id {
         replay_pending_causal_approvals(state, &gid).await;
     }
+    ensure_listeners_after_local_admission(state, &event_group_id, applied.accepted).await;
     applied
+}
+
+/// Issue #376: re-run the listener ensure when an apply admits the LOCAL agent
+/// into a group whose listeners were refused earlier.
+///
+/// Besides startup, create, join and card import, `ensure_named_group_listeners`
+/// is also driven here — from both apply wrappers and, for the same-task exit
+/// case, from the metadata listener's own tail (FIX A). That coverage matters
+/// because of the ban gate: a banned member can still redeem a fresh invite
+/// (the invite carries the authority roster verbatim, tombstones included, and
+/// the `MemberJoined` admission chain has no ban gate), so its local stub marks
+/// *itself* banned and the ensure at join time refuses both listeners. The
+/// authority's `MemberAdded` then arrives and flips the entry to Active — over
+/// direct delivery (a shared task, no per-group listener registered, so this
+/// wrapper-site call spawns it), or on this group's own metadata listener
+/// (whose still-registered handle makes this call a no-op — the listener tail
+/// re-subscribes instead). Either way the re-admitted member is subscribed
+/// without waiting for a restart.
+///
+/// Called after `_serialized` returns, so the per-group membership guard is
+/// already released: `ensure_named_group_listeners` takes `named_groups.read()`
+/// plus the task maps, and must not nest under that guard. Both spawners are
+/// idempotent, so the common no-op case is a `named_groups` scan plus a task-map
+/// lookup per spawner.
+///
+/// Returns a boxed future rather than being an `async fn` because this closes a
+/// type-level cycle: `ensure_named_group_listeners` spawns the metadata
+/// listener, whose receive loop calls back into this apply path. The compiler
+/// cannot infer auto-traits around that loop, so the `Send` bound is declared
+/// here instead. The runtime recursion is depth-1 — the spawned listener
+/// registers itself under this key before processing anything, so its own
+/// applies find the entry present and the inner ensure returns immediately.
+fn ensure_listeners_after_local_admission<'a>(
+    state: &'a Arc<AppState>,
+    event_group_id: &'a str,
+    accepted: bool,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        if !accepted {
+            return;
+        }
+        let resolved = {
+            let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+            let groups = state.named_groups.read().await;
+            groups
+                .iter()
+                .find(|(key, info)| {
+                    (key.as_str() == event_group_id || info.stable_group_id() == event_group_id)
+                        && info.has_active_member(&local_agent_hex)
+                        && named_group_listeners_allowed(info, &local_agent_hex)
+                })
+                .map(|(key, _)| key.clone())
+        };
+        if let Some(group_id) = resolved {
+            ensure_named_group_listeners(Arc::clone(state), &group_id).await;
+        }
+    })
 }
 
 async fn apply_named_group_metadata_event_inner(
@@ -7586,6 +8201,7 @@ async fn apply_named_group_metadata_event_inner(
     // Only when allow_queue is true (suppressed during replay itself to
     // prevent recursion).
     let mut replay_group_id: Option<String> = None;
+    let event_group_id = named_group_metadata_event_group_id(&event).to_string();
     let applied = apply_named_group_metadata_event_inner_serialized(
         state,
         event,
@@ -7604,6 +8220,7 @@ async fn apply_named_group_metadata_event_inner(
             replay_pending_causal_approvals(state, &gid).await;
         }
     }
+    ensure_listeners_after_local_admission(state, &event_group_id, applied.accepted).await;
     applied
 }
 
@@ -7669,16 +8286,25 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
     // DM `sender_hex` is reliable regardless of the cache, so bypassing
     // `verified` does not weaken membership authorization — only the racy cache
     // annotation is skipped.
-    let bypass_verified = matches!(
-        event,
-        NamedGroupMetadataEvent::GroupDeleted {
-            commit: Some(_),
-            ..
-        } | NamedGroupMetadataEvent::MemberRemoved {
-            commit: Some(_),
-            ..
-        }
-    );
+    // The additional bypass shapes below are equally self-authenticating, and
+    // they are the lanes a phone-embedded engine (no discovery presence, so
+    // never `verified`) needs when its gossip mesh is unhealthy and events
+    // arrive over direct/bridged delivery instead:
+    // - `MemberJoined` without a recovery attestation is the self-delivered
+    //   original join: the arm requires sender == member, verifies the
+    //   joiner's ML-DSA signature over the canonical bytes (which include the
+    //   invite secret), and requires the AgentId derived from the embedded
+    //   public key to equal the claimed member — so a valid event proves the
+    //   transport sender holds the member's key and the invite. The
+    //   recovery-courier shape (attestation present) keeps requiring
+    //   `verified`: its sender-is-active-member check trusts the transport
+    //   sender claim.
+    // - `MemberBanned` / `MemberUnbanned` / `MemberRoleUpdated` with a commit
+    //   are admin actions: the arms require actor == sender with an
+    //   Admin-or-higher role in the LOCAL roster and validate the signed
+    //   state commit via `apply_stateful_event_to_group`, whose
+    //   revision-anchored chain also refuses replays of stale commits.
+    let bypass_verified = metadata_event_bypasses_transport_verified(&event);
     if !verified && !bypass_verified {
         tracing::debug!(
             target: "treekem.trace",
@@ -7792,6 +8418,26 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
         return ApplyMetadataResult::REJECTED;
     }
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    // Issue #384: once THIS node is locally banned for a group, #376 wiped its
+    // crypto material and history but kept the Banned tombstone. It must not
+    // re-seed or re-key that wiped state from any further metadata event — a
+    // hostile or stale peer could otherwise restore the group's crypto, roster
+    // and event-log history, undoing the wipe. The one exception is an event
+    // that re-admits us (a `MemberAdded`/`MemberUnbanned` naming this agent),
+    // which the arm below verifies against the signed authority commit before
+    // lifting the tombstone. Mirrors the `withdrawn` gate above.
+    if info.is_banned(&local_agent_hex) && !metadata_event_readmits_local(&event, &local_agent_hex)
+    {
+        tracing::debug!(
+            target: "treekem.trace",
+            stage = "apply_metadata_event_reject",
+            reason = "local_agent_banned",
+            event = event_kind,
+            group_id = %resolved_group_key,
+            sender = %sender_hex,
+        );
+        return ApplyMetadataResult::REJECTED;
+    }
     if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
         && treekem_metadata_event_requires_phase3(&event)
     {
@@ -8168,12 +8814,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                             Err(_) => return ApplyMetadataResult::REJECTED,
                         }
                     } else if let Some(welcome_ref) = welcome_ref {
-                        match fetch_treekem_welcome_with_retries(state, &group_id, &welcome_ref)
-                            .await
-                        {
+                        match fetch_treekem_welcome(state, &group_id, &welcome_ref).await {
                             Ok(bytes) => bytes,
                             Err(e) => {
-                                tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), welcome_id = %welcome_ref.welcome_id, "failed to fetch TreeKEM Welcome blob after retries: {e}");
+                                tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), welcome_id = %welcome_ref.welcome_id, "failed to fetch TreeKEM Welcome blob (bounded attempt; the join-result poll re-drives): {e}");
                                 return ApplyMetadataResult::REJECTED;
                             }
                         }
@@ -8406,9 +9050,29 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     "member_removed_self",
                 )
                 .await;
+                // Issue #386 (mirror of #376 FIX D): removing only the resolved
+                // alias leaves the sibling alias of a converged dual-alias group
+                // resident in named_groups.json. The startup re-subscribe loop
+                // iterates every named_groups key (`ensure_named_group_listeners`),
+                // so that surviving alias rejoins the group's gossip topics on
+                // restart. Drop the roster entry under EVERY alias. Unlike the
+                // Banned tombstone the ban path retains, a removal keeps no
+                // entry, so every alias goes.
+                let stable_group_id = next.stable_group_id().to_string();
                 if !matches!(
                     persist_named_groups_mutation(state, |groups| {
-                        groups.remove(&resolved_group_key).is_some()
+                        let mut aliases = collect_same_stable_group_aliases(
+                            groups,
+                            &resolved_group_key,
+                            Some(&stable_group_id),
+                        );
+                        aliases.insert(resolved_group_key.clone());
+                        aliases.insert(stable_group_id.clone());
+                        let mut removed_any = false;
+                        for alias in &aliases {
+                            removed_any |= groups.remove(alias).is_some();
+                        }
+                        removed_any
                     })
                     .await,
                     Ok(AtomicWriteOutcome::Durable)
@@ -8419,6 +9083,19 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 save_mls_groups(state).await;
                 let _ =
                     prune_treekem_cache_groups(state, &cache_aliases, "member_removed_self").await;
+                // Issue #376: being removed is a departure. The teardown above
+                // is keyed by the local group id, so the stable-id-keyed
+                // TreeKEM event log and pending-event queue stayed resident on
+                // a node that is no longer in the group. The `replay_group_id`
+                // set above still drives `replay_pending_causal_approvals`
+                // after this returns; post-wipe that replay is a no-op.
+                wipe_local_group_crypto_material(
+                    state,
+                    &resolved_group_key,
+                    Some(next.stable_group_id()),
+                    "member_removed_self",
+                )
+                .await;
                 return ApplyMetadataResult::ACCEPTED_EXIT;
             }
             if let Some((commit_b64, _epoch)) = treekem_payload {
@@ -8462,6 +9139,25 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             let _ =
                 prune_treekem_cache_member(state, &resolved_group_key, &agent_id, "member_removed")
                     .await;
+            // ADR-0014 §2: a self-leave carries no commit, so the member who
+            // just left still holds a live ratchet-tree leaf and keeps reading
+            // group traffic until a remaining member rotates them out. Hand
+            // that to the designated committer. Deferred to its own task
+            // because the membership guard is held for the rest of this apply
+            // and the rekey has to take it; on every node that is not the
+            // designated committer this is a cheap no-op.
+            if self_leave_auth {
+                let rekey_state = Arc::clone(state);
+                let rekey_group = resolved_group_key.clone();
+                tokio::spawn(async move {
+                    let _ = reconcile_treekem_self_leave_rekeys(
+                        &rekey_state,
+                        &rekey_group,
+                        "observed_self_leave",
+                    )
+                    .await;
+                });
+            }
             ApplyMetadataResult::ACCEPTED_EXIT
         }
         NamedGroupMetadataEvent::GroupDeleted {
@@ -8675,7 +9371,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 None
             };
             let current = info.clone();
-            let Ok(next) = apply_stateful_event_with_evidence(
+            let Ok(mut next) = apply_stateful_event_with_evidence(
                 state,
                 &resolved_group_key,
                 &current,
@@ -8702,21 +9398,22 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             else {
                 return ApplyMetadataResult::REJECTED;
             };
-            let cache_aliases = treekem_cache_group_aliases(state, &resolved_group_key).await;
             let banned_self = agent_id == local_agent_hex;
+            // A node cannot apply the commit that bans it; its own teardown
+            // runs after the roster mutation below (issue #376).
+            let treekem_payload = if banned_self { None } else { treekem_payload };
             if banned_self {
-                state
-                    .treekem_groups
-                    .write()
-                    .await
-                    .remove(&resolved_group_key);
-                remove_treekem_persistence_for_group_id(
-                    state,
-                    &resolved_group_key,
-                    "member_banned_self",
-                )
-                .await;
-            } else if let Some((commit_b64, epoch)) = treekem_payload {
+                // Issue #376: the roster entry survives as the Banned
+                // tombstone, so it is the one departure that persists a
+                // `GroupInfo` for a group this node has left — and it carries
+                // the 32-byte GSS group key into `named_groups.json`. Neither
+                // branch above clears it here: the TreeKEM ban route sends
+                // `secret_epoch: None`, and the GSS branch only clears on a
+                // strict epoch advance. Same treatment as the withdrawn
+                // tombstone: the record stays, the key material goes.
+                clear_group_info_key_material(&mut next);
+            }
+            if let Some((commit_b64, epoch)) = treekem_payload {
                 use base64::Engine as _;
                 let commit_bytes = match BASE64.decode(commit_b64) {
                     Ok(bytes) => bytes,
@@ -8744,18 +9441,60 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     return ApplyMetadataResult::REJECTED;
                 }
             }
-            if !matches!(
-                persist_named_group_info(state, &resolved_group_key, next.clone()).await,
-                Ok(AtomicWriteOutcome::Durable)
-            ) {
+            let persisted = if banned_self {
+                // Issue #376 (FIX D): `clear_group_info_key_material` cleared the
+                // 32-byte GSS key on `next`, but a single-slot persist would
+                // leave the sibling alias of a converged dual-alias group still
+                // carrying it. Persist the cleared record under every alias, as
+                // the withdrawn-tombstone path does — but WITHOUT setting
+                // withdrawn, so the Banned tombstone stays visible.
+                let stable_group_id = next.stable_group_id().to_string();
+                persist_named_groups_mutation(state, |groups| {
+                    let mut aliases = collect_same_stable_group_aliases(
+                        groups,
+                        &resolved_group_key,
+                        Some(&stable_group_id),
+                    );
+                    aliases.insert(resolved_group_key.clone());
+                    aliases.insert(stable_group_id.clone());
+                    for alias in &aliases {
+                        groups.insert(alias.clone(), next.clone());
+                    }
+                    true
+                })
+                .await
+            } else {
+                persist_named_group_info(state, &resolved_group_key, next.clone()).await
+            };
+            if !matches!(persisted, Ok(AtomicWriteOutcome::Durable)) {
                 return ApplyMetadataResult::REJECTED;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             *replay_group_id = Some(resolved_group_key.clone());
             remember_treekem_membership_event(state, &event_for_log).await;
             if banned_self {
-                let _ =
-                    prune_treekem_cache_groups(state, &cache_aliases, "member_banned_self").await;
+                // Issue #376: a ban is a departure, and the only one that keeps
+                // its roster entry — the Banned tombstone must stay visible to
+                // the user and to the rejoin path. Wipe after the card-cache
+                // refresh and `remember_treekem_membership_event` above, both of
+                // which would otherwise re-seed what this clears. Because the
+                // roster entry survives, the #363 `no_local_group` catch-up
+                // refusal never fires here, so clearing the retained history is
+                // the only thing stopping a banned node from serving it.
+                //
+                // `replay_pending_causal_approvals`, driven after this apply
+                // returns, can still drain a queued GSS `JoinRequestApproved`
+                // and re-seed `group_card_cache` for the group. That is bounded
+                // and holds no key material, and the event log is NOT re-seeded
+                // because replay applies with `allow_queue = false`, which skips
+                // `remember_treekem_membership_event`.
+                wipe_local_group_crypto_material(
+                    state,
+                    &resolved_group_key,
+                    Some(next.stable_group_id()),
+                    "member_banned_self",
+                )
+                .await;
             } else {
                 let _ = prune_treekem_cache_member(
                     state,
@@ -9082,12 +9821,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                             Err(_) => return ApplyMetadataResult::REJECTED,
                         }
                     } else if let Some(welcome_ref) = welcome_ref {
-                        match fetch_treekem_welcome_with_retries(state, &group_id, &welcome_ref)
-                            .await
-                        {
+                        match fetch_treekem_welcome(state, &group_id, &welcome_ref).await {
                             Ok(bytes) => bytes,
                             Err(e) => {
-                                tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), welcome_id = %welcome_ref.welcome_id, "failed to fetch TreeKEM Welcome blob after retries: {e}");
+                                tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), welcome_id = %welcome_ref.welcome_id, "failed to fetch TreeKEM Welcome blob (bounded attempt; the join-result poll re-drives): {e}");
                                 return ApplyMetadataResult::REJECTED;
                             }
                         }
@@ -9614,6 +10351,14 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 );
                 return ApplyMetadataResult::REJECTED;
             }
+            // Canonicalize the roster identity to the lowercase hex derived from
+            // the verified public key. Step 4 accepts the wire value only
+            // case-insensitively, but every `members_v2` key and lookup uses
+            // canonical lowercase hex; storing or propagating a mixed-case id
+            // would key the member off-canonical (unfindable by canonical id,
+            // and — via the published MemberAdded's `agent_id` — desyncing the
+            // roster_root that downstream receivers commit against).
+            let member_agent_id = derived;
 
             // 5. Invite-join v1 is strictly role-capped. The joiner signs
             //    the role, but the invite itself grants only Member; accepting
@@ -9673,11 +10418,398 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
 
-            // 7. Idempotent — if the joiner is already active, a replayed
-            //    MemberJoined after the inviter committed the add is a no-op and
-            //    must not consume any fresh invite record.
+            // 7. Already-active joiner. Two cases:
+            //    a) Genuine replay — a MemberJoined that arrives after the
+            //       inviter already committed the add. No-op; must not consume
+            //       a fresh invite.
+            //    b) Returning-member re-key — the member reinstalled / lost
+            //       local TreeKEM state and re-issues MemberJoined with a NEW
+            //       KeyPackage + a fresh single-use invite. They stay
+            //       roster-active but keyless until we re-key. Perform an MLS
+            //       remove+add at the current epoch so they receive a fresh
+            //       Welcome. Self-authorized: MemberJoined is signed by the
+            //       joiner agent key, and the fresh admin-issued invite gate
+            //       still applies.
             if info.has_active_member(&member_agent_id) {
-                return ApplyMetadataResult::REJECTED;
+                let stored_kp_b64 = info
+                    .members_v2
+                    .get(&member_agent_id)
+                    .and_then(|m| m.treekem_key_package_b64.clone());
+                let is_rekey = info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+                    && match (&stored_kp_b64, &treekem_key_package_b64) {
+                        // A NEW KeyPackage from an active member signals a
+                        // returning member that lost local TreeKEM state.
+                        (Some(stored), Some(incoming)) => stored != incoming,
+                        _ => false,
+                    };
+                if !is_rekey {
+                    // Genuine replay / no new KeyPackage: no-op, consume nothing.
+                    return ApplyMetadataResult::REJECTED;
+                }
+
+                let signing_kp = state.agent.identity().agent_keypair();
+                let now_ms = now_millis_u64();
+                let mut next = info.clone();
+
+                // Authorization: consume the fresh single-use invite (same gate
+                // as the fresh-add path). `consume_issued_invite` has no
+                // already-member guard, so a re-key still requires a valid,
+                // unconsumed, in-window invite.
+                if let Err(reason) = next.consume_issued_invite(
+                    &invite_secret,
+                    &member_agent_id,
+                    role,
+                    ts_ms,
+                    now_ms,
+                ) {
+                    if reason == "invite_secret_unknown" {
+                        state
+                            .groups_diagnostics
+                            .record_member_joined_rejected_invite_secret_unknown(
+                                &resolved_group_key,
+                            );
+                    }
+                    tracing::debug!(
+                        group_id = %LogHexId::group(&resolved_group_key),
+                        member = %LogHexId::agent(&member_agent_id),
+                        reason,
+                        "MemberJoined re-key: invite validation failed"
+                    );
+                    return ApplyMetadataResult::REJECTED;
+                }
+
+                // Decode the stored (stale) and incoming (fresh) KeyPackages.
+                let Some(stored_kp_b64) = stored_kp_b64 else {
+                    return ApplyMetadataResult::REJECTED;
+                };
+                let stored_kp_bytes = match BASE64.decode(&stored_kp_b64) {
+                    Ok(b) => b,
+                    Err(_) => return ApplyMetadataResult::REJECTED,
+                };
+                let Some(new_kp_b64) = treekem_key_package_b64.clone() else {
+                    return ApplyMetadataResult::REJECTED;
+                };
+                let new_kp_bytes = match BASE64.decode(&new_kp_b64) {
+                    Ok(b) => b,
+                    Err(_) => return ApplyMetadataResult::REJECTED,
+                };
+                let member_id = match parse_agent_id_hex(&member_agent_id) {
+                    Ok(id) => id,
+                    Err(_) => return ApplyMetadataResult::REJECTED,
+                };
+
+                // The incoming member-signed join event doubles as the recovery
+                // record for the FRESH KeyPackage (same construction as the
+                // fresh-add path) — it feeds the add commit's security binding
+                // and, attested, the member key-package recovery cache.
+                let rekey_recovery = NamedGroupMetadataEvent::MemberJoined {
+                    group_id: group_id.clone(),
+                    stable_group_id: stable_group_id.clone(),
+                    member_agent_id: member_agent_id.clone(),
+                    member_public_key_b64: member_public_key_b64.clone(),
+                    role,
+                    display_name: display_name.clone(),
+                    inviter_agent_id: inviter_agent_id.clone(),
+                    invite_secret: invite_secret.clone(),
+                    ts_ms,
+                    treekem_key_package_b64: Some(new_kp_b64.clone()),
+                    recovery_authority_agent_id: None,
+                    recovery_authority_public_key_b64: None,
+                    recovery_authority_signature_b64: None,
+                    recovery_authority_commit: None,
+                    signature_b64: signature_b64.clone(),
+                };
+
+                // ADR-0038 review B1: receivers reject a `MemberAdded` into an
+                // OwnerCertified group that does not carry the certificate the
+                // member is admitted under, so the re-key commits below must
+                // carry it exactly as the fresh-add path does. Re-checked here
+                // rather than assumed from the existing seat: a certificate can
+                // have expired or been revoked since the member was first
+                // admitted, and a re-key must not resurrect it.
+                let rekey_owner_certified_admission =
+                    match owner_certified_admission_check(state, &info, &member_agent_id).await {
+                        Ok(cert) => cert,
+                        Err(failure) => {
+                            tracing::info!(
+                                group_id = %LogHexId::group(&resolved_group_key),
+                                member = %LogHexId::agent(&member_agent_id),
+                                "MemberJoined re-key: refusing OwnerCertified re-key ({failure})"
+                            );
+                            return ApplyMetadataResult::REJECTED;
+                        }
+                    };
+                let group = {
+                    let map = state.treekem_groups.read().await;
+                    map.get(&resolved_group_key).cloned()
+                };
+                let Some(group) = group else {
+                    return ApplyMetadataResult::REJECTED;
+                };
+                let mut guard = group.lock().await;
+                let rollback_snapshot = match guard.to_snapshot_bytes() {
+                    Ok(snapshot) => snapshot,
+                    Err(e) => {
+                        tracing::warn!(
+                            group_id = %LogHexId::group(&resolved_group_key),
+                            member = %LogHexId::agent(&member_agent_id),
+                            "MemberJoined re-key: failed to snapshot TreeKEM group: {e}"
+                        );
+                        return ApplyMetadataResult::REJECTED;
+                    }
+                };
+
+                // Seal BOTH state commits BEFORE mutating the live TreeKEM
+                // tree. seal_commit is fallible (signing); doing both seals
+                // first means the only fallible steps left between the two
+                // live tree mutations are the mutations themselves, and those
+                // roll back from the snapshot above.
+                let expected1 = guard.epoch().saturating_add(1);
+                let expected2 = expected1.saturating_add(1);
+
+                // Commit 1: roster with the stale KP removed, sealed at
+                // epoch +1. Removes carry the plain epoch binding.
+                next.roster_revision = next.roster_revision.saturating_add(1);
+                next.secret_epoch = expected1;
+                next.security_binding = Some(format!("treekem:epoch={expected1}"));
+                let commit1 = match next.seal_commit(signing_kp, now_ms) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(
+                            group_id = %LogHexId::group(&resolved_group_key),
+                            member = %LogHexId::agent(&member_agent_id),
+                            "MemberJoined re-key: failed to seal remove commit: {e}"
+                        );
+                        return ApplyMetadataResult::REJECTED;
+                    }
+                };
+                let revision1 = next.roster_revision;
+
+                // Commit 2: roster with the fresh KP, sealed at epoch +2 with
+                // the recovery binding (same discipline as the fresh-add path).
+                next.set_member_treekem_key_package(&member_agent_id, new_kp_b64.clone());
+                next.roster_revision = next.roster_revision.saturating_add(1);
+                next.secret_epoch = expected2;
+                let Some(binding) = treekem_recovery_security_binding(expected2, &rekey_recovery)
+                else {
+                    return ApplyMetadataResult::REJECTED;
+                };
+                next.security_binding = Some(binding);
+                let commit2 = match next.seal_commit(signing_kp, now_ms) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(
+                            group_id = %LogHexId::group(&resolved_group_key),
+                            member = %LogHexId::agent(&member_agent_id),
+                            "MemberJoined re-key: failed to seal add commit: {e}"
+                        );
+                        return ApplyMetadataResult::REJECTED;
+                    }
+                };
+                let revision2 = next.roster_revision;
+
+                // Now mutate the live TreeKEM tree back-to-back: remove the
+                // stale leaf (epoch +1) then add the fresh KeyPackage
+                // (epoch +2). Any failure restores the pre-re-key snapshot.
+                let tk_remove = match guard.remove_member_verified(member_id, &stored_kp_bytes) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(
+                            group_id = %LogHexId::group(&resolved_group_key),
+                            member = %LogHexId::agent(&member_agent_id),
+                            "MemberJoined re-key: remove_member_verified failed: {e}"
+                        );
+                        return ApplyMetadataResult::REJECTED;
+                    }
+                };
+                if guard.epoch() != expected1 {
+                    rollback_treekem_group_after_failed_install(
+                        state,
+                        &resolved_group_key,
+                        &info,
+                        &rollback_snapshot,
+                        &mut guard,
+                        "member_rekey_remove",
+                    );
+                    return ApplyMetadataResult::REJECTED;
+                }
+                let out = match guard.add_member(member_id, &new_kp_bytes) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        rollback_treekem_group_after_failed_install(
+                            state,
+                            &resolved_group_key,
+                            &info,
+                            &rollback_snapshot,
+                            &mut guard,
+                            "member_rekey_add",
+                        );
+                        tracing::warn!(
+                            group_id = %LogHexId::group(&resolved_group_key),
+                            member = %LogHexId::agent(&member_agent_id),
+                            "MemberJoined re-key: add_member failed: {e}"
+                        );
+                        return ApplyMetadataResult::REJECTED;
+                    }
+                };
+                if guard.epoch() != expected2 {
+                    rollback_treekem_group_after_failed_install(
+                        state,
+                        &resolved_group_key,
+                        &info,
+                        &rollback_snapshot,
+                        &mut guard,
+                        "member_rekey_add",
+                    );
+                    return ApplyMetadataResult::REJECTED;
+                }
+
+                // Persist ONCE after both commits, then expose the roster.
+                if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
+                    state,
+                    &resolved_group_key,
+                    next.clone(),
+                    &guard,
+                )
+                .await
+                {
+                    rollback_treekem_group_after_failed_install(
+                        state,
+                        &resolved_group_key,
+                        &info,
+                        &rollback_snapshot,
+                        &mut guard,
+                        "member_rekey_persist",
+                    );
+                    tracing::error!(
+                        group_id = %LogHexId::group(&resolved_group_key),
+                        "MemberJoined re-key: failed to persist TreeKEM snapshot: {e}"
+                    );
+                    return ApplyMetadataResult::REJECTED;
+                }
+                let metadata_topic = next.metadata_topic.clone();
+                let event_group_id = next.stable_group_id().to_string();
+                if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
+                    return ApplyMetadataResult::REJECTED;
+                }
+                state
+                    .groups_diagnostics
+                    .record_member_joined(&resolved_group_key);
+
+                // Attest + cache the fresh KeyPackage's recovery record against
+                // the ADD commit so a future removal of this member works from
+                // the re-keyed leaf, not the stale one.
+                match attest_member_joined_recovery_event(&rekey_recovery, signing_kp, &commit2) {
+                    Ok(attested) => {
+                        cache_treekem_member_key_package(
+                            state,
+                            join_result_key(&group_id, &member_agent_id),
+                            attested,
+                            true,
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            group_id = %LogHexId::group(&resolved_group_key),
+                            "MemberJoined re-key: failed to attest recovery record: {e}"
+                        );
+                    }
+                }
+
+                // Stage the Welcome from the SECOND (add) commit only — it
+                // carries the joiner's fresh TreeKEM state at epoch +2.
+                let welcome_ref = Some(
+                    stage_treekem_welcome(state, &event_group_id, &member_agent_id, out.welcome)
+                        .await,
+                );
+
+                // Build + publish + deliver BOTH commits IN ORDER: remove @ +1,
+                // then add @ +2, so existing members' trees advance +1 then +1.
+                let removed_event = NamedGroupMetadataEvent::MemberRemoved {
+                    group_id: event_group_id.clone(),
+                    revision: revision1,
+                    actor: inviter_agent_id.clone(),
+                    agent_id: member_agent_id.clone(),
+                    treekem_commit_b64: Some(BASE64.encode(&tk_remove)),
+                    treekem_epoch: Some(expected1),
+                    secret_epoch: None,
+                    commit: Some(commit1),
+                };
+                let added_event = NamedGroupMetadataEvent::MemberAdded {
+                    group_id: event_group_id.clone(),
+                    revision: revision2,
+                    actor: inviter_agent_id.clone(),
+                    agent_id: member_agent_id.clone(),
+                    display_name: display_name.clone(),
+                    treekem_commit_b64: Some(BASE64.encode(&out.commit)),
+                    treekem_welcome_b64: None,
+                    welcome_ref,
+                    treekem_epoch: Some(expected2),
+                    treekem_key_package_hash: next
+                        .members_v2
+                        .get(&member_agent_id)
+                        .and_then(|member| member.treekem_key_package_hash.clone()),
+                    member_joined_recovery: None,
+                    member_recovery_history: Vec::new(),
+                    certificate_b64: rekey_owner_certified_admission.as_ref().map(|cert| {
+                        use base64::Engine as _;
+                        BASE64.encode(bincode::serialize(cert).unwrap_or_default())
+                    }),
+                    commit: Some(commit2),
+                };
+
+                // Only the ADD is the joiner's poll-able join-result (it
+                // carries the Welcome at epoch +2).
+                stage_join_result(
+                    state,
+                    &event_group_id,
+                    &member_agent_id,
+                    added_event.clone(),
+                )
+                .await;
+
+                publish_named_group_metadata_event(state, &metadata_topic, &removed_event).await;
+                remember_treekem_membership_event(state, &removed_event).await;
+                publish_named_group_metadata_event(state, &metadata_topic, &added_event).await;
+                remember_treekem_membership_event(state, &added_event).await;
+                spawn_named_group_event_delivery_to_active_members(
+                    state,
+                    &next,
+                    &removed_event,
+                    std::slice::from_ref(&member_agent_id),
+                );
+                spawn_named_group_event_delivery_to_active_members(
+                    state,
+                    &next,
+                    &added_event,
+                    std::slice::from_ref(&member_agent_id),
+                );
+                // #333 C/D: the re-key's epoch pair is exactly the "terminal
+                // group-control event whose loss silently strands a member at
+                // the wrong epoch" class the bounded redelivery schedule
+                // exists for — but this path publishes outside the five
+                // armed admin-action handlers, so arm it here too.
+                spawn_group_control_event_redelivery(
+                    state,
+                    &metadata_topic,
+                    &next,
+                    &removed_event,
+                    std::slice::from_ref(&member_agent_id),
+                );
+                spawn_group_control_event_redelivery(
+                    state,
+                    &metadata_topic,
+                    &next,
+                    &added_event,
+                    std::slice::from_ref(&member_agent_id),
+                );
+                tracing::info!(
+                    group_id = %LogHexId::group(&resolved_group_key),
+                    member = %LogHexId::agent(&member_agent_id),
+                    "MemberJoined: re-keyed returning member (remove+add, epoch+2)"
+                );
+                return ApplyMetadataResult::ACCEPTED_CONTINUE;
             }
 
             // 7b. ADR-0038 OwnerCertified admission. Deliberately AFTER the
@@ -10108,25 +11240,71 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
     }
 }
 
+/// Whether this node may hold gossip listeners for `info` at all.
+///
+/// `withdrawn` is terminal. A ban is the one departure that keeps its roster
+/// entry — the tombstone has to stay visible to the user and to the rejoin
+/// path — so without this gate the banned node re-subscribes on every ensure
+/// and on every restart, rebuilding the membership history its teardown just
+/// wiped. Having a roster entry, it also never trips the #363 `no_local_group`
+/// catch-up refusal that protects the other departure paths.
+///
+/// Deliberately "the local agent is banned", NOT "the local agent is not
+/// active": a joiner legitimately holds a group it is not yet a member of, and
+/// its listeners must keep running or the join never converges. Re-admission
+/// after an un-ban arrives over the re-invite / Welcome direct-delivery path,
+/// which does not depend on these topic subscriptions.
+///
+/// Split out as a pure function so the decision is unit-testable: in-process
+/// test agents have no gossip runtime, so `Agent::subscribe` fails and an
+/// assertion on the spawned-task map cannot tell a refusal apart from a failed
+/// subscribe.
+fn named_group_listeners_allowed(info: &x0x::groups::GroupInfo, local_agent_hex: &str) -> bool {
+    !info.withdrawn && !info.is_banned(local_agent_hex)
+}
+
+/// The metadata topic this node should listen on for `info`, if any.
+fn named_group_metadata_listener_topic(
+    info: &x0x::groups::GroupInfo,
+    local_agent_hex: &str,
+) -> Option<String> {
+    named_group_listeners_allowed(info, local_agent_hex).then(|| info.metadata_topic.clone())
+}
+
+/// The public-message topic key this node should listen on for `info`, if any.
+///
+/// Same terminality rules as the metadata listener, plus the `MlsEncrypted`
+/// gate matching `GET /groups/:id/messages`, which rejects those groups
+/// outright rather than serving a plaintext history.
+fn named_group_public_listener_key(
+    info: &x0x::groups::GroupInfo,
+    local_agent_hex: &str,
+) -> Option<String> {
+    (named_group_listeners_allowed(info, local_agent_hex)
+        && info.policy.confidentiality != x0x::groups::GroupConfidentiality::MlsEncrypted)
+        .then(|| info.stable_group_id().to_string())
+}
+
 async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &str) {
+    // A registered-but-finished handle is a listener whose subscription ended
+    // (e.g. `sub.recv()` returned None); treating it as present would block
+    // re-subscription forever, so a finished entry counts as absent (#376).
     if state
         .group_metadata_tasks
         .read()
         .await
-        .contains_key(group_id)
+        .get(group_id)
+        .is_some_and(|handle| !handle.is_finished())
     {
         return;
     }
 
     let metadata_topic = {
+        let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
         let groups = state.named_groups.read().await;
-        groups.get(group_id).and_then(|g| {
-            if g.withdrawn {
-                None
-            } else {
-                Some(g.metadata_topic.clone())
-            }
-        })
+        groups
+            .get(group_id)
+            .and_then(|g| named_group_metadata_listener_topic(g, &local_agent_hex))
     };
     let Some(metadata_topic) = metadata_topic else {
         return;
@@ -10143,6 +11321,10 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
     let state_for_task = Arc::clone(&state);
     let handle = tokio::spawn(async move {
         let mut shutdown_rx = state_for_task.shutdown_notify.subscribe();
+        // Track a membership-driven exit so the tail can re-evaluate its own
+        // eligibility (#376, FIX A). A shutdown or a closed subscription does
+        // not qualify — only an apply that returned `should_exit`.
+        let mut membership_exit = false;
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => break,
@@ -10158,22 +11340,57 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
                         msg.raw_envelope.as_deref(),
                     )
                     .await;
-                    if apply_result.should_exit { break; }
+                    if apply_result.should_exit {
+                        membership_exit = true;
+                        break;
+                    }
                 }
             }
         }
-        state_for_task
-            .group_metadata_tasks
-            .write()
-            .await
-            .remove(&task_group_id);
+        // Deregister only our own registration. Since the teardown stopped
+        // aborting the calling task this tail is always reached, so a blind
+        // remove could evict a NEWER handle registered between the teardown's
+        // abort pass and here (a concurrent re-invite re-ensuring listeners),
+        // leaving that listener live but untracked and the next ensure
+        // spawning a duplicate.
+        {
+            let mut tasks = state_for_task.group_metadata_tasks.write().await;
+            if tasks
+                .get(&task_group_id)
+                .is_some_and(|handle| Some(handle.id()) == tokio::task::try_id())
+            {
+                tasks.remove(&task_group_id);
+            }
+        }
+        // FIX A (#376): the wrapper-site re-ensure ran while THIS handle was
+        // still registered, so for a `should_exit` on our own task it no-op'd
+        // on our own entry and re-subscription would otherwise wait for a later
+        // apply on a different task or a restart. Now that we have deregistered,
+        // re-evaluate eligibility for ourselves: a re-admit (still active +
+        // listener-allowed) re-subscribes exactly one new listener — which
+        // registers before processing, so its own applies find the entry and do
+        // not recurse — while a genuine departure (left / removed / banned →
+        // ineligible) resolves to nothing and spawns none.
+        if membership_exit {
+            ensure_listeners_after_local_admission(&state_for_task, &task_group_id, true).await;
+        }
     });
 
-    state
+    // FIX C (#376): the check→subscribe→insert window lets two ensures both
+    // spawn. A plain `insert` DROPS (detaches) the loser, leaving an orphan
+    // listener invisible to `abort_group_listener_tasks` — the one that could
+    // re-seed `treekem_event_log` after a ban. Abort the displaced handle. The
+    // `try_id` guard is a cheap guard against the impossible self-eviction.
+    if let Some(prev) = state
         .group_metadata_tasks
         .write()
         .await
-        .insert(group_id, handle);
+        .insert(group_id, handle)
+    {
+        if Some(prev.id()) != tokio::task::try_id() {
+            prev.abort();
+        }
+    }
 }
 
 /// Spawn every gossip listener a member needs for a named group.
@@ -10193,16 +11410,11 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
 pub(in crate::server) async fn ensure_named_group_listeners(state: Arc<AppState>, group_id: &str) {
     ensure_named_group_metadata_listener(Arc::clone(&state), group_id).await;
     let public_topic_key = {
+        let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
         let groups = state.named_groups.read().await;
-        groups.get(group_id).and_then(|info| {
-            if info.withdrawn
-                || info.policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted
-            {
-                None
-            } else {
-                Some(info.stable_group_id().to_string())
-            }
-        })
+        groups
+            .get(group_id)
+            .and_then(|info| named_group_public_listener_key(info, &local_agent_hex))
     };
     if let Some(stable_id) = public_topic_key {
         spawn_public_message_listener(state, stable_id).await;
@@ -10679,7 +11891,43 @@ pub(in crate::server) async fn get_named_group_members(
     let Some(info) = groups.get(&id) else {
         return not_found("group not found");
     };
-    let members = named_group_member_values(info);
+    let mut members = named_group_member_values(info);
+    let stable = info.stable_group_id().to_string();
+    drop(groups);
+    // `pending_welcome`: a member whose staged join-result was never
+    // positively delivered is keyless and mute no matter what the roster
+    // says — the shell must render "joining…", not a full member row
+    // (family-smoke find 2026-08-16).
+    {
+        let member_ids: Vec<String> = members
+            .iter()
+            .filter_map(|m| {
+                m.get("agent_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            })
+            .collect();
+        let member_refs: Vec<&str> = member_ids.iter().map(String::as_str).collect();
+        let results = state.pending_join_results.read().await;
+        let pending = pending_welcome_member_set(
+            &results,
+            &[id.as_str(), stable.as_str()],
+            &member_refs,
+            now_millis_u64(),
+        );
+        for m in &mut members {
+            let agent = m
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            if let (Some(obj), Some(agent)) = (m.as_object_mut(), agent) {
+                obj.insert(
+                    "pending_welcome".to_string(),
+                    serde_json::Value::Bool(pending.contains(&agent)),
+                );
+            }
+        }
+    }
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -12112,7 +13360,7 @@ fn spawn_group_public_message_delivery(
         match agent
             .send_direct_with_config(
                 &recipient,
-                payload,
+                payload.clone(),
                 group_public_message_direct_delivery_config(),
             )
             .await
@@ -12131,6 +13379,28 @@ fn spawn_group_public_message_delivery(
                     recipient = %LogHexId::agent(&recipient_label),
                     "failed to direct-deliver public group message: {e}"
                 );
+                // fetch>it mesh-off reconcile: the #310 race cut the unicast
+                // budget to ONE 3 s attempt, calibrated for always-on nodes.
+                // A leaf or quiesced phone routinely needs the demand-dial
+                // repair path that only a later attempt exercises, and its
+                // gossip legs may be dark — so a FAILED retryable attempt
+                // gets one delayed retry. Success stays single-send, keeping
+                // the #310 latency win.
+                tokio::time::sleep(GROUP_BACKGROUND_PUBLISH_DELAY).await;
+                if let Err(e) = agent
+                    .send_direct_with_config(
+                        &recipient,
+                        payload,
+                        group_public_message_direct_delivery_config(),
+                    )
+                    .await
+                {
+                    tracing::info!(
+                        group_id = %LogHexId::group(&group_id),
+                        recipient = %LogHexId::agent(&recipient_label),
+                        "delayed public-message unicast retry also failed ({e}); gossip race is the carry"
+                    );
+                }
             }
         }
         outstanding.fetch_sub(1, Ordering::Relaxed);
@@ -12393,6 +13663,11 @@ pub(in crate::server) async fn spawn_global_public_message_listener(
 /// listener. The spawned task owns only the receive loop.
 async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
     {
+        // Issue #376: `GET /groups/:id/messages` calls this directly, bypassing
+        // `ensure_named_group_listeners`, so the eligibility gate has to live
+        // here too — otherwise a banned node on a public-read group
+        // re-subscribes and re-populates `public_messages` after its teardown.
+        let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
         let groups = state.named_groups.read().await;
         if groups
             .get(&group_id)
@@ -12401,14 +13676,19 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
                     .values()
                     .find(|info| info.stable_group_id() == group_id.as_str())
             })
-            .is_some_and(|info| info.withdrawn)
+            .is_some_and(|info| named_group_public_listener_key(info, &local_agent_hex).is_none())
         {
             return;
         }
     }
     {
+        // A finished handle is a listener whose subscription ended; count it as
+        // absent so a dead entry cannot block re-subscription forever (#376).
         let tasks = state.public_message_tasks.read().await;
-        if tasks.contains_key(&group_id) {
+        if tasks
+            .get(&group_id)
+            .is_some_and(|handle| !handle.is_finished())
+        {
             return;
         }
     }
@@ -12422,6 +13702,7 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
     };
     let state_for_listener = Arc::clone(&state);
     let group_id_for_listener = group_id.clone();
+    let task_group_id = group_id.clone();
     let topic_for_log = topic.clone();
     let mut shutdown_rx = state.shutdown_notify.subscribe();
     let handle = tokio::spawn(async move {
@@ -12450,12 +13731,32 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
                 }
             }
         }
+        // FIX B (#376): deregister our own registration on exit — mirroring the
+        // metadata listener's tail — so a subscription that ends (recv None)
+        // does not leave a dead handle that every later ensure short-circuits
+        // on. Remove only when the stored handle is still ours.
+        {
+            let mut tasks = state_for_listener.public_message_tasks.write().await;
+            if tasks
+                .get(&task_group_id)
+                .is_some_and(|handle| Some(handle.id()) == tokio::task::try_id())
+            {
+                tasks.remove(&task_group_id);
+            }
+        }
     });
-    state
+    // FIX C (#376): abort the handle displaced by a racing spawn rather than
+    // dropping (detaching) it, so no orphan public listener survives untracked.
+    if let Some(prev) = state
         .public_message_tasks
         .write()
         .await
-        .insert(group_id, handle);
+        .insert(group_id, handle)
+    {
+        if Some(prev.id()) != tokio::task::try_id() {
+            prev.abort();
+        }
+    }
 }
 
 /// POST /groups/:id/invite — generate an invite link (admin+; body optional).
@@ -13709,7 +15010,7 @@ pub(in crate::server) async fn join_group_via_invite(
                     state_for_poll,
                     group_id_for_poll,
                     event_group_id_for_poll,
-                    inviter,
+                    vec![inviter],
                     member_for_poll,
                     invite_is_treekem,
                     member_joined_resend,
@@ -15071,22 +16372,6 @@ async fn wipe_local_group_crypto_material(
         }
     }
     {
-        let mut tasks = state.group_metadata_tasks.write().await;
-        for alias in &aliases {
-            if let Some(handle) = tasks.remove(alias) {
-                handle.abort();
-            }
-        }
-    }
-    {
-        let mut tasks = state.public_message_tasks.write().await;
-        for alias in &aliases {
-            if let Some(handle) = tasks.remove(alias) {
-                handle.abort();
-            }
-        }
-    }
-    {
         let mut join_results = state.pending_join_results.write().await;
         join_results.retain(|key, pending| {
             !join_result_key_matches_any_group_alias(key, &aliases)
@@ -15131,8 +16416,45 @@ async fn wipe_local_group_crypto_material(
         }
     }
 
+    // #390: the staging sidecar must record the wipe, or a restart would
+    // resurrect the departed/banned group's staged join-results — exactly
+    // the re-seed class #384 closed for roster state.
+    persist_join_result_staging(state).await;
+
     for alias in &aliases {
         remove_treekem_persistence_for_group_id(state, alias, reason).await;
+    }
+
+    // The listener aborts run LAST, and never against the calling task. The
+    // metadata listener registers its own `JoinHandle` here under the roster
+    // key and then drives the apply that reaches this teardown, so a blind
+    // abort is a self-abort: tokio defers it to the next yield and everything
+    // still to do — including the `remove_file` loop above, which erases
+    // private TreeKEM key material — is dropped with the future. Keeping both
+    // aborts at the end means no future reordering can lose a teardown step
+    // this way, whichever step happens to yield first.
+    abort_group_listener_tasks(&state.group_metadata_tasks, &aliases).await;
+    abort_group_listener_tasks(&state.public_message_tasks, &aliases).await;
+}
+
+/// Deregister and abort the listener tasks recorded for `aliases`, skipping the
+/// task currently executing.
+///
+/// Dropping the map entry is correct for our own task too — the listener loop
+/// it belongs to exits on the `should_exit` result of the apply that called
+/// this teardown, and its own tail no longer needs to deregister itself.
+async fn abort_group_listener_tasks(
+    tasks: &RwLock<HashMap<String, tokio::task::JoinHandle<()>>>,
+    aliases: &HashSet<String>,
+) {
+    let current = tokio::task::try_id();
+    let mut tasks = tasks.write().await;
+    for alias in aliases {
+        if let Some(handle) = tasks.remove(alias) {
+            if current != Some(handle.id()) {
+                handle.abort();
+            }
+        }
     }
 }
 
@@ -15331,32 +16653,17 @@ async fn drop_local_named_group_state(
         );
         return false;
     }
+    // Pruned with the aliases resolved *before* the roster mutation, which is
+    // the only point a third alias reachable only through the roster entry is
+    // still discoverable; the wipe below re-resolves and covers `id` plus
+    // `stable_group_id` unconditionally.
     let _ = prune_treekem_cache_groups(state, &cache_aliases, reason).await;
-    {
-        let mut cache = state.group_card_cache.write().await;
-        cache.remove(id);
-        if let Some(stable_group_id) = stable_group_id {
-            cache.remove(stable_group_id);
-        }
-    }
-    {
-        let mut mls_groups = state.mls_groups.write().await;
-        mls_groups.remove(id);
-        if let Some(stable_group_id) = stable_group_id {
-            mls_groups.remove(stable_group_id);
-        }
-    }
-    {
-        let mut treekem_groups = state.treekem_groups.write().await;
-        treekem_groups.remove(id);
-        if let Some(stable_group_id) = stable_group_id {
-            treekem_groups.remove(stable_group_id);
-        }
-    }
-    remove_treekem_persistence_for_group_id(state, id, reason).await;
-    if let Some(stable_group_id) = stable_group_id {
-        remove_treekem_persistence_for_group_id(state, stable_group_id, reason).await;
-    }
+    // Issue #376: this used to tear down the card cache, the MLS/TreeKEM
+    // groups and the at-rest persistence one key at a time, leaving the
+    // stable-id-keyed TreeKEM event log and pending-event queue resident on a
+    // node that no longer holds the group. The shared teardown clears every
+    // alias of all of it, so a dropped group leaves no material behind.
+    wipe_local_group_crypto_material(state, id, stable_group_id, reason).await;
     save_mls_groups(state).await;
     stop_named_group_metadata_listener(state, id).await;
     if let Some(stable_group_id) = stable_group_id {
@@ -15470,7 +16777,7 @@ async fn leave_treekem_group(
     save_mls_groups(&state).await;
 
     let event = NamedGroupMetadataEvent::MemberRemoved {
-        group_id: event_group_id,
+        group_id: event_group_id.clone(),
         revision,
         actor: local_agent_hex.clone(),
         agent_id: local_agent_hex,
@@ -15482,6 +16789,19 @@ async fn leave_treekem_group(
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     remember_treekem_membership_event(&state, &event).await;
     spawn_named_group_event_delivery_to_active_members(&state, &delivery_roster, &event, &[]);
+    // Issue #376: the teardown above is keyed by the local group id and leaves
+    // the stable-id-keyed material behind — including the membership event log
+    // `remember_treekem_membership_event` just re-appended this leave to. Wipe
+    // last, after the event is published and handed to delivery: each
+    // per-recipient send is a detached task holding its own `Arc<Agent>` and a
+    // pre-serialized payload, so the task aborts here cannot cancel it.
+    //
+    // Two side effects are intended, per ADR-0012 "a left group leaves nothing
+    // behind locally", and apply to every departure routed through this
+    // teardown: the group's local public-message history is dropped, and an
+    // in-flight `stream_welcome_blob` this node was serving stalls when its ack
+    // slot goes (the joiner retries against another member).
+    wipe_local_group_crypto_material(&state, &id, Some(&event_group_id), "treekem_leave").await;
 
     (
         StatusCode::OK,
@@ -15673,6 +16993,213 @@ async fn remove_treekem_named_group_member(
             "members": named_group_member_values(&next),
         })),
     )
+}
+
+/// ADR-0014 §2/§4: issue the responsive TreeKEM rekey that a self-leave leaves
+/// owed, and return how many rotations were committed.
+///
+/// A self-leave publishes a roster-only `MemberRemoved` — `treekem_commit_b64:
+/// None`, no epoch advance — because RFC-9420 forbids the leaver from
+/// committing their own removal. Until a *remaining* member commits it, the
+/// departed member's leaf is still in the ratchet tree, so they keep deriving
+/// every epoch secret the group produces and can read its traffic. An
+/// adversarial leaver simply keeps a copy of their TreeKEM state; the local
+/// wipe on their own daemon is hygiene for a cooperating client, not a security
+/// property. This is what actually closes that window.
+///
+/// Three properties make it safe to run from anywhere:
+///
+/// - **Single committer.** Only `designated_rekey_committer` acts, so
+///   concurrent observation by several members still yields one commit at the
+///   epoch rather than a pile-up of duelling ones.
+/// - **Driven from persisted state.** The trigger is "a non-active roster entry
+///   whose KeyPackage still resolves to a live leaf", which survives a restart,
+///   so a leave observed while the committer was down is repaired when it next
+///   comes up rather than staying open indefinitely.
+/// - **Idempotent.** The commit blanks the leaf, so a repeat pass sees nothing
+///   owed. Applying the same leave twice yields one epoch advance, not two.
+///
+/// Each rotation reuses the admin-remove wire shape verbatim, so receivers take
+/// the existing `admin_remove_auth` apply branch and no new protocol is added.
+async fn reconcile_treekem_self_leave_rekeys(
+    state: &Arc<AppState>,
+    group_key: &str,
+    reason: &str,
+) -> usize {
+    use base64::Engine as _;
+
+    let membership_lock = group_membership_lock(state, group_key).await;
+    let _membership_guard = membership_lock.lock().await;
+
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let holders = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(group_key) else {
+            return 0;
+        };
+        if info.withdrawn || info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem {
+            return 0;
+        }
+        if info.designated_rekey_committer().as_deref() != Some(local_agent_hex.as_str()) {
+            return 0;
+        }
+        info.treekem_leaf_holders_not_active()
+    };
+    if holders.is_empty() {
+        return 0;
+    }
+
+    let Some(group) = state.treekem_groups.read().await.get(group_key).cloned() else {
+        // No loaded tree: nothing can be rotated here. The next startup pass
+        // retries once snapshots are restored.
+        tracing::debug!(
+            group_id = %LogHexId::group(group_key),
+            reason,
+            "self-leave rekey deferred: TreeKEM group not loaded"
+        );
+        return 0;
+    };
+
+    let signing_kp = state.agent.identity().agent_keypair();
+    let mut rotated = 0usize;
+    for (departed_hex, kp_b64) in holders {
+        let Ok(departed_agent) = parse_agent_id_hex(&departed_hex) else {
+            continue;
+        };
+        let Ok(kp_bytes) = BASE64.decode(&kp_b64) else {
+            continue;
+        };
+
+        let (mut next, metadata_topic, event_group_id) = {
+            let groups = state.named_groups.read().await;
+            let Some(info) = groups.get(group_key) else {
+                break;
+            };
+            (
+                info.clone(),
+                info.metadata_topic.clone(),
+                info.stable_group_id().to_string(),
+            )
+        };
+
+        let mut guard = group.lock().await;
+        // Already rotated out (admin remove, or an earlier pass): nothing owed.
+        if !guard.has_leaf_for_key_package(&kp_bytes) {
+            continue;
+        }
+        let treekem_epoch = guard.epoch().saturating_add(1);
+        next.roster_revision = next.roster_revision.saturating_add(1);
+        let revision = next.roster_revision;
+        next.remove_member(&departed_hex, Some(local_agent_hex.clone()));
+        next.secret_epoch = treekem_epoch;
+        next.security_binding = Some(format!("treekem:epoch={treekem_epoch}"));
+        let commit = match next.seal_commit(signing_kp, now_millis_u64()) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    group_id = %LogHexId::group(group_key),
+                    member = %LogHexId::agent(&departed_hex),
+                    "self-leave rekey seal failed: {e}"
+                );
+                continue;
+            }
+        };
+        let treekem_commit = match guard.remove_member_verified(departed_agent, &kp_bytes) {
+            Ok(commit) => commit,
+            Err(e) => {
+                tracing::warn!(
+                    group_id = %LogHexId::group(group_key),
+                    member = %LogHexId::agent(&departed_hex),
+                    "self-leave rekey remove_member_verified failed: {e}"
+                );
+                continue;
+            }
+        };
+        if guard.epoch() != treekem_epoch {
+            tracing::error!(
+                group_id = %LogHexId::group(group_key),
+                "self-leave rekey epoch did not advance as expected"
+            );
+            continue;
+        }
+        if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
+            state,
+            group_key,
+            next.clone(),
+            &guard,
+        )
+        .await
+        {
+            tracing::error!(
+                group_id = %LogHexId::group(group_key),
+                "failed to persist TreeKEM snapshot after self-leave rekey: {e}"
+            );
+            continue;
+        }
+        drop(guard);
+
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_key.to_string(), next.clone());
+        save_mls_groups(state).await;
+        let _ = prune_treekem_cache_member(state, group_key, &departed_hex, reason).await;
+
+        let event = NamedGroupMetadataEvent::MemberRemoved {
+            group_id: event_group_id,
+            revision,
+            actor: local_agent_hex.clone(),
+            agent_id: departed_hex.clone(),
+            treekem_commit_b64: Some(
+                base64::engine::general_purpose::STANDARD.encode(treekem_commit),
+            ),
+            treekem_epoch: Some(treekem_epoch),
+            secret_epoch: None,
+            commit: Some(commit),
+        };
+        publish_named_group_metadata_event(state, &metadata_topic, &event).await;
+        remember_treekem_membership_event(state, &event).await;
+        // Deliberately not delivered to the departed member: they left
+        // voluntarily and their local state is already torn down.
+        spawn_named_group_event_delivery_to_active_members(state, &next, &event, &[]);
+        // #333 C/D: a remaining member that misses this MemberRemoved queues
+        // the rekey as a revision gap and cannot decrypt at the new epoch —
+        // its own commit message documents that failure mode — so it gets
+        // the bounded redelivery schedule like every admin-side removal.
+        spawn_group_control_event_redelivery(state, &metadata_topic, &next, &event, &[]);
+        maybe_publish_group_card_after_state_change(state, group_key).await;
+
+        tracing::info!(
+            group_id = %LogHexId::group(group_key),
+            member = %LogHexId::agent(&departed_hex),
+            epoch = treekem_epoch,
+            reason,
+            "issued responsive TreeKEM rekey after self-leave"
+        );
+        rotated = rotated.saturating_add(1);
+    }
+    rotated
+}
+
+/// Startup half of the ADR-0014 §4 lazy catch-up: sweep every group for
+/// rotations owed to a departure this node did not witness live (it was down,
+/// or was not yet the designated committer when the member left).
+pub(in crate::server) async fn reconcile_treekem_self_leave_rekeys_all_groups(
+    state: &Arc<AppState>,
+) {
+    let group_keys: Vec<String> = state.named_groups.read().await.keys().cloned().collect();
+    for group_key in group_keys {
+        let rotated =
+            reconcile_treekem_self_leave_rekeys(state, &group_key, "startup_catchup").await;
+        if rotated > 0 {
+            tracing::info!(
+                group_id = %LogHexId::group(&group_key),
+                rotated,
+                "startup catch-up closed pending self-leave rekeys"
+            );
+        }
+    }
 }
 
 /// GET /groups/:id/state — Phase D.3: inspect the stable-identity +
@@ -16598,7 +18125,7 @@ pub(in crate::server) async fn leave_group(
         }
     };
     let event = NamedGroupMetadataEvent::MemberRemoved {
-        group_id: event_group_id,
+        group_id: event_group_id.clone(),
         revision,
         actor: local_agent_hex.clone(),
         agent_id: local_agent_hex.clone(),
@@ -16640,6 +18167,8 @@ pub(in crate::server) async fn leave_group(
     let mut cache = state.group_card_cache.write().await;
     prune_expired_group_cards(&mut cache, now_millis_u64());
     cache.remove(&id);
+    // Released before the shared teardown below, which takes the same lock.
+    drop(cache);
     state.mls_groups.write().await.remove(&id);
     // ADR-0012: drop the live TreeKEM group and wipe at-rest TreeKEM
     // persistence (snapshot plus replay journal, both containing private key
@@ -16648,6 +18177,10 @@ pub(in crate::server) async fn leave_group(
     // (NotFound is ignored).
     state.treekem_groups.write().await.remove(&id);
     remove_treekem_persistence_for_group_id(&state, &id, "leave_group").await;
+    // Issue #376: everything above is keyed by the local group id. The TreeKEM
+    // event log and pending-event queue are keyed by the STABLE id, so they
+    // survived this teardown on a node that had just left the group.
+    wipe_local_group_crypto_material(&state, &id, Some(&event_group_id), "leave_group").await;
     save_mls_groups(&state).await;
     stop_named_group_metadata_listener(&state, &id).await;
 
@@ -20804,9 +22337,26 @@ fn treekem_snapshot_envelope_matches_info(
     envelope: &TreeKemSnapshotEnvelope,
     info: &x0x::groups::GroupInfo,
 ) -> bool {
-    envelope.state_revision == info.state_revision
-        && envelope.state_hash == info.state_hash
-        && envelope.security_binding == info.security_binding
+    // `security_binding` (the TreeKEM/MLS epoch) is the crypto-relevant seal.
+    // There is exactly one snapshot file per group, overwritten in place on
+    // every crypto operation (including per-message ratchet re-seals), so the
+    // on-disk snapshot is always the freshest tree for the group — the epoch is
+    // NOT a fine-grained tree hash, it is a rekey counter. A matching epoch
+    // therefore confirms no rekey advanced `info` past what the snapshot last
+    // captured; a rekey persisted to `info` without re-sealing the snapshot
+    // leaves the epochs unequal and is still refused here.
+    //
+    // `state_revision`/`state_hash` are metadata-plane commitments that advance
+    // for roster-only governance (role changes, ban/unban tombstones) which
+    // never touch the TreeKEM tree, so the snapshot is legitimately not
+    // re-sealed for them. Requiring exact equality there bricked groups on
+    // restart after any such governance action (#399) — the snapshot read
+    // "behind" the metadata and the group refused to load. Only refuse a
+    // snapshot that is *ahead* of the durable metadata; the metadata may lead
+    // the last-sealed snapshot, but a snapshot ahead of it signals a
+    // rolled-back / inconsistent named-groups record.
+    envelope.security_binding == info.security_binding
+        && envelope.state_revision <= info.state_revision
 }
 
 async fn persist_treekem_snapshot_bytes(
@@ -25762,56 +27312,349 @@ pub(in crate::server) async fn write_named_groups_json_atomic(
 
 // A day, not minutes: the counterparty in a join is often a phone — locked,
 // backgrounded, offline — so the two halves of the handshake can be hours
-// apart. The joiner keeps polling only for JOIN_RESULT_POLL_TIMEOUT, but the
-// staged result (owner side) and the armed expected-inviter (joiner side)
-// must both outlive that window, or a late half permanently orphans the
-// join: the owner never re-stages for an already-active member, and the
-// joiner rejects a result it no longer expects (`missing_expected_inviter`).
-// Both stores are in-memory (lost to restarts) and re-armed by a retried
-// join, so retention this long costs only bytes, never correctness.
+// apart. The staged result (owner side) and the armed expected-inviter
+// (joiner side) must both outlive the poll window, or a late half permanently
+// orphans the join: the owner never re-stages for an already-active member,
+// and the joiner rejects a result it no longer expects
+// (`missing_expected_inviter`). The staged stores persist to the join-result
+// sidecar (#390) and TTLs count in wall-clock ms, so retention spans daemon
+// restarts.
 const PENDING_JOIN_RESULT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
-const JOIN_RESULT_POLL_TIMEOUT: Duration = Duration::from_secs(120);
+/// True while a wall-clock-stamped staging entry is inside `ttl`. A stamp in
+/// the future (clock stepped back between restarts) reads as fresh, matching
+/// the ADR-0028 sidecars' skew tolerance.
+fn staging_entry_fresh(created_at_ms: u64, ttl: Duration, now_ms: u64) -> bool {
+    now_ms.saturating_sub(created_at_ms) < ttl.as_millis() as u64
+}
 
-/// Non-TreeKEM joins have no TreeKEM Welcome to converge on, so their repair
-/// poll runs for as long as the authority keeps the staged `MemberAdded`
-/// commit (`PENDING_JOIN_RESULT_TTL`): a commit missed during the join window
-/// stays pullable for the whole staging lifetime (#297).
-const NON_TREEKEM_JOIN_RESULT_POLL_TIMEOUT: Duration = PENDING_JOIN_RESULT_TTL;
+/// #390: versioned sidecar for the join-result staging stores. One file for
+/// both maps: they are written by the same staging sites, served together,
+/// and wiped together on departure/ban, so a single atomic write keeps them
+/// mutually consistent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JoinResultStagingSidecar {
+    version: u32,
+    #[serde(default)]
+    join_results: HashMap<String, PendingJoinResult>,
+    #[serde(default)]
+    welcomes: HashMap<String, PendingWelcome>,
+}
+
+/// Wall-clock cadence for `MemberJoined` resends to the authority (#333),
+/// decoupled from the poll's exponential backoff (see the resend arm in
+/// [`poll_join_result_until_deadline`]). ~6 s preserves the cadence the
+/// propagation tests were calibrated against.
+const MEMBER_JOINED_RESEND_INTERVAL: Duration = Duration::from_secs(6);
+
+/// Stop resending after this many attempts (~2 min at the cadence above);
+/// the poll itself keeps running to `JOIN_RESULT_POLL_HORIZON`.
+const MEMBER_JOINED_RESEND_MAX_ATTEMPTS: u32 = 20;
+
+const JOIN_RESULT_STAGING_SIDECAR_VERSION: u32 = 1;
+
+/// Loader bound: staged entries beyond this per-map cap are dropped
+/// oldest-first. Joins are rare and TTL-pruned, so a real daemon never nears
+/// it; the cap only bounds a corrupted or hand-crafted sidecar.
+const JOIN_RESULT_STAGING_MAX_ENTRIES: usize = 256;
+
+/// #390: persist both staging maps — persistence lock (P) then data read
+/// locks (Q), mirroring the ADR-0028 sidecars. Callers that already hold a
+/// staging map's write lock MUST drop it first.
+pub(in crate::server) async fn save_join_result_staging(
+    state: &AppState,
+) -> std::io::Result<AtomicWriteOutcome> {
+    let _persistence_guard = state.join_result_staging_persistence_lock.lock().await;
+    let json_result = {
+        let results = state.pending_join_results.read().await;
+        let welcomes = state.pending_welcomes.read().await;
+        let sidecar = JoinResultStagingSidecar {
+            version: JOIN_RESULT_STAGING_SIDECAR_VERSION,
+            join_results: results.clone(),
+            welcomes: welcomes.clone(),
+        };
+        serde_json::to_string(&sidecar)
+            .map_err(|e| std::io::Error::other(format!("serialize join-result staging: {e}")))
+    };
+    let json = match json_result {
+        Ok(json) => json,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "#390: join-result staging serialization failed before replacement"
+            );
+            return Ok(AtomicWriteOutcome::NotReplaced);
+        }
+    };
+    write_named_groups_json_atomic(&state.join_result_staging_path, &json).await
+}
+
+/// Log-and-continue wrapper for the staging save: durability here is an
+/// upgrade over the pre-#390 in-memory-only behavior, never a reason to fail
+/// the staging call itself.
+async fn persist_join_result_staging(state: &AppState) {
+    if let Err(error) = save_join_result_staging(state).await {
+        tracing::warn!(%error, "#390: failed to persist join-result staging sidecar");
+    }
+}
+
+/// #390: restore the staging maps at boot. Lenient by design — this is
+/// best-effort delivery state, not causal-integrity state. A missing file is
+/// a clean start; an unreadable or wrong-version file is set aside as
+/// `.corrupt` (evidence preserved, the next save writes fresh); entries are
+/// TTL-pruned and capped before they reach memory so a stale or oversized
+/// sidecar cannot resurrect unbounded state. Runs before the group listeners
+/// spawn, and the departure/ban wipe re-saves post-wipe, so a banned group's
+/// staging never survives a restart (#384 invariant).
+pub(in crate::server) async fn load_join_result_staging(state: &AppState) {
+    let path = state.join_result_staging_path.clone();
+    let raw = match tokio::fs::read(&path).await {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                path = %path.display(),
+                "#390: cannot read join-result staging sidecar; starting empty"
+            );
+            return;
+        }
+    };
+    let sidecar: JoinResultStagingSidecar = match serde_json::from_slice(&raw) {
+        Ok(sidecar) => sidecar,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                path = %path.display(),
+                "#390: join-result staging sidecar unreadable; setting aside as .corrupt"
+            );
+            set_aside_corrupt_staging_sidecar(&path).await;
+            return;
+        }
+    };
+    if sidecar.version != JOIN_RESULT_STAGING_SIDECAR_VERSION {
+        tracing::error!(
+            version = sidecar.version,
+            path = %path.display(),
+            "#390: unsupported join-result staging sidecar version; setting aside as .corrupt"
+        );
+        set_aside_corrupt_staging_sidecar(&path).await;
+        return;
+    }
+    let now_ms = now_millis_u64();
+    let mut join_results = sidecar.join_results;
+    join_results
+        .retain(|_, p| staging_entry_fresh(p.created_at_ms, PENDING_JOIN_RESULT_TTL, now_ms));
+    let mut welcomes = sidecar.welcomes;
+    welcomes.retain(|_, p| staging_entry_fresh(p.created_at_ms, PENDING_WELCOME_TTL, now_ms));
+    cap_staging_oldest_first(&mut join_results, |p| p.created_at_ms);
+    cap_staging_oldest_first(&mut welcomes, |p| p.created_at_ms);
+    let (results_len, welcomes_len) = (join_results.len(), welcomes.len());
+    *state.pending_join_results.write().await = join_results;
+    *state.pending_welcomes.write().await = welcomes;
+    if results_len > 0 || welcomes_len > 0 {
+        tracing::info!(
+            join_results = results_len,
+            welcomes = welcomes_len,
+            "#390: restored staged join-results from sidecar"
+        );
+    }
+}
+
+async fn set_aside_corrupt_staging_sidecar(path: &FsPath) {
+    let mut corrupt = path.as_os_str().to_owned();
+    corrupt.push(".corrupt");
+    if let Err(error) = tokio::fs::rename(path, &corrupt).await {
+        tracing::warn!(%error, "#390: failed to set aside corrupt staging sidecar");
+    }
+}
+
+/// Drop oldest entries beyond [`JOIN_RESULT_STAGING_MAX_ENTRIES`].
+fn cap_staging_oldest_first<V>(map: &mut HashMap<String, V>, created_at_ms: impl Fn(&V) -> u64) {
+    if map.len() <= JOIN_RESULT_STAGING_MAX_ENTRIES {
+        return;
+    }
+    let mut stamps: Vec<(u64, String)> = map
+        .iter()
+        .map(|(key, value)| (created_at_ms(value), key.clone()))
+        .collect();
+    stamps.sort_unstable();
+    let excess = map.len() - JOIN_RESULT_STAGING_MAX_ENTRIES;
+    for (_, key) in stamps.into_iter().take(excess) {
+        map.remove(&key);
+    }
+}
+
+/// #390 (cross-review): who a boot-time re-armed poll may ask for the
+/// staged join-result, or `None` when the group must not be polled at all.
+///
+/// Only the admin that authored the invite ever stages the join-result (the
+/// `local_is_inviter` gate in the `MemberJoined` apply arm), and after a
+/// restart the joiner no longer knows which admin that was — so EVERY
+/// active admin is polled (creator included). Only the true inviter holds
+/// the staged result and replies, and the receive path's author-delivered
+/// fallback plus the authority-commit verification still gate the reply, so
+/// a wrong guess can miss but never forge.
+///
+/// `None` for: a withdrawn tombstone; a group this agent is locally BANNED
+/// from (the Banned tombstone deliberately survives departure — re-polling
+/// the banning admin would be indefinite unwanted traffic and a liveness
+/// beacon to the party that removed us); and our own group (we are an
+/// authority, there is no counterparty).
+fn respawn_poll_targets(
+    info: &x0x::groups::GroupInfo,
+    self_agent: &AgentId,
+    self_hex: &str,
+) -> Option<Vec<AgentId>> {
+    if info.withdrawn || info.is_banned(self_hex) {
+        return None;
+    }
+    if info.creator == *self_agent {
+        return None;
+    }
+    let mut targets: Vec<AgentId> = info
+        .active_members()
+        .filter(|member| member.role.at_least(x0x::groups::GroupRole::Admin))
+        .filter_map(|member| parse_agent_id_hex(&member.agent_id).ok())
+        .filter(|id| id != self_agent)
+        .collect();
+    if !targets.contains(&info.creator) {
+        targets.push(info.creator);
+    }
+    Some(targets)
+}
+
+/// #390: on daemon start, re-arm the join-result poll for every locally
+/// known group whose join never converged before the previous shutdown — the
+/// poll task dies with the process and nothing else on the joiner
+/// re-requests the Welcome (an app relaunch mid-join is a daemon restart).
+///
+/// Unconverged means: TreeKEM plane — the group is known but no TreeKEM
+/// state is installed under any alias (roster-listed-or-stubbed, keyless);
+/// GSS plane — the local roster does not list this agent (#297 repair case).
+/// Poll targets and exclusions are [`respawn_poll_targets`]'s decision. A
+/// group whose staged result no longer exists anywhere polls harmlessly at
+/// the backoff cap until the 24h horizon lapses.
+///
+/// Returns the re-armed group ids so startup logging and tests observe the
+/// decision without any network traffic.
+pub(in crate::server) async fn respawn_unconverged_join_polls(state: Arc<AppState>) -> Vec<String> {
+    let self_agent = state.agent.agent_id();
+    let self_hex = hex::encode(self_agent.as_bytes());
+    struct Candidate {
+        group_id: String,
+        mls_group_id: String,
+        stable_group_id: String,
+        targets: Vec<AgentId>,
+        is_treekem: bool,
+        self_in_roster: bool,
+    }
+    let candidates: Vec<Candidate> = {
+        let groups = state.named_groups.read().await;
+        groups
+            .iter()
+            .filter_map(|(group_id, info)| {
+                let targets = respawn_poll_targets(info, &self_agent, &self_hex)?;
+                if targets.is_empty() {
+                    return None;
+                }
+                Some(Candidate {
+                    group_id: group_id.clone(),
+                    mls_group_id: info.mls_group_id.clone(),
+                    stable_group_id: info.stable_group_id().to_string(),
+                    targets,
+                    is_treekem: info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem,
+                    self_in_roster: info.has_member(&self_hex),
+                })
+            })
+            .collect()
+    };
+    let mut respawned = Vec::new();
+    for candidate in candidates {
+        let unconverged = if candidate.is_treekem {
+            let treekem = state.treekem_groups.read().await;
+            !(treekem.contains_key(&candidate.group_id)
+                || treekem.contains_key(&candidate.mls_group_id)
+                || treekem.contains_key(&candidate.stable_group_id))
+        } else {
+            !candidate.self_in_roster
+        };
+        if !unconverged {
+            continue;
+        }
+        let poll_state = Arc::clone(&state);
+        let poll_group = candidate.group_id.clone();
+        let poll_event_group = candidate.stable_group_id;
+        let poll_member = self_hex.clone();
+        let await_treekem = candidate.is_treekem;
+        let targets = candidate.targets;
+        tokio::spawn(async move {
+            poll_join_result_until_membership_confirmed(
+                poll_state,
+                poll_group,
+                poll_event_group,
+                targets,
+                poll_member,
+                await_treekem,
+                // The signed MemberJoined died with the previous process:
+                // there is nothing to resend and no single inviter (#333
+                // resend stays fresh-join-only).
+                None,
+            )
+            .await;
+        });
+        respawned.push(candidate.group_id);
+    }
+    respawned
+}
+
+/// #390: BOTH planes poll for as long as the authority keeps the staged
+/// `MemberAdded` commit (`PENDING_JOIN_RESULT_TTL`). The old 120s TreeKEM
+/// give-up predates the staged stores surviving restarts: it silently
+/// orphaned any join whose Welcome delivery outlived two minutes of mesh
+/// trouble, which the LAN-fleet reproof hit on every unhealthy-mesh join.
+/// The poll now backs off (`join_result_poll_delay`) instead of burning a
+/// fixed 2s interval for a day.
+const JOIN_RESULT_POLL_HORIZON: Duration = PENDING_JOIN_RESULT_TTL;
 
 /// Retention for recorded expected join-result inviters. Must cover the
-/// longest join-result poll window so late roster-repair responses are still
-/// accepted instead of rejected as `missing_expected_inviter`.
-///
-/// This is a single retention for ALL planes, so pinning it to the non-TreeKEM
-/// window also widens TreeKEM pins from 120 s to the full staging retention.
-/// That is deliberate and
-/// harmless: a TreeKEM poll clears its own pin at `JOIN_RESULT_POLL_TIMEOUT`,
-/// so the longer retention only affects entries whose poll task died without
-/// clearing. A pin authorizes nothing on its own — it names the one inviter
-/// whose `MemberAdded` this joiner will consider, and the event still goes
+/// join-result poll horizon so late roster-repair responses are still
+/// accepted instead of rejected as `missing_expected_inviter`. A pin
+/// authorizes nothing on its own — it names the one inviter whose
+/// `MemberAdded` this joiner will consider, and the event still goes
 /// through `apply_named_group_metadata_event`.
-const EXPECTED_JOIN_RESULT_INVITER_TTL: Duration = NON_TREEKEM_JOIN_RESULT_POLL_TIMEOUT;
+const EXPECTED_JOIN_RESULT_INVITER_TTL: Duration = JOIN_RESULT_POLL_HORIZON;
 
 const JOIN_RESULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// How many unconfirmed join-result polls pass between `MemberJoined` resends
-/// to the authority (#333). At `JOIN_RESULT_POLL_INTERVAL` that is roughly one
-/// resend every 6s — slow enough that a merely slow authority is not spammed,
-/// fast enough that a lost join volley is repaired well inside the 30s the
-/// propagation tests allow.
-const MEMBER_JOINED_RESEND_POLL_INTERVALS: u32 = 3;
+/// Ceiling for the poll's exponential backoff: frequent enough that a mesh
+/// recovery converges the join within minutes, rare enough that a day-long
+/// horizon costs ~300 sends instead of 43 200.
+const JOIN_RESULT_POLL_BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
 
-const PENDING_WELCOME_TTL: Duration = Duration::from_secs(10 * 60);
+/// Delay before poll attempt `attempt` (0-based): 2s, 4s, 8s, … capped at
+/// [`JOIN_RESULT_POLL_BACKOFF_CAP`]. Pure, so the schedule is unit-testable.
+fn join_result_poll_delay(attempt: u32) -> Duration {
+    JOIN_RESULT_POLL_INTERVAL
+        .saturating_mul(1u32 << attempt.min(16))
+        .min(JOIN_RESULT_POLL_BACKOFF_CAP)
+}
 
-const WELCOME_FETCH_TIMEOUT: Duration = Duration::from_secs(90);
+/// #390: matches `PENDING_JOIN_RESULT_TTL`. The old 10-minute welcome TTL
+/// under a 24h join-result TTL left a window where the owner served a
+/// `MemberAdded` whose `welcome_ref` resolved to nothing (`welcome_not_staged`
+/// on the inline path, "unknown blob" on the native path) — an orphaned join
+/// with no repair short of a fresh invite + re-key.
+const PENDING_WELCOME_TTL: Duration = PENDING_JOIN_RESULT_TTL;
 
-const WELCOME_FETCH_RETRY_DELAYS: [Duration; 4] = [
-    Duration::ZERO,
-    Duration::from_secs(5),
-    Duration::from_secs(20),
-    Duration::from_secs(60),
-];
+/// #390: one bounded attempt. The Welcome pull runs inside
+/// `apply_named_group_metadata_event` while the per-group membership guard is
+/// held, inside the sequential join-result DM listener — the old 90s × 4-try
+/// ladder pinned that lane for up to ~7.5 minutes on an unhealthy mesh,
+/// evicting queued DMs and outliving the poll window. Retry cadence belongs
+/// to `poll_join_result_until_membership_confirmed`, which re-delivers the
+/// event and re-enters this fetch on its own backoff.
+const WELCOME_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn welcome_id_for_bytes(bytes: &[u8]) -> String {
     hex::encode(blake3::hash(bytes).as_bytes())
@@ -25819,6 +27662,50 @@ fn welcome_id_for_bytes(bytes: &[u8]) -> String {
 
 fn join_result_key(group_id: &str, member_agent_id: &str) -> String {
     format!("{group_id}:{member_agent_id}")
+}
+
+/// The members of a group whose staged join-result exists, is fresh, and
+/// has never been positively delivered — the set the members endpoint
+/// surfaces as `pending_welcome` so a shell can render "joining…" instead
+/// of a silently keyless full member. `group_keys` carries every id the
+/// staging may have keyed under (canonical + stable alias).
+fn pending_welcome_member_set(
+    results: &HashMap<String, PendingJoinResult>,
+    group_keys: &[&str],
+    member_agent_ids: &[&str],
+    now_ms: u64,
+) -> std::collections::HashSet<String> {
+    let mut pending = std::collections::HashSet::new();
+    for member in member_agent_ids {
+        for gk in group_keys {
+            if let Some(entry) = results.get(&join_result_key(gk, member)) {
+                if entry.delivered_at_ms.is_none()
+                    && staging_entry_fresh(entry.created_at_ms, PENDING_JOIN_RESULT_TTL, now_ms)
+                {
+                    pending.insert((*member).to_string());
+                    break;
+                }
+            }
+        }
+    }
+    pending
+}
+
+/// Mark the staged join-result under `key` positively delivered (an acked
+/// direct send, or a completed inline/bridged serve) and persist the
+/// sidecar, so `pending_welcome` clears for that member. Idempotent; a
+/// missing or already-stamped entry writes nothing.
+async fn mark_join_result_delivered(state: &AppState, key: &str) {
+    {
+        let mut results = state.pending_join_results.write().await;
+        match results.get_mut(key) {
+            Some(p) if p.delivered_at_ms.is_none() => {
+                p.delivered_at_ms = Some(now_millis_u64());
+            }
+            _ => return,
+        }
+    }
+    persist_join_result_staging(state).await;
 }
 
 fn validate_join_result_inviter(
@@ -26022,8 +27909,10 @@ pub(in crate::server) async fn get_join_result_inline(
 ) -> impl IntoResponse {
     let key = join_result_key(&id, &member);
     let mut event = {
+        let now_ms = now_millis_u64();
         let mut results = state.pending_join_results.write().await;
-        results.retain(|_, p| p.created_at.elapsed() < PENDING_JOIN_RESULT_TTL);
+        results
+            .retain(|_, p| staging_entry_fresh(p.created_at_ms, PENDING_JOIN_RESULT_TTL, now_ms));
         match results.get(&key) {
             Some(p) => p.event.clone(),
             None => {
@@ -26069,6 +27958,10 @@ pub(in crate::server) async fn get_join_result_inline(
         };
         set_inline_welcome(&mut event, BASE64.encode(bytes));
     }
+    // A completed inline serve is a positive delivery observation (the
+    // bridged fetch is joiner-driven and relay-acked): clear the member's
+    // pending_welcome.
+    mark_join_result_delivered(&state, &key).await;
     (
         StatusCode::OK,
         Json(serde_json::json!({ "ok": true, "event": event })),
@@ -26235,6 +28128,7 @@ mod engine_a_tests {
             member_joined_recovery: None,
             member_recovery_history: Vec::new(),
             commit: None,
+            certificate_b64: None,
         };
         set_inline_welcome(&mut event, "V0VMQ09NRQ==".into());
         match event {
@@ -26328,16 +28222,22 @@ async fn stage_join_result(
         })
     }
     .await;
+    let now_ms = now_millis_u64();
     let mut results = state.pending_join_results.write().await;
-    results.retain(|_, pending| pending.created_at.elapsed() < PENDING_JOIN_RESULT_TTL);
+    results.retain(|_, pending| {
+        staging_entry_fresh(pending.created_at_ms, PENDING_JOIN_RESULT_TTL, now_ms)
+    });
     results.insert(
         key.clone(),
         PendingJoinResult {
             head_attestation: head_attestation.clone(),
             event,
-            created_at: Instant::now(),
+            created_at_ms: now_ms,
+            delivered_at_ms: None,
         },
     );
+    let pending_count = results.len();
+    drop(results);
     tracing::debug!(
         target: "treekem.trace",
         stage = "stage_join_result",
@@ -26350,8 +28250,9 @@ async fn stage_join_result(
         has_inline_welcome,
         welcome_ref = ?welcome_ref_id,
         treekem_epoch = ?treekem_epoch,
-        pending_count = results.len(),
+        pending_count,
     );
+    persist_join_result_staging(state).await;
 }
 
 /// #447/#458: re-fire a `MemberJoined` volley for a join whose local stub
@@ -26492,24 +28393,45 @@ async fn refire_pending_join_volley(
         Arc::clone(state),
         group_id_hex.to_string(),
         stable_group_id,
-        inviter,
+        vec![inviter],
         joiner_hex,
         invite_is_treekem,
         Some(resend),
     ));
 }
 
+/// Issue #377: every arm below authorizes on `sender`, and on the raw-QUIC
+/// direct path the sender AgentId is a self-asserted 32-byte wire prefix — only
+/// the `MachineId` is authenticated by the QUIC handshake. `verified` is the
+/// transport's assertion that the claimed AgentId→MachineId binding was
+/// confirmed, so without it `sender_hex == member_agent_id` and
+/// `validate_join_result_inviter` compare against an attacker-chosen string.
+/// Mirrors `handle_treekem_catchup_request` / `_response` and the direct
+/// metadata listener, which already carry `msg.verified` into their gates.
+/// Gossip-inbox and loopback deliveries always set `verified`, so this only
+/// rejects raw-QUIC senders we cannot bind; the join-result poll loop re-issues
+/// the fetch once the identity announcement lands, and a gossip-isolated joiner
+/// has the token-gated `POST /groups/:id/join-result/:member` path.
 pub(in crate::server) async fn handle_join_result_message(
     state: &Arc<AppState>,
     sender: &AgentId,
+    verified: bool,
     msg: JoinResultMessage,
 ) {
+    if !verified && !join_result_signed_ok(&msg, &hex::encode(sender.as_bytes())) {
+        tracing::warn!(
+            sender = %LogHexId::agent(&hex::encode(sender.as_bytes())),
+            "ignoring join-result message from unverified sender"
+        );
+        return;
+    }
     match msg {
         JoinResultMessage::FetchRequest {
             group_id,
             member_agent_id,
             from_revision,
             base_state_hash: _base_state_hash,
+            signed_by: _,
         } => {
             let sender_hex = hex::encode(sender.as_bytes());
             tracing::debug!(
@@ -26529,10 +28451,29 @@ pub(in crate::server) async fn handle_join_result_message(
             // admission for this group BEFORE answering, so "nothing
             // staged" can turn into a staged result on the next poll.
             retry_pending_owner_cert_joins(state, Some(&group_id)).await;
+            // Signed fetches are replayable for the staging TTL, and the serve
+            // pays an ML-DSA sign plus a locked staging sweep per request. The
+            // per-(group, member) entry mirrors the mk-serve throttle; the
+            // joiner's poll backoff is coarser than the window, so a
+            // legitimate retry is never blocked.
+            let throttle_key = format!("{group_id}:jr-serve:{sender_hex}");
+            {
+                let mut throttle = state.treekem_catchup_throttle.write().await;
+                if throttle
+                    .get(&throttle_key)
+                    .is_some_and(|last| last.elapsed() < TREEKEM_CATCHUP_THROTTLE)
+                {
+                    return;
+                }
+                throttle.insert(throttle_key, Instant::now());
+            }
             let key = join_result_key(&group_id, &member_agent_id);
             let (event, head_attestation, pending_count) = {
+                let now_ms = now_millis_u64();
                 let mut results = state.pending_join_results.write().await;
-                results.retain(|_, pending| pending.created_at.elapsed() < PENDING_JOIN_RESULT_TTL);
+                results.retain(|_, pending| {
+                    staging_entry_fresh(pending.created_at_ms, PENDING_JOIN_RESULT_TTL, now_ms)
+                });
                 (
                     results.get(&key).map(|pending| pending.event.clone()),
                     results
@@ -26602,10 +28543,15 @@ pub(in crate::server) async fn handle_join_result_message(
                 }
                 None => Vec::new(),
             };
+            let response_signer = build_catchup_signer(
+                state,
+                &join_result_result_sign_input(&group_id, &member_agent_id),
+            );
             let response = JoinResultMessage::Result {
                 event: Box::new(event),
                 chain,
                 head_attestation: head_attestation.map(Box::new),
+                signed_by: response_signer,
             };
             let payload = match serde_json::to_vec(&response) {
                 Ok(payload) => payload,
@@ -26648,12 +28594,16 @@ pub(in crate::server) async fn handle_join_result_message(
                     payload_len,
                     payload_hash = %payload_hash,
                 );
+                // The send only reports Ok on a recipient ACK, so this is
+                // a positive delivery: clear the member's pending_welcome.
+                mark_join_result_delivered(state, &key).await;
             }
         }
         JoinResultMessage::Result {
             event,
             chain,
             head_attestation,
+            signed_by: _,
         } => {
             let event = *event;
             tracing::debug!(
@@ -26750,44 +28700,64 @@ pub(in crate::server) async fn handle_join_result_message(
 }
 
 /// Poll the join authority for the authoritative join result until the join
-/// is locally confirmed, re-requesting the staged `MemberAdded` commit every
-/// `JOIN_RESULT_POLL_INTERVAL`.
+/// is locally confirmed, re-requesting the staged `MemberAdded` commit on the
+/// `join_result_poll_delay` backoff for up to `JOIN_RESULT_POLL_HORIZON`.
 ///
 /// Confirmation depends on the secure plane: TreeKEM joins (`await_treekem`)
 /// converge once the TreeKEM group is installed, i.e. the Welcome carried by
 /// the join result has been processed. Non-TreeKEM joins have no key schedule
 /// to converge; they converge once the local roster lists the joiner as an
-/// active member, and poll for the longer
-/// `NON_TREEKEM_JOIN_RESULT_POLL_TIMEOUT` so a `MemberAdded` commit missed
-/// during the join window (e.g. a gossip connection dropping right after the
-/// join was accepted) is repaired instead of leaving the joiner permanently
-/// absent from its own roster and write-locked with a 403 (#297).
-///
-/// The poll also repairs the *outbound* leg. `member_joined` carries the
-/// signed `MemberJoined` event the join volley sent; if that volley was lost
-/// outright the authority never stages a result, so nothing this loop fetches
-/// can ever succeed. Every `MEMBER_JOINED_RESEND_POLL_INTERVALS` unconfirmed
-/// polls the volley is re-sent (#333). Re-application is a documented no-op
-/// for an already-active member, and once the authority applies it the staged
-/// result satisfies the next poll — so resends stop on their own.
+/// active member, repairing a `MemberAdded` commit missed during the join
+/// window instead of leaving the joiner permanently absent from its own
+/// roster and write-locked with a 403 (#297). Both planes share the staged
+/// stores' 24h horizon (#390); the loop is re-armed after a daemon restart by
+/// `respawn_unconverged_join_polls`.
 async fn poll_join_result_until_membership_confirmed(
     state: Arc<AppState>,
     group_id: String,
     event_group_id: String,
-    inviter: AgentId,
+    targets: Vec<AgentId>,
     member_agent_id: String,
     await_treekem: bool,
     member_joined: Option<MemberJoinedResend>,
 ) {
-    let timeout = if await_treekem {
-        JOIN_RESULT_POLL_TIMEOUT
-    } else {
-        NON_TREEKEM_JOIN_RESULT_POLL_TIMEOUT
-    };
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = tokio::time::Instant::now() + JOIN_RESULT_POLL_HORIZON;
+    poll_join_result_until_deadline(
+        state,
+        group_id,
+        event_group_id,
+        targets,
+        member_agent_id,
+        await_treekem,
+        member_joined,
+        deadline,
+    )
+    .await;
+}
+
+/// [`poll_join_result_until_membership_confirmed`] with an injectable
+/// deadline, so tests can drive the give-up path without the 24h horizon.
+/// `targets` is usually the single known inviter; a boot-time re-arm passes
+/// every active admin because only the (no-longer-known) inviter holds the
+/// staged result — non-holders ignore the fetch, so extra targets cost one
+/// small DM per tick and can never serve a wrong result past the receive
+/// path's verification.
+#[allow(clippy::too_many_arguments)]
+async fn poll_join_result_until_deadline(
+    state: Arc<AppState>,
+    group_id: String,
+    event_group_id: String,
+    targets: Vec<AgentId>,
+    member_agent_id: String,
+    await_treekem: bool,
+    member_joined: Option<MemberJoinedResend>,
+    deadline: tokio::time::Instant,
+) {
     let expected_key = join_result_key(&event_group_id, &member_agent_id);
+    let mut attempt: u32 = 0;
     let mut timed_out = true;
-    let mut unconfirmed_polls: u32 = 0;
+    let mut resend_attempts: u32 = 0;
+    let mut next_resend_at = tokio::time::Instant::now() + MEMBER_JOINED_RESEND_INTERVAL;
     while tokio::time::Instant::now() < deadline {
         let confirmed = if await_treekem {
             state.treekem_groups.read().await.contains_key(&group_id)
@@ -26803,7 +28773,6 @@ async fn poll_join_result_until_membership_confirmed(
             timed_out = false;
             break;
         }
-        unconfirmed_polls = unconfirmed_polls.saturating_add(1);
         let (from_revision, base_state_hash) = {
             let groups = state.named_groups.read().await;
             groups
@@ -26816,6 +28785,10 @@ async fn poll_join_result_until_membership_confirmed(
             member_agent_id: member_agent_id.clone(),
             from_revision,
             base_state_hash,
+            signed_by: build_catchup_signer(
+                &state,
+                &join_result_fetch_sign_input(&event_group_id, &member_agent_id),
+            ),
         };
         let payload = match serde_json::to_vec(&request) {
             Ok(payload) => payload,
@@ -26832,35 +28805,38 @@ async fn poll_join_result_until_membership_confirmed(
             group_id = %group_id,
             event_group_id = %event_group_id,
             member = %member_agent_id,
+            targets = targets.len(),
             payload_len,
             payload_hash = %payload_hash,
         );
-        if let Err(e) = state
-            .agent
-            .send_direct_with_config(&inviter, payload, direct_message_send_config())
-            .await
-        {
-            tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch attempt failed: {e}");
-            tracing::debug!(
-                target: "treekem.trace",
-                stage = "fetch_request_send_err",
-                group_id = %group_id,
-                event_group_id = %event_group_id,
-                member = %member_agent_id,
-                payload_len,
-                payload_hash = %payload_hash,
-                error = %e,
-            );
-        } else {
-            tracing::debug!(
-                target: "treekem.trace",
-                stage = "fetch_request_send_ok",
-                group_id = %group_id,
-                event_group_id = %event_group_id,
-                member = %member_agent_id,
-                payload_len,
-                payload_hash = %payload_hash,
-            );
+        for target in &targets {
+            if let Err(e) = state
+                .agent
+                .send_direct_with_config(target, payload.clone(), direct_message_send_config())
+                .await
+            {
+                tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch attempt failed: {e}");
+                tracing::debug!(
+                    target: "treekem.trace",
+                    stage = "fetch_request_send_err",
+                    group_id = %group_id,
+                    event_group_id = %event_group_id,
+                    member = %member_agent_id,
+                    payload_len,
+                    payload_hash = %payload_hash,
+                    error = %e,
+                );
+            } else {
+                tracing::debug!(
+                    target: "treekem.trace",
+                    stage = "fetch_request_send_ok",
+                    group_id = %group_id,
+                    event_group_id = %event_group_id,
+                    member = %member_agent_id,
+                    payload_len,
+                    payload_hash = %payload_hash,
+                );
+            }
         }
         // Outbound-leg repair (#333): the authority can only stage a result
         // for a `MemberJoined` it actually received, so a lost join volley
@@ -26873,55 +28849,75 @@ async fn poll_join_result_until_membership_confirmed(
         // targets), while the metadata publish needs no key material but only
         // reaches an authority the mesh already covers.
         //
+        // Wall-clock cadence, deliberately decoupled from the poll's
+        // exponential backoff: "every 3rd poll" was calibrated against a
+        // fixed 2 s tick and would stretch to 14 s -> 15 min under the
+        // backoff, missing the very repair window it exists to close. And
+        // bounded: the poll runs to a 24 h horizon, and an unbounded 6 s
+        // resend for 24 h is ~14,400 unwanted publishes per orphaned join
+        // (deviation from the unbounded upstream arm, whose loop died at
+        // 120 s).
+        //
         // Spawned, not awaited, for the same reason every other named-group
         // delivery is spawned: a send can block for the full ack timeout, and
         // blocking here would stretch the fetch cadence this loop exists to
         // maintain. Individual attempts are expected to fail; the repair is
         // the repetition, not any single send.
         if let Some(member_joined) = member_joined.as_ref() {
-            if unconfirmed_polls.is_multiple_of(MEMBER_JOINED_RESEND_POLL_INTERVALS) {
+            let now = tokio::time::Instant::now();
+            if resend_attempts < MEMBER_JOINED_RESEND_MAX_ATTEMPTS && now >= next_resend_at {
+                next_resend_at = now + MEMBER_JOINED_RESEND_INTERVAL;
+                resend_attempts = resend_attempts.saturating_add(1);
                 let resend_state = Arc::clone(&state);
-                let recipient = inviter;
+                let recipients = targets.clone();
                 let topic = member_joined.metadata_topic.clone();
                 let event = member_joined.event.clone();
                 let payload = member_joined.payload.clone();
                 let resend_len = payload.len();
                 let resend_hash = hex::encode(blake3::hash(&payload).as_bytes());
-                let attempt = unconfirmed_polls / MEMBER_JOINED_RESEND_POLL_INTERVALS;
+                let resend_attempt = resend_attempts;
                 let resend_group_id = group_id.clone();
                 let resend_event_group_id = event_group_id.clone();
                 let resend_member = member_agent_id.clone();
                 tokio::spawn(async move {
                     publish_named_group_metadata_event(&resend_state, &topic, &event).await;
-                    let error = resend_state
-                        .agent
-                        .send_direct_with_config(
-                            &recipient,
-                            payload,
-                            named_group_direct_delivery_config(),
-                        )
-                        .await
-                        .err();
-                    tracing::debug!(
-                        target: "treekem.trace",
-                        stage = "member_joined_resend",
-                        group_id = %resend_group_id,
-                        event_group_id = %resend_event_group_id,
-                        member = %resend_member,
-                        attempt,
-                        payload_len = resend_len,
-                        payload_hash = %resend_hash,
-                        direct_error = error.as_ref().map(|e| e.to_string()),
-                    );
+                    for recipient in &recipients {
+                        let error = resend_state
+                            .agent
+                            .send_direct_with_config(
+                                recipient,
+                                payload.clone(),
+                                named_group_direct_delivery_config(),
+                            )
+                            .await
+                            .err();
+                        tracing::debug!(
+                            target: "treekem.trace",
+                            stage = "member_joined_resend",
+                            group_id = %resend_group_id,
+                            event_group_id = %resend_event_group_id,
+                            member = %resend_member,
+                            attempt = resend_attempt,
+                            payload_len = resend_len,
+                            payload_hash = %resend_hash,
+                            direct_error = error.as_ref().map(|e| e.to_string()),
+                        );
+                    }
                 });
             }
         }
-        tokio::time::sleep(JOIN_RESULT_POLL_INTERVAL).await;
+        tokio::time::sleep(join_result_poll_delay(attempt)).await;
+        attempt = attempt.saturating_add(1);
+    }
+    if timed_out {
+        // #390: leave the expected-inviter pin armed. It carries its own
+        // 24h TTL, and a result that lands after the horizon must still
+        // apply — clearing it here orphaned late deliveries as
+        // `missing_expected_inviter`.
+        tracing::warn!(group_id = %LogHexId::group(&group_id), member = %LogHexId::agent(&member_agent_id), await_treekem, "timed out polling authority for join result; membership remains unconfirmed");
+        return;
     }
     clear_expected_join_result_inviter(state.as_ref(), &expected_key);
-    if timed_out {
-        tracing::warn!(group_id = %LogHexId::group(&group_id), member = %LogHexId::agent(&member_agent_id), await_treekem, "timed out polling authority for join result; membership remains unconfirmed");
-    }
 }
 
 async fn stage_treekem_welcome(
@@ -26933,15 +28929,20 @@ async fn stage_treekem_welcome(
     let welcome_id = welcome_id_for_bytes(&bytes);
     let byte_len = bytes.len() as u64;
     let source = hex::encode(state.agent.agent_id().as_bytes());
+    let now_ms = now_millis_u64();
     let pending = PendingWelcome {
         group_id: group_id.to_string(),
         joiner_agent: joiner_agent.to_string(),
         bytes,
-        created_at: Instant::now(),
+        created_at_ms: now_ms,
     };
     let mut welcomes = state.pending_welcomes.write().await;
-    welcomes.retain(|_, pending| pending.created_at.elapsed() < PENDING_WELCOME_TTL);
+    welcomes.retain(|_, pending| {
+        staging_entry_fresh(pending.created_at_ms, PENDING_WELCOME_TTL, now_ms)
+    });
     welcomes.insert(welcome_id.clone(), pending);
+    drop(welcomes);
+    persist_join_result_staging(state).await;
     WelcomeRef {
         welcome_id,
         byte_len,
@@ -27016,37 +29017,9 @@ async fn cleanup_welcome_fetch_state(state: &Arc<AppState>, welcome_id: &str) {
         .remove(welcome_id);
 }
 
-async fn fetch_treekem_welcome_with_retries(
-    state: &Arc<AppState>,
-    group_id: &str,
-    welcome_ref: &WelcomeRef,
-) -> std::result::Result<Vec<u8>, String> {
-    let mut last_error = None;
-    for (attempt, delay) in WELCOME_FETCH_RETRY_DELAYS.iter().enumerate() {
-        if !delay.is_zero() {
-            tokio::time::sleep(*delay).await;
-        }
-        match fetch_treekem_welcome(state, group_id, welcome_ref).await {
-            Ok(bytes) => return Ok(bytes),
-            Err(e) => {
-                tracing::warn!(
-                    target: "welcome.trace",
-                    stage = "fetch_retry_failed",
-                    group_id,
-                    welcome_id = %welcome_ref.welcome_id,
-                    attempt,
-                    next_delay_ms = ?WELCOME_FETCH_RETRY_DELAYS
-                        .get(attempt + 1)
-                        .map(|d| d.as_millis() as u64),
-                    error = %e,
-                );
-                last_error = Some(e);
-            }
-        }
-    }
-    Err(last_error.unwrap_or_else(|| "TreeKEM Welcome fetch did not run".to_string()))
-}
-
+/// #390: single bounded attempt — see [`WELCOME_FETCH_TIMEOUT`]. The caller
+/// holds the per-group membership guard inside the sequential join-result DM
+/// listener, so in-place retry ladders belong to the outer poll, never here.
 async fn fetch_treekem_welcome(
     state: &Arc<AppState>,
     group_id: &str,
@@ -27137,11 +29110,24 @@ async fn fetch_treekem_welcome(
     Ok(received)
 }
 
+/// Issue #377: same gate as [`handle_join_result_message`]. Every arm
+/// authorizes on `sender` alone — `pending.joiner_agent == sender_hex` decides
+/// who may pull a group's TreeKEM Welcome blob, and `receive.source ==
+/// sender_hex` decides who may offer, chunk or abort an in-flight fetch — so an
+/// unverified (attacker-chosen) AgentId makes all of them vacuous.
 pub(in crate::server) async fn handle_welcome_blob_message(
     state: &Arc<AppState>,
     sender: &AgentId,
+    verified: bool,
     msg: WelcomeBlobMessage,
 ) {
+    if !verified {
+        tracing::warn!(
+            sender = %LogHexId::agent(&hex::encode(sender.as_bytes())),
+            "ignoring TreeKEM Welcome blob message from unverified sender"
+        );
+        return;
+    }
     match msg {
         WelcomeBlobMessage::FetchRequest {
             group_id,
@@ -27225,7 +29211,7 @@ async fn handle_welcome_fetch_request(
         tracing::warn!(welcome_id, "Welcome fetch for unknown blob");
         return;
     };
-    if pending.created_at.elapsed() >= PENDING_WELCOME_TTL {
+    if !staging_entry_fresh(pending.created_at_ms, PENDING_WELCOME_TTL, now_millis_u64()) {
         state.pending_welcomes.write().await.remove(&welcome_id);
         return;
     }
@@ -27477,9 +29463,13 @@ pub(in crate::server) mod tests {
     mod adr0028_sidecar_recovery_controls;
     mod adr0038_owner_certified;
     mod cache_hardening_followup;
+    mod genesis_kp_catchup_398;
     mod hs_f2_membership_cluster;
     mod hs_r3_invite_auth;
+    mod join_result_390_staging;
     mod pr291_restart_marker_matrix;
+    mod sec377_dm_verified_gate;
+    mod sec393_file_verified_gate;
     fn fake_group_state_commit(
         group_id: &str,
         revision: u64,
@@ -28210,6 +30200,8 @@ pub(in crate::server) mod tests {
             predecessor_relay_outbox_path: treekem_dir.join("predecessor_relay_outbox.json"),
             public_group_bootstrap_outbox_path: treekem_dir
                 .join("public_group_bootstrap_outbox.json"),
+            join_result_staging_path: data_dir.join("pending_join_results.json"),
+            join_result_staging_persistence_lock: Mutex::new(()),
             treekem_member_key_packages,
             treekem_event_log: RwLock::new(HashMap::new()),
             treekem_catchup_throttle: RwLock::new(HashMap::new()),
@@ -28349,7 +30341,7 @@ pub(in crate::server) mod tests {
                 poll_state,
                 poll_group_id,
                 event_group_id,
-                inviter,
+                vec![inviter],
                 poll_member,
                 false,
                 // No `MemberJoined` payload: this test pins the loop's exit
@@ -28391,6 +30383,130 @@ pub(in crate::server) mod tests {
         assert!(
             expected_join_result_inviter(state.as_ref(), &expected_key).is_none(),
             "expected-inviter pin must be dropped when the repair poll stops"
+        );
+        Ok(())
+    }
+
+    /// Why: #390 — the poll's give-up used to clear the expected-inviter pin,
+    /// so a join result landing after the poll window was rejected as
+    /// `missing_expected_inviter` and the join stayed orphaned for good. A
+    /// timed-out poll must leave the pin armed; the pin's own 24h TTL bounds
+    /// its lifetime, and it authorizes nothing by itself.
+    #[tokio::test]
+    async fn timed_out_join_result_poll_leaves_expected_inviter_armed() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let (info, _owner_hex) = sole_owner_group();
+        let group_id = info.mls_group_id.clone();
+        let event_group_id = info.stable_group_id().to_string();
+        let joiner_hex = "bb".repeat(32);
+        let inviter = x0x::identity::AgentKeypair::generate()?.agent_id();
+        let expected_key = join_result_key(&event_group_id, &joiner_hex);
+        record_expected_join_result_inviter(
+            state.as_ref(),
+            expected_key.clone(),
+            hex::encode(inviter.as_bytes()),
+        );
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        // Deadline already elapsed: the loop body never runs and the poll
+        // gives up at once — the shortest reproduction of an exhausted
+        // horizon with the join still unconverged.
+        poll_join_result_until_deadline(
+            Arc::clone(&state),
+            group_id,
+            event_group_id,
+            vec![inviter],
+            joiner_hex,
+            false,
+            // No resend copy: the loop body never runs, and the #333 arm is
+            // exercised by the lost-initial-volley integration test.
+            None,
+            tokio::time::Instant::now(),
+        )
+        .await;
+
+        assert!(
+            expected_join_result_inviter(state.as_ref(), &expected_key).is_some(),
+            "a timed-out poll must leave the pin armed for late join results"
+        );
+        Ok(())
+    }
+
+    /// The #333 resend must run on a WALL-CLOCK cadence, decoupled from the
+    /// poll's exponential backoff: gated on "every 3rd poll" it fires at
+    /// 14 s → 15 min under the backoff and misses the repair window it exists
+    /// to close. This drives an unconverging poll for a bounded window and
+    /// asserts the resend's metadata publish landed within it (~6 s cadence).
+    #[tokio::test]
+    async fn member_joined_resend_fires_on_wall_clock_cadence_under_backoff() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let (info, owner_hex) = sole_owner_group();
+        let group_id = info.mls_group_id.clone();
+        let event_group_id = info.stable_group_id().to_string();
+        let joiner_hex = "cc".repeat(32);
+        let inviter = x0x::identity::AgentKeypair::generate()?.agent_id();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        let resend_topic = format!("test.resend.{event_group_id}");
+        let event = NamedGroupMetadataEvent::MemberJoined {
+            group_id: group_id.clone(),
+            stable_group_id: Some(event_group_id.clone()),
+            member_agent_id: joiner_hex.clone(),
+            member_public_key_b64: String::new(),
+            role: x0x::groups::GroupRole::Member,
+            display_name: Some("cadence probe".to_string()),
+            inviter_agent_id: owner_hex,
+            invite_secret: String::new(),
+            ts_ms: 0,
+            treekem_key_package_b64: None,
+            recovery_authority_agent_id: None,
+            recovery_authority_public_key_b64: None,
+            recovery_authority_signature_b64: None,
+            recovery_authority_commit: None,
+            signature_b64: String::new(),
+        };
+        let payload = serde_json::to_vec(&event)?;
+        let member_joined = Some(MemberJoinedResend {
+            metadata_topic: resend_topic.clone(),
+            event,
+            payload,
+        });
+
+        NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+            .lock()
+            .expect("publish-attempt recorder poisoned")
+            .clear();
+
+        // The joiner never lands in the roster, so the poll keeps repairing
+        // until the injected deadline. 15 s comfortably covers the ~6 s first
+        // resend even with fetch sends parked in failure paths.
+        poll_join_result_until_deadline(
+            Arc::clone(&state),
+            group_id,
+            event_group_id,
+            vec![inviter],
+            joiner_hex,
+            false,
+            member_joined,
+            tokio::time::Instant::now() + Duration::from_secs(15),
+        )
+        .await;
+
+        assert!(
+            NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+                .lock()
+                .expect("publish-attempt recorder poisoned")
+                .iter()
+                .any(|(topic, _, _)| topic == &resend_topic),
+            "the #333 resend must republish the MemberJoined within the poll window"
         );
         Ok(())
     }
@@ -33265,8 +35381,108 @@ pub(in crate::server) mod tests {
         Ok(bytes)
     }
 
+    /// `pending_welcome` truth (family-smoke find 2026-08-16): a joiner
+    /// whose staged join-result was never positively delivered sat in the
+    /// owner's roster as a full "active" member while being keyless and
+    /// mute — the owner had NO signal. The members endpoint now flags
+    /// exactly the staged-fresh-undelivered set; delivered or TTL-stale
+    /// entries clear the flag.
     #[test]
-    fn treekem_snapshot_envelope_binding_detects_mismatch() {
+    fn pending_welcome_flags_only_staged_fresh_undelivered_members() {
+        fn staged(delivered: Option<u64>, created_at_ms: u64) -> PendingJoinResult {
+            PendingJoinResult {
+                event: NamedGroupMetadataEvent::GroupDeleted {
+                    group_id: "g".into(),
+                    revision: 1,
+                    actor: "a".repeat(64),
+                    commit: None,
+                },
+                head_attestation: None,
+                created_at_ms,
+                delivered_at_ms: delivered,
+            }
+        }
+        let now: u64 = 100_000_000;
+        let gid = "11".repeat(32);
+        let stable = "22".repeat(32);
+        let undelivered = "aa".repeat(32);
+        let delivered = "bb".repeat(32);
+        let stale = "cc".repeat(32);
+        let keyless_via_alias = "dd".repeat(32);
+        let never_staged = "ee".repeat(32);
+        let mut results = HashMap::new();
+        results.insert(
+            join_result_key(&gid, &undelivered),
+            staged(None, now - 5_000),
+        );
+        results.insert(
+            join_result_key(&gid, &delivered),
+            staged(Some(now - 1_000), now - 5_000),
+        );
+        results.insert(
+            join_result_key(&gid, &stale),
+            staged(None, now - PENDING_JOIN_RESULT_TTL.as_millis() as u64 - 1),
+        );
+        // Staged under the group's OTHER alias (stable vs mls id).
+        results.insert(
+            join_result_key(&stable, &keyless_via_alias),
+            staged(None, now - 5_000),
+        );
+
+        let members = [
+            undelivered.as_str(),
+            delivered.as_str(),
+            stale.as_str(),
+            keyless_via_alias.as_str(),
+            never_staged.as_str(),
+        ];
+        let set =
+            pending_welcome_member_set(&results, &[gid.as_str(), stable.as_str()], &members, now);
+        assert!(set.contains(&undelivered), "staged+fresh+undelivered flags");
+        assert!(
+            set.contains(&keyless_via_alias),
+            "alias-keyed staging flags"
+        );
+        assert!(!set.contains(&delivered), "positively delivered clears");
+        assert!(!set.contains(&stale), "TTL-stale staging clears");
+        assert!(!set.contains(&never_staged), "never staged never flags");
+    }
+
+    /// Sidecar back-compat: entries persisted before `delivered_at_ms`
+    /// existed must deserialize as undelivered rather than fail the whole
+    /// sidecar load.
+    #[test]
+    fn pending_join_result_sidecar_backcompat_defaults_undelivered() {
+        let old = r#"{"event":{"kind":"group_deleted","group_id":"g","revision":1,"actor":"a"},"created_at_ms":7}"#;
+        let parsed: std::result::Result<PendingJoinResult, _> = serde_json::from_str(old);
+        if let Ok(p) = parsed {
+            assert_eq!(p.delivered_at_ms, None);
+            assert_eq!(p.created_at_ms, 7);
+        } else {
+            // The event enum's serde shape may not match this literal —
+            // round-trip instead: serialize a current entry, strip the new
+            // field, re-parse.
+            let entry = PendingJoinResult {
+                event: NamedGroupMetadataEvent::GroupDeleted {
+                    group_id: "g".into(),
+                    revision: 1,
+                    actor: "a".repeat(64),
+                    commit: None,
+                },
+                created_at_ms: 7,
+                delivered_at_ms: Some(9),
+                head_attestation: None,
+            };
+            let mut v = serde_json::to_value(&entry).unwrap();
+            v.as_object_mut().unwrap().remove("delivered_at_ms");
+            let p: PendingJoinResult = serde_json::from_value(v).unwrap();
+            assert_eq!(p.delivered_at_ms, None);
+            assert_eq!(p.created_at_ms, 7);
+        }
+    }
+
+    #[test]
+    fn treekem_snapshot_envelope_binding_tracks_epoch_not_roster_metadata() {
         let mut info = x0x::groups::GroupInfo::with_policy(
             "secure".to_string(),
             String::new(),
@@ -33278,17 +35494,53 @@ pub(in crate::server) mod tests {
         info.state_revision = 7;
         info.state_hash = "hash-a".to_string();
         info.security_binding = Some("treekem:epoch=3".to_string());
+        // The snapshot was sealed when the group was at revision 7 / epoch 3.
         let envelope = TreeKemSnapshotEnvelope {
             version: TREEKEM_DAEMON_SNAPSHOT_VERSION,
-            state_revision: info.state_revision,
-            state_hash: info.state_hash.clone(),
-            security_binding: info.security_binding.clone(),
+            state_revision: 7,
+            state_hash: "hash-a".to_string(),
+            security_binding: Some("treekem:epoch=3".to_string()),
             snapshot: b"snapshot".to_vec(),
         };
         assert!(treekem_snapshot_envelope_matches_info(&envelope, &info));
 
+        // #399: a roster-only governance action (role change, ban/unban
+        // tombstone) advances `state_revision` + `state_hash` on the
+        // named-group info but never touches the TreeKEM tree, so the snapshot
+        // is not re-sealed. The epoch is unchanged, so the snapshot is still
+        // the correct tree and MUST restore — the old exact-equality check
+        // bricked the group here, refusing to load it after any governance
+        // action until it was manually repaired.
+        info.state_revision = 9;
         info.state_hash = "hash-b".to_string();
-        assert!(!treekem_snapshot_envelope_matches_info(&envelope, &info));
+        assert!(
+            treekem_snapshot_envelope_matches_info(&envelope, &info),
+            "#399: roster-only metadata advance must not brick snapshot restore"
+        );
+
+        // A crypto rekey advanced the epoch on the info without re-sealing the
+        // snapshot: the tree is genuinely stale and MUST still be refused.
+        let mut rekeyed = info.clone();
+        rekeyed.security_binding = Some("treekem:epoch=4".to_string());
+        assert!(
+            !treekem_snapshot_envelope_matches_info(&envelope, &rekeyed),
+            "epoch divergence must still refuse a crypto-stale snapshot"
+        );
+
+        // A snapshot AHEAD of the durable metadata (same epoch, higher
+        // revision) signals a rolled-back / inconsistent named_groups.json and
+        // is refused defensively.
+        let ahead = TreeKemSnapshotEnvelope {
+            version: TREEKEM_DAEMON_SNAPSHOT_VERSION,
+            state_revision: info.state_revision + 1,
+            state_hash: "hash-b".to_string(),
+            security_binding: Some("treekem:epoch=3".to_string()),
+            snapshot: b"snapshot".to_vec(),
+        };
+        assert!(
+            !treekem_snapshot_envelope_matches_info(&ahead, &info),
+            "a snapshot ahead of the durable metadata must be refused"
+        );
     }
 
     #[test]
@@ -34108,6 +36360,7 @@ pub(in crate::server) mod tests {
             member_agent_id: "bb".repeat(32),
             from_revision: Some(3),
             base_state_hash: None,
+            signed_by: None,
         };
         let payload = serde_json::to_vec(&request);
         assert!(payload.is_ok(), "join-result fetch request serializes");
@@ -34139,6 +36392,7 @@ pub(in crate::server) mod tests {
             }),
             chain: Vec::new(),
             head_attestation: None,
+            signed_by: None,
         };
         let result_payload = serde_json::to_vec(&result);
         assert!(result_payload.is_ok(), "join-result response serializes");
@@ -34667,6 +36921,7 @@ pub(in crate::server) mod tests {
             missing_prev_state_hash: Some("state-2".to_string()),
             target_member_id: None,
             limit: 8,
+            signed_by: None,
         };
         let encoded = serde_json::to_value(&request).expect("catch-up request serializes");
         assert_eq!(encoded["message_type"], "treekem_catchup_request");
@@ -34676,6 +36931,9 @@ pub(in crate::server) mod tests {
             group_id: "aa".to_string(),
             events: Vec::new(),
             truncated: false,
+            target_member_id: None,
+            target_member_key_package_b64: None,
+            signed_by: None,
         };
         let encoded = serde_json::to_value(&response).expect("catch-up response serializes");
         assert_eq!(encoded["message_type"], "treekem_catchup_response");
@@ -35417,6 +37675,7 @@ pub(in crate::server) mod tests {
             missing_prev_state_hash: None,
             target_member_id: Some(fixture.member_hex.clone()),
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+            signed_by: None,
         };
         let log_keys = vec![fixture.group_id.clone(), fixture.stable_group_id.clone()];
         let response = member_keyed_treekem_catchup_response(&restarted, &log_keys, &request)
@@ -35428,6 +37687,1335 @@ pub(in crate::server) mod tests {
             verify_member_joined_key_package_event(&response.events[0]),
             "returned key package retains a valid member signature"
         );
+        Ok(())
+    }
+
+    /// Build a serving peer whose TreeKEM event log still names `subject_hex`
+    /// in a cached `MemberAdded`. This models the peer that was never told
+    /// about a later departure: `prune_treekem_cache_member` only prunes the
+    /// remover's own cache.
+    async fn cached_add_catchup_fixture(
+        group_byte: u8,
+        subject_hex: &str,
+    ) -> Result<(Arc<AppState>, tempfile::TempDir, String)> {
+        let (state, dir) = secure_endpoint_test_state().await?;
+        let group_id = format!("{group_byte:02x}").repeat(32);
+        let stable_group_id = format!("{:02x}", group_byte.wrapping_add(1)).repeat(32);
+        let creator = state.agent.agent_id();
+        let creator_hex = hex::encode(creator.as_bytes());
+        let info = treekem_metadata_group_info(creator, &group_id, &stable_group_id);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+        let cached_add = NamedGroupMetadataEvent::MemberAdded {
+            group_id: group_id.clone(),
+            revision: 2,
+            actor: creator_hex.clone(),
+            agent_id: subject_hex.to_string(),
+            display_name: None,
+            treekem_commit_b64: Some("Yw==".to_string()),
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: Some(2),
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
+            commit: Some(fake_group_state_commit(&group_id, 2, &creator_hex)),
+            certificate_b64: None,
+        };
+        state
+            .treekem_event_log
+            .write()
+            .await
+            .insert(group_id.clone(), VecDeque::from(vec![cached_add]));
+        Ok((state, dir, group_id))
+    }
+
+    /// Drive one catch-up request and report how many outbound DMs the handler
+    /// attempted: a refusal returns before any send, a served request always
+    /// attempts one (the offline test agent then fails the send).
+    async fn treekem_catchup_send_attempts(
+        state: &Arc<AppState>,
+        sender: &AgentId,
+        group_id: &str,
+        target_member_id: Option<String>,
+    ) -> u64 {
+        let outgoing = || {
+            state
+                .agent
+                .direct_messaging()
+                .diagnostics_snapshot()
+                .stats
+                .outgoing_send_total
+        };
+        let before = outgoing();
+        let request = TreeKemCatchupRequest {
+            message_type: "treekem_catchup_request".to_string(),
+            group_id: group_id.to_string(),
+            requester_agent_id: hex::encode(sender.as_bytes()),
+            from_revision: 0,
+            from_treekem_epoch: 0,
+            current_state_hash: String::new(),
+            missing_prev_state_hash: None,
+            target_member_id,
+            limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+            signed_by: None,
+        };
+        handle_treekem_catchup_request(state, sender, true, request).await;
+        outgoing().saturating_sub(before)
+    }
+
+    /// Issue #363: a removed member is still named by this peer's cached
+    /// `MemberAdded`, but the roster records the departure. Catch-up must be
+    /// refused — otherwise a departed member keeps pulling the group's
+    /// membership event stream from every peer whose cache was never pruned.
+    #[tokio::test]
+    async fn treekem_catchup_refuses_departed_member_with_cached_add() -> Result<()> {
+        let departed = x0x::identity::AgentKeypair::generate()?;
+        let departed_id = departed.agent_id();
+        let departed_hex = hex::encode(departed_id.as_bytes());
+        let (state, _dir, group_id) = cached_add_catchup_fixture(0x5c, &departed_hex).await?;
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_id).expect("fixture group is present");
+            info.add_member(
+                departed_hex.clone(),
+                x0x::groups::GroupRole::Member,
+                None,
+                None,
+            );
+            info.remove_member(&departed_hex, None);
+            assert!(
+                !info.has_active_member(&departed_hex),
+                "fixture models a departed member"
+            );
+        }
+
+        assert_eq!(
+            treekem_catchup_send_attempts(&state, &departed_id, &group_id, None).await,
+            0,
+            "a departed member must not be served from a stale cached add"
+        );
+        Ok(())
+    }
+
+    /// Issue #363: `ban_member` tombstones through `or_insert_with`, so a
+    /// banned peer can hold a roster entry it never held as an active member.
+    /// Banned is non-active, so the cached add must not serve it either.
+    #[tokio::test]
+    async fn treekem_catchup_refuses_banned_member_with_cached_add() -> Result<()> {
+        let banned = x0x::identity::AgentKeypair::generate()?;
+        let banned_id = banned.agent_id();
+        let banned_hex = hex::encode(banned_id.as_bytes());
+        let (state, _dir, group_id) = cached_add_catchup_fixture(0x60, &banned_hex).await?;
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_id).expect("fixture group is present");
+            info.ban_member(&banned_hex, None);
+            assert!(info.is_banned(&banned_hex), "fixture models a banned peer");
+        }
+
+        assert_eq!(
+            treekem_catchup_send_attempts(&state, &banned_id, &group_id, None).await,
+            0,
+            "a banned peer must not be served from a stale cached add"
+        );
+        Ok(())
+    }
+
+    /// Issue #363: the member-keyed KeyPackage response is composed after the
+    /// authorization gate, so a departed member must not reach it either — the
+    /// single choke point has to cover both serve branches.
+    #[tokio::test]
+    async fn treekem_catchup_refuses_departed_member_keyed_request() -> Result<()> {
+        let departed = x0x::identity::AgentKeypair::generate()?;
+        let departed_id = departed.agent_id();
+        let departed_hex = hex::encode(departed_id.as_bytes());
+        let (state, _dir, group_id) = cached_add_catchup_fixture(0x62, &departed_hex).await?;
+        let target_hex = {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_id).expect("fixture group is present");
+            info.add_member(
+                departed_hex.clone(),
+                x0x::groups::GroupRole::Member,
+                None,
+                None,
+            );
+            info.remove_member(&departed_hex, None);
+            hex::encode(state.agent.agent_id().as_bytes())
+        };
+
+        assert_eq!(
+            treekem_catchup_send_attempts(&state, &departed_id, &group_id, Some(target_hex)).await,
+            0,
+            "a departed member must not reach the member-keyed KeyPackage serve"
+        );
+        Ok(())
+    }
+
+    /// Issue #363: a node that left the group removes its `named_groups` entry
+    /// but keeps the in-memory TreeKEM event log (only the withdrawn-tombstone
+    /// path wipes it). Without the roster it has no authority to serve that
+    /// log's membership history to anyone — including a peer its stale cached
+    /// add still names.
+    #[tokio::test]
+    async fn treekem_catchup_refuses_serve_without_local_group() -> Result<()> {
+        let requester = x0x::identity::AgentKeypair::generate()?;
+        let requester_id = requester.agent_id();
+        let requester_hex = hex::encode(requester_id.as_bytes());
+        let (state, _dir, group_id) = cached_add_catchup_fixture(0x64, &requester_hex).await?;
+        // Model the local departure: `leave` drops the roster entry and leaves
+        // the event log behind.
+        state.named_groups.write().await.remove(&group_id);
+        assert!(
+            state
+                .treekem_event_log
+                .read()
+                .await
+                .get(&group_id)
+                .is_some_and(|events| !events.is_empty()),
+            "the departed node still holds the cached add"
+        );
+
+        assert_eq!(
+            treekem_catchup_send_attempts(&state, &requester_id, &group_id, None).await,
+            0,
+            "a node without the group roster must not serve its residual log"
+        );
+        Ok(())
+    }
+
+    /// Issue #363: the bootstrap path must not regress. A joiner this peer has
+    /// only ever seen through the cached add has no roster entry at all, and
+    /// is still served.
+    #[tokio::test]
+    async fn treekem_catchup_serves_bootstrap_joiner_with_cached_add() -> Result<()> {
+        let joiner = x0x::identity::AgentKeypair::generate()?;
+        let joiner_id = joiner.agent_id();
+        let joiner_hex = hex::encode(joiner_id.as_bytes());
+        let (state, _dir, group_id) = cached_add_catchup_fixture(0x5e, &joiner_hex).await?;
+        {
+            let groups = state.named_groups.read().await;
+            let info = groups.get(&group_id).expect("fixture group is present");
+            assert!(
+                !info.members_v2.contains_key(&joiner_hex),
+                "fixture models a joiner with no roster entry"
+            );
+        }
+
+        assert_eq!(
+            treekem_catchup_send_attempts(&state, &joiner_id, &group_id, None).await,
+            1,
+            "a bootstrap joiner named by a cached add is still served"
+        );
+        Ok(())
+    }
+
+    /// Same as [`treekem_catchup_send_attempts`] but drives a specific page
+    /// frontier so a test can separate distinct advancing pages (a joiner
+    /// syncing a long log) from duplicate re-requests of the same page.
+    async fn treekem_catchup_page_send_attempts(
+        state: &Arc<AppState>,
+        sender: &AgentId,
+        group_id: &str,
+        from_revision: u64,
+    ) -> u64 {
+        let outgoing = || {
+            state
+                .agent
+                .direct_messaging()
+                .diagnostics_snapshot()
+                .stats
+                .outgoing_send_total
+        };
+        let before = outgoing();
+        let request = TreeKemCatchupRequest {
+            message_type: "treekem_catchup_request".to_string(),
+            group_id: group_id.to_string(),
+            requester_agent_id: hex::encode(sender.as_bytes()),
+            from_revision,
+            from_treekem_epoch: 0,
+            current_state_hash: String::new(),
+            missing_prev_state_hash: None,
+            target_member_id: None,
+            limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+            signed_by: None,
+        };
+        handle_treekem_catchup_request(state, sender, true, request).await;
+        outgoing().saturating_sub(before)
+    }
+
+    /// Issue #378: the regular event-log serve is a peer-driven amplifier. A
+    /// verified peer that re-requests the *same* catch-up page in a tight loop
+    /// must be served at most once per throttle window — otherwise each request
+    /// forces a full event-log read, filter/sort, JSON serialization, and a DM
+    /// send with no cost to the requester.
+    #[tokio::test]
+    async fn treekem_catchup_page_throttles_duplicate_page_burst() -> Result<()> {
+        let joiner = x0x::identity::AgentKeypair::generate()?;
+        let joiner_id = joiner.agent_id();
+        let joiner_hex = hex::encode(joiner_id.as_bytes());
+        let (state, _dir, group_id) = cached_add_catchup_fixture(0x70, &joiner_hex).await?;
+
+        // Ten identical requests for the same page (from_revision 0). Before the
+        // throttle every one is served; after it, only the first is.
+        let mut served = 0;
+        for _ in 0..10 {
+            served += treekem_catchup_page_send_attempts(&state, &joiner_id, &group_id, 0).await;
+        }
+        assert_eq!(
+            served, 1,
+            "a burst of identical catch-up-page requests must be served at most once per window"
+        );
+        Ok(())
+    }
+
+    /// Issue #378 regression guard: the throttle keys on the advancing page
+    /// frontier, so a joiner paging sequentially through a long log presents a
+    /// fresh key for every page and is never starved. Distinct advancing pages
+    /// must each be served even when issued back-to-back inside one window.
+    #[tokio::test]
+    async fn treekem_catchup_page_allows_sequential_paging() -> Result<()> {
+        let joiner = x0x::identity::AgentKeypair::generate()?;
+        let joiner_id = joiner.agent_id();
+        let joiner_hex = hex::encode(joiner_id.as_bytes());
+        let (state, _dir, group_id) = cached_add_catchup_fixture(0x72, &joiner_hex).await?;
+
+        // A joiner advancing one revision at a time through the log. Every page
+        // is a distinct frontier, so every page is served, back-to-back.
+        let mut served = 0;
+        for revision in 0..8 {
+            served +=
+                treekem_catchup_page_send_attempts(&state, &joiner_id, &group_id, revision).await;
+        }
+        assert_eq!(
+            served, 8,
+            "distinct advancing catch-up pages must all be served — a legitimate joiner is not starved"
+        );
+        Ok(())
+    }
+
+    struct DepartureFixture {
+        state: Arc<AppState>,
+        _dir: tempfile::TempDir,
+        group_id: String,
+        stable_group_id: String,
+        peer_kp: x0x::identity::AgentKeypair,
+        peer_hex: String,
+    }
+
+    impl DepartureFixture {
+        /// The keys a departure has to clear. The roster is keyed by the local
+        /// group id; the TreeKEM caches are keyed by the stable id.
+        fn aliases(&self) -> [&str; 2] {
+            [self.group_id.as_str(), self.stable_group_id.as_str()]
+        }
+    }
+
+    /// Issue #376: a group holding the in-memory TreeKEM material a departure
+    /// must leave nothing of. `local_active` selects the departure path under
+    /// test: an active member self-leaves or is removed, a non-member drops
+    /// local-only. When the local node is active a second Admin is seated so
+    /// its own removal still satisfies the last-admin invariant.
+    async fn departure_fixture(
+        group_byte: u8,
+        plane: x0x::mls::SecureGroupPlane,
+        local_active: bool,
+    ) -> Result<DepartureFixture> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = format!("{group_byte:02x}").repeat(32);
+        let stable_group_id = format!("{:02x}", group_byte.wrapping_add(1)).repeat(32);
+        let local = state.agent.agent_id();
+        let local_hex = hex::encode(local.as_bytes());
+        let peer_kp = x0x::identity::AgentKeypair::generate()?;
+        let peer = peer_kp.agent_id();
+        let peer_hex = hex::encode(peer.as_bytes());
+        let creator = if local_active { local } else { peer };
+        let mut info = treekem_metadata_group_info(creator, &group_id, &stable_group_id);
+        info.secure_plane = plane;
+        if plane == x0x::mls::SecureGroupPlane::Gss {
+            info.security_binding = Some("gss:epoch=0".to_string());
+        }
+        if local_active {
+            info.add_member(
+                peer_hex.clone(),
+                x0x::groups::GroupRole::Admin,
+                Some(local_hex.clone()),
+                None,
+            );
+        }
+        info.recompute_state_hash();
+        assert_eq!(
+            info.has_active_member(&local_hex),
+            local_active,
+            "fixture must model the requested local membership"
+        );
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        // Both surfaces are keyed by the STABLE group id — see
+        // `remember_treekem_membership_event` and
+        // `queue_treekem_membership_event`, which key on the event's group id.
+        // That is exactly why a roster-keyed piecemeal teardown misses them.
+        let retained = NamedGroupMetadataEvent::MemberAdded {
+            group_id: stable_group_id.clone(),
+            revision: 2,
+            actor: hex::encode(creator.as_bytes()),
+            agent_id: peer_hex.clone(),
+            display_name: None,
+            treekem_commit_b64: Some("Yw==".to_string()),
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: Some(2),
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
+            commit: Some(fake_group_state_commit(
+                &stable_group_id,
+                2,
+                &hex::encode(creator.as_bytes()),
+            )),
+            certificate_b64: None,
+        };
+        state.treekem_event_log.write().await.insert(
+            stable_group_id.clone(),
+            VecDeque::from(vec![retained.clone()]),
+        );
+        state.treekem_pending_events.write().await.insert(
+            stable_group_id.clone(),
+            VecDeque::from(vec![PendingTreeKemMetadataEvent {
+                event: retained,
+                sender: peer,
+                queued_at: Instant::now(),
+            }]),
+        );
+
+        Ok(DepartureFixture {
+            state,
+            _dir,
+            group_id,
+            stable_group_id,
+            peer_kp,
+            peer_hex,
+        })
+    }
+
+    /// Issue #376: a departed node holds no group material. The event log is
+    /// the membership history itself, so retaining it after departure is the
+    /// retention root-cause behind the #363 catch-up leak.
+    async fn assert_departure_wiped_treekem_state(
+        state: &AppState,
+        aliases: &[&str],
+        context: &str,
+    ) {
+        {
+            let logs = state.treekem_event_log.read().await;
+            for alias in aliases {
+                assert!(
+                    !logs.contains_key(*alias),
+                    "{context}: treekem_event_log still holds {alias} after departure"
+                );
+            }
+        }
+        let pending = state.treekem_pending_events.read().await;
+        for alias in aliases {
+            assert!(
+                !pending.contains_key(*alias),
+                "{context}: treekem_pending_events still holds {alias} after departure"
+            );
+        }
+    }
+
+    /// Recipients recorded for a `MemberRemoved` direct delivery of `group_id`
+    /// on the given path ("direct" or "delayed").
+    fn member_removed_delivery_recipients(group_id: &str, path: &str) -> Vec<String> {
+        NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST
+            .lock()
+            .expect("delivery recorder poisoned")
+            .iter()
+            .filter(|(_, gid, kind, recorded)| {
+                gid == group_id && *kind == "member_removed" && *recorded == path
+            })
+            .map(|(recipient, _, _, _)| recipient.clone())
+            .collect()
+    }
+
+    /// Issue #376: the TreeKEM self-leave tore down the roster entry, the card
+    /// cache, the live group and the at-rest persistence but left the in-memory
+    /// membership event log behind — and then re-appended the leave event to
+    /// it. Departure must clear it, without suppressing the direct delivery
+    /// that remaining members rely on to close the roster-revision gap.
+    #[tokio::test]
+    async fn self_leave_wipes_treekem_event_log() -> Result<()> {
+        let f = departure_fixture(0x66, x0x::mls::SecureGroupPlane::TreeKem, true).await?;
+        NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST
+            .lock()
+            .expect("delivery recorder poisoned")
+            .clear();
+
+        let (status, body) = response_json(
+            leave_group(
+                State(Arc::clone(&f.state)),
+                axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                    durable: true,
+                }),
+                Path(f.group_id.clone()),
+            )
+            .await
+            .into_response(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "self-leave must succeed: {body}");
+
+        assert_departure_wiped_treekem_state(&f.state, &f.aliases(), "treekem self-leave").await;
+        for path in ["direct", "delayed"] {
+            assert!(
+                member_removed_delivery_recipients(&f.stable_group_id, path).contains(&f.peer_hex),
+                "the leave event must still be direct-delivered ({path}) to the remaining member"
+            );
+        }
+        Ok(())
+    }
+
+    /// Issue #376: the GSS leave path has its own piecemeal teardown with the
+    /// same gap.
+    #[tokio::test]
+    async fn gss_leave_wipes_treekem_event_log() -> Result<()> {
+        let f = departure_fixture(0x68, x0x::mls::SecureGroupPlane::Gss, true).await?;
+
+        let (status, body) = response_json(
+            leave_group(
+                State(Arc::clone(&f.state)),
+                axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                    durable: true,
+                }),
+                Path(f.group_id.clone()),
+            )
+            .await
+            .into_response(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "GSS leave must succeed: {body}");
+
+        assert_departure_wiped_treekem_state(&f.state, &f.aliases(), "gss leave").await;
+        Ok(())
+    }
+
+    /// Issue #376: an admin-authored removal of this node is a departure too —
+    /// the apply arm dropped the roster entry and exited the subscriber while
+    /// keeping the group's membership history in memory.
+    #[tokio::test]
+    async fn member_removed_self_wipes_treekem_event_log() -> Result<()> {
+        let f = departure_fixture(0x6a, x0x::mls::SecureGroupPlane::Gss, true).await?;
+        let event = admin_removes_local_event(&f).await?;
+
+        let applied =
+            apply_named_group_metadata_event(&f.state, event, f.peer_kp.agent_id(), true, None)
+                .await;
+        assert!(
+            applied.accepted && applied.should_exit,
+            "an admin removal of this node must apply and exit the subscriber"
+        );
+        assert!(
+            !f.state.named_groups.read().await.contains_key(&f.group_id),
+            "the removed node must drop its roster entry"
+        );
+
+        assert_departure_wiped_treekem_state(&f.state, &f.aliases(), "member removed self").await;
+        Ok(())
+    }
+
+    /// The co-admin's signed `MemberRemoved` naming this node, sealed against
+    /// the fixture's committed state.
+    async fn admin_removes_local_event(f: &DepartureFixture) -> Result<NamedGroupMetadataEvent> {
+        let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+        let mut committed = f
+            .state
+            .named_groups
+            .read()
+            .await
+            .get(&f.group_id)
+            .cloned()
+            .context("fixture group is present")?;
+        committed.roster_revision = committed.roster_revision.saturating_add(1);
+        let revision = committed.roster_revision;
+        committed.remove_member(&local_hex, Some(f.peer_hex.clone()));
+        let commit = committed.seal_commit(&f.peer_kp, 1_000)?;
+        Ok(NamedGroupMetadataEvent::MemberRemoved {
+            group_id: f.stable_group_id.clone(),
+            revision,
+            actor: f.peer_hex.clone(),
+            agent_id: local_hex,
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: None,
+            commit: Some(commit),
+        })
+    }
+
+    /// Issue #376: the metadata listener registers its own `JoinHandle` in
+    /// `group_metadata_tasks` under the roster key and then drives the very
+    /// apply that reaches the teardown — so aborting that map entry blindly is
+    /// a self-abort. Tokio defers it to the next yield, and every teardown step
+    /// after the abort is then dropped with the future: the pending Welcome
+    /// blobs (sealed key material) and the at-rest TreeKEM persistence both
+    /// survive on a node that just left the group. Drive the apply from inside
+    /// a registered task and assert the TAIL of the wipe ran.
+    #[tokio::test]
+    async fn member_removed_self_wipe_survives_listener_self_abort() -> Result<()> {
+        let f = departure_fixture(0x6e, x0x::mls::SecureGroupPlane::Gss, true).await?;
+
+        // Keyed by the STABLE id: the apply arm's own piecemeal removal is
+        // keyed by the roster key, so only the wipe's tail deletes this file.
+        let snapshot = treekem_snapshot_path_for_drop(&f.state, &f.stable_group_id)
+            .context("stable group id must map to a snapshot path")?;
+        tokio::fs::write(&snapshot, b"treekem-snapshot").await?;
+        f.state.pending_welcomes.write().await.insert(
+            "welcome-376".to_string(),
+            PendingWelcome {
+                group_id: f.stable_group_id.clone(),
+                joiner_agent: f.peer_hex.clone(),
+                bytes: vec![1, 2, 3],
+                created_at_ms: now_millis_u64(),
+            },
+        );
+
+        let event = admin_removes_local_event(&f).await?;
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let state_for_task = Arc::clone(&f.state);
+        let sender = f.peer_kp.agent_id();
+        let handle = tokio::spawn(async move {
+            if start_rx.await.is_err() {
+                return;
+            }
+            let applied =
+                apply_named_group_metadata_event(&state_for_task, event, sender, true, None).await;
+            // The real listener loops back to `sub.recv().await` here, so a
+            // deferred self-abort lands on this yield rather than earlier.
+            tokio::task::yield_now().await;
+            if applied.accepted && applied.should_exit {
+                let _ = done_tx.send(());
+            }
+        });
+        f.state
+            .group_metadata_tasks
+            .write()
+            .await
+            .insert(f.group_id.clone(), handle);
+        start_tx
+            .send(())
+            .map_err(|()| anyhow::anyhow!("apply task exited before it was started"))?;
+        let task_survived = done_rx.await.is_ok();
+
+        let snapshot_removed = !tokio::fs::try_exists(&snapshot).await?;
+        let welcomes_dropped = f.state.pending_welcomes.read().await.is_empty();
+        assert!(
+            snapshot_removed && welcomes_dropped && task_survived,
+            "the teardown must complete on the task that runs it: \
+             snapshot_removed={snapshot_removed} welcomes_dropped={welcomes_dropped} \
+             task_survived={task_survived}"
+        );
+        Ok(())
+    }
+
+    /// Issue #386: a converged named group can be resident under more than one
+    /// alias — the per-instance mls id AND the stable group id. The
+    /// `removed_self` teardown dropped the roster entry under only the resolved
+    /// alias, so a sibling alias survived in `named_groups.json`. That is the
+    /// exact key the startup re-subscribe loop iterates
+    /// (`server/mod.rs`: every `named_groups` key -> `ensure_named_group_listeners`),
+    /// so on restart the surviving alias re-subscribes the node to the gossip
+    /// topics of a group it was removed from — rejoining a mesh it had left.
+    /// Mirror #376 FIX D: drop the roster entry under EVERY alias so no alias
+    /// survives to re-subscribe. Unlike the ban, a removal keeps no tombstone,
+    /// so every alias goes. The single-alias common case stays covered by
+    /// `member_removed_self_wipes_treekem_event_log`.
+    #[tokio::test]
+    async fn member_removed_self_drops_every_alias() -> Result<()> {
+        let f = departure_fixture(0x74, x0x::mls::SecureGroupPlane::Gss, true).await?;
+
+        // Model the converged dual-alias group: the same GroupInfo is resident
+        // under both the mls id (`f.group_id`) and the stable id
+        // (`f.stable_group_id`). Seeding the sibling makes the resolved alias
+        // the stable id, so a single-slot removal leaves the mls-id alias
+        // behind — the surviving key the restart re-subscribe loop keys on.
+        {
+            let mut groups = f.state.named_groups.write().await;
+            let sibling = groups
+                .get(&f.group_id)
+                .context("fixture group is present")?
+                .clone();
+            groups.insert(f.stable_group_id.clone(), sibling);
+        }
+
+        let event = admin_removes_local_event(&f).await?;
+        let applied =
+            apply_named_group_metadata_event(&f.state, event, f.peer_kp.agent_id(), true, None)
+                .await;
+        assert!(
+            applied.accepted && applied.should_exit,
+            "an admin removal of this node must apply and exit the subscriber"
+        );
+
+        {
+            let groups = f.state.named_groups.read().await;
+            for alias in f.aliases() {
+                assert!(
+                    !groups.contains_key(alias),
+                    "removed_self must drop every roster alias; the surviving alias \
+                     {alias} would re-subscribe the group's gossip topics on restart"
+                );
+            }
+        }
+
+        assert_departure_wiped_treekem_state(
+            &f.state,
+            &f.aliases(),
+            "member removed self dual-alias",
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Issue #376: a ban is the fifth departure. Unlike the others the roster
+    /// entry is deliberately KEPT (tombstoned Banned) so the user and the
+    /// rejoin path can still see it — which is exactly why the #363
+    /// `no_local_group` refusal never fires for a banned node, and why the
+    /// retained history had to be wiped explicitly. The surviving roster entry
+    /// also kept the metadata listener eligible, so the node re-subscribed on
+    /// every restart and rebuilt the log it had just been banned from.
+    #[tokio::test]
+    async fn member_banned_self_wipes_treekem_event_log() -> Result<()> {
+        assert_ban_of_local_member_leaves_nothing(0x70, x0x::mls::SecureGroupPlane::Gss).await
+    }
+
+    /// Issue #376: the TreeKEM plane takes the same ban path but reaches it
+    /// through the `treekem_payload` shadow — a node cannot process the commit
+    /// that removes it from the tree. Without the shadow this apply decodes the
+    /// commit and rejects, so the teardown never runs at all.
+    #[tokio::test]
+    async fn member_banned_self_wipes_treekem_event_log_on_treekem_plane() -> Result<()> {
+        assert_ban_of_local_member_leaves_nothing(0x72, x0x::mls::SecureGroupPlane::TreeKem).await
+    }
+
+    /// Drive an admin-authored ban of this node on `plane` and assert the full
+    /// departure contract: history wiped, group key gone, tombstone kept, and
+    /// the group no longer listener-eligible.
+    async fn assert_ban_of_local_member_leaves_nothing(
+        group_byte: u8,
+        plane: x0x::mls::SecureGroupPlane,
+    ) -> Result<()> {
+        let f = departure_fixture(group_byte, plane, true).await?;
+        let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+        let treekem = plane == x0x::mls::SecureGroupPlane::TreeKem;
+        if treekem {
+            // Without a live TreeKEM group `current_treekem_epoch` is None and
+            // every TreeKEM membership event is queued as `treekem_not_ready`
+            // before it can reach the ban arm.
+            let group_id_bytes = hex::decode(&f.group_id)?;
+            let seed = agent_treekem_seed(f.state.agent.as_ref(), &group_id_bytes);
+            let live =
+                x0x::mls::TreeKemMlsGroup::create(group_id_bytes, f.state.agent.agent_id(), &seed)?;
+            f.state
+                .treekem_groups
+                .write()
+                .await
+                .insert(f.group_id.clone(), Arc::new(Mutex::new(live)));
+        }
+
+        // The GSS group key. The ban keeps its roster entry, so unless it is
+        // cleared explicitly this 32-byte secret is persisted to
+        // `named_groups.json` on the banned node. Seed it on BOTH aliases of a
+        // converged dual-alias group (local id + stable id): a single-slot
+        // clear would leave the sibling alias still carrying the key (FIX D).
+        let mut committed = {
+            let mut groups = f.state.named_groups.write().await;
+            let info = groups
+                .get_mut(&f.group_id)
+                .context("fixture group is present")?;
+            info.shared_secret = Some(vec![7u8; 32]);
+            let info = info.clone();
+            // GSS only: seed the stable-id sibling with the key too, so the
+            // per-alias assertion catches a single-slot clear. Not on the
+            // TreeKEM plane — a second entry under the stable id would change
+            // group resolution away from the local id the live TreeKEM group is
+            // keyed under, stranding this test's epoch precondition.
+            if !treekem {
+                let mut sibling = info.clone();
+                sibling.shared_secret = Some(vec![7u8; 32]);
+                groups.insert(f.stable_group_id.clone(), sibling);
+            }
+            info
+        };
+        committed.roster_revision = committed.roster_revision.saturating_add(1);
+        let revision = committed.roster_revision;
+        committed.ban_member(&local_hex, Some(f.peer_hex.clone()));
+        if treekem {
+            // Mirror the apply's TreeKEM branch so the sealed commit matches.
+            committed.secret_epoch = 1;
+            committed.security_binding = Some("treekem:epoch=1".to_string());
+        }
+        let commit = committed.seal_commit(&f.peer_kp, 1_000)?;
+        let event = NamedGroupMetadataEvent::MemberBanned {
+            group_id: f.stable_group_id.clone(),
+            revision,
+            actor: f.peer_hex.clone(),
+            agent_id: local_hex.clone(),
+            secret_epoch: None,
+            // An invalid commit ("Yw==" decodes but is not a TreeKEM commit):
+            // with the shadow in place the banned node must never reach the
+            // decode/process, so a valid one is unnecessary.
+            treekem_commit_b64: treekem.then(|| "Yw==".to_string()),
+            treekem_epoch: treekem.then_some(1),
+            commit: Some(commit),
+        };
+
+        let applied =
+            apply_named_group_metadata_event(&f.state, event, f.peer_kp.agent_id(), true, None)
+                .await;
+        assert!(
+            applied.accepted && applied.should_exit,
+            "the ban must apply and exit the subscriber"
+        );
+        {
+            let groups = f.state.named_groups.read().await;
+            let info = groups
+                .get(&f.group_id)
+                .context("a banned group must stay on the roster")?;
+            assert!(
+                info.is_banned(&local_hex),
+                "the ban tombstone must be retained so the user still sees it"
+            );
+            assert!(
+                named_group_metadata_listener_topic(info, &local_hex).is_none()
+                    && named_group_public_listener_key(info, &local_hex).is_none(),
+                "a banned node must be refused both listeners; the retained roster entry \
+                 otherwise re-subscribes it on every ensure and every restart"
+            );
+            // FIX D: the key must be gone on EVERY alias present, not just the
+            // resolved one — a single-slot clear leaves the sibling holding the
+            // secret. The GSS variant seeds both aliases; the TreeKEM variant
+            // has only the local-id entry, so this checks whatever is present.
+            for alias in f.aliases() {
+                if let Some(entry) = groups.get(alias) {
+                    assert!(
+                        entry.shared_secret.is_none(),
+                        "the group key must not survive on the banned node (alias {alias})"
+                    );
+                }
+            }
+        }
+
+        assert_departure_wiped_treekem_state(&f.state, &f.aliases(), "member banned self").await;
+        Ok(())
+    }
+
+    /// Issue #376: the listener eligibility rules, asserted directly.
+    ///
+    /// These are pure because the in-process test agent has no gossip runtime:
+    /// `Agent::subscribe` fails, so `ensure_named_group_metadata_listener`
+    /// registers no task whatever the predicate decides, and an assertion on
+    /// the task map cannot tell a refusal from a failed subscribe. (Verified:
+    /// the earlier task-map assertion still passed with the ban check deleted.)
+    #[tokio::test]
+    async fn named_group_listener_eligibility_rules() -> Result<()> {
+        let f = departure_fixture(0x74, x0x::mls::SecureGroupPlane::Gss, true).await?;
+        let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+        let mut base = f
+            .state
+            .named_groups
+            .read()
+            .await
+            .get(&f.group_id)
+            .cloned()
+            .context("fixture group is present")?;
+        // The fixture preset is PrivateSecure (MlsEncrypted), which has no
+        // public-message listener at all; relax it so the ban/withdrawn rules
+        // are observable on BOTH listeners rather than passing vacuously on a
+        // group that never had the public one.
+        base.policy.confidentiality = x0x::groups::GroupConfidentiality::SignedPublic;
+
+        assert!(
+            named_group_metadata_listener_topic(&base, &local_hex).is_some()
+                && named_group_public_listener_key(&base, &local_hex).is_some(),
+            "an active member must hold both listeners"
+        );
+
+        // A joiner holds the group before it is a member; refusing here would
+        // strand the join, which is why the gate is "banned", not "inactive".
+        let mut joiner = base.clone();
+        joiner.remove_member(&local_hex, None);
+        assert!(
+            !joiner.has_active_member(&local_hex),
+            "fixture models a not-yet-active local agent"
+        );
+        assert!(
+            named_group_metadata_listener_topic(&joiner, &local_hex).is_some()
+                && named_group_public_listener_key(&joiner, &local_hex).is_some(),
+            "a joiner that is not yet an active member must keep its listeners"
+        );
+
+        let mut banned = base.clone();
+        banned.ban_member(&local_hex, None);
+        assert!(
+            named_group_metadata_listener_topic(&banned, &local_hex).is_none()
+                && named_group_public_listener_key(&banned, &local_hex).is_none(),
+            "a banned local agent must be refused both listeners"
+        );
+
+        let mut withdrawn = base.clone();
+        withdrawn.withdrawn = true;
+        assert!(
+            named_group_metadata_listener_topic(&withdrawn, &local_hex).is_none()
+                && named_group_public_listener_key(&withdrawn, &local_hex).is_none(),
+            "a withdrawn group must be refused both listeners"
+        );
+
+        // The ban is scoped to THIS agent: another member's ban is irrelevant.
+        let mut peer_banned = base.clone();
+        peer_banned.ban_member(&f.peer_hex, None);
+        assert!(
+            named_group_metadata_listener_topic(&peer_banned, &local_hex).is_some(),
+            "another member's ban must not silence this node"
+        );
+
+        let mut encrypted = base.clone();
+        encrypted.policy.confidentiality = x0x::groups::GroupConfidentiality::MlsEncrypted;
+        assert!(
+            named_group_metadata_listener_topic(&encrypted, &local_hex).is_some()
+                && named_group_public_listener_key(&encrypted, &local_hex).is_none(),
+            "MlsEncrypted groups keep metadata but publish no plaintext history"
+        );
+        Ok(())
+    }
+
+    /// Issue #376: a banned member can still redeem a fresh invite — the invite
+    /// carries the authority roster verbatim (only key material is stripped)
+    /// and the `MemberJoined` admission chain has no ban gate — so its local
+    /// stub marks itself banned and the join-time ensure refuses both
+    /// listeners. The authority's `MemberAdded` then flips it Active over
+    /// direct delivery, and nothing re-ran the ensure: an active member with no
+    /// subscriptions until the next restart.
+    ///
+    /// Limitation, stated honestly: with no gossip runtime the spawn itself is
+    /// unobservable here, so this pins the transition that must trigger the
+    /// re-ensure (banned+refused -> active+eligible across one apply) and that
+    /// the apply completes. The decision itself is pinned by
+    /// `named_group_listener_eligibility_rules`.
+    #[tokio::test]
+    async fn readmitted_banned_member_becomes_listener_eligible() -> Result<()> {
+        let f = departure_fixture(0x76, x0x::mls::SecureGroupPlane::Gss, true).await?;
+        let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+
+        // The re-invited stub: the authority's roster still carries this node's
+        // Banned tombstone, so the join-time ensure refused both listeners.
+        let mut committed = {
+            let mut groups = f.state.named_groups.write().await;
+            let info = groups
+                .get_mut(&f.group_id)
+                .context("fixture group is present")?;
+            info.ban_member(&local_hex, Some(f.peer_hex.clone()));
+            info.recompute_state_hash();
+            info.clone()
+        };
+        assert!(
+            named_group_metadata_listener_topic(&committed, &local_hex).is_none(),
+            "precondition: the re-invited stub is listener-ineligible"
+        );
+
+        committed.roster_revision = committed.roster_revision.saturating_add(1);
+        let revision = committed.roster_revision;
+        committed.add_member(
+            local_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(f.peer_hex.clone()),
+            None,
+        );
+        let commit = committed.seal_commit(&f.peer_kp, 1_000)?;
+        let event = NamedGroupMetadataEvent::MemberAdded {
+            group_id: f.stable_group_id.clone(),
+            revision,
+            actor: f.peer_hex.clone(),
+            agent_id: local_hex.clone(),
+            display_name: None,
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
+            commit: Some(commit),
+            certificate_b64: None,
+        };
+
+        let applied =
+            apply_named_group_metadata_event(&f.state, event, f.peer_kp.agent_id(), true, None)
+                .await;
+        assert!(
+            applied.accepted,
+            "the authority's re-admission must apply on the re-invited node"
+        );
+
+        let groups = f.state.named_groups.read().await;
+        let info = groups
+            .get(&f.group_id)
+            .context("the re-admitted group must stay on the roster")?;
+        assert!(
+            info.has_active_member(&local_hex),
+            "re-admission must clear the local Banned tombstone"
+        );
+        // Metadata only: the fixture preset is MlsEncrypted, which has no
+        // public-message listener. The metadata listener is the load-bearing
+        // one here — it is what the ban silenced.
+        assert!(
+            named_group_metadata_listener_topic(info, &local_hex).is_some(),
+            "a re-admitted member must become listener-eligible again"
+        );
+        Ok(())
+    }
+
+    /// Issue #384: drive a real admin-authored self-ban on a fresh GSS fixture
+    /// so the local node reaches the #376 banned+wiped state — crypto/history
+    /// gone, Banned tombstone kept. Returns the fixture so a follow-on event can
+    /// be applied against the genuinely-wiped state.
+    async fn banned_and_wiped_gss_fixture(group_byte: u8) -> Result<DepartureFixture> {
+        let f = departure_fixture(group_byte, x0x::mls::SecureGroupPlane::Gss, true).await?;
+        let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+        let mut committed = f
+            .state
+            .named_groups
+            .read()
+            .await
+            .get(&f.group_id)
+            .cloned()
+            .context("fixture group is present")?;
+        committed.roster_revision = committed.roster_revision.saturating_add(1);
+        let revision = committed.roster_revision;
+        committed.ban_member(&local_hex, Some(f.peer_hex.clone()));
+        let commit = committed.seal_commit(&f.peer_kp, 1_000)?;
+        let event = NamedGroupMetadataEvent::MemberBanned {
+            group_id: f.stable_group_id.clone(),
+            revision,
+            actor: f.peer_hex.clone(),
+            agent_id: local_hex.clone(),
+            secret_epoch: None,
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            commit: Some(commit),
+        };
+        let applied =
+            apply_named_group_metadata_event(&f.state, event, f.peer_kp.agent_id(), true, None)
+                .await;
+        assert!(applied.accepted, "the admin self-ban must apply");
+        assert!(
+            f.state
+                .named_groups
+                .read()
+                .await
+                .get(&f.group_id)
+                .context("banned group stays on the roster")?
+                .is_banned(&local_hex),
+            "the Banned tombstone must survive the wipe"
+        );
+        assert_departure_wiped_treekem_state(&f.state, &f.aliases(), "banned+wiped precondition")
+            .await;
+        Ok(f)
+    }
+
+    /// Issue #384 (gap 1): once THIS node is locally banned for a group, the
+    /// #376 wipe cleared its crypto and history but kept the Banned tombstone.
+    /// The apply path must refuse any further metadata event for that group that
+    /// does NOT re-admit us — otherwise a hostile or stale admin re-seeds the
+    /// wiped state (here: an authority-signed `MemberAdded` for a THIRD member
+    /// repopulates `treekem_event_log`, restoring the very history #376 wiped).
+    #[tokio::test]
+    async fn banned_local_apply_refuses_hostile_reseed() -> Result<()> {
+        let f = banned_and_wiped_gss_fixture(0x88).await?;
+        let third = x0x::identity::AgentKeypair::generate()?;
+        let third_hex = hex::encode(third.agent_id().as_bytes());
+
+        let mut committed = f
+            .state
+            .named_groups
+            .read()
+            .await
+            .get(&f.group_id)
+            .cloned()
+            .context("banned group is present")?;
+        committed.roster_revision = committed.roster_revision.saturating_add(1);
+        let revision = committed.roster_revision;
+        committed.add_member(
+            third_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(f.peer_hex.clone()),
+            None,
+        );
+        let commit = committed.seal_commit(&f.peer_kp, 2_000)?;
+        let hostile = NamedGroupMetadataEvent::MemberAdded {
+            group_id: f.stable_group_id.clone(),
+            revision,
+            actor: f.peer_hex.clone(),
+            agent_id: third_hex.clone(),
+            display_name: None,
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
+            commit: Some(commit),
+            certificate_b64: None,
+        };
+
+        let applied =
+            apply_named_group_metadata_event(&f.state, hostile, f.peer_kp.agent_id(), true, None)
+                .await;
+        assert!(
+            !applied.accepted,
+            "a locally-banned node must refuse a metadata event that does not re-admit it"
+        );
+        assert_departure_wiped_treekem_state(
+            &f.state,
+            &f.aliases(),
+            "hostile re-seed refused while banned",
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Issue #384 (anti-regression): the gap-1 gate must NOT block a legitimate
+    /// re-admission. A prior round regressed rejoin (a re-invited previously
+    /// banned member could not receive until restart). An authority-signed
+    /// `MemberAdded` naming THIS agent lifts the Banned tombstone and must still
+    /// apply on the banned+wiped node — this is the distinction the gate turns
+    /// on: it refuses re-seeds but admits the event that re-admits us.
+    #[tokio::test]
+    async fn banned_local_apply_admits_authority_readmission() -> Result<()> {
+        let f = banned_and_wiped_gss_fixture(0x8a).await?;
+        let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+
+        let mut committed = f
+            .state
+            .named_groups
+            .read()
+            .await
+            .get(&f.group_id)
+            .cloned()
+            .context("banned group is present")?;
+        committed.roster_revision = committed.roster_revision.saturating_add(1);
+        let revision = committed.roster_revision;
+        committed.add_member(
+            local_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(f.peer_hex.clone()),
+            None,
+        );
+        let commit = committed.seal_commit(&f.peer_kp, 2_000)?;
+        let readmit = NamedGroupMetadataEvent::MemberAdded {
+            group_id: f.stable_group_id.clone(),
+            revision,
+            actor: f.peer_hex.clone(),
+            agent_id: local_hex.clone(),
+            display_name: None,
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
+            commit: Some(commit),
+            certificate_b64: None,
+        };
+
+        let applied =
+            apply_named_group_metadata_event(&f.state, readmit, f.peer_kp.agent_id(), true, None)
+                .await;
+        assert!(
+            applied.accepted,
+            "the authority's re-admission must still apply on a banned+wiped node"
+        );
+        // The self-ban tombstoned every alias (#376 FIX D dual-alias persist);
+        // the re-admission commit carries the stable id, so it resolves to and
+        // clears the tombstone on whichever alias the applier picks. Assert the
+        // re-admission took effect on the resolved alias — the point is that the
+        // gate admitted it, not which alias key it landed under.
+        let groups = f.state.named_groups.read().await;
+        let readmitted = f
+            .aliases()
+            .into_iter()
+            .filter_map(|alias| groups.get(alias))
+            .find(|info| info.has_active_member(&local_hex))
+            .context("re-admission must clear the local Banned tombstone")?;
+        assert!(
+            named_group_metadata_listener_topic(readmitted, &local_hex).is_some(),
+            "a re-admitted member must become listener-eligible again"
+        );
+        Ok(())
+    }
+
+    /// Issue #384 (gap 2): the catch-up serve path never checked local-ban. The
+    /// #376 wipe clears the event log, but the retained Banned tombstone means
+    /// the #363 `no_local_group` refusal never fires — so if the log is ever
+    /// re-seeded (a residual entry, or a re-seed slipping past gap 1), a banned
+    /// node would still serve the group's membership history. A banned node must
+    /// refuse to serve catch-up outright.
+    #[tokio::test]
+    async fn banned_local_refuses_catchup_serve() -> Result<()> {
+        let requester = x0x::identity::AgentKeypair::generate()?;
+        let requester_id = requester.agent_id();
+        let requester_hex = hex::encode(requester_id.as_bytes());
+        let (state, _dir, group_id) = cached_add_catchup_fixture(0x8c, &requester_hex).await?;
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_id).expect("fixture group is present");
+            info.ban_member(&local_hex, None);
+            assert!(
+                info.is_banned(&local_hex),
+                "fixture models a banned local node"
+            );
+        }
+        assert!(
+            state
+                .treekem_event_log
+                .read()
+                .await
+                .get(&group_id)
+                .is_some_and(|events| !events.is_empty()),
+            "precondition: a residual/re-seeded log survives on the banned node"
+        );
+
+        assert_eq!(
+            treekem_catchup_send_attempts(&state, &requester_id, &group_id, None).await,
+            0,
+            "a locally-banned node must refuse to serve catch-up"
+        );
+        Ok(())
+    }
+
+    /// Issue #385: the `SecureShareDelivered` equal-epoch reseal is the fourth
+    /// way the #376 wipe could be undone. Once THIS node is locally banned,
+    /// #376 cleared `shared_secret` (`clear_group_info_key_material`) but kept
+    /// the Banned tombstone and the epoch. The reseal arm accepts an equal-epoch
+    /// envelope precisely when `shared_secret.is_none()` — exactly the
+    /// banned+wiped state — and its own terminality recheck
+    /// (`ensure_named_group_key_material_install_allowed`) only refuses
+    /// WITHDRAWN groups, not banned ones. So the #384 apply gate — which admits
+    /// only an event that re-admits us, and `SecureShareDelivered` re-admits no
+    /// one — is the SOLE thing that refuses this reseal.
+    ///
+    /// This is a regression/characterization test: it passes on ac5accb (#384)
+    /// because that gate rejects the event before it reaches the reseal arm. It
+    /// has teeth — a genuine equal-epoch envelope sealed to the banned node's
+    /// OWN ML-KEM key would reach the install and restore `shared_secret` if the
+    /// gate were removed (nothing else stops it), so removing #384's gate turns
+    /// this red. It locks in coverage of the `SecureShareDelivered` path
+    /// specifically, which #384's own tests (a `MemberAdded` re-seed and a
+    /// catch-up serve) did not exercise.
+    #[tokio::test]
+    async fn banned_node_reseal_does_not_restore_shared_secret() -> Result<()> {
+        let f = banned_and_wiped_gss_fixture(0x8e).await?;
+        let local_hex = hex::encode(f.state.agent.agent_id().as_bytes());
+
+        // Read the genuinely banned+wiped state: no secret, epoch retained.
+        let (wire_group_id, epoch) = {
+            let groups = f.state.named_groups.read().await;
+            let info = groups.get(&f.group_id).context("banned group is present")?;
+            assert!(
+                info.is_banned(&local_hex),
+                "precondition: local node is banned"
+            );
+            assert_eq!(
+                info.shared_secret, None,
+                "precondition: #376 wiped the shared secret"
+            );
+            (info.stable_group_id().to_string(), info.secret_epoch)
+        };
+
+        // Seal a REAL envelope carrying a fresh secret to the banned node's own
+        // ML-KEM public key, at the SAME epoch the wiped state still records —
+        // the exact equal-epoch reseal the arm accepts when `shared_secret` is
+        // absent, sealed the same way the ban hot path seals to survivors.
+        let reseal_secret = [0x5a_u8; 32];
+        let aad = secure_share_aad(&wire_group_id, &local_hex, epoch);
+        let (kem_ct, aead_nonce, aead_ct) =
+            x0x::groups::kem_envelope::seal_group_secret_to_recipient(
+                &f.state.agent_kem_keypair.public_bytes,
+                &aad,
+                &reseal_secret,
+            )?;
+        let reseal = NamedGroupMetadataEvent::SecureShareDelivered {
+            group_id: wire_group_id,
+            recipient: local_hex.clone(),
+            secret_epoch: epoch,
+            kem_ciphertext_b64: BASE64.encode(&kem_ct),
+            aead_nonce_b64: BASE64.encode(aead_nonce),
+            aead_ciphertext_b64: BASE64.encode(&aead_ct),
+            actor: f.peer_hex.clone(),
+        };
+
+        let applied =
+            apply_named_group_metadata_event(&f.state, reseal, f.peer_kp.agent_id(), true, None)
+                .await;
+        assert!(
+            !applied.accepted,
+            "a locally-banned node must refuse an equal-epoch SecureShareDelivered reseal"
+        );
+
+        let groups = f.state.named_groups.read().await;
+        let info = groups
+            .get(&f.group_id)
+            .context("banned group stays on the roster")?;
+        assert_eq!(
+            info.shared_secret, None,
+            "the equal-epoch reseal must not re-install shared_secret on a banned node"
+        );
+        assert!(
+            info.is_banned(&local_hex),
+            "the Banned tombstone must survive the refused reseal"
+        );
+        Ok(())
+    }
+
+    /// Issue #376: the local-only drop (this node holds group state it is not
+    /// an active member of) is the third path that kept the event log.
+    #[tokio::test]
+    async fn local_only_drop_wipes_treekem_event_log() -> Result<()> {
+        let f = departure_fixture(0x6c, x0x::mls::SecureGroupPlane::TreeKem, false).await?;
+
+        let (status, body) = response_json(
+            leave_group(
+                State(Arc::clone(&f.state)),
+                axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                    durable: true,
+                }),
+                Path(f.group_id.clone()),
+            )
+            .await
+            .into_response(),
+        )
+        .await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "local-only drop must succeed: {body}"
+        );
+        assert_eq!(
+            body.get("local_only").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "the fixture must exercise the LocalOnlyDrop disposition: {body}"
+        );
+
+        assert_departure_wiped_treekem_state(&f.state, &f.aliases(), "local-only drop").await;
         Ok(())
     }
 
@@ -35913,6 +39501,7 @@ pub(in crate::server) mod tests {
             missing_prev_state_hash: None,
             target_member_id: Some(member_hex.clone()),
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+            signed_by: None,
         };
         let log_keys = vec![group_id.clone(), stable_group_id.clone()];
         let response = member_keyed_treekem_catchup_response(&restarted, &log_keys, &request)
@@ -36135,6 +39724,7 @@ pub(in crate::server) mod tests {
             missing_prev_state_hash: None,
             target_member_id: Some(member_hex.clone()),
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+            signed_by: None,
         };
         let log_keys = vec![group_id.clone(), stable_group_id];
         let response = member_keyed_treekem_catchup_response(&w_state, &log_keys, &request)
@@ -37011,7 +40601,16 @@ pub(in crate::server) mod tests {
             &authority_id,
             3600,
         );
-        populate_invite_base_state_from_group_info(&mut invite, &authority_info);
+        crate::server::routes::identity::populate_invite_base_state_v4(
+            &mut invite,
+            &authority_info,
+            None,
+        );
+        // #469: the joiner refuses an unsigned invite (`invite_unsigned`)
+        // before it ever reaches the replay path under test.
+        invite
+            .sign_v4(authority.agent.identity().agent_keypair(), None)
+            .map_err(|e| anyhow::anyhow!("sign fixture invite: {e}"))?;
         let invite_link = invite.encode_link().expect("invite encodes under budget");
         let parsed = x0x::groups::invite::SignedInvite::from_link(&invite_link)
             .map_err(|e| anyhow::anyhow!("decode fixture invite: {e}"))?;
@@ -37031,6 +40630,8 @@ pub(in crate::server) mod tests {
             Json(JoinGroupRequest {
                 invite: invite_link.clone(),
                 display_name: None,
+                mode: None,
+                expected_owner_user_id: None,
             }),
         )
         .await
@@ -37060,6 +40661,8 @@ pub(in crate::server) mod tests {
             Json(JoinGroupRequest {
                 invite: invite_link.clone(),
                 display_name: None,
+                mode: None,
+                expected_owner_user_id: None,
             }),
         )
         .await
@@ -37087,8 +40690,13 @@ pub(in crate::server) mod tests {
             "retry re-announces MemberJoined so the owner can re-admit"
         );
 
-        // Once converged (Welcome accepted installs TreeKEM state), the same
-        // replay becomes the issue-#188 idempotent no-op again.
+        // Once converged, the same replay becomes the issue-#188 idempotent
+        // no-op again. Convergence is TWO facts, not one: the accepted
+        // Welcome installs TreeKEM state, and the authority's MemberAdded
+        // seats the joiner on its own roster. #447/#458 made the second one
+        // observable (`join_state`), so the fixture has to model it — a
+        // TreeKEM install without the seat is precisely the
+        // `pending_authority_commit` limbo whose repair volley re-fires.
         let group_id_bytes = hex::decode(&group_id)?;
         let seed = agent_treekem_seed(joiner.agent.as_ref(), &group_id_bytes);
         let converged =
@@ -37098,6 +40706,19 @@ pub(in crate::server) mod tests {
             .write()
             .await
             .insert(group_id.clone(), Arc::new(Mutex::new(converged)));
+        {
+            let mut groups = joiner.named_groups.write().await;
+            let info = groups
+                .get_mut(&group_id)
+                .expect("the join stub is still on the roster");
+            info.add_member(
+                joiner_hex.clone(),
+                x0x::groups::GroupRole::Member,
+                Some(inviter_hex.clone()),
+                None,
+            );
+            info.recompute_state_hash();
+        }
         NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
             .lock()
             .expect("publish-attempt recorder poisoned")
@@ -37107,6 +40728,8 @@ pub(in crate::server) mod tests {
             Json(JoinGroupRequest {
                 invite: invite_link,
                 display_name: None,
+                mode: None,
+                expected_owner_user_id: None,
             }),
         )
         .await
@@ -37131,13 +40754,33 @@ pub(in crate::server) mod tests {
     fn join_handshake_state_outlives_a_slow_counterparty() {
         // The other half of a join is often a phone that admits (or reads its
         // result) minutes-to-hours later. If either side's handshake state
-        // only lives as long as the joiner's active poll window, a late half
-        // orphans the join: the owner never re-stages for an already-active
-        // member, and the joiner rejects a result it no longer expects
-        // (`missing_expected_inviter`). Keep both retentions far above the
-        // poll window.
-        assert!(EXPECTED_JOIN_RESULT_INVITER_TTL >= JOIN_RESULT_POLL_TIMEOUT.saturating_mul(60));
-        assert!(PENDING_JOIN_RESULT_TTL >= JOIN_RESULT_POLL_TIMEOUT.saturating_mul(60));
+        // lived shorter than the poll horizon, a late half orphans the join:
+        // the owner never re-stages for an already-active member, and the
+        // joiner rejects a result it no longer expects
+        // (`missing_expected_inviter`). #390 pins all three to the same 24h
+        // horizon — including the Welcome blob, whose old 10-minute TTL was
+        // the orphaned-`welcome_ref` window.
+        assert!(EXPECTED_JOIN_RESULT_INVITER_TTL >= JOIN_RESULT_POLL_HORIZON);
+        assert!(PENDING_JOIN_RESULT_TTL >= JOIN_RESULT_POLL_HORIZON);
+        assert!(PENDING_WELCOME_TTL >= PENDING_JOIN_RESULT_TTL);
+    }
+
+    #[test]
+    fn join_result_poll_backoff_ramps_and_caps() {
+        // #390: the poll runs for a day, so its cadence must decay — 2s, 4s,
+        // 8s… — and cap at JOIN_RESULT_POLL_BACKOFF_CAP so a mesh recovery
+        // still converges within minutes. A shift past the cap must neither
+        // overflow nor shrink.
+        assert_eq!(join_result_poll_delay(0), Duration::from_secs(2));
+        assert_eq!(join_result_poll_delay(1), Duration::from_secs(4));
+        assert_eq!(join_result_poll_delay(2), Duration::from_secs(8));
+        assert_eq!(join_result_poll_delay(7), Duration::from_secs(256));
+        assert_eq!(join_result_poll_delay(8), JOIN_RESULT_POLL_BACKOFF_CAP);
+        assert_eq!(join_result_poll_delay(31), JOIN_RESULT_POLL_BACKOFF_CAP);
+        assert_eq!(
+            join_result_poll_delay(u32::MAX),
+            JOIN_RESULT_POLL_BACKOFF_CAP
+        );
     }
 
     fn direct_send_test_request(agent_id: String, payload: String) -> DirectSendRequest {
@@ -37519,6 +41162,109 @@ pub(in crate::server) mod tests {
         Ok(())
     }
 
+    /// Security regression (#379): the `MemberJoined` apply path validated the
+    /// joiner-supplied AgentId hex case-INSENSITIVELY (step 4's
+    /// `eq_ignore_ascii_case`) but then inserted the RAW wire hex as the
+    /// `members_v2` map key. Every other roster lookup keys on canonical
+    /// lowercase hex, so a mixed-case join produced an entry unfindable by the
+    /// canonical id — the member was silently roster-desynced. An accepted
+    /// joiner MUST be keyed by the canonical lowercase hex derived from the
+    /// verified public key, and the non-canonical wire hex must not appear as a
+    /// key.
+    #[tokio::test]
+    async fn member_joined_mixed_case_agent_id_stored_under_canonical_lowercase_key() -> Result<()>
+    {
+        let fixture = member_joined_treekem_fixture(0xc1, 0xc2).await?;
+        let state = &fixture.state;
+        let group_id = fixture.group_id.clone();
+        let stable_group_id = fixture.stable_group_id.clone();
+        let inviter_hex = hex::encode(state.agent.agent_id().as_bytes());
+
+        // A fresh joiner. Its canonical AgentId hex is lowercase; we publish a
+        // MIXED-CASE hex on the wire and sign over THAT value, so the joiner's
+        // self-signature still verifies (step 3) and the case-insensitive
+        // derived-id check (step 4) still accepts the wire value.
+        let joiner_kp = x0x::identity::AgentKeypair::generate()?;
+        let joiner_id = joiner_kp.agent_id();
+        let canonical_hex = hex::encode(joiner_id.as_bytes());
+        let mixed_case_hex = canonical_hex.to_ascii_uppercase();
+        assert_ne!(
+            mixed_case_hex, canonical_hex,
+            "uppercasing must actually change the hex (it must contain a-f digits)"
+        );
+
+        let invite_secret = "mixed-case-join-invite".to_string();
+        let now_ms = now_millis_u64();
+        {
+            let mut groups = state.named_groups.write().await;
+            groups
+                .get_mut(&group_id)
+                .expect("group exists")
+                .record_issued_invite(
+                    invite_secret.clone(),
+                    now_ms / 1_000,
+                    0,
+                    x0x::groups::GroupRole::Member,
+                );
+        }
+
+        let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(joiner_id, &[0xc3; 32])?;
+        let kp_b64 = BASE64.encode(prepared.key_package_bytes());
+        let public_key_b64 = BASE64.encode(joiner_kp.public_key().as_bytes());
+        let canonical = canonical_member_joined_bytes(
+            &group_id,
+            Some(&stable_group_id),
+            &mixed_case_hex,
+            &public_key_b64,
+            x0x::groups::GroupRole::Member,
+            None,
+            &inviter_hex,
+            &invite_secret,
+            now_ms,
+            Some(&kp_b64),
+        );
+        let signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            joiner_kp.secret_key(),
+            &canonical,
+        )
+        .map_err(|e| anyhow::anyhow!("sign mixed-case MemberJoined: {e:?}"))?;
+        let join = NamedGroupMetadataEvent::MemberJoined {
+            group_id: group_id.clone(),
+            stable_group_id: Some(stable_group_id.clone()),
+            member_agent_id: mixed_case_hex.clone(),
+            member_public_key_b64: public_key_b64,
+            role: x0x::groups::GroupRole::Member,
+            display_name: None,
+            inviter_agent_id: inviter_hex,
+            invite_secret,
+            ts_ms: now_ms,
+            treekem_key_package_b64: Some(kp_b64),
+            recovery_authority_agent_id: None,
+            recovery_authority_public_key_b64: None,
+            recovery_authority_signature_b64: None,
+            recovery_authority_commit: None,
+            signature_b64: BASE64.encode(signature.as_bytes()),
+        };
+
+        let result = apply_named_group_metadata_event(state, join, joiner_id, true, None).await;
+        assert!(
+            result.accepted,
+            "a validly signed invite-join must be accepted by the local inviter"
+        );
+
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&group_id).expect("group exists");
+        assert!(
+            info.has_active_member(&canonical_hex),
+            "joiner must be findable by the canonical lowercase AgentId hex"
+        );
+        assert!(
+            !info.members_v2.contains_key(&mixed_case_hex),
+            "roster must not be keyed by the non-canonical wire hex"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn recovered_member_key_package_survives_inviter_demotion() -> Result<()> {
         let fixture = member_joined_treekem_fixture(0x9d, 0x9e).await?;
@@ -37562,6 +41308,9 @@ pub(in crate::server) mod tests {
             group_id: fixture.stable_group_id.clone(),
             events: vec![fixture.event.clone()],
             truncated: false,
+            target_member_id: None,
+            target_member_key_package_b64: None,
+            signed_by: None,
         };
         let unauthorized = x0x::identity::AgentKeypair::generate()?;
         handle_treekem_catchup_response(state, &unauthorized.agent_id(), true, response.clone())
@@ -37953,6 +41702,282 @@ pub(in crate::server) mod tests {
         let on_disk = tokio::fs::read_to_string(path).await?;
         let parsed: BTreeMap<String, serde_json::Value> = serde_json::from_str(&on_disk)?;
         Ok(parsed.into_keys().collect())
+    }
+
+    /// Stage a TreeKEM group holding a member who has already self-left: the
+    /// roster records the departure but, as a self-leave carries no commit, the
+    /// leaf is still live and the epoch has not moved. Returns the departed
+    /// member's hex id, their KeyPackage, and the shared group handle.
+    async fn staged_self_leave(
+        state: &Arc<AppState>,
+        group_id: &str,
+        committer: AgentId,
+    ) -> Result<(String, Vec<u8>, Arc<Mutex<x0x::mls::TreeKemMlsGroup>>)> {
+        use base64::Engine as _;
+
+        let group_id_bytes = hex::decode(group_id)?;
+        let local = state.agent.agent_id();
+        let local_hex = hex::encode(local.as_bytes());
+        let local_seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+        let mut group =
+            x0x::mls::TreeKemMlsGroup::create(group_id_bytes.clone(), local, &local_seed)?;
+
+        let leaver = AgentId([0x6b; 32]);
+        let leaver_hex = hex::encode(leaver.as_bytes());
+        let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(leaver, &[0x6b; 32])?;
+        let leaver_kp = prepared.key_package_bytes().to_vec();
+        group.add_member(leaver, &leaver_kp)?;
+
+        let mut info = treekem_metadata_group_info(committer, group_id, group_id);
+        let committer_hex = hex::encode(committer.as_bytes());
+        if committer != local {
+            info.add_member(
+                local_hex,
+                x0x::groups::GroupRole::Member,
+                Some(committer_hex.clone()),
+                None,
+            );
+        }
+        info.add_member(
+            leaver_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(committer_hex),
+            None,
+        );
+        info.set_member_treekem_key_package(
+            &leaver_hex,
+            base64::engine::general_purpose::STANDARD.encode(&leaver_kp),
+        );
+        // The self-leave exactly as a remaining member applies it: roster-only,
+        // no TreeKEM commit, epoch untouched.
+        info.remove_member(&leaver_hex, Some(leaver_hex.clone()));
+        info.secret_epoch = group.epoch();
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info);
+
+        let group = Arc::new(Mutex::new(group));
+        state
+            .treekem_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), Arc::clone(&group));
+        assert!(
+            group.lock().await.has_leaf_for_key_package(&leaver_kp),
+            "precondition: a self-leave leaves the departed leaf live"
+        );
+        Ok((leaver_hex, leaver_kp, group))
+    }
+
+    /// The gap ADR-0014 left open. The crypto that excludes a departed member
+    /// already worked — an admin remove rotates them out fine. What was missing
+    /// was anything *triggering* it after a voluntary leave: the empirical
+    /// three-arm run polled a fully-online group 30 times over five minutes and
+    /// saw the epoch pinned at 2 the whole way, while the leaver's restored
+    /// snapshot read post-departure traffic in the clear.
+    #[tokio::test]
+    async fn self_leave_advances_the_epoch_and_rotates_the_leaver_out() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id_storage = "6a".repeat(32);
+        let group_id = group_id_storage.as_str();
+        let local = state.agent.agent_id();
+        let (leaver_hex, leaver_kp, group) = staged_self_leave(&state, group_id, local).await?;
+        let epoch_before = group.lock().await.epoch();
+
+        NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+            .lock()
+            .expect("publish-attempt recorder poisoned")
+            .clear();
+
+        let rotated = reconcile_treekem_self_leave_rekeys(&state, group_id, "test").await;
+
+        assert_eq!(rotated, 1, "the designated committer must issue the rekey");
+        assert_eq!(
+            group.lock().await.epoch(),
+            epoch_before.saturating_add(1),
+            "a self-leave must advance the group epoch — a roster-only fix leaves the leaver reading"
+        );
+        assert!(
+            !group.lock().await.has_leaf_for_key_package(&leaver_kp),
+            "the departed member's leaf must be blanked, not merely marked Removed"
+        );
+        let groups = state.named_groups.read().await;
+        let info = groups.get(group_id).expect("group retained");
+        assert_eq!(
+            info.secret_epoch,
+            epoch_before.saturating_add(1),
+            "the published roster must bind to the new epoch"
+        );
+        drop(groups);
+        assert!(
+            NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+                .lock()
+                .expect("publish-attempt recorder poisoned")
+                .iter()
+                .any(|(_, gid, _)| gid == group_id),
+            "remaining members must be told, or they cannot converge to the new epoch"
+        );
+        assert!(!leaver_hex.is_empty());
+        Ok(())
+    }
+
+    /// Upstream's #370 join-approval flow seeds PENDING roster mirrors, which
+    /// also read `!is_active()` — the self-leave reconcile's trigger set. A
+    /// pending joiner carries a KeyPackage but never a ratchet-tree leaf, so
+    /// the `has_leaf_for_key_package` guard must skip them: rotating "out" a
+    /// member who was never in would burn an epoch per pending join and
+    /// re-key against nothing.
+    #[tokio::test]
+    async fn a_pending_joiner_with_a_key_package_is_never_a_rekey_candidate() -> Result<()> {
+        use base64::Engine as _;
+
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id_storage = "6d".repeat(32);
+        let group_id = group_id_storage.as_str();
+        let group_id_bytes = hex::decode(group_id)?;
+        let local = state.agent.agent_id();
+        let local_seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+        let group = x0x::mls::TreeKemMlsGroup::create(group_id_bytes.clone(), local, &local_seed)?;
+        let epoch_before = group.epoch();
+
+        // A seeded pending joiner: KeyPackage published, no leaf in the tree.
+        let pending = AgentId([0x6e; 32]);
+        let pending_hex = hex::encode(pending.as_bytes());
+        let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(pending, &[0x6e; 32])?;
+        let pending_kp = prepared.key_package_bytes().to_vec();
+
+        let mut info = treekem_metadata_group_info(local, group_id, group_id);
+        let local_hex = hex::encode(local.as_bytes());
+        info.add_member(
+            pending_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(local_hex),
+            None,
+        );
+        info.members_v2
+            .get_mut(&pending_hex)
+            .expect("pending entry")
+            .state = x0x::groups::GroupMemberState::Pending;
+        info.set_member_treekem_key_package(
+            &pending_hex,
+            base64::engine::general_purpose::STANDARD.encode(&pending_kp),
+        );
+        info.secret_epoch = group.epoch();
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info);
+        let group = Arc::new(Mutex::new(group));
+        state
+            .treekem_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), Arc::clone(&group));
+
+        let rotated = reconcile_treekem_self_leave_rekeys(&state, group_id, "test-pending").await;
+
+        assert_eq!(rotated, 0, "a pending joiner must never trigger a rekey");
+        assert_eq!(
+            group.lock().await.epoch(),
+            epoch_before,
+            "no epoch may advance for a member who never held a leaf"
+        );
+        Ok(())
+    }
+
+    /// Re-applying the same leave must not commit twice. Each extra commit is
+    /// another epoch the rest of the group has to converge on, and a pile-up is
+    /// how this subsystem wedges.
+    #[tokio::test]
+    async fn repeated_self_leave_yields_one_epoch_advance_not_two() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id_storage = "6c".repeat(32);
+        let group_id = group_id_storage.as_str();
+        let local = state.agent.agent_id();
+        let (_leaver_hex, _kp, group) = staged_self_leave(&state, group_id, local).await?;
+        let epoch_before = group.lock().await.epoch();
+
+        let first = reconcile_treekem_self_leave_rekeys(&state, group_id, "test-first").await;
+        let epoch_after_first = group.lock().await.epoch();
+        let second = reconcile_treekem_self_leave_rekeys(&state, group_id, "test-repeat").await;
+
+        assert_eq!(first, 1, "the first pass owes one rotation");
+        assert_eq!(second, 0, "the second pass owes nothing");
+        assert_eq!(
+            epoch_after_first,
+            epoch_before.saturating_add(1),
+            "one advance"
+        );
+        assert_eq!(
+            group.lock().await.epoch(),
+            epoch_after_first,
+            "a repeat pass must not advance the epoch again"
+        );
+        Ok(())
+    }
+
+    /// Every remaining member observes the same self-leave. Only the designated
+    /// committer may act on it — if all of them did, they would each commit at
+    /// the same epoch and the group would wedge on duelling commits.
+    #[tokio::test]
+    async fn a_member_who_is_not_the_designated_committer_does_not_rekey() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id_storage = "6d".repeat(32);
+        let group_id = group_id_storage.as_str();
+        // The group's admin/creator is someone else, so this node is a plain
+        // member and must stay out of the way.
+        let other_admin = AgentId([0x01; 32]);
+        let (_leaver_hex, leaver_kp, group) =
+            staged_self_leave(&state, group_id, other_admin).await?;
+        let epoch_before = group.lock().await.epoch();
+
+        let rotated = reconcile_treekem_self_leave_rekeys(&state, group_id, "test").await;
+
+        assert_eq!(rotated, 0, "a non-designated member must not commit");
+        assert_eq!(
+            group.lock().await.epoch(),
+            epoch_before,
+            "a bystander must not advance the epoch"
+        );
+        assert!(
+            group.lock().await.has_leaf_for_key_package(&leaver_kp),
+            "the rotation is still owed — by the designated committer, not this node"
+        );
+        Ok(())
+    }
+
+    /// ADR-0014 §4. If the rekey only ever fired on the live event, a leave
+    /// that happened while the committer was down would never rotate and the
+    /// hole would stay open indefinitely. The trigger is reconstructed from
+    /// persisted roster state instead, so coming back up closes it.
+    #[tokio::test]
+    async fn a_leave_missed_while_down_is_rekeyed_on_the_next_startup_pass() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id_storage = "6e".repeat(32);
+        let group_id = group_id_storage.as_str();
+        let local = state.agent.agent_id();
+        // No live event is delivered here at all — this is the state a daemon
+        // finds on disk after being offline for the departure.
+        let (_leaver_hex, leaver_kp, group) = staged_self_leave(&state, group_id, local).await?;
+        let epoch_before = group.lock().await.epoch();
+
+        reconcile_treekem_self_leave_rekeys_all_groups(&state).await;
+
+        assert_eq!(
+            group.lock().await.epoch(),
+            epoch_before.saturating_add(1),
+            "the startup sweep must close a rekey owed from an unwitnessed leave"
+        );
+        assert!(
+            !group.lock().await.has_leaf_for_key_package(&leaver_kp),
+            "the departed leaf must be gone after catch-up"
+        );
+        Ok(())
     }
 }
 
