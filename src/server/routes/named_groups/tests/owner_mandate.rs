@@ -3791,3 +3791,56 @@ async fn replaced_not_durable_queued_replay_withholds_the_notification_759() -> 
     assert_eq!(row.counters.task_deltas_quarantine_applied, 0);
     Ok(())
 }
+
+/// WHY (ADR-0064 §1a, returning-member re-key): that path seals its ADD with
+/// the PLAIN `seal_commit` — the owner certificate rides in `certificate_b64`
+/// — so the mandate minted at its pre-mutation point must anchor a terminal
+/// produced by a different sealer than the seat path's. If it does not, or if
+/// the field is left `None` (which compiles), every enforcing member on an
+/// owner-axis group refuses the re-key once the authority is recorded Capable,
+/// and the refusal is silent to the returning member: it never gets its seat
+/// back. The absent-mandate refusal itself is pinned by the slice-3 grace
+/// tests above.
+#[tokio::test]
+async fn rekey_add_mandate_anchors_the_plain_seal_it_ships_with() -> Result<()> {
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "d6".repeat(32);
+    let base = sealed_group(state.as_ref(), &group_id, owner_certified_policy(&owner_kp)).await?;
+    let joiner_kp = AgentKeypair::generate()?;
+    let joiner_hex = hex::encode(joiner_kp.agent_id().as_bytes());
+    let actor_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let cert = x0x::identity::AgentCertificate::issue_for_public_key(
+        &owner_kp,
+        joiner_kp.public_key().as_bytes(),
+        None,
+    )?;
+    let pre_seal = seat_write(&base, &joiner_hex, &actor_hex, &cert);
+
+    let minted = mint_owner_mandate_for_seat(
+        state.as_ref(),
+        &pre_seal,
+        7,
+        &joiner_hex,
+        &actor_hex,
+        "d6-invite-secret",
+        Some(&cert),
+        44_000,
+    )
+    .await;
+    let Some(minted) = minted else {
+        panic!("the re-key ADD on an owner-axis group must mint a mandate");
+    };
+
+    let mut sealed = pre_seal.clone();
+    let commit = sealed.seal_commit(state.agent.identity().agent_keypair(), 45_000)?;
+    assert_eq!(minted.expected_terminal_revision, commit.revision);
+    assert_eq!(
+        minted.parent_state_hash,
+        commit.prev_state_hash.clone().expect("parent")
+    );
+    assert_eq!(minted.roster_root_after_add, commit.roster_root);
+    assert_eq!(minted.policy_hash, commit.policy_hash);
+    assert_eq!(minted.public_meta_hash, commit.public_meta_hash);
+    assert_eq!(minted.declared_epoch, 7);
+    Ok(())
+}

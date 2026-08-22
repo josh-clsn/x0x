@@ -7197,6 +7197,9 @@ async fn forking_catchup_responder_adopts_nothing_under_anchored_gap() -> Result
             group_id: stage.group_id.clone(),
             events: vec![fork_event],
             truncated: false,
+            signed_by: None,
+            target_member_id: None,
+            target_member_key_package_b64: None,
         },
     )
     .await;
@@ -7363,6 +7366,9 @@ async fn forking_catchup_policy_page_leaves_group_state_untouched() -> Result<()
             group_id: stage.group_id.clone(),
             events: vec![policy_event],
             truncated: false,
+            signed_by: None,
+            target_member_id: None,
+            target_member_key_package_b64: None,
         },
     )
     .await;
@@ -7633,6 +7639,9 @@ async fn honest_multicommit_gap_converges_page_by_page_under_gate() -> Result<()
                 group_id: stage.group_id.clone(),
                 events: vec![page_event],
                 truncated: false,
+                signed_by: None,
+                target_member_id: None,
+                target_member_key_package_b64: None,
             },
         )
         .await;
@@ -7676,6 +7685,9 @@ async fn honest_multicommit_gap_converges_page_by_page_under_gate() -> Result<()
             group_id: stage.group_id.clone(),
             events: vec![treekem_event],
             truncated: false,
+            signed_by: None,
+            target_member_id: None,
+            target_member_key_package_b64: None,
         },
     )
     .await;
@@ -7847,6 +7859,9 @@ async fn stale_record_in_one_group_does_not_block_another() -> Result<()> {
             group_id: other_group,
             events: vec![],
             truncated: false,
+            signed_by: None,
+            target_member_id: None,
+            target_member_key_package_b64: None,
         },
     )
     .await;
