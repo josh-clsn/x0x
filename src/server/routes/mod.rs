@@ -109,8 +109,8 @@ pub(super) use named_groups::{
 };
 pub(super) use network::{
     ack_diagnostics, bootstrap_cache_stats, connectivity_diagnostics, dm_diagnostics,
-    gossip_diagnostics, groups_diagnostics, network_status, peer_health_handler, peers,
-    probe_peer_handler, relay_diagnostics, transport_diagnostics,
+    gossip_diagnostics, groups_diagnostics, mesh_join, mesh_quiesce, network_status,
+    peer_health_handler, peers, probe_peer_handler, relay_diagnostics, transport_diagnostics,
 };
 pub(super) use owner::{
     owner_agents_issue, owner_agents_revoke, owner_riders_issue, owner_riders_list,

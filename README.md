@@ -255,7 +255,7 @@ curl -H "Authorization: Bearer $TOKEN" "http://$API/contacts"
 ```
 
 - **[SKILL.md](./SKILL.md)** — agent-facing guide with verified examples for every major surface.
-- **[docs/api-reference.md](./docs/api-reference.md)** — the complete REST + WebSocket + SSE reference (all 174 endpoints, auth classes, request/response shapes, WS/SSE event tables).
+- **[docs/api-reference.md](./docs/api-reference.md)** — the complete REST + WebSocket + SSE reference (all 176 documented endpoints, auth classes, request/response shapes, WS/SSE event tables).
 - **[docs/local-apps.md](./docs/local-apps.md)** — integrating non-Rust applications with the daemon.
 - **[docs/adr/README.md](./docs/adr/README.md)** — the ADR index: every design decision, 0001–0058, with errata.
 - `x0x routes` — print every endpoint served by your running daemon.

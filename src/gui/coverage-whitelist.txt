@@ -44,3 +44,8 @@ POST /shutdown
 # not a URL the coverage crawler follows from /api listing. GUI calls both.
 GET /home
 POST /home/rename
+
+# ── Runtime mesh flips — embedder control surface (fetch>it mobile shell
+# flips mesh mode over REST); not a browser-GUI concern ──
+POST /mesh/join
+POST /mesh/quiesce

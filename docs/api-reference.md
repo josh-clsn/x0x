@@ -124,9 +124,13 @@ The Home Suite campaign (ADRs 0036–0043, plus the 0044–0058 backfills) added
   `GET /diagnostics/ws`.
 
 Open issues for this release are listed in the README's *Known limitations*
-table (#446–#451). This reference documents **174 endpoints — exactly the set
-`x0x routes` prints** (two further served paths sit outside the registry:
-`/.well-known/agent-card.json` and the `/gui/` alias).
+table (#446–#451). This reference documents **176 endpoints** — the 174
+upstream surfaces plus the two runtime mesh flips this fork adds for embedded
+shells. `x0x routes` prints 179: it also lists the three engine-A
+control-plane routes (`POST /groups/:id/apply-metadata-event` and
+`GET`/`POST /groups/:id/join-result/:member`), which client apps bridge and no
+browser calls. Two further served paths sit outside the registry:
+`/.well-known/agent-card.json` and the `/gui/` alias.
 
 ## System
 
@@ -624,6 +628,8 @@ or an illegal placement; `501` ceremony disabled.
 | GET | `/presence/events` | `x0x presence events` | Server-Sent Events stream of presence online/offline events |
 | GET | `/network/status` | `x0x network status` | NAT and connectivity diagnostics |
 | GET | `/network/bootstrap-cache` | `x0x network cache` | Bootstrap cache stats |
+| POST | `/mesh/join` | `x0x mesh join` | Dial the gossip mesh (bootstrap phases); returns immediately with `status: "dialing"` |
+| POST | `/mesh/quiesce` | `x0x mesh quiesce` | Disconnect all mesh peers and latch the mesh off (inbound rejected, gossip sends dropped, reappearing peers re-swept) until `/mesh/join`; returns `disconnected` count |
 | GET | `/peers/:peer_id/health` | `x0x peer health <peer_id>` | Connection health snapshot for a peer |
 | POST | `/peers/:peer_id/probe` | `x0x peer probe <peer_id>` | Active `probe_peer` liveness + RTT check |
 | GET | `/peers/events` | `x0x peer events` | SSE stream of peer lifecycle events |
