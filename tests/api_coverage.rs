@@ -334,6 +334,21 @@ const COVERED: &[CoveredEndpoint] = &[
         d4_stateful_events_converge_via_signed_commits
     ),
     covered!(
+        Post,
+        "/groups/:id/apply-metadata-event",
+        apply_metadata_event_endpoint_rejects_invalid_event
+    ),
+    covered!(
+        Get,
+        "/groups/:id/join-result/:member",
+        join_result_inline_get_404_when_not_staged
+    ),
+    covered!(
+        Post,
+        "/groups/:id/join-result/:member",
+        apply_join_result_endpoint_rejects_invalid_event
+    ),
+    covered!(
         Get,
         "/groups/:id/requests",
         d4_join_request_events_converge_via_signed_commits
@@ -506,6 +521,10 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
     (
         "tests/named_group_join_metadata_event.rs",
         include_str!("named_group_join_metadata_event.rs"),
+    ),
+    (
+        "tests/named_group_integration.rs",
+        include_str!("named_group_integration.rs"),
     ),
     (
         "tests/connectivity_test.rs",
