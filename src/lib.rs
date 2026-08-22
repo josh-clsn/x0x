@@ -22091,41 +22091,75 @@ mod tests {
         // Id seams refuse pre-socket — deterministic: the gate runs before
         // any transport work, so the refusal itself must carry the
         // suppression reason.
-        for (seam, err) in [
-            (
-                "connect_peer",
-                alice_network
-                    .connect_peer(bob_peer)
-                    .await
-                    .expect_err("connect_peer must refuse a suppressed peer"),
-            ),
-            (
-                "connect_peer_with_addrs",
-                alice_network
-                    .connect_peer_with_addrs(bob_peer, vec![bob_addr])
-                    .await
-                    .expect_err("connect_peer_with_addrs must refuse a suppressed peer"),
-            ),
-            (
-                "connect_cached_peer",
-                alice_network
-                    .connect_cached_peer(bob_peer)
-                    .await
-                    .expect_err("connect_cached_peer must refuse a suppressed peer"),
-            ),
-            (
-                "connect_addr",
-                alice_network
-                    .connect_addr(bob_addr)
-                    .await
-                    .expect_err("connect_addr must refuse a suppressed answered id"),
-            ),
-        ] {
-            assert!(
-                err.to_string().contains("reconnect-suppressed"),
-                "{seam}: refusal must come from the dial gate, got: {err}"
-            );
+        //
+        // Invariant C is asserted with a BRACKETED count: capture
+        // immediately before the battery, run all four seams, capture
+        // immediately after, require zero delta. A background writer
+        // outside these seams (probed live: the count is flat ACROSS the
+        // four seams even in runs where it moved — ant-quic's own
+        // bootstrap-cache bookkeeping for the still-answering peer is the
+        // suspect, and no fixed quiet window reliably out-waits it) can
+        // land a stray success between captures, so a dirty window is
+        // retried; a seam-authored recording dirties EVERY window and
+        // still fails.
+        let mut clean_pass = false;
+        for _bracket_attempt in 0..3 {
+            let before = cache
+                .get_peer(&bob_peer)
+                .await
+                .expect("bob cached")
+                .stats
+                .success_count;
+            for (seam, err) in [
+                (
+                    "connect_peer",
+                    alice_network
+                        .connect_peer(bob_peer)
+                        .await
+                        .expect_err("connect_peer must refuse a suppressed peer"),
+                ),
+                (
+                    "connect_peer_with_addrs",
+                    alice_network
+                        .connect_peer_with_addrs(bob_peer, vec![bob_addr])
+                        .await
+                        .expect_err("connect_peer_with_addrs must refuse a suppressed peer"),
+                ),
+                (
+                    "connect_cached_peer",
+                    alice_network
+                        .connect_cached_peer(bob_peer)
+                        .await
+                        .expect_err("connect_cached_peer must refuse a suppressed peer"),
+                ),
+                (
+                    "connect_addr",
+                    alice_network
+                        .connect_addr(bob_addr)
+                        .await
+                        .expect_err("connect_addr must refuse a suppressed answered id"),
+                ),
+            ] {
+                assert!(
+                    err.to_string().contains("reconnect-suppressed"),
+                    "{seam}: refusal must come from the dial gate, got: {err}"
+                );
+            }
+            let after = cache
+                .get_peer(&bob_peer)
+                .await
+                .expect("bob cached")
+                .stats
+                .success_count;
+            if after == before {
+                clean_pass = true;
+                break;
+            }
         }
+        assert!(
+            clean_pass,
+            "refused dials must not record a cache success (no clean bracket in 3 attempts)"
+        );
 
         // Regression-detection drain, NOT a settle heuristic: each of
         // the four wrapper-side record_success sites (see the invariant-C
