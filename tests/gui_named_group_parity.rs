@@ -146,6 +146,25 @@ const DEFERRED: &[(Method, &str, &str)] = &[
         "/groups/:id/quarantine/clear",
         "operator/ops endpoint; exposed via CLI + REST, GUI ops panel deferred (ADR-0064)",
     ),
+    // Engine-A relay-delivered join lane: machine-to-machine control
+    // plane driven by client apps bridging events for gossip-isolated
+    // peers. Never a browser action; the browser GUI joins via the
+    // normal invite path.
+    (
+        Method::Post,
+        "/groups/:id/apply-metadata-event",
+        "engine-A control plane; client apps bridge events, not a browser action",
+    ),
+    (
+        Method::Get,
+        "/groups/:id/join-result/:member",
+        "engine-A control plane; client apps poll staged join-results, not a browser action",
+    ),
+    (
+        Method::Post,
+        "/groups/:id/join-result/:member",
+        "engine-A control plane; client apps push bridged join-results, not a browser action",
+    ),
 ];
 
 /// One observed `api(...)` call: the first-argument expression text
