@@ -58,14 +58,15 @@ use routes::{
     list_machines, list_mls_groups, list_named_groups, list_revocations, list_task_lists,
     list_tasks, load_causal_approval_queue, load_named_groups, load_predecessor_relay_outbox,
     load_treekem_member_key_packages, machine_for_agent_handler, machines_by_user_handler,
-    mls_decrypt, mls_encrypt, named_group_metadata_event_group_id, named_group_metadata_event_kind,
-    network_status, now_millis_u64, peer_health_handler, peers, pin_machine, presence,
-    presence_find, presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
-    publish_group_card_to_discovery, put_kv_value, quick_trust, recover_treekem_named_journals,
-    reject_join_request, reject_unverified_direct_public_message, relay_diagnostics,
-    remove_mls_member, remove_named_group_member, replay_pending_causal_approvals,
-    restore_treekem_groups, revoke_contact, run_fallback_github_poll, run_gossip_update_listener,
-    run_startup_update_check, save_named_groups_checked, save_named_groups_checked_unlocked,
+    mesh_join, mesh_quiesce, mls_decrypt, mls_encrypt, named_group_metadata_event_group_id,
+    named_group_metadata_event_kind, network_status, now_millis_u64, peer_health_handler, peers,
+    pin_machine, presence, presence_find, presence_foaf, presence_online, presence_status,
+    probe_peer_handler, publish, publish_group_card_to_discovery, put_kv_value, quick_trust,
+    recover_treekem_named_journals, reject_join_request, reject_unverified_direct_public_message,
+    relay_diagnostics, remove_mls_member, remove_named_group_member,
+    replay_pending_causal_approvals, restore_treekem_groups, revoke_contact,
+    run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
+    save_named_groups_checked, save_named_groups_checked_unlocked,
     save_predecessor_relay_outbox_unlocked, seal_group_state, secure_group_decrypt,
     secure_group_encrypt, secure_group_reseal, secure_open_envelope_adversarial,
     send_group_public_message, set_group_display_name, shutdown_handler,
@@ -829,12 +830,42 @@ pub async fn serve_with_options(
         }
     }
 
-    // P0-1: subscribe to the global group discovery topic so remote public
-    // groups populate the local card cache without manual import.
-    bg_tasks.extend(spawn_global_discovery_listener(Arc::clone(&state)).await);
-    // Phase C.2: load persisted shard subscriptions and re-subscribe with
-    // staggered jitter to avoid anti-entropy storms.
-    bg_tasks.extend(spawn_directory_resubscribe(Arc::clone(&state)).await);
+    // ADR-012 wire-compat: v2 (payload-covering) gossip headers are emitted
+    // only when the config opts in. Stock 0.5.71 emits v2 unconditionally,
+    // which pre-0.5.71 peers cannot decode — the vendored gate defaults to
+    // the v1 wire format so a mixed fleet keeps interoperating; flip
+    // `gossip_emit_v2 = true` only once every node runs a v2-capable build.
+    saorsa_gossip_pubsub::set_emit_v2_headers(config.gossip_emit_v2);
+    if config.gossip_emit_v2 {
+        tracing::info!("gossip: emitting ADR-012 v2 (payload-covering) headers");
+    }
+
+    if config.leaf_mode {
+        // Leaf mode: the global discovery topic, directory tag shards, and
+        // the global public-message fallback (below) are network-serving
+        // duties whose traffic scales with the whole mesh — a metered
+        // device opts out. First-party surfaces (own groups, own inbox,
+        // contact channels) are unaffected.
+        //
+        // The subscription trim alone is only part of the cost: PlumTree
+        // nodes also relay EAGER payloads for topics they never subscribed
+        // to (pass-through, so messages propagate past intermediate hops).
+        // Measured 2026-07-28, that pass-through traffic dominated. This
+        // turns it off for unsubscribed topics too.
+        state.agent.set_leaf_mode(true);
+        tracing::info!(
+            "leaf mode: skipping global discovery, directory shard, and \
+             global public-message subscriptions; not relaying pass-through \
+             topics"
+        );
+    } else {
+        // P0-1: subscribe to the global group discovery topic so remote public
+        // groups populate the local card cache without manual import.
+        bg_tasks.extend(spawn_global_discovery_listener(Arc::clone(&state)).await);
+        // Phase C.2: load persisted shard subscriptions and re-subscribe with
+        // staggered jitter to avoid anti-entropy storms.
+        bg_tasks.extend(spawn_directory_resubscribe(Arc::clone(&state)).await);
+    }
     // Restart-amnesia fix: load the persisted task-list/kv-store subscription
     // manifest now (before REST handlers can mutate it) — the actual
     // re-create/re-join runs after `join_network` in the join task below.
@@ -844,7 +875,12 @@ pub async fn serve_with_options(
     bg_tasks.extend(spawn_listed_to_contacts_listener(Arc::clone(&state)).await);
     // Phase E: subscribe to a stable global SignedPublic message fallback so
     // first messages are not dependent on a brand-new per-group topic tree.
-    bg_tasks.extend(spawn_global_public_message_listener(Arc::clone(&state)).await);
+    // Leaf nodes skip it (see the leaf-mode block above): it is a shared
+    // whole-network topic, and fetch>it-style leafs use private per-group
+    // messaging, not the public first-message fallback.
+    if !config.leaf_mode {
+        bg_tasks.extend(spawn_global_public_message_listener(Arc::clone(&state)).await);
+    }
 
     // Re-publish our own discoverable group cards after startup so late joiners
     // pick them up.
@@ -898,6 +934,7 @@ pub async fn serve_with_options(
     let join_agent = Arc::clone(&agent);
     let rendezvous_enabled = config.rendezvous_enabled;
     let rendezvous_validity_ms = config.rendezvous_validity_ms;
+    let defer_mesh_join = config.defer_mesh_join;
 
     // Start the DM inbox as soon as join_network has created the gossip
     // runtime. join_network may keep working through slow bootstrap/cache
@@ -918,6 +955,7 @@ pub async fn serve_with_options(
         dm_inbox_public_group_bootstrap_route_tx,
         dm_inbox_kv_store_delta_route_tx,
         dm_inbox_predecessor_relay_route_tx,
+        config.leaf_mode,
     )));
 
     // Restart-amnesia fix: re-register every persisted task-list/kv-store
@@ -938,7 +976,18 @@ pub async fn serve_with_options(
         crdt_subscriptions::rehydrate(crdt_rehydrate_state).await;
     }));
     bg_tasks.push(tokio::spawn(async move {
-        match join_agent.join_network().await {
+        // Infra (gossip runtime + listeners) always starts, even when the
+        // mesh dial is deferred: a quiesced embedder still serves every
+        // local surface and must be ready for a later `POST /mesh/join`.
+        if let Err(e) = join_agent.start_network_infra().await {
+            tracing::error!("Failed to start network infra: {e}");
+            return;
+        }
+        if defer_mesh_join {
+            tracing::info!("mesh join deferred (defer_mesh_join): POST /mesh/join to dial");
+            return;
+        }
+        match join_agent.dial_bootstrap().await {
             Ok(()) => {
                 tracing::info!("Network joined");
                 if rendezvous_enabled {
@@ -1635,6 +1684,9 @@ pub async fn serve_with_options(
         // Upgrade
         .route("/upgrade", get(check_upgrade))
         .route("/upgrade/apply", post(apply_upgrade))
+        // Runtime mesh membership (no-teardown mesh flips for embedders)
+        .route("/mesh/join", post(mesh_join))
+        .route("/mesh/quiesce", post(mesh_quiesce))
         // Network diagnostics
         .route("/network/bootstrap-cache", get(bootstrap_cache_stats))
         .route("/diagnostics/connectivity", get(connectivity_diagnostics))
@@ -1927,6 +1979,7 @@ pub async fn list_instances() -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_dm_inbox_when_gossip_ready(
     agent: Arc<x0x::Agent>,
     kem_keypair: Arc<x0x::groups::kem_envelope::AgentKemKeypair>,
@@ -1935,9 +1988,10 @@ async fn start_dm_inbox_when_gossip_ready(
     public_group_bootstrap_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     kv_store_delta_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     predecessor_relay_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
+    leaf_mode: bool,
 ) {
     for attempt in 1..=DM_INBOX_START_MAX_ATTEMPTS {
-        let dm_inbox_config = x0x::dm_inbox::DmInboxConfig::default()
+        let mut dm_inbox_config = x0x::dm_inbox::DmInboxConfig::default()
             .with_typed_payload_route(x0x::exec::EXEC_DM_PREFIX, exec_route_tx.clone())
             .with_typed_payload_route(
                 GROUP_PUBLIC_MESSAGE_DM_PREFIX,
@@ -1956,6 +2010,7 @@ async fn start_dm_inbox_when_gossip_ready(
                 GROUP_PREDECESSOR_RELAY_DM_PREFIX,
                 predecessor_relay_route_tx.clone(),
             );
+        dm_inbox_config.skip_legacy_bus = leaf_mode;
         match agent
             .start_dm_inbox(Arc::clone(&kem_keypair), dm_inbox_config)
             .await
