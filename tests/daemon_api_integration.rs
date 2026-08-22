@@ -895,6 +895,48 @@ async fn daemon_api_network_status() {
     assert_eq!(r.status(), StatusCode::OK);
 }
 
+/// No-teardown mesh flip, mesh-on half: the dial is spawned in the
+/// background, so the endpoint must answer immediately with `"dialing"`
+/// rather than holding the request across the bootstrap retry rounds.
+#[tokio::test]
+#[ignore]
+async fn daemon_api_mesh_join() {
+    let d = daemon().await;
+    let r: Value = ca(&d)
+        .post(d.url("/mesh/join"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["ok"], true);
+    assert_eq!(r["status"], "dialing");
+}
+
+/// No-teardown mesh flip, mesh-off half: quiesce sweeps mesh connections and
+/// reports the count while the daemon (and its API) keeps serving — the whole
+/// point of the endpoint is that mesh-off never requires a teardown.
+#[tokio::test]
+#[ignore]
+async fn daemon_api_mesh_quiesce() {
+    let d = daemon().await;
+    let r: Value = ca(&d)
+        .post(d.url("/mesh/quiesce"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["ok"], true);
+    assert!(r["disconnected"].is_u64());
+
+    // The daemon must still be serving after the sweep.
+    let health = ca(&d).get(d.url("/health")).send().await.unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+}
+
 #[tokio::test]
 #[ignore]
 async fn daemon_api_announce() {

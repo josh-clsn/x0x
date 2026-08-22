@@ -115,6 +115,11 @@ pub(crate) trait SeedAdmission: Send + Sync {
 #[async_trait::async_trait]
 impl SeedAdmission for NetworkNode {
     async fn admission(&self, peer: &ant_quic::PeerId) -> PeerAdmission {
+        // The mesh-off latch refuses every JOIN frame: a seed that was
+        // answered before a quiesce must not re-open the overlay.
+        if self.mesh_quiesced() {
+            return PeerAdmission::Suppressed;
+        }
         self.peer_admission(peer).await
     }
 }
