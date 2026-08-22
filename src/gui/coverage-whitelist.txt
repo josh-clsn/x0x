@@ -45,3 +45,12 @@ POST /shutdown
 # function call, not a path literal the crawler can statically match.
 # The endpoint IS wired: shareIdentity/generateCard/genCardModal. ──
 GET /agent/card
+# ── ADR-0038 Home space — entered from the sidebar via navigate('homespace'),
+# not a URL the coverage crawler follows from /api listing. GUI calls both.
+GET /home
+POST /home/rename
+
+# ── Runtime mesh flips — embedder control surface (fetch>it mobile shell
+# flips mesh mode over REST); not a browser-GUI concern ──
+POST /mesh/join
+POST /mesh/quiesce

@@ -281,6 +281,37 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub bootstrap_peers: Option<Vec<SocketAddr>>,
 
+    /// Leaf mode for metered or battery-constrained devices (phones,
+    /// laptops on hotspots). A leaf node keeps every first-party surface —
+    /// its own DM inbox, its own groups, contact channels, the full REST
+    /// API — but opts out of network-serving gossip duties whose traffic
+    /// scales with the whole network rather than this node's use: the
+    /// shared legacy DM bus, the global group-discovery topic, persisted
+    /// directory tag-shard subscriptions, and the global public-message
+    /// fallback. Protocol-compatible with full nodes: a leaf is
+    /// indistinguishable from a node that simply never joined those
+    /// topics. Default `false` (full mesh duty).
+    #[serde(default)]
+    pub leaf_mode: bool,
+
+    /// ADR-012 wire compatibility: emit v2 (payload-covering) gossip
+    /// message headers. Pre-0.5.71 peers cannot decode the v2 header at
+    /// all, so this stays `false` until every node in the fleet runs a
+    /// v2-capable build; receive-side verification is always on either
+    /// way. Default `false` (v1 wire format).
+    #[serde(default)]
+    pub gossip_emit_v2: bool,
+
+    /// Serve without dialing the mesh. The gossip runtime, listeners, and
+    /// every local surface start normally, but the bootstrap dial phases
+    /// are skipped until `POST /mesh/join`. For embedders (the fetch>it
+    /// mobile shell) that flip mesh mode at runtime: re-serving to change
+    /// mode orphaned saorsa-gossip-pubsub tasks (no shutdown API) into a
+    /// hot failure loop, so mode changes must not tear the daemon down.
+    /// Default `false` (dial at startup, the daemon's historical behavior).
+    #[serde(default)]
+    pub defer_mesh_join: bool,
+
     /// X0X-0062 reviewer P2 #2: enable or disable ant-quic's best-effort
     /// UPnP IGD port-mapping. Default `true` (matches ant-quic). Set to
     /// `false` in the daemon TOML (`port_mapping_enabled = false`) or via
@@ -711,6 +742,21 @@ fn default_rendezvous_validity_ms() -> u64 {
 }
 
 impl DaemonConfig {
+    /// Whether this daemon stays off the compatibility DM bus.
+    ///
+    /// The bus (`x0x/dm/v1/bus`) is a single whole-network topic: every
+    /// subscriber re-broadcasts every gossip-path DM in the network, not
+    /// just its own. A leaf carries no network freight, so leaf mode implies
+    /// the opt-out even when the standalone key is unset; the standalone key
+    /// stays available to a full node that wants only this one duty dropped.
+    ///
+    /// One value, read at all three join points: the inbox subscription, the
+    /// reverse-ACK pre-warm, and durable-ACK publication.
+    #[must_use]
+    pub(super) fn skips_legacy_dm_bus(&self) -> bool {
+        self.skip_legacy_dm_bus || self.leaf_mode
+    }
+
     /// Whether self-update is enabled in this config. The daemon binary uses
     /// this to set [`ServeOptions::self_update_enabled`]; the process-scoped
     /// skip flag is applied separately by [`crate::server::serve_with_options`].
@@ -792,6 +838,9 @@ impl Default for DaemonConfig {
             network_id: None,
             zero_peer_restart_secs: None,
             api_watchdog: super::ApiWatchdogConfig::default(),
+            leaf_mode: false,
+            gossip_emit_v2: false,
+            defer_mesh_join: false,
         }
     }
 }
@@ -1232,6 +1281,60 @@ mod tests {
         let cfg: DaemonConfig =
             toml::from_str("network_id = 'x0x.testnet'").expect("network_id TOML parses");
         assert_eq!(cfg.network_id.as_deref(), Some("x0x.testnet"));
+    }
+
+    #[test]
+    fn leaf_mode_defaults_off_and_parses_from_toml() {
+        // Full mesh duty must stay the default: leaf mode drops
+        // network-serving subscriptions, and an existing deployment that
+        // upgrades without touching its config must keep serving.
+        let cfg: DaemonConfig =
+            toml::from_str("bind_address = '[::]:5483'").expect("minimal TOML parses");
+        assert!(!cfg.leaf_mode);
+        assert!(!DaemonConfig::default().leaf_mode);
+
+        // A metered device opts in with one key.
+        let cfg: DaemonConfig = toml::from_str("leaf_mode = true").expect("leaf_mode TOML parses");
+        assert!(cfg.leaf_mode);
+    }
+
+    /// A leaf must not carry the whole network's DM traffic. The bus opt-out
+    /// is an independent key upstream; leaf mode has to imply it, or a
+    /// metered device that set one key would still subscribe, pre-warm and
+    /// publish ACKs on a topic that re-broadcasts every gossip-path DM in
+    /// the network. The default stays "join the bus" so a rolling upgrade
+    /// from a daemon that still sends there keeps delivering.
+    #[test]
+    fn leaf_mode_implies_the_legacy_dm_bus_opt_out() {
+        assert!(!DaemonConfig::default().skips_legacy_dm_bus());
+
+        let leaf: DaemonConfig = toml::from_str("leaf_mode = true").expect("leaf_mode TOML parses");
+        assert!(leaf.skips_legacy_dm_bus());
+
+        // A full node can still drop just this one duty.
+        let opted_out: DaemonConfig =
+            toml::from_str("skip_legacy_dm_bus = true").expect("skip_legacy_dm_bus TOML parses");
+        assert!(!opted_out.leaf_mode);
+        assert!(opted_out.skips_legacy_dm_bus());
+
+        let both: DaemonConfig = toml::from_str("leaf_mode = true\nskip_legacy_dm_bus = true\n")
+            .expect("both keys parse");
+        assert!(both.skips_legacy_dm_bus());
+    }
+
+    #[test]
+    fn daemon_config_defer_mesh_join_defaults_false() {
+        // Dial-at-startup must stay the default: every existing deployment
+        // upgrades without a config change and still joins the mesh. Only an
+        // embedder that flips mesh mode at runtime opts in with one key.
+        assert!(!DaemonConfig::default().defer_mesh_join);
+
+        let cfg: DaemonConfig = toml::from_str("").expect("empty TOML parses");
+        assert!(!cfg.defer_mesh_join);
+
+        let cfg: DaemonConfig =
+            toml::from_str("defer_mesh_join = true").expect("defer_mesh_join TOML parses");
+        assert!(cfg.defer_mesh_join);
     }
 
     // The two canonical messages enforced by `InstanceName::try_from`.
