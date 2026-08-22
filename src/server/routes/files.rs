@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use x0x::contacts::TrustLevel;
 use x0x::identity::AgentId;
+use x0x::logging::LogHexId;
 
 fn file_transfer_now() -> (u64, u64) {
     let now = std::time::SystemTime::now()
@@ -484,11 +485,31 @@ pub(in crate::server) async fn file_reject_handler(
 // ---------------------------------------------------------------------------
 
 /// Dispatch an incoming `FileMessage` from the direct messaging channel.
+///
+/// Issue #393: every arm authorizes on `sender`, and on the raw-QUIC direct path
+/// the sender `AgentId` is a self-asserted 32-byte wire prefix — only the
+/// `MachineId` is authenticated by the QUIC handshake. An `Offer` pins the
+/// transfer's `remote_agent_id` to `sender`, and the `Accept` / `Reject` /
+/// `Chunk` / `Complete` arms then gate on `remote_agent_id == sender_hex`, so
+/// without `verified` those comparisons are all against an attacker-chosen
+/// string: a forged offer fabricates a transfer with spoofed provenance and a
+/// forged chunk injects file bytes. Mirrors the #377 join-result / Welcome-blob
+/// DM handlers, which already reject unverified senders. Gossip-inbox and
+/// loopback deliveries always set `verified`; a transient raw-QUIC miss
+/// self-heals once the identity binding lands, well within a transfer's lifetime.
 pub(in crate::server) async fn handle_file_message(
     state: &Arc<AppState>,
     sender: &AgentId,
+    verified: bool,
     msg: x0x::files::FileMessage,
 ) {
+    if !verified {
+        tracing::warn!(
+            sender = %LogHexId::agent(&hex::encode(sender.as_bytes())),
+            "ignoring file message from unverified sender"
+        );
+        return;
+    }
     match msg {
         x0x::files::FileMessage::Offer(offer) => {
             handle_file_offer(state, sender, offer).await;

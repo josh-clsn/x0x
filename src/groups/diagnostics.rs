@@ -84,6 +84,11 @@ pub struct GroupCounters {
     pub invites_refused_reasons: std::collections::BTreeMap<String, u64>,
     /// #477: terminal join-attempt outcomes and refusal-serve bookkeeping.
     pub join_attempts_timed_out: u64,
+    /// #390: join results that arrived AFTER their attempt was finalized as
+    /// `timed_out` and still applied, because the expected-inviter pin is
+    /// deliberately left armed past the poll horizon. A non-zero value is
+    /// the evidence that late deliveries are real on this install.
+    pub join_results_applied_after_timeout: u64,
     pub join_refusal_stale_attempt: u64,
     pub join_refusal_signing_throttled: u64,
     /// #468 A5: UNIQUE authenticated fork-evidence records adopted into
@@ -309,6 +314,9 @@ fn merge_counters(dst: &mut GroupCounters, src: &GroupCounters) {
     dst.join_attempts_timed_out = dst
         .join_attempts_timed_out
         .saturating_add(src.join_attempts_timed_out);
+    dst.join_results_applied_after_timeout = dst
+        .join_results_applied_after_timeout
+        .saturating_add(src.join_results_applied_after_timeout);
     dst.join_refusal_stale_attempt = dst
         .join_refusal_stale_attempt
         .saturating_add(src.join_refusal_stale_attempt);
@@ -657,6 +665,15 @@ impl GroupsDiagnostics {
     pub fn record_join_attempt_timed_out(&self, group_id: &str) {
         self.with_counters(group_id, |c| {
             c.join_attempts_timed_out = c.join_attempts_timed_out.saturating_add(1);
+        });
+    }
+
+    /// #390: record a join result that applied after its attempt had already
+    /// been finalized as `timed_out` (the pin outlives the poll horizon).
+    pub fn record_join_result_applied_after_timeout(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.join_results_applied_after_timeout =
+                c.join_results_applied_after_timeout.saturating_add(1);
         });
     }
 
@@ -1306,6 +1323,7 @@ mod tests {
                 base + 13,
             )]),
             join_attempts_timed_out: base + 14,
+            join_results_applied_after_timeout: base + 114,
             join_refusal_stale_attempt: base + 15,
             join_refusal_signing_throttled: base + 16,
             adoption_fork_evidence: base + 17,
@@ -1410,6 +1428,10 @@ mod tests {
         assert_eq!(
             merged.join_attempts_timed_out,
             dst.join_attempts_timed_out + src.join_attempts_timed_out
+        );
+        assert_eq!(
+            merged.join_results_applied_after_timeout,
+            dst.join_results_applied_after_timeout + src.join_results_applied_after_timeout
         );
         assert_eq!(
             merged.join_refusal_stale_attempt,
