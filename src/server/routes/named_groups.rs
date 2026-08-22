@@ -13223,12 +13223,16 @@ fn group_public_unicast_is_retryable(err: &x0x::dm::DmError) -> bool {
 
 fn group_public_message_direct_delivery_config() -> x0x::dm::DmSendConfig {
     let mut config = named_group_direct_delivery_config();
-    // User-visible community posts should use the receive-ACKed raw path when
-    // the member already has a live direct binding. Keep gossip-inbox as the
-    // fallback for startup/convergence, but do not force it: a saturated
-    // gossip overlay must not strand a post when the direct path is healthy.
-    config.prefer_raw_quic_if_connected = true;
-    config.require_gossip = false;
+    // fetch>it: force the gossip-inbox lane. GROUP_PUBLIC_MESSAGE_DM_PREFIX
+    // is stripped ONLY by the typed-payload route fed from the gossip-lane
+    // subscription loop — src/direct.rs has no routing for it — so a unicast
+    // that wins on raw QUIC is delivered to nothing while the transport-level
+    // receive ack makes the sender see Ok. That silent-success hole is worst
+    // exactly where this repair leg matters most (leaf/quiesced phones whose
+    // gossip legs are dark). Upstream's raw-preferred setting returns when a
+    // direct.rs receiver for this prefix exists.
+    config.prefer_raw_quic_if_connected = false;
+    config.require_gossip = true;
     // Do not drop require_gossip_ack on this path to "make groups fast" —
     // that flag is the durable-DM contract. Shorten THIS path's first-attempt
     // budget instead (issue #310); product DMs keep the 8s default.
@@ -41821,6 +41825,172 @@ pub(in crate::server) mod tests {
             "remaining members must be told, or they cannot converge to the new epoch"
         );
         assert!(!leaver_hex.is_empty());
+        Ok(())
+    }
+
+    /// The `3322176`×`d77c88c` composition contract: upstream's #333 resend
+    /// re-transmits the IDENTICAL serialized MemberJoined, so against a
+    /// re-keyed returning member the first apply performs exactly one epoch
+    /// pair (remove@e+1 + add@e+2) consuming one fresh invite, and the resend
+    /// lands in the preserved replay arm — REJECTED, no second pair, no
+    /// double consumption. Nothing in either parent tree covered this.
+    #[tokio::test]
+    async fn a_333_resend_against_a_rekeyed_member_produces_exactly_one_epoch_pair() -> Result<()> {
+        use base64::Engine as _;
+
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id_storage = "7a".repeat(32);
+        let group_id = group_id_storage.as_str();
+        let group_id_bytes = hex::decode(group_id)?;
+        let inviter = state.agent.agent_id();
+        let inviter_hex = hex::encode(inviter.as_bytes());
+        let seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+        let group = x0x::mls::TreeKemMlsGroup::create(group_id_bytes.clone(), inviter, &seed)?;
+        let group = Arc::new(Mutex::new(group));
+        state
+            .treekem_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), Arc::clone(&group));
+        let mut info = treekem_metadata_group_info(inviter, group_id, group_id);
+        let now_ms = now_millis_u64();
+        let joiner_keypair = x0x::identity::AgentKeypair::generate()?;
+        let joiner_id = joiner_keypair.agent_id();
+        let joiner_hex = hex::encode(joiner_id.as_bytes());
+        let joiner_pub_b64 = BASE64.encode(joiner_keypair.public_key().as_bytes());
+        let invite1 = "rekey-333-invite-1".to_string();
+        info.record_issued_invite(
+            invite1.clone(),
+            now_ms / 1_000,
+            0,
+            x0x::groups::GroupRole::Member,
+        );
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info);
+
+        let signed_join = |invite_secret: &str, kp_b64: &str, ts_ms: u64| -> Result<_> {
+            let canonical = canonical_member_joined_bytes(
+                group_id,
+                Some(group_id),
+                &joiner_hex,
+                &joiner_pub_b64,
+                x0x::groups::GroupRole::Member,
+                None,
+                &inviter_hex,
+                invite_secret,
+                ts_ms,
+                Some(kp_b64),
+            );
+            let signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+                joiner_keypair.secret_key(),
+                &canonical,
+            )
+            .map_err(|e| anyhow::anyhow!("sign MemberJoined: {e:?}"))?;
+            Ok(NamedGroupMetadataEvent::MemberJoined {
+                group_id: group_id.to_string(),
+                stable_group_id: Some(group_id.to_string()),
+                member_agent_id: joiner_hex.clone(),
+                member_public_key_b64: joiner_pub_b64.clone(),
+                role: x0x::groups::GroupRole::Member,
+                display_name: None,
+                inviter_agent_id: inviter_hex.clone(),
+                invite_secret: invite_secret.to_string(),
+                ts_ms,
+                treekem_key_package_b64: Some(kp_b64.to_string()),
+                recovery_authority_agent_id: None,
+                recovery_authority_public_key_b64: None,
+                recovery_authority_signature_b64: None,
+                recovery_authority_commit: None,
+                signature_b64: BASE64.encode(signature.as_bytes()),
+            })
+        };
+
+        // 1. Land the original join: the member becomes roster-active, KP_old.
+        let prepared_old = x0x::mls::TreeKemMlsGroup::prepare_member(joiner_id, &[0x7b; 32])?;
+        let kp_old_b64 = BASE64.encode(prepared_old.key_package_bytes());
+        let join1 = signed_join(&invite1, &kp_old_b64, now_ms)?;
+        let first_join = apply_named_group_metadata_event(&state, join1, joiner_id, true, None)
+            .await
+            .accepted;
+        assert!(first_join, "the original join must apply");
+        let epoch_after_join = group.lock().await.epoch();
+
+        // 2. One fresh single-use invite: the re-key's authorization gate.
+        let invite2 = "rekey-333-invite-2".to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .get_mut(group_id)
+            .expect("group exists")
+            .record_issued_invite(
+                invite2.clone(),
+                now_ms / 1_000,
+                0,
+                x0x::groups::GroupRole::Member,
+            );
+
+        // 3. The returning-member re-key: same agent, NEW KeyPackage.
+        let prepared_new = x0x::mls::TreeKemMlsGroup::prepare_member(joiner_id, &[0x7c; 32])?;
+        let kp_new_b64 = BASE64.encode(prepared_new.key_package_bytes());
+        let rekey_event = signed_join(&invite2, &kp_new_b64, now_ms + 1)?;
+
+        NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+            .lock()
+            .expect("publish-attempt recorder poisoned")
+            .clear();
+
+        // 4. First apply performs the re-key: exactly one epoch PAIR.
+        let rekey =
+            apply_named_group_metadata_event(&state, rekey_event.clone(), joiner_id, true, None)
+                .await;
+        assert!(rekey.accepted, "returning-member re-key must apply");
+        assert_eq!(
+            group.lock().await.epoch(),
+            epoch_after_join + 2,
+            "re-key = remove@e+1 + add@e+2, exactly one pair"
+        );
+        let publishes_after_rekey = NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+            .lock()
+            .expect("publish-attempt recorder poisoned")
+            .len();
+        assert_eq!(
+            publishes_after_rekey, 2,
+            "one MemberRemoved + one MemberAdded publish"
+        );
+        assert_eq!(
+            member_treekem_kp(&state, group_id, &joiner_hex)
+                .await
+                .as_deref(),
+            Some(kp_new_b64.as_str()),
+            "roster carries KP_new after the re-key"
+        );
+
+        // 5. The #333 resend: the IDENTICAL event again.
+        let resend =
+            apply_named_group_metadata_event(&state, rekey_event, joiner_id, true, None).await;
+
+        // 6. The composition contract.
+        assert!(
+            !resend.accepted,
+            "the resend must land in the preserved replay/no-op arm"
+        );
+        assert_eq!(
+            group.lock().await.epoch(),
+            epoch_after_join + 2,
+            "no second epoch pair"
+        );
+        assert_eq!(
+            NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+                .lock()
+                .expect("publish-attempt recorder poisoned")
+                .len(),
+            publishes_after_rekey,
+            "no second publish volley"
+        );
         Ok(())
     }
 

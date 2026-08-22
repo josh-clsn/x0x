@@ -3061,7 +3061,10 @@ impl NetworkNode {
     /// [`DisconnectReason::Transport`] (transport closes are reconnect-
     /// eligible by definition and never tombstoned).
     fn suppress_reconnect(&self, peer_id: [u8; 32], reason: DisconnectReason) {
-        if reason.reconnect_eligible() {
+        // `Some(ZERO)` is the reason model's "does not suppress at all"
+        // (Transport, Quiesce): write nothing rather than a never-live entry,
+        // so "a quiesce sweep writes no tombstone" is literally true.
+        if reason.suppression_ttl() == Some(Duration::ZERO) {
             return;
         }
         if let Ok(mut map) = self.reconnect_suppressions.lock() {
