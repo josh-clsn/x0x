@@ -533,6 +533,15 @@ impl PubSubManager {
         self.plumtree.set_leaf_mode(enabled);
     }
 
+    /// Whether the fork leaf relay policy is active. Mirrors
+    /// `DaemonConfig::leaf_mode`, which is also what drives
+    /// `DmInboxConfig::skip_legacy_bus` — code on the DM warm paths reads it
+    /// here because those helpers only get the manager.
+    #[must_use]
+    pub fn leaf_mode(&self) -> bool {
+        self.plumtree.leaf_mode()
+    }
+
     /// Snapshot of Leaf vs Full participation for `GET /diagnostics/gossip`.
     #[must_use]
     pub fn participation_snapshot(&self) -> ParticipationSnapshot {
