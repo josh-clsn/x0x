@@ -804,10 +804,11 @@ pub(crate) fn direct_ack_hedge_outcome(
 /// durable send to `peer`.
 ///
 /// Joins (1) this agent's inbox (where ACKs land), (2) the peer's inbox,
-/// and (3) the compatibility bus. C2 refreshes those topic ids on the
-/// subscribed path. C4 also pre-subscribes the peer inbox so the first
-/// durable POST is not a cold `publish_topic_id` join. Does not walk
-/// pass-through topics (Leaf-safe; C0/#395 hygiene).
+/// and (3) the compatibility bus — the last one only on a full node, see
+/// below. C2 refreshes those topic ids on the subscribed path. C4 also
+/// pre-subscribes the peer inbox so the first durable POST is not a cold
+/// `publish_topic_id` join. Does not walk pass-through topics (Leaf-safe;
+/// C0/#395 hygiene).
 pub(crate) async fn warm_reverse_ack_topics(
     pubsub: &PubSubManager,
     self_agent: &AgentId,
@@ -830,12 +831,19 @@ pub(crate) async fn warm_reverse_ack_topics(
             dm_inbox_topic(peer),
         )
         .await;
-    pubsub
-        .ensure_subscribed_topic_id(
-            DM_BUS_TOPIC,
-            saorsa_gossip_types::TopicId::from_entity(DM_BUS_TOPIC.as_bytes()),
-        )
-        .await;
+    // A leaf must not join the global compatibility bus. `skip_legacy_bus`
+    // keeps it off the inbox service's subscription list for exactly one
+    // reason — it is a whole-network topic whose traffic a metered device is
+    // opting out of — and a pre-warm that joined it anyway would put the bus
+    // back on any trusted-contact connect. Full nodes are unaffected.
+    if !pubsub.leaf_mode() {
+        pubsub
+            .ensure_subscribed_topic_id(
+                DM_BUS_TOPIC,
+                saorsa_gossip_types::TopicId::from_entity(DM_BUS_TOPIC.as_bytes()),
+            )
+            .await;
+    }
 }
 
 /// Reverse-ACK pre-warm is for a Trusted *other* peer. Self and untrusted
@@ -3205,6 +3213,44 @@ mod tests {
         assert!(
             after_publish.contains(&peer_inbox),
             "publish must reuse the pre-warmed peer inbox membership"
+        );
+    }
+
+    /// The leaf contract has to survive the reverse-ACK pre-warm. Upstream
+    /// joins self inbox, peer inbox AND the global compatibility bus on any
+    /// trusted-contact connect (#396 C2/C4); the bus is precisely the
+    /// whole-network topic `DmInboxConfig::skip_legacy_bus` keeps a metered
+    /// device off, so a pre-warm that joined it would re-open the cost that
+    /// `leaf_mode` exists to close — silently, on a path no config touches.
+    /// The two inbox topics are first-party and must still be warmed: leaf
+    /// mode trims network duty, never this node's own delivery.
+    #[tokio::test]
+    async fn leaf_reverse_ack_prewarm_skips_the_compatibility_bus() {
+        let node = Arc::new(
+            NetworkNode::new(NetworkConfig::default(), None, None)
+                .await
+                .expect("network node"),
+        );
+        let pubsub = PubSubManager::new(node, None).expect("pubsub");
+        pubsub.set_leaf_mode(true);
+        let self_id = AgentId([0xC3; 32]);
+        let peer = AgentId([0xD4; 32]);
+        let self_inbox = dm_inbox_topic(&self_id);
+        let peer_inbox = dm_inbox_topic(&peer);
+        let bus = saorsa_gossip_types::TopicId::from_entity(DM_BUS_TOPIC.as_bytes());
+
+        warm_reverse_ack_topics(&pubsub, &self_id, &peer).await;
+
+        let warmed = pubsub.plumtree_topic_ids().await;
+        assert!(
+            warmed.contains(&self_inbox) && warmed.contains(&peer_inbox),
+            "leaf mode must still pre-warm both inboxes -- ACK delivery is \
+             first-party, not network duty: {warmed:?}"
+        );
+        assert!(
+            !warmed.contains(&bus),
+            "leaf must not join the global compatibility DM bus on pre-warm \
+             -- that is the subscription skip_legacy_bus removes: {warmed:?}"
         );
     }
 
