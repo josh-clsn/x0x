@@ -1106,6 +1106,51 @@ mod tests {
         assert!(cfg.defer_mesh_join);
     }
 
+    #[test]
+    fn gossip_emit_v2_defaults_to_v1() {
+        // ADR-012 wire compatibility. Two halves have to agree, and only one
+        // of them was covered before: the config key that decides the wire
+        // format, and the vendored gate `serve_with_options` pushes it into
+        // (`saorsa_gossip_pubsub::set_emit_v2_headers`, server/mod.rs). A v2
+        // header is undecodable to a pre-0.5.71 peer, so a default that
+        // drifted to `true` on either side would be a silent flag day for the
+        // whole fleet and both phone packages.
+        assert!(
+            !DaemonConfig::default().gossip_emit_v2,
+            "v1 must stay the default wire format"
+        );
+        let cfg: DaemonConfig = toml::from_str("").expect("empty TOML parses");
+        assert!(!cfg.gossip_emit_v2, "an absent key must read as v1");
+
+        // The gate itself starts off, so a daemon that never reaches
+        // `serve_with_options` still emits v1.
+        assert!(
+            !saorsa_gossip_pubsub::emit_v2_headers(),
+            "the vendored emit gate must start disabled"
+        );
+
+        // The accessor pair is the wiring `serve_with_options` relies on:
+        // whatever the config says must land in the gate, both ways.
+        for wanted in [true, false] {
+            saorsa_gossip_pubsub::set_emit_v2_headers(wanted);
+            assert_eq!(
+                saorsa_gossip_pubsub::emit_v2_headers(),
+                wanted,
+                "the gate must report what it was set to"
+            );
+        }
+        assert!(
+            !saorsa_gossip_pubsub::emit_v2_headers(),
+            "restored to the v1 default for any test sharing this process"
+        );
+
+        // Opting in is still one key, for the day the fleet is uniformly
+        // v2-capable.
+        let cfg: DaemonConfig =
+            toml::from_str("gossip_emit_v2 = true").expect("gossip_emit_v2 TOML parses");
+        assert!(cfg.gossip_emit_v2);
+    }
+
     // The two canonical messages enforced by `InstanceName::try_from`.
     // `x0xd::resolve_instance_startup` propagates these verbatim (bare `?`,
     // no added context), so an invalid CLI or config name surfaces one

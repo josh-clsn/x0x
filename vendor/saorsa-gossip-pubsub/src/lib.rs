@@ -2871,17 +2871,6 @@ const ZERO_TAIL_FORWARD_LIMIT: usize = 512;
 /// revocation-set republish, and 300 s cadences; all of that is fixed by taking
 /// the upstream range, not by flipping this gate. Flipping it would only strand
 /// pre-0.5.71 peers.
-///
-/// Default **off**: locally originated frames are sealed as v1, byte-identical
-/// to what a 0.5.68-0.5.70 fleet emits and decodes. Upstream 0.5.71 seals v2
-/// unconditionally, and a v2 header is 33 bytes longer than the v1 form it
-/// replaces — a pre-0.5.71 peer cannot decode it at all. That makes the stock
-/// crate a flag-day upgrade. With this gate the fleet upgrades binaries first
-/// (still speaking v1 on the wire, still interoperating in both directions),
-/// then flips to v2 once every node is on the new build.
-///
-/// Receive is unaffected: this build always verifies a v2 payload hash when one
-/// is present, and accepts v1 per `SignaturePolicy`.
 static EMIT_V2_HEADERS: AtomicBool = AtomicBool::new(false);
 
 /// Enable/disable ADR-012 v2 header emission (default: disabled). Flip to
@@ -2904,7 +2893,6 @@ fn seal_if_v2_emit(header: &mut MessageHeader, payload: Option<&[u8]>) {
         header.seal_payload_hash(payload);
     }
 }
-
 
 /// Interior zero-run length that marks a payload as a reassembly-gap
 /// artifact. ant-quic zero-fills in ~1448-byte transport windows; ML-DSA
