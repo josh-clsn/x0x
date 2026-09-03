@@ -18056,10 +18056,33 @@ pub(in crate::server) async fn leave_group(
     // gate continues to guard the shared terminal-withdrawal flow
     // (POST /groups/:id/state/withdraw).
     if info.caller_role(&local_agent_hex).is_none() {
-        return api_error(
-            StatusCode::FORBIDDEN,
-            "leaving a group requires active membership in it",
-        );
+        // Issue #376 x #446 r5: a node that holds TreeKEM state for a group
+        // it is NOT an active member of — removed remotely, or a join stub
+        // that never converged — still has to be able to tear that state
+        // down, or its group keys, snapshot and event log are stranded on
+        // disk for good. That is the `LocalOnlyDrop` disposition, and the
+        // membership gate above makes it unreachable, because the gate's
+        // predicate is exactly its negation.
+        //
+        // The r5 gate exists to stop a SESSION bearer durably deleting this
+        // daemon's view of a group it does not belong to. The durable-owner
+        // fence keeps that property intact — a session bearer still gets the
+        // 403 — while leaving the daemon's own owner the local cleanup. The
+        // branch this admits publishes nothing and mutates no roster: it
+        // drops local state only, and only for the TreeKEM plane the
+        // disposition covers. Every other non-member leave stays refused.
+        let local_only_drop = actor.is_durable_owner()
+            && info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+            && treekem_leave_disposition(info, &local_agent_hex)
+                == TreeKemLeaveDisposition::LocalOnlyDrop;
+        if !local_only_drop {
+            return api_error(
+                StatusCode::FORBIDDEN,
+                "leaving a group requires active membership in it",
+            );
+        }
+        drop(groups);
+        return leave_treekem_group(state, id, local_agent_hex).await;
     }
 
     // #369 / PR #370 review item 4: the ONE self-leave routing decision,
@@ -39027,6 +39050,38 @@ pub(in crate::server) mod tests {
         );
 
         assert_departure_wiped_treekem_state(&f.state, &f.aliases(), "local-only drop").await;
+        Ok(())
+    }
+
+    /// Issue #446 r5 is the reason the local-only drop is fenced rather than
+    /// open: a browser SESSION bearer must not be able to durably delete this
+    /// daemon's view of a group it does not belong to. Same fixture, same
+    /// route, session actor — refused.
+    #[tokio::test]
+    async fn local_only_drop_refuses_a_session_bearer() -> Result<()> {
+        let f = departure_fixture(0x6d, x0x::mls::SecureGroupPlane::TreeKem, false).await?;
+
+        let (status, body) = response_json(
+            leave_group(
+                State(Arc::clone(&f.state)),
+                axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                    durable: false,
+                }),
+                Path(f.group_id.clone()),
+            )
+            .await
+            .into_response(),
+        )
+        .await?;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a session bearer must not drop a group it is not a member of: {body}"
+        );
+        assert!(
+            f.state.named_groups.read().await.contains_key(&f.group_id),
+            "the refused drop must leave the local group record in place"
+        );
         Ok(())
     }
 
