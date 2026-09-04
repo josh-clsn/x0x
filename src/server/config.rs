@@ -56,6 +56,7 @@ const ROOT_OWNED_KEYS: &[&str] = &[
     "presence_offline_timeout_secs",
     "rendezvous_enabled",
     "rendezvous_validity_ms",
+    "skip_legacy_dm_bus",
     "user_key_path",
     "zero_peer_restart_secs",
 ];
@@ -210,6 +211,27 @@ enabled = false
             Some(std::path::Path::new("/var/lib/x0x-443/identity"))
         );
         assert!(ignored.is_empty(), "got spurious ignored keys: {ignored:?}");
+    }
+
+    #[test]
+    fn skip_legacy_dm_bus_is_a_recognised_root_key() {
+        // A DM-bus opt-out that serde silently dropped would leave the
+        // operator on the bus they asked to leave, with no error anywhere.
+        let (config, ignored) =
+            parse_with_ignored_keys("skip_legacy_dm_bus = true\n").expect("parses");
+        assert!(
+            config.skip_legacy_dm_bus,
+            "the root key must reach the config"
+        );
+        assert!(ignored.is_empty(), "got spurious ignored keys: {ignored:?}");
+
+        let findings = diagnose_section_placement(&root("[gossip]\nskip_legacy_dm_bus = true\n"));
+        assert_eq!(
+            findings.len(),
+            1,
+            "misplacing it under a section is flagged"
+        );
+        assert_eq!(findings[0].key, "skip_legacy_dm_bus");
     }
 
     #[test]

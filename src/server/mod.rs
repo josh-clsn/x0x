@@ -1163,6 +1163,7 @@ pub async fn serve_with_options(
     let dm_inbox_kv_store_delta_route_tx = kv_store_delta_dm_tx.clone();
     let dm_inbox_public_group_bootstrap_route_tx = public_group_bootstrap_dm_tx.clone();
     let dm_inbox_predecessor_relay_route_tx = predecessor_relay_dm_tx.clone();
+    let dm_inbox_skip_legacy_bus = config.skip_legacy_dm_bus;
     bg_tasks.push(tokio::spawn(start_dm_inbox_when_gossip_ready(
         dm_inbox_agent,
         dm_inbox_kem,
@@ -1171,6 +1172,7 @@ pub async fn serve_with_options(
         dm_inbox_public_group_bootstrap_route_tx,
         dm_inbox_kv_store_delta_route_tx,
         dm_inbox_predecessor_relay_route_tx,
+        dm_inbox_skip_legacy_bus,
     )));
 
     // Restart-amnesia fix: re-register every persisted task-list/kv-store
@@ -2224,6 +2226,7 @@ pub async fn list_instances() -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_dm_inbox_when_gossip_ready(
     agent: Arc<x0x::Agent>,
     kem_keypair: Arc<x0x::groups::kem_envelope::AgentKemKeypair>,
@@ -2232,9 +2235,11 @@ async fn start_dm_inbox_when_gossip_ready(
     public_group_bootstrap_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     kv_store_delta_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     predecessor_relay_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
+    skip_legacy_bus: bool,
 ) {
     for attempt in 1..=DM_INBOX_START_MAX_ATTEMPTS {
         let dm_inbox_config = x0x::dm_inbox::DmInboxConfig::default()
+            .with_skip_legacy_bus(skip_legacy_bus)
             .with_typed_payload_route(x0x::exec::EXEC_DM_PREFIX, exec_route_tx.clone())
             .with_typed_payload_route(
                 GROUP_PUBLIC_MESSAGE_DM_PREFIX,

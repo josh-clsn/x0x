@@ -284,6 +284,24 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub(super) observed_prefix_enabled: bool,
 
+    /// Stay off the whole-network compatibility DM bus (`skip_legacy_dm_bus`).
+    ///
+    /// The bus carries every gossip-path DM in the network and every
+    /// subscriber re-broadcasts it, which on a metered connection is the
+    /// dominant idle cost. Set `skip_legacy_dm_bus = true` in the daemon
+    /// TOML (opt-in, no CLI flag, same pattern as `observed_prefix_enabled`)
+    /// and this daemon neither subscribes to the bus, nor pre-warms it for
+    /// reverse ACKs, nor publishes durable ACKs on it.
+    ///
+    /// The cost: DMs from senders that publish *only* on the bus no longer
+    /// arrive, and durable ACKs travel the targeted inbox route plus the
+    /// Direct hedge instead of both gossip routes. Per-recipient inbox
+    /// delivery, which every current sender uses, is unchanged, and this
+    /// daemon still falls back to the bus when *sending*. Default `false`:
+    /// behaviour is identical to before.
+    #[serde(default)]
+    pub(super) skip_legacy_dm_bus: bool,
+
     /// Update configuration.
     #[serde(default)]
     pub(super) update: DaemonUpdateConfig,
@@ -634,6 +652,7 @@ impl Default for DaemonConfig {
             port_mapping_enabled: default_port_mapping_enabled(),
             peer_relay: x0x::network::PeerRelayConfig::default(),
             observed_prefix_enabled: false,
+            skip_legacy_dm_bus: false,
             update: DaemonUpdateConfig::default(),
             history: default_history_config(),
             gossip: x0x::gossip::GossipConfig::default(),
@@ -1306,6 +1325,21 @@ mod tests {
         let config: DaemonConfig =
             toml::from_str("observed_prefix_enabled = true").expect("opt-in parses");
         assert!(config.observed_prefix_enabled);
+    }
+
+    #[test]
+    fn skip_legacy_dm_bus_defaults_off_and_parses_opt_in() {
+        // Default-OFF in every construction path: a daemon that never heard
+        // of the option keeps the compatibility DM bus, so senders that
+        // publish only there still reach it.
+        let config: DaemonConfig = toml::from_str("").expect("empty config parses");
+        assert!(!config.skip_legacy_dm_bus);
+        assert!(!DaemonConfig::default().skip_legacy_dm_bus);
+
+        // Explicit opt-in parses through.
+        let config: DaemonConfig =
+            toml::from_str("skip_legacy_dm_bus = true").expect("opt-in parses");
+        assert!(config.skip_legacy_dm_bus);
     }
 
     #[test]
