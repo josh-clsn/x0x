@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- `leaf_mode` / `DmInboxConfig::skip_legacy_bus` now also covers the durable-ACK
+  publisher, which still published every v2 ACK on the compatibility DM bus and
+  preferred an eager peer there. Publishing to an unsubscribed topic initializes
+  its PlumTree peers and grafts an eager set, so a leaf rejoined the bus mesh on
+  every ACK it sent. A leaf's durable ACKs now take the targeted inbox route plus
+  the Direct hedge; full nodes are unchanged.
+
 ## [v0.41.0] - 2026-09-03
 
 Home Suite hardening release. Summarises the notable user-facing changes since v0.39.9 (the v0.39.10–v0.40.4 tags carried no changelog entries).

@@ -266,6 +266,12 @@ pub struct DaemonConfig {
     /// fallback. Protocol-compatible with full nodes: a leaf is
     /// indistinguishable from a node that simply never joined those
     /// topics. Default `false` (full mesh duty).
+    ///
+    /// The DM bus is left at all three of its join points — the inbox
+    /// subscription, the reverse-ACK pre-warm, and the durable-ACK legacy
+    /// route, which would otherwise cold-join the bus on every ACK a leaf
+    /// sends — so such a leaf's durable ACKs travel the targeted inbox
+    /// route plus the Direct hedge instead of both gossip routes.
     #[serde(default)]
     pub leaf_mode: bool,
 
