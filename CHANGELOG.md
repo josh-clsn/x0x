@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `skip_legacy_dm_bus` (daemon TOML, default `false`): opt out of the whole-network compatibility DM bus (`x0x/dm/v1/bus`). The bus carries every gossip-path DM in the network and every subscriber re-broadcasts it, which on a metered link is the dominant idle cost. When set, the daemon does not subscribe to the bus, does not pre-warm it for reverse ACKs, and publishes durable ACKs on the targeted inbox route (plus the Direct hedge) only. The trade-off: DMs from senders that publish *only* on the bus no longer arrive, and an ACK has one fewer gossip route. Per-recipient inbox delivery, which every current sender uses, is unchanged, and outbound sends still fall back to the bus. Unset, behaviour is identical to before.
+
 ## [v0.41.0] - 2026-09-03
 
 Home Suite hardening release. Summarises the notable user-facing changes since v0.39.9 (the v0.39.10–v0.40.4 tags carried no changelog entries).

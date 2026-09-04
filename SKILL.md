@@ -593,6 +593,10 @@ rendezvous_enabled = true             # global findability
 network_id = "x0x.prod"               # gossip plane isolation ("" = open)
 port_mapping_enabled = true           # UPnP IGD mapping
 observed_prefix_enabled = false       # masked origin prefix on DM surfaces
+skip_legacy_dm_bus = false            # opt-in: stay off the whole-network compatibility DM bus
+#                                     # (metered links). Costs: no DMs from senders that publish
+#                                     # ONLY on the bus, and durable ACKs use the targeted inbox
+#                                     # route + Direct hedge. Per-recipient inbox delivery unchanged
 # identity_dir = "/srv/x0x/identity"  # keep ALL identity material (machine.key, agent.key, agent.cert,
 #                                     # and the opt-in user.key lookup) out of ~/.x0x — with this set the
 #                                     # daemon never falls back to ~/.x0x (the embedding storage boundary)
