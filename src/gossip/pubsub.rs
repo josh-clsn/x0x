@@ -22,7 +22,7 @@ use saorsa_gossip_types::{
     MessageHeader, MessageKind, PeerHealthOracle, PeerId, TopicId, TopicPriority,
 };
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
@@ -370,6 +370,12 @@ pub struct PubSubManager {
     topic_id_by_name: Arc<std::sync::RwLock<HashMap<String, TopicId>>>,
     /// Live subscribed transport ids for the Leaf C0 refuse gate.
     subscribed_topic_ids: Arc<std::sync::RwLock<HashSet<TopicId>>>,
+    /// Whether this node's DM inbox opted out of the whole-network
+    /// compatibility DM bus (`DmInboxConfig::skip_legacy_bus`). Recorded
+    /// when the inbox service spawns, because the reverse-ACK pre-warm is
+    /// handed only this manager and must not rejoin a bus the inbox
+    /// deliberately left. Default `false` — every node keeps the bus.
+    skip_legacy_dm_bus: AtomicBool,
     /// Inbound unsubscribed pass-through frames this Leaf refused.
     unsubscribed_refused_frames: AtomicU64,
     unsubscribed_refused_bytes: AtomicU64,
@@ -509,6 +515,7 @@ impl PubSubManager {
             passthrough_refresh_runs: AtomicU64::new(0),
             topic_id_by_name: Arc::new(std::sync::RwLock::new(HashMap::new())),
             subscribed_topic_ids: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            skip_legacy_dm_bus: AtomicBool::new(false),
             unsubscribed_refused_frames: AtomicU64::new(0),
             unsubscribed_refused_bytes: AtomicU64::new(0),
             unsubscribed_refused_graft_equiv: AtomicU64::new(0),
@@ -1280,6 +1287,21 @@ impl PubSubManager {
         holds.insert(topic.to_string(), hold);
         drop(holds);
         self.refresh_subscribed_topic_id(topic, topic_id).await;
+    }
+
+    /// Record whether the DM inbox opted out of the compatibility DM bus.
+    ///
+    /// Called once when the inbox service spawns. The reverse-ACK pre-warm
+    /// ([`crate::dm_inbox::warm_reverse_ack_topics`]) receives only this
+    /// manager, so the choice lives here rather than being threaded through
+    /// every connect-event caller.
+    pub(crate) fn set_skip_legacy_dm_bus(&self, skip: bool) {
+        self.skip_legacy_dm_bus.store(skip, Ordering::Relaxed);
+    }
+
+    /// Whether the DM inbox opted out of the compatibility DM bus.
+    pub(crate) fn skip_legacy_dm_bus(&self) -> bool {
+        self.skip_legacy_dm_bus.load(Ordering::Relaxed)
     }
 
     /// Topic ids currently known to PlumTree. Test helper for proving a
@@ -2640,6 +2662,26 @@ mod tests {
         assert_eq!(snap.mode, ParticipationMode::Leaf);
         assert!(!snap.passthrough_refresh_ran);
         assert_eq!(snap.passthrough_refresh_runs, 0);
+    }
+
+    #[tokio::test]
+    async fn a_new_manager_is_on_the_compatibility_dm_bus() {
+        // The DM bus opt-out is recorded here by the inbox service; until it
+        // is, every node is on the bus. A manager that defaulted the other
+        // way would silently drop legacy-bus DMs for daemons that never set
+        // the option.
+        let node = test_node().await;
+        let manager = PubSubManager::new(node, None).expect("manager");
+        assert!(
+            !manager.skip_legacy_dm_bus(),
+            "a fresh manager must not claim the DM inbox left the bus"
+        );
+
+        manager.set_skip_legacy_dm_bus(true);
+        assert!(
+            manager.skip_legacy_dm_bus(),
+            "the inbox service's recorded choice must be readable by the pre-warm"
+        );
     }
 
     #[tokio::test]
