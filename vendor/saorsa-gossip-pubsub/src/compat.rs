@@ -947,6 +947,9 @@ impl<T: GossipTransport + 'static> GossipTransport for PolicyTransport<T> {
     }
 }
 
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests;
+// The published 0.5.78/0.5.79 tarball ships `src/compat/tests.rs`, but its
+// `saorsa_gossip_legacy_compat_fixture` dev-dependency is neither declared in
+// the packaged manifest nor published to crates.io, so the crate's own
+// `cargo test --lib` cannot build as published. The module is dropped from the
+// vendored copy to keep the vendor's self-test gate runnable; nothing in
+// `compat.rs` itself is changed, and x0x references no compat symbol.
