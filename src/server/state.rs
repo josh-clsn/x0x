@@ -295,11 +295,13 @@ pub struct DaemonConfig {
     pub leaf_mode: bool,
 
     /// ADR-012 wire compatibility: emit v2 (payload-covering) gossip
-    /// message headers. Pre-0.5.71 peers cannot decode the v2 header at
-    /// all, so this stays `false` until every node in the fleet runs a
-    /// v2-capable build; receive-side verification is always on either
-    /// way. Default `false` (v1 wire format).
-    #[serde(default)]
+    /// message headers. Default `true`, and **v1 emission is retired with
+    /// the 0.42.3 crossing** — x0x 0.42 refuses a v1 header-only-signed
+    /// envelope on receive (ADR-014 `RejectV1`) and the production
+    /// bootstraps run 0.42.x, so a v1 emitter delivers to nobody. The key
+    /// stays settable for a deliberate test or a pre-0.42 fleet;
+    /// receive-side verification is always on either way.
+    #[serde(default = "default_gossip_emit_v2")]
     pub gossip_emit_v2: bool,
 
     /// Serve without dialing the mesh. The gossip runtime, listeners, and
@@ -545,6 +547,12 @@ impl Default for DaemonWsConfig {
 /// Default QUIC port: 5483 (LIVE on a phone keypad).
 /// Every x0x node uses the same well-known port by default.
 pub const DEFAULT_QUIC_PORT: u16 = 5483;
+
+/// ADR-012: v2 headers are the wire from the 0.42.3 crossing on. See
+/// [`DaemonConfig::gossip_emit_v2`].
+fn default_gossip_emit_v2() -> bool {
+    true
+}
 
 fn default_bootstrap_peers() -> Vec<SocketAddr> {
     x0x::network::DEFAULT_BOOTSTRAP_PEERS
@@ -839,7 +847,7 @@ impl Default for DaemonConfig {
             zero_peer_restart_secs: None,
             api_watchdog: super::ApiWatchdogConfig::default(),
             leaf_mode: false,
-            gossip_emit_v2: false,
+            gossip_emit_v2: true,
             defer_mesh_join: false,
         }
     }
@@ -1347,26 +1355,26 @@ mod tests {
     }
 
     #[test]
-    fn gossip_emit_v2_defaults_to_v1() {
-        // ADR-012 wire compatibility. Two halves have to agree, and only one
-        // of them was covered before: the config key that decides the wire
-        // format, and the vendored gate `serve_with_options` pushes it into
-        // (`saorsa_gossip_pubsub::set_emit_v2_headers`, server/mod.rs). A v2
-        // header is undecodable to a pre-0.5.71 peer, so a default that
-        // drifted to `true` on either side would be a silent flag day for the
-        // whole fleet and both phone packages.
+    fn gossip_emit_v2_defaults_to_v2() {
+        // ADR-012 wire compatibility. Two halves have to agree: the config key
+        // that decides the wire format, and the vendored gate
+        // `serve_with_options` pushes it into
+        // (`saorsa_gossip_pubsub::set_emit_v2_headers`, server/mod.rs). Both
+        // default to v2 from the 0.42.3 crossing on — 0.42 refuses a v1
+        // header-only-signed envelope on receive, so a default that drifted
+        // back to `false` on either side would silently deliver to nobody.
         assert!(
-            !DaemonConfig::default().gossip_emit_v2,
-            "v1 must stay the default wire format"
+            DaemonConfig::default().gossip_emit_v2,
+            "v2 is the wire format from the 0.42.3 crossing on"
         );
         let cfg: DaemonConfig = toml::from_str("").expect("empty TOML parses");
-        assert!(!cfg.gossip_emit_v2, "an absent key must read as v1");
+        assert!(cfg.gossip_emit_v2, "an absent key must read as v2");
 
-        // The gate itself starts off, so a daemon that never reaches
-        // `serve_with_options` still emits v1.
+        // The gate itself starts on, so a daemon that never reaches
+        // `serve_with_options` still emits a wire 0.42 accepts.
         assert!(
-            !saorsa_gossip_pubsub::emit_v2_headers(),
-            "the vendored emit gate must start disabled"
+            saorsa_gossip_pubsub::emit_v2_headers(),
+            "the vendored emit gate must start enabled"
         );
 
         // The accessor pair is the wiring `serve_with_options` relies on:
@@ -1379,16 +1387,17 @@ mod tests {
                 "the gate must report what it was set to"
             );
         }
+        saorsa_gossip_pubsub::set_emit_v2_headers(true);
         assert!(
-            !saorsa_gossip_pubsub::emit_v2_headers(),
-            "restored to the v1 default for any test sharing this process"
+            saorsa_gossip_pubsub::emit_v2_headers(),
+            "restored to the v2 default for any test sharing this process"
         );
 
-        // Opting in is still one key, for the day the fleet is uniformly
-        // v2-capable.
+        // The retired v1 wire is still reachable through the one key, for a
+        // deliberate test or a fleet that predates 0.42.
         let cfg: DaemonConfig =
-            toml::from_str("gossip_emit_v2 = true").expect("gossip_emit_v2 TOML parses");
-        assert!(cfg.gossip_emit_v2);
+            toml::from_str("gossip_emit_v2 = false").expect("gossip_emit_v2 TOML parses");
+        assert!(!cfg.gossip_emit_v2);
     }
 
     // The two canonical messages enforced by `InstanceName::try_from`.

@@ -3011,33 +3011,30 @@ const ZERO_TAIL_FORWARD_LIMIT: usize = 512;
 
 /// fetch>it wire-compat gate for the ADR-012 v2 (payload-covering) header.
 ///
-/// Default **off**: locally originated frames are sealed as v1. `MessageHeader`
-/// has a hand-written `Serialize` that omits the tail unless `version >= 2`, so
-/// the gated-off form is byte-identical to what a 0.5.68-0.5.70 fleet emits and
-/// decodes. Stock 0.5.75 still seals v2 unconditionally at all seven egress
-/// sites, and a v2 header a pre-0.5.71 peer cannot decode at all — which makes
-/// the stock crate a flag-day upgrade. With this gate the fleet upgrades
-/// binaries first (still speaking v1 on the wire, still interoperating in both
-/// directions), then flips to v2 once every node runs a v2-capable build.
+/// Default **on**, matching the stock crate, which seals v2 unconditionally at
+/// all seven egress sites. The gate stays settable so a caller can still pin
+/// either wire format, but **v1 emission is retired with the 0.42.3 crossing**:
+/// x0x 0.42 refuses a v1 header-only-signed envelope on receive (ADR-014
+/// `RejectV1`) and the production bootstrap nodes run 0.42.x, so a v1-emitting
+/// daemon delivers to nobody. Measured on this branch, the v1 default left
+/// twenty tests red for one reason — no gossip delivery at all, loopback
+/// included.
+///
+/// The gate existed for the mixed 0.40.x fleet: `MessageHeader` has a
+/// hand-written `Serialize` that omits the tail unless `version >= 2`, so the
+/// gated-off form is byte-identical to what a 0.5.68-0.5.70 fleet emits and
+/// decodes, which let that fleet upgrade binaries first and flip the wire
+/// afterwards. fetch>it crosses fleet, desktop and phones in one move, so that
+/// staging no longer buys anything, and the pre-0.5.71 peers it protected can
+/// no longer talk to 0.42 either way.
 ///
 /// Receive is unaffected: this build always verifies a v2 payload hash when one
-/// is present, and accepts v1 per `SignaturePolicy` — whose default is still
-/// `AcceptV1`, and which x0x never sets at any version. A v1 emitter is
-/// therefore accepted normally by a 0.5.75 peer, never dropped or penalised.
-///
-/// **The default stayed off through the v0.40.4 catch-up (2026-08-27),
-/// deliberately.** Upstream's storm-control work (x0x #421/#423/#425) is about
-/// a *different* V2 — the x0x agent-signed application envelope — and its
-/// `TopicValidator` is `Fn(&TopicId, &[u8]) -> ValidationAction`, which cannot
-/// see this header. The load that was hurting the public bootstrap nodes was
-/// app-level announce re-publish with fresh message ids, unconditional
-/// revocation-set republish, and 300 s cadences; all of that is fixed by taking
-/// the upstream range, not by flipping this gate. Flipping it would only strand
-/// pre-0.5.71 peers.
-static EMIT_V2_HEADERS: AtomicBool = AtomicBool::new(false);
+/// is present, and accepts v1 per `SignaturePolicy`.
+static EMIT_V2_HEADERS: AtomicBool = AtomicBool::new(true);
 
-/// Enable/disable ADR-012 v2 header emission (default: disabled). Flip to
-/// `true` only once every peer in the fleet runs a v2-capable build.
+/// Enable/disable ADR-012 v2 header emission (default: enabled). Setting it to
+/// `false` restores the retired v1 wire and is only useful against a fleet that
+/// predates 0.42.
 pub fn set_emit_v2_headers(enabled: bool) {
     EMIT_V2_HEADERS.store(enabled, Ordering::Relaxed);
 }
