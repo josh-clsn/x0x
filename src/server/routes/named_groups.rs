@@ -3934,10 +3934,14 @@ pub(in crate::server) fn validate_public_group_bootstrap(
 pub(in crate::server) const MAX_BOOTSTRAP_INSTALLED_GROUPS: usize = 256;
 
 async fn stop_named_group_metadata_listener(state: &AppState, group_id: &str) {
-    let reg = state.group_metadata_tasks.write().await.remove(group_id);
-    if let Some(reg) = reg {
-        reg.handle.abort();
-    }
+    // Shares `abort_group_listener_registrations` so the self-abort footgun
+    // removed from the teardown cannot return through this door: every current
+    // caller is an HTTP task, but a listener-driven caller would otherwise
+    // truncate itself here exactly as the teardown used to (#376). Upstream's
+    // registration token guards the listener's OWN tail deregistration; it does
+    // not guard a blind abort taken from inside that listener.
+    let aliases = HashSet::from([group_id.to_string()]);
+    abort_group_listener_registrations(&state.group_metadata_tasks, &aliases).await;
 }
 
 /// The hash the served chain reaches (its last link's `state_hash`) — the
@@ -14826,17 +14830,21 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 next.roster_revision = next.roster_revision.saturating_add(1);
                 next.secret_epoch = expected1;
                 next.security_binding = Some(format!("treekem:epoch={expected1}"));
-                let commit1 = match next.seal_commit(signing_kp, now_ms) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(
-                            group_id = %LogHexId::group(&resolved_group_key),
-                            member = %LogHexId::agent(&member_agent_id),
-                            "MemberJoined re-key: failed to seal remove commit: {e}"
-                        );
-                        return ApplyMetadataResult::REJECTED;
-                    }
-                };
+                // ADR-0038: an owner-axis group refuses a PLAIN seal, so both
+                // re-key commits go through the ordinary-commit wrapper — it
+                // is exactly `seal_commit` on every other admission axis.
+                let commit1 =
+                    match seal_commit_owner_certified(state, &mut next, signing_kp, now_ms).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!(
+                                group_id = %LogHexId::group(&resolved_group_key),
+                                member = %LogHexId::agent(&member_agent_id),
+                                "MemberJoined re-key: failed to seal remove commit: {e}"
+                            );
+                            return ApplyMetadataResult::REJECTED;
+                        }
+                    };
                 let revision1 = next.roster_revision;
 
                 // Commit 2: roster with the fresh KP, sealed at epoch +2 with
@@ -14868,17 +14876,18 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     now_ms,
                 )
                 .await;
-                let commit2 = match next.seal_commit(signing_kp, now_ms) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(
-                            group_id = %LogHexId::group(&resolved_group_key),
-                            member = %LogHexId::agent(&member_agent_id),
-                            "MemberJoined re-key: failed to seal add commit: {e}"
-                        );
-                        return ApplyMetadataResult::REJECTED;
-                    }
-                };
+                let commit2 =
+                    match seal_commit_owner_certified(state, &mut next, signing_kp, now_ms).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!(
+                                group_id = %LogHexId::group(&resolved_group_key),
+                                member = %LogHexId::agent(&member_agent_id),
+                                "MemberJoined re-key: failed to seal add commit: {e}"
+                            );
+                            return ApplyMetadataResult::REJECTED;
+                        }
+                    };
                 let revision2 = next.roster_revision;
 
                 // Now mutate the live TreeKEM tree back-to-back: remove the
@@ -22313,22 +22322,12 @@ async fn wipe_local_group_crypto_material(
             messages.remove(alias);
         }
     }
-    {
-        let mut tasks = state.group_metadata_tasks.write().await;
-        for alias in &aliases {
-            if let Some(reg) = tasks.remove(alias) {
-                reg.handle.abort();
-            }
-        }
-    }
-    {
-        let mut tasks = state.public_message_tasks.write().await;
-        for alias in &aliases {
-            if let Some(handle) = tasks.remove(alias) {
-                handle.abort();
-            }
-        }
-    }
+    // #376: the listener aborts do NOT run here. This teardown is driven by
+    // the metadata listener's own apply, so a blind abort of its registration
+    // at this point is a self-abort: tokio defers it to the next yield and
+    // every step below — including the `remove_file` loop that erases private
+    // TreeKEM key material — is dropped with the future. Both aborts run at
+    // the end of this function, through the self-skipping helpers.
     {
         let mut join_results = state.pending_join_results.write().await;
         join_results.retain(|key, pending| {
@@ -39567,7 +39566,10 @@ async fn handle_join_result_message_bound(
             // per-(group, member) entry mirrors the mk-serve throttle; the
             // joiner's poll backoff is coarser than the window, so a
             // legitimate retry is never blocked.
-            let throttle_key = format!("{group_id}:jr-serve:{sender_hex}");
+            let throttle_key = format!(
+                "{group_id}:jr-serve:{sender_hex}:{}",
+                attempt_id.as_deref().unwrap_or("")
+            );
             {
                 let mut throttle = state.treekem_catchup_throttle.write().await;
                 if throttle
