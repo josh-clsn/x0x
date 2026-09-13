@@ -187,9 +187,9 @@ The Home Suite campaign (ADRs 0036–0043, plus the 0044–0058 backfills) added
   `GET /diagnostics/ws`.
 
 Open issues for this release are listed in the README's *Known limitations*
-table (#446–#451). This reference documents **176 endpoints** — the 174
+table (#446–#451). This reference documents **181 endpoints** — the 179
 upstream surfaces plus the two runtime mesh flips this fork adds for embedded
-shells. `x0x routes` prints 179: it also lists the three engine-A
+shells. `x0x routes` prints 184: it also lists the three engine-A
 control-plane routes (`POST /groups/:id/apply-metadata-event` and
 `GET`/`POST /groups/:id/join-result/:member`), which client apps bridge and no
 browser calls. Two further served paths sit outside the registry:
