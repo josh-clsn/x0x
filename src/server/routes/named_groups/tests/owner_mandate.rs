@@ -2829,17 +2829,16 @@ async fn owner_anchored_apply_path_clears_quarantine() -> Result<()> {
     Ok(())
 }
 
-/// WHY (ADR-0064 §1a, returning-member re-key): that path seals its ADD with
-/// the PLAIN `seal_commit` — the owner certificate rides in `certificate_b64`
-/// — so the mandate minted at its pre-mutation point must anchor a terminal
-/// produced by a different sealer than the seat path's. If it does not, or if
-/// the field is left `None` (which compiles), every enforcing member on an
-/// owner-axis group refuses the re-key once the authority is recorded Capable,
-/// and the refusal is silent to the returning member: it never gets its seat
-/// back. The absent-mandate refusal itself is pinned by the slice-3 grace
-/// tests above.
+/// WHY (ADR-0064 §1a, returning-member re-key): the re-key mints its mandate
+/// at the ADD's pre-mutation point and then seals through the ordinary-commit
+/// wrapper, so the anchored values must equal the terminal that wrapper
+/// produces. If they do not, or if the field is left `None` (which compiles),
+/// every enforcing member on an owner-axis group refuses the re-key once the
+/// authority is recorded Capable — and the refusal is silent to the returning
+/// member: it never gets its seat back. The absent-mandate refusal itself is
+/// pinned by the slice-3 grace tests above.
 #[tokio::test]
-async fn rekey_add_mandate_anchors_the_plain_seal_it_ships_with() -> Result<()> {
+async fn rekey_add_mandate_anchors_the_terminal_it_ships_with() -> Result<()> {
     let (state, _dir, owner_kp) = owner_authority_state().await?;
     let group_id = "d6".repeat(32);
     let base = sealed_group(state.as_ref(), &group_id, owner_certified_policy(&owner_kp)).await?;
@@ -2869,7 +2868,13 @@ async fn rekey_add_mandate_anchors_the_plain_seal_it_ships_with() -> Result<()> 
     };
 
     let mut sealed = pre_seal.clone();
-    let commit = sealed.seal_commit(state.agent.identity().agent_keypair(), 45_000)?;
+    let commit = seal_commit_owner_certified(
+        state.as_ref(),
+        &mut sealed,
+        state.agent.identity().agent_keypair(),
+        45_000,
+    )
+    .await?;
     assert_eq!(minted.expected_terminal_revision, commit.revision);
     assert_eq!(
         minted.parent_state_hash,
