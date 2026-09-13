@@ -1,6 +1,5 @@
 /target
 /audit.jsonl
-Cargo.lock
 /node_modules
 /python/dist
 /python/*.egg-info
@@ -52,3 +51,7 @@ wpa-build.log
 # Convergence soak harness output (daemon logs, per-run reports)
 tests/convergence/out/
 lcov.info
+
+# The vendored crate is built through the workspace patch; its standalone
+# lock is a local artifact of running its own tests.
+/vendor/saorsa-gossip-pubsub/Cargo.lock
