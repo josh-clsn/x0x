@@ -4647,19 +4647,16 @@ impl Agent {
         self.gossip_cache_adapter.as_ref()
     }
 
-    /// Apply the leaf relay policy to this agent's gossip runtime.
+    /// Record that this agent runs on a metered device.
     ///
-    /// A leaf publishes, receives, and relays for its own topics but stops
-    /// relaying for topics no local subscriber wants — the duty whose cost
-    /// scales with the whole network rather than this node's use. No-op when
-    /// the agent has no gossip runtime. See
-    /// `saorsa_gossip_pubsub::PlumtreePubSub::set_leaf_mode`.
+    /// The marker gates the connection-maintenance paths (proactive
+    /// reconnect, announcement auto-connect) that dial peers this node has
+    /// no first-party reason to hold open. Pass-through relaying is refused
+    /// by the Leaf C0 gate in [`gossip::pubsub::PubSubManager`], selected by
+    /// the participation mode the daemon resolves at startup.
     pub fn set_leaf_mode(&self, enabled: bool) {
         self.leaf_mode
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
-        if let Some(rt) = self.gossip_runtime.as_ref() {
-            rt.pubsub().set_leaf_mode(enabled);
-        }
     }
 
     /// Snapshot of pub/sub drop-detection counters.

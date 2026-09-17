@@ -179,6 +179,30 @@ pub struct ParticipationSelection {
     pub reason: &'static str,
 }
 
+/// Force Leaf on a metered node, whatever the address-shaped resolution said.
+///
+/// `leaf_mode = true` is the operator saying "this device does not carry the
+/// network's freight". [`resolve_participation`] also selects Full from the
+/// bind address (`dual_listen`, `seed_addr`) and the binary's path
+/// (`managed_binary`), none of which the metered device controls, so without
+/// this override a phone behind a promoted dual-stack bind would go back on
+/// relay duty silently. An explicit operator relay opt-in is contradictory
+/// with `leaf_mode` and loses to it here, under its own reason string so the
+/// diagnostics endpoint shows which switch won.
+#[must_use]
+pub fn metered_leaf_override(
+    selection: ParticipationSelection,
+    metered_leaf: bool,
+) -> ParticipationSelection {
+    if metered_leaf && selection.mode.forwards_passthrough() {
+        return ParticipationSelection {
+            mode: ParticipationMode::Leaf,
+            reason: "metered_leaf_mode",
+        };
+    }
+    selection
+}
+
 /// Snapshot exposed on `GET /diagnostics/gossip`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ParticipationSnapshot {
@@ -274,6 +298,46 @@ fn seed_addrs() -> &'static HashSet<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn metered_leaf_mode_overrides_every_full_selection() {
+        // Why: the vendored pass-through gate is gone, so Leaf participation
+        // (which refuses pass-through frames at C0) is the only thing keeping
+        // a metered device off relay duty. Every Full reason must lose to it.
+        for reason in ["dual_listen", "seed_addr", "managed_binary", "operator_relay"] {
+            let forced = metered_leaf_override(
+                ParticipationSelection {
+                    mode: ParticipationMode::Full,
+                    reason,
+                },
+                true,
+            );
+            assert_eq!(forced.mode, ParticipationMode::Leaf, "{reason} must yield");
+            assert_eq!(forced.reason, "metered_leaf_mode");
+        }
+    }
+
+    #[test]
+    fn without_leaf_mode_the_resolved_selection_is_untouched() {
+        let selection = ParticipationSelection {
+            mode: ParticipationMode::Full,
+            reason: "seed_addr",
+        };
+        assert_eq!(
+            metered_leaf_override(selection.clone(), false),
+            selection,
+            "a node that never asked for leaf mode keeps its resolved mode"
+        );
+        let leaf = ParticipationSelection {
+            mode: ParticipationMode::Leaf,
+            reason: "default_leaf",
+        };
+        assert_eq!(
+            metered_leaf_override(leaf.clone(), true),
+            leaf,
+            "an already-Leaf selection keeps its own reason"
+        );
+    }
+
     use super::*;
 
     const CLIENT_QUIC_PORT: u16 = 5483;
