@@ -623,12 +623,20 @@ pub async fn serve_with_options(
         // Safe: single-threaded startup path, before any Agent tasks spawn.
         std::env::set_var("X0X_RELAY_OPT_IN", "1");
     }
-    let participation = x0x::gossip::resolve_participation(x0x::gossip::ParticipationInputs {
-        operator_relay,
-        bind_addr: bind_address,
-        local_addrs: &[],
-        current_exe: exe.as_deref(),
-    });
+    // A metered node (`leaf_mode = true`) never carries the network's
+    // pass-through freight, so its declared participation cannot be Full:
+    // the address- and path-shaped Full selections (`dual_listen`,
+    // `seed_addr`, `managed_binary`) would otherwise put a phone back on
+    // relay duty without anyone asking for it.
+    let participation = x0x::gossip::metered_leaf_override(
+        x0x::gossip::resolve_participation(x0x::gossip::ParticipationInputs {
+            operator_relay,
+            bind_addr: bind_address,
+            local_addrs: &[],
+            current_exe: exe.as_deref(),
+        }),
+        config.leaf_mode,
+    );
     tracing::info!(
         mode = %participation.mode,
         reason = participation.reason,
@@ -1513,16 +1521,6 @@ pub async fn serve_with_options(
         }
     }
 
-    // ADR-012 wire-compat: v2 (payload-covering) gossip headers are emitted
-    // only when the config opts in. Stock 0.5.71 emits v2 unconditionally,
-    // which pre-0.5.71 peers cannot decode — the vendored gate defaults to
-    // the v1 wire format so a mixed fleet keeps interoperating; flip
-    // `gossip_emit_v2 = true` only once every node runs a v2-capable build.
-    saorsa_gossip_pubsub::set_emit_v2_headers(config.gossip_emit_v2);
-    if config.gossip_emit_v2 {
-        tracing::info!("gossip: emitting ADR-012 v2 (payload-covering) headers");
-    }
-
     if config.leaf_mode {
         // Leaf mode: the global discovery topic, directory tag shards, and
         // the global public-message fallback (below) are network-serving
@@ -1533,8 +1531,9 @@ pub async fn serve_with_options(
         // The subscription trim alone is only part of the cost: PlumTree
         // nodes also relay EAGER payloads for topics they never subscribed
         // to (pass-through, so messages propagate past intermediate hops).
-        // Measured 2026-07-28, that pass-through traffic dominated. This
-        // turns it off for unsubscribed topics too.
+        // Measured 2026-07-28, that pass-through traffic dominated. Leaf
+        // participation — forced above for a metered node — refuses those
+        // frames at the C0 gate before PlumTree can create topic state.
         state.agent.set_leaf_mode(true);
         tracing::info!(
             "leaf mode: skipping global discovery, directory shard, \
