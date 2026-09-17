@@ -4718,6 +4718,71 @@ mod tests {
         )
     }
 
+    /// WHY (ADR-012): every gossip frame this daemon emits must carry the v2
+    /// payload-covering header. The fork used to gate that behind a vendored
+    /// `EMIT_V2_HEADERS` switch so a pre-0.42 fleet could stay on the v1
+    /// header-only-signed wire; 0.42+ refuses v1 on receive, the gate was
+    /// retired with the vendor, and the crate now seals unconditionally. This
+    /// pins the emitted wire so a dependency bump that reintroduced an opt-in
+    /// v1 default would fail here instead of on the fleet, where the symptom
+    /// is silent non-delivery.
+    #[tokio::test]
+    async fn published_headers_are_adr012_v2_payload_covering() {
+        const TOPIC: &str = "x0x.adr012.emit.test";
+        let topic_id = TopicId::from_entity(TOPIC.as_bytes());
+        let publisher = PubSubManager::new(test_node().await, None).expect("publisher manager");
+        let peer = PeerId::new([9u8; 32]);
+        *publisher.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: vec![peer],
+            sends: Vec::new(),
+        });
+        let _sub = publisher.subscribe(TOPIC.to_string()).await;
+        publisher
+            .set_topic_peers_for_test(topic_id, vec![peer])
+            .await;
+
+        let payload = Bytes::from_static(b"adr-012 payload");
+        publisher
+            .publish(TOPIC.to_string(), payload.clone())
+            .await
+            .expect("publish");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut eager = None;
+        while eager.is_none() {
+            for (_peer, bytes) in drain_sends(&publisher) {
+                if let Some(header) = peek_pubsub_header(&bytes) {
+                    if header.kind == MessageKind::Eager && header.topic == topic_id {
+                        eager = Some((header, bytes));
+                        break;
+                    }
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the published EAGER frame never reached the recorder"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let (header, frame) = eager.expect("eager frame");
+        assert_eq!(header.version, 2, "v1 emission is retired");
+        let message: saorsa_gossip_pubsub::GossipMessage =
+            postcard::from_bytes(&frame).expect("frame decodes as a GossipMessage");
+        let wire_payload = message.payload.expect("an EAGER frame carries its payload");
+        let sealed = *blake3::hash(wire_payload.as_ref()).as_bytes();
+        assert_eq!(
+            header.payload_hash,
+            Some(sealed),
+            "the sealed hash must cover the payload bytes on the wire"
+        );
+        assert!(
+            wire_payload
+                .windows(payload.len())
+                .any(|window| window == payload.as_ref()),
+            "the frame under test must be the message this test published"
+        );
+    }
+
     /// WHY (#674 C2/C3 — the acceptance seam): a Full relay carrying a
     /// topic it has NO local subscriber for must forward lazily — zero
     /// EAGER re-publish, IHAVE announce instead — while the subscriber at
