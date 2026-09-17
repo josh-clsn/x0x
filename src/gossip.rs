@@ -13,9 +13,9 @@ pub(crate) mod wire;
 
 pub use config::GossipConfig;
 pub use participation::{
-    classify_outbound_relay_json, leaf_refuses_unsubscribed_passthrough, resolve_participation,
-    ParticipationInputs, ParticipationMode, ParticipationSelection, ParticipationSnapshot,
-    RelayMetering, RELAY_BYTES_SEMANTICS,
+    classify_outbound_relay_json, leaf_refuses_unsubscribed_passthrough, metered_leaf_override,
+    resolve_participation, ParticipationInputs, ParticipationMode, ParticipationSelection,
+    ParticipationSnapshot, RelayMetering, RELAY_BYTES_SEMANTICS,
 };
 pub use pubsub::{
     InboundByTopicSnapshot, PubSubManager, PubSubMessage, PubSubStats, PubSubStatsSnapshot,
