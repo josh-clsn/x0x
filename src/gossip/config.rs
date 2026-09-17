@@ -214,6 +214,16 @@ impl GossipConfig {
         }
     }
 
+    /// Drop the relay opt-in for a metered node.
+    ///
+    /// [`Self::resolved_participation`] reads `relay` directly, so a config
+    /// that carries both `leaf_mode = true` and `gossip.relay = true` would
+    /// resolve Full — and the Leaf C0 gate, which is what actually refuses
+    /// pass-through frames, would stay off. The metered switch wins.
+    pub fn clear_relay_for_metered_leaf(&mut self) {
+        self.relay = false;
+    }
+
     /// Validate the budget separately so budget typos can fall back without
     /// turning an otherwise valid daemon config into a restart loop.
     pub fn validate_egress_budget(&self) -> Result<(), String> {
@@ -409,6 +419,22 @@ mod tests {
         assert_eq!(cfg.leaf_max_eager_degree, defaults.leaf_max_eager_degree);
         assert!(cfg.deprecation_warnings().is_empty());
         assert!(!cfg.relay);
+        assert_eq!(cfg.resolved_participation(), ParticipationMode::Leaf);
+    }
+
+    #[test]
+    fn metered_leaf_clears_the_relay_optin_so_participation_resolves_leaf() {
+        // Why: `leaf_mode = true` plus `gossip.relay = true` is a real
+        // config (an operator flipping a relay onto a metered link). The
+        // participation selection alone is not enough — this method is what
+        // the daemon calls so `resolved_participation` cannot re-Full it.
+        let mut cfg = GossipConfig {
+            relay: true,
+            ..GossipConfig::default()
+        };
+        assert_eq!(cfg.resolved_participation(), ParticipationMode::Full);
+        cfg.clear_relay_for_metered_leaf();
+        cfg.participation = ParticipationMode::Leaf;
         assert_eq!(cfg.resolved_participation(), ParticipationMode::Leaf);
     }
 
