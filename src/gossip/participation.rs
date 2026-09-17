@@ -303,7 +303,12 @@ mod tests {
         // Why: the vendored pass-through gate is gone, so Leaf participation
         // (which refuses pass-through frames at C0) is the only thing keeping
         // a metered device off relay duty. Every Full reason must lose to it.
-        for reason in ["dual_listen", "seed_addr", "managed_binary", "operator_relay"] {
+        for reason in [
+            "dual_listen",
+            "seed_addr",
+            "managed_binary",
+            "operator_relay",
+        ] {
             let forced = metered_leaf_override(
                 ParticipationSelection {
                     mode: ParticipationMode::Full,
