@@ -430,6 +430,39 @@ pub async fn serve(config: DaemonConfig) -> anyhow::Result<ServerHandle> {
 /// here and surfaces as `Err` BEFORE any long-lived task is spawned. On success
 /// a single supervisor task is spawned and a [`ServerHandle`] is returned with
 /// the bound address already readable.
+/// The relay opt-in decision for a daemon start, as a pure function of the
+/// three sources plus the metered switch.
+///
+/// Returns the effective operator-relay flag and, when the metered switch
+/// overrode an opt-in, the sources it beat (argv, TOML, environment order)
+/// for the one log line that says which switch lost. A metered node wins
+/// over every source: `resolved_participation` reads `gossip.relay`, while
+/// the #398 capability advertisement reads argv and the env var itself, so
+/// closing only one of them leaves a metered phone advertising relay and
+/// coordinator capability it refuses to honour.
+fn metered_relay_decision(
+    cli_relay: bool,
+    toml_relay: bool,
+    env_relay: bool,
+    leaf_mode: bool,
+) -> (bool, String) {
+    let relay_opt_in = cli_relay || toml_relay || env_relay;
+    if !leaf_mode {
+        return (relay_opt_in, String::new());
+    }
+    let mut overrode = Vec::new();
+    if cli_relay {
+        overrode.push("--relay");
+    }
+    if toml_relay {
+        overrode.push("gossip.relay");
+    }
+    if env_relay {
+        overrode.push("X0X_RELAY_OPT_IN");
+    }
+    (false, overrode.join(","))
+}
+
 pub async fn serve_with_options(
     config: DaemonConfig,
     options: ServeOptions,
@@ -617,19 +650,28 @@ pub async fn serve_with_options(
     // capability advertisement (#406's `relay_opt_in_explicit`, which reads
     // the flag/env itself). Normalise the env var so the announcement side's
     // process-wide check observes TOML/CLI opt-in too.
-    let relay_opt_in = cli_relay
-        || config.gossip.relay
-        || std::env::var_os("X0X_RELAY_OPT_IN").is_some_and(|v| v == "1");
-    // A metered node (`leaf_mode = true`) refuses relay duty outright, so the
-    // opt-in cannot reach either consumer: not the capability advertisement
-    // (#406 reads the env var) and not `resolved_participation`, which reads
-    // `gossip.relay` directly and would otherwise put the node back on Full.
-    let operator_relay = relay_opt_in && !config.leaf_mode;
-    if relay_opt_in && config.leaf_mode {
-        tracing::warn!(
-            "leaf mode: ignoring the relay opt-in — a metered node does not \
-             carry pass-through traffic"
-        );
+    let env_relay = std::env::var_os("X0X_RELAY_OPT_IN").is_some_and(|v| v == "1");
+    let (operator_relay, overrode_relay_sources) =
+        metered_relay_decision(cli_relay, config.gossip.relay, env_relay, config.leaf_mode);
+    // A metered node (`leaf_mode = true`) refuses relay duty outright, and the
+    // opt-in arrives from three independent places — argv, this TOML key and
+    // the env var — each of which is read by a different consumer:
+    // `resolved_participation` reads `gossip.relay`, and the #398 capability
+    // advertisement reads argv and the env var itself. All three lose here.
+    if config.leaf_mode {
+        if !overrode_relay_sources.is_empty() {
+            tracing::warn!(
+                overrode = %overrode_relay_sources,
+                "leaf mode: ignoring the relay opt-in — a metered node does not \
+                 carry pass-through traffic"
+            );
+        }
+        // Safe: single-threaded startup path, before any Agent tasks spawn —
+        // the same window the `set_var` below relies on. Removing the
+        // inherited variable stops anything that re-reads the environment
+        // (child processes included) from seeing an opt-in this node refuses.
+        std::env::remove_var("X0X_RELAY_OPT_IN");
+        x0x::suppress_relay_opt_in_for_metered_leaf();
     }
     if operator_relay {
         // Safe: single-threaded startup path, before any Agent tasks spawn.
@@ -1527,7 +1569,11 @@ pub async fn serve_with_options(
     // converged before the previous shutdown. The poll task does not survive
     // a restart, and nothing else on the joiner re-requests the Welcome — an
     // app relaunch mid-join (routine on Android) orphaned the join for good.
-    let respawned = respawn_unconverged_join_polls(Arc::clone(&state)).await;
+    // The poll holds an `Arc<AppState>` for up to the 24 h join-result
+    // horizon, so it must be a tracked background task: the drain aborts it
+    // and the #661 `drop(state)` below is then the last reference even on a
+    // daemon restarted mid-join.
+    let respawned = respawn_unconverged_join_polls(Arc::clone(&state), &mut bg_tasks).await;
     if !respawned.is_empty() {
         tracing::info!(
             groups = ?respawned,
@@ -4777,6 +4823,54 @@ mod owner_singleton_tests {
 /// hydration bridge — pre-populated cache ⇒ reconcile hydrates with no
 /// event; ring overflow (`Lagged`) ⇒ the full reconcile recovers; a second
 /// reconcile run hydrates nothing.
+#[cfg(test)]
+mod metered_relay_decision_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::metered_relay_decision;
+
+    /// One case per opt-in source. Each must (a) select operator relay on
+    /// an ordinary node and (b) lose to `leaf_mode`, naming itself in the
+    /// log line, on a metered one. Losing here is what makes the node
+    /// resolve Leaf participation AND — through the suppression the same
+    /// branch arms — advertise no relay/coordinator capability.
+    #[test]
+    fn every_relay_opt_in_source_loses_to_the_metered_switch() {
+        for (cli, toml, env, name) in [
+            (true, false, false, "--relay"),
+            (false, true, false, "gossip.relay"),
+            (false, false, true, "X0X_RELAY_OPT_IN"),
+        ] {
+            let (ordinary, overrode) = metered_relay_decision(cli, toml, env, false);
+            assert!(ordinary, "{name} must opt an ordinary node into relay duty");
+            assert!(
+                overrode.is_empty(),
+                "{name}: nothing is overridden off-leaf"
+            );
+
+            let (metered, overrode) = metered_relay_decision(cli, toml, env, true);
+            assert!(!metered, "{name} must not put a metered node on relay duty");
+            assert_eq!(overrode, name, "the log line must name the source it beat");
+        }
+    }
+
+    /// All three at once are all reported, in argv/TOML/env order; and a
+    /// metered node with no opt-in logs nothing.
+    #[test]
+    fn overridden_sources_are_reported_together_and_only_when_present() {
+        let (operator_relay, overrode) = metered_relay_decision(true, true, true, true);
+        assert!(!operator_relay);
+        assert_eq!(overrode, "--relay,gossip.relay,X0X_RELAY_OPT_IN");
+
+        let (operator_relay, overrode) = metered_relay_decision(false, false, false, true);
+        assert!(!operator_relay);
+        assert!(
+            overrode.is_empty(),
+            "a metered node that never asked for relay duty has nothing to warn about"
+        );
+    }
+}
+
 #[cfg(test)]
 mod member_certificate_bridge_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

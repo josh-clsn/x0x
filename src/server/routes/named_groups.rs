@@ -35783,7 +35783,10 @@ fn respawn_poll_targets(
 ///
 /// Returns the re-armed group ids so startup logging and tests observe the
 /// decision without any network traffic.
-pub(in crate::server) async fn respawn_unconverged_join_polls(state: Arc<AppState>) -> Vec<String> {
+pub(in crate::server) async fn respawn_unconverged_join_polls(
+    state: Arc<AppState>,
+    tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+) -> Vec<String> {
     let self_agent = state.agent.agent_id();
     let self_hex = hex::encode(self_agent.as_bytes());
     struct Candidate {
@@ -35833,7 +35836,7 @@ pub(in crate::server) async fn respawn_unconverged_join_polls(state: Arc<AppStat
         let poll_member = self_hex.clone();
         let await_treekem = candidate.is_treekem;
         let targets = candidate.targets;
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             poll_join_result_until_membership_confirmed(
                 poll_state,
                 poll_group,
@@ -35851,7 +35854,7 @@ pub(in crate::server) async fn respawn_unconverged_join_polls(state: Arc<AppStat
                 String::new(),
             )
             .await;
-        });
+        }));
         respawned.push(candidate.group_id);
     }
     respawned
