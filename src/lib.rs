@@ -2373,19 +2373,62 @@ impl AnnouncementAssistSnapshot {
     }
 }
 
+/// Metered-leaf suppression of the #398 relay opt-in.
+///
+/// `leaf_mode = true` says this device does not carry the network's
+/// freight. The opt-in reaches this module from three places — TOML
+/// `gossip.relay` (which the daemon resolves), `X0X_RELAY_OPT_IN=1` and
+/// argv `--relay` (both read here) — and advertising relay/coordinator
+/// capability on a metered node invites peers to push traffic that the
+/// Leaf C0 gate can only refuse AFTER it crossed the metered link: the
+/// wire carries no PRUNE, so inbound still arrives.
+static METERED_LEAF_RELAY_SUPPRESSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Refuse the #398 relay opt-in for the rest of this process because the
+/// node is metered (`leaf_mode = true`). Idempotent; the daemon arms it
+/// during startup, before any announcement can be built.
+pub fn suppress_relay_opt_in_for_metered_leaf() {
+    METERED_LEAF_RELAY_SUPPRESSED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the metered-leaf suppression is armed.
+#[must_use]
+pub fn relay_opt_in_suppressed_for_metered_leaf() -> bool {
+    METERED_LEAF_RELAY_SUPPRESSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The opt-in decision, as a pure function of its three inputs, so every
+/// source is testable (argv cannot be rewritten inside a test process).
+/// A metered leaf beats all of them.
+const fn relay_opt_in_declared(argv_opt_in: bool, env_opt_in: bool, metered_leaf: bool) -> bool {
+    !metered_leaf && (argv_opt_in || env_opt_in)
+}
+
 /// #398: explicit operator opt-in for announcing relay/coordinator
 /// capability without verified public reachability (manually
-/// port-forwarded hosts, hosts behind an operator-trusted edge). Checked
-/// once per process; absent by default.
+/// port-forwarded hosts, hosts behind an operator-trusted edge). The
+/// argv/env observation is checked once per process; absent by default.
+///
+/// The metered-leaf suppression is read OUTSIDE that cache on purpose: the
+/// first evaluation can happen before the daemon arms the switch, and a
+/// latched `true` would keep a metered node advertising relay capability
+/// for the life of the process.
 fn relay_opt_in_explicit() -> bool {
-    static OPT_IN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OPT_IN.get_or_init(|| {
-        // Command line: --relay / --relay-opt-in flag present.
-        let argv_opt_in = std::env::args().any(|arg| arg == "--relay" || arg == "--relay-opt-in");
-        // Environment: X0X_RELAY_OPT_IN=1.
-        let env_opt_in = std::env::var_os("X0X_RELAY_OPT_IN").is_some_and(|v| v == "1");
-        argv_opt_in || env_opt_in
-    })
+    static OPT_IN: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    let (argv_opt_in, env_opt_in) = *OPT_IN.get_or_init(|| {
+        (
+            // Command line: --relay / --relay-opt-in flag present.
+            std::env::args().any(|arg| arg == "--relay" || arg == "--relay-opt-in"),
+            // Environment: X0X_RELAY_OPT_IN=1.
+            std::env::var_os("X0X_RELAY_OPT_IN").is_some_and(|v| v == "1"),
+        )
+    });
+    relay_opt_in_declared(
+        argv_opt_in,
+        env_opt_in,
+        relay_opt_in_suppressed_for_metered_leaf(),
+    )
 }
 
 struct IdentityAnnouncementBuildOptions<'a> {
@@ -21175,6 +21218,60 @@ mod tests {
             let snapshot = AnnouncementAssistSnapshot::from_node_status(&status);
             assert_eq!(snapshot.relay_capable, Some(true));
             assert_eq!(snapshot.coordinator_capable, Some(true));
+        }
+
+        /// The metered switch must beat EVERY relay opt-in source. argv
+        /// cannot be rewritten inside a test process, so the decision is
+        /// pinned on the pure function each source feeds; the capability
+        /// test below covers the wiring.
+        #[test]
+        fn metered_leaf_beats_every_relay_opt_in_source() {
+            for (argv, env, label) in [
+                (true, false, "argv --relay"),
+                (false, true, "X0X_RELAY_OPT_IN=1"),
+                (true, true, "both"),
+            ] {
+                assert!(
+                    relay_opt_in_declared(argv, env, false),
+                    "{label} must opt a non-metered node in"
+                );
+                assert!(
+                    !relay_opt_in_declared(argv, env, true),
+                    "{label} must lose to leaf_mode on a metered node"
+                );
+            }
+            assert!(
+                !relay_opt_in_declared(false, false, false),
+                "no source, no opt-in"
+            );
+        }
+
+        /// The suppression's observable contract: with it armed, a node
+        /// that would otherwise advertise on the opt-in alone (no verified
+        /// global scope, no port mapping) advertises neither capability.
+        /// This is what keeps peers from selecting a metered phone as
+        /// relay or coordinator — traffic C0 can only refuse after it has
+        /// already crossed the metered link.
+        #[test]
+        fn metered_leaf_suppression_withdraws_the_advertised_capabilities() {
+            let status = ant_quic::NodeStatus {
+                direct_reachability_scope: Some(ant_quic::ReachabilityScope::LocalNetwork),
+                can_receive_direct: false,
+                port_mapping_active: false,
+                relay_service_enabled: true,
+                coordinator_service_enabled: true,
+                ..ant_quic::NodeStatus::default()
+            };
+            suppress_relay_opt_in_for_metered_leaf();
+            assert!(relay_opt_in_suppressed_for_metered_leaf());
+            assert!(
+                !relay_opt_in_explicit(),
+                "a metered node declares no relay opt-in, whatever argv or \
+                 the environment said"
+            );
+            let snapshot = AnnouncementAssistSnapshot::from_node_status(&status);
+            assert_eq!(snapshot.relay_capable, Some(false));
+            assert_eq!(snapshot.coordinator_capable, Some(false));
         }
 
         /// #398: capability still requires the service — reachability

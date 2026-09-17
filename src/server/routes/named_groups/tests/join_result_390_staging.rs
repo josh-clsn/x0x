@@ -255,13 +255,37 @@ async fn respawn_targets_only_unconverged_foreign_groups() -> Result<()> {
         groups.insert("g6".to_string(), g6);
     }
 
-    let mut respawned = respawn_unconverged_join_polls(Arc::clone(&state)).await;
+    let mut tasks = Vec::new();
+    let mut respawned = respawn_unconverged_join_polls(Arc::clone(&state), &mut tasks).await;
     respawned.sort();
     assert_eq!(
         respawned,
         vec!["g1".to_string(), "g4".to_string()],
         "only the unconverged foreign-owned groups get a re-armed poll; \
          own/converged/banned/withdrawn groups must all be skipped"
+    );
+    // #661 shutdown ordering: each re-armed poll holds an `Arc<AppState>`
+    // for up to the 24 h horizon, so the daemon must be able to stop it.
+    // A handle per re-armed group is what lets the drain abort them; a
+    // detached spawn kept the exclusive history handle open past the
+    // supervisor's `drop(state)` on exactly the daemon that restarted
+    // mid-join.
+    assert_eq!(
+        tasks.len(),
+        respawned.len(),
+        "every re-armed poll must be handed back for the shutdown drain"
+    );
+    for task in &tasks {
+        task.abort();
+    }
+    for task in tasks {
+        let _ = task.await;
+    }
+    assert_eq!(
+        Arc::strong_count(&state),
+        1,
+        "aborting the re-armed polls must release every AppState reference \
+         they captured, so the supervisor's drop is the last one"
     );
     Ok(())
 }
