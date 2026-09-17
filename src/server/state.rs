@@ -315,14 +315,6 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub leaf_mode: bool,
 
-    /// ADR-012 wire compatibility: emit v2 (payload-covering) gossip
-    /// message headers. Pre-0.5.71 peers cannot decode the v2 header at
-    /// all, so this stays `false` until every node in the fleet runs a
-    /// v2-capable build; receive-side verification is always on either
-    /// way. Default `false` (v1 wire format).
-    #[serde(default)]
-    pub gossip_emit_v2: bool,
-
     /// Serve without dialing the mesh. The gossip runtime, listeners, and
     /// every local surface start normally, but the bootstrap dial phases
     /// are skipped until `POST /mesh/join`. For embedders (the fetch>it
@@ -865,7 +857,6 @@ impl Default for DaemonConfig {
             zero_peer_restart_secs: None,
             api_watchdog: super::ApiWatchdogConfig::default(),
             leaf_mode: false,
-            gossip_emit_v2: false,
             defer_mesh_join: false,
         }
     }
