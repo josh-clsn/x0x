@@ -531,9 +531,20 @@ pub async fn serve_with_options(
     // capability advertisement (#406's `relay_opt_in_explicit`, which reads
     // the flag/env itself). Normalise the env var so the announcement side's
     // process-wide check observes TOML/CLI opt-in too.
-    let operator_relay = cli_relay
+    let relay_opt_in = cli_relay
         || config.gossip.relay
         || std::env::var_os("X0X_RELAY_OPT_IN").is_some_and(|v| v == "1");
+    // A metered node (`leaf_mode = true`) refuses relay duty outright, so the
+    // opt-in cannot reach either consumer: not the capability advertisement
+    // (#406 reads the env var) and not `resolved_participation`, which reads
+    // `gossip.relay` directly and would otherwise put the node back on Full.
+    let operator_relay = relay_opt_in && !config.leaf_mode;
+    if relay_opt_in && config.leaf_mode {
+        tracing::warn!(
+            "leaf mode: ignoring the relay opt-in — a metered node does not \
+             carry pass-through traffic"
+        );
+    }
     if operator_relay {
         // Safe: single-threaded startup path, before any Agent tasks spawn.
         std::env::set_var("X0X_RELAY_OPT_IN", "1");
@@ -560,6 +571,9 @@ pub async fn serve_with_options(
         "resolved gossip participation mode"
     );
     let mut gossip_config = config.gossip.clone();
+    if config.leaf_mode {
+        gossip_config.clear_relay_for_metered_leaf();
+    }
     gossip_config.participation = participation.mode;
     gossip_config.participation_reason = participation.reason.to_string();
 
