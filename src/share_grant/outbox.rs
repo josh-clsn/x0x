@@ -159,6 +159,9 @@ pub enum OutboxError {
     /// The outbox file could not be read or written.
     #[error("redelivery outbox store: {0}")]
     Store(String),
+    /// The grant is revoked: it is never queued (#983 post-merge P1).
+    #[error("grant is revoked")]
+    Revoked,
 }
 
 /// What one worker pass did.
@@ -374,14 +377,25 @@ impl GrantRedeliveryOutbox {
     /// Durably queue `grant` for `recipient`. Returns `Ok(true)` once the
     /// entry is on disk, `Ok(false)` if it was already queued.
     ///
+    /// Runs under the send gate (shared) and re-checks `revocations` under
+    /// it (#983 post-merge P1). Every revocation takes the gate exclusively
+    /// before it becomes effective and then removes the grant's entries, so
+    /// either the revocation is already visible here (refused: a revoked
+    /// grant is NEVER queued) or it lands after this insert and removes it.
+    /// A `DELETE /grants/:id` that completes while the `POST`'s initial DM is
+    /// still pending therefore cannot be undone by the `POST` queueing the
+    /// grant afterwards.
+    ///
     /// # Errors
-    /// Not queueable (foreign, forged or expired grant), a bound reached, or
-    /// a store failure. A refused entry leaves the outbox unchanged.
+    /// Not queueable (foreign, forged or expired grant), revoked, a bound
+    /// reached, or a store failure. A refused entry leaves the outbox
+    /// unchanged.
     pub async fn enqueue(
         &self,
         grant: &ShareGrant,
         recipient: AgentId,
         now_unix: u64,
+        revocations: &RwLock<RevocationSet>,
     ) -> Result<bool, OutboxError> {
         self.queueable(grant)?;
         let deadline = grant
@@ -396,6 +410,14 @@ impl GrantRedeliveryOutbox {
             )));
         }
         let key = key_of(&grant.grant_id, &recipient);
+        let _gate = self.send_gate.read().await;
+        if revocations
+            .read()
+            .await
+            .is_share_grant_revoked(&grant.grant_id, &grant.owner)
+        {
+            return Err(OutboxError::Revoked);
+        }
         let _write = self.write_lock.lock().await;
         {
             let mut entries = self.lock();
@@ -508,19 +530,32 @@ impl GrantRedeliveryOutbox {
             return report;
         }
         let _gate = self.send_gate.read().await;
-        // 1. Drop dead entries.
+        // 0. A previous write failed and nothing has rewritten the file
+        //    since: retry it now, even if the outbox is otherwise idle, so a
+        //    stale entry does not linger on disk (#983 post-merge P2).
+        if self.dirty.load(Ordering::Acquire) {
+            let _write = self.write_lock.lock().await;
+            if self.dirty.load(Ordering::Acquire) {
+                if let Err(e) = self.persist().await {
+                    tracing::warn!("share-grant outbox: dirty rewrite failed again: {e}");
+                }
+            }
+        }
+        // 1. One snapshot, judged once against the revocation set: the same
+        //    snapshot supplies both the dead entries and the due ones, so no
+        //    entry is ever sent without having been checked.
         let snapshot = self.pending();
-        let dead: Vec<EntryKey> = {
+        let (dead, live): (Vec<PendingGrantDelivery>, Vec<PendingGrantDelivery>) = {
             let revoked = revocations.read().await;
-            snapshot
-                .iter()
-                .filter(|e| {
-                    now_unix >= e.deadline
-                        || revoked.is_share_grant_revoked(&e.grant.grant_id, &e.grant.owner)
-                })
-                .map(|e| key_of(&e.grant.grant_id, &e.recipient))
-                .collect()
+            snapshot.into_iter().partition(|e| {
+                now_unix >= e.deadline
+                    || revoked.is_share_grant_revoked(&e.grant.grant_id, &e.grant.owner)
+            })
         };
+        let dead: Vec<EntryKey> = dead
+            .iter()
+            .map(|e| key_of(&e.grant.grant_id, &e.recipient))
+            .collect();
         if !dead.is_empty() {
             let _write = self.write_lock.lock().await;
             {
@@ -535,14 +570,20 @@ impl GrantRedeliveryOutbox {
                 tracing::warn!("share-grant outbox: dropping dead entries not persisted: {e}");
             }
         }
-        // 2. Pick due entries.
-        let mut due: Vec<PendingGrantDelivery> = self
-            .pending()
+        // 2. Pick due entries from that SAME checked snapshot, and re-check
+        //    each one against the revocation set right before sending
+        //    (#983 post-merge P1; the gate keeps local and gossiped
+        //    revocations out for the rest of this pass).
+        let mut due: Vec<PendingGrantDelivery> = live
             .into_iter()
             .filter(|e| e.next_attempt_at <= now_unix)
             .collect();
         due.sort_by_key(|e| (e.next_attempt_at, e.queued_at));
         due.truncate(OUTBOX_MAX_SENDS_PER_STEP);
+        {
+            let revoked = revocations.read().await;
+            due.retain(|e| !revoked.is_share_grant_revoked(&e.grant.grant_id, &e.grant.owner));
+        }
         if due.is_empty() {
             return report;
         }

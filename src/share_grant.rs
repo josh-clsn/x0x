@@ -906,6 +906,19 @@ pub async fn handle_share_grant_dm(
     store: Option<&ShareGrantStore>,
     typed: DmTypedPayload,
 ) -> DmTypedPayloadCompletionResult {
+    handle_share_grant_dm_checked(store, None, typed).await
+}
+
+/// [`handle_share_grant_dm`] that also refuses (ACK withheld, nothing
+/// stored) a grant already revoked in `revocations` — defence in depth for
+/// #983 post-merge P1: a delivery that races its own revocation is never
+/// stored by a daemon that already knows the revocation. The daemon routes
+/// deliveries here.
+pub async fn handle_share_grant_dm_checked(
+    store: Option<&ShareGrantStore>,
+    revocations: Option<&RwLock<RevocationSet>>,
+    typed: DmTypedPayload,
+) -> DmTypedPayloadCompletionResult {
     let DmTypedPayload {
         sender,
         payload,
@@ -915,10 +928,23 @@ pub async fn handle_share_grant_dm(
     let result = match store {
         None => Err("share grants are not enabled on this daemon".to_string()),
         Some(store) => match ShareGrant::from_dm_payload(&payload) {
-            Ok(grant) => store
-                .accept(grant, unix_now_secs())
-                .await
-                .map_err(|e| e.to_string()),
+            Ok(grant) => {
+                let revoked = match revocations {
+                    Some(set) => set
+                        .read()
+                        .await
+                        .is_share_grant_revoked(&grant.grant_id, &grant.owner),
+                    None => false,
+                };
+                if revoked {
+                    Err("share grant is revoked; not stored".to_string())
+                } else {
+                    store
+                        .accept(grant, unix_now_secs())
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            }
             Err(e) => Err(e.to_string()),
         },
     };
@@ -978,11 +1004,16 @@ pub fn grant_delivery_request(grant: &ShareGrant) -> Result<(Vec<u8>, [u8; 16]),
 /// Deliver `grant` to each recipient concurrently through `send` (which
 /// must return `Ok` only on the recipient's durable v2 ACK) and durably
 /// queue every failed recipient in `outbox` for redelivery (#926).
+///
+/// A failed recipient is queued with the clock read at QUEUE time (`now`),
+/// not before the send, and only if the grant is not revoked by then (see
+/// [`outbox::GrantRedeliveryOutbox::enqueue`]; #983 post-merge P1).
 pub async fn deliver_grant_via<F, Fut>(
     grant: &ShareGrant,
     recipients: &[AgentId],
     outbox: Option<&outbox::GrantRedeliveryOutbox>,
-    now_unix: u64,
+    revocations: &RwLock<RevocationSet>,
+    now: impl Fn() -> u64,
     send: F,
 ) -> Vec<GrantDelivery>
 where
@@ -1016,9 +1047,15 @@ where
             error: result.err(),
         };
         if !delivery.delivered {
-            delivery.queued =
-                queue_failed_delivery(grant, recipient, outbox, now_unix, &mut delivery.error)
-                    .await;
+            delivery.queued = queue_failed_delivery(
+                grant,
+                recipient,
+                outbox,
+                revocations,
+                now(),
+                &mut delivery.error,
+            )
+            .await;
         }
         out.push(delivery);
     }
@@ -1031,13 +1068,17 @@ async fn queue_failed_delivery(
     grant: &ShareGrant,
     recipient: AgentId,
     outbox: Option<&outbox::GrantRedeliveryOutbox>,
+    revocations: &RwLock<RevocationSet>,
     now_unix: u64,
     error: &mut Option<String>,
 ) -> bool {
     let Some(outbox) = outbox else {
         return false;
     };
-    match outbox.enqueue(grant, recipient, now_unix).await {
+    match outbox
+        .enqueue(grant, recipient, now_unix, revocations)
+        .await
+    {
         Ok(_) => true,
         Err(e) => {
             let reason = format!("not queued for redelivery: {e}");
@@ -1060,6 +1101,17 @@ impl crate::Agent {
     #[must_use]
     pub fn share_grant_store(&self) -> Option<Arc<ShareGrantStore>> {
         self.owner_trust().share_grant_store()
+    }
+
+    /// Handle one delivered share grant (the daemon's typed-DM route):
+    /// [`handle_share_grant_dm_checked`] against this daemon's store and
+    /// revocation set.
+    pub async fn handle_share_grant_delivery(
+        &self,
+        typed: DmTypedPayload,
+    ) -> DmTypedPayloadCompletionResult {
+        let store = self.share_grant_store();
+        handle_share_grant_dm_checked(store.as_deref(), Some(&self.revocation_set), typed).await
     }
 
     /// What the held grants confer on `(agent_id, machine_id)` for this
@@ -1208,7 +1260,8 @@ impl crate::Agent {
             grant,
             recipients,
             outbox.as_deref(),
-            unix_now_secs(),
+            &self.revocation_set,
+            unix_now_secs,
             |recipient, payload, request_id| {
                 self.send_share_grant_dm(recipient, payload, request_id, GRANT_DELIVERY_RETRIES)
             },

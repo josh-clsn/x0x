@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Share-grant revoke during `POST /grants` can no longer be undone
+  (#983 post-merge P1).** A `DELETE /grants/:id` that completed while the
+  grant's initial DM was still pending could be followed by the POST queueing
+  the revoked grant and the worker delivering it. Queueing now runs under the
+  outbox send gate, re-checks revocation under it and never queues a revoked
+  grant (timestamped at queue time); the worker selects due entries from the
+  same revocation-checked snapshot and re-checks each before sending; the
+  receiving daemon refuses to store a grant it already knows is revoked; and
+  an idle worker pass retries a failed (dirty) outbox write.
 - **Share-grant redelivery outbox (#926, ADR-0070 §2).** A grant delivery
   whose durable-DM attempts all fail is now queued in
   `<data_dir>/share-grant-outbox.bin` (durable, 0600) and retried on bounded
