@@ -92,6 +92,7 @@ async fn real_home_seat_control_envelopes_exceed_direct_message_limit() -> Resul
     let welcome_ref =
         stage_treekem_welcome(&state, &stable_group_id, &member_hex, out.welcome).await;
     let event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stable_group_id.clone(),
         revision,
         actor: authority_hex.clone(),
@@ -261,6 +262,7 @@ async fn real_home_seat_control_envelopes_exceed_direct_message_limit() -> Resul
     let second_welcome_ref =
         stage_treekem_welcome(&state, &stable_group_id, &second_hex, second_out.welcome).await;
     let second_event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stable_group_id.clone(),
         revision: after.roster_revision,
         actor: authority_hex,
@@ -442,6 +444,7 @@ async fn build_bound_joiner_scenario(dir: &std::path::Path) -> Result<BoundJoine
     // INLINE welcome: the joiner consumes its Welcome from the event bytes,
     // so adoption stays socket-free (no welcome fetch transfer).
     let event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stable_group_id.clone(),
         revision,
         actor: authority_hex.clone(),

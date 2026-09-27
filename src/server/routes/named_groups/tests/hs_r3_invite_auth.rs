@@ -2857,6 +2857,7 @@ async fn every_stateful_event_variant_routes_conflicts_through_the_wrapper() -> 
         .await?;
         let added_hex = hex::encode(AgentKeypair::generate()?.agent_id().as_bytes());
         let event = NamedGroupMetadataEvent::MemberAdded {
+            roster_certificates_b64: Vec::new(),
             group_id: group_id.clone(),
             revision: 1,
             actor: authority_hex.clone(),

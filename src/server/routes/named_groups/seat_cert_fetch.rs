@@ -654,33 +654,45 @@ pub(in crate::server) async fn roster_certificate_sidecar(
     group_id: &str,
     recipient_hex: &str,
 ) -> Vec<String> {
+    let groups = state.named_groups.read().await;
+    let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_id) else {
+        return Vec::new();
+    };
+    roster_certificate_sidecar_for_info(state, info, recipient_hex)
+}
+
+/// [`roster_certificate_sidecar`] over a `GroupInfo` the caller already
+/// holds (#1023: the seat-event builders hold the just-sealed `next`, and
+/// some of them still hold the `named_groups` guard).
+pub(in crate::server) fn roster_certificate_sidecar_for_info(
+    state: &AppState,
+    info: &crate::groups::GroupInfo,
+    recipient_hex: &str,
+) -> Vec<String> {
     use base64::Engine as _;
+    if info.withdrawn || info.policy.admission.owner_certified_user_id().is_none() {
+        return Vec::new();
+    }
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
-    let local_cert = state.agent.identity().agent_certificate().cloned();
-    let mut certs: Vec<(bool, String, crate::identity::AgentCertificate)> = {
-        let groups = state.named_groups.read().await;
-        let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_id) else {
-            return Vec::new();
-        };
-        if info.withdrawn || info.policy.admission.owner_certified_user_id().is_none() {
-            return Vec::new();
-        }
-        info.active_members()
-            .filter(|seat| seat.agent_id != recipient_hex)
-            .filter_map(|seat| {
-                let is_local = seat.agent_id == local_hex;
-                let cert = match (&seat.certificate, is_local) {
-                    (Some(cert), _) => cert.clone(),
-                    (None, true) => local_cert.clone().filter(|cert| {
+    let local_cert = state.agent.identity().agent_certificate();
+    let mut certs: Vec<(bool, String, crate::identity::AgentCertificate)> = info
+        .active_members()
+        .filter(|seat| seat.agent_id != recipient_hex)
+        .filter_map(|seat| {
+            let is_local = seat.agent_id == local_hex;
+            let cert = match (&seat.certificate, is_local) {
+                (Some(cert), _) => cert.clone(),
+                (None, true) => local_cert
+                    .filter(|cert| {
                         seat.certificate_digest.as_deref()
                             == Some(hex::encode(cert_digest_bincode(cert)).as_str())
-                    })?,
-                    (None, false) => return None,
-                };
-                Some((is_local, seat.agent_id.clone(), cert))
-            })
-            .collect()
-    };
+                    })?
+                    .clone(),
+                (None, false) => return None,
+            };
+            Some((is_local, seat.agent_id.clone(), cert))
+        })
+        .collect();
     certs.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     certs
         .into_iter()
@@ -688,6 +700,82 @@ pub(in crate::server) async fn roster_certificate_sidecar(
         .filter_map(|(_, _, cert)| bincode::serialize(&cert).ok())
         .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
         .collect()
+}
+
+/// #1023: attach the sealing authority's roster certificates to the
+/// authoritative `MemberAdded` it just built from `next` (the sealed
+/// roster). The joiner's own certificate already rides `certificate_b64`,
+/// so its seat is skipped.
+///
+/// Root cause this closes: #970 put the sidecar only on the JoinResult,
+/// but a joiner seated first by the gossip or direct copy of this event
+/// stops polling and never fetches that JoinResult (R19: the promoted
+/// admin was seated by the direct `MemberAdded` control blob and never
+/// held the creator's certificate). The seat event reaches every joiner
+/// and every existing member, so it is the carrier that cannot be
+/// skipped.
+///
+/// The sidecar is trimmed from the end until the event fits the budget
+/// of the transport its BARE form would use (#970's rule): an event that
+/// fitted a direct message still does, so attaching certificates never
+/// moves an event onto a transport a legacy receiver may not support.
+/// A no-op for anything but an owner-certified `MemberAdded`.
+pub(in crate::server) fn attach_roster_certificates_to_member_added(
+    state: &AppState,
+    next: &crate::groups::GroupInfo,
+    event: &mut super::NamedGroupMetadataEvent,
+) {
+    fn set_sidecar(event: &mut super::NamedGroupMetadataEvent, sidecar: Vec<String>) {
+        if let super::NamedGroupMetadataEvent::MemberAdded {
+            roster_certificates_b64,
+            ..
+        } = event
+        {
+            *roster_certificates_b64 = sidecar;
+        }
+    }
+    let super::NamedGroupMetadataEvent::MemberAdded { agent_id, .. } = &*event else {
+        return;
+    };
+    let mut sidecar = roster_certificate_sidecar_for_info(state, next, agent_id);
+    set_sidecar(event, Vec::new());
+    if sidecar.is_empty() {
+        return;
+    }
+    let Ok(bare_len) = serde_json::to_vec(&*event).map(|bytes| bytes.len()) else {
+        return;
+    };
+    let budget = if bare_len <= crate::dm::MAX_PAYLOAD_BYTES {
+        crate::dm::MAX_PAYLOAD_BYTES
+    } else {
+        super::TREEKEM_MEMBER_KEY_PACKAGE_CACHE_MAX_BYTES
+    };
+    while !sidecar.is_empty() {
+        set_sidecar(event, sidecar.clone());
+        if serde_json::to_vec(&*event).is_ok_and(|bytes| bytes.len() <= budget) {
+            return;
+        }
+        sidecar.pop();
+    }
+    set_sidecar(event, Vec::new());
+}
+
+/// #1023 receiver side: the certificate sidecar a `MemberAdded` carries,
+/// keyed by the event's group id, captured before the apply consumes the
+/// event. `None` for every other event and for an empty sidecar.
+pub(in crate::server) fn member_added_sidecar(
+    event: &super::NamedGroupMetadataEvent,
+) -> Option<(String, Vec<String>)> {
+    match event {
+        super::NamedGroupMetadataEvent::MemberAdded {
+            group_id,
+            roster_certificates_b64,
+            ..
+        } if !roster_certificates_b64.is_empty() => {
+            Some((group_id.clone(), roster_certificates_b64.clone()))
+        }
+        _ => None,
+    }
 }
 
 /// Receiver side of [`roster_certificate_sidecar`]: hydrate digest-only

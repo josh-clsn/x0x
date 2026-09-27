@@ -1526,6 +1526,7 @@ async fn issue458r2_adoption_refuses_commit_signed_by_non_actor() -> Result<()> 
             &signer,
         )?;
         NamedGroupMetadataEvent::MemberAdded {
+            roster_certificates_b64: Vec::new(),
             group_id: stage.group_id.clone(),
             revision,
             actor,
@@ -3851,6 +3852,7 @@ async fn issue458r4_removed_admin_fork_rejected() -> Result<()> {
         &attacker,
     )?;
     let fork_event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stage.group_id.clone(),
         revision: stub.roster_revision + 2,
         actor: attacker_hex.clone(),
@@ -4029,6 +4031,7 @@ async fn issue458r5_stale_joiner_removed_admin_fork_rejected() -> Result<()> {
         &attacker,
     )?;
     let fork_event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stage.group_id.clone(),
         revision: stub.roster_revision + 2,
         actor: attacker_hex.clone(),
@@ -4211,6 +4214,7 @@ async fn issue458r5_withdrawn_link_refused() -> Result<()> {
         &signer,
     )?;
     let event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stage.group_id.clone(),
         revision: terminal.revision,
         actor: stage.authority_hex.clone(),
@@ -4379,6 +4383,7 @@ async fn r6c_targeted_refusal(
         _ => panic!("stage member_added"),
     };
     let event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stage.group_id.clone(),
         revision: terminal.revision,
         actor: stage.authority_hex.clone(),
@@ -5579,6 +5584,7 @@ async fn adr0064_s4_removed_admin_fork_to_joiner_quarantines() -> Result<()> {
     let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
     use base64::Engine as _;
     let event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stage.group_id.clone(),
         revision: terminal.revision,
         actor: a_hex.clone(),
@@ -5677,6 +5683,7 @@ async fn adr0064_s4_removed_admin_fork_to_joiner_quarantines() -> Result<()> {
         &a_kp,
     )?;
     let event2 = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stage.group_id.clone(),
         revision: stranger_terminal.revision,
         actor: a_hex.clone(),
@@ -6059,6 +6066,7 @@ async fn stale_base_treekem_fork_with_replayed_owner_attestation_still_quarantin
     let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
     use base64::Engine as _;
     let event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stage.group_id.clone(),
         revision: terminal.revision,
         actor: a_hex.clone(),
@@ -6282,6 +6290,7 @@ async fn stale_base_treekem_sibling_terminal_with_genuine_owner_attestation_quar
     let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
     use base64::Engine as _;
     let event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stage.group_id.clone(),
         revision: sibling.revision,
         actor: b_hex.clone(),
@@ -7100,6 +7109,7 @@ async fn forking_catchup_responder_adopts_nothing_under_anchored_gap() -> Result
     let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
     use base64::Engine as _;
     let terminal_event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stage.group_id.clone(),
         revision: stub.state_revision,
         actor: hex::encode(stage.authority.agent.agent_id().as_bytes()),
@@ -7617,6 +7627,7 @@ async fn stale_record_in_one_group_does_not_block_another() -> Result<()> {
     let mut queue = std::collections::VecDeque::new();
     queue.push_back(PendingTreeKemMetadataEvent {
         event: as_treekem_join_result(&NamedGroupMetadataEvent::MemberAdded {
+            roster_certificates_b64: Vec::new(),
             group_id: stage.group_id.clone(),
             revision: genuine.revision,
             actor: hex::encode(stage.authority.agent.agent_id().as_bytes()),
@@ -7845,6 +7856,7 @@ async fn real_invite_stale_base_gap_is_classified_anchored_and_queued() -> Resul
     let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
     use base64::Engine as _;
     let event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stage.group_id.clone(),
         revision: stub.state_revision,
         actor: hex::encode(stage.authority.agent.agent_id().as_bytes()),
@@ -7993,6 +8005,7 @@ async fn real_invite_removed_admin_sibling_is_classified_and_quarantined() -> Re
     let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
     use base64::Engine as _;
     let event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stage.group_id.clone(),
         revision: stub.state_revision,
         actor: b_hex.clone(),
@@ -8334,6 +8347,7 @@ async fn adr0064_s4_removed_admin_fork_replay_under_held_lock_no_deadlock() -> R
     let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
     use base64::Engine as _;
     let event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stage.group_id.clone(),
         revision: terminal.revision,
         actor: a_hex.clone(),
