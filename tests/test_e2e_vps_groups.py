@@ -446,25 +446,34 @@ class GroupReportRedactionTests(unittest.TestCase):
         return json.dumps({"passes": harness.passes, "failures": harness.failures,
                            "responses": list(responses)})
 
-    def test_http_error_keeps_status_class_and_safe_code_only(self):
-        body = json.dumps({"ok": False, "error": self.SECRET, "reason": "not_admin",
-                           "code": self.SECRET}).encode()
+    def test_http_error_keeps_status_and_class_only(self):
+        # Codex #1021 P1: lowercase token-like and hex "reason"/"code" values
+        # passed the old character filter. No body field may be kept.
+        body = json.dumps({"ok": False, "error": self.SECRET, "reason": "token_secret_value",
+                           "code": "deadbeef" * 8}).encode()
         error = urllib.error.HTTPError("http://127.0.0.1/contacts", 403, self.SECRET, {},
                                        io.BytesIO(body))
         self.addCleanup(error.close)
         harness = self._harness(error)
         response = harness.call("anchor", "contact_add", {"agent_id": "b" * 64})
-        self.assertEqual({"error_class": "HTTPError", "http_status": 403, "reason": "not_admin"},
-                         response["outcome"])
+        self.assertEqual({"error_class": "HTTPError", "http_status": 403}, response["outcome"])
         harness.assert_pass("anchor adds contact", response.get("outcome") == "ok",
                             f"outcome={response.get('outcome')}")
-        self.assertNotIn("token-secret-value", self._report(harness, response))
+        report = self._report(harness, response)
+        for leaked in ("token-secret-value", "token_secret_value", "deadbeef"):
+            self.assertNotIn(leaked, report)
 
     def test_generic_exception_keeps_class_only(self):
         harness = self._harness(RuntimeError(self.SECRET))
         response = harness.call("anchor", "contact_list")
         self.assertEqual({"error_class": "RuntimeError"}, response["outcome"])
         self.assertNotIn("token-secret-value", self._report(harness, response))
+
+    def test_unlisted_exception_class_is_other(self):
+        class TokenSecretValueError(Exception):
+            pass
+        response = self._harness(TokenSecretValueError(self.SECRET)).call("anchor", "contact_list")
+        self.assertEqual({"error_class": "Other"}, response["outcome"])
 
     def test_unreachable_scenario_failure_row_keeps_class_only(self):
         harness = self._harness(RuntimeError("unused"))

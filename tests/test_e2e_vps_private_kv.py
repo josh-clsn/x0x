@@ -573,14 +573,14 @@ class PrivateKvHarnessTests(unittest.TestCase):
                               lambda node: node in stopped, mock.Mock())
         return scenario, stopped, raised.exception
 
-    def test_owner_key_barrier_failure_is_a_fixture_precondition_before_any_stop(self):
+    def test_owner_key_barrier_timeout_is_a_product_failure_before_any_stop(self):
         # R19: a writer that never held the owner key leaves the late member
-        # nothing to sync; that must read as the fixture's failure, not the
-        # product's, and the owner must still be online.
+        # nothing to sync. Everything is online at the barrier, so the timeout
+        # is a product (writer convergence) failure, and it leaves the
+        # late-history precondition unmet; the owner must still be online.
         def await_value(node, _sid, key, *_a, **_k):
             if node == "writer" and key.endswith("-owner"):
-                raise AssertionError("writer receives k did not converge in 120s; "
-                                     "last_status=404; last_error=None")
+                raise self.h.PollTimeout("writer receives k", 120, 120.2, 404, None)
         scenario, stopped, error = self._failing_exercise(
             await_value, lambda _node: (200, {"ok": True, "stores": {}}))
         self.assertIn("did not converge", str(error))
@@ -590,10 +590,12 @@ class PrivateKvHarnessTests(unittest.TestCase):
         self.assertEqual({"barrier": "writer_owner_key_before_offline"}, barrier_calls[0].kwargs)
         failed = [row for row in scenario.e.assertions if not row["passed"]]
         self.assertEqual(1, len(failed))
-        self.assertIn("fixture precondition failed", failed[0]["label"])
-        self.assertIn("not a product verdict", failed[0]["label"])
-        self.assertEqual("writer_owner_key_before_offline", failed[0]["precondition"])
-        self.assertIn("did not converge", failed[0]["poll_timeout"])
+        self.assertIn("product failure", failed[0]["label"])
+        self.assertIn("late-history precondition unmet", failed[0]["label"])
+        self.assertNotIn("not a product verdict", failed[0]["label"])
+        self.assertEqual("product_failure", failed[0]["verdict"])
+        self.assertEqual("unmet", failed[0]["late_history_precondition"])
+        self.assertIn("writer receives k did not converge", failed[0]["poll_timeout"])
 
     def test_owner_key_barrier_passes_both_stores_before_offline(self):
         scenario = self.h.Scenario({n: FakeApi(i) for n, i in IDS.items()}, self.h.Evidence())
@@ -610,8 +612,7 @@ class PrivateKvHarnessTests(unittest.TestCase):
         secret = "Bearer token-secret-value"
         def await_value(node, _sid, key, *_a, **_k):
             if node == "late" and key.endswith("-owner"):
-                raise AssertionError("late receives k did not converge in 120s; "
-                                     "last_status=404; last_error=None")
+                raise self.h.PollTimeout("late receives k", 120, 120.2, 404, None)
         def state_sync(node):
             if node == "late":
                 return 200, {"ok": True, "token": secret, "stores": {

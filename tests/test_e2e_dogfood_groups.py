@@ -51,21 +51,29 @@ class DogfoodReportRedactionTests(unittest.TestCase):
             {"alice": dogfood.Runner("alice", anchor)}, log,
         )
 
-    def test_http_error_keeps_status_class_and_safe_code_only(self):
-        body = json.dumps({"ok": False, "error": SECRET, "reason": "not_admin",
-                           "code": SECRET}).encode()
+    def test_http_error_keeps_status_and_class_only(self):
+        # Codex #1021 P1: lowercase token-like and hex "reason"/"code" values
+        # passed the old character filter. No body field may be kept.
+        body = json.dumps({"ok": False, "error": SECRET, "reason": "token_secret_value",
+                           "code": "deadbeef" * 8}).encode()
         error = urllib.error.HTTPError("http://127.0.0.1/contacts", 403, SECRET, {},
                                        io.BytesIO(body))
         self.addCleanup(error.close)
         response = self._harness(error).call("alice", "contact_add", {"agent_id": "b" * 64})
-        self.assertEqual({"error_class": "HTTPError", "http_status": 403, "reason": "not_admin"},
-                         response["outcome"])
-        self.assertNotIn("token-secret-value", json.dumps(response))
+        self.assertEqual({"error_class": "HTTPError", "http_status": 403}, response["outcome"])
+        for leaked in ("token-secret-value", "token_secret_value", "deadbeef"):
+            self.assertNotIn(leaked, json.dumps(response))
 
     def test_generic_exception_keeps_class_only(self):
         response = self._harness(RuntimeError(SECRET)).call("alice", "contact_list")
         self.assertEqual({"error_class": "RuntimeError"}, response["outcome"])
         self.assertNotIn("token-secret-value", json.dumps(response))
+
+    def test_unlisted_exception_class_is_other(self):
+        class TokenSecretValueError(Exception):
+            pass
+        response = self._harness(TokenSecretValueError(SECRET)).call("alice", "contact_list")
+        self.assertEqual({"error_class": "Other"}, response["outcome"])
 
     def test_written_report_keeps_scenario_crash_class_only(self):
         dogfood = self.dogfood

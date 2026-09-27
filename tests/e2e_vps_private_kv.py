@@ -17,7 +17,7 @@ from typing import Any, Callable
 
 from e2e_tunnel import TunnelHandle, start_ssh_tunnel, stop_ssh_tunnel
 from e2e_vps_groups import NODES_DEFAULT, load_tokens
-from e2e_vps_kv import Api, Evidence, Scenario as SharedScenario, ServiceCustody, active_provider_ids, enc, poll, safe_identifier, with_poll_timeout
+from e2e_vps_kv import Api, Evidence, PollTimeout, Scenario as SharedScenario, ServiceCustody, active_provider_ids, enc, poll, safe_identifier, with_poll_timeout
 
 
 # #824: the documented transient `GET /home` state while startup provisioning
@@ -230,14 +230,16 @@ class Scenario(SharedScenario):
                                      and owner_last[0] == 200
                                      and isinstance(owner_body.get("members"), list) else None),
             local_probe_count=local_samples)
-        raise AssertionError(f"{readiness_label} did not converge in {self.timeout:g}s")
+        raise PollTimeout(readiness_label, self.timeout, elapsed,
+                          owner_last[0] if isinstance(owner_last, tuple) else None, last_error)
 
     def await_owner_key_barrier(self, label: str, writer: str, stores: dict[str, str],
                                 owner_key: str) -> None:
         """The writer holds every store's owner key before the owner goes offline.
 
-        A timeout here is a fixture precondition failure, not a product verdict:
-        the later late-member history read would have had no source to sync from.
+        Everything is still online here, so a timeout is a PRODUCT failure: the
+        writer did not converge an owner-authored value. It also leaves the
+        late-history precondition unmet, so no cold-history verdict is reached.
         """
         for app, sid in stores.items():
             try:
@@ -245,9 +247,12 @@ class Scenario(SharedScenario):
                                  barrier="writer_owner_key_before_offline")
             except AssertionError as error:
                 self.e.assertions.append(with_poll_timeout({
-                    "label": (f"{label} fixture precondition failed: {writer} did not hold the "
-                              f"{app} owner key before the owner went offline (not a product verdict)"),
-                    "passed": False, "precondition": "writer_owner_key_before_offline",
+                    "label": (f"{label} product failure: {writer} did not converge the {app} "
+                              f"owner key while the owner was online; late-history precondition "
+                              f"unmet, so no cold-history verdict"),
+                    "passed": False, "verdict": "product_failure",
+                    "check": "writer_owner_key_convergence_while_online",
+                    "late_history_precondition": "unmet",
                     "app": app, "error_class": type(error).__name__}, error))
                 raise
 

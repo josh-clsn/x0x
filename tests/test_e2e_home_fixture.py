@@ -895,9 +895,10 @@ esac
         self.assertEqual("timeout", data["polls"][0]["outcome"])
         self.assertEqual(200, data["polls"][0]["last_http_status"])
         self.assertFalse(data["polls"][0]["expected_member_present"])
-        failure = [row for row in data["assertions"] if row["label"] == "fixture AssertionError"]
+        failure = [row for row in data["assertions"] if row["label"] == "fixture PollTimeout"]
         self.assertEqual(1, len(failure), data["assertions"])
         self.assertFalse(failure[0]["passed"])
+        self.assertIn("did not converge", failure[0]["poll_timeout"])
 
 
 if __name__ == "__main__": unittest.main()

@@ -56,33 +56,11 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+from e2e_vps_kv import safe_error_outcome
+
 
 PREFIX_CMD = b"x0xtest|cmd|"
 PREFIX_RES = b"x0xtest|res|"
-
-
-# x0x error bodies are {"ok": false, "error": <text>, "reason": <code>} (a few
-# routes use "code"). Reports keep the HTTP status, the exception class and
-# only these machine-code fields; never the body, error text or a token.
-SAFE_ERROR_CODE_FIELDS = ("reason", "code")
-_ERROR_CODE_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_")
-
-
-def safe_error_outcome(exc: BaseException) -> Dict[str, Any]:
-    outcome: Dict[str, Any] = {"error_class": type(exc).__name__}
-    if isinstance(exc, urllib.error.HTTPError):
-        outcome["http_status"] = exc.code
-        try:
-            body = json.loads(exc.read())
-        except Exception:
-            body = None
-        if isinstance(body, dict):
-            for name in SAFE_ERROR_CODE_FIELDS:
-                value = body.get(name)
-                if (isinstance(value, str) and 0 < len(value) <= 64
-                        and set(value) <= _ERROR_CODE_CHARS):
-                    outcome[name] = value
-    return outcome
 
 
 # ─── HTTP / SSE plumbing ──────────────────────────────────────────────

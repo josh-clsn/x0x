@@ -129,10 +129,13 @@ class LegacyHarnessTests(unittest.TestCase):
         # poll's own message (label/status/error class) is safe to keep;
         # any other exception may echo a token and must stay class-only.
         secret = "Bearer token-secret-value"
+        poll_timeout = self.m.with_poll_timeout.__globals__["PollTimeout"]
         for error, expect_text in (
-            (AssertionError("valid barrier converges did not converge in 120s; last_status=404; last_error=None"), True),
+            (poll_timeout("valid barrier converges", 120, 120.4, 404, None), True),
             (RuntimeError(secret), False),
             (AssertionError(secret), False),
+            # Codex #1021 P1: a spoofed phrase in a plain AssertionError is not poll()'s.
+            (AssertionError(f"{secret} did not converge in 120s; last_status=404"), False),
         ):
             failure = self.m.harness_failure(error)
             self.assertEqual(expect_text, "poll_timeout" in failure)

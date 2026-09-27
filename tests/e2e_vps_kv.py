@@ -95,26 +95,69 @@ def poll(label: str, timeout: float, probe: Callable[[], Any], accept: Callable[
             return last
         time.sleep(1)
     status = poll_status(last)
+    elapsed = round(time.monotonic() - started, 3)
     if receipt is not None:
-        receipt({"label": label, "elapsed_seconds": round(time.monotonic() - started, 3),
+        receipt({"label": label, "elapsed_seconds": elapsed,
                  "first_sample_utc": first_sample_utc, "last_sample_utc": last_sample_utc,
                  "probe_count": probe_count, "last_status": status,
                  "last_error_class": last_error, "outcome": "timeout"}, last)
-    raise AssertionError(f"{label} did not converge in {timeout:g}s; last_status={status}; last_error={last_error}")
+    raise PollTimeout(label, timeout, elapsed, status, last_error)
+
+
+class PollTimeout(AssertionError):
+    """poll()'s timeout, carrying the structured fields a report may keep."""
+
+    def __init__(self, label: str, timeout: float, elapsed_seconds: float,
+                 last_status: int | None, last_error: str | None) -> None:
+        self.label, self.timeout, self.elapsed_seconds = label, timeout, elapsed_seconds
+        self.last_status, self.last_error = last_status, last_error
+        super().__init__(f"{label} did not converge in {timeout:g}s; "
+                         f"last_status={last_status}; last_error={last_error}")
+
+
+SAFE_POLL_LABEL = re.compile(r"\A[A-Za-z0-9 ._:/()-]{1,300}\Z")
+SAFE_CLASS_NAME = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
 
 
 def poll_timeout_text(error: BaseException) -> str | None:
-    """poll()'s own timeout message, or None for any other exception.
+    """Report text for a PollTimeout, or None for any other exception.
 
-    poll() builds that message from its label, a status code and an error
-    class only, so it is token-free and safe for a report. Any other
-    exception text may echo a server body or bearer token and must never be
-    recorded; callers keep those class-only.
+    The text is rebuilt only from the timeout's validated structured fields;
+    str(error) is never read, so neither a spoofed AssertionError carrying the
+    same phrase nor altered exception args can put a body or token in a report.
     """
-    text = str(error)
-    if isinstance(error, AssertionError) and " did not converge in " in text:
-        return text[:500]
-    return None
+    if not isinstance(error, PollTimeout):
+        return None
+    label = error.label if isinstance(error.label, str) and SAFE_POLL_LABEL.fullmatch(error.label) \
+        else "unsafe_label"
+    status = error.last_status if type(error.last_status) is int else None
+    last_error = (error.last_error if isinstance(error.last_error, str)
+                  and SAFE_CLASS_NAME.fullmatch(error.last_error) else None)
+    timeout = error.timeout if isinstance(error.timeout, (int, float)) else 0
+    elapsed = error.elapsed_seconds if isinstance(error.elapsed_seconds, (int, float)) else 0
+    return (f"{label} did not converge in {timeout:g}s; elapsed_seconds={elapsed:g}; "
+            f"last_status={status}; last_error={last_error}")
+
+
+# Exception classes a harness may name in a report; anything else is "Other".
+SAFE_ERROR_CLASSES = frozenset({
+    "HTTPError", "URLError", "TimeoutError", "ConnectionError", "ConnectionRefusedError",
+    "ConnectionResetError", "ConnectionAbortedError", "BrokenPipeError", "OSError",
+    "JSONDecodeError", "RuntimeError", "ValueError", "KeyError", "TypeError",
+    "AssertionError", "PollTimeout"})
+
+
+def safe_error_outcome(exc: BaseException) -> dict[str, Any]:
+    """Report outcome for a failed API call: allow-listed class and HTTP status only.
+
+    Never the response body, its "error"/"reason"/"code" text, or str(exc):
+    any of them can echo a server body or bearer token.
+    """
+    name = type(exc).__name__
+    outcome: dict[str, Any] = {"error_class": name if name in SAFE_ERROR_CLASSES else "Other"}
+    if isinstance(exc, urllib.error.HTTPError) and type(exc.code) is int:
+        outcome["http_status"] = exc.code
+    return outcome
 
 
 def with_poll_timeout(row: dict[str, Any], error: BaseException) -> dict[str, Any]:
