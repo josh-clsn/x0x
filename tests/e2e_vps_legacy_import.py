@@ -78,6 +78,19 @@ def observer_response_class(result: tuple[int, dict[str, Any]] | None) -> str:
     return "value_present"
 
 
+
+def harness_failure(error: Exception) -> dict[str, Any]:
+    """Assertion row for an exception that aborted the scenario.
+
+    poll() builds its AssertionError from label, status and error class only,
+    so that text is token-free and is kept; any other exception may echo a
+    server body or token and stays class-only.
+    """
+    failure: dict[str, Any] = {"label": f"harness {type(error).__name__}", "passed": False}
+    if isinstance(error, AssertionError) and " did not converge in " in str(error):
+        failure["poll_timeout"] = str(error)[:500]
+    return failure
+
 class LegacyScenario:
     def __init__(self, clients: dict[str, Api], evidence: Evidence, timeout: float) -> None:
         self.c, self.e, self.timeout = clients, evidence, timeout
@@ -126,7 +139,10 @@ class LegacyScenario:
     def barrier_absence(self, observer: str, writer: str, sid: str, forbidden: str) -> None:
         barrier = f"barrier-{uuid.uuid4().hex}"
         self.e.check("valid writer barrier accepted", self.put(writer, sid, barrier, "barrier") == 200)
-        poll("valid barrier converges", self.timeout, lambda: self.read(observer, sid, barrier), lambda r: r == (200, "barrier"))
+        poll("valid barrier converges", self.timeout, lambda: self.read(observer, sid, barrier), lambda r: r == (200, "barrier"),
+             lambda facts, last: self.e.record_poll(
+                 facts, operation="valid_barrier_converges", node=observer, writer=writer,
+                 response_class=f"status_{last[0]}" if last else "no_response"))
         deadline = time.monotonic() + min(self.timeout, 3.0)
         observations = 0
         while True:
@@ -307,7 +323,7 @@ def main() -> int:
         )
         success = True
     except Exception as error:
-        evidence.assertions.append({"label": f"harness {type(error).__name__}", "passed": False})
+        evidence.assertions.append(harness_failure(error))
     finally:
         for error in custody.restore(health): success = False; evidence.assertions.append({"label": error, "passed": False})
         for node, tunnel in list(tunnels.items()):
