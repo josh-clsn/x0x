@@ -107,7 +107,8 @@
 //! longer verifies or is not this owner's — yields an empty outbox that
 //! refuses writes ([`GrantRedeliveryOutbox::load_error`]), so the file is
 //! never silently truncated or replaced. Only entries past their deadline
-//! are dropped on load, as the lifecycle rules say. A failed write marks the
+//! are dropped on load, as the lifecycle rules say, and the pruned set is
+//! written back at once (#1004) so they do not linger on disk. A failed write marks the
 //! outbox dirty; the next mutation (including a retried revocation) rewrites
 //! it even if it changes nothing in memory.
 
@@ -269,7 +270,9 @@ impl GrantRedeliveryOutbox {
     }
 
     /// Load `path` (missing ⇒ empty). Entries whose deadline has passed at
-    /// `now_unix` are dropped. Anything else wrong — unreadable, malformed,
+    /// `now_unix` are dropped and the file is rewritten without them (a
+    /// failed rewrite leaves the outbox dirty for the worker to retry).
+    /// Anything else wrong — unreadable, malformed,
     /// a duplicate key, an entry that no longer verifies or is not signed
     /// by `local_owner`, or a total or per-grantee bound exceeded — yields
     /// an empty outbox that refuses writes ([`Self::load_error`]); nothing
@@ -303,8 +306,21 @@ impl GrantRedeliveryOutbox {
         };
         let file = file.and_then(|file| outbox.validate_loaded(file, now_unix, &path));
         match file {
-            Ok(entries) => {
+            Ok((entries, expired)) => {
                 outbox.entries = std::sync::Mutex::new(entries);
+                // #1004: entries that expired while the daemon was down are
+                // gone from memory; rewrite the file so they are gone from
+                // disk too. Only a fully validated file reaches here, so a
+                // fail-closed file is never rewritten. A failed write leaves
+                // the outbox dirty and the first worker pass retries it.
+                if expired > 0 {
+                    let _write = outbox.write_lock.lock().await;
+                    if let Err(e) = outbox.persist().await {
+                        tracing::warn!(
+                            "share-grant outbox: pruning expired entries not persisted: {e}"
+                        );
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!("share-grant outbox unreadable, holding no deliveries: {e}");
@@ -315,13 +331,13 @@ impl GrantRedeliveryOutbox {
     }
 
     /// Check every loaded entry (see [`Self::load`]); only past-deadline
-    /// entries are dropped.
+    /// entries are dropped. Returns the kept entries and how many expired.
     fn validate_loaded(
         &self,
         file: OutboxFile,
         now_unix: u64,
         path: &std::path::Path,
-    ) -> Result<BTreeMap<EntryKey, PendingGrantDelivery>, String> {
+    ) -> Result<(BTreeMap<EntryKey, PendingGrantDelivery>, usize), String> {
         let mut entries = BTreeMap::new();
         let mut expired = 0usize;
         for entry in file.entries {
@@ -361,7 +377,7 @@ impl GrantRedeliveryOutbox {
                 "share-grant outbox: dropped expired entries on load"
             );
         }
-        Ok(entries)
+        Ok((entries, expired))
     }
 
     /// Exclusive side of the send gate. Hold it while recording a local
@@ -538,16 +554,18 @@ impl GrantRedeliveryOutbox {
     }
 
     /// Make every delivery to one of `recipients` due at `now_unix` (the
-    /// recipient's machine was seen again) and wake the worker. Returns
-    /// whether anything was nudged. In memory only: the persisted schedule
-    /// is merely later, which is safe.
+    /// recipient's machine was seen again) and wake the worker. An entry
+    /// that is already due is included too (#1004): it keeps its earlier
+    /// schedule and still wakes the worker. Returns whether any delivery to
+    /// `recipients` is queued. In memory only: the persisted schedule is
+    /// merely later, which is safe.
     pub fn nudge(&self, recipients: &[AgentId], now_unix: u64) -> bool {
         let mut nudged = false;
         {
             let mut entries = self.lock();
             for entry in entries.values_mut() {
-                if recipients.contains(&entry.recipient) && entry.next_attempt_at > now_unix {
-                    entry.next_attempt_at = now_unix;
+                if recipients.contains(&entry.recipient) {
+                    entry.next_attempt_at = entry.next_attempt_at.min(now_unix);
                     nudged = true;
                 }
             }

@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Share-grant outbox P3 fixes (#1004).** Entries that expired while the
+  daemon was down are now removed from `share-grant-outbox.bin` on load, not
+  only from memory (a file that fails validation is still never rewritten).
+  The reconnect nudge now covers every queued delivery to the reconnected
+  agent, including ones already due, and always wakes the worker for them.
 - **Share-grant revoke during `POST /grants` can no longer be undone
   (#983 post-merge P1).** A `DELETE /grants/:id` that completed while the
   grant's initial DM was still pending could be followed by the POST queueing
