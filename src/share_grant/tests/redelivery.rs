@@ -1426,3 +1426,91 @@ async fn stored_grant_stops_granting_when_the_revocation_arrives() {
     );
     assert!(fresh.issued(&grant.grant_id).is_none());
 }
+
+/// WHY (#1004 P3 a): an entry that expired while the daemon was down must
+/// leave the outbox FILE on load, not only memory. Otherwise it stays on
+/// disk until some unrelated write happens. Here the file is loaded again
+/// at a time when that entry was still live: without the rewrite the stale
+/// entry would come back.
+#[tokio::test]
+async fn expired_entries_are_pruned_from_disk_on_load() {
+    let world = World::new().await;
+    let short = world.grant(0x31, 100);
+    let long = world.grant(0x32, 3_600);
+    {
+        let outbox = world.outbox(world.now).await;
+        for grant in [&short, &long] {
+            assert!(outbox
+                .enqueue(grant, world.a1, world.now, &world.revocations)
+                .await
+                .unwrap());
+        }
+    }
+    assert_eq!(
+        world.outbox(world.now).await.len(),
+        2,
+        "control: both entries are on disk"
+    );
+
+    // Restart after the short grant's deadline: it is dropped on load.
+    let restarted = world.outbox(world.now + 200).await;
+    assert!(restarted.load_error().is_none());
+    assert_eq!(restarted.len(), 1);
+    drop(restarted);
+
+    // Read the file back at a time when the short entry would still be
+    // live: only a rewritten file lacks it.
+    let reread = world.outbox(world.now).await;
+    let ids: Vec<[u8; 32]> = reread.pending().iter().map(|e| e.grant.grant_id).collect();
+    assert_eq!(
+        ids,
+        vec![long.grant_id],
+        "the entry that expired while down must be gone from share-grant-outbox.bin"
+    );
+}
+
+/// WHY (#1004 P3 b): when the grantee's machine reconnects, the nudge must
+/// cover every queued delivery to it, including one that is ALREADY due. It
+/// used to count only entries it moved earlier, so for an overdue entry it
+/// reported nothing and did not wake the worker, and the retry waited for
+/// the next poll.
+#[tokio::test]
+async fn reconnect_nudge_includes_already_due_entries() {
+    use futures::FutureExt;
+    let world = World::new().await;
+    let outbox = GrantRedeliveryOutbox::in_memory(Some(world.owner.user_id()));
+    let grant = world.grant(0x33, 3_600);
+    assert!(outbox
+        .enqueue(&grant, world.a1, world.now, &world.revocations)
+        .await
+        .unwrap());
+    // Consume the wake-up left by the enqueue.
+    assert!(outbox.notified().now_or_never().is_some());
+    assert!(
+        outbox.notified().now_or_never().is_none(),
+        "control: no wake-up pending"
+    );
+
+    // The entry is overdue when A1's machine connects again.
+    let later = world.now + retry_delay_secs(0) + 10;
+    let scheduled = outbox.pending()[0].next_attempt_at;
+    assert!(scheduled < later, "control: the entry is already due");
+
+    assert!(
+        outbox.nudge(&[world.a1], later),
+        "a nudge must include a delivery that is already due"
+    );
+    assert!(
+        outbox.notified().now_or_never().is_some(),
+        "the nudge must wake the worker for an already-due delivery"
+    );
+    assert_eq!(
+        outbox.pending()[0].next_attempt_at,
+        scheduled,
+        "an overdue entry keeps its earlier schedule"
+    );
+
+    // A peer with nothing queued is still not nudged.
+    assert!(!outbox.nudge(&[AgentId([0x42; 32])], later));
+    assert!(outbox.notified().now_or_never().is_none());
+}
