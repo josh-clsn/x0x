@@ -467,8 +467,8 @@ esac
                 "    certify_same_owner_device(outsider)\n    evidence.check(\"outsider holds no owner key before denial\",")),
                 None),
             "history before admin stop": (None, mutant(harness, "m_hist", (
-                """        stop_admin()
-        self.e.check(history_offline_label""", """        self.e.check(history_offline_label"""), (
+                """            stop_admin()
+            self.e.check(history_offline_label""", """            self.e.check(history_offline_label"""), (
                 "        expected = set(actor_ids.values())\n",
                 "        stop_admin()\n        expected = set(actor_ids.values())\n")).Scenario),
             "late seat minted by owner after stop": (None, mutant(harness, "m_owner", (

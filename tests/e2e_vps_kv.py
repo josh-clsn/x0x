@@ -240,7 +240,7 @@ class Scenario:
         raw = body.get("value")
         return status, base64.b64decode(raw).decode() if status == 200 and isinstance(raw, str) else None
 
-    def await_value(self, node: str, sid: str, key: str, value: str) -> None:
+    def await_value(self, node: str, sid: str, key: str, value: str, **context: Any) -> None:
         gid, app = self.store_context.get(sid, (None, None))
         expected_hash = value_hash(value)
         def receipt(facts: dict[str, Any], last: Any) -> None:
@@ -249,7 +249,7 @@ class Scenario:
                                app=app, store_topic=safe_identifier(sid), key=safe_identifier(key),
                                response_class=self.read_classes.get((node, sid, key)),
                                expected_value_sha256=expected_hash,
-                               observed_value_sha256=value_hash(observed))
+                               observed_value_sha256=value_hash(observed), **context)
         result = poll(f"{node} receives {key}", self.timeout,
                       lambda: self.read_value(node, sid, key), lambda got: got == (200, value), receipt)
         self.e.check(f"{node} converged {key}", result == (200, value), value_sha256=expected_hash)
