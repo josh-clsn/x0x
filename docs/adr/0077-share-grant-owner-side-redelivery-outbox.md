@@ -2,7 +2,8 @@
 
 <!-- File name: docs/adr/0077-share-grant-owner-side-redelivery-outbox.md -->
 
-- **Status:** Proposed
+- **Status:** Accepted
+- **Accepted:** 2026-09-27 by David Irvine (accepted via AskUserQuestion 2026-09-27; implemented in #983/#994/#1010; status change applied by Claude at his instruction)
 - **Date:** 2026-09-26
 - **Decision owners:** David Irvine (direction), Claude (drafting)
 - **Reviewers:** pending (cross-model review required before acceptance)
