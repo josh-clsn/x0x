@@ -575,6 +575,7 @@ pub(in crate::server) async fn gossip_diagnostics(
         Some(snap) => {
             let pubsub_stages =
                 augment_pubsub_stage_diagnostics(state.agent.gossip_pubsub_stage_stats());
+            let participation_snapshot = state.agent.gossip_participation();
             let egress = state.agent.gossip_egress_diagnostics().unwrap_or_default();
             let (agents, machines, users) = state.agent.discovery_cache_entry_counts().await;
             (
@@ -583,8 +584,10 @@ pub(in crate::server) async fn gossip_diagnostics(
                 "ok": true,
                 "uptime_secs": state.start_time.elapsed().as_secs(),
                 "stats": snap,
-                "participation": state.agent.gossip_participation(),
-                // #945 visibility (ADR 0074 precondition): the numbers that
+                // #945: one participation snapshot feeds both the
+                // top-level field and leaf_egress — no torn reads under load.
+                "participation": participation_snapshot,
+                // #945 visibility (ADR 0078 precondition): the numbers that
                 // say whether a default Leaf is over its egress budget,
                 // first-class instead of nested. Purely additive; the deep
                 // forms stay (`participation`, `egress_budget`).
@@ -598,13 +601,11 @@ pub(in crate::server) async fn gossip_diagnostics(
                     "subscribed_outbound_bytes_per_sec_60s": egress["egress_budget"]
                         ["subscribed_outbound_bytes_per_sec_60s"]
                         .clone(),
-                    "epidemic_forward_bytes": state
-                        .agent
-                        .gossip_participation()
+                    "epidemic_forward_bytes": participation_snapshot
+                        .as_ref()
                         .map(|p| p.epidemic_forward_bytes),
-                    "epidemic_forward_msgs": state
-                        .agent
-                        .gossip_participation()
+                    "epidemic_forward_msgs": participation_snapshot
+                        .as_ref()
                         .map(|p| p.epidemic_forward_msgs),
                     "leaf_egress_snapshot": egress["egress_budget"]["leaf_egress"].clone(),
                 },
@@ -895,7 +896,7 @@ mod participation_diagnostics_tests {
         }
     }
 
-    /// #945 (ADR 0074 precondition): the first-class `leaf_egress` block —
+    /// #945 (ADR 0078 precondition): the first-class `leaf_egress` block —
     /// the four numbers an operator needs to see whether a default Leaf is
     /// over its budget — is present at the real route, typed as counters,
     /// and consistent with the deep forms (`participation`,
@@ -947,7 +948,7 @@ mod participation_diagnostics_tests {
         let leaf = &body["leaf_egress"];
         assert!(leaf.is_object(), "leaf_egress block present");
         // Default config: observe_only (the #504 default this visibility
-        // ships alongside ADR 0074's proposal to change it).
+        // ships alongside ADR 0078's proposal to change it).
         assert_eq!(leaf["byte_policy"], "observe_only");
         assert_eq!(leaf["applies_to_leaf"], true, "default node is a Leaf");
         for counter in [

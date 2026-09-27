@@ -4041,9 +4041,13 @@ async function pollNetworkView(){
       const lnote=g('g-ege-note');
       if(lnote){
         const over=(le.hard_exceeded|0)>0;
+        const policy=String(le.byte_policy||'');
+        const policyNote=policy==='shed_normal'
+          ?'shed_normal: over-budget forwarded traffic is being deferred (Critical topics never shed)'
+          :'observe_only meters this and sheds nothing';
         lnote.innerHTML=over
-          ? '<span class="trust trust-blocked" style="font-size:10px">over hard budget</span> this Leaf is forwarding beyond its configured egress budget (observe_only meters, nothing is shed — see ADR 0078)'
-          : '<span class="trust trust-trusted" style="font-size:10px">within budget</span> no hard-budget exceedance samples since startup';
+          ? '<span class="trust trust-blocked" style="font-size:10px">over hard budget</span> this Leaf is forwarding beyond its configured egress budget ('+policyNote+' — see ADR 0078)'
+          : '<span class="trust trust-trusted" style="font-size:10px">within budget</span> no hard-budget exceedance samples since startup (policy: '+esc(policy||'—')+')';
       }
     }
   }
