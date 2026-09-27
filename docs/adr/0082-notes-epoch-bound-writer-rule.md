@@ -174,6 +174,10 @@ against the replica's roster history:
     record whose op span (`partial_start_vv`..`partial_end_vv`) contains it.
   - **Dependency not yet accepted:** the record is **held**.
   - **Dependency with a higher epoch:** the record is **refused** (permanent).
+  - **One peer per record.** Every op in a record's update must belong to the
+    record's own `loro_peer`. Otherwise a record could carry, and so re-date,
+    another writer's later ops; a record that breaks this is refused as
+    malformed.
 - **Honest writers are never refused by this.** A writer's epoch is chosen as the
   maximum over its dependencies (§2).
 - **What backdating can still do (the honest limit).** A removed member A still
