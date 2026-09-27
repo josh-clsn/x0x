@@ -2,7 +2,8 @@
 
 <!-- File name: docs/adr/0081-notes-use-loro-crdt.md -->
 
-- **Status:** Proposed
+- **Status:** Accepted
+- **Accepted:** 2026-09-27 by David Irvine (loro chosen over yrs+gate; 12 MiB store budget and bounded poisoned-doc leak accepted; status change applied by Claude at his instruction)
 - **Date:** 2026-09-27
 - **Decision owners:** David Irvine (chose loro, 2026-09-27; only David may accept); Claude (drafting)
 - **Reviewers:** pending (cross-model review required before acceptance)
