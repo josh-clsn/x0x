@@ -323,6 +323,20 @@ class KvHarnessTests(unittest.TestCase):
         self.assertEqual(receipt["expected_value_sha256"], receipt["observed_value_sha256"])
         self.assertNotIn("sensitive-value", json.dumps(evidence.polls))
 
+    def test_failure_rows_keep_poll_timeout_text_but_never_other_error_text(self):
+        # R19 legacy failed as a bare class name; the fix keeps poll()'s own
+        # message. Any other exception text may carry a token and must not
+        # enter a report, even when it is an AssertionError.
+        secret = "Bearer token-secret-value"
+        timeout = AssertionError(
+            "valid barrier converges did not converge in 120s; last_status=404; last_error=None")
+        row = self.kv.with_poll_timeout({"label": "harness", "passed": False}, timeout)
+        self.assertIn("did not converge", row["poll_timeout"])
+        for error in (RuntimeError(secret), AssertionError(secret), ValueError(secret)):
+            row = self.kv.with_poll_timeout({"label": "harness", "passed": False}, error)
+            self.assertNotIn("poll_timeout", row)
+            self.assertNotIn(secret, json.dumps(row))
+
     def test_unsafe_server_fields_and_tokens_never_enter_receipt(self):
         evidence = self.kv.Evidence()
         secret = "Bearer token-secret-value"

@@ -17,7 +17,7 @@ from typing import Any, Callable
 
 from e2e_tunnel import TunnelHandle, start_ssh_tunnel, stop_ssh_tunnel
 from e2e_vps_groups import NODES_DEFAULT, load_tokens
-from e2e_vps_kv import Api, Evidence, Scenario as SharedScenario, ServiceCustody, active_provider_ids, enc, poll, safe_identifier
+from e2e_vps_kv import Api, Evidence, Scenario as SharedScenario, ServiceCustody, active_provider_ids, enc, poll, safe_identifier, with_poll_timeout
 
 
 # #824: the documented transient `GET /home` state while startup provisioning
@@ -443,7 +443,9 @@ def main() -> int:
                     custody.restore_required.remove(node)
         succeeded = True
     except Exception as error:
-        evidence.assertions.append({"label": "harness", "passed": False, "error": str(error)})
+        # Class only: str(error) could echo a server body or bearer token.
+        evidence.assertions.append(with_poll_timeout({"label": "harness", "passed": False,
+                                                      "error": type(error).__name__}, error))
     finally:
         for error in custody.restore(await_health):
             evidence.assertions.append({"label": error, "passed": False})

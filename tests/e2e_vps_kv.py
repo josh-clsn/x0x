@@ -103,6 +103,28 @@ def poll(label: str, timeout: float, probe: Callable[[], Any], accept: Callable[
     raise AssertionError(f"{label} did not converge in {timeout:g}s; last_status={status}; last_error={last_error}")
 
 
+def poll_timeout_text(error: BaseException) -> str | None:
+    """poll()'s own timeout message, or None for any other exception.
+
+    poll() builds that message from its label, a status code and an error
+    class only, so it is token-free and safe for a report. Any other
+    exception text may echo a server body or bearer token and must never be
+    recorded; callers keep those class-only.
+    """
+    text = str(error)
+    if isinstance(error, AssertionError) and " did not converge in " in text:
+        return text[:500]
+    return None
+
+
+def with_poll_timeout(row: dict[str, Any], error: BaseException) -> dict[str, Any]:
+    """Add the safe poll-timeout text to a failure row when there is one."""
+    text = poll_timeout_text(error)
+    if text is not None:
+        row["poll_timeout"] = text
+    return row
+
+
 def poll_status(value: Any) -> int | None:
     return value[0] if isinstance(value, tuple) and value and isinstance(value[0], int) else None
 
@@ -433,8 +455,8 @@ def main() -> int:
                                                            stop_admin=stop_admin, offline=offline)
         succeeded = True
     except Exception as error:
-        evidence.assertions.append({"label": "harness", "passed": False,
-                                    "error_class": type(error).__name__})
+        evidence.assertions.append(with_poll_timeout({"label": "harness", "passed": False,
+                                                      "error_class": type(error).__name__}, error))
     finally:
         for error in custody.restore(await_health):
             succeeded = False; evidence.assertions.append({"label": error, "passed": False})

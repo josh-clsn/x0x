@@ -15,7 +15,7 @@ from typing import Any
 
 from e2e_tunnel import start_ssh_tunnel, stop_ssh_tunnel
 from e2e_vps_groups import load_tokens
-from e2e_vps_kv import Api, Evidence, ServiceCustody, enc, poll
+from e2e_vps_kv import Api, Evidence, ServiceCustody, enc, poll, with_poll_timeout
 
 
 def removed_group_refusal(result: tuple[int, dict[str, Any]]) -> bool:
@@ -80,16 +80,8 @@ def observer_response_class(result: tuple[int, dict[str, Any]] | None) -> str:
 
 
 def harness_failure(error: Exception) -> dict[str, Any]:
-    """Assertion row for an exception that aborted the scenario.
-
-    poll() builds its AssertionError from label, status and error class only,
-    so that text is token-free and is kept; any other exception may echo a
-    server body or token and stays class-only.
-    """
-    failure: dict[str, Any] = {"label": f"harness {type(error).__name__}", "passed": False}
-    if isinstance(error, AssertionError) and " did not converge in " in str(error):
-        failure["poll_timeout"] = str(error)[:500]
-    return failure
+    """Assertion row for an exception that aborted the scenario (see poll_timeout_text)."""
+    return with_poll_timeout({"label": f"harness {type(error).__name__}", "passed": False}, error)
 
 class LegacyScenario:
     def __init__(self, clients: dict[str, Api], evidence: Evidence, timeout: float) -> None:
