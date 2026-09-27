@@ -77,6 +77,30 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+# x0x error bodies are {"ok": false, "error": <text>, "reason": <code>} (a few
+# routes use "code"). Reports keep the HTTP status, the exception class and
+# only these machine-code fields; never the body, error text or a token.
+SAFE_ERROR_CODE_FIELDS = ("reason", "code")
+_ERROR_CODE_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_")
+
+
+def safe_error_outcome(exc: BaseException) -> Dict[str, Any]:
+    outcome: Dict[str, Any] = {"error_class": type(exc).__name__}
+    if isinstance(exc, urllib.error.HTTPError):
+        outcome["http_status"] = exc.code
+        try:
+            body = json.loads(exc.read())
+        except Exception:
+            body = None
+        if isinstance(body, dict):
+            for name in SAFE_ERROR_CODE_FIELDS:
+                value = body.get(name)
+                if (isinstance(value, str) and 0 < len(value) <= 64
+                        and set(value) <= _ERROR_CODE_CHARS):
+                    outcome[name] = value
+    return outcome
+
+
 # ─── token-file parsing ────────────────────────────────────────────────
 
 
@@ -577,20 +601,11 @@ class FleetHarness:
                 "outcome": "ok", "details": details,
                 "node": "anchor_local",
             }
-        except urllib.error.HTTPError as exc:
-            try:
-                body = json.loads(exc.read())
-            except Exception:
-                body = {"status": exc.code, "reason": exc.reason}
-            return {
-                "kind": f"{action}_result", "request_id": request_id,
-                "outcome": {"error": body, "http_status": exc.code},
-                "details": {}, "node": "anchor_local",
-            }
         except Exception as exc:
+            # Never the raw body or str(exc): either can echo a bearer token.
             return {
                 "kind": f"{action}_result", "request_id": request_id,
-                "outcome": {"error": str(exc)},
+                "outcome": safe_error_outcome(exc),
                 "details": {}, "node": "anchor_local",
             }
 
@@ -660,7 +675,7 @@ class FleetHarness:
                     )
                 else:
                     self.failures.append(
-                        f"{name} contacts lifecycle unreachable: {exc}"
+                        f"{name} contacts lifecycle unreachable: {type(exc).__name__}"
                     )
 
     def run_group_lifecycle(self) -> None:
@@ -719,7 +734,7 @@ class FleetHarness:
                         "  SKIP %s join unreachable: %s", member, exc,
                     )
                     continue
-                self.failures.append(f"{member} join unreachable: {exc}")
+                self.failures.append(f"{member} join unreachable: {type(exc).__name__}")
                 continue
             ok = resp.get("outcome") == "ok"
             self.assert_pass(f"{member} joins via invite", ok)
@@ -744,7 +759,7 @@ class FleetHarness:
             try:
                 r = self.call(m, "group_members", {"group_id": mgid})
             except Exception as exc:
-                self.failures.append(f"{m} members query: {exc}")
+                self.failures.append(f"{m} members query: {type(exc).__name__}")
                 continue
             aids = self._member_aids(r.get("details"))
             self.assert_pass(
@@ -801,7 +816,7 @@ class FleetHarness:
                      "body": f"phase-b: ack from {member}"},
                 )
             except Exception as exc:
-                self.failures.append(f"{member} group send: {exc}")
+                self.failures.append(f"{member} group send: {type(exc).__name__}")
                 continue
             self.assert_pass(
                 f"{member} posts reply in group",
@@ -818,7 +833,7 @@ class FleetHarness:
             try:
                 resp = self.call(m, "group_messages", {"group_id": mgid})
             except Exception as exc:
-                self.failures.append(f"{m} messages query: {exc}")
+                self.failures.append(f"{m} messages query: {type(exc).__name__}")
                 continue
             bodies = self._message_bodies(resp.get("details"))
             self.assert_pass(
@@ -936,7 +951,7 @@ class FleetHarness:
                     self.log.warning("  SKIP %s TreeKEM join: %s", member, exc)
                     continue
                 self.failures.append(
-                    f"{member} TreeKEM join unreachable: {exc}"
+                    f"{member} TreeKEM join unreachable: {type(exc).__name__}"
                 )
                 continue
             if resp.get("outcome") == "ok":
@@ -1400,7 +1415,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             harness.run_treekem_state_commit_audit()
         except Exception as exc:
             log.exception("scenario crashed: %s", exc)
-            harness.failures.append(f"scenario crash: {exc}")
+            harness.failures.append(f"scenario crash: {type(exc).__name__}")
 
         router.stop()
 

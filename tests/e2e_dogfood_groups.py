@@ -61,6 +61,30 @@ PREFIX_CMD = b"x0xtest|cmd|"
 PREFIX_RES = b"x0xtest|res|"
 
 
+# x0x error bodies are {"ok": false, "error": <text>, "reason": <code>} (a few
+# routes use "code"). Reports keep the HTTP status, the exception class and
+# only these machine-code fields; never the body, error text or a token.
+SAFE_ERROR_CODE_FIELDS = ("reason", "code")
+_ERROR_CODE_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_")
+
+
+def safe_error_outcome(exc: BaseException) -> Dict[str, Any]:
+    outcome: Dict[str, Any] = {"error_class": type(exc).__name__}
+    if isinstance(exc, urllib.error.HTTPError):
+        outcome["http_status"] = exc.code
+        try:
+            body = json.loads(exc.read())
+        except Exception:
+            body = None
+        if isinstance(body, dict):
+            for name in SAFE_ERROR_CODE_FIELDS:
+                value = body.get(name)
+                if (isinstance(value, str) and 0 < len(value) <= 64
+                        and set(value) <= _ERROR_CODE_CHARS):
+                    outcome[name] = value
+    return outcome
+
+
 # ─── HTTP / SSE plumbing ──────────────────────────────────────────────
 
 
@@ -407,23 +431,12 @@ class DogfoodHarness:
                 "details": details,
                 "node": "anchor_local",
             }
-        except urllib.error.HTTPError as exc:
-            try:
-                body = json.loads(exc.read())
-            except Exception:
-                body = {"status": exc.code, "reason": exc.reason}
-            return {
-                "kind": f"{action}_result",
-                "request_id": request_id,
-                "outcome": {"error": body, "http_status": exc.code},
-                "details": {},
-                "node": "anchor_local",
-            }
         except Exception as exc:
+            # Never the raw body or str(exc): either can echo a bearer token.
             return {
                 "kind": f"{action}_result",
                 "request_id": request_id,
-                "outcome": {"error": str(exc)},
+                "outcome": safe_error_outcome(exc),
                 "details": {},
                 "node": "anchor_local",
             }
@@ -579,7 +592,7 @@ class DogfoodHarness:
                 or not invite_url.startswith("x0x://invite/")
             ):
                 self.failures.append(
-                    f"{owner} invite for {member} missing or wrong format: {invite_url!r}"
+                    f"{owner} invite for {member} missing or wrong format"
                 )
                 continue
             join_resp = self.call(
@@ -934,7 +947,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
     except Exception as exc:
         log.exception("scenario crashed: %s", exc)
-        harness.failures.append(f"scenario crash: {exc}")
+        harness.failures.append(f"scenario crash: {type(exc).__name__}")
 
     router.stop()
 
