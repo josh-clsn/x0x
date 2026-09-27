@@ -1547,6 +1547,25 @@ pub(in crate::server) enum NamedGroupMetadataEvent {
         owner_mandate: Option<x0x::groups::OwnerMandate>,
         #[serde(default)]
         commit: Option<x0x::groups::GroupStateCommit>,
+        /// #1023 (R19 Home blocker): base64 bincode `AgentCertificate`s for
+        /// every OTHER owner-certified seat the sealing authority holds
+        /// bytes for (the creator and every owner device included). The
+        /// seat event is the one message every joiner is guaranteed to
+        /// apply: a joiner seated by this gossip or direct copy stops
+        /// polling and never fetches its JoinResult, so a sidecar on the
+        /// JoinResult alone (#970) never reaches it. Carrying the
+        /// certificates here lets any member, including one later
+        /// promoted to Admin, hydrate the digest-only seat of an owner
+        /// device that is offline.
+        ///
+        /// Not covered by any signature. A receiver installs an entry only
+        /// when it hashes to a committed seat digest and verifies under
+        /// the group owner (see
+        /// `seat_cert_fetch::hydrate_from_roster_certificate_sidecar`).
+        /// Empty and omitted by legacy authorities; legacy receivers
+        /// ignore the key.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        roster_certificates_b64: Vec<String>,
     },
     MemberRemoved {
         group_id: String,
@@ -10367,6 +10386,9 @@ async fn apply_named_group_metadata_event_with_binding(
         } => Some((group_id.clone(), agent_id.clone())),
         _ => None,
     };
+    // #1023: a seat event's certificate sidecar, captured before `event`
+    // moves and installed only after every apply guard has dropped.
+    let roster_sidecar = seat_cert_fetch::member_added_sidecar(&event);
     let applied = Box::pin(apply_named_group_metadata_event_inner_serialized(
         state,
         event,
@@ -10387,6 +10409,7 @@ async fn apply_named_group_metadata_event_with_binding(
         replay_pending_causal_approvals(state, &gid, &mut cleared_quarantine).await;
     }
     resume_task_ingest_after_durable_clear(state, &cleared_quarantine).await;
+    hydrate_from_member_added_sidecar(state, roster_sidecar).await;
     if applied.accepted {
         if let Some((gid, member)) = departing_member.as_ref() {
             clear_cert_evidence_stamps_for(state, gid, Some(member)).await;
@@ -10397,6 +10420,24 @@ async fn apply_named_group_metadata_event_with_binding(
     }
     refresh_group_rosters_for_gossip(state).await;
     applied
+}
+
+/// #1023: install the certificate sidecar a `MemberAdded` carried onto the
+/// matching digest-only seats. Runs whether or not the apply was accepted:
+/// the direct and gossip copies of one seat event race, so the second copy
+/// is a no-op apply whose sidecar may still be the first one this node
+/// can use. Every entry is verified against the committed seat digest and
+/// the group owner before install
+/// (`seat_cert_fetch::hydrate_from_roster_certificate_sidecar`). MUST be
+/// called with no membership or `named_groups` guard held.
+async fn hydrate_from_member_added_sidecar(
+    state: &Arc<AppState>,
+    sidecar: Option<(String, Vec<String>)>,
+) {
+    if let Some((group_id, certificates)) = sidecar {
+        seat_cert_fetch::hydrate_from_roster_certificate_sidecar(state, &group_id, &certificates)
+            .await;
+    }
 }
 
 /// #876: is this apply the one that seats a member (the replay trigger for
@@ -10627,6 +10668,8 @@ async fn apply_named_group_metadata_event_inner(
     // #759 item 1: as in `apply_named_group_metadata_event` above — the
     // notification is consumed only after the (guard-free) replay call.
     let mut cleared_quarantine = std::collections::BTreeSet::new();
+    // #1023: as in `apply_named_group_metadata_event_with_binding`.
+    let roster_sidecar = seat_cert_fetch::member_added_sidecar(&event);
     let applied = Box::pin(apply_named_group_metadata_event_inner_serialized(
         state,
         event,
@@ -10649,6 +10692,7 @@ async fn apply_named_group_metadata_event_inner(
         }
     }
     resume_task_ingest_after_durable_clear(state, &cleared_quarantine).await;
+    hydrate_from_member_added_sidecar(state, roster_sidecar).await;
     if applied.accepted {
         if let Some(event_gid) = member_landing_group {
             // Resolve to the local map key AFTER the apply (the group may
@@ -10959,6 +11003,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             certificate_b64,
             owner_mandate,
             commit,
+            // #1023: hydrated by the apply wrappers after every guard has
+            // dropped (`hydrate_from_member_added_sidecar`), never here.
+            roster_certificates_b64: _,
         } => {
             // ADR-0038 review B1 (+round-2): receivers enforce OwnerCertified
             // admission on inbound authority commits too. The event must
@@ -13758,7 +13805,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         && verify_authority_attested_member_joined_recovery(&next, recovery)
                 })
                 .await;
-            let event = NamedGroupMetadataEvent::MemberAdded {
+            let mut event = NamedGroupMetadataEvent::MemberAdded {
+                roster_certificates_b64: Vec::new(),
                 group_id: event_group_id.clone(),
                 revision,
                 actor: inviter_agent_id.clone(),
@@ -13781,6 +13829,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 owner_mandate,
                 commit: Some(commit),
             };
+            // #1023: every other owner-certified seat's certificate rides
+            // the seat event, so the joiner holds them even when it is
+            // seated by this copy and never fetches its JoinResult.
+            seat_cert_fetch::attach_roster_certificates_to_member_added(state, &next, &mut event);
             // #477 T4(b): park in the seat→Result staging interval — a
             // fetch issued here blocks on the membership mutex and then
             // observes the staged RESULT after release (never a torn
@@ -18854,7 +18906,8 @@ pub(in crate::server) async fn add_named_group_member(
         }
         drop(mls_groups);
         save_mls_groups(&state).await;
-        let event = NamedGroupMetadataEvent::MemberAdded {
+        let mut event = NamedGroupMetadataEvent::MemberAdded {
+            roster_certificates_b64: Vec::new(),
             group_id: event_group_id,
             revision,
             actor: actor_hex,
@@ -18876,6 +18929,12 @@ pub(in crate::server) async fn add_named_group_member(
             owner_mandate,
             commit: Some(commit),
         };
+        // #1023: the sealed roster's other certificates ride the seat event.
+        seat_cert_fetch::attach_roster_certificates_to_member_added(
+            &state,
+            &bootstrap_group,
+            &mut event,
+        );
         (metadata_topic, event, members, epoch, bootstrap_group)
     };
 
@@ -19114,7 +19173,8 @@ async fn add_treekem_named_group_member(
     drop(guard);
 
     let welcome_ref = stage_treekem_welcome(&state, &event_group_id, &agent_hex, out.welcome).await;
-    let event = NamedGroupMetadataEvent::MemberAdded {
+    let mut event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: event_group_id,
         revision,
         actor: actor_hex,
@@ -19141,6 +19201,8 @@ async fn add_treekem_named_group_member(
         owner_mandate,
         commit: Some(commit),
     };
+    // #1023: the sealed roster's other certificates ride the seat event.
+    seat_cert_fetch::attach_roster_certificates_to_member_added(&state, &next, &mut event);
     cache_treekem_member_key_package(
         &state,
         join_result_key(&id, &agent_hex),
@@ -34340,6 +34402,18 @@ pub(in crate::server) async fn join_result_payload_with_roster_certificates(
     member_agent_id: &str,
     mut response: JoinResultMessage,
 ) -> serde_json::Result<Vec<u8>> {
+    // #1023: the staged seat event carries its own copy of the sidecar
+    // below. The result-level sidecar supersedes it here, so the result's
+    // transport and size stay exactly what #970 made them.
+    if let JoinResultMessage::Result { event, .. } = &mut response {
+        if let NamedGroupMetadataEvent::MemberAdded {
+            roster_certificates_b64,
+            ..
+        } = event.as_mut()
+        {
+            roster_certificates_b64.clear();
+        }
+    }
     let bare = serde_json::to_vec(&response)?;
     let mut sidecar =
         seat_cert_fetch::roster_certificate_sidecar(state, group_id, member_agent_id).await;
@@ -42256,6 +42330,7 @@ pub(in crate::server) mod tests {
         seated.state_hash = commit_add.state_hash.clone();
         seated.state_revision = commit_add.revision;
         let member_added = NamedGroupMetadataEvent::MemberAdded {
+            roster_certificates_b64: Vec::new(),
             group_id: parent.stable_group_id().to_string(),
             revision: revision_add,
             actor: admin_hex.clone(),
@@ -42423,6 +42498,7 @@ pub(in crate::server) mod tests {
         );
         let commit_add = sign_metadata_terminality_commit(&parent, &seated, &state, 2_000);
         let member_added = NamedGroupMetadataEvent::MemberAdded {
+            roster_certificates_b64: Vec::new(),
             group_id: parent.stable_group_id().to_string(),
             revision: seated.roster_revision,
             actor: admin_hex.clone(),
@@ -42489,6 +42565,7 @@ pub(in crate::server) mod tests {
         );
         let commit_add2 = sign_metadata_terminality_commit(&seated_now, &seated2, &state, 3_000);
         let member_added2 = NamedGroupMetadataEvent::MemberAdded {
+            roster_certificates_b64: Vec::new(),
             group_id: parent.stable_group_id().to_string(),
             revision: seated2.roster_revision,
             actor: admin_hex.clone(),
@@ -42822,6 +42899,7 @@ pub(in crate::server) mod tests {
         );
         let commit_add = sign_metadata_terminality_commit(&parent, &seated, &state, 2_000);
         let member_added = NamedGroupMetadataEvent::MemberAdded {
+            roster_certificates_b64: Vec::new(),
             group_id: parent.stable_group_id().to_string(),
             revision: seated.roster_revision,
             actor: admin_hex.clone(),
@@ -47628,6 +47706,7 @@ pub(in crate::server) mod tests {
         let group_id = info.stable_group_id().to_string();
 
         let member_added_by_admin = NamedGroupMetadataEvent::MemberAdded {
+            roster_certificates_b64: Vec::new(),
             group_id: group_id.clone(),
             revision: 2,
             actor: admin_hex.clone(),
@@ -47756,6 +47835,7 @@ pub(in crate::server) mod tests {
         info.recompute_state_hash();
         let group_id = info.stable_group_id().to_string();
         let event = NamedGroupMetadataEvent::MemberAdded {
+            roster_certificates_b64: Vec::new(),
             group_id: group_id.clone(),
             revision: 3,
             actor: creator_hex.clone(),
@@ -48134,6 +48214,7 @@ pub(in crate::server) mod tests {
         info.roster_revision = 1;
         info.state_hash = "rev1".to_string();
         let event = NamedGroupMetadataEvent::MemberAdded {
+            roster_certificates_b64: Vec::new(),
             group_id: info.stable_group_id().to_string(),
             revision: 3,
             actor: "11".repeat(32),
@@ -48200,6 +48281,7 @@ pub(in crate::server) mod tests {
 
         let result = JoinResultMessage::Result {
             event: Box::new(NamedGroupMetadataEvent::MemberAdded {
+                roster_certificates_b64: Vec::new(),
                 group_id: "aa".repeat(32),
                 revision: 1,
                 actor: "11".repeat(32),
@@ -49055,6 +49137,7 @@ pub(in crate::server) mod tests {
         assert_eq!(welcome_id, hex::encode(blake3::hash(bytes).as_bytes()));
 
         let event = NamedGroupMetadataEvent::MemberAdded {
+            roster_certificates_b64: Vec::new(),
             group_id: "aa".to_string(),
             revision: 1,
             actor: "11".to_string(),
@@ -49251,6 +49334,7 @@ pub(in crate::server) mod tests {
     #[test]
     fn phase3_metadata_classifier_allows_completed_membership_events() {
         let member_added = NamedGroupMetadataEvent::MemberAdded {
+            roster_certificates_b64: Vec::new(),
             group_id: "aa".to_string(),
             revision: 1,
             actor: "11".to_string(),
@@ -49312,6 +49396,7 @@ pub(in crate::server) mod tests {
         }
 
         let add_epoch_2 = NamedGroupMetadataEvent::MemberAdded {
+            roster_certificates_b64: Vec::new(),
             group_id: "aa".to_string(),
             revision: 2,
             actor: "11".to_string(),
@@ -49381,6 +49466,7 @@ pub(in crate::server) mod tests {
             signature: "sig".to_string(),
         };
         let event = NamedGroupMetadataEvent::MemberAdded {
+            roster_certificates_b64: Vec::new(),
             group_id: "aa".to_string(),
             revision: 10,
             actor: "11".to_string(),

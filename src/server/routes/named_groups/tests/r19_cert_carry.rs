@@ -101,6 +101,7 @@ fn staged_member_added(
     member_cert: &x0x::identity::AgentCertificate,
 ) -> NamedGroupMetadataEvent {
     NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: group_key.to_string(),
         revision: 2,
         actor: actor_hex.to_string(),
@@ -525,5 +526,478 @@ async fn sidecar_never_pushes_an_inline_join_result_over_the_dm_limit() -> Resul
         "the authority's own certificate is carried first"
     );
     state.agent.shutdown().await;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// #1023 (R19 Home blocker): the seat event carries the roster certificates
+// ---------------------------------------------------------------------------
+
+/// A socket-free daemon state that holds the owner USER key, as every Home
+/// device does in R19. Its identity certificate is therefore issued by
+/// the owner (the builder issues it at startup).
+async fn owner_device_state(
+    seed: &[u8; 32],
+) -> Result<(
+    Arc<AppState>,
+    tempfile::TempDir,
+    x0x::identity::AgentCertificate,
+)> {
+    let dir = tempfile::tempdir()?;
+    let data_dir = dir.path();
+    let agent = Arc::new(
+        Agent::builder()
+            .with_machine_key(data_dir.join("machine.key"))
+            .with_agent_key(x0x::identity::AgentKeypair::generate()?)
+            .with_agent_cert_path(data_dir.join("agent.cert"))
+            .with_user_key(x0x::identity::UserKeypair::from_seed(seed)?)
+            .with_peer_cache_disabled()
+            .with_contact_store_path(data_dir.join("contacts.json"))
+            .build()
+            .await?,
+    );
+    let cert = agent
+        .identity()
+        .agent_certificate()
+        .cloned()
+        .expect("an owner-key device holds an owner-issued certificate");
+    let state = secure_endpoint_test_state_at(data_dir, agent).await?;
+    Ok((state, dir, cert))
+}
+
+/// How [`creator_offline_scenario`] promotes the admin.
+#[derive(Clone, Copy)]
+enum Promotion {
+    /// Set the role on the admin's local record.
+    LocalRecord,
+    /// Apply the creator's real signed role-update commit, published by
+    /// the production `update_member_role` route, through the normal
+    /// receive path.
+    SignedCommit,
+}
+
+/// The R19 Home cast, from the moment the creator went offline.
+struct CreatorOfflineScenario {
+    /// Creator and original owner device ("nyc"). Already shut down.
+    creator_hex: String,
+    creator_cert: x0x::identity::AgentCertificate,
+    /// The member that is later promoted and seals the next join
+    /// ("singapore"), with the seat event it was seated by applied.
+    admin: Arc<AppState>,
+    _admin_dir: tempfile::TempDir,
+    group_id: String,
+    owner: x0x::identity::UserKeypair,
+    /// The seat event exactly as the creator published it.
+    seat_event: NamedGroupMetadataEvent,
+    /// The creator's JoinResult for the admin, served by the production
+    /// builder before the creator went offline (never delivered).
+    served_join_result: Vec<u8>,
+}
+
+/// Build the R19 shape through production code:
+/// 1. The creator (owner device, owner key) creates an owner-certified
+///    group whose creator seat commits to its own certificate, and seals
+///    the base revision.
+/// 2. The admin-to-be holds the group stub a joiner gets from its invite:
+///    the base roster projection, so the creator's seat is DIGEST-ONLY.
+///    It never cached the creator's announce (the creator announced
+///    before it existed).
+/// 3. The creator admits it through the real add-member route and the
+///    published seat event is captured. The creator then goes OFFLINE.
+/// 4. The admin applies that seat event through the gossip/direct receive
+///    path. It is never handed a JoinResult: in R19 the seat event won
+///    the race, the joiner stopped polling, and #970's JoinResult sidecar
+///    never arrived.
+/// 5. The admin is promoted, per `promotion`.
+async fn creator_offline_scenario(promotion: Promotion) -> Result<CreatorOfflineScenario> {
+    let seed: [u8; 32] = rand::random();
+    let owner = x0x::identity::UserKeypair::from_seed(&seed)?;
+    let (creator, _creator_dir, creator_cert) = owner_device_state(&seed).await?;
+    let (admin, admin_dir, admin_cert) = owner_device_state(&seed).await?;
+    let creator_hex = hex::encode(creator.agent.agent_id().as_bytes());
+    let admin_hex = hex::encode(admin.agent.agent_id().as_bytes());
+    let group_id = hex::encode(rand::random::<[u8; 32]>());
+
+    // (1) The creator's owner-certified group, creator seat byte-bearing.
+    let mut base = x0x::groups::GroupInfo::with_policy(
+        "r1023-home".to_string(),
+        String::new(),
+        creator.agent.agent_id(),
+        group_id.clone(),
+        x0x::groups::GroupPolicy {
+            discoverability: x0x::groups::GroupDiscoverability::Hidden,
+            admission: x0x::groups::GroupAdmission::OwnerCertified(owner.user_id()),
+            confidentiality: x0x::groups::GroupConfidentiality::MlsEncrypted,
+            read_access: x0x::groups::GroupReadAccess::MembersOnly,
+            write_access: x0x::groups::GroupWriteAccess::MembersOnly,
+        },
+    );
+    assert_eq!(base.secure_plane, x0x::mls::SecureGroupPlane::Gss);
+    base.set_member_certificate(&creator_hex, creator_cert.clone())
+        .expect("the creator's certificate binds its own seat");
+    seal_commit_owner_certified(
+        &creator,
+        &mut base,
+        creator.agent.identity().agent_keypair(),
+        now_millis_u64(),
+    )
+    .await?;
+    creator
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), base.clone());
+
+    // (2) The admin-to-be's stub: the creator's seat is digest-only.
+    let mut stub = base.clone();
+    stub.members_v2
+        .get_mut(&creator_hex)
+        .expect("creator seat")
+        .certificate = None;
+    admin
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), stub);
+    let creator_digest = seat_digest(&creator_cert);
+    assert!(
+        admin
+            .agent
+            .announce_blob_cache
+            .find_by_cert_digest(&digest_arr(&creator_digest))
+            .await
+            .is_none(),
+        "the admin never cached the creator's announce"
+    );
+
+    // (3) The creator admits the admin-to-be through the production route.
+    install_discovery_cert(&creator, &admin.agent, &admin_cert).await;
+    creator
+        .named_group_test_recorders
+        .publish_bytes
+        .lock()
+        .expect("publish hook")
+        .clear();
+    let response = add_named_group_member(
+        State(Arc::clone(&creator)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+        Json(AddNamedGroupMemberRequest {
+            agent_id: admin_hex.clone(),
+            display_name: None,
+            treekem_key_package_b64: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK, "the creator admits");
+    let seat_event = creator
+        .named_group_test_recorders
+        .publish_bytes
+        .lock()
+        .expect("publish hook")
+        .iter()
+        .filter_map(|(_topic, bytes)| serde_json::from_slice::<NamedGroupMetadataEvent>(bytes).ok())
+        .find(|event| {
+            matches!(event, NamedGroupMetadataEvent::MemberAdded { agent_id, .. }
+                if *agent_id == admin_hex)
+        })
+        .expect("the creator published the admin's seat event");
+    let served_join_result = join_result_payload_with_roster_certificates(
+        &creator,
+        &group_id,
+        &admin_hex,
+        JoinResultMessage::Result {
+            event: Box::new(seat_event.clone()),
+            chain: Vec::new(),
+            head_attestation: None,
+            roster_certificates_b64: Vec::new(),
+        },
+    )
+    .await?;
+    // (5a) With `Promotion::SignedCommit` the creator promotes the admin
+    // through the production role route BEFORE going offline, and the
+    // published signed role-update commit is captured for delivery.
+    let role_event = match promotion {
+        Promotion::LocalRecord => None,
+        Promotion::SignedCommit => {
+            let response = update_member_role(
+                State(Arc::clone(&creator)),
+                axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                    durable: true,
+                }),
+                Path((group_id.clone(), admin_hex.clone())),
+                Json(UpdateMemberRoleRequest {
+                    role: "admin".to_string(),
+                }),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::OK, "the creator promotes");
+            let event = creator
+                .named_group_test_recorders
+                .publish_bytes
+                .lock()
+                .expect("publish hook")
+                .iter()
+                .filter_map(|(_topic, bytes)| {
+                    serde_json::from_slice::<NamedGroupMetadataEvent>(bytes).ok()
+                })
+                .find(|event| {
+                    matches!(event, NamedGroupMetadataEvent::MemberRoleUpdated {
+                        agent_id, role: x0x::groups::GroupRole::Admin, commit: Some(_), ..
+                    } if *agent_id == admin_hex)
+                })
+                .expect("the creator published a signed role-update commit");
+            Some(event)
+        }
+    };
+    let creator_id = creator.agent.agent_id();
+    creator.agent.shutdown().await;
+    drop(creator);
+
+    // (4) The admin is seated by the seat event alone.
+    let applied =
+        apply_named_group_metadata_event(&admin, seat_event.clone(), creator_id, true, None).await;
+    assert!(applied.accepted, "the seat event seats the admin");
+
+    // (5b) Promotion.
+    match role_event {
+        None => {
+            let mut groups = admin.named_groups.write().await;
+            let info = groups.get_mut(&group_id).expect("admin's group");
+            assert!(info.has_active_member(&admin_hex), "the admin is seated");
+            info.members_v2
+                .get_mut(&admin_hex)
+                .expect("admin seat")
+                .role = x0x::groups::GroupRole::Admin;
+        }
+        Some(event) => {
+            let applied =
+                apply_named_group_metadata_event(&admin, event, creator_id, true, None).await;
+            assert!(
+                applied.accepted,
+                "the admin applies the creator's signed role-update commit"
+            );
+        }
+    }
+    {
+        let groups = admin.named_groups.read().await;
+        let info = groups.get(&group_id).expect("admin's group");
+        assert_eq!(
+            info.members_v2.get(&admin_hex).map(|seat| seat.role),
+            Some(x0x::groups::GroupRole::Admin),
+            "the admin is promoted"
+        );
+    }
+    Ok(CreatorOfflineScenario {
+        creator_hex,
+        creator_cert,
+        admin,
+        _admin_dir: admin_dir,
+        group_id,
+        owner,
+        seat_event,
+        served_join_result,
+    })
+}
+
+/// The promoted admin's seal of a new joiner D, after first adding each
+/// `extra_digest_only` seat (agent hex, committed digest) with no bytes.
+async fn promoted_admin_seals_new_joiner(
+    s: &CreatorOfflineScenario,
+    extra_digest_only: &[(String, String)],
+) -> std::result::Result<x0x::groups::GroupStateCommit, x0x::groups::state_commit::ApplyError> {
+    let d_kp = x0x::identity::AgentKeypair::generate().expect("joiner key");
+    let d_hex = hex::encode(d_kp.agent_id().as_bytes());
+    let d_cert = x0x::identity::AgentCertificate::issue(&s.owner, &d_kp).expect("joiner cert");
+    let mut next = s
+        .admin
+        .named_groups
+        .read()
+        .await
+        .get(&s.group_id)
+        .expect("admin's group")
+        .clone();
+    for (agent_hex, digest) in extra_digest_only {
+        next.add_member(
+            agent_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            None,
+            None,
+        );
+        next.members_v2
+            .get_mut(agent_hex)
+            .expect("extra seat")
+            .certificate_digest = Some(digest.clone());
+    }
+    next.add_member(d_hex.clone(), x0x::groups::GroupRole::Member, None, None);
+    next.set_member_certificate(&d_hex, d_cert)
+        .expect("D's certificate binds its fresh seat");
+    seal_commit_owner_certified(
+        &s.admin,
+        &mut next,
+        s.admin.agent.identity().agent_keypair(),
+        now_millis_u64(),
+    )
+    .await
+}
+
+/// THE R19 CASE (#1023). The creator and original owner device is
+/// offline; the promoted admin, which was seated by the seat event and
+/// never received a JoinResult, must seal the next joiner.
+///
+/// Before #1023 only the JoinResult carried certificates (#970). The seat
+/// event carried just the joiner's own, so the admin kept the creator's
+/// seat digest-only and every seal refused with
+/// `OwnerCertMemberPending [creator]` for as long as the creator was
+/// offline: the 20 refusals in the R19 Singapore log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn promoted_admin_seals_join_while_creator_offline() -> Result<()> {
+    let s = creator_offline_scenario(Promotion::LocalRecord).await?;
+    let commit = promoted_admin_seals_new_joiner(&s, &[])
+        .await
+        .unwrap_or_else(|err| {
+            panic!("the promoted admin must seal while the creator is offline: {err}")
+        });
+    assert!(!commit.roster_root.is_empty());
+
+    // The creator's bytes reached the admin through the seat event: they
+    // are on its seat, they are not in its announce cache, and the event
+    // carried exactly the creator's certificate.
+    assert!(seat_has_bytes(&s.admin, &s.group_id, &s.creator_hex).await);
+    assert!(s
+        .admin
+        .agent
+        .announce_blob_cache
+        .find_by_cert_digest(&digest_arr(&seat_digest(&s.creator_cert)))
+        .await
+        .is_none());
+    let NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64,
+        ..
+    } = &s.seat_event
+    else {
+        panic!("seat event is a MemberAdded");
+    };
+    assert_eq!(
+        roster_certificates_b64,
+        &vec![cert_b64(&s.creator_cert)],
+        "the seat event carries every other certified seat (here the creator), not the joiner's own"
+    );
+    s.admin.agent.shutdown().await;
+    Ok(())
+}
+
+/// The R19 case with a REAL promotion: the creator promotes the admin
+/// through the production role route before going offline, and the admin
+/// applies that signed `MemberRoleUpdated` commit through the normal
+/// receive path (no local role edit). The promoted admin then seals the
+/// next joiner. Fails without #1023 exactly like
+/// `promoted_admin_seals_join_while_creator_offline`: the role commit
+/// carries no certificates, so the creator's seat stays digest-only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_promoted_by_signed_commit_seals_join_while_creator_offline() -> Result<()> {
+    let s = creator_offline_scenario(Promotion::SignedCommit).await?;
+    let commit = promoted_admin_seals_new_joiner(&s, &[])
+        .await
+        .unwrap_or_else(|err| {
+            panic!(
+                "the admin promoted by the creator's signed commit must seal while the creator is offline: {err}"
+            )
+        });
+    assert!(!commit.roster_root.is_empty());
+    assert!(seat_has_bytes(&s.admin, &s.group_id, &s.creator_hex).await);
+    s.admin.agent.shutdown().await;
+    Ok(())
+}
+
+/// The carry does not weaken the gate. A seat whose certificate was never
+/// carried anywhere (no seat event, no JoinResult, no announce) still
+/// blocks the promoted admin's seal with `OwnerCertMemberPending`, and it
+/// is the ONLY member named: the creator, whose certificate was carried,
+/// is resolved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn uncarried_certificate_still_blocks_with_owner_cert_member_pending() -> Result<()> {
+    let s = creator_offline_scenario(Promotion::LocalRecord).await?;
+    let x_kp = x0x::identity::AgentKeypair::generate().expect("x key");
+    let x_hex = hex::encode(x_kp.agent_id().as_bytes());
+    let x_cert = x0x::identity::AgentCertificate::issue(&s.owner, &x_kp).expect("x cert");
+    let err = promoted_admin_seals_new_joiner(&s, &[(x_hex.clone(), seat_digest(&x_cert))])
+        .await
+        .expect_err("a never-carried certificate must keep blocking the seal");
+    match &err {
+        x0x::groups::state_commit::ApplyError::OwnerCertMemberPending { members, .. } => {
+            assert_eq!(members, &vec![x_hex.clone()], "{err}");
+        }
+        other => panic!("expected OwnerCertMemberPending, got {other}"),
+    }
+    s.admin.agent.shutdown().await;
+    Ok(())
+}
+
+/// Wire compatibility of the new `MemberAdded.roster_certificates_b64`:
+/// - a legacy event (no key) decodes, with an empty sidecar;
+/// - an event with no sidecar serializes WITHOUT the key, byte-identical
+///   to the legacy wire;
+/// - the event enum ignores keys it does not know, which is how a legacy
+///   receiver (the same derive, without this field) reads a new event;
+/// - the JoinResult keeps #970's shape: its event copy drops the sidecar
+///   and the result-level sidecar still carries the certificates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn member_added_certificate_sidecar_is_wire_compatible() -> Result<()> {
+    let s = creator_offline_scenario(Promotion::LocalRecord).await?;
+    let mut json = serde_json::to_value(&s.seat_event)?;
+    let object = json.as_object_mut().expect("event object");
+    assert!(object.contains_key("roster_certificates_b64"));
+
+    object.remove("roster_certificates_b64");
+    let legacy: NamedGroupMetadataEvent = serde_json::from_value(json)?;
+    let mut expected = s.seat_event.clone();
+    if let NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64,
+        ..
+    } = &mut expected
+    {
+        roster_certificates_b64.clear();
+    }
+    assert_eq!(legacy, expected, "a legacy event decodes with no sidecar");
+    assert!(
+        !String::from_utf8(serde_json::to_vec(&legacy)?)?.contains("roster_certificates_b64"),
+        "no sidecar means no key on the wire"
+    );
+
+    let mut future = serde_json::to_value(&s.seat_event)?;
+    future
+        .as_object_mut()
+        .expect("event object")
+        .insert("x0x_unknown_future_key".to_string(), serde_json::json!([1]));
+    let decoded: NamedGroupMetadataEvent = serde_json::from_value(future)?;
+    assert_eq!(
+        decoded, s.seat_event,
+        "unknown keys are ignored, not refused"
+    );
+
+    let JoinResultMessage::Result {
+        event,
+        roster_certificates_b64,
+        ..
+    } = serde_json::from_slice::<JoinResultMessage>(&s.served_join_result)?
+    else {
+        panic!("served payload is a Result");
+    };
+    let NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: event_sidecar,
+        ..
+    } = event.as_ref()
+    else {
+        panic!("JoinResult event is a MemberAdded");
+    };
+    assert!(
+        event_sidecar.is_empty(),
+        "the JoinResult's event copy drops the sidecar"
+    );
+    assert_eq!(roster_certificates_b64, vec![cert_b64(&s.creator_cert)]);
+    s.admin.agent.shutdown().await;
     Ok(())
 }

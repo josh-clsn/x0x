@@ -903,6 +903,7 @@ async fn receiver_rejects_member_added_without_committed_certificate() -> Result
     let outsider = AgentKeypair::generate()?;
     let outsider_hex = hex::encode(outsider.agent_id().as_bytes());
     let event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: group_id.clone(),
         revision: 2,
         actor: owner_hex.clone(),
@@ -979,6 +980,7 @@ async fn receiver_rejects_member_added_for_revoked_target() -> Result<()> {
         .verify_and_insert(record, Some(&cert))?;
     use base64::Engine as _;
     let event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: group_id.clone(),
         revision: 2,
         actor: owner_hex,
