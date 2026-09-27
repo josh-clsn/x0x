@@ -2,7 +2,8 @@
 
 <!-- File name: docs/adr/0079-grant-carried-owner-and-machine-names.md -->
 
-- **Status:** Proposed
+- **Status:** Accepted
+- **Accepted:** 2026-09-27 by David Irvine (grant-only design chosen 2026-09-27 (X0U3 announcement rejected); status change applied by Claude at his instruction)
 - **Date:** 2026-09-27
 - **Decision owners:** David Irvine (direction decided 2026-09-27, simplified to
   grant-only the same day; only David may accept)
