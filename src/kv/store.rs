@@ -822,6 +822,43 @@ where
     Ok(T::deserialize(deserializer).unwrap_or_default())
 }
 
+/// The exact serde shape of [`KvStore`] as persisted inside **v1** snapshot
+/// files (`X0XKVS1\0`), i.e. by every release up to and including v0.45.0.
+///
+/// FROZEN — never edit. Field order and serde attributes mirror
+/// `git show v0.45.0:src/kv/store.rs` byte-for-byte in encoding terms. A v1
+/// snapshot body is `bincode(store) || u64 seq_counter`, so the store is NOT
+/// at stream end: any field appended to [`KvStore`] after v0.45.0 (e.g.
+/// `last_history_endorser`) would consume the leading bytes of `seq_counter`
+/// and fail every v0.45.0 file. v1 files are therefore decoded through this
+/// frozen shape and converted with [`KvStore::from_v1_snapshot_shape`];
+/// fields added since v0.45.0 take their defaults.
+#[derive(Deserialize)]
+pub(crate) struct KvStoreV1SnapshotShape {
+    id: KvStoreId,
+    keys: OrSet<String>,
+    entries: HashMap<String, KvEntry>,
+    name: LwwRegister<String>,
+    #[serde(default = "default_policy")]
+    policy: AccessPolicy,
+    #[serde(default)]
+    owner: Option<AgentId>,
+    #[serde(default)]
+    allowed_writers: HashSet<AgentId>,
+    #[serde(default)]
+    version: u64,
+    #[serde(default, deserialize_with = "de_tolerant")]
+    latest_checkpoint: Option<OwnerCheckpoint>,
+    #[serde(default, deserialize_with = "de_tolerant")]
+    highest_checkpoint_seq: u64,
+    #[serde(default, deserialize_with = "de_tolerant")]
+    anchor_channel: AnchorChannel,
+    #[serde(default, deserialize_with = "de_tolerant")]
+    policy_version: u64,
+    #[serde(default, deserialize_with = "de_tolerant")]
+    ownership_conflict: Option<(AgentId, AgentId)>,
+}
+
 fn default_policy() -> AccessPolicy {
     AccessPolicy::Signed
 }
@@ -1191,6 +1228,46 @@ impl KvStore {
     /// version-derived floor, is what makes this bound exact.)
     pub(crate) fn restore_seq_counter(&self, floor: u64) {
         self.seq_counter.fetch_max(floor, Ordering::Relaxed);
+    }
+
+    /// Convert a store decoded through the frozen v1 (≤ v0.45.0) snapshot
+    /// shape into the current in-memory form. Every field added after
+    /// v0.45.0 takes its default; the struct literal is exhaustive so a new
+    /// `KvStore` field cannot be added without deciding its v1 default here.
+    pub(crate) fn from_v1_snapshot_shape(v1: KvStoreV1SnapshotShape) -> Self {
+        let KvStoreV1SnapshotShape {
+            id,
+            keys,
+            entries,
+            name,
+            policy,
+            owner,
+            allowed_writers,
+            version,
+            latest_checkpoint,
+            highest_checkpoint_seq,
+            anchor_channel,
+            policy_version,
+            ownership_conflict,
+        } = v1;
+        Self {
+            id,
+            keys,
+            entries,
+            name,
+            policy,
+            owner,
+            allowed_writers,
+            version,
+            latest_checkpoint,
+            highest_checkpoint_seq,
+            anchor_channel,
+            policy_version,
+            ownership_conflict,
+            last_history_endorser: None,
+            seq_counter: default_seq_counter(),
+            secure: None,
+        }
     }
 
     /// Get the current version.
@@ -3065,6 +3142,12 @@ impl KvStore {
     #[must_use]
     pub fn last_history_endorser(&self) -> Option<&AgentId> {
         self.last_history_endorser.as_ref()
+    }
+
+    /// Test seam: set the persisted endorser directly (snapshot-format tests).
+    #[cfg(test)]
+    pub(crate) fn set_last_history_endorser_for_test(&mut self, endorser: Option<AgentId>) {
+        self.last_history_endorser = endorser;
     }
 
     /// Generate a delta containing all state (for initial sync).

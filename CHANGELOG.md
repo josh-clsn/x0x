@@ -108,6 +108,17 @@ All notable changes to this project will be documented in this file.
   `docs/diagnostics.md`.
 ### Fixed
 
+- **KV store snapshots written by v0.45.0 load again (release blocker).** A
+  field added to `KvStore` after v0.45.0 sat between the store and the
+  trailing sequence counter in the snapshot file, so every v0.45.0 snapshot
+  under `<data_dir>/kv-stores/` failed with "unexpected end of file" and the
+  store was skipped at startup. v1 (`X0XKVS1`) snapshots are now decoded with
+  the exact v0.45.0 layout; new snapshots are written as v2 (`X0XKVS2`, with
+  the counter first). **Downgrade:** v0.45.0 does not read v2 snapshots. It
+  logs "unrecognized kv snapshot format (missing v1 magic)… refusing to start
+  with amnesia", skips that store (the manifest entry stays), and leaves the
+  file untouched; re-upgrading restores it. See
+  `docs/design/persisted-format-compat.md`.
 - **Group task-list deltas are now sealed with the group key (#895, security).**
   A group-scoped task list (`x0x.group.<gid>.symphony.<lid>`) used to publish
   its deltas and its `/state-sync` full-state serve as plaintext on a topic
