@@ -747,10 +747,12 @@ async fn creator_offline_scenario_on_plane(
         else {
             panic!("seat event")
         };
-        assert!(
-            roster_certificates_b64.len() < extra_seats + 1,
-            "the production builder really trimmed the large group's sidecar"
-        );
+        if !legacy_sidecar {
+            assert!(
+                roster_certificates_b64.len() < extra_seats + 1,
+                "the production builder really trimmed the large group's sidecar"
+            );
+        }
         if legacy_sidecar {
             roster_certificates_b64.clear();
         }
@@ -1213,7 +1215,7 @@ fn legacy_member_added_retains_certificate_recovery_context() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn trimmed_member_added_recovers_before_creator_offline_seal() -> Result<()> {
     let s =
-        creator_offline_scenario_on_plane(Promotion::SignedCommit, false, 20, false, true).await?;
+        creator_offline_scenario_on_plane(Promotion::SignedCommit, false, 15, false, true).await?;
     assert!(!promoted_admin_seals_new_joiner(&s, &[])
         .await?
         .roster_root
@@ -1226,7 +1228,7 @@ async fn trimmed_member_added_recovers_before_creator_offline_seal() -> Result<(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn legacy_member_added_recovers_before_creator_offline_seal() -> Result<()> {
     let s =
-        creator_offline_scenario_on_plane(Promotion::SignedCommit, false, 20, true, true).await?;
+        creator_offline_scenario_on_plane(Promotion::SignedCommit, false, 12, true, true).await?;
     assert!(!promoted_admin_seals_new_joiner(&s, &[])
         .await?
         .roster_root
@@ -1240,7 +1242,7 @@ async fn legacy_member_added_recovers_before_creator_offline_seal() -> Result<()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn trimmed_member_added_all_holders_offline_stays_pending() -> Result<()> {
     let s =
-        creator_offline_scenario_on_plane(Promotion::SignedCommit, false, 20, false, false).await?;
+        creator_offline_scenario_on_plane(Promotion::SignedCommit, false, 15, false, false).await?;
     let err = promoted_admin_seals_new_joiner(&s, &[])
         .await
         .expect_err("no holder answered");

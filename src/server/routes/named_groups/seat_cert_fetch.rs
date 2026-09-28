@@ -45,9 +45,11 @@ pub(in crate::server) const CERT_FETCH_REQUESTED_TTL_MS: u64 = 60_000;
 pub(in crate::server) const CERT_FETCH_ANSWER_INTERVAL_MS: u64 = 30_000;
 /// Responder: how long a failed roster/cache lookup is negatively cached.
 pub(in crate::server) const CERT_FETCH_MISS_TTL_MS: u64 = 60_000;
-/// Absolute cap on the responder suppression map and the deadline-stamp
-/// map (both are keyed by peer-supplied values).
+/// Absolute cap on request, responder suppression and deadline-stamp maps
+/// (all are keyed by peer-supplied values).
 pub(in crate::server) const CERT_FETCH_CACHE_MAX_ENTRIES: usize = 4096;
+/// Bound the recovery traffic caused by one accepted MemberAdded.
+const CERT_FETCH_PER_APPLY_MAX: usize = 16;
 /// How long a certificate-unobtainable seal refusal stays RETRYABLE
 /// before the typed (terminal) refusal is staged.
 pub(in crate::server) const CERT_EVIDENCE_DEADLINE_MS: u64 = 10 * 60_000;
@@ -132,10 +134,10 @@ pub(in crate::server) fn publish_group_cert_fetch(
         return;
     };
     // Rate-limited by the in-flight dedup above (once per digest per TTL).
-    tracing::info!(
+    tracing::debug!(
         group_id = %LogHexId::group(stable_group_id),
         cert_digest = %LogHexId::new("digest", digest_hex),
-        "#946: group-scoped certificate fetch request sent"
+        "#946: group-scoped certificate fetch request scheduled"
     );
     let mut payload = Vec::with_capacity(GROUP_CERT_FETCH_DOMAIN.len() + json.len());
     payload.extend_from_slice(GROUP_CERT_FETCH_DOMAIN);
@@ -143,8 +145,13 @@ pub(in crate::server) fn publish_group_cert_fetch(
     let topic = metadata_topic.to_string();
     let pubsub = state.agent.pubsub();
     let digest_hex = digest_hex.to_string();
+    // Spread simultaneous recovery across members and digests without
+    // sleeping in the apply path or holding any membership/cache guard.
+    let delay =
+        std::time::Duration::from_millis(rand::Rng::gen_range(&mut rand::thread_rng(), 25..=250));
     tokio::spawn(async move {
         let Some(pubsub) = pubsub else { return };
+        tokio::time::sleep(delay).await;
         if let Err(e) = pubsub.publish(topic, bytes::Bytes::from(payload)).await {
             tracing::debug!(
                 cert_digest = %digest_hex,
@@ -164,8 +171,21 @@ fn reserve_cert_fetch(
 ) -> bool {
     requested
         .retain(|_, at| (now.duration_since(*at).as_millis() as u64) < CERT_FETCH_REQUESTED_TTL_MS);
-    if requested.contains_key(digest_hex) || requested.len() >= CERT_FETCH_CACHE_MAX_ENTRIES {
+    if requested.contains_key(digest_hex) {
+        tracing::debug!(cert_digest = %LogHexId::new("digest", digest_hex),
+            "#946: duplicate certificate fetch request dropped");
         return false;
+    }
+    if requested.len() >= CERT_FETCH_CACHE_MAX_ENTRIES {
+        if let Some(oldest) = requested
+            .iter()
+            .min_by_key(|(_, at)| **at)
+            .map(|(key, _)| key.clone())
+        {
+            requested.remove(&oldest);
+            tracing::debug!(cert_digest = %LogHexId::new("digest", &oldest),
+                "#946: oldest certificate fetch tracking entry evicted at capacity");
+        }
     }
     requested.insert(digest_hex.to_string(), now);
     true
@@ -803,7 +823,7 @@ pub(in crate::server) fn member_added_sidecar(
 fn missing_roster_certificate_digests(
     info: &crate::groups::GroupInfo,
     local_hex: &str,
-    _event: &MemberAddedCertificates,
+    event: &MemberAddedCertificates,
 ) -> Vec<String> {
     if info.withdrawn
         || info.policy.admission.owner_certified_user_id().is_none()
@@ -811,11 +831,42 @@ fn missing_roster_certificate_digests(
     {
         return Vec::new();
     }
-    info.active_members()
+    // MemberAdded references its roster through the signed root, not an
+    // explicit digest list. A later apply may have won the lock meanwhile:
+    // never use that later roster to widen this event's recovery scope.
+    let Some(root) = event.roster_root.as_deref() else {
+        return Vec::new();
+    };
+    if crate::groups::state_commit::compute_roster_root(&info.members_v2) != root {
+        tracing::debug!("#1023: certificate recovery skipped after roster changed");
+        return Vec::new();
+    }
+    // The joiner's own certificate travels separately in certificate_b64.
+    let sidecar_digests = info
+        .active_members()
+        .filter(|seat| {
+            seat.agent_id != event.seated_member
+                && (seat.certificate_digest.is_some() || seat.certificate.is_some())
+        })
+        .count();
+    if local_hex != event.seated_member && event.certificates.len() >= sidecar_digests {
+        return Vec::new();
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut digests: Vec<_> = info
+        .active_members()
         .filter(|seat| seat.certificate.is_none())
         .filter_map(|seat| seat.certificate_digest.clone())
-        .take(CERT_FETCH_CACHE_MAX_ENTRIES)
-        .collect()
+        .filter(|digest| seen.insert(digest.clone()))
+        .take(CERT_FETCH_PER_APPLY_MAX + 1)
+        .collect();
+    if digests.len() > CERT_FETCH_PER_APPLY_MAX {
+        tracing::debug!(group_id = %LogHexId::group(info.stable_group_id()),
+            limit = CERT_FETCH_PER_APPLY_MAX,
+            "#1023: excess per-apply certificate fetch requests dropped; seal retry can recover");
+        digests.truncate(CERT_FETCH_PER_APPLY_MAX);
+    }
+    digests
 }
 
 /// Recover certificates omitted by a trimmed or legacy seat event while
