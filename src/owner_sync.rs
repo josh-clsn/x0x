@@ -2226,6 +2226,22 @@ impl ReannounceLimiter {
     }
 }
 
+/// The SyncV1 acceptor's own admission check, run when a session starts,
+/// after the shared accept loop has handed the stream over. The accept
+/// loop's check and this one are separated by the handoff: a machine
+/// revocation (ADR-0018) that lands in between must still stop the session
+/// (ADR 0084, revocation race). The peer's enrollment must verify and be
+/// current under `owner`, and the peer machine must not be revoked.
+async fn inbound_session_admissible(
+    store: &OwnerSyncStore,
+    revocation_set: &tokio::sync::RwLock<crate::revocation::RevocationSet>,
+    peer: &MachineId,
+    owner: &UserId,
+) -> bool {
+    // Cheap-first: the device-map miss costs no signature verification.
+    store.is_enrolled(peer, owner).await && !revocation_set.read().await.is_machine_revoked(peer)
+}
+
 /// Daemon-resident Tier-1 sync service (the `ForwardService` pattern for
 /// `SyncV1`): owns the single registered acceptor for
 /// [`crate::streams::StreamProtocol::SyncV1`], gates each inbound stream on
@@ -2432,11 +2448,18 @@ impl OwnerSyncService {
         };
         let local_machine = self.agent.machine_id();
         let peer = stream.peer();
-        if !self.store.is_enrolled(&peer, &owner_kp.user_id()).await {
+        if !inbound_session_admissible(
+            &self.store,
+            &self.agent.revocation_set(),
+            &peer,
+            &owner_kp.user_id(),
+        )
+        .await
+        {
             tracing::warn!(
                 target: "x0x::owner_sync",
                 machine = %hex::encode(peer.0),
-                "refusing SyncV1 stream from non-enrolled machine"
+                "refusing SyncV1 stream from non-enrolled or revoked machine"
             );
             return; // drop => stream reset, fail closed
         }
@@ -2989,6 +3012,53 @@ mod tests {
         b.enroll(OwnerEnrollment::sign(machine(1), owner, 1_000, None).unwrap())
             .await
             .unwrap();
+    }
+
+    // ADR 0084 revocation race: a machine revoked after the accept loop
+    // admitted its SyncV1 stream, but before the acceptor starts the
+    // session, must be refused by the acceptor's own check.
+    #[tokio::test]
+    async fn acceptor_refuses_machine_revoked_after_admission() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+        let owner = owner_kp(9);
+        let peer_kp = crate::identity::MachineKeypair::generate().expect("machine keygen");
+        let peer = peer_kp.machine_id();
+        store
+            .enroll(OwnerEnrollment::sign(peer, &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("enroll");
+        let revocations = tokio::sync::RwLock::new(crate::revocation::RevocationSet::new());
+        assert!(
+            inbound_session_admissible(&store, &revocations, &peer, &owner.user_id()).await,
+            "precondition: an enrolled, unrevoked machine is admitted"
+        );
+
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let record = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Machine(peer),
+            peer_kp.public_key(),
+            peer_kp.secret_key(),
+            now_secs,
+            None,
+        )
+        .expect("sign machine revocation");
+        revocations
+            .write()
+            .await
+            .verify_and_insert(record, None)
+            .expect("insert machine revocation");
+
+        assert!(
+            store.is_enrolled(&peer, &owner.user_id()).await,
+            "the enrollment itself still verifies"
+        );
+        assert!(
+            !inbound_session_admissible(&store, &revocations, &peer, &owner.user_id()).await,
+            "the acceptor must refuse a machine revoked after admission"
+        );
     }
 
     pub(in crate::owner_sync) fn sign_names(
