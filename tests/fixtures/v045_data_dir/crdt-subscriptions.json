@@ -1,0 +1,30 @@
+{
+  "entries": [
+    {
+      "kind": "kv_store",
+      "id": "fixture-v045-personal",
+      "name": "fixture-personal",
+      "topic": "fixture-v045-personal",
+      "role": "created",
+      "expected_owner": "710eff444bd71330304e7893a5b6e1e479a17479c39de85149d5143879cc8615",
+      "policy": "signed"
+    },
+    {
+      "kind": "kv_store",
+      "id": "x0x/group/17c98060bb515546ece481cf4d6fc470555749ba39447e93574b752e4da62fd8/kv/31fc62d78014cd2e3dd270e1597bce99da8d40065d383944295be6b9e99454ec",
+      "name": "wiki",
+      "topic": "x0x/group/17c98060bb515546ece481cf4d6fc470555749ba39447e93574b752e4da62fd8/kv/31fc62d78014cd2e3dd270e1597bce99da8d40065d383944295be6b9e99454ec",
+      "role": "created",
+      "expected_owner": "710eff444bd71330304e7893a5b6e1e479a17479c39de85149d5143879cc8615",
+      "policy": "encrypted",
+      "stable_group_id": "17c98060bb515546ece481cf4d6fc470555749ba39447e93574b752e4da62fd8"
+    },
+    {
+      "kind": "task_list",
+      "id": "fixture-v045-tasks",
+      "name": "fixture-tasks",
+      "topic": "fixture-v045-tasks",
+      "role": "created"
+    }
+  ]
+}
