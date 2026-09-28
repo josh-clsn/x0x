@@ -354,4 +354,206 @@ mod tests {
         let targets = presence_broadcast_targets(vec![peer(9)], &[peer(9)]);
         assert_eq!(targets, vec![peer(9)]);
     }
+
+    /// x0x#1036 W2 row (a): a pool-tombstoned peer is a disconnected peer.
+    ///
+    /// `disconnect_pool_candidates` (LRU/idle pool eviction) records a
+    /// `PoolEviction` reconnect-suppression tombstone and then closes the
+    /// connection, so the peer leaves ant-quic's `connected_peers()` — the
+    /// `send_ready_peers()` snapshot the keepalive pass feeds this tracker —
+    /// and the tombstone stops proactive redial from bringing it back.
+    /// HyParView knows nothing of the pool and keeps the peer in the active
+    /// view, so without pruning SWIM, shuffle and presence would keep
+    /// sending to it ("Peer not found") for the tombstone's lifetime.
+    ///
+    /// Pinned: the absence clock starts at the first pass after the close
+    /// (not while the tombstone is live but the connection is still open),
+    /// the peer is pruned once it has been absent for the threshold, it is
+    /// not restored while it stays evicted, and a random walk that re-adds
+    /// it while still evicted does not buy it a fresh grace period.
+    #[tokio::test]
+    async fn pool_tombstoned_peer_is_pruned_after_threshold() {
+        let membership = FakeMembership::default();
+        let (kept, evicted) = (peer(10), peer(11));
+        for p in [kept, evicted] {
+            membership.add_active(p).await.expect("add");
+        }
+        let mut tracker = StaleTargetTracker::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+
+        // Tombstone set, close still in flight: ant-quic still reports the
+        // connection, so the peer is connected for send-target purposes.
+        let both = set(&[kept, evicted]);
+        maintain_active_view(&membership, &mut tracker, &both, t0).await;
+
+        // Closed by the pool: gone from the send-ready snapshot.
+        let only_kept = set(&[kept]);
+        let t_close = t0 + Duration::from_secs(15);
+        let plan = maintain_active_view(&membership, &mut tracker, &only_kept, t_close).await;
+        assert!(plan.prune.is_empty(), "grace starts at the close");
+        let plan = maintain_active_view(
+            &membership,
+            &mut tracker,
+            &only_kept,
+            t_close + Duration::from_secs(59),
+        )
+        .await;
+        assert!(plan.prune.is_empty(), "still inside the grace period");
+
+        let plan = maintain_active_view(
+            &membership,
+            &mut tracker,
+            &only_kept,
+            t_close + Duration::from_secs(60),
+        )
+        .await;
+        assert_eq!(plan.prune, vec![evicted]);
+        assert_eq!(
+            membership.active_view(),
+            vec![kept],
+            "a pool-evicted peer must stop being a send target"
+        );
+
+        // Still evicted: not restored, and a random-walk re-add is pruned on
+        // the very next pass.
+        let plan = maintain_active_view(
+            &membership,
+            &mut tracker,
+            &only_kept,
+            t_close + Duration::from_secs(75),
+        )
+        .await;
+        assert!(plan.restore.is_empty(), "no restore while evicted");
+        membership.add_active(evicted).await.expect("re-add");
+        let plan = maintain_active_view(
+            &membership,
+            &mut tracker,
+            &only_kept,
+            t_close + Duration::from_secs(90),
+        )
+        .await;
+        assert_eq!(plan.prune, vec![evicted]);
+        assert_eq!(membership.active_view(), vec![kept]);
+    }
+
+    /// x0x#1036 W2 row (b): a plane-pending peer counts as connected.
+    ///
+    /// `PeerAdmission::PlanePending` means ant-quic holds a live connection
+    /// but the issue #206 plane hello has not resolved yet (at most
+    /// `PLANE_LEGACY_GRACE`, 10 s). The keepalive pass feeds this tracker
+    /// `NetworkNode::send_ready_peers()`, which is ant-quic's
+    /// `connected_peers()` with no admission filter, so a plane-pending peer
+    /// is in the snapshot exactly like an admitted one. That is the intended
+    /// semantics: this tracker bounds send targets by *transport*
+    /// connectivity, because only a send with no connection fails with
+    /// "Peer not found". Gossip admission is enforced elsewhere
+    /// (`gossip_plane_peers`, `peer_admission`) and is not this tracker's job.
+    ///
+    /// Pinned, in consequence: a pruned peer that reconnects is restored even
+    /// while plane-pending, and being seen plane-pending restarts the absence
+    /// clock. If the plane is then refused, the peer is disconnected with a
+    /// `PolicyRejection` tombstone and is pruned one full threshold after
+    /// that disconnect: never earlier, and never left in the view for good.
+    #[test]
+    fn plane_pending_peer_counts_as_connected() {
+        let mut tracker = StaleTargetTracker::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+        let p = peer(20);
+        let none = HashSet::new();
+        // Seen only as plane-pending: in the send-ready snapshot.
+        let plane_pending = set(&[p]);
+
+        tracker.observe(&[p], &none, t0);
+        assert_eq!(
+            tracker
+                .observe(&[p], &none, t0 + Duration::from_secs(60))
+                .prune,
+            vec![p]
+        );
+
+        // Reconnects; the plane hello is still in flight.
+        let plan = tracker.observe(&[], &plane_pending, t0 + Duration::from_secs(70));
+        assert_eq!(plan.restore, vec![p], "restored while plane-pending");
+
+        // Absent 50 s, seen plane-pending once, then refused and dropped.
+        let t1 = t0 + Duration::from_secs(100);
+        tracker.observe(&[p], &none, t1);
+        tracker.observe(&[p], &plane_pending, t1 + Duration::from_secs(50));
+        let refused_at = t1 + Duration::from_secs(55);
+        assert!(tracker.observe(&[p], &none, refused_at).prune.is_empty());
+        assert!(
+            tracker
+                .observe(&[p], &none, refused_at + Duration::from_secs(59))
+                .prune
+                .is_empty(),
+            "the plane-pending sighting restarted the absence clock"
+        );
+        assert_eq!(
+            tracker
+                .observe(&[p], &none, refused_at + Duration::from_secs(60))
+                .prune,
+            vec![p]
+        );
+    }
+
+    /// x0x#1036 W2 row (c): presence targeting and active-view pruning agree.
+    ///
+    /// Presence targets come from `NetworkNode::connected_peers()`; pruning
+    /// comes from `NetworkNode::send_ready_peers()`. Both are ant-quic
+    /// `Node::connected_peers()` projected to peer ids, with no further
+    /// filter, so over one connectivity snapshot they are the same set. This
+    /// test drives both off one snapshot and pins the invariant: a pruned
+    /// peer is never a presence target, a presence target is never pruned,
+    /// and pruning never removes a presence target (presence computed from
+    /// the pruned view equals presence computed from the unpruned view).
+    #[tokio::test]
+    async fn presence_targets_and_pruning_agree() {
+        let membership = FakeMembership::default();
+        let (up, flapped, long_gone, transport_only) = (peer(30), peer(31), peer(32), peer(33));
+        for p in [up, flapped, long_gone] {
+            membership.add_active(p).await.expect("add");
+        }
+        let mut tracker = StaleTargetTracker::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+
+        maintain_active_view(&membership, &mut tracker, &set(&[up, flapped]), t0).await;
+        maintain_active_view(
+            &membership,
+            &mut tracker,
+            &set(&[up]),
+            t0 + Duration::from_secs(30),
+        )
+        .await;
+
+        // One snapshot for both consumers.
+        let snapshot = vec![up, transport_only];
+        let now = t0 + Duration::from_secs(60);
+        let view_before = membership.active_view();
+        let presence_before = presence_broadcast_targets(view_before.clone(), &snapshot);
+        let plan = maintain_active_view(&membership, &mut tracker, &set(&snapshot), now).await;
+        let presence_after = presence_broadcast_targets(membership.active_view(), &snapshot);
+
+        assert_eq!(plan.prune, vec![long_gone], "only the 60 s-absent peer");
+        for pruned in &plan.prune {
+            assert!(
+                !presence_before.contains(pruned),
+                "a pruned peer must not be a presence target"
+            );
+        }
+        for target in &presence_before {
+            assert!(
+                !plan.prune.contains(target),
+                "a presence target must not be pruned"
+            );
+        }
+        assert_eq!(
+            presence_before, presence_after,
+            "pruning must not change the presence target set"
+        );
+        assert_eq!(presence_after, vec![up, transport_only]);
+        assert!(
+            !presence_after.contains(&flapped),
+            "inside its grace a disconnected peer stays in the view but gets no beacon"
+        );
+    }
 }
