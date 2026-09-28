@@ -125,7 +125,7 @@ pub(in crate::server) fn publish_group_cert_fetch(
             let elapsed_ms = now.duration_since(*at).as_millis() as u64;
             elapsed_ms < CERT_FETCH_REQUESTED_TTL_MS
         });
-        if requested.contains_key(digest_hex) {
+        if requested.contains_key(digest_hex) || requested.len() >= CERT_FETCH_CACHE_MAX_ENTRIES {
             return;
         }
         requested.insert(digest_hex.to_string(), now);
@@ -762,7 +762,8 @@ pub(in crate::server) fn attach_roster_certificates_to_member_added(
 
 /// #1023 receiver side: the certificate sidecar a `MemberAdded` carries,
 /// keyed by the event's group id, captured before the apply consumes the
-/// event. `None` for every other event and for an empty sidecar.
+/// event. Empty legacy sidecars retain the group id so the post-apply
+/// receiver can request missing certificates. `None` for other events.
 pub(in crate::server) fn member_added_sidecar(
     event: &super::NamedGroupMetadataEvent,
 ) -> Option<(String, Vec<String>)> {
@@ -771,10 +772,47 @@ pub(in crate::server) fn member_added_sidecar(
             group_id,
             roster_certificates_b64,
             ..
-        } if !roster_certificates_b64.is_empty() => {
-            Some((group_id.clone(), roster_certificates_b64.clone()))
-        }
+        } => Some((group_id.clone(), roster_certificates_b64.clone())),
         _ => None,
+    }
+}
+
+/// Recover certificates omitted by a trimmed or legacy seat event while
+/// its authority is likely still online. Admission is not certificate
+/// readiness: any remaining digest-only seat still blocks a later seal.
+/// Called after an authenticated, accepted apply and sidecar hydration,
+/// with no membership guard held. Uses #946's existing request TTL, response
+/// validation and bounded cache; no join-attempt state or wire fields change.
+pub(in crate::server) async fn request_missing_roster_certificates(
+    state: &AppState,
+    group_id: &str,
+) {
+    let (topic, stable_id, digests) = {
+        let groups = state.named_groups.read().await;
+        let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_id) else {
+            return;
+        };
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        if info.withdrawn
+            || info.policy.admission.owner_certified_user_id().is_none()
+            || !info.has_active_member(&local_hex)
+        {
+            return;
+        }
+        let digests: Vec<String> = info
+            .active_members()
+            .filter(|seat| seat.certificate.is_none())
+            .filter_map(|seat| seat.certificate_digest.clone())
+            .take(CERT_FETCH_CACHE_MAX_ENTRIES)
+            .collect();
+        (
+            info.metadata_topic.clone(),
+            info.stable_group_id().to_string(),
+            digests,
+        )
+    };
+    for digest in digests {
+        publish_group_cert_fetch(state, &topic, &stable_id, &digest);
     }
 }
 

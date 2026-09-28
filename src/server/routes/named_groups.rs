@@ -10409,7 +10409,7 @@ async fn apply_named_group_metadata_event_with_binding(
         replay_pending_causal_approvals(state, &gid, &mut cleared_quarantine).await;
     }
     resume_task_ingest_after_durable_clear(state, &cleared_quarantine).await;
-    hydrate_from_member_added_sidecar(state, roster_sidecar).await;
+    hydrate_from_member_added_sidecar(state, roster_sidecar, applied.accepted && verified).await;
     if applied.accepted {
         if let Some((gid, member)) = departing_member.as_ref() {
             clear_cert_evidence_stamps_for(state, gid, Some(member)).await;
@@ -10433,10 +10433,14 @@ async fn apply_named_group_metadata_event_with_binding(
 async fn hydrate_from_member_added_sidecar(
     state: &Arc<AppState>,
     sidecar: Option<(String, Vec<String>)>,
+    recover_missing: bool,
 ) {
     if let Some((group_id, certificates)) = sidecar {
         seat_cert_fetch::hydrate_from_roster_certificate_sidecar(state, &group_id, &certificates)
             .await;
+        if recover_missing {
+            seat_cert_fetch::request_missing_roster_certificates(state, &group_id).await;
+        }
     }
 }
 
@@ -10692,7 +10696,7 @@ async fn apply_named_group_metadata_event_inner(
         }
     }
     resume_task_ingest_after_durable_clear(state, &cleared_quarantine).await;
-    hydrate_from_member_added_sidecar(state, roster_sidecar).await;
+    hydrate_from_member_added_sidecar(state, roster_sidecar, applied.accepted && verified).await;
     if applied.accepted {
         if let Some(event_gid) = member_landing_group {
             // Resolve to the local map key AFTER the apply (the group may
