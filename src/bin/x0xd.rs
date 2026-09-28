@@ -645,7 +645,7 @@ async fn load_config(path: &str) -> Result<DaemonConfig> {
 /// it shuts the writer thread down and every subsequent log line is silently
 /// discarded (issue #600).
 /// #1036: colour the stdout log only for an interactive terminal, and never
-/// when `NO_COLOR` is set (https://no-color.org).
+/// when `NO_COLOR` is set (<https://no-color.org/>).
 fn log_ansi_enabled(stdout_is_terminal: bool, no_color: bool) -> bool {
     stdout_is_terminal && !no_color
 }
