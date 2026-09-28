@@ -92,6 +92,7 @@ This directory contains architecture decision records for x0x.
 
 
 - [ADR 0062: Recover Ordinary Home Persistence as One Durable Pair](./0062-home-persistence-pair-recovery.md) (proposed 2026-09-06) — #471: ordinary-pair undo intent, truthful recovery-required results and exclusive journal ownership; commit ambiguity, caller fencing and downgrade policy require human design review before implementation.
+- [ADR 0084: Admit Owner Sync from Enrolled Machines on Verified Enrollment Alone](./0084-enrolled-owner-sync-admission.md) (proposed 2026-09-28, retroactive) — #1040/#1044: amends ADR-0041; an enrolled, unrevoked machine with no known agent may open `SyncV1` only, to the owner-sync acceptor, skipping the agent gate and connect ACL; reject ⇒ revert #1044 on main before the v0.46.0 rc (D06)
 
 
 ## Errata (Accepted ADRs are immutable; corrections recorded here)
