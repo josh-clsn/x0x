@@ -92,6 +92,7 @@ This directory contains architecture decision records for x0x.
 
 
 - [ADR 0062: Recover Ordinary Home Persistence as One Durable Pair](./0062-home-persistence-pair-recovery.md) (proposed 2026-09-06) — #471: ordinary-pair undo intent, truthful recovery-required results and exclusive journal ownership; commit ambiguity, caller fencing and downgrade policy require human design review before implementation.
+- [ADR 0085: Persisted Binary Formats Are Versioned, Read Every Released Layout, and Fail Closed on Downgrade](./0085-persisted-binary-formats-are-versioned.md) (proposed 2026-09-28) — #1046/D01: KV snapshots `X0XKVS1`→`X0XKVS2`; frozen decoders for released layouts; fixtures from the released encoder; downgrade leaves files intact but unreadable
 
 
 ## Errata (Accepted ADRs are immutable; corrections recorded here)
