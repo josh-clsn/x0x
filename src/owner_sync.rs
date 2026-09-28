@@ -14,7 +14,15 @@
 //!
 //! 1. the ADR-0022 machine identity gates (transport-verified, trusted,
 //!    non-revoked) have already cleared — enforced by the shared accept loop
-//!    before this protocol's acceptor sees the stream;
+//!    before this protocol's acceptor sees the stream. **#1040 exception:**
+//!    when the transport-authenticated machine has NO known agent (e.g.
+//!    this device restarted with an empty discovery cache), the accept loop
+//!    admits a `SyncV1` stream — and no other protocol — if the machine is
+//!    in the verified owner enrollment set (signature chains to the local
+//!    owner, current, not in the revocation set), re-verified after the
+//!    prefix read. The outbound pass likewise dials such a machine by its
+//!    id using only bootstrap-cache addresses (enrollments carry none);
+//!    see [`crate::Agent`]'s `open_enrolled_owner_sync_stream`;
 //! 2. the remote machine is in the local **owner device set**: an
 //!    [`crate::owner_sync::OwnerEnrollment`] record signed by the owner key, whose public key
 //!    derives to this install's `UserId`, and whose optional expiry has not
@@ -2174,6 +2182,66 @@ async fn write_paged_records<S: AsyncWrite + Unpin>(
     }
     Ok(())
 }
+/// Minimum spacing between identity re-announcements triggered by the SAME
+/// enrolled owner machine connecting (#1040).
+///
+/// Why 60 s: an identity announcement is a network-wide gossip publish that
+/// every receiver ML-DSA-verifies (the #656 CPU budget), so a flapping owner
+/// connection must not turn into an announcement storm. The regular
+/// heartbeat is [`crate::IDENTITY_HEARTBEAT_INTERVAL_SECS`] (600 s); one
+/// extra announcement per enrolled device per minute is at most a 10x
+/// increase for that device and only while it reconnects, and is still far
+/// inside the #824 owner-sync wait, so a restarted peer hears us well before
+/// its provisioning deadline. Owner sync itself does not depend on it.
+pub const OWNER_REANNOUNCE_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Per-machine rate limiter for owner-connect re-announcements (#1040):
+/// [`Self::allow`] returns `true` at most once per machine per interval.
+/// Expired entries are pruned on every call, so memory is bounded by the
+/// machines seen within one interval (enrolled machines only).
+pub(crate) struct ReannounceLimiter {
+    interval: Duration,
+    last: std::collections::HashMap<[u8; 32], std::time::Instant>,
+}
+
+impl ReannounceLimiter {
+    pub(crate) fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Whether `machine` may trigger a re-announcement at `now`; records it
+    /// when allowed.
+    pub(crate) fn allow(&mut self, machine: &MachineId, now: std::time::Instant) -> bool {
+        let interval = self.interval;
+        self.last
+            .retain(|_, at| now.saturating_duration_since(*at) < interval);
+        if self.last.contains_key(&machine.0) {
+            return false;
+        }
+        self.last.insert(machine.0, now);
+        true
+    }
+}
+
+/// The SyncV1 acceptor's own admission check, run when a session starts,
+/// after the shared accept loop has handed the stream over. The accept
+/// loop's check and this one are separated by the handoff: a machine
+/// revocation (ADR-0018) that lands in between must still stop the session
+/// (ADR 0084, revocation race). The peer's enrollment must verify and be
+/// current under `owner`, and the peer machine must not be revoked.
+async fn inbound_session_admissible(
+    store: &OwnerSyncStore,
+    revocation_set: &tokio::sync::RwLock<crate::revocation::RevocationSet>,
+    peer: &MachineId,
+    owner: &UserId,
+) -> bool {
+    // Cheap-first: the device-map miss costs no signature verification.
+    store.is_enrolled(peer, owner).await && !revocation_set.read().await.is_machine_revoked(peer)
+}
+
 /// Daemon-resident Tier-1 sync service (the `ForwardService` pattern for
 /// `SyncV1`): owns the single registered acceptor for
 /// [`crate::streams::StreamProtocol::SyncV1`], gates each inbound stream on
@@ -2220,7 +2288,86 @@ impl OwnerSyncService {
             session_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SESSIONS)),
         });
         service.spawn_acceptor_loop(acceptor).await;
+        service.spawn_reannounce_on_owner_connect().await;
         Ok(service)
+    }
+
+    /// #1040: when an enrolled owner machine newly connects, re-announce
+    /// this device's identity (so a peer that restarted with an empty
+    /// discovery cache learns our agent promptly) and kick a sync pass.
+    /// Bounded by [`ReannounceLimiter`] at one re-announcement per machine
+    /// per [`OWNER_REANNOUNCE_MIN_INTERVAL`]. Owner sync itself never
+    /// waits on this: admission and dialing use the enrollment alone.
+    async fn spawn_reannounce_on_owner_connect(self: &Arc<Self>) {
+        let Some(network) = self.agent.network().map(Arc::clone) else {
+            return;
+        };
+        let mut events = network.subscribe();
+        let service = Arc::downgrade(self);
+        let task = tokio::spawn(async move {
+            let mut limiter = ReannounceLimiter::new(OWNER_REANNOUNCE_MIN_INTERVAL);
+            loop {
+                let event = match events.recv().await {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                let crate::network::NetworkEvent::PeerConnected { peer_id, .. } = event else {
+                    continue;
+                };
+                let Some(service) = service.upgrade() else {
+                    break;
+                };
+                service
+                    .on_peer_connected(MachineId(peer_id), &mut limiter)
+                    .await;
+            }
+        });
+        self.tasks.lock().await.push(task);
+    }
+
+    async fn on_peer_connected(&self, machine: MachineId, limiter: &mut ReannounceLimiter) {
+        let Some((owner, local)) = self.owner_and_machine() else {
+            return;
+        };
+        if machine == local {
+            return;
+        }
+        // Cheap-first: a non-enrolled peer misses the device map without
+        // any signature verification.
+        if !self.store.is_enrolled(&machine, &owner).await {
+            return;
+        }
+        if self
+            .agent
+            .revocation_set()
+            .read()
+            .await
+            .is_machine_revoked(&machine)
+        {
+            return;
+        }
+        if !limiter.allow(&machine, std::time::Instant::now()) {
+            tracing::debug!(
+                target: "x0x::owner_sync",
+                machine = %hex::encode(machine.0),
+                "enrolled owner machine reconnected; re-announce rate-limited (#1040)"
+            );
+            return;
+        }
+        tracing::info!(
+            target: "x0x::owner_sync",
+            machine = %hex::encode(machine.0),
+            "enrolled owner machine connected; re-announcing identity and kicking sync (#1040)"
+        );
+        if let Err(e) = self.agent.reannounce_identity().await {
+            tracing::warn!(
+                target: "x0x::owner_sync",
+                error = %e,
+                "owner-connect identity re-announcement failed (#1040)"
+            );
+        }
+        self.kick();
     }
 
     /// Install the live daemon view (idempotent; called by the daemon right
@@ -2301,11 +2448,18 @@ impl OwnerSyncService {
         };
         let local_machine = self.agent.machine_id();
         let peer = stream.peer();
-        if !self.store.is_enrolled(&peer, &owner_kp.user_id()).await {
+        if !inbound_session_admissible(
+            &self.store,
+            &self.agent.revocation_set(),
+            &peer,
+            &owner_kp.user_id(),
+        )
+        .await
+        {
             tracing::warn!(
                 target: "x0x::owner_sync",
                 machine = %hex::encode(peer.0),
-                "refusing SyncV1 stream from non-enrolled machine"
+                "refusing SyncV1 stream from non-enrolled or revoked machine"
             );
             return; // drop => stream reset, fail closed
         }
@@ -2370,13 +2524,22 @@ impl OwnerSyncService {
             .into_iter()
             .filter(|d| d.machine_id == *machine)
             .min_by_key(|d| d.agent_id.as_bytes().to_vec())
-            .ok_or_else(|| ("discovery", "machine not in discovery cache".to_string()))?
-            .agent_id;
-        let stream = self
-            .agent
-            .open_peer_stream(&target_agent, crate::streams::StreamProtocol::SyncV1)
-            .await
-            .map_err(|e| ("open_stream", e.to_string()))?;
+            .map(|d| d.agent_id);
+        let stream = match target_agent {
+            Some(target_agent) => self
+                .agent
+                .open_peer_stream(&target_agent, crate::streams::StreamProtocol::SyncV1)
+                .await
+                .map_err(|e| ("open_stream", e.to_string()))?,
+            // #1040: no agent announced on the machine yet (e.g. this
+            // device restarted with an empty discovery cache). Dial the
+            // enrolled machine by its id on the verified enrollment alone.
+            None => self
+                .agent
+                .open_enrolled_owner_sync_stream(machine)
+                .await
+                .map_err(|e| ("enrolled_dial", e.to_string()))?,
+        };
         let peer = stream.peer();
         let (mut send, mut recv) = stream.into_split();
         let _permit = self
@@ -2849,6 +3012,53 @@ mod tests {
         b.enroll(OwnerEnrollment::sign(machine(1), owner, 1_000, None).unwrap())
             .await
             .unwrap();
+    }
+
+    // ADR 0084 revocation race: a machine revoked after the accept loop
+    // admitted its SyncV1 stream, but before the acceptor starts the
+    // session, must be refused by the acceptor's own check.
+    #[tokio::test]
+    async fn acceptor_refuses_machine_revoked_after_admission() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+        let owner = owner_kp(9);
+        let peer_kp = crate::identity::MachineKeypair::generate().expect("machine keygen");
+        let peer = peer_kp.machine_id();
+        store
+            .enroll(OwnerEnrollment::sign(peer, &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("enroll");
+        let revocations = tokio::sync::RwLock::new(crate::revocation::RevocationSet::new());
+        assert!(
+            inbound_session_admissible(&store, &revocations, &peer, &owner.user_id()).await,
+            "precondition: an enrolled, unrevoked machine is admitted"
+        );
+
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let record = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Machine(peer),
+            peer_kp.public_key(),
+            peer_kp.secret_key(),
+            now_secs,
+            None,
+        )
+        .expect("sign machine revocation");
+        revocations
+            .write()
+            .await
+            .verify_and_insert(record, None)
+            .expect("insert machine revocation");
+
+        assert!(
+            store.is_enrolled(&peer, &owner.user_id()).await,
+            "the enrollment itself still verifies"
+        );
+        assert!(
+            !inbound_session_admissible(&store, &revocations, &peer, &owner.user_id()).await,
+            "the acceptor must refuse a machine revoked after admission"
+        );
     }
 
     pub(in crate::owner_sync) fn sign_names(
@@ -4303,5 +4513,39 @@ mod home_pointer_election_tests {
             !home_pointer_mint_decision(&refreshed, Some(&stored), "agent-b", false),
             "a co-member must not refresh the primary's Home pointer"
         );
+    }
+
+    /// WHY (#1040): an identity announcement is a network-wide publish that
+    /// every receiver verifies. A flapping owner connection must yield at
+    /// most one re-announcement per machine per interval, while a DIFFERENT
+    /// enrolled machine is not starved, and the machine may re-announce
+    /// again once the interval has passed.
+    #[test]
+    fn owner_reconnect_reannounce_is_rate_limited_per_machine() {
+        let interval = OWNER_REANNOUNCE_MIN_INTERVAL;
+        let mut limiter = ReannounceLimiter::new(interval);
+        let t0 = std::time::Instant::now();
+        assert!(
+            limiter.allow(&MachineId([1; 32]), t0),
+            "first connect re-announces"
+        );
+        for step in [0, 1, 30, 59] {
+            assert!(
+                !limiter.allow(&MachineId([1; 32]), t0 + Duration::from_secs(step)),
+                "reconnect {step}s later must not re-announce again"
+            );
+        }
+        assert!(
+            limiter.allow(&MachineId([2; 32]), t0 + Duration::from_secs(1)),
+            "another enrolled machine has its own budget"
+        );
+        assert!(
+            limiter.allow(&MachineId([1; 32]), t0 + interval),
+            "after the interval the machine may re-announce again"
+        );
+        assert!(!limiter.allow(&MachineId([1; 32]), t0 + interval + Duration::from_secs(1)));
+        // Stale entries are pruned: memory is bounded by recent machines.
+        assert!(limiter.allow(&MachineId([3; 32]), t0 + interval * 3));
+        assert_eq!(limiter.last.len(), 1, "expired entries must be pruned");
     }
 }

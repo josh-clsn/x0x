@@ -1467,7 +1467,18 @@ impl ForwardService {
     /// its `handle_inbound` task. Over-cap streams are reset (dropped) +
     /// counted rather than spawning unbounded.
     fn spawn_stream_handler(self: &Arc<Self>, stream: PeerStream) {
-        let peer_agent = stream.agent();
+        // Forward streams reach this acceptor only after the agent identity
+        // gate, so they always carry an agent. An agentless stream (only the
+        // #1040 enrollment-only SyncV1 path creates one) fails closed: it is
+        // dropped, which resets it, before admission or any handler runs.
+        let Some(peer_agent) = stream.agent() else {
+            tracing::warn!(
+                target: "x0x::forward",
+                peer = %hex::encode(stream.peer().0),
+                "inbound forward refused: stream carries no agent identity — resetting"
+            );
+            return;
+        };
         let admission = match self.admit(peer_agent, true) {
             Some(a) => a,
             None => {

@@ -16,7 +16,7 @@ use crate::kv::encrypted::{
 use crate::kv::retained_paging::{
     decode_page, RetainedPageBinding, RetainedPagePool, RetainedPageV1,
 };
-use crate::kv::store::{AccessPolicy, MergeOutcome};
+use crate::kv::store::{AccessPolicy, KvStoreV1SnapshotShape, MergeOutcome};
 use crate::kv::treekem::{SharedTreeKemKvProtector, TreeKemKvStoreRecordV1};
 use crate::kv::{KvError, KvStore, KvStoreDelta, KvStoreId, Result};
 use saorsa_gossip_types::PeerId;
@@ -3997,40 +3997,98 @@ impl KvStoreSync {
 /// temp file mid-rename.
 static SNAPSHOT_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Magic prefix of the v1 snapshot file format.
+/// Magic prefix of the v1 snapshot file format (read-only since v0.46).
 ///
-/// Format: `MAGIC(8) || bincode(SnapshotBody { store, seq_counter })`.
-/// The envelope exists so the OR-Set sequence-counter ceiling (which is
-/// `serde(skip)` on `KvStore` for wire/legacy-layout reasons) survives a
-/// restart exactly. The format is introduced unreleased — no shipped binary
-/// ever wrote a bare-`KvStore` snapshot — so there is no compat read path:
-/// a file without the magic is rejected (fail closed) rather than guessed at.
-const SNAPSHOT_MAGIC: &[u8; 8] = b"X0XKVS1\0";
+/// Format: `MAGIC(8) || bincode(store: <v0.45.0 KvStore shape>) || u64 seq_counter`.
+/// Written by every release up to and including v0.45.0. Because the store
+/// is followed by `seq_counter`, the store is NOT at stream end, so no field
+/// can ever be appended to its v1 shape: v1 bodies are decoded through the
+/// frozen [`KvStoreV1SnapshotShape`] and never written again.
+const SNAPSHOT_MAGIC_V1: &[u8; 8] = b"X0XKVS1\0";
 
-/// Owned snapshot body (decode side).
+/// Magic prefix of the v2 snapshot file format (written since v0.46).
+///
+/// Format: `MAGIC(8) || bincode(SnapshotBodyV2 { seq_counter, store })`.
+/// `seq_counter` comes FIRST so the store's bytes run to the true end of the
+/// stream — the only position where `KvStore`'s trailing `de_tolerant`
+/// fields can default at EOF. The envelope exists so the OR-Set
+/// sequence-counter ceiling (which is `serde(skip)` on `KvStore` for
+/// wire/legacy-layout reasons) survives a restart exactly.
+///
+/// Downgrade: v0.45.0 (and older) only accept the v1 magic; a v2 file makes
+/// their `load_snapshot` return an error, which every caller treats as
+/// fail-closed ("refusing to start with amnesia") without rewriting or
+/// deleting the file. See `docs/design/persisted-format-compat.md`.
+const SNAPSHOT_MAGIC_V2: &[u8; 8] = b"X0XKVS2\0";
+
+/// Owned v2 snapshot body (decode side).
 #[derive(Deserialize)]
-struct SnapshotBody {
+struct SnapshotBodyV2 {
+    seq_counter: u64,
+    store: KvStore,
+}
+
+/// Borrowing v2 snapshot body (encode side — avoids cloning the store).
+#[derive(Serialize)]
+struct SnapshotBodyV2Ref<'a> {
+    seq_counter: u64,
+    store: &'a KvStore,
+}
+
+/// Owned v1 snapshot body, decoded through the frozen v0.45.0 store shape.
+#[derive(Deserialize)]
+struct SnapshotBodyV1 {
+    store: KvStoreV1SnapshotShape,
+    seq_counter: u64,
+}
+
+/// Pre-release v1 body: the v1 magic in front of the CURRENT `KvStore`
+/// shape. Only unreleased v0.46 candidate builds (after `last_history_endorser`
+/// was added, before this format bump) could have written it; accepted
+/// solely as an exact-length fallback when the v0.45.0 shape does not fit.
+#[derive(Deserialize)]
+struct SnapshotBodyV1PreRelease {
     store: KvStore,
     seq_counter: u64,
 }
 
-/// Borrowing snapshot body (encode side — avoids cloning the store).
-#[derive(Serialize)]
-struct SnapshotBodyRef<'a> {
-    store: &'a KvStore,
-    seq_counter: u64,
+/// bincode options identical to `bincode::serialize`/`deserialize`
+/// (little-endian, fixed-width ints, no limit) except that trailing bytes
+/// are REJECTED: a snapshot body must be consumed exactly, which is what
+/// makes the v1 layout discrimination unambiguous.
+fn snapshot_bincode() -> impl bincode::Options {
+    use bincode::Options;
+    bincode::DefaultOptions::new().with_fixint_encoding()
 }
 
-/// Encode a store into v1 snapshot bytes (magic + body).
+/// Encode a store into v2 snapshot bytes (magic + body).
 fn encode_snapshot(store: &KvStore) -> Result<Vec<u8>> {
-    let body = SnapshotBodyRef {
-        store,
+    let body = SnapshotBodyV2Ref {
         seq_counter: store.seq_counter_value(),
+        store,
     };
     let mut out = Vec::with_capacity(256);
-    out.extend_from_slice(SNAPSHOT_MAGIC);
+    out.extend_from_slice(SNAPSHOT_MAGIC_V2);
     out.extend_from_slice(&bincode::serialize(&body)?);
     Ok(out)
+}
+
+/// Decode a v1 body: the exact v0.45.0 layout first, then (only if that does
+/// not consume the body exactly) the pre-release current-shape layout.
+fn decode_snapshot_body_v1(body_bytes: &[u8]) -> Result<(KvStore, u64)> {
+    use bincode::Options;
+    match snapshot_bincode().deserialize::<SnapshotBodyV1>(body_bytes) {
+        Ok(body) => Ok((
+            KvStore::from_v1_snapshot_shape(body.store),
+            body.seq_counter,
+        )),
+        Err(v045_err) => {
+            match snapshot_bincode().deserialize::<SnapshotBodyV1PreRelease>(body_bytes) {
+                Ok(body) => Ok((body.store, body.seq_counter)),
+                Err(_) => Err(v045_err.into()),
+            }
+        }
+    }
 }
 
 /// Outcome of one snapshot commit attempt.
@@ -4170,7 +4228,7 @@ fn write_snapshot_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// - `Ok(Some(store))` — snapshot present and valid.
 /// - `Ok(None)` — no snapshot at `path` (first run).
 /// - `Err(_)` — snapshot present but unreadable, undecodable, or not in the
-///   v1 format. Callers MUST fail closed on this (refuse to start an empty
+///   v1/v2 format. Callers MUST fail closed on this (refuse to start an empty
 ///   replica over a corrupt snapshot): silently discarding it would reopen
 ///   the restart-amnesia window (an `AppendOnly` owner that forgets its keys
 ///   will re-accept rewrites of them).
@@ -4198,15 +4256,20 @@ pub fn load_snapshot(path: &Path) -> Result<Option<KvStore>> {
 /// This is used by explicit import paths that must hash and validate the
 /// exact bytes they decode, without reopening a mutable filesystem path.
 pub(crate) fn load_snapshot_bytes(bytes: &[u8]) -> Result<KvStore> {
-    let Some(body_bytes) = bytes.strip_prefix(SNAPSHOT_MAGIC.as_slice()) else {
-        return Err(std::io::Error::other(
-            "unrecognized kv snapshot format (missing v1 magic) — corrupt or foreign file; \
+    let (store, seq_counter) =
+        if let Some(body_bytes) = bytes.strip_prefix(SNAPSHOT_MAGIC_V2.as_slice()) {
+            use bincode::Options;
+            let body: SnapshotBodyV2 = snapshot_bincode().deserialize(body_bytes)?;
+            (body.store, body.seq_counter)
+        } else if let Some(body_bytes) = bytes.strip_prefix(SNAPSHOT_MAGIC_V1.as_slice()) {
+            decode_snapshot_body_v1(body_bytes)?
+        } else {
+            return Err(std::io::Error::other(
+                "unrecognized kv snapshot format (missing v1/v2 magic) — corrupt or foreign file; \
              refusing to start with amnesia",
-        )
-        .into());
-    };
-    let body: SnapshotBody = bincode::deserialize(body_bytes)?;
-    let store = body.store;
+            )
+            .into());
+        };
     // #341: a snapshot carrying the Encrypted policy opens fail-closed
     // (the secure context is `serde(skip)` and must be re-attached by the
     // caller — see `KvStore::set_secure_context`) unless/until that happens:
@@ -4220,7 +4283,7 @@ pub(crate) fn load_snapshot_bytes(bytes: &[u8]) -> Result<KvStore> {
             hex::encode(group_id)
         );
     }
-    store.restore_seq_counter(body.seq_counter.max(store.current_version()));
+    store.restore_seq_counter(seq_counter.max(store.current_version()));
     Ok(store)
 }
 
@@ -4481,7 +4544,7 @@ mod tests {
             "restored seq counter must exceed every pre-restart seq"
         );
 
-        // A file without the v1 magic (e.g. a bare-bincode or foreign file)
+        // A file without a v1/v2 magic (e.g. a bare-bincode or foreign file)
         // fails closed.
         std::fs::write(&path, bincode::serialize(&store).expect("serialize")).expect("write bare");
         assert!(
@@ -4496,13 +4559,195 @@ mod tests {
         );
 
         // Truncated/garbage body AFTER a valid magic also fails closed.
-        let mut evil = SNAPSHOT_MAGIC.to_vec();
-        evil.extend_from_slice(b"\x01\x02\x03");
-        std::fs::write(&path, evil).expect("write garbage body");
+        for magic in [SNAPSHOT_MAGIC_V1, SNAPSHOT_MAGIC_V2] {
+            let mut evil = magic.to_vec();
+            evil.extend_from_slice(b"\x01\x02\x03");
+            std::fs::write(&path, evil).expect("write garbage body");
+            assert!(
+                load_snapshot(&path).is_err(),
+                "garbage body must be an error (fail closed)"
+            );
+        }
+        // An unknown future magic fails closed too (never guessed at).
+        let mut future = b"X0XKVS9\0".to_vec();
+        future.extend_from_slice(&bytes[SNAPSHOT_MAGIC_V2.len()..]);
+        std::fs::write(&path, future).expect("write future magic");
         assert!(
             load_snapshot(&path).is_err(),
-            "garbage body must be an error (fail closed)"
+            "unknown magic must be an error (fail closed)"
         );
+    }
+
+    /// A real v0.45.0 snapshot: generated by v0.45.0's own `encode_snapshot`
+    /// (throwaway example against a `v0.45.0` worktree; generator recorded in
+    /// `docs/design/persisted-format-compat.md`). Store: Allowlisted (owner
+    /// refresh at policy_version 3, +1 by `allow_writer`), owner `[1;32]`,
+    /// allowlisted writer `[2;32]`, live
+    /// `alpha`/`beta`, tombstoned `gamma`, renamed, an ownership conflict
+    /// (`[1;32]` anchored vs `[9;32]` claimed), a checkpoint at seq 7, and a
+    /// seq counter (13) that runs ahead of `version` (8).
+    const V045_SNAPSHOT: &[u8] = include_bytes!("../../tests/fixtures/kv_snapshot_v0_45_0.bin");
+
+    fn assert_v045_fixture_contents(store: &KvStore) {
+        let owner = AgentId([1; 32]);
+        assert_eq!(
+            store.id(),
+            &KvStoreId::for_topic_owner("fixture-topic-v045", &owner)
+        );
+        assert_eq!(store.name(), "fixture-v045-renamed");
+        assert_eq!(*store.policy(), AccessPolicy::Allowlisted);
+        // 3 from the owner refresh, +1 from `allow_writer`.
+        assert_eq!(store.policy_version(), 4);
+        assert_eq!(store.current_version(), 8);
+        assert_eq!(store.owner(), Some(&owner));
+        assert!(store.allowed_writers().contains(&AgentId([2; 32])));
+        assert_eq!(
+            store.get("alpha").map(|e| e.value.clone()),
+            Some(b"one".to_vec())
+        );
+        assert_eq!(
+            store.get("beta").map(|e| e.value.clone()),
+            Some(b"two".to_vec())
+        );
+        assert!(store.get("gamma").is_none(), "tombstone must survive");
+        let mut keys: Vec<_> = store.active_keys().into_iter().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(
+            store.ownership_source(),
+            crate::kv::store::OwnershipSource::Conflict {
+                anchored: owner,
+                announced: AgentId([9; 32]),
+            },
+            "recorded ownership conflict must survive"
+        );
+        assert_eq!(store.highest_checkpoint_seq, 7);
+        assert_eq!(
+            store.latest_checkpoint.as_ref().map(|cp| cp.checkpoint_seq),
+            Some(7)
+        );
+        assert_eq!(store.last_history_endorser(), None, "new field defaults");
+    }
+
+    #[test]
+    fn v045_snapshot_fixture_loads() {
+        // WHY (v0.46 release blocker): v0.45.0 wrote `X0XKVS1 || store ||
+        // seq_counter`; the post-0.45 `last_history_endorser` field consumed
+        // the head of `seq_counter`, so every 0.45 snapshot hit UnexpectedEof.
+        assert!(V045_SNAPSHOT.starts_with(SNAPSHOT_MAGIC_V1));
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("kv").join("v045.bin");
+        write_snapshot_atomic(&path, V045_SNAPSHOT).expect("write fixture");
+        let restored = load_snapshot(&path)
+            .expect("a v0.45.0 snapshot must load")
+            .expect("present");
+        assert_v045_fixture_contents(&restored);
+        // Seq-counter ceiling: 0.45 persisted counter 13 (version 8). The
+        // exact persisted value — not a version-derived floor — must be the
+        // restore ceiling, or OR-Set (peer, seq) tags would be reused.
+        assert_eq!(restored.seq_counter_value(), 13);
+        assert_eq!(restored.next_seq().expect("sequence"), 14);
+    }
+
+    #[test]
+    fn v045_snapshot_resaves_as_v2_and_round_trips() {
+        let v1 = load_snapshot_bytes(V045_SNAPSHOT).expect("v0.45.0 snapshot loads");
+        let counter = v1.seq_counter_value();
+        let v2 = encode_snapshot(&v1).expect("encode");
+        assert!(
+            v2.starts_with(SNAPSHOT_MAGIC_V2),
+            "v1 -> load -> save writes v2"
+        );
+        let again = load_snapshot_bytes(&v2).expect("v2 loads");
+        assert_v045_fixture_contents(&again);
+        assert_eq!(
+            again.seq_counter_value(),
+            counter,
+            "seq counter round-trips"
+        );
+        // v2 -> load -> save stays v2 and loses nothing. (Bytes are not
+        // compared: HashMap/HashSet iteration order varies per instance.)
+        let v2_again = encode_snapshot(&again).expect("re-encode");
+        assert!(v2_again.starts_with(SNAPSHOT_MAGIC_V2));
+        assert_eq!(v2_again.len(), v2.len());
+        let third = load_snapshot_bytes(&v2_again).expect("v2 reloads");
+        assert_v045_fixture_contents(&third);
+        assert_eq!(third.seq_counter_value(), counter);
+    }
+
+    #[test]
+    fn v2_snapshot_round_trips_new_fields() {
+        let owner = agent(1);
+        let mut store = KvStore::new(store_id(8), "v2".to_string(), owner, AccessPolicy::Signed)
+            .expect("kv store");
+        store
+            .put(
+                "k".to_string(),
+                b"v".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+        store.set_last_history_endorser_for_test(Some(agent(5)));
+        store.highest_checkpoint_seq = 11;
+        let _ = store.next_seq().expect("sequence");
+        let counter = store.seq_counter_value();
+        let bytes = encode_snapshot(&store).expect("encode");
+        assert!(bytes.starts_with(SNAPSHOT_MAGIC_V2));
+        let restored = load_snapshot_bytes(&bytes).expect("v2 loads");
+        assert_eq!(restored.last_history_endorser(), Some(&agent(5)));
+        assert_eq!(restored.highest_checkpoint_seq, 11);
+        assert_eq!(restored.seq_counter_value(), counter);
+        assert_eq!(
+            restored.get("k").map(|e| e.value.clone()),
+            Some(b"v".to_vec())
+        );
+        // Trailing bytes after a v2 body are rejected (exact consumption).
+        let mut long = bytes.clone();
+        long.push(0);
+        assert!(load_snapshot_bytes(&long).is_err());
+    }
+
+    #[test]
+    fn prerelease_v1_current_shape_snapshot_still_loads() {
+        // Unreleased v0.46 candidates wrote the v1 magic in front of the
+        // current `KvStore` shape; the exact-length fallback keeps them.
+        #[derive(Serialize)]
+        struct PreRelease<'a> {
+            store: &'a KvStore,
+            seq_counter: u64,
+        }
+        for endorser in [None, Some(agent(6))] {
+            let mut store = KvStore::new(
+                store_id(9),
+                "pre".to_string(),
+                agent(1),
+                AccessPolicy::Signed,
+            )
+            .expect("kv store");
+            store
+                .put(
+                    "k".to_string(),
+                    b"v".to_vec(),
+                    "text/plain".to_string(),
+                    peer(1),
+                )
+                .expect("put");
+            store.set_last_history_endorser_for_test(endorser);
+            let _ = store.next_seq().expect("sequence");
+            let counter = store.seq_counter_value();
+            let mut bytes = SNAPSHOT_MAGIC_V1.to_vec();
+            bytes.extend(
+                bincode::serialize(&PreRelease {
+                    store: &store,
+                    seq_counter: counter,
+                })
+                .expect("encode"),
+            );
+            let restored = load_snapshot_bytes(&bytes).expect("pre-release v1 loads");
+            assert_eq!(restored.last_history_endorser(), endorser.as_ref());
+            assert_eq!(restored.seq_counter_value(), counter);
+        }
     }
 
     #[test]
@@ -7849,6 +8094,256 @@ mod tests {
             .await
         );
         assert!(store.read().await.get("wrong-kind").is_none());
+    }
+
+    /// #836 (the #847 reviewer's synchronous pin, part 2 — the CONTEXT
+    /// half): a withdrawal must drop writer authorization COMPLETELY —
+    /// the role map cleared, the shared secret dropped and the
+    /// authorization generation bumped — and a live group that has lost
+    /// its secret must not authorize either. Pre-fix, withdrawal cleared
+    /// only the active-member set (an AdminOnly writer rode the stale
+    /// role map) and `authorizes_writer` had no secret requirement.
+    #[test]
+    fn gss_withdrawal_drops_writer_authorization_completely() {
+        let admin_kp = AgentKeypair::generate().expect("admin keypair");
+        let admin = admin_kp.agent_id();
+        let (mut group, mut contexts, group_id) = encrypted_group(&[admin]);
+        group.policy.write_access = crate::groups::GroupWriteAccess::AdminOnly;
+        let context = contexts.pop().expect("context");
+        context.update_from_group(&group);
+        assert!(
+            context.is_authorized_writer(&admin),
+            "an active admin is authorized while the group is live"
+        );
+        let epoch0 = context.current_epoch();
+        let generation0 = context
+            .encrypted_authorization_generation()
+            .expect("gss context reports its authorization generation");
+
+        // WITHDRAWAL: no role-map residue, no secret, new generation.
+        group.withdrawn = true;
+        context.update_from_group(&group);
+        assert!(
+            !context.is_authorized_writer(&admin),
+            "#836: a withdrawn admin is NOT an authorized writer (role map cleared, secret dropped)"
+        );
+        assert!(
+            !context.is_active_member(&admin),
+            "membership fails closed too"
+        );
+        assert_ne!(
+            context
+                .encrypted_authorization_generation()
+                .expect("generation"),
+            generation0,
+            "#836: withdrawal bumps the authorization generation (the merge-path fence)"
+        );
+        let store_id = store_id(97);
+        assert!(
+            context.seal(&store_id, b"withdrawn").is_err(),
+            "#836: sealing fails closed without the shared secret"
+        );
+
+        // A PRE-withdrawal verified (generation, epoch) authorization is
+        // refused at merge time: the generation fence inside
+        // `apply_if_encrypted_authorized` is what the merge path re-checks
+        // under the store lock.
+        let mut applied = false;
+        let refused =
+            context.apply_if_encrypted_authorized(&admin, epoch0, generation0, &mut || {
+                applied = true;
+                Ok(())
+            });
+        assert!(
+            refused.is_err(),
+            "#836: a generation taken before the withdrawal must not authorize after it"
+        );
+        assert!(!applied, "the merge closure never runs");
+
+        // A LIVE group that has lost its secret (a member-removal rotation
+        // this device has not caught up with) cannot authorize writers:
+        // pre-fix `authorizes_writer` had no secret requirement.
+        let member_kp = AgentKeypair::generate().expect("second keypair");
+        let member = member_kp.agent_id();
+        let (mut live, mut live_contexts, _) = encrypted_group(&[admin, member]);
+        live.policy.write_access = crate::groups::GroupWriteAccess::AdminOnly;
+        let live_context = live_contexts.pop().expect("live context");
+        live_context.update_from_group(&live);
+        assert!(live_context.is_authorized_writer(&admin));
+        live.shared_secret = None;
+        live_context.update_from_group(&live);
+        assert!(
+            !live_context.is_authorized_writer(&admin),
+            "#836: a secret-less live group must not authorize writers (no secret, no seal)"
+        );
+        let _ = group_id;
+    }
+
+    /// #836 (the #847 reviewer's synchronous pin, part 1 — the MERGE
+    /// half): the guarded encrypted merge runs ONLY for the store's own
+    /// attached context (the `Arc::ptr_eq` fence `merge_guarded_encrypted_delta`
+    /// enforces), and the composition the merge path performs —
+    /// `apply_if_encrypted_authorized` re-checking (generation, epoch,
+    /// writer) around the guarded merge — applies for a CURRENT admin at
+    /// the CURRENT epoch.
+    #[test]
+    fn guarded_encrypted_merge_requires_its_own_attached_context() {
+        let admin_kp = AgentKeypair::generate().expect("admin keypair");
+        let admin = admin_kp.agent_id();
+        let (mut group, mut contexts, group_id) = encrypted_group(&[admin]);
+        group.policy.write_access = crate::groups::GroupWriteAccess::AdminOnly;
+        let context = contexts.pop().expect("context");
+        // A SECOND context arc for the SAME group (a second open handle).
+        let other_context = std::sync::Arc::new(
+            GssKvSecureContext::from_group(&group).expect("group holds a shared secret"),
+        );
+        context.update_from_group(&group);
+        other_context.update_from_group(&group);
+        let epoch = context.current_epoch();
+        let generation = context
+            .encrypted_authorization_generation()
+            .expect("generation");
+
+        let id = store_id(98);
+        let mut store =
+            KvStore::new_encrypted(id, "Enc".to_string(), admin, group_id, context.clone())
+                .expect("encrypted store bound to the context");
+        let delta = |key: &str, seq: u64| {
+            KvStoreDelta::for_put(
+                key.to_string(),
+                KvEntry::new(key.to_string(), b"v".to_vec(), "text/plain".to_string()),
+                (peer(1), seq),
+                seq,
+            )
+        };
+        let as_err = |outcome: crate::kv::Result<crate::kv::store::MergeOutcome>| match outcome {
+            Ok(crate::kv::store::MergeOutcome::Rejected(reason)) => Err(KvError::Merge(format!(
+                "group-signed delta rejected by content admission: {reason:?}"
+            ))),
+            other => other.map(|_| ()),
+        };
+        let attached: std::sync::Arc<dyn crate::kv::encrypted::KvSecureContext> = context.clone();
+
+        // The composition the production merge path performs: re-checked
+        // authorization around the guarded merge, at the current epoch and
+        // generation, for a current admin — applies.
+        let mut merged = false;
+        let outcome = context.apply_if_encrypted_authorized(&admin, epoch, generation, &mut || {
+            merged = true;
+            as_err(store.merge_guarded_encrypted_delta(
+                &delta("sync-pin", 1),
+                peer(1),
+                &admin,
+                &attached,
+            ))
+        });
+        assert!(
+            outcome.is_ok(),
+            "current admin at current epoch merges: {outcome:?}"
+        );
+        assert!(merged, "the guarded merge ran");
+        assert!(store.get("sync-pin").is_some());
+
+        // The ptr_eq fence: the SAME group, but a DIFFERENT context arc —
+        // the guarded merge must refuse to run for a context the store did
+        // not attach (fail closed, never a cross-context merge).
+        let foreign: std::sync::Arc<dyn crate::kv::encrypted::KvSecureContext> =
+            other_context.clone();
+        let refused = store.merge_guarded_encrypted_delta(
+            &delta("foreign-pin", 2),
+            peer(1),
+            &admin,
+            &foreign,
+        );
+        assert!(
+            refused.is_err(),
+            "#836: the guarded merge requires the store's OWN attached context"
+        );
+        assert!(store.get("foreign-pin").is_none());
+    }
+
+    /// #836 (the #847 reviewer's pin of the MERGE-WIRING half, which the
+    /// synchronous tests cannot reach): a record sealed under the CURRENT
+    /// epoch by a STILL-AUTHORIZED writer, whose merge is already past
+    /// every pre-lock check and parked on the store lock, must be refused
+    /// when the group epoch rotates while it waits — the epoch and
+    /// generation fences `apply_if_encrypted_authorized` re-checks under
+    /// the store lock. With the merge path reverted to a plain
+    /// writer-checked merge (the pre-fix shape), the writer is still
+    /// authorized and the STALE-EPOCH record merges.
+    #[tokio::test]
+    async fn encrypted_epoch_rotation_during_store_lock_wait_refuses_stale_record() {
+        let keypair = AgentKeypair::generate().expect("admin keypair");
+        let admin = keypair.agent_id();
+        let (mut group, mut contexts, group_id) = encrypted_group(&[admin]);
+        group.policy.write_access = crate::groups::GroupWriteAccess::AdminOnly;
+        let context = contexts.pop().expect("context");
+        context.update_from_group(&group);
+        let epoch_before = context.current_epoch();
+        let secure = context.clone() as SharedKvSecureContext;
+        let id = store_id(99);
+        let target = Arc::new(RwLock::new(
+            KvStore::new_encrypted(id, "Enc".to_string(), admin, group_id, context.clone())
+                .expect("target store"),
+        ));
+        let signing = AuthorSigning::from_keypair(&keypair).expect("admin signer");
+        let pages = Arc::new(std::sync::Mutex::new(RetainedPagePool::default()));
+
+        let stale_delta = KvStoreDelta::for_put(
+            "epoch-race".to_string(),
+            KvEntry::new(
+                "epoch-race".to_string(),
+                b"stale-epoch".to_vec(),
+                "text/plain".to_string(),
+            ),
+            (peer(1), 1),
+            1,
+        );
+        let stale_record = secure
+            .seal_authorized(
+                &signing,
+                KvMutationKind::Delta,
+                &id,
+                &bincode::serialize(&stale_delta).expect("stale delta"),
+            )
+            .expect("record sealed under the current epoch");
+        let stale_wire = encode_delta(peer(1), &stale_record).expect("stale wire");
+
+        // Park the real receive future just past its pre-lock checks.
+        let merge = KvStoreSync::merge_encrypted_record(
+            &secure,
+            None,
+            &target,
+            &id,
+            peer(2),
+            &stale_wire,
+            &pages,
+        );
+        tokio::pin!(merge);
+        {
+            let _held_write = target.write().await;
+            assert!(futures::poll!(&mut merge).is_pending());
+            // The epoch rotates while the merge waits on the store lock.
+            let _ = group.rotate_shared_secret();
+            context.update_from_group(&group);
+            assert_ne!(
+                context.current_epoch(),
+                epoch_before,
+                "the group's secret epoch advanced"
+            );
+            assert!(
+                context.is_authorized_writer(&admin),
+                "the writer itself is STILL authorized (only the epoch moved)"
+            );
+        }
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(2), merge.as_mut())
+                .await
+                .expect("blocked merge completion"),
+            "#836: a record sealed under the pre-rotation epoch must be refused after the rotation"
+        );
+        let after = target.read().await;
+        assert!(after.get("epoch-race").is_none());
     }
 
     #[tokio::test]

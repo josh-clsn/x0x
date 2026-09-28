@@ -82,7 +82,10 @@ pub fn classify_dm_payload(payload: &[u8]) -> DmPayloadClass {
         || payload
             .strip_prefix(KV_STORE_DELTA_DM_PREFIX)
             .is_some_and(|bytes| {
-                serde_json::from_slice::<crate::kv::KvStoreDirectDelta>(bytes).is_ok()
+                // #1041: the payload is bincode; a legacy r1 JSON
+                // payload stays recognized.
+                bincode::deserialize::<crate::kv::KvStoreDirectDelta>(bytes).is_ok()
+                    || serde_json::from_slice::<crate::kv::KvStoreDirectDelta>(bytes).is_ok()
             })
         || crate::exec::protocol::decode_frame_payload(payload).is_ok()
         || payload.starts_with(LTC_CARD_FRAME_PREFIX)
