@@ -482,3 +482,392 @@ async fn unverified_raw_direct_mark_connected_cannot_confer_owner_trust() {
         Err(NetworkError::PeerTrustRejected { .. })
     ));
 }
+
+// ── #1040: enrolled owner-sync admission for a machine with no known agent ──
+
+/// A transport-authenticated machine whose discovery-cache entry is EMPTY
+/// (no agent announced on it), seen by an install owned by `local_owner`,
+/// enrolled per `enrollment` (signed by `enroller`, normally the owner).
+struct UnknownMachine {
+    _dir: tempfile::TempDir,
+    machine_kp: MachineKeypair,
+    machine_id: MachineId,
+    contacts: Arc<RwLock<ContactStore>>,
+    cache: Arc<RwLock<HashMap<AgentId, DiscoveredAgent>>>,
+    revocations: Arc<RwLock<RevocationSet>>,
+    move_state: Arc<RwLock<MoveState>>,
+    connect_policy: Arc<std::sync::RwLock<Arc<ConnectPolicy>>>,
+    devices: Arc<OwnerSyncStore>,
+    trust: OwnerTrust,
+}
+
+impl UnknownMachine {
+    async fn new(
+        local_owner: &UserKeypair,
+        enroller: &UserKeypair,
+        enrollment: Enrollment,
+    ) -> Self {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let machine_kp = MachineKeypair::generate().expect("machine keygen");
+        let machine_id = machine_kp.machine_id();
+        let devices = OwnerSyncStore::load(dir.path())
+            .await
+            .expect("device store");
+        let now_ms = unix_now_secs().saturating_mul(1000);
+        let enrolled = match enrollment {
+            Enrollment::Current => {
+                Some(OwnerEnrollment::sign(machine_id, enroller, now_ms, None).expect("sign"))
+            }
+            Enrollment::Expired => {
+                Some(OwnerEnrollment::sign(machine_id, enroller, 1_000, Some(2_000)).expect("sign"))
+            }
+            Enrollment::None => None,
+        };
+        if let Some(enrolled) = enrolled {
+            devices.enroll(enrolled).await.expect("enroll");
+        }
+        let devices = Arc::new(devices);
+        let trust = OwnerTrust::new(
+            Some(local_owner.user_id()),
+            AuthenticatedMachineBindings::default(),
+        );
+        trust.install_device_store(Arc::clone(&devices));
+        Self {
+            machine_kp,
+            machine_id,
+            contacts: Arc::new(RwLock::new(ContactStore::new(
+                dir.path().join("contacts.json"),
+            ))),
+            cache: Arc::new(RwLock::new(HashMap::new())),
+            revocations: Arc::new(RwLock::new(RevocationSet::new())),
+            move_state: Arc::new(RwLock::new(MoveState::default())),
+            connect_policy: Arc::new(std::sync::RwLock::new(Arc::new(ConnectPolicy::default()))),
+            devices,
+            trust,
+            _dir: dir,
+        }
+    }
+
+    async fn enrolled() -> (UserKeypair, Self) {
+        let owner = UserKeypair::generate().expect("owner keygen");
+        let machine = Self::new(&owner, &owner, Enrollment::Current).await;
+        (owner, machine)
+    }
+
+    /// The accept loop's pre-prefix branch decision.
+    async fn candidate(&self) -> bool {
+        crate::Agent::enrolled_owner_sync_candidate(
+            &self.cache,
+            &self.revocations,
+            &self.trust,
+            &self.machine_id,
+        )
+        .await
+    }
+
+    /// The accept loop's post-prefix routing for `protocol`.
+    async fn route(
+        &self,
+        protocol: crate::streams::StreamProtocol,
+    ) -> crate::EnrolledOwnerSyncRoute<()> {
+        crate::Agent::route_enrolled_owner_sync(
+            &self.cache,
+            &self.revocations,
+            &self.trust,
+            &self.machine_id,
+            protocol,
+            || (),
+        )
+        .await
+    }
+
+    /// Whether the post-prefix routing admits `protocol` on enrollment.
+    async fn admits(&self, protocol: crate::streams::StreamProtocol) -> bool {
+        matches!(
+            self.route(protocol).await,
+            crate::EnrolledOwnerSyncRoute::Admitted(())
+        )
+    }
+
+    /// Make an agent KNOWN on this machine (as a delivered announcement
+    /// would), returning its id.
+    async fn learn_agent(&self) -> AgentId {
+        let agent_kp = AgentKeypair::generate().expect("agent keygen");
+        let agent_id = agent_kp.agent_id();
+        self.cache.write().await.insert(
+            agent_id,
+            DiscoveredAgent {
+                self_name: None,
+                agent_id,
+                machine_id: self.machine_id,
+                user_id: None,
+                addresses: Vec::new(),
+                announced_at: 0,
+                last_seen: 0,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                cert_not_after: None,
+                agent_certificate: None,
+                agent_public_key: agent_kp.public_key().as_bytes().to_vec(),
+                cert_digest: None,
+            },
+        );
+        agent_id
+    }
+
+    /// Both halves: what an inbound SyncV1 stream actually gets.
+    async fn sync_v1_admitted(&self) -> bool {
+        self.candidate().await && self.admits(crate::streams::StreamProtocol::SyncV1).await
+    }
+
+    /// The shared inbound gate (datagram lane, forwards, and the accept
+    /// loop for every machine outside the #1040 branch).
+    async fn shared_gate(&self) -> Result<Vec<AgentId>, NetworkError> {
+        crate::Agent::gate_peer_machine_inbound(
+            &self.cache,
+            &self.contacts,
+            &self.revocations,
+            &self.move_state,
+            &self.connect_policy,
+            &self.trust,
+            &self.machine_id,
+        )
+        .await
+    }
+}
+
+const NON_SYNC_PROTOCOLS: [crate::streams::StreamProtocol; 4] = [
+    crate::streams::StreamProtocol::ForwardV1,
+    crate::streams::StreamProtocol::SocksV1,
+    crate::streams::StreamProtocol::ForwardV2,
+    crate::streams::StreamProtocol::WebRtcV1,
+];
+
+// #1040 positive control: the verified enrollment alone admits SyncV1 from
+// a machine the discovery cache does not know. Without this the negative
+// cases below would pass vacuously.
+#[tokio::test]
+async fn enrolled_machine_with_no_known_agent_is_admitted_for_sync_v1() {
+    let (_owner, m) = UnknownMachine::enrolled().await;
+    assert!(m.cache.read().await.is_empty(), "no agent is known");
+    assert!(m.sync_v1_admitted().await);
+}
+
+// #1040: nothing is widened. An enrolled but otherwise unknown machine's
+// forward, SOCKS, and media streams are still denied, and the shared gate
+// (datagram lane, forward decisions) still says `deny_not_verified`.
+#[tokio::test]
+async fn enrolled_machine_with_no_known_agent_gets_no_other_stream_kind() {
+    let (_owner, m) = UnknownMachine::enrolled().await;
+    assert!(
+        m.candidate().await,
+        "precondition: the #1040 branch is taken"
+    );
+    for protocol in NON_SYNC_PROTOCOLS {
+        assert!(
+            !m.admits(protocol).await,
+            "{protocol:?} from an enrolled but unknown machine must stay denied"
+        );
+    }
+    assert!(matches!(
+        m.shared_gate().await,
+        Err(NetworkError::PeerNotVerified { .. })
+    ));
+}
+
+// #1040: a transport-authenticated machine that is NOT enrolled is still
+// denied its SyncV1 stream.
+#[tokio::test]
+async fn non_enrolled_machine_sync_v1_is_denied() {
+    let owner = UserKeypair::generate().expect("owner keygen");
+    let m = UnknownMachine::new(&owner, &owner, Enrollment::None).await;
+    assert!(!m.candidate().await);
+    assert!(!m.admits(crate::streams::StreamProtocol::SyncV1).await);
+    assert!(matches!(
+        m.shared_gate().await,
+        Err(NetworkError::PeerNotVerified { .. })
+    ));
+}
+
+// #1040: an enrollment signed by a DIFFERENT owner is not in this device's
+// verified set (the signature must chain to the local owner).
+#[tokio::test]
+async fn foreign_owner_enrollment_is_denied() {
+    let owner = UserKeypair::generate().expect("owner keygen");
+    let stranger = UserKeypair::generate().expect("stranger keygen");
+    let m = UnknownMachine::new(&owner, &stranger, Enrollment::Current).await;
+    assert!(!m.sync_v1_admitted().await);
+}
+
+// #1040: an expired enrollment is denied.
+#[tokio::test]
+async fn expired_enrollment_is_denied_for_sync_v1_admission() {
+    let owner = UserKeypair::generate().expect("owner keygen");
+    let m = UnknownMachine::new(&owner, &owner, Enrollment::Expired).await;
+    assert!(!m.candidate().await);
+    assert!(!m.admits(crate::streams::StreamProtocol::SyncV1).await);
+}
+
+// #1040: a revoked machine (ADR-0018 revocation set) is denied even though
+// its enrollment still verifies, and the re-check after the prefix read
+// catches a revocation that lands after the pre-prefix check.
+#[tokio::test]
+async fn revoked_machine_enrollment_is_denied_even_mid_admission() {
+    let (_owner, m) = UnknownMachine::enrolled().await;
+    assert!(
+        m.candidate().await,
+        "precondition: admitted before revocation"
+    );
+    let record = RevocationRecord::sign(
+        RevokedSubject::Machine(m.machine_id),
+        m.machine_kp.public_key(),
+        m.machine_kp.secret_key(),
+        unix_now_secs(),
+        None,
+    )
+    .expect("sign machine revocation");
+    m.revocations
+        .write()
+        .await
+        .verify_and_insert(record, None)
+        .expect("insert machine revocation");
+    assert!(
+        !m.admits(crate::streams::StreamProtocol::SyncV1).await,
+        "the post-prefix re-check must see the revocation"
+    );
+    assert!(!m.candidate().await);
+}
+
+// #1040: a deleted enrollment (`DELETE /sync/devices/:id`) is denied.
+#[tokio::test]
+async fn deleted_enrollment_is_denied() {
+    let (_owner, m) = UnknownMachine::enrolled().await;
+    assert!(m.sync_v1_admitted().await, "precondition");
+    assert!(m.devices.unenroll(&m.machine_id).await.expect("unenroll"));
+    assert!(!m.sync_v1_admitted().await);
+}
+
+// #1040: the branch is only for machines with NO known agent. Once any
+// agent is known on the machine, the shared agent-level gate decides (so
+// revoked/blocked/expired agents are never bypassed by the enrollment).
+#[tokio::test]
+async fn known_agent_on_enrolled_machine_uses_the_shared_gate() {
+    let (_owner, m) = UnknownMachine::enrolled().await;
+    m.learn_agent().await;
+    assert!(!m.candidate().await);
+}
+
+// #1044 review round 1 (P2): the pre-prefix check found no known agent, but
+// a BLOCKED agent on the machine becomes known while the prefix is read.
+// The post-prefix routing must send the stream to the shared gate (which
+// denies it), not admit it on the enrollment alone. Deterministic: the
+// agent is learned between the two decisions, with no sleeps. Before the
+// fix the post-prefix step re-checked only the enrollment and admitted.
+#[tokio::test]
+async fn agent_learned_during_prefix_read_goes_through_the_shared_gate() {
+    let (_owner, m) = UnknownMachine::enrolled().await;
+    assert!(m.candidate().await, "pre-prefix: enrolled, no known agent");
+    let agent_id = m.learn_agent().await;
+    m.contacts
+        .write()
+        .await
+        .set_trust(&agent_id, TrustLevel::Blocked);
+    assert_eq!(
+        m.route(crate::streams::StreamProtocol::SyncV1).await,
+        crate::EnrolledOwnerSyncRoute::SharedGate,
+        "an agent known at admission time must not ride the enrollment-only path"
+    );
+    assert!(matches!(
+        m.shared_gate().await,
+        Err(NetworkError::PeerTrustRejected { .. })
+    ));
+}
+
+// #1044 P2, the ACL arm: the newly known agent is otherwise acceptable
+// (a Trusted contact) but not on an Enabled connect ACL. The shared gate's
+// ACL still applies, so the stream is denied.
+#[tokio::test]
+async fn agent_learned_during_prefix_read_is_still_subject_to_the_connect_acl() {
+    let (_owner, m) = UnknownMachine::enrolled().await;
+    assert!(m.candidate().await, "pre-prefix: enrolled, no known agent");
+    let agent_id = m.learn_agent().await;
+    m.contacts
+        .write()
+        .await
+        .set_trust(&agent_id, TrustLevel::Trusted);
+    assert!(
+        m.shared_gate().await.is_ok(),
+        "precondition: trusted passes"
+    );
+    *m.connect_policy
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Arc::new(ConnectPolicy::Enabled(ConnectAcl {
+            loaded_from: std::path::PathBuf::from("/test/connect-acl.toml"),
+            loaded_at_unix_ms: 0,
+            allow: Vec::new(),
+            owner_allow: Vec::new(),
+            grant_allow: Vec::new(),
+        }));
+    assert_eq!(
+        m.route(crate::streams::StreamProtocol::SyncV1).await,
+        crate::EnrolledOwnerSyncRoute::SharedGate
+    );
+    assert!(matches!(
+        m.shared_gate().await,
+        Err(NetworkError::PeerNotInConnectAcl { .. })
+    ));
+}
+
+// #1044 P2: the admission closure runs only on the enrollment-only path,
+// and never when an agent is known (the handoff is decided under the same
+// discovery-cache guard as the "no known agent" check).
+#[tokio::test]
+async fn admission_closure_runs_only_while_no_agent_is_known() {
+    let (_owner, m) = UnknownMachine::enrolled().await;
+    let mut ran = false;
+    let route = crate::Agent::route_enrolled_owner_sync(
+        &m.cache,
+        &m.revocations,
+        &m.trust,
+        &m.machine_id,
+        crate::streams::StreamProtocol::SyncV1,
+        || ran = true,
+    )
+    .await;
+    assert_eq!(route, crate::EnrolledOwnerSyncRoute::Admitted(()));
+    assert!(ran);
+    m.learn_agent().await;
+    let mut ran = false;
+    let route = crate::Agent::route_enrolled_owner_sync(
+        &m.cache,
+        &m.revocations,
+        &m.trust,
+        &m.machine_id,
+        crate::streams::StreamProtocol::SyncV1,
+        || ran = true,
+    )
+    .await;
+    assert_eq!(route, crate::EnrolledOwnerSyncRoute::SharedGate);
+    assert!(!ran, "no enrollment-only handoff once an agent is known");
+}
+
+// #1040: an install without the owner device set installed (or without an
+// owner) admits nothing on enrollment.
+#[tokio::test]
+async fn no_device_store_or_no_owner_admits_nothing() {
+    let (owner, mut m) = UnknownMachine::enrolled().await;
+    m.trust = OwnerTrust::new(
+        Some(owner.user_id()),
+        AuthenticatedMachineBindings::default(),
+    );
+    assert!(!m.sync_v1_admitted().await, "no device store installed");
+    m.trust = OwnerTrust::new(None, AuthenticatedMachineBindings::default());
+    m.trust.install_device_store(Arc::clone(&m.devices));
+    assert!(!m.sync_v1_admitted().await, "ownerless install");
+}

@@ -151,6 +151,21 @@ impl StreamAccept {
             .unwrap_or_else(|| self.tx.clone())
     }
 
+    /// The registered acceptor's sender for `protocol`, and ONLY that: never
+    /// the default channel. The #1040 enrolled owner-sync admission routes
+    /// through this, so a stream admitted on enrollment alone reaches the
+    /// owner-sync acceptor or nothing.
+    pub(crate) fn registered_sender(
+        &self,
+        protocol: StreamProtocol,
+    ) -> Option<tokio::sync::mpsc::Sender<PeerStream>> {
+        let acceptors = self
+            .acceptors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        acceptors.get(&protocol.as_u8()).cloned()
+    }
+
     /// Register the single acceptor for `protocol` (bounded channel of
     /// [`STREAM_ACCEPTOR_CAPACITY`]). Fails with
     /// [`NetworkError::StreamAcceptorConflict`] when an acceptor is already
@@ -424,7 +439,10 @@ pub enum StreamProtocol {
     /// machines. The ADR-0022 identity gates apply exactly as for every
     /// other protocol; the sync acceptor additionally fails closed unless
     /// the remote machine is in the local owner device set (owner-key
-    /// signed enrollment).
+    /// signed enrollment). The one difference (#1040): when the
+    /// transport-authenticated machine has NO known agent, the accept loop
+    /// admits a `SyncV1` stream (and only a `SyncV1` stream) if the
+    /// machine holds a verified, current, unrevoked owner enrollment.
     SyncV1 = 0x05,
 }
 
@@ -474,6 +492,11 @@ pub struct PeerStream {
     /// therefore check **every** agent and fail-closed if any is
     /// unauthorized (issue #192). The list reflects announced agents only;
     /// see `docs/connect-acl.md` "Limitations: announced agents only".
+    ///
+    /// Exception (#1040): a `SyncV1` stream admitted or opened on the
+    /// owner-signed enrollment of a machine with no known agent carries an
+    /// EMPTY list. Such a stream reaches only the registered owner-sync
+    /// acceptor, which uses [`PeerStream::peer`] and never `agent()`.
     agents: Vec<crate::identity::AgentId>,
     peer: MachineId,
     protocol: StreamProtocol,
