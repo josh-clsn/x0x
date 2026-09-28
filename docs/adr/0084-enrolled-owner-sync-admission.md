@@ -56,8 +56,8 @@
   owner sync may be admitted without the agent-level gate.
 - **Fail closed:** revoked, expired, deleted or unverifiable enrollments must be
   denied, with no cached verdict.
-- **No unauthenticated addressing:** a dial must never be steerable by an
-  announcement or rendezvous hint.
+- **Authenticated identity:** a dial may use untrusted address hints, but
+  it must reach only the enrolled machine's peer id.
 
 ## Considered Options
 
@@ -100,9 +100,14 @@ We will take option 1, in its merged form (#1044, with #1050 as a follow-up):
 3. **Outbound dial.**
    - When no agent is known on an enrolled machine, the owner-sync pass dials
      it by machine id.
-   - Enrollments carry no addresses, so the **only** address source is the
-     bootstrap-cache entry for that PeerId.
-   - Every dial is peer-authenticated, and an existing connection is reused.
+   - Enrollments carry no addresses, so the address source is the
+     bootstrap-cache entry for that PeerId. **Those addresses are hints, not
+     trusted data:** the cache is also filled from identity announcements
+     (`src/lib.rs` ~9094–9114, ~9847–9863).
+   - Every dial is peer-authenticated (QUIC peer id = enrolled machine id),
+     so a wrong or poisoned address cannot reach an impostor. It can only
+     waste a dial attempt or delay sync until a good address is learned.
+   - An existing connection is reused.
 4. **Re-announce.** When an enrolled owner machine connects, the device
    re-announces its identity and starts a sync pass. This happens at most once
    per machine every 60 s (`OWNER_REANNOUNCE_MIN_INTERVAL`). Owner sync does
@@ -126,6 +131,19 @@ We will take option 1, in its merged form (#1044, with #1050 as a follow-up):
 
 ### Negative / Trade-offs
 
+- **Denials this path skips.** On this path the discovery cache has no agent
+  for the machine, so the agent-level ADR-0022 gate does not run. That gate
+  would otherwise apply (`src/lib.rs` ~14065–14139):
+  - agent revocation;
+  - agent-certificate expiry;
+  - blocked-contact and pinning checks;
+  - retired-binding and placement enforcement;
+  - the connect ACL.
+
+  Only these machine-level checks apply here:
+  - machine revocation (ADR-0018);
+  - owner-signed, current enrollment;
+  - the owner-key session proof.
 - **The ADR-0041 bound on a compromised owner machine becomes weaker.**
   - Before, a machine holding a valid enrollment also needed a known agent that
     passed trust and the connect ACL.
@@ -136,6 +154,29 @@ We will take option 1, in its merged form (#1044, with #1050 as a follow-up):
     the owner-key session proof.
   - To stop a machine syncing, the owner must revoke or un-enroll it. An ACL
     entry is not enough.
+- **Enrollment freshness and removal:**
+  - Expiry is checked with the 5-minute clock-skew grace
+    (`ENROLL_EXPIRY_SKEW_MS`), so an enrollment admits for up to 5 minutes
+    after its stated expiry.
+  - `unenroll` deletes the record without a tombstone. Deletion is local to
+    this device. If an old, still-unexpired owner-signed enrollment for that
+    machine is later re-inserted locally, for example by restoring
+    `sync/devices.json` from a backup or re-running `enroll`, admission comes
+    back. This is not a remote replay path, because enrollments are not
+    accepted from the network.
+  - An admitted owner-sync session is **not** re-checked while it is open. A
+    revocation, expiry or unenroll takes effect on the next admission, not
+    inside a live session.
+- **Revocation race at admission.**
+  - `is_enrolled_owner_machine` checks the revocation set and then releases
+    that lock before the enrollment check and the discovery-lock handoff.
+  - The SyncV1 acceptor (`owner_sync.rs` `handle_inbound`) re-checks
+    enrollment but not machine revocation.
+  - So a machine revocation that lands inside that window does not stop the
+    session that is already being admitted.
+  - **Required follow-up before the v0.46.0 release candidate:** the acceptor
+    re-checks the machine revocation set, with a test in which the revocation
+    lands after the gate and before the acceptor.
 - **Two admission paths now exist for one stream kind.** They converge on the
   same acceptor, and the atomic re-check decides between them. W3's single
   `Authority::decide` (charter D17) should fold both into one decision function.
@@ -162,7 +203,10 @@ These tests are in #1044:
   - an enrolled machine with no known agent is admitted for `SyncV1` and gets
     no other stream kind;
   - a non-enrolled machine is denied, and so is a foreign-owner, expired,
-    deleted or revoked enrollment (revoked is denied even mid-admission);
+    deleted or revoked enrollment. "Revoked mid-admission" covers a
+    revocation that lands before the post-prefix re-check, **not** one that
+    lands between that re-check and the acceptor (see the revocation race
+    under Trade-offs);
   - a known agent takes the shared gate;
   - an agent learned during the prefix read takes the shared gate, including
     the connect ACL;
@@ -176,6 +220,6 @@ sealed testnet. #1040 stays open until this ADR is decided.
 
 - Do not add a verification cache to `is_enrolled_owner_machine`.
 - Do not route enrollment-admitted streams to the default channel.
-- Do not add address sources to the outbound dial other than the bootstrap
-  cache.
+- Treat every dial address as an untrusted hint. Rely only on peer-id
+  authentication, never on where an address came from.
 - Any new stream kind that wants enrollment-only admission needs its own ADR.
