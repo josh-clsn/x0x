@@ -631,6 +631,14 @@ async fn load_config(path: &str) -> Result<DaemonConfig> {
     Ok(config)
 }
 
+/// Whether the stdout log layer emits ANSI colour codes.
+///
+/// #1036: colour the stdout log only for an interactive terminal, and never
+/// when `NO_COLOR` is set (<https://no-color.org/>).
+fn log_ansi_enabled(stdout_is_terminal: bool, no_color: bool) -> bool {
+    stdout_is_terminal && !no_color
+}
+
 /// Initialize structured logging.
 ///
 /// Filter resolution order:
@@ -644,12 +652,6 @@ async fn load_config(path: &str) -> Result<DaemonConfig> {
 /// sink. **The caller must keep it alive for the process lifetime** — dropping
 /// it shuts the writer thread down and every subsequent log line is silently
 /// discarded (issue #600).
-/// #1036: colour the stdout log only for an interactive terminal, and never
-/// when `NO_COLOR` is set (<https://no-color.org/>).
-fn log_ansi_enabled(stdout_is_terminal: bool, no_color: bool) -> bool {
-    stdout_is_terminal && !no_color
-}
-
 fn init_logging(level: &str, format: &str) -> Result<WorkerGuard> {
     use tracing_subscriber::EnvFilter;
 

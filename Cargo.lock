@@ -146,9 +146,9 @@ dependencies = [
 
 [[package]]
 name = "ant-quic"
-version = "0.27.53"
+version = "0.27.54"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0adb90f354208d58c7bf665df290f5732b4a861455d792944c6c889f74e194b1"
+checksum = "39b673f80aaf68d1245be706eda158c3e3334c127ac13998b9e4ae02522fbacf"
 dependencies = [
  "anyhow",
  "async-trait",
