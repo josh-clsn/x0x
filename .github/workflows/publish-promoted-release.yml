@@ -33,6 +33,9 @@ jobs:
     # Draft creation is a staging boundary. Ecosystem publication is performed
     # only after the exact draft bytes pass the operator promotion checklist.
     needs: validate-promoted-release
+    # A `release: published` run has GITHUB_REF = refs/tags/<tag_name>, so the
+    # tag-restricted `release` environment admits it.
+    environment: release
     runs-on: ubuntu-latest
     env:
       CLAWHUB_REGISTRY: https://clawhub.ai
@@ -303,6 +306,7 @@ jobs:
   publish-crates:
     name: Publish to crates.io
     needs: validate-promoted-release
+    environment: release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
