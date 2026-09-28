@@ -2,7 +2,8 @@
 
 <!-- File name: docs/adr/0083-agent-initiated-gui-show.md -->
 
-- **Status:** Proposed — needs David Irvine's acceptance
+- **Status:** Accepted
+- **Accepted:** 2026-09-28 by David Irvine (decisions Q1–Q5; remote show on by default; status change applied by Claude at his instruction)
 - **Date:** 2026-09-27
 - **Decision owners:** David Irvine (decision), Claude (drafting)
 - **Reviewers:** pending — David Irvine (acceptance); omp (cross-model review)
