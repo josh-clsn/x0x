@@ -610,13 +610,23 @@ struct CreatorOfflineScenario {
 ///    never arrived.
 /// 5. The admin is promoted, per `promotion`.
 async fn creator_offline_scenario(promotion: Promotion) -> Result<CreatorOfflineScenario> {
+    creator_offline_scenario_on_plane(promotion, false, 0, false, false).await
+}
+
+async fn creator_offline_scenario_on_plane(
+    promotion: Promotion,
+    home_treekem: bool,
+    extra_seats: usize,
+    legacy_sidecar: bool,
+    recover: bool,
+) -> Result<CreatorOfflineScenario> {
     let seed: [u8; 32] = rand::random();
     let owner = x0x::identity::UserKeypair::from_seed(&seed)?;
     let (creator, _creator_dir, creator_cert) = owner_device_state(&seed).await?;
     let (admin, admin_dir, admin_cert) = owner_device_state(&seed).await?;
     let creator_hex = hex::encode(creator.agent.agent_id().as_bytes());
     let admin_hex = hex::encode(admin.agent.agent_id().as_bytes());
-    let group_id = hex::encode(rand::random::<[u8; 32]>());
+    let mut group_id = hex::encode(rand::random::<[u8; 32]>());
 
     // (1) The creator's owner-certified group, creator seat byte-bearing.
     let mut base = x0x::groups::GroupInfo::with_policy(
@@ -635,6 +645,13 @@ async fn creator_offline_scenario(promotion: Promotion) -> Result<CreatorOffline
     assert_eq!(base.secure_plane, x0x::mls::SecureGroupPlane::Gss);
     base.set_member_certificate(&creator_hex, creator_cert.clone())
         .expect("the creator's certificate binds its own seat");
+    for _ in 0..extra_seats {
+        let key = x0x::identity::AgentKeypair::generate()?;
+        let id = hex::encode(key.agent_id().as_bytes());
+        base.add_member(id.clone(), x0x::groups::GroupRole::Member, None, None);
+        base.set_member_certificate(&id, x0x::identity::AgentCertificate::issue(&owner, &key)?)
+            .expect("extra certificate binds its seat");
+    }
     seal_commit_owner_certified(
         &creator,
         &mut base,
@@ -648,12 +665,29 @@ async fn creator_offline_scenario(promotion: Promotion) -> Result<CreatorOffline
         .await
         .insert(group_id.clone(), base.clone());
 
+    let prepared = if home_treekem {
+        creator.named_groups.write().await.remove(&group_id);
+        super::super::super::home::provision_home(&creator).await;
+        let (_, home) = super::super::super::home::find_home(&creator, &owner.user_id())
+            .await
+            .expect("provisioned Home");
+        base = home;
+        group_id = base.mls_group_id.clone();
+        assert_eq!(base.secure_plane, x0x::mls::SecureGroupPlane::TreeKem);
+        let seed = agent_treekem_seed(&admin.agent, &hex::decode(&group_id)?);
+        Some(x0x::mls::TreeKemMlsGroup::prepare_member(
+            admin.agent.agent_id(),
+            &seed,
+        )?)
+    } else {
+        None
+    };
+
     // (2) The admin-to-be's stub: the creator's seat is digest-only.
     let mut stub = base.clone();
-    stub.members_v2
-        .get_mut(&creator_hex)
-        .expect("creator seat")
-        .certificate = None;
+    for seat in stub.members_v2.values_mut() {
+        seat.certificate = None;
+    }
     admin
         .named_groups
         .write()
@@ -685,13 +719,15 @@ async fn creator_offline_scenario(promotion: Promotion) -> Result<CreatorOffline
         Json(AddNamedGroupMemberRequest {
             agent_id: admin_hex.clone(),
             display_name: None,
-            treekem_key_package_b64: None,
+            treekem_key_package_b64: prepared
+                .as_ref()
+                .map(|p| BASE64.encode(p.key_package_bytes())),
         }),
     )
     .await
     .into_response();
     assert_eq!(response.status(), StatusCode::OK, "the creator admits");
-    let seat_event = creator
+    let mut seat_event = creator
         .named_group_test_recorders
         .publish_bytes
         .lock()
@@ -703,6 +739,22 @@ async fn creator_offline_scenario(promotion: Promotion) -> Result<CreatorOffline
                 if *agent_id == admin_hex)
         })
         .expect("the creator published the admin's seat event");
+    if extra_seats > 0 {
+        let NamedGroupMetadataEvent::MemberAdded {
+            roster_certificates_b64,
+            ..
+        } = &mut seat_event
+        else {
+            panic!("seat event")
+        };
+        assert!(
+            roster_certificates_b64.len() < extra_seats + 1,
+            "the production builder really trimmed the large group's sidecar"
+        );
+        if legacy_sidecar {
+            roster_certificates_b64.clear();
+        }
+    }
     let served_join_result = join_result_payload_with_roster_certificates(
         &creator,
         &group_id,
@@ -752,14 +804,126 @@ async fn creator_offline_scenario(promotion: Promotion) -> Result<CreatorOffline
             Some(event)
         }
     };
+    // Deliver the actual staged Welcome inline, without a live creator or
+    // a JoinResult when the receiver processes the seat event.
+    if home_treekem {
+        let NamedGroupMetadataEvent::MemberAdded {
+            treekem_welcome_b64,
+            welcome_ref,
+            roster_certificates_b64,
+            ..
+        } = &mut seat_event
+        else {
+            panic!("TreeKEM seat event")
+        };
+        assert_eq!(
+            roster_certificates_b64,
+            &vec![cert_b64(&creator_cert)],
+            "the separate TreeKEM Home builder attaches the creator certificate"
+        );
+        let reference = welcome_ref.take().expect("staged Welcome");
+        let welcomes = creator.pending_welcomes.read().await;
+        let welcome = welcomes.get(&reference.welcome_id).expect("Welcome bytes");
+        *treekem_welcome_b64 = Some(BASE64.encode(&welcome.bytes));
+    }
+    if extra_seats > 0 {
+        // Seat from the event ONLY. Never fetch/deliver a JoinResult.
+        assert!(
+            apply_named_group_metadata_event(
+                &admin,
+                seat_event.clone(),
+                creator.agent.agent_id(),
+                true,
+                None
+            )
+            .await
+            .accepted
+        );
+        let missing: Vec<_> = admin
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .expect("group")
+            .active_members()
+            .filter(|seat| seat.certificate.is_none())
+            .map(|seat| {
+                (
+                    seat.agent_id.clone(),
+                    seat.certificate_digest.clone().expect("digest"),
+                )
+            })
+            .collect();
+        assert!(
+            !missing.is_empty(),
+            "trimmed seats remain digest-only until fetched"
+        );
+        for (_, digest) in &missing {
+            assert!(
+                admin
+                    .cert_fetch_requested
+                    .lock()
+                    .expect("requests")
+                    .contains_key(digest),
+                "admission must request every omitted certificate BEFORE the first seal"
+            );
+        }
+        if recover {
+            // Deterministic transport harness: exercise both #946 handlers.
+            // Only the authority holds omitted bytes, solely on roster seats.
+            for (member, digest) in &missing {
+                let request = serde_json::to_vec(&seat_cert_fetch::GroupCertFetchRequest {
+                    group_id: group_id.clone(),
+                    cert_digest: digest.clone(),
+                    requester: admin_hex.clone(),
+                })?;
+                assert!(
+                    seat_cert_fetch::handle_group_cert_fetch_request(
+                        &creator,
+                        &request,
+                        Some(&admin.agent.agent_id()),
+                        true,
+                        &group_id
+                    )
+                    .await
+                );
+                let cert = creator
+                    .named_groups
+                    .read()
+                    .await
+                    .get(&group_id)
+                    .expect("group")
+                    .members_v2
+                    .get(member)
+                    .expect("member")
+                    .certificate
+                    .clone()
+                    .expect("bytes");
+                let response = serde_json::to_vec(&seat_cert_fetch::GroupCertFetchResponse {
+                    group_id: group_id.clone(),
+                    cert_digest: digest.clone(),
+                    cert_json_b64: BASE64.encode(serde_json::to_vec(&cert)?),
+                })?;
+                assert!(
+                    seat_cert_fetch::handle_group_cert_fetch_response(
+                        &admin, &response, true, &group_id
+                    )
+                    .await
+                );
+            }
+        }
+    }
     let creator_id = creator.agent.agent_id();
     creator.agent.shutdown().await;
     drop(creator);
 
     // (4) The admin is seated by the seat event alone.
-    let applied =
-        apply_named_group_metadata_event(&admin, seat_event.clone(), creator_id, true, None).await;
-    assert!(applied.accepted, "the seat event seats the admin");
+    if extra_seats == 0 {
+        let applied =
+            apply_named_group_metadata_event(&admin, seat_event.clone(), creator_id, true, None)
+                .await;
+        assert!(applied.accepted, "the seat event seats the admin");
+    }
 
     // (5b) Promotion.
     match role_event {
@@ -998,6 +1162,107 @@ async fn member_added_certificate_sidecar_is_wire_compatible() -> Result<()> {
         "the JoinResult's event copy drops the sidecar"
     );
     assert_eq!(roster_certificates_b64, vec![cert_b64(&s.creator_cert)]);
+    s.admin.agent.shutdown().await;
+    Ok(())
+}
+
+/// Exercises the separate TreeKEM Home builder and the real signed promotion.
+/// Runtime execution belongs to isolated Linux CI, never the macOS host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn treekem_home_promoted_admin_seals_while_creator_offline() -> Result<()> {
+    let s =
+        creator_offline_scenario_on_plane(Promotion::SignedCommit, true, 0, false, false).await?;
+    assert!(
+        s.admin
+            .treekem_groups
+            .read()
+            .await
+            .contains_key(&s.group_id),
+        "the receiver installed its own TreeKEM Welcome"
+    );
+    assert!(seat_has_bytes(&s.admin, &s.group_id, &s.creator_hex).await);
+    let commit = promoted_admin_seals_new_joiner(&s, &[]).await?;
+    assert!(!commit.roster_root.is_empty());
+    s.admin.agent.shutdown().await;
+    Ok(())
+}
+
+/// Legacy MemberAdded events have no sidecar, but still need the same
+/// post-apply certificate recovery as a trimmed event. Pure wire unit test.
+#[test]
+fn legacy_member_added_retains_certificate_recovery_context() {
+    let event: NamedGroupMetadataEvent = serde_json::from_value(serde_json::json!({
+        "event": "member_added", "group_id": "group", "revision": 1,
+        "actor": "creator", "agent_id": "joiner", "display_name": null
+    }))
+    .expect("legacy event");
+    assert_eq!(
+        seat_cert_fetch::member_added_sidecar(&event),
+        Some(("group".to_string(), Vec::new())),
+        "an empty legacy sidecar must not skip post-apply recovery"
+    );
+}
+
+/// Red before the fix: seating does not request the trimmed certificates.
+/// With recovery during admission, all other holders can leave before seal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn trimmed_member_added_recovers_before_creator_offline_seal() -> Result<()> {
+    let s =
+        creator_offline_scenario_on_plane(Promotion::SignedCommit, false, 20, false, true).await?;
+    assert!(!promoted_admin_seals_new_joiner(&s, &[])
+        .await?
+        .roster_root
+        .is_empty());
+    s.admin.agent.shutdown().await;
+    Ok(())
+}
+
+/// A 0.45 / pre-#1025 authority omits the sidecar altogether.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_member_added_recovers_before_creator_offline_seal() -> Result<()> {
+    let s =
+        creator_offline_scenario_on_plane(Promotion::SignedCommit, false, 20, true, true).await?;
+    assert!(!promoted_admin_seals_new_joiner(&s, &[])
+        .await?
+        .roster_root
+        .is_empty());
+    s.admin.agent.shutdown().await;
+    Ok(())
+}
+
+/// No receiver can recover bytes after their last holder disappears.
+/// Keep the fail-closed seal and bounded retry deadline in this case.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn trimmed_member_added_all_holders_offline_stays_pending() -> Result<()> {
+    let s =
+        creator_offline_scenario_on_plane(Promotion::SignedCommit, false, 20, false, false).await?;
+    let err = promoted_admin_seals_new_joiner(&s, &[])
+        .await
+        .expect_err("no holder answered");
+    assert!(matches!(
+        err,
+        x0x::groups::state_commit::ApplyError::OwnerCertMemberPending { .. }
+    ));
+    assert!(!seat_cert_fetch::cert_evidence_deadline_elapsed(
+        &s.admin,
+        &s.group_id,
+        "next",
+        "attempt"
+    ));
+    let key = seat_cert_fetch::cert_evidence_stamp_key(&s.group_id, "next");
+    s.admin
+        .cert_unresolvable_since
+        .lock()
+        .expect("deadlines")
+        .get_mut(&key)
+        .expect("stamp")
+        .first_ms = now_millis_u64() - seat_cert_fetch::CERT_EVIDENCE_DEADLINE_MS;
+    assert!(seat_cert_fetch::cert_evidence_deadline_elapsed(
+        &s.admin,
+        &s.group_id,
+        "next",
+        "attempt"
+    ));
     s.admin.agent.shutdown().await;
     Ok(())
 }
