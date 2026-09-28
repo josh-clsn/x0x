@@ -155,8 +155,27 @@ binary-encoded format:
     cases.
 - A v0.45.0 `load_snapshot` was run against a v2 file: it refused the file
   and left it byte-identical.
-- v0.46.0 gate row 4 loads a real v0.45.0 `data_dir`, then checks the
-  downgrade.
+- **Real release `data_dir`, loader level** (on main since #1046, e7ba342):
+  - `tests/fixtures/v045_data_dir/` was written by the v0.45.0 release binary.
+    Its `PROVENANCE.md` records the binary sha256, the steps and a hash for
+    every file.
+  - `tests/v045_data_dir_fixture.rs` decodes every KV-store and task-list
+    snapshot in that directory through the daemon's own loaders
+    (`kv::sync::load_snapshot`, `TaskListStorage::load_task_list_opt`) and
+    checks the values written through the v0.45.0 API.
+  - On afacc56 (before #1046), `every_v045_kv_store_snapshot_loads` is
+    **red**: `kv-stores/31fc…54ec.bin must load: … unexpected end of file`
+    (`PROVENANCE.md` L38–43). With #1046 it is **green**, and the task-list
+    control passes on both.
+  - These are **loader tests**. They start no daemon, open no store through
+    the API, and do not exercise downgrade.
+- **Daemon upgrade and downgrade** (the release gate, a separate check):
+  v0.46.0 gate row 4 copies the same `data_dir` to a host, then:
+  - upgrades in place, checking that the stores open through the running
+    daemon;
+  - downgrades to v0.45.0, checking that stores 0.46 wrote to are refused
+    with the files left byte-identical;
+  - upgrades again, checking that the stores come back.
 
 ## Notes for AI-assisted work
 
