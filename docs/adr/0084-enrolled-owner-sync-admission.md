@@ -1,6 +1,7 @@
 # ADR 0084: Admit Owner Sync from Enrolled Machines on Verified Enrollment Alone
 
-- **Status:** Proposed
+- **Status:** Accepted
+- **Accepted:** 2026-09-28 by David Irvine (charter decision D06: keep #1044, file this ADR retroactively rather than revert; accepted on the round-2 text addressing Codex round-1 findings 1–4; the SyncV1-acceptor machine-revocation re-check is required before the v0.46.0 rc; status change applied by Claude at his instruction)
 - **Date:** 2026-09-28
 - **Decision owners:** David Irvine (decision), Claude x0x-32 (drafting)
 - **Reviewers:** Codex (cross-model review); David Irvine (acceptance)
