@@ -10360,18 +10360,21 @@ impl Agent {
             if let Some(ref runtime) = self.gossip_runtime {
                 let active = runtime.membership().active_view();
                 let active_view_count = active.len();
-                let mut broadcast_peers = active;
 
-                let mut connected_peer_count = 0usize;
+                let mut connected = Vec::new();
                 if let Some(ref net) = self.network {
-                    let connected = net.connected_peers().await;
-                    connected_peer_count = connected.len();
-                    broadcast_peers.extend(
-                        connected
-                            .into_iter()
-                            .map(|peer| saorsa_gossip_types::PeerId::new(peer.0)),
-                    );
+                    connected = net
+                        .connected_peers()
+                        .await
+                        .into_iter()
+                        .map(|peer| saorsa_gossip_types::PeerId::new(peer.0))
+                        .collect();
                 }
+                let connected_peer_count = connected.len();
+                // x0x#1036: never beacon to active-view peers without a
+                // connection; those sends can only fail ("Peer not found").
+                let broadcast_peers =
+                    gossip::stale_targets::presence_broadcast_targets(active, &connected);
 
                 pw.manager().replace_broadcast_peers(broadcast_peers).await;
                 let broadcast_peer_count = pw.manager().broadcast_peer_count().await;
@@ -10408,18 +10411,21 @@ impl Agent {
 
                         let active = runtime_clone.membership().active_view();
                         let active_view_count = active.len();
-                        let mut broadcast_peers = active;
 
-                        let mut connected_peer_count = 0usize;
+                        let mut connected = Vec::new();
                         if let Some(ref net) = network_clone {
-                            let connected = net.connected_peers().await;
-                            connected_peer_count = connected.len();
-                            broadcast_peers.extend(
-                                connected
-                                    .into_iter()
-                                    .map(|peer| saorsa_gossip_types::PeerId::new(peer.0)),
-                            );
+                            connected = net
+                                .connected_peers()
+                                .await
+                                .into_iter()
+                                .map(|peer| saorsa_gossip_types::PeerId::new(peer.0))
+                                .collect();
                         }
+                        let connected_peer_count = connected.len();
+                        // x0x#1036: active-view peers without a connection
+                        // are not beacon targets (see presence_broadcast_targets).
+                        let broadcast_peers =
+                            gossip::stale_targets::presence_broadcast_targets(active, &connected);
 
                         pw_clone
                             .manager()
