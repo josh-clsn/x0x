@@ -1,6 +1,7 @@
 # ADR 0085: Persisted Binary Formats Are Versioned, Read Every Released Layout, and Fail Closed on Downgrade
 
-- **Status:** Proposed
+- **Status:** Accepted
+- **Accepted:** 2026-09-28 by David Irvine (charter decision D01 companion to #1046: versioned snapshot magic, frozen decoders for released layouts, fail-closed downgrade accepted; accepted after Codex cross-model review round 2 APPROVED with no open findings; status change applied by Claude at his instruction)
 - **Date:** 2026-09-28
 - **Decision owners:** David Irvine (decision), Claude x0x-32 (drafting)
 - **Reviewers:** OMP (cross-model review); David Irvine (acceptance)
