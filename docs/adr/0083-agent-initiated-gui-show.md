@@ -154,10 +154,11 @@ an explicit decision.
     tick already runs only then.
   - The sender asks each online enrolled owner machine for this value with a
     `GuiActivityQuery` typed DM (§6) and picks the most recent value that is
-    no older than `ACTIVE_WINDOW` (proposed 15 minutes).
+    no older than `ACTIVE_WINDOW` (15 minutes).
   - The local machine takes part like any other.
-  - If no machine qualifies, the result is `no_active_machine` and lists the
-    candidate machines so the agent can pick one explicitly.
+  - If no machine qualifies, the result is the error `no_active_machine`. It
+    asks for an explicit machine and lists the candidate machines so the agent
+    can pick one.
   - The query is answered only to owner-trusted senders. Anyone else gets no
     reply, so activity is not observable by strangers.
 - **Absent.** The target is this machine.
@@ -207,19 +208,22 @@ On a request that passes §2 and §5, the target machine:
   ```toml
   [gui_show]
   local_enabled = true    # POST /gui/show without a remote target
-  remote_enabled = false  # accept shows from other owner machines
+  remote_enabled = true   # accept shows from other owner machines
   ```
 
   When `remote_enabled = false`, the target answers `disabled`, and activity
   queries are answered `disabled` (with no timestamp). The settings are read
   at startup and on `POST /acl/reload`.
-- **Defaults — FLAGGED FOR DAVID (Q1, Q2).** The proposal above is: local on,
-  because it is no more than `x0x gui --view` behind an API; remote **off**,
-  because it is a new cross-machine capability and should be opted into once
-  per machine. The alternative is remote on by default, which gives the R10
-  acceptance ("machine A shows, machine B opens") zero setup, since owner
-  trust already bounds who can use it. That default must be decided at
-  acceptance.
+- **Defaults (decided by David Irvine, 2026-09-28; see Decisions on the open
+  questions).**
+  - Local show is **on** by default: it is no more than `x0x gui --view`
+    behind an API.
+  - Remote show is **on** by default (`remote_enabled = true`). The draft
+    recommended off. David chose on so the R10 acceptance ("machine A shows,
+    machine B opens") needs zero setup, since owner trust already bounds who
+    can use it. He accepted the remaining risk with the origin banner, the
+    per-agent block list and the rate limit as the mitigations. Any machine
+    can still opt out with `remote_enabled = false`.
 
 ### 6. Wire messages
 
@@ -368,16 +372,21 @@ covers is removed.
 - **Review trigger:** any change that lets a request carry a URL, host, port
   or token, or that adds a `ShareCap` for display, needs a superseding ADR.
 
-## Open questions for acceptance
+## Decisions on the open questions (David Irvine, 2026-09-28)
 
-- **Q1.** Is remote show off or on by default? (§5; the proposal is off.)
-- **Q2.** Is local show on by default? (§5; the proposal is on.)
-- **Q3.** Should `active` use the GUI-visibility heuristic with a 15-minute
-  window, or require an explicit machine in v1?
-- **Q4.** Are the rate-limit numbers right (burst 3, 1 per 20 s, 30 per hour
-  per target)?
-- **Q5.** Should a visible GUI navigate in place (the proposal), or should
-  every show open a new window?
+- **Q1 — remote show default: ON.** `[gui_show] remote_enabled` defaults to
+  `true`. David chose this over the drafted recommendation of off, and
+  accepted the risk with three mitigations: the origin banner, the per-agent
+  block list and the rate limit (§5).
+- **Q2 — local show default: ON.** `[gui_show] local_enabled` defaults to
+  `true`.
+- **Q3 — `active` target:** the owner machine whose GUI was most recently
+  visible within 15 minutes (`ACTIVE_WINDOW`). If there is none, the error
+  `no_active_machine` asks for an explicit machine (§3).
+- **Q4 — rate limits as drafted:** burst 3, then 1 per 20 s, and at most 30
+  per hour per target machine (§5).
+- **Q5 — display:** switch the visible open GUI tab to the view, and open a
+  new window only when no GUI is open (§4 steps 2–3).
 
 ## Notes for AI-assisted work
 
