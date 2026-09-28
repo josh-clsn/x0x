@@ -10432,14 +10432,18 @@ async fn apply_named_group_metadata_event_with_binding(
 /// called with no membership or `named_groups` guard held.
 async fn hydrate_from_member_added_sidecar(
     state: &Arc<AppState>,
-    sidecar: Option<(String, Vec<String>)>,
+    sidecar: Option<seat_cert_fetch::MemberAddedCertificates>,
     recover_missing: bool,
 ) {
-    if let Some((group_id, certificates)) = sidecar {
-        seat_cert_fetch::hydrate_from_roster_certificate_sidecar(state, &group_id, &certificates)
-            .await;
+    if let Some(sidecar) = sidecar {
+        seat_cert_fetch::hydrate_from_roster_certificate_sidecar(
+            state,
+            &sidecar.group_id,
+            &sidecar.certificates,
+        )
+        .await;
         if recover_missing {
-            seat_cert_fetch::request_missing_roster_certificates(state, &group_id).await;
+            seat_cert_fetch::request_missing_roster_certificates(state, &sidecar).await;
         }
     }
 }

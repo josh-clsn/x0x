@@ -1198,7 +1198,12 @@ fn legacy_member_added_retains_certificate_recovery_context() {
     .expect("legacy event");
     assert_eq!(
         seat_cert_fetch::member_added_sidecar(&event),
-        Some(("group".to_string(), Vec::new())),
+        Some(seat_cert_fetch::MemberAddedCertificates {
+            group_id: "group".to_string(),
+            certificates: Vec::new(),
+            seated_member: "joiner".to_string(),
+            roster_root: None,
+        }),
         "an empty legacy sidecar must not skip post-apply recovery"
     );
 }
