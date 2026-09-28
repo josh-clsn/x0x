@@ -2231,14 +2231,15 @@ impl ReannounceLimiter {
 /// loop's check and this one are separated by the handoff: a machine
 /// revocation (ADR-0018) that lands in between must still stop the session
 /// (ADR 0084, revocation race). The peer's enrollment must verify and be
-/// current under `owner`.
+/// current under `owner`, and the peer machine must not be revoked.
 async fn inbound_session_admissible(
     store: &OwnerSyncStore,
-    _revocation_set: &tokio::sync::RwLock<crate::revocation::RevocationSet>,
+    revocation_set: &tokio::sync::RwLock<crate::revocation::RevocationSet>,
     peer: &MachineId,
     owner: &UserId,
 ) -> bool {
-    store.is_enrolled(peer, owner).await
+    // Cheap-first: the device-map miss costs no signature verification.
+    store.is_enrolled(peer, owner).await && !revocation_set.read().await.is_machine_revoked(peer)
 }
 
 /// Daemon-resident Tier-1 sync service (the `ForwardService` pattern for
