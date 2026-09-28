@@ -1,6 +1,7 @@
 # ADR 0086: Gossip Send Targets Are Bounded by Transport Connectivity
 
-- **Status:** Proposed
+- **Status:** Accepted
+- **Accepted:** 2026-09-28 by David Irvine (#1036 product fix; the implementation merged to main in #1059 ahead of acceptance and is ratified by this acceptance; OMP cross-model review round 1 approved the implementing PR; status change applied by Claude at his instruction)
 - **Date:** 2026-09-28
 - **Decision owners:** David Irvine (decision), Claude x0x-32 (drafting)
 - **Reviewers:** OMP (cross-model review, per the 2026-09-28 resolution plan); David Irvine (acceptance)
