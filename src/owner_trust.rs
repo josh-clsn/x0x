@@ -248,6 +248,36 @@ impl OwnerTrust {
             .clone()
     }
 
+    /// Whether the transport-authenticated `machine_id` is in this device's
+    /// VERIFIED owner enrollment set (#1040): this install has an owner, the
+    /// device set is installed, the machine is not in the ADR-0018
+    /// revocation set, and its stored [`crate::owner_sync::OwnerEnrollment`]
+    /// verifies against the local owner key and is current (not expired,
+    /// not deleted). The enrollment is re-verified on every call
+    /// ([`OwnerSyncStore::is_enrolled`]); there is no verification cache.
+    ///
+    /// This is a MACHINE-level fact. It admits nothing by itself; the only
+    /// caller that turns it into admission is the accept loop's `SyncV1`
+    /// branch for a machine with no known agent (and the matching outbound
+    /// owner-sync dial). A non-enrolled machine costs a map lookup, never
+    /// an ML-DSA verification.
+    pub async fn is_enrolled_owner_machine(
+        &self,
+        revocation_set: &RwLock<RevocationSet>,
+        machine_id: &MachineId,
+    ) -> bool {
+        let Some(owner) = self.local_owner else {
+            return false;
+        };
+        let Some(devices) = self.device_store() else {
+            return false;
+        };
+        if revocation_set.read().await.is_machine_revoked(machine_id) {
+            return false;
+        }
+        devices.is_enrolled(machine_id, &owner).await
+    }
+
     /// Whether `(agent_id, machine_id)` is owner-trusted (module docs, 1–5).
     ///
     /// `machine_id` must be the transport-authenticated peer machine (the

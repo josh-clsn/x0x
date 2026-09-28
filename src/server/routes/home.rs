@@ -3968,6 +3968,237 @@ pub(in crate::server::routes) mod tests {
         Ok(())
     }
 
+    /// Loopback-only transport for the #1040 two-device test: no bootstrap
+    /// peers, no mDNS, no port mapping, so nothing outside the test is dialed.
+    fn loopback_network_config() -> crate::network::NetworkConfig {
+        crate::network::NetworkConfig {
+            bind_addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
+            bootstrap_nodes: Vec::new(),
+            port_mapping_enabled: false,
+            mdns_enabled: false,
+            ..crate::network::NetworkConfig::default()
+        }
+    }
+
+    /// An owned device with a live loopback transport, wired the way daemon
+    /// startup wires owner sync (device store installed, daemon view
+    /// attached), but WITHOUT `join_network`: no gossip runtime runs, so no
+    /// identity announcement can be sent or received. Only the stream
+    /// accept loop is started. The discovery cache therefore starts, and
+    /// stays, empty — the #1040 state of a restarted owner device.
+    async fn owned_networked_state(
+        data_dir: &std::path::Path,
+        owner_seed: [u8; 32],
+    ) -> anyhow::Result<Arc<AppState>> {
+        let user = crate::identity::UserKeypair::from_seed(&owner_seed)?;
+        let agent = Arc::new(
+            crate::Agent::builder()
+                .with_machine_key(data_dir.join("machine.key"))
+                .with_agent_key_path(data_dir.join("agent.key"))
+                .with_agent_cert_path(data_dir.join("agent.cert"))
+                .with_user_key(user)
+                .with_contact_store_path(data_dir.join("contacts.json"))
+                .with_peer_cache_dir(data_dir.join("peers"))
+                .with_network_config(loopback_network_config())
+                .build()
+                .await?,
+        );
+        agent.start_stream_accept_loop();
+        let state =
+            super::super::named_groups::tests::secure_endpoint_test_state_at(data_dir, agent)
+                .await?;
+        let sync = sync_of(&state)?;
+        state
+            .agent
+            .install_owner_device_store(Arc::clone(sync.store()));
+        sync.attach_view(Arc::new(super::super::DaemonView::new(Arc::clone(&state))));
+        Ok(state)
+    }
+
+    /// The device's bound loopback address.
+    async fn loopback_addr(state: &AppState) -> anyhow::Result<std::net::SocketAddr> {
+        let network = state
+            .agent
+            .network()
+            .ok_or_else(|| anyhow::anyhow!("networked fixture"))?;
+        let addr = network
+            .bound_addr()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("bound address"))?;
+        Ok(if addr.ip().is_unspecified() {
+            std::net::SocketAddr::from(([127, 0, 0, 1], addr.port()))
+        } else {
+            addr
+        })
+    }
+
+    /// Seed `state`'s bootstrap cache with `peer`'s address, as a restarted
+    /// device's persisted peer cache would hold it.
+    async fn remember_peer_address(
+        state: &AppState,
+        peer: crate::identity::MachineId,
+        addr: std::net::SocketAddr,
+    ) -> anyhow::Result<()> {
+        let cache = state
+            .agent
+            .network()
+            .and_then(|network| network.bootstrap_cache())
+            .ok_or_else(|| anyhow::anyhow!("networked fixture has a bootstrap cache"))?;
+        cache
+            .add_from_connection(ant_quic::PeerId(peer.0), vec![addr], None)
+            .await;
+        Ok(())
+    }
+
+    /// Whether `state`'s discovery cache has any agent on `machine` — true
+    /// only once an identity announcement from that machine was delivered.
+    async fn knows_an_agent_on(
+        state: &AppState,
+        machine: crate::identity::MachineId,
+    ) -> anyhow::Result<bool> {
+        Ok(state
+            .agent
+            .discovered_agents()
+            .await?
+            .iter()
+            .any(|agent| agent.machine_id == machine))
+    }
+
+    /// Wait until `store` records one more successful session than `before`.
+    async fn next_successful_session(
+        mut sessions: tokio::sync::watch::Receiver<u64>,
+        before: u64,
+        what: &str,
+    ) -> anyhow::Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while *sessions.borrow_and_update() == before {
+                sessions.changed().await?;
+            }
+            anyhow::Ok(())
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "#1040: {what}: no owner-sync session completed without an identity announcement"
+            )
+        })?
+    }
+
+    /// WHY (#1040, R20 Home 13/16): an owner device that restarts has an
+    /// EMPTY discovery cache. Until one of its enrolled owner machine's
+    /// identity announcements arrives — over two minutes on a loaded host —
+    /// it could neither dial that machine (`machine not in discovery cache`)
+    /// nor accept its transport-authenticated `SyncV1` stream
+    /// (`deny_not_verified`). The #824 wait then kept Home at
+    /// `provisioning_pending`. The owner-signed enrollment alone must carry
+    /// owner sync in both directions, with no announcement ever delivered,
+    /// and Home must settle.
+    ///
+    /// Fails before the fix: the restarted device's pass stops at the
+    /// discovery miss, no session completes, and Home stays pending.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn restarted_owner_device_with_empty_discovery_cache_syncs_both_ways_and_settles_home(
+    ) -> anyhow::Result<()> {
+        let (dir_a, dir_b) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let seed = [0x9E; 32];
+        // `running` holds the owner's Home; `restarted` just came back up.
+        let running = owned_networked_state(dir_a.path(), seed).await?;
+        let restarted = owned_networked_state(dir_b.path(), seed).await?;
+        let (m_running, m_restarted) = (running.agent.machine_id(), restarted.agent.machine_id());
+        anyhow::ensure!(m_running != m_restarted, "distinct machines");
+        enroll_machine(&running, m_restarted.0).await?;
+        enroll_machine(&restarted, m_running.0).await?;
+
+        provision_home(&running).await;
+        assert_eq!(home_shaped_group_count(&running).await, 1);
+        let (running_home, _) = find_home(running.as_ref(), &owner_of(&running))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("running device Home"))?;
+
+        let task = provision_home_at_startup(&restarted, std::time::Duration::from_secs(600))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("the restarted owner device must defer (#824)"))?;
+        let (status, body) = response_json(
+            get_home(State(Arc::clone(&restarted)))
+                .await
+                .into_response(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "provisioning_pending", "{body}");
+
+        // Each side's persisted peer cache remembers the other's address;
+        // neither discovery cache knows any agent on the other machine.
+        remember_peer_address(&restarted, m_running, loopback_addr(&running).await?).await?;
+        remember_peer_address(&running, m_restarted, loopback_addr(&restarted).await?).await?;
+        assert!(!knows_an_agent_on(&restarted, m_running).await?);
+        assert!(!knows_an_agent_on(&running, m_restarted).await?);
+
+        // TO the other device: the restarted device dials, the running
+        // device must admit the inbound SyncV1 stream.
+        let before = *sync_of(&running)?.store().successful_sessions_rx().borrow();
+        let inbound = sync_of(&running)?.store().successful_sessions_rx();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            sync_of(&restarted)?.sync_all(),
+        )
+        .await?;
+        next_successful_session(inbound, before, "restarted -> running").await?;
+
+        // FROM the other device: the running device dials, the restarted
+        // device must admit the inbound SyncV1 stream.
+        let before = *sync_of(&restarted)?
+            .store()
+            .successful_sessions_rx()
+            .borrow();
+        let inbound = sync_of(&restarted)?.store().successful_sessions_rx();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            sync_of(&running)?.sync_all(),
+        )
+        .await?;
+        next_successful_session(inbound, before, "running -> restarted").await?;
+
+        for (state, peer, who) in [
+            (&restarted, m_running, "restarted"),
+            (&running, m_restarted, "running"),
+        ] {
+            let statuses = sync_of(state)?.store().session_statuses().await;
+            assert_eq!(
+                statuses.get(&peer.0).map(|s| s.last_session_ok),
+                Some(true),
+                "{who}: the last session with the other owner device must have succeeded"
+            );
+        }
+
+        // Home left provisioning_pending: the restarted device adopted the
+        // running device's Home instead of waiting or minting a duplicate.
+        tokio::time::timeout(std::time::Duration::from_secs(20), task)
+            .await
+            .map_err(|_| anyhow::anyhow!("#1040: Home provisioning stayed pending"))??;
+        let (status, body) = response_json(
+            get_home(State(Arc::clone(&restarted)))
+                .await
+                .into_response(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "elsewhere", "{body}");
+        assert_eq!(body["canonical_group_id"], running_home.as_str());
+        assert_eq!(home_shaped_group_count(&restarted).await, 0);
+
+        // None of this rode on an identity announcement.
+        assert!(
+            !knows_an_agent_on(&restarted, m_running).await?,
+            "an identity announcement was delivered; the test no longer proves #1040"
+        );
+        assert!(
+            !knows_an_agent_on(&running, m_restarted).await?,
+            "an identity announcement was delivered; the test no longer proves #1040"
+        );
+        Ok(())
+    }
+
     /// WHY (#824): a pass that reached nobody, or a failed session, says
     /// nothing about whether the owner already has a Home. Right after the
     /// key-bearing restart that is the normal case, so neither may end the
