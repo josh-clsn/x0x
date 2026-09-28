@@ -71,23 +71,70 @@ struct LoadedLegacyStore {
 pub(in crate::server) const KV_STORE_DELTA_DM_PREFIX: &[u8] = b"X0X-KV-DELTA-V1\n";
 pub(in crate::server) use x0x::kv::KvStoreDirectDelta;
 
+/// #1041: bincode, not serde_json. The delta's OR-Set maps key to
+/// `HashSet<UniqueTag>` (UniqueTag = (PeerId, u64)) and the name LWW
+/// register's vector clock is a `HashMap<PeerId, u64>` — maps with
+/// NON-STRING keys that serde_json refuses ("key must be a string"), so
+/// the r1 fallback failed to serialize the legacy-SOURCE shapes (seed
+/// puts + DELETE tombstones + a renamed store) and never delivered.
+/// bincode has no map-key restriction; the wire shape stays
+/// prefix-prefixed bytes under the same typed-DM route.
 fn encode_kv_store_delta_direct_payload(
     store_id: &str,
     peer_id: saorsa_gossip_types::PeerId,
     delta: &x0x::kv::KvStoreDelta,
-) -> serde_json::Result<Vec<u8>> {
+) -> bincode::Result<Vec<u8>> {
     let msg = KvStoreDirectDelta {
         store_id: store_id.to_string(),
         peer_id,
         delta: delta.clone(),
     };
-    let json = serde_json::to_vec(&msg)?;
-    let mut payload = Vec::with_capacity(KV_STORE_DELTA_DM_PREFIX.len() + json.len());
+    let bytes = bincode::serialize(&msg)?;
+    let mut payload = Vec::with_capacity(KV_STORE_DELTA_DM_PREFIX.len() + bytes.len());
     payload.extend_from_slice(KV_STORE_DELTA_DM_PREFIX);
-    payload.extend_from_slice(&json);
+    payload.extend_from_slice(&bytes);
     Ok(payload)
 }
 
+/// #1041: the direct-delivery payload must serialize EVERY delta shape the
+/// fallback can be handed — including the legacy-SOURCE signed stores
+/// (seed puts plus a DELETE tombstone), whose `removed` map carries
+/// `HashSet<UniqueTag>` (UniqueTag = (PeerId, u64), PeerId a 32-byte
+/// array) and whose `name_update` LWW register carries a
+/// `HashMap<PeerId, u64>` vector clock. serde_json cannot serialize a
+/// map with non-string keys: the r1 fallback failed 80x with
+/// `key must be a string`, so the fallback never delivered at all.
+#[test]
+fn kv_delta_direct_payload_serializes_legacy_source_shapes() {
+    let peer = saorsa_gossip_types::PeerId::new([7u8; 32]);
+    let entry = x0x::kv::KvEntry::new(
+        format!("{}/seed", "ab".repeat(16)),
+        b"payload".to_vec(),
+        "application/octet-stream".to_string(),
+    );
+    // A DELETE tombstone: the removed map carries the tag SET.
+    let mut removed = std::collections::HashMap::new();
+    removed.insert(
+        format!("{}/dead", "ab".repeat(16)),
+        std::collections::HashSet::from([(peer, 1u64)]),
+    );
+    // The name LWW register (its vector clock is the second non-string
+    // key source).
+    let mut delta = x0x::kv::KvStoreDelta::new(1);
+    delta.removed = removed;
+    delta
+        .added
+        .insert(format!("{}/seed", "ab".repeat(16)), (entry, (peer, 1u64)));
+    // The name LWW register: its vector clock is a HashMap<PeerId, u64> —
+    // a map with NON-STRING keys once it has an entry.
+    let mut name = saorsa_gossip_crdt_sync::LwwRegister::new("legacy".to_string());
+    name.set("legacy-store".to_string(), peer);
+    delta.name_update = Some(name);
+    let payload = encode_kv_store_delta_direct_payload("x0x-app-store", peer, &delta)
+        .expect("the direct payload serializes legacy-SOURCE shapes (#1041)");
+    assert!(payload.starts_with(KV_STORE_DELTA_DM_PREFIX));
+    let _ = entry;
+}
 fn kv_store_delta_direct_delivery_config() -> x0x::dm::DmSendConfig {
     let mut config = direct_message_send_config();
     config.require_gossip = true;
@@ -3016,8 +3063,8 @@ mod tests {
         );
 
         let decoded: KvStoreDirectDelta =
-            serde_json::from_slice(&payload[KV_STORE_DELTA_DM_PREFIX.len()..])
-                .expect("payload JSON should decode");
+            bincode::deserialize(&payload[KV_STORE_DELTA_DM_PREFIX.len()..])
+                .expect("payload bincode should decode (#1041)");
         assert_eq!(decoded.store_id, "store-1");
         assert_eq!(decoded.peer_id, peer_id);
         assert_eq!(decoded.delta.version, delta.version);

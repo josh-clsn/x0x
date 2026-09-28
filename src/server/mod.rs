@@ -2058,7 +2058,13 @@ pub async fn serve_with_options(
                 let Some(payload) = typed.payload.strip_prefix(KV_STORE_DELTA_DM_PREFIX) else {
                     continue;
                 };
-                let Ok(delta_msg) = serde_json::from_slice::<KvStoreDirectDelta>(payload) else {
+                // #1041: the payload is BINCODE (a serde_json payload
+                // cannot carry the delta's PeerId-keyed maps). A JSON
+                // payload from an r1 sender is still accepted — the r1
+                // shape serialized only when it had no non-string keys.
+                let delta_msg = bincode::deserialize::<KvStoreDirectDelta>(payload)
+                    .or_else(|_| serde_json::from_slice::<KvStoreDirectDelta>(payload));
+                let Ok(delta_msg) = delta_msg else {
                     tracing::debug!(
                         sender = %hex::encode(typed.sender.as_bytes()),
                         "typed kv-store DM payload was not a KvStoreDirectDelta"
@@ -2818,7 +2824,12 @@ pub(crate) fn valid_public_group_bootstrap_typed_dm(payload: &[u8]) -> bool {
 pub(crate) fn valid_kv_store_delta_typed_dm(payload: &[u8]) -> bool {
     payload
         .strip_prefix(KV_STORE_DELTA_DM_PREFIX)
-        .is_some_and(|bytes| serde_json::from_slice::<KvStoreDirectDelta>(bytes).is_ok())
+        .is_some_and(|bytes| {
+            // #1041: bincode is the encoding (a JSON payload cannot carry
+            // PeerId-keyed maps); a legacy r1 JSON payload stays valid.
+            bincode::deserialize::<KvStoreDirectDelta>(bytes).is_ok()
+                || serde_json::from_slice::<KvStoreDirectDelta>(bytes).is_ok()
+        })
 }
 
 pub(crate) fn valid_predecessor_relay_typed_dm(payload: &[u8]) -> bool {
