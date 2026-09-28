@@ -13736,6 +13736,129 @@ impl Agent {
         ))
     }
 
+    /// #1040: open an owner-sync (`SyncV1`) stream to an enrolled owner
+    /// machine that the discovery cache does not know (no agent announced
+    /// on it yet, e.g. right after this device restarted).
+    ///
+    /// Admission mirrors the inbound branch: the machine must be in this
+    /// device's verified owner enrollment set
+    /// ([`owner_trust::OwnerTrust::is_enrolled_owner_machine`]: signature
+    /// chain to the local owner, current, not revoked).
+    ///
+    /// Dial source: the signed `OwnerEnrollment` carries NO addresses, so
+    /// the only source is the bootstrap cache entry for the enrolled
+    /// machine's PeerId. Every dial is peer-authenticated by that PeerId
+    /// ([`network::NetworkNode::connect_peer_with_addrs`] rejects any other
+    /// answering peer), so an address can only ever reach the enrolled
+    /// machine. No announcement, rendezvous, or other unauthenticated hint
+    /// is consulted. An existing connection to the machine is reused.
+    ///
+    /// The returned stream carries no agent ([`streams::PeerStream::peer`]
+    /// is the enrolled machine).
+    pub(crate) async fn open_enrolled_owner_sync_stream(
+        &self,
+        machine_id: &identity::MachineId,
+    ) -> error::NetworkResult<streams::PeerStream> {
+        if !self
+            .owner_trust
+            .is_enrolled_owner_machine(&self.revocation_set, machine_id)
+            .await
+        {
+            return Err(error::NetworkError::PeerNotVerified {
+                agent_id: machine_id.0,
+            });
+        }
+        let network = self
+            .network
+            .as_ref()
+            .ok_or_else(|| error::NetworkError::NodeError("network not initialized".to_string()))?;
+        let peer = ant_quic::PeerId(machine_id.0);
+        if !network.is_connected(&peer).await {
+            let addrs: Vec<std::net::SocketAddr> = match network.bootstrap_cache() {
+                Some(cache) => cache
+                    .get_peer(&peer)
+                    .await
+                    .map(|cached| cached.preferred_addresses())
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            if addrs.is_empty() {
+                return Err(error::NetworkError::ConnectionFailed(format!(
+                    "enrolled owner machine {} has no bootstrap-cache address \
+                     (owner enrollments carry no addresses) (#1040)",
+                    hex::encode(machine_id.as_bytes())
+                )));
+            }
+            let mut last_error = None;
+            let mut connected = false;
+            for addr in addrs {
+                match network.connect_peer_with_addrs(peer, vec![addr]).await {
+                    Ok((_, answered)) if answered == peer => {
+                        connected = true;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(e) => last_error = Some(e),
+                }
+            }
+            if !connected {
+                return Err(last_error.unwrap_or_else(|| {
+                    error::NetworkError::ConnectionFailed(format!(
+                        "enrolled owner machine {} did not answer at any bootstrap-cache address (#1040)",
+                        hex::encode(machine_id.as_bytes())
+                    ))
+                }));
+            }
+        }
+        let protocol = streams::StreamProtocol::SyncV1;
+        let (mut send, recv) = network.open_bi(&peer).await?;
+        streams::write_protocol_prefix(&mut send, protocol).await?;
+        tracing::info!(
+            target: "x0x::streams",
+            machine = %hex::encode(machine_id.as_bytes()),
+            protocol = ?protocol,
+            "outbound owner-sync stream opened on verified owner enrollment (no known agent, #1040)"
+        );
+        Ok(streams::PeerStream::new(
+            Vec::new(),
+            *machine_id,
+            protocol,
+            send,
+            recv,
+        ))
+    }
+
+    /// Publish a fresh identity announcement now, off the heartbeat cycle
+    /// (#1040: an enrolled owner machine just connected and may have
+    /// restarted with an empty discovery cache). The caller rate-limits.
+    /// A no-op without a gossip runtime and network.
+    pub(crate) async fn reannounce_identity(&self) -> error::Result<()> {
+        let (Some(runtime), Some(network)) = (&self.gossip_runtime, &self.network) else {
+            return Ok(());
+        };
+        let ctx = HeartbeatContext {
+            identity: std::sync::Arc::clone(&self.identity),
+            runtime: std::sync::Arc::clone(runtime),
+            network: std::sync::Arc::clone(network),
+            selection_skew: std::sync::Arc::clone(&self.selection_skew),
+            interval_secs: self.heartbeat_interval_secs,
+            cache: std::sync::Arc::clone(&self.identity_discovery_cache),
+            machine_cache: std::sync::Arc::clone(&self.machine_discovery_cache),
+            user_identity_consented: std::sync::Arc::clone(&self.user_identity_consented),
+            allow_local_discovery_addrs: allow_local_discovery_addresses(network.config()),
+            revocation_set: std::sync::Arc::clone(&self.revocation_set),
+            last_revocation_generation: std::sync::atomic::AtomicU64::new(0),
+            heartbeat_tick: std::sync::atomic::AtomicU64::new(0),
+            verified_cert_tx: std::sync::Arc::clone(&self.verified_cert_tx),
+            machine_kem_public: self.machine_kem_public_key(),
+            move_state: std::sync::Arc::clone(&self.move_state),
+            legacy_announce: self.legacy_announce,
+            self_name: std::sync::Arc::clone(&self.self_name),
+            self_name_ever_set: std::sync::Arc::clone(&self.self_name_ever_set),
+        };
+        ctx.announce().await
+    }
+
     /// Outbound identity gate shared by every lane a peer connection can
     /// carry — byte-streams ([`Self::open_peer_stream`]) and the
     /// unreliable datagram lane ([`Self::open_peer_datagram_lane`]) — so
@@ -14191,6 +14314,125 @@ impl Agent {
         std::sync::Arc::clone(&guard)
     }
 
+    /// #1040 pre-prefix check: whether an inbound stream from `machine_id`
+    /// takes the enrolled owner-sync branch instead of the shared gate.
+    ///
+    /// True only when the discovery cache knows NO agent on the machine
+    /// (the case the shared gate denies as `deny_not_verified`) AND the
+    /// machine is in this device's verified owner enrollment set
+    /// ([`owner_trust::OwnerTrust::is_enrolled_owner_machine`]). A machine
+    /// with any known agent always goes through the shared gate, so its
+    /// agent-level denials (revoked, expired, blocked, dead pairing, ACL)
+    /// are never bypassed.
+    pub(crate) async fn enrolled_owner_sync_candidate(
+        discovery_cache: &tokio::sync::RwLock<
+            std::collections::HashMap<identity::AgentId, DiscoveredAgent>,
+        >,
+        revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
+        owner_trust: &owner_trust::OwnerTrust,
+        machine_id: &identity::MachineId,
+    ) -> bool {
+        let has_known_agent = {
+            let cache = discovery_cache.read().await;
+            cache.values().any(|agent| agent.machine_id == *machine_id)
+        };
+        !has_known_agent
+            && owner_trust
+                .is_enrolled_owner_machine(revocation_set, machine_id)
+                .await
+    }
+
+    /// #1040 post-prefix decision: admit `protocol` from an enrolled
+    /// machine with no known agent only when it is `SyncV1` and the
+    /// enrollment still verifies NOW (re-checked here, after the prefix
+    /// read, so a revocation or deletion that landed meanwhile denies).
+    pub(crate) async fn admit_enrolled_owner_sync(
+        revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
+        owner_trust: &owner_trust::OwnerTrust,
+        machine_id: &identity::MachineId,
+        protocol: streams::StreamProtocol,
+    ) -> bool {
+        protocol == streams::StreamProtocol::SyncV1
+            && owner_trust
+                .is_enrolled_owner_machine(revocation_set, machine_id)
+                .await
+    }
+
+    /// #1040 per-stream task for the enrolled owner-sync branch of the
+    /// accept loop: read the prefix (bounded), apply
+    /// [`Self::admit_enrolled_owner_sync`], and hand an admitted stream to
+    /// the REGISTERED `SyncV1` acceptor only — never the default channel.
+    /// Anything else drops the halves (→ QUIC reset) with zero application
+    /// bytes surfaced, logged `deny_not_verified` as the shared gate would.
+    async fn dispatch_enrolled_owner_sync_stream(
+        incoming: std::sync::Arc<streams::StreamAccept>,
+        revocation_set: std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+        owner_trust: owner_trust::OwnerTrust,
+        machine_id: identity::MachineId,
+        send: ant_quic::HighLevelSendStream,
+        mut recv: ant_quic::HighLevelRecvStream,
+    ) {
+        let protocol = match tokio::time::timeout(
+            streams::PREFIX_READ_TIMEOUT,
+            streams::read_protocol_prefix(&mut recv),
+        )
+        .await
+        {
+            Ok(Ok(protocol)) => protocol,
+            Ok(Err(e)) => {
+                tracing::info!(
+                    target: "x0x::streams",
+                    machine = %hex::encode(machine_id.as_bytes()),
+                    outcome = "deny_protocol",
+                    error = %e,
+                    "inbound stream protocol prefix rejected"
+                );
+                return;
+            }
+            Err(_) => {
+                tracing::info!(
+                    target: "x0x::streams",
+                    machine = %hex::encode(machine_id.as_bytes()),
+                    outcome = "deny_prefix_timeout",
+                    "inbound stream prefix byte timed out — resetting"
+                );
+                return;
+            }
+        };
+        let admitted =
+            Self::admit_enrolled_owner_sync(&revocation_set, &owner_trust, &machine_id, protocol)
+                .await;
+        let sender = if admitted {
+            incoming.registered_sender(streams::StreamProtocol::SyncV1)
+        } else {
+            None
+        };
+        let Some(sender) = sender else {
+            tracing::info!(
+                target: "x0x::streams",
+                machine = %hex::encode(machine_id.as_bytes()),
+                protocol = ?protocol,
+                outcome = "deny_not_verified",
+                "inbound traffic from machine with no known agent — denied"
+            );
+            return;
+        };
+        tracing::info!(
+            target: "x0x::streams",
+            machine = %hex::encode(machine_id.as_bytes()),
+            outcome = "admit_enrolled_owner_sync",
+            "SyncV1 stream admitted on verified owner enrollment (no known agent, #1040)"
+        );
+        let peer_stream = streams::PeerStream::new(Vec::new(), machine_id, protocol, send, recv);
+        if sender.try_send(peer_stream).is_err() {
+            tracing::debug!(
+                target: "x0x::streams",
+                protocol = ?protocol,
+                "owner-sync acceptor channel full; dropping accepted stream"
+            );
+        }
+    }
+
     /// Start the inbound byte-stream accept loop (idempotent).
     ///
     /// Called automatically by [`Agent::join_network`]. The loop is the SOLE
@@ -14234,6 +14476,35 @@ impl Agent {
                     }
                 };
                 let machine_id = identity::MachineId(ant_peer_id.0);
+
+                // #1040: a machine with NO known agent whose owner-signed
+                // enrollment verifies (current, unrevoked) may open a
+                // SyncV1 stream, and nothing else. The protocol is not
+                // known until the prefix is read, so this branch reads it
+                // in a per-stream task, re-verifies the enrollment, and
+                // routes ONLY to the registered SyncV1 acceptor; every
+                // other protocol is denied `deny_not_verified` exactly as
+                // the shared gate below would deny it. The shared gate
+                // (also used by the datagram lane and forwards) is not
+                // touched.
+                if Agent::enrolled_owner_sync_candidate(
+                    &discovery_cache,
+                    &revocation_set,
+                    &owner_trust,
+                    &machine_id,
+                )
+                .await
+                {
+                    tokio::spawn(Agent::dispatch_enrolled_owner_sync_stream(
+                        std::sync::Arc::clone(&incoming),
+                        std::sync::Arc::clone(&revocation_set),
+                        owner_trust.clone(),
+                        machine_id,
+                        send,
+                        recv,
+                    ));
+                    continue;
+                }
 
                 // Identity gate + connect-ACL gate — the shared inbound
                 // posture (also used by the datagram lane) resolves every
