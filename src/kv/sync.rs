@@ -8096,6 +8096,256 @@ mod tests {
         assert!(store.read().await.get("wrong-kind").is_none());
     }
 
+    /// #836 (the #847 reviewer's synchronous pin, part 2 — the CONTEXT
+    /// half): a withdrawal must drop writer authorization COMPLETELY —
+    /// the role map cleared, the shared secret dropped and the
+    /// authorization generation bumped — and a live group that has lost
+    /// its secret must not authorize either. Pre-fix, withdrawal cleared
+    /// only the active-member set (an AdminOnly writer rode the stale
+    /// role map) and `authorizes_writer` had no secret requirement.
+    #[test]
+    fn gss_withdrawal_drops_writer_authorization_completely() {
+        let admin_kp = AgentKeypair::generate().expect("admin keypair");
+        let admin = admin_kp.agent_id();
+        let (mut group, mut contexts, group_id) = encrypted_group(&[admin]);
+        group.policy.write_access = crate::groups::GroupWriteAccess::AdminOnly;
+        let context = contexts.pop().expect("context");
+        context.update_from_group(&group);
+        assert!(
+            context.is_authorized_writer(&admin),
+            "an active admin is authorized while the group is live"
+        );
+        let epoch0 = context.current_epoch();
+        let generation0 = context
+            .encrypted_authorization_generation()
+            .expect("gss context reports its authorization generation");
+
+        // WITHDRAWAL: no role-map residue, no secret, new generation.
+        group.withdrawn = true;
+        context.update_from_group(&group);
+        assert!(
+            !context.is_authorized_writer(&admin),
+            "#836: a withdrawn admin is NOT an authorized writer (role map cleared, secret dropped)"
+        );
+        assert!(
+            !context.is_active_member(&admin),
+            "membership fails closed too"
+        );
+        assert_ne!(
+            context
+                .encrypted_authorization_generation()
+                .expect("generation"),
+            generation0,
+            "#836: withdrawal bumps the authorization generation (the merge-path fence)"
+        );
+        let store_id = store_id(97);
+        assert!(
+            context.seal(&store_id, b"withdrawn").is_err(),
+            "#836: sealing fails closed without the shared secret"
+        );
+
+        // A PRE-withdrawal verified (generation, epoch) authorization is
+        // refused at merge time: the generation fence inside
+        // `apply_if_encrypted_authorized` is what the merge path re-checks
+        // under the store lock.
+        let mut applied = false;
+        let refused =
+            context.apply_if_encrypted_authorized(&admin, epoch0, generation0, &mut || {
+                applied = true;
+                Ok(())
+            });
+        assert!(
+            refused.is_err(),
+            "#836: a generation taken before the withdrawal must not authorize after it"
+        );
+        assert!(!applied, "the merge closure never runs");
+
+        // A LIVE group that has lost its secret (a member-removal rotation
+        // this device has not caught up with) cannot authorize writers:
+        // pre-fix `authorizes_writer` had no secret requirement.
+        let member_kp = AgentKeypair::generate().expect("second keypair");
+        let member = member_kp.agent_id();
+        let (mut live, mut live_contexts, _) = encrypted_group(&[admin, member]);
+        live.policy.write_access = crate::groups::GroupWriteAccess::AdminOnly;
+        let live_context = live_contexts.pop().expect("live context");
+        live_context.update_from_group(&live);
+        assert!(live_context.is_authorized_writer(&admin));
+        live.shared_secret = None;
+        live_context.update_from_group(&live);
+        assert!(
+            !live_context.is_authorized_writer(&admin),
+            "#836: a secret-less live group must not authorize writers (no secret, no seal)"
+        );
+        let _ = group_id;
+    }
+
+    /// #836 (the #847 reviewer's synchronous pin, part 1 — the MERGE
+    /// half): the guarded encrypted merge runs ONLY for the store's own
+    /// attached context (the `Arc::ptr_eq` fence `merge_guarded_encrypted_delta`
+    /// enforces), and the composition the merge path performs —
+    /// `apply_if_encrypted_authorized` re-checking (generation, epoch,
+    /// writer) around the guarded merge — applies for a CURRENT admin at
+    /// the CURRENT epoch.
+    #[test]
+    fn guarded_encrypted_merge_requires_its_own_attached_context() {
+        let admin_kp = AgentKeypair::generate().expect("admin keypair");
+        let admin = admin_kp.agent_id();
+        let (mut group, mut contexts, group_id) = encrypted_group(&[admin]);
+        group.policy.write_access = crate::groups::GroupWriteAccess::AdminOnly;
+        let context = contexts.pop().expect("context");
+        // A SECOND context arc for the SAME group (a second open handle).
+        let other_context = std::sync::Arc::new(
+            GssKvSecureContext::from_group(&group).expect("group holds a shared secret"),
+        );
+        context.update_from_group(&group);
+        other_context.update_from_group(&group);
+        let epoch = context.current_epoch();
+        let generation = context
+            .encrypted_authorization_generation()
+            .expect("generation");
+
+        let id = store_id(98);
+        let mut store =
+            KvStore::new_encrypted(id, "Enc".to_string(), admin, group_id, context.clone())
+                .expect("encrypted store bound to the context");
+        let delta = |key: &str, seq: u64| {
+            KvStoreDelta::for_put(
+                key.to_string(),
+                KvEntry::new(key.to_string(), b"v".to_vec(), "text/plain".to_string()),
+                (peer(1), seq),
+                seq,
+            )
+        };
+        let as_err = |outcome: crate::kv::Result<crate::kv::store::MergeOutcome>| match outcome {
+            Ok(crate::kv::store::MergeOutcome::Rejected(reason)) => Err(KvError::Merge(format!(
+                "group-signed delta rejected by content admission: {reason:?}"
+            ))),
+            other => other.map(|_| ()),
+        };
+        let attached: std::sync::Arc<dyn crate::kv::encrypted::KvSecureContext> = context.clone();
+
+        // The composition the production merge path performs: re-checked
+        // authorization around the guarded merge, at the current epoch and
+        // generation, for a current admin — applies.
+        let mut merged = false;
+        let outcome = context.apply_if_encrypted_authorized(&admin, epoch, generation, &mut || {
+            merged = true;
+            as_err(store.merge_guarded_encrypted_delta(
+                &delta("sync-pin", 1),
+                peer(1),
+                &admin,
+                &attached,
+            ))
+        });
+        assert!(
+            outcome.is_ok(),
+            "current admin at current epoch merges: {outcome:?}"
+        );
+        assert!(merged, "the guarded merge ran");
+        assert!(store.get("sync-pin").is_some());
+
+        // The ptr_eq fence: the SAME group, but a DIFFERENT context arc —
+        // the guarded merge must refuse to run for a context the store did
+        // not attach (fail closed, never a cross-context merge).
+        let foreign: std::sync::Arc<dyn crate::kv::encrypted::KvSecureContext> =
+            other_context.clone();
+        let refused = store.merge_guarded_encrypted_delta(
+            &delta("foreign-pin", 2),
+            peer(1),
+            &admin,
+            &foreign,
+        );
+        assert!(
+            refused.is_err(),
+            "#836: the guarded merge requires the store's OWN attached context"
+        );
+        assert!(store.get("foreign-pin").is_none());
+    }
+
+    /// #836 (the #847 reviewer's pin of the MERGE-WIRING half, which the
+    /// synchronous tests cannot reach): a record sealed under the CURRENT
+    /// epoch by a STILL-AUTHORIZED writer, whose merge is already past
+    /// every pre-lock check and parked on the store lock, must be refused
+    /// when the group epoch rotates while it waits — the epoch and
+    /// generation fences `apply_if_encrypted_authorized` re-checks under
+    /// the store lock. With the merge path reverted to a plain
+    /// writer-checked merge (the pre-fix shape), the writer is still
+    /// authorized and the STALE-EPOCH record merges.
+    #[tokio::test]
+    async fn encrypted_epoch_rotation_during_store_lock_wait_refuses_stale_record() {
+        let keypair = AgentKeypair::generate().expect("admin keypair");
+        let admin = keypair.agent_id();
+        let (mut group, mut contexts, group_id) = encrypted_group(&[admin]);
+        group.policy.write_access = crate::groups::GroupWriteAccess::AdminOnly;
+        let context = contexts.pop().expect("context");
+        context.update_from_group(&group);
+        let epoch_before = context.current_epoch();
+        let secure = context.clone() as SharedKvSecureContext;
+        let id = store_id(99);
+        let target = Arc::new(RwLock::new(
+            KvStore::new_encrypted(id, "Enc".to_string(), admin, group_id, context.clone())
+                .expect("target store"),
+        ));
+        let signing = AuthorSigning::from_keypair(&keypair).expect("admin signer");
+        let pages = Arc::new(std::sync::Mutex::new(RetainedPagePool::default()));
+
+        let stale_delta = KvStoreDelta::for_put(
+            "epoch-race".to_string(),
+            KvEntry::new(
+                "epoch-race".to_string(),
+                b"stale-epoch".to_vec(),
+                "text/plain".to_string(),
+            ),
+            (peer(1), 1),
+            1,
+        );
+        let stale_record = secure
+            .seal_authorized(
+                &signing,
+                KvMutationKind::Delta,
+                &id,
+                &bincode::serialize(&stale_delta).expect("stale delta"),
+            )
+            .expect("record sealed under the current epoch");
+        let stale_wire = encode_delta(peer(1), &stale_record).expect("stale wire");
+
+        // Park the real receive future just past its pre-lock checks.
+        let merge = KvStoreSync::merge_encrypted_record(
+            &secure,
+            None,
+            &target,
+            &id,
+            peer(2),
+            &stale_wire,
+            &pages,
+        );
+        tokio::pin!(merge);
+        {
+            let _held_write = target.write().await;
+            assert!(futures::poll!(&mut merge).is_pending());
+            // The epoch rotates while the merge waits on the store lock.
+            let _ = group.rotate_shared_secret();
+            context.update_from_group(&group);
+            assert_ne!(
+                context.current_epoch(),
+                epoch_before,
+                "the group's secret epoch advanced"
+            );
+            assert!(
+                context.is_authorized_writer(&admin),
+                "the writer itself is STILL authorized (only the epoch moved)"
+            );
+        }
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(2), merge.as_mut())
+                .await
+                .expect("blocked merge completion"),
+            "#836: a record sealed under the pre-rotation epoch must be refused after the rotation"
+        );
+        let after = target.read().await;
+        assert!(after.get("epoch-race").is_none());
+    }
+
     #[tokio::test]
     async fn encrypted_admin_withdrawn_during_store_lock_wait_cannot_merge() {
         let keypair = AgentKeypair::generate().expect("admin keypair");
