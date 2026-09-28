@@ -488,8 +488,20 @@ impl X0xLinkTransport {
         inbound_tx: mpsc::Sender<(PeerConnection, StreamType, Vec<u8>)>,
         accepted_tx: mpsc::Sender<PeerConnection>,
     ) {
+        // Media streams arrive only after the agent identity gate, so they
+        // always carry an agent. An agentless stream (only the #1040
+        // enrollment-only SyncV1 path creates one) fails closed: the lane is
+        // dropped (reset) without surfacing an accepted peer.
+        let Some(peer_agent) = stream.agent() else {
+            tracing::warn!(
+                target: "voice",
+                peer = %hex::encode(stream.peer().0),
+                "media stream carries no agent identity; lane dropped"
+            );
+            return;
+        };
         let peer_conn = PeerConnection {
-            peer_id: hex::encode(stream.agent().0),
+            peer_id: hex::encode(peer_agent.0),
             remote_addr: placeholder_addr(),
         };
         let recv = stream.recv_mut();

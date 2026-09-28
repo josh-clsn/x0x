@@ -496,7 +496,8 @@ pub struct PeerStream {
     /// Exception (#1040): a `SyncV1` stream admitted or opened on the
     /// owner-signed enrollment of a machine with no known agent carries an
     /// EMPTY list. Such a stream reaches only the registered owner-sync
-    /// acceptor, which uses [`PeerStream::peer`] and never `agent()`.
+    /// acceptor, which uses [`PeerStream::peer`]; [`PeerStream::agent`]
+    /// returns `None` for such a stream.
     agents: Vec<crate::identity::AgentId>,
     peer: MachineId,
     protocol: StreamProtocol,
@@ -524,14 +525,19 @@ impl PeerStream {
         }
     }
 
-    /// The first agent identity on the peer machine. For the common
-    /// single-agent-per-machine case this is that agent. When multiple
-    /// agents share the peer machine the specific opener cannot be
-    /// determined — use [`PeerStream::peer_agents`] for authorization
-    /// decisions so the connect ACL checks every agent.
+    /// The first agent identity on the peer machine, or `None` when the
+    /// stream carries no agent. For the common single-agent-per-machine case
+    /// this is that agent. When multiple agents share the peer machine the
+    /// specific opener cannot be determined — use [`PeerStream::peer_agents`]
+    /// for authorization decisions so the connect ACL checks every agent.
+    ///
+    /// Returns `None` for a `SyncV1` stream admitted on the owner-signed
+    /// enrollment of a machine with no known agent (#1040/#1044). Streams
+    /// that passed the agent identity gate always carry at least one agent,
+    /// but callers must still handle `None` by failing closed.
     #[must_use]
-    pub fn agent(&self) -> crate::identity::AgentId {
-        self.agents[0]
+    pub fn agent(&self) -> Option<crate::identity::AgentId> {
+        first_agent(&self.agents)
     }
 
     /// All agent identities known to run on the peer machine. The connect
@@ -572,6 +578,14 @@ impl PeerStream {
     }
 }
 
+/// First agent of a stream's agent list, `None` when the list is empty
+/// (enrollment-only `SyncV1` admission, #1040). Backs [`PeerStream::agent`];
+/// a free function so the empty-list case is unit-testable without live QUIC
+/// stream halves.
+fn first_agent(agents: &[crate::identity::AgentId]) -> Option<crate::identity::AgentId> {
+    agents.first().copied()
+}
+
 /// Write the protocol-prefix byte on a freshly-opened outbound stream.
 ///
 /// Called by the opener immediately after [`ant_quic::Node::open_bi`] so the
@@ -604,6 +618,41 @@ pub(crate) async fn read_protocol_prefix(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1040/#1044: the enrollment-only SyncV1 admission path builds a
+    /// `PeerStream` with an EMPTY agent list. `PeerStream::agent` must report
+    /// that as `None` so no caller can panic on it (no-panic rule).
+    #[test]
+    fn enrollment_only_stream_has_no_agent() {
+        // Exactly the list `start_stream_accept_loop` hands to
+        // `PeerStream::new` for an enrollment-only SyncV1 stream.
+        let enrollment_only: Vec<crate::identity::AgentId> = Vec::new();
+        assert_eq!(first_agent(&enrollment_only), None);
+    }
+
+    /// A gated stream still yields its (first) agent: the fix must not
+    /// weaken the common path forward/voice depend on.
+    #[test]
+    fn gated_stream_returns_its_agent() {
+        let a = crate::identity::AgentId([0xA1; 32]);
+        let b = crate::identity::AgentId([0xB2; 32]);
+        assert_eq!(first_agent(&[a]), Some(a));
+        assert_eq!(first_agent(&[a, b]), Some(a));
+    }
+
+    /// Red control (rule 9): the pre-fix body of `PeerStream::agent` was
+    /// `self.agents[0]`. On the enrollment-only (empty) list that indexes out
+    /// of bounds and panics — the latent production panic this change
+    /// removes. Kept as a control so the hazard stays documented.
+    #[test]
+    #[should_panic(expected = "index out of bounds")]
+    fn control_old_agent_accessor_panics_on_enrollment_only_stream() {
+        fn old_agent(agents: &[crate::identity::AgentId]) -> crate::identity::AgentId {
+            agents[0]
+        }
+        let enrollment_only: Vec<crate::identity::AgentId> = Vec::new();
+        let _ = old_agent(&enrollment_only);
+    }
 
     #[test]
     fn protocol_prefix_round_trips() {
