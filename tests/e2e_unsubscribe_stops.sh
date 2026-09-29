@@ -29,6 +29,7 @@ trap cleanup EXIT
 rm -rf "$DIR"; mkdir -p "$DIR"
 cat >"$DIR/config.toml" <<TOML
 instance_name = "e2e-unsub"
+network_id = "x0x.prod"
 data_dir = "$DIR"
 bind_address = "127.0.0.1:19081"
 api_address = "127.0.0.1:19181"

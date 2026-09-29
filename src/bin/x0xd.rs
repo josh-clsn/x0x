@@ -213,6 +213,10 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Whether a config file was actually loaded (explicit `--config`, or the
+    // instance's default path). A named instance with a file must declare its
+    // plane (David, 2026-09-29); one with no file keeps unset = prod.
+    let mut config_file_loaded = true;
     let (mut config, mut config_findings) = match &config_path {
         Some(path) => load_config(path).await?,
         None => {
@@ -226,6 +230,7 @@ async fn main() -> anyhow::Result<()> {
             if default_path.exists() {
                 load_config(default_path.to_str().unwrap_or("/etc/x0x/config.toml")).await?
             } else {
+                config_file_loaded = false;
                 (DaemonConfig::default(), Vec::new())
             }
         }
@@ -236,6 +241,18 @@ async fn main() -> anyhow::Result<()> {
         config.instance_name.clone(),
         connect_acl_override.as_deref(),
     )?;
+
+    // A named instance whose config file sets no top-level `network_id` would
+    // silently join the prod plane: refuse (the operator-authored case where
+    // the testnet ran on prod). Without any config file, keep unset = prod
+    // (install.sh / `x0x daemon start --name` write none) and only warn below.
+    if let Some(name) = instance_name.as_ref() {
+        if config_file_loaded && config.network_id.is_none() {
+            anyhow::bail!(x0x::server::config::named_instance_missing_network_id(
+                name.as_str()
+            ));
+        }
+    }
 
     // Apply instance-scoped defaults for data_dir and api_address when --name
     // is active but the config didn't explicitly set instance-scoped values.

@@ -88,10 +88,43 @@ fn stray_key_fails_check_and_is_logged_as_a_warning() {
 }
 
 #[test]
-fn named_instance_without_network_id_fails_check() {
+fn named_instance_config_file_without_network_id_refuses() {
+    // David, 2026-09-29: a named instance whose config file declares no plane
+    // must not start (on main it started on x0x.prod with a warning).
     let (out, text) = check("log_level = 'warn'\n", &["--name", "n7check"]);
     assert!(!out.status.success(), "{text}");
-    assert!(text.contains("named instance `n7check`"), "{text}");
+    assert!(
+        text.contains("named instance 'n7check' has no network_id"),
+        "{text}"
+    );
+    assert!(!text.contains("Configuration is valid"), "{text}");
+}
+
+#[test]
+fn named_instance_without_any_config_file_still_starts_on_prod() {
+    // `install.sh --name` / `x0x daemon start --name` write no config file:
+    // such an instance keeps unset = prod. `--check` reports it as a finding
+    // but it is not refused.
+    let home = tempfile::tempdir().expect("tmpdir");
+    let out = Command::new(env!("CARGO_BIN_EXE_x0xd"))
+        .args(["--name", "n7nofile", "--check"])
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join("config"))
+        .env("XDG_DATA_HOME", home.path().join("data"))
+        .env("NO_COLOR", "1")
+        .env_remove("RUST_LOG")
+        .output()
+        .expect("spawn x0xd --check");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!text.contains("has no network_id"), "not refused: {text}");
+    assert!(
+        text.contains("named instance `n7nofile` sets no top-level `network_id`"),
+        "{text}"
+    );
 }
 
 #[test]

@@ -675,6 +675,11 @@ fn hermetic_mdns_line(extra_config: &str) -> &'static str {
     }
 }
 
+/// The plane a harness daemon joins when its constructor chooses none. This is
+/// what an unset `network_id` resolved to before named instances had to
+/// declare one, so no test changes plane.
+const HARNESS_DEFAULT_PLANE: &str = "x0x.prod";
+
 fn with_private_plane(plane_id: &str, extra_config: &str) -> String {
     let has_network_id = extra_config
         .lines()
@@ -933,6 +938,12 @@ async fn start_instance_with_env(
     // #417: hermetic by default. Sits with the other flat keys, ABOVE
     // `extra_config`, for the same reason `[update]` sits below it.
     let mdns_line = hermetic_mdns_line(extra_config);
+    // A named instance whose config file sets no `network_id` refuses to start
+    // (David, 2026-09-29). Constructors that do not choose a plane (`cluster`,
+    // `solo`, `join_peer`, `trio_*`) keep their previous plane, prod, stated
+    // explicitly; `pair*` already passes a private plane.
+    let owned_extra = with_private_plane(HARNESS_DEFAULT_PLANE, extra_config);
+    let extra_config = owned_extra.as_str();
     let config_content = format!(
         "api_address = \"127.0.0.1:{api_port}\"\n\
          bind_address = \"0.0.0.0:{bind_port}\"\n\
