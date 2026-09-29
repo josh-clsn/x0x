@@ -2708,6 +2708,126 @@ async fn anchors_commit_binds_the_full_header_under_the_owner_key() -> Result<()
 /// revision it applies but never clears (the fence). The conflict path
 /// never clears (pinned in fork_quarantine::
 /// adr0064_owner_anchored_successor_conflicting_commit_never_clears).
+/// N19-B r2 (P1, mandate path): an owner-anchored clear that would come
+/// from the mandate-carrying MemberAdded arm must never publish on a
+/// non-durable write. Under `ReplacedNotDurable` the apply REJECTS and
+/// the marker stays in memory (and on disk) — pre-fix, the published
+/// candidate kept the cleared marker and the REJECTED return did not
+/// restore containment.
+#[tokio::test]
+async fn n19b_mandate_clear_keeps_marker_when_not_directory_durable() -> Result<()> {
+    let (state, _dir, owner_kp, group_id, joiner_hex, pre_seal, cert) = receiver_stage().await?;
+    let actor_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let terminal = terminal_commit_for(&pre_seal, state.agent.identity().agent_keypair(), 2_000);
+    let mandate = mint_mandate_like_authority(
+        &pre_seal,
+        None,
+        0,
+        &joiner_hex,
+        &actor_hex,
+        "n19b-invite-secret",
+        &cert,
+        &owner_kp,
+        1_500,
+    );
+    {
+        let mut groups = state.named_groups.write().await;
+        let live = groups.get_mut(&group_id).expect("receiver group");
+        let terminal_header = live.terminal_commit_header();
+        live.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: terminal.revision.saturating_sub(1),
+            state_hash: "evidenced-conflict-hash".to_string(),
+            committed_by: actor_hex.clone(),
+            observed_at_ms: now_millis_u64(),
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: terminal_header.clone(),
+                conflicting_commit: terminal_header,
+                classification: None,
+            },
+            no_anchor: false,
+        });
+    }
+    let event = member_added_event(
+        &group_id,
+        terminal.revision,
+        &actor_hex,
+        &joiner_hex,
+        &cert,
+        terminal,
+        Some(mandate),
+    );
+    let _fault = set_save_fault(&state, SaveFault::ReplacedNotDurable);
+    let result = apply_event(&state, event).await;
+    assert!(
+        !result.accepted,
+        "a non-durable apply rejects (the sealed record never landed)"
+    );
+    drop(_fault);
+    let marker_kept = {
+        let groups = state.named_groups.read().await;
+        groups.get(&group_id).expect("group").is_fork_quarantined()
+    };
+    assert!(
+        marker_kept,
+        "N19-B: the mandate-path clear must keep the marker in memory until Durable"
+    );
+    Ok(())
+}
+
+/// N19-B r2 (P2): the all-clean seal persists through the FULL #457
+/// transaction — journaled TreeKEM snapshot rebind and live restore
+/// included — and its quarantine clear is a separate durable-gated
+/// transition. Under `ReplacedNotDurable` the seal refuses, the marker
+/// stays in memory, and the TreeKEM rebind surfaces exactly as the
+/// pre-N19-B transaction did.
+#[tokio::test]
+async fn n19b_all_clean_seal_keeps_marker_when_not_directory_durable() -> Result<()> {
+    let (state, _dir, owner_kp, group_id, _joiner_hex, pre_seal, _cert) = receiver_stage().await?;
+    // The marker an all-clean seal may clear: owner axis, strictly below
+    // the sealed revision.
+    {
+        let mut groups = state.named_groups.write().await;
+        let live = groups.get_mut(&group_id).expect("receiver group");
+        let header = live.terminal_commit_header();
+        live.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: live.state_revision.saturating_sub(1),
+            state_hash: "evidenced-conflict-hash".to_string(),
+            committed_by: hex::encode(state.agent.agent_id().as_bytes()),
+            observed_at_ms: now_millis_u64(),
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: header.clone(),
+                conflicting_commit: header,
+                classification: None,
+            },
+            no_anchor: false,
+        });
+    }
+    let _ = (&owner_kp, &pre_seal);
+    let _fault = set_save_fault(&state, SaveFault::ReplacedNotDurable);
+    let response = seal_group_state(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+    )
+    .await
+    .into_response();
+    drop(_fault);
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a non-durable seal refuses"
+    );
+    let marker_kept = {
+        let groups = state.named_groups.read().await;
+        groups.get(&group_id).expect("group").is_fork_quarantined()
+    };
+    assert!(
+        marker_kept,
+        "N19-B: the all-clean seal's clear keeps the marker until Durable"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn owner_anchored_apply_path_clears_quarantine() -> Result<()> {
     let (state, dir, owner_kp, group_id, joiner_hex, pre_seal, cert) = receiver_stage().await?;
@@ -3593,9 +3713,12 @@ async fn replaced_not_durable_apply_keeps_the_visible_candidate_but_does_not_not
             "the Watson ruling keeps the visible replacement: the seat is \
              there in memory and on disk"
         );
+        // N19-B: the owner-anchored clear is durable-gated, so on a
+        // ReplacedNotDurable apply the visible candidate KEEPS the marker
+        // (containment fails closed; pre-N19-B it carried the clear).
         assert!(
-            !live.is_fork_quarantined(),
-            "the visible candidate carries the CLEAR — marker absent"
+            live.is_fork_quarantined(),
+            "N19-B: the visible candidate keeps the marker until the clear is Durable"
         );
     }
     assert!(
@@ -3704,9 +3827,12 @@ async fn replaced_not_durable_queued_replay_withholds_the_notification_759() -> 
             live.has_active_member(&joiner_hex),
             "the visible replacement from the replayed apply is kept"
         );
+        // N19-B: the owner-anchored clear is durable-gated, so on a
+        // ReplacedNotDurable queued replay the visible candidate KEEPS the
+        // marker (containment fails closed; pre-N19-B it carried the clear).
         assert!(
-            !live.is_fork_quarantined(),
-            "the visible candidate carries the clear — marker absent"
+            live.is_fork_quarantined(),
+            "N19-B: the visible candidate keeps the marker until the clear is Durable"
         );
     }
     assert!(

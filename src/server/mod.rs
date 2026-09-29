@@ -3328,6 +3328,7 @@ async fn handle_predecessor_relay_typed_payload_inner(
                 None,
                 &mut replay_group_id,
                 &mut cleared_after,
+                &mut None,
                 None,
                 true,
                 false,
@@ -3782,6 +3783,7 @@ async fn handle_predecessor_relay_typed_payload_inner(
                 Some(admission_first_seen_ms),
                 &mut replay_group_id,
                 &mut cleared_after,
+                &mut None,
                 None,
                 true, // lock_already_held
                 false,

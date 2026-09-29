@@ -5389,6 +5389,71 @@ async fn adr0064_restart_preserves_marker_and_gate_still_refuses() -> Result<()>
 /// A bare invite stub cannot hold evidence (empty commit_log), so the
 /// fixture seats the marker on the r3-stage stub, which retains its
 /// sealed base commit.
+/// N19-B r2 (P1, adoption path): the tier-1 adoption's owner-anchored
+/// clear must never publish on a non-durable write. Under
+/// `ReplacedNotDurable` the apply rejects and the joiner stub keeps its
+/// marker — pre-fix, the published candidate kept the cleared marker
+/// while the event was REJECTED.
+#[tokio::test]
+async fn n19b_adoption_clear_keeps_marker_when_not_directory_durable() -> Result<()> {
+    let terminal_revision = |stage: &R3Stage| -> u64 {
+        match &stage.member_added {
+            NamedGroupMetadataEvent::MemberAdded {
+                commit: Some(commit),
+                ..
+            } => commit.revision,
+            _ => panic!("staged MemberAdded carries its terminal commit"),
+        }
+    };
+    let stage = r3_stage(0x9C).await?;
+    let terminal = terminal_revision(&stage);
+    assert!(terminal >= 1, "the staged terminal advances the chain");
+    {
+        let terminal_header = {
+            let groups = stage.joiner_state.named_groups.read().await;
+            groups
+                .get(&stage.group_id)
+                .expect("stub")
+                .terminal_commit_header()
+        };
+        let mut groups = stage.joiner_state.named_groups.write().await;
+        groups
+            .get_mut(&stage.group_id)
+            .expect("stub")
+            .fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: terminal - 1,
+            state_hash: "evidenced-conflict-hash".to_string(),
+            committed_by: stage.authority_hex.clone(),
+            observed_at_ms: now_millis_u64(),
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: terminal_header.clone(),
+                conflicting_commit: terminal_header,
+                classification: None,
+            },
+            no_anchor: false,
+        });
+    }
+    let _fault = set_save_fault(&stage.joiner_state, SaveFault::ReplacedNotDurable);
+    let result = r3_apply_with_chain(&stage, stage.chain.clone()).await;
+    assert!(
+        !result.accepted,
+        "a non-durable apply rejects (the sealed record never landed)"
+    );
+    drop(_fault);
+    let marker_kept = {
+        let groups = stage.joiner_state.named_groups.read().await;
+        groups
+            .get(&stage.group_id)
+            .expect("stub")
+            .is_fork_quarantined()
+    };
+    assert!(
+        marker_kept,
+        "N19-B: the adoption-path clear must keep the marker in memory until Durable"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn adr0064_adoption_clear_requires_strictly_greater_revision() -> Result<()> {
     let terminal_revision = |stage: &R3Stage| -> u64 {
@@ -6823,7 +6888,7 @@ async fn issue820_non_treekem_sibling_requires_exact_terminal_attestation() -> R
         assert_eq!(info.state_hash, stub.state_hash, "{label}");
         drop(groups);
         if should_adopt {
-            let seated = adopted.expect("positive control returns an adopted copy");
+            let (seated, _clear_due) = adopted.expect("positive control returns an adopted copy");
             assert!(seated.has_active_member(&stage.joiner_hex), "{label}");
             assert_eq!(seated.state_hash, terminal.state_hash, "{label}");
             assert!(seated.state_hash_is_current(), "{label}");
@@ -8560,6 +8625,7 @@ async fn adr0064_s4_removed_admin_fork_replay_under_held_lock_no_deadlock() -> R
             None,
             &mut replay_group_id,
             &mut std::collections::BTreeSet::new(),
+            &mut None,
             None,
             true,
             true,
