@@ -7,7 +7,7 @@ Eight workflows in `.github/workflows/`:
 - **release.yml**: Multi-platform builds (7 targets), macOS code signing, publishes to crates.io. Also generates `release-manifest.json` and signature for the self-update system (see [`upgrade-system.md`](upgrade-system.md)).
 - **build.yml**: PR validation
 - **sign-skill.yml**: GPG-signs `SKILL.md` (manual dispatch)
-- **integration.yml**: integration and soak tests on pushes to `main` and on PRs to any base
+- **integration.yml**: integration tests on pushes to `main` and on PRs to any base; the soak and timing suites run only on the weekly schedule
 - **adr-governance.yml**: ADR checks on PRs touching `docs/adr/**` or `.adr-kit.yaml`
 - **claude.yml**: Claude Code responses to issue/PR review comments
 
