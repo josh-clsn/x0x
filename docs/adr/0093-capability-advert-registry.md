@@ -50,8 +50,9 @@ ADR remains Proposed pending its own review and acceptance.
 
 ### Registry and allocation
 
-Registry version 1 is a `u64` bitmap. Absence, version 0, an unknown registry
-version, or an unset bit means **not supported**. Unknown bits are ignored.
+Registry version 1 is a `u64` bitmap. Within a verified current advert,
+absence, version 0, an unknown registry version, or an unset bit means
+**not supported**. Unknown bits are ignored.
 The version identifies the bitmap's interpretation, not the software release.
 
 | Bit | Name | Meaning |
@@ -95,15 +96,19 @@ Use only the latest verified, machine-bound announcement in `CapabilityStore`.
 Existing signed-timestamp ordering and the 900-second TTL apply to the whole
 advert, including the trailer. A newer legacy announcement clears the bits;
 an old replay cannot restore them or extend their lifetime. Unknown, stale,
-and card-only peers lack the bits. A registry claim from a different machine
-cannot be combined with an older machine's advert.
+and card-only capability state is not positive evidence of missing support.
+A registry claim from a different machine cannot be combined with an older
+machine's advert.
 
 At the common direct-message egress, before product transport work
-or ACK waiter creation, inspect the typed payload prefix. Require bit 0 for
+or ACK waiter creation, inspect the typed payload prefix. Check bit 0 for
 ShareGrant, bit 1 for both authority predecessor relays and requester offers.
 A bounded targeted announcement refresh is allowed before refusal, so
 on-demand advertisement can converge. Local loopback is unchanged.
-Missing support returns typed `DmError::RecipientUpgradeRequired`, rendered
+Only a verified, current advert lacking the required bit holds a send. Unknown,
+expired and card-only state sends exactly as before, without waiting for an
+advert; existing transport and durable-ACK requirements still apply.
+Known missing support returns typed `DmError::RecipientUpgradeRequired`, rendered
 as `recipient_upgrade_required` with the required named capability. It is
 retryable after a fresh advert; do not send any payload or accept a receipt.
 
@@ -128,14 +133,16 @@ that a newer application understood a message.
 
 ### Positive
 
-- 0.46 sends neither payload to a 0.45 recipient; a false Accepted ACK from
-  that recipient cannot cancel a send that was never started.
+- With a current verified advert, 0.46 sends neither payload to a 0.45
+  recipient; a false Accepted ACK from that recipient cannot cancel a send
+  that was never started.
 - Pending grants and offers resume automatically when fresh support arrives.
 - Future application changes have an explicit, reviewable allocation rule.
 
 ### Negative / Trade-offs
 
-- Unknown or stale upgraded peers wait for advertisement convergence.
+- Unknown or stale peers retain existing delivery behaviour, including the
+  mixed-version risk until a current verified advert arrives.
 - The trailer adds one ML-DSA signature per advert and verification on ingest.
 - Pre-D08 development builds also lack the bits and must upgrade.
 - Already lost mixed-era grants are not reconstructed; owners must reissue them.
@@ -151,9 +158,9 @@ that a newer application understood a message.
 Inert exact-name tests cover signed advertisement round-trip, legacy base
 read/verification, absence yielding no bits, forged/unverified/card claims,
 stale state, per-bit gating, zero transport calls while blocked, grant queue
-retention and delivery after an upgraded announcement. Local tests do not
-claim to exercise live transport. Red/green SHAs and gate results belong in
-the implementing PR body.
+retention, unknown-capability delivery and delivery after an upgraded
+announcement. Local tests do not claim to exercise live transport. Red/green
+SHAs and gate results belong in the implementing PR body.
 
 **Release gate row 4b (CI/sealed testnet only):** run a real 0.45.0 peer with
 history enabled beside the candidate. Queue a ShareGrant and both an
@@ -161,8 +168,9 @@ authority relay and requester offer. Assert zero such DMs reach 0.45, typed
 `recipient_upgrade_required`, and retained obligations across retries and
 sender restart. Upgrade the recipient; receive a fresh signed advert; assert
 all three deliver and leave their outboxes only after the required receipt.
-Repeat with missing/stale adverts and a history-disabled receiver; ordinary
-DMs must still work. Check that a 0.45 reader verifies candidate adverts.
+Repeat with missing/stale adverts (existing send behaviour must continue)
+and a history-disabled receiver; ordinary DMs must still work. Check that
+a 0.45 reader verifies candidate adverts.
 Row 4b is required release acceptance, not replaced by the inert unit tests.
 
 ## Notes for AI-assisted work

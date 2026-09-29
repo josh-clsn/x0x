@@ -320,6 +320,7 @@ struct CachedDigestExt {
 }
 
 struct CachedAdvert {
+    verified_advert: bool,
     capabilities: DmCapabilities,
     machine_id: [u8; 32],
     expires_at: Instant,
@@ -373,17 +374,28 @@ impl CapabilityStore {
             .map(|binding| binding.capabilities)
     }
 
-    /// Refuse unsupported typed payloads before any transport or ACK waiter
-    /// exists. Every initial send and retry uses this same gate (ADR 0093).
+    /// Hold typed payloads only when a current verified advert lacks support.
+    /// Unknown, expired and card-only state preserves existing send behaviour.
     pub fn require_payload_capability(
         &self,
         recipient: &AgentId,
         payload: &[u8],
     ) -> Result<(), crate::dm::DmError> {
-        self.lookup(recipient)
-            .map(|caps| caps.application_registry)
-            .unwrap_or_default()
-            .require_payload(payload)
+        let Ok(inner) = self.inner.lock() else {
+            return Ok(());
+        };
+        if let Some(entry) = inner.adverts.get(recipient.as_bytes()) {
+            if entry.verified_advert
+                && entry.machine_id != [0; 32]
+                && Instant::now() <= entry.expires_at
+            {
+                return entry
+                    .capabilities
+                    .application_registry
+                    .require_payload(payload);
+            }
+        }
+        Ok(())
     }
 
     /// Look up a peer's capability together with the machine that signed it.
@@ -528,6 +540,7 @@ impl CapabilityStore {
         inner.adverts.insert(
             *agent_id.as_bytes(),
             CachedAdvert {
+                verified_advert: true,
                 capabilities,
                 machine_id: *machine_id.as_bytes(),
                 expires_at,
@@ -659,6 +672,7 @@ impl CapabilityStore {
         inner.adverts.insert(
             *agent_id.as_bytes(),
             CachedAdvert {
+                verified_advert: false,
                 capabilities,
                 machine_id: *machine_id.as_bytes(),
                 expires_at,
@@ -1425,6 +1439,7 @@ mod digest_diagnostic_tests {
 
     fn base(expires_at: Instant, digest_support: bool) -> CachedAdvert {
         CachedAdvert {
+            verified_advert: true,
             capabilities: DmCapabilities {
                 digest_support,
                 ..DmCapabilities::pending()

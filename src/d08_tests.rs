@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Inert D08 boundary tests: memory, signatures and a temporary outbox only.
 use crate::dm::{CapabilityRegistry, DmCapabilities, DmError};
 use crate::dm_capability::{CapabilityAdvert, CapabilityStore};
@@ -101,10 +103,18 @@ fn d08_unverified_forged_stale_and_card_bits_fail_closed() {
 }
 
 #[test]
-fn d08_offer_requires_bit_before_transport() {
+fn d08_offer_known_lacking_is_held_before_transport() {
     let store = CapabilityStore::new();
     let recipient = AgentId([3; 32]);
     let payload = b"X0X-GROUP-PREDECESSOR-RELAY-V1\nrequest";
+    let mut legacy = DmCapabilities::v2_durable_gossip_ready(vec![1; 1184]);
+    legacy.application_registry = CapabilityRegistry::default();
+    store.insert(
+        recipient,
+        MachineId([2; 32]),
+        legacy,
+        crate::dm::now_unix_ms() - 1,
+    );
     let mut sends = 0;
     let blocked = store.require_payload_capability(&recipient, payload);
     if blocked.is_ok() {
@@ -214,7 +224,7 @@ async fn d08_grant_stays_queued_until_bit_arrives() {
 }
 
 #[tokio::test]
-async fn d08_real_egress_refuses_grants_and_offers_without_network() {
+async fn d08_real_egress_holds_only_known_lacking_without_network() {
     // AgentBuilder defaults to network_config=None: no NetworkNode, gossip
     // runtime, sockets or daemon are constructed. All storage is scoped here.
     let dir = tempfile::tempdir().unwrap();
@@ -240,8 +250,33 @@ async fn d08_real_egress_refuses_grants_and_offers_without_network() {
             .await
             .unwrap_err();
         assert!(
+            !matches!(error, DmError::RecipientUpgradeRequired { .. }),
+            "unknown: {error:?}"
+        );
+    }
+    let mut legacy = DmCapabilities::v2_durable_gossip_ready(vec![1; 1184]);
+    legacy.application_registry = CapabilityRegistry::default();
+    agent.capability_store.insert(
+        recipient,
+        MachineId([2; 32]),
+        legacy,
+        crate::dm::now_unix_ms(),
+    );
+    for payload in [
+        crate::share_grant::SHARE_GRANT_DM_PREFIX,
+        b"X0X-GROUP-PREDECESSOR-RELAY-V1\n".as_slice(),
+    ] {
+        let error = agent
+            .send_direct_with_config(
+                &recipient,
+                payload.to_vec(),
+                crate::dm::DmSendConfig::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
             matches!(error, DmError::RecipientUpgradeRequired { .. }),
-            "{error:?}"
+            "known lacking: {error:?}"
         );
     }
 }
@@ -280,4 +315,90 @@ fn d08_latest_legacy_advert_clears_bits_and_replay_cannot_restore() {
     assert!(store
         .require_payload_capability(&signing.agent_id, crate::share_grant::SHARE_GRANT_DM_PREFIX)
         .is_err());
+}
+
+#[tokio::test]
+async fn d08_unknown_caps_grant_is_delivered() {
+    use crate::share_grant::{
+        deliver_grant_via, outbox::GrantRedeliveryOutbox, Grantee, ShareCap, ShareGrant,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let owner = UserKeypair::generate().unwrap();
+    let recipient = AgentId([3; 32]);
+    let now = crate::dm::now_unix_ms() / 1000;
+    let grant = ShareGrant::sign(
+        &owner,
+        [1; 32],
+        Grantee::Agent(recipient),
+        vec![AgentId([4; 32])],
+        vec![ShareCap::Dm],
+        now - 1,
+        now + 3600,
+    )
+    .unwrap();
+    let revocations = tokio::sync::RwLock::new(crate::revocation::RevocationSet::new());
+    let outbox =
+        GrantRedeliveryOutbox::load(dir.path().join("outbox"), Some(owner.user_id()), now).await;
+    let store = CapabilityStore::new();
+    let sends = std::sync::atomic::AtomicUsize::new(0);
+    let send = |to, payload: Vec<u8>, _id| {
+        let result = store
+            .require_payload_capability(&to, &payload)
+            .map_err(|e| e.to_string());
+        if result.is_ok() {
+            sends.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        std::future::ready(result)
+    };
+    let results = deliver_grant_via(
+        &grant,
+        &[recipient],
+        Some(&outbox),
+        &revocations,
+        || now,
+        send,
+    )
+    .await;
+    assert!(results[0].delivered);
+    assert!(!results[0].queued);
+    assert!(results[0].error.is_none());
+    assert_eq!(outbox.len(), 0);
+    assert_eq!(sends.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[test]
+fn d08_unknown_expired_and_card_only_caps_allow_offers_and_grants() {
+    let recipient = AgentId([3; 32]);
+    let store = CapabilityStore::new();
+    for state in 0..3 {
+        if state == 1 {
+            assert!(store.insert(
+                recipient,
+                MachineId([2; 32]),
+                DmCapabilities::pending(),
+                crate::dm::now_unix_ms()
+            ));
+            assert!(store
+                .lookup_binding_at(
+                    &recipient,
+                    std::time::Instant::now() + std::time::Duration::from_secs(901)
+                )
+                .is_none());
+        } else if state == 2 {
+            assert!(store.insert_from_card(
+                recipient,
+                MachineId([2; 32]),
+                DmCapabilities::pending(),
+                crate::dm::now_unix_ms()
+            ));
+        }
+        for payload in [
+            crate::share_grant::SHARE_GRANT_DM_PREFIX,
+            b"X0X-GROUP-PREDECESSOR-RELAY-V1\n".as_slice(),
+        ] {
+            store
+                .require_payload_capability(&recipient, payload)
+                .unwrap();
+        }
+    }
 }

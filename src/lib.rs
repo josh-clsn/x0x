@@ -6744,24 +6744,19 @@ impl Agent {
         // of the 409 is that it is fast and deterministic, never a hang.
         if (config.require_durable_app_ack
             && !capability_binding_supports_durable_ack(advert_binding.as_ref()))
-            || advert_binding
-                .as_ref()
-                .map(|binding| binding.capabilities.application_registry)
-                .unwrap_or_default()
-                .require_payload(&payload)
+            || self
+                .capability_store
+                .require_payload_capability(to, &payload)
                 .is_err()
         {
             self.refresh_strict_dm_capability(*to).await;
             advert_binding = self.capability_store.lookup_binding(to);
         }
-        // ADR 0093: inspect the same fresh binding that selects the recipient
-        // below. A targeted advert refresh is allowed, but no product payload
-        // or ACK waiter exists until the named bit is known.
-        if let Err(error) = advert_binding
-            .as_ref()
-            .map(|binding| binding.capabilities.application_registry)
-            .unwrap_or_default()
-            .require_payload(&payload)
+        // ADR 0093: only positive, current advert evidence of missing support
+        // holds product payloads. Unknown capabilities keep existing behaviour.
+        if let Err(error) = self
+            .capability_store
+            .require_payload_capability(to, &payload)
         {
             tracing::info!(recipient = %hex::encode(to.as_bytes()), %error,
                 "typed delivery retained pending recipient capability");
