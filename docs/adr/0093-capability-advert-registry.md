@@ -1,9 +1,10 @@
 # ADR 0093: Capability Advertisement Registry
 
-- **Status:** Proposed
+- **Status:** Accepted
+- **Accepted:** 2026-09-29 by David Irvine (charter decision D08: the grant capability bit ships in v0.46.0; accepted on the text merged with #1064 at c44dd2b, which holds sends only for peers whose current verified advert lacks the bit, while unknown, expired or card-only capabilities send as before; OMP cross-model review r2 APPROVE; status change applied by Claude at his instruction)
 - **Date:** 2026-09-29
 - **Decision owners:** David Irvine (D08 ratification), Codex (author)
-- **Reviewers:** pending; David Irvine (ADR acceptance)
+- **Reviewers:** OMP (cross-model review, 2 rounds); David Irvine (acceptance)
 - **Supersedes:** none
 - **Superseded by:** none
 - **Vision requirement:** R5 (share a subset of my agents with other people),
