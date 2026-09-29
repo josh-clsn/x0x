@@ -242,7 +242,7 @@ The sidebar is your map:
 | Encrypted groups (MLS) | `x0x groups …` | [docs/security.md](./docs/security.md) |
 | Remote exec (ACL-gated, off by default) | `x0x exec <agent> -- <argv…>` | [docs/exec.md](./docs/exec.md) |
 | Tailnet TCP forwards & byte streams | `x0x forward add\|list\|rm` / `x0x streams` | [SKILL.md](./SKILL.md) |
-| Self-update | `x0x upgrade [--check\|--apply]` | [docs/upgrade-system.md](./docs/upgrade-system.md) |
+| Self-update | `x0x upgrade --check` (read-only); install via authenticated `POST /upgrade/apply` | [docs/upgrade-system.md](./docs/upgrade-system.md) |
 | Diagnostics | `x0x diagnostics <area>` / `x0x network status` | [docs/diagnostics.md](./docs/diagnostics.md) |
 
 **Machine pinning** deserves a note: every agent runs on a machine with its own hardware-pinned key. `x0x machines pin <agent_id> <machine_id>` rejects the `(agent, machine)` pair if the agent later appears on unexpected hardware — a cheap defence against key theft.

@@ -2174,10 +2174,11 @@ Run a command on **another** agent's machine. Disabled by default; every request
 | GET | `/upgrade` | — (CLI does not call this) | Daemon-side check for updates (release manifests over the `x0x/release` gossip topic; GitHub first-discovery fallback) |
 | POST | `/upgrade/apply` | — (CLI does not call this) | Daemon applies the latest verified release manifest with transactional restart |
 
-**The CLI is a separate, standalone updater.** `x0x upgrade [--check]` (and
-`--apply`, which dispatches to the same standalone path — the flag does not
-target the daemon) checks GitHub directly and needs **no running daemon**.
-Drive the daemon-side endpoints above over REST or the GUI. See
+**The CLI only checks; it never installs.** `x0x upgrade --check` is a
+read-only check against GitHub and needs **no running daemon**. `x0x upgrade`,
+`--apply` and `--force` refuse installation (N2, v0.46.0): install with the
+authenticated daemon endpoint `POST /upgrade/apply` (or let the daemon's
+self-update apply it), over REST or the GUI. See
 [docs/upgrade-system.md](upgrade-system.md).
 
 **#451 caveat:** never downgrade an owned install to v0.40.x — the old
