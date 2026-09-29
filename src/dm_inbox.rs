@@ -37,6 +37,31 @@ const DURABLE_ACK_MAX_CONCURRENT: usize = 32;
 /// Shared with the daemon's predecessor listener. A literal prefix alone is
 /// ordinary DM text until the suffix is a verified signed pubsub envelope.
 pub const GROUP_PREDECESSOR_RELAY_DM_PREFIX: &[u8] = b"X0X-GROUP-PREDECESSOR-RELAY-V1\n";
+
+/// The byte prefixes production registers as typed-DM routes when the DM
+/// inbox starts (`start_dm_inbox_when_gossip_ready`). The raw-QUIC dispatch
+/// consults this table for UNVERIFIED frames even BEFORE the inbox exists
+/// (N12: the raw listener starts earlier and passes an empty route list —
+/// without this, the startup window would re-open the user-DM leak).
+///
+/// `PUBLIC_GROUP_BOOTSTRAP_DM_PREFIX` is defined in the server layer; its
+/// literal is repeated here and pinned equal by a server-side test.
+pub(crate) const PRODUCTION_TYPED_DM_PREFIXES: [&[u8]; 6] = [
+    crate::exec::EXEC_DM_PREFIX,
+    GROUP_PREDECESSOR_RELAY_DM_PREFIX,
+    crate::share_grant::SHARE_GRANT_DM_PREFIX,
+    crate::history::classify::GROUP_PUBLIC_MESSAGE_DM_PREFIX,
+    crate::history::classify::KV_STORE_DELTA_DM_PREFIX,
+    b"X0X-PUBLIC-GROUP-BOOTSTRAP-V2\n",
+];
+
+/// Whether these bytes claim one of the production typed-DM protocols
+/// (prefix match only — recognition, not validation).
+pub(crate) fn recognized_production_typed_prefix(payload: &[u8]) -> bool {
+    PRODUCTION_TYPED_DM_PREFIXES
+        .iter()
+        .any(|prefix| payload.starts_with(prefix))
+}
 const PREDECESSOR_RELAY_MAX_ENVELOPE_BYTES: usize = 64 * 1024;
 
 /// Outcome of the C5 live Direct/typed ACK hedge.
@@ -2316,6 +2341,14 @@ impl InboxPipeline {
         } else {
             (None, TypedRouteOutcome::NoPrefix)
         }
+    }
+
+    /// Whether these bytes are a COMPLETE match for a registered typed
+    /// route (prefix and validator): a protocol frame, not a user DM.
+    /// Non-consuming - the caller decides what to do with it (N12: an
+    /// unverified typed frame must not fall through to the generic bus).
+    pub(crate) fn typed_route_recognizes(routes: &[DmTypedPayloadRoute], payload: &[u8]) -> bool {
+        Self::matching_typed_route(routes, payload).0.is_some()
     }
 
     /// Shared prefix dispatch for verified gossip and post-validation raw direct
