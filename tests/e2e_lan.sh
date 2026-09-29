@@ -349,6 +349,7 @@ done
 # Write configs — NO bootstrap_peers, rely on mDNS for cross-node discovery
 $SSH "$S1_TARGET" "cat > $DATA_DIR/config1.toml << 'TOML'
 instance_name = \"e2e-lan-studio1\"
+network_id = \"x0x.prod\"
 data_dir = \"$DATA_DIR/data1\"
 bind_address = \"0.0.0.0:$S1_BIND_PORT\"
 api_address = \"127.0.0.1:$S1_API_PORT\"
@@ -360,6 +361,7 @@ echo \$! > $DATA_DIR/pid1"
 
 $SSH "$S2_TARGET" "cat > $DATA_DIR/config2.toml << 'TOML'
 instance_name = \"e2e-lan-peer\"
+network_id = \"x0x.prod\"
 data_dir = \"$DATA_DIR/data2\"
 bind_address = \"0.0.0.0:$S2_BIND_PORT\"
 api_address = \"127.0.0.1:$S2_API_PORT\"
@@ -1158,6 +1160,7 @@ echo -e "\n${CYAN}[17/18] Seedless Bootstrap (3rd agent via mDNS)${NC}"
 # Start a third instance on peer, different port, ZERO bootstrap peers
 $SSH "$S2_TARGET" "mkdir -p $DATA_DIR/data3 && cat > $DATA_DIR/config3.toml << 'TOML'
 instance_name = \"e2e-lan-peerb\"
+network_id = \"x0x.prod\"
 data_dir = \"$DATA_DIR/data3\"
 bind_address = \"0.0.0.0:$S3_BIND_PORT\"
 api_address = \"127.0.0.1:$S3_API_PORT\"

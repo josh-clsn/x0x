@@ -309,6 +309,7 @@ def main() -> int:
     DATA_DIR.mkdir(parents=True)
 
     config = """instance_name = "local-probe"
+network_id = "x0x.prod"
 data_dir = "/tmp/x0x-local-probe"
 bind_address = "0.0.0.0:15484"
 api_address = "127.0.0.1:19201"

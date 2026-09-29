@@ -117,6 +117,14 @@ All notable changes to this project will be documented in this file.
   `"x0x.prod"` to keep joining prod). A named instance with no config file at
   all (`install.sh --name`, `x0x daemon start --name`) is unaffected and still
   joins `x0x.prod` with a warning. The unnamed default instance is unchanged.
+  **Do this BEFORE upgrading:** a deployed named instance whose config lacks
+  `network_id` will refuse to start after the upgrade, and self-update has no
+  rollback. v0.45's `x0xd --check` does **not** flag this (it reports
+  "Configuration is valid"), so check by hand: the config must have a
+  `network_id = "…"` line above its first `[section]` header, e.g.
+  `awk '/^\[/{exit} /^network_id/{f=1} END{exit !f}' <config> || echo MISSING`.
+  A named instance is one started with `--name` or whose config sets
+  `instance_name`.
 - **A misplaced `network_id` no longer puts a daemon on the prod plane (N7).**
   `network_id` or `mdns_enabled` under a config section (e.g. `[gossip]`) was
   silently ignored, so the daemon joined `x0x.prod`; the testnet ran on prod
