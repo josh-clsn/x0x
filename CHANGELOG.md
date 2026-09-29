@@ -118,8 +118,11 @@ All notable changes to this project will be documented in this file.
   all (`install.sh --name`, `x0x daemon start --name`) is unaffected and still
   joins `x0x.prod` with a warning. The unnamed default instance is unchanged.
   **Do this BEFORE upgrading:** a deployed named instance whose config lacks
-  `network_id` will refuse to start after the upgrade, and self-update has no
-  rollback. v0.45's `x0xd --check` does **not** flag this (it reports
+  `network_id` will refuse to start after the upgrade. Under a supervisor
+  (systemd, launchd) the new binary is already in place and there is no
+  automatic rollback, so the service stays down; only the unsupervised
+  transactional handoff restores the previous binary when the new one fails
+  its health check. v0.45's `x0xd --check` does **not** flag this (it reports
   "Configuration is valid"), so check by hand: the config must have a
   `network_id = "…"` line above its first `[section]` header, e.g.
   `awk '/^\[/{exit} /^network_id/{f=1} END{exit !f}' <config> || echo MISSING`.

@@ -49,7 +49,7 @@ BOB_AUDIT="$WORK_DIR/bob-exec.jsonl"
 declare -a DAEMON_PIDS=()
 
 cat > "$ALICE_CFG" <<EOF_CFG
-network_id = "x0x.localtest"
+network_id = "x0x.prod"
 bind_address = "[::]:$QUIC_ALICE"
 api_address = "127.0.0.1:$API_ALICE"
 data_dir = "$ALICE_DATA"
@@ -68,7 +68,7 @@ enabled = false
 EOF_CFG
 
 cat > "$BOB_CFG" <<EOF_CFG
-network_id = "x0x.localtest"
+network_id = "x0x.prod"
 bind_address = "[::]:$QUIC_BOB"
 api_address = "127.0.0.1:$API_BOB"
 data_dir = "$BOB_DATA"
