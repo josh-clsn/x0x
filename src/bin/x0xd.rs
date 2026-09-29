@@ -213,7 +213,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let mut config = match &config_path {
+    let (mut config, mut config_findings) = match &config_path {
         Some(path) => load_config(path).await?,
         None => {
             let config_dir_name = match &cli_instance_name {
@@ -226,7 +226,7 @@ async fn main() -> anyhow::Result<()> {
             if default_path.exists() {
                 load_config(default_path.to_str().unwrap_or("/etc/x0x/config.toml")).await?
             } else {
-                DaemonConfig::default()
+                (DaemonConfig::default(), Vec::new())
             }
         }
     };
@@ -292,6 +292,20 @@ async fn main() -> anyhow::Result<()> {
     // non-blocking stdout writer thread and silently discards every later log
     // line. Named (not `_`) so it is not dropped at the end of this statement.
     let _log_guard = init_logging(&config.log_level, &config.log_format)?;
+    // N7: config findings are emitted only now, once a subscriber exists.
+    // Before this they were logged inside `load_config`, ahead of
+    // `init_logging`, and so were silently dropped.
+    if let Some(name) = instance_name.as_ref() {
+        if let Some(warning) = x0x::server::config::named_instance_plane_warning(
+            name.as_str(),
+            config.network_id.as_deref(),
+        ) {
+            config_findings.push(warning);
+        }
+    }
+    for finding in &config_findings {
+        tracing::warn!(target: "x0x::startup", "{finding}");
+    }
 
     let exec_policy = x0x::exec::load_exec_policy(exec_acl_override.as_deref(), exec_acl_load_mode)
         .await
@@ -318,6 +332,19 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if check_only {
+        // N7: `--check` fails on any config finding, so an operator sees the
+        // drift. Startup itself only warns on these (a stray key must not
+        // stop a live daemon after a self-update); misplaced plane keys were
+        // already refused in `load_config`.
+        if !config_findings.is_empty() {
+            for finding in &config_findings {
+                println!("FINDING  {finding}");
+            }
+            anyhow::bail!(
+                "configuration has {} finding(s); see FINDING lines above",
+                config_findings.len()
+            );
+        }
         println!("Configuration is valid");
         println!("{:#?}", config);
         println!("Exec ACL summary: {:#?}", exec_policy.summary());
@@ -603,23 +630,24 @@ async fn run_doctor(config: &DaemonConfig) -> Result<()> {
 }
 
 /// Load configuration from TOML file.
-async fn load_config(path: &str) -> Result<DaemonConfig> {
+///
+/// Returns the config and its non-fatal findings as warning lines, which the
+/// caller emits once logging is initialised (N7). A plane-isolation key
+/// (`network_id`, `mdns_enabled`) below the top level is fatal here.
+async fn load_config(path: &str) -> Result<(DaemonConfig, Vec<String>)> {
     let content = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("failed to read config file: {path}"))?;
-    // Issue #385: name every key the schema drops (any depth) instead of
-    // letting it vanish into a default. Warn-only (0.35.1 ruling).
-    let (config, ignored_keys) = x0x::server::config::parse_with_ignored_keys(&content)
+    // Issue #385 / N7: name every key the schema drops (any depth) instead
+    // of letting it vanish into a default. Only plane-isolation keys are
+    // fatal: an ignored `network_id` joins the prod plane. Every other
+    // dropped or misplaced key stays warn-only (0.35.1 ruling), because live
+    // prod configs carry stray keys and rejecting them would stop the
+    // daemon after a self-update.
+    let (config, findings) = x0x::server::config::analyze(&content)
         .with_context(|| format!("failed to parse config file: {path}"))?;
-    x0x::server::config::warn_ignored_keys(&ignored_keys);
-    // Warn loudly — but do not reject (0.35.1 cleanup ruling) — about a
-    // top-level key an operator placed under a sub-section, where serde
-    // silently drops it (e.g. `data_dir` under `[history]`, which owns
-    // `db_path`, not `data_dir`). Rejection could brick a drifted live config
-    // on upgrade; it is deferred to a later minor with notice.
-    if let Ok(root) = toml::from_str::<toml::Table>(&content) {
-        let findings = x0x::server::config::diagnose_section_placement(&root);
-        x0x::server::config::warn_section_misplacements(&findings);
+    if let Some(message) = findings.plane_error() {
+        anyhow::bail!("{message} (config file: {path})");
     }
     // ADR-0064 §1b: an out-of-range enforcement value changes security
     // behaviour (a 0-day grace would refuse every recorded-capable
@@ -628,7 +656,7 @@ async fn load_config(path: &str) -> Result<DaemonConfig> {
     if let Err(message) = config.groups.validate() {
         anyhow::bail!("invalid [groups] configuration: {message}");
     }
-    Ok(config)
+    Ok((config, findings.warning_lines()))
 }
 
 /// Whether the stdout log layer emits ANSI colour codes.
