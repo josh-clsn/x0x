@@ -108,6 +108,15 @@ All notable changes to this project will be documented in this file.
   `docs/diagnostics.md`.
 ### Fixed
 
+- **A misplaced `network_id` no longer puts a daemon on the prod plane (N7).**
+  `network_id` or `mdns_enabled` under a config section (e.g. `[gossip]`) was
+  silently ignored, so the daemon joined `x0x.prod`; the testnet ran on prod
+  this way. `x0xd` now refuses to start, and `x0xd --check` fails, when either
+  key is anywhere but the top level (including under an unknown section).
+  Other unknown or misplaced keys stay warn-only at startup but now fail
+  `x0xd --check`, and their warnings are actually shown: they were logged
+  before the log subscriber existed and silently dropped. A named instance
+  without a top-level `network_id` is warned that it joins `x0x.prod`.
 - **KV store snapshots written by v0.45.0 load again (release blocker).** A
   field added to `KvStore` after v0.45.0 sat between the store and the
   trailing sequence counter in the snapshot file, so every v0.45.0 snapshot
