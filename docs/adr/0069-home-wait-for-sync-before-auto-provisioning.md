@@ -1,9 +1,11 @@
 # ADR 0069: Home Auto-Provisioning Waits for Owner Sync
 
-- **Status:** Proposed. To be accepted **as a record of shipped behaviour**
-  (charter decision D11, 2026-09-29) and superseded by ADR 0088 (prov., the
-  group-protocol liveness contract, which replaces Home auto-provisioning with an
-  explicit owner group).
+- **Status:** Accepted as a record of shipped behaviour (charter decision D11);
+  to be superseded by ADR 0088 (prov., the group-protocol liveness contract, which
+  replaces Home auto-provisioning with an explicit owner group).
+- **Accepted:** 2026-09-29 by David Irvine (D11: records the wait-for-sync behaviour
+  shipped by #826/#884 and on main via #802; not a design endorsement beyond ADR 0088;
+  status change applied by Claude at his instruction)
 - **Date:** 2026-09-24 (updated 2026-09-29 for #863 and #1040)
 - **Decision owners:** David Irvine (product decision on PR #826: wait for sync
   before auto-provisioning), Claude (drafting)
