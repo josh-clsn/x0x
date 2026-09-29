@@ -250,14 +250,21 @@ pub fn analyze(content: &str) -> Result<(DaemonConfig, ConfigFindings), toml::de
     // otherwise go unseen.
     let mut misplaced_plane_keys = Vec::new();
     for (section, value) in &root {
-        if let Some(table) = value.as_table() {
-            collect_plane_keys(section, table, &mut misplaced_plane_keys);
+        // A root-level scalar is where a plane key belongs; only nested
+        // tables and arrays (of tables, at any depth) can hide one.
+        if value.is_table() || value.is_array() {
+            collect_plane_keys(section, value, &mut misplaced_plane_keys);
         }
     }
+    // serde reports an ignored enclosing table or array by its own path;
+    // drop it when a plane key inside it is already fatal, so the operator
+    // sees one message per problem.
     let is_plane_path = |path: &String| {
-        misplaced_plane_keys
-            .iter()
-            .any(|plane: &String| path == plane || plane.starts_with(&format!("{path}.")))
+        misplaced_plane_keys.iter().any(|plane: &String| {
+            path == plane
+                || plane.starts_with(&format!("{path}."))
+                || plane.starts_with(&format!("{path}["))
+        })
     };
     let ignored_keys = ignored
         .into_iter()
@@ -277,15 +284,27 @@ pub fn analyze(content: &str) -> Result<(DaemonConfig, ConfigFindings), toml::de
     ))
 }
 
-/// Append the dotted path of every plane key inside `table` (at any depth).
-fn collect_plane_keys(prefix: &str, table: &toml::Table, out: &mut Vec<String>) {
-    for (key, value) in table {
-        let path = format!("{prefix}.{key}");
-        if PLANE_KEYS.contains(&key.as_str()) {
-            out.push(path);
-        } else if let Some(sub) = value.as_table() {
-            collect_plane_keys(&path, sub, out);
+/// Append the dotted path of every plane key inside `value`, recursing
+/// through tables and arrays (including arrays of tables, `[[section]]`, and
+/// inline arrays) at any depth. Array elements are addressed as `path[i]`.
+fn collect_plane_keys(prefix: &str, value: &toml::Value, out: &mut Vec<String>) {
+    match value {
+        toml::Value::Table(table) => {
+            for (key, child) in table {
+                let path = format!("{prefix}.{key}");
+                if PLANE_KEYS.contains(&key.as_str()) {
+                    out.push(path);
+                } else {
+                    collect_plane_keys(&path, child, out);
+                }
+            }
         }
+        toml::Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                collect_plane_keys(&format!("{prefix}[{index}]"), item, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -353,6 +372,34 @@ network_id = 'x0x.testnet'
         assert!(
             findings.warning_lines().is_empty(),
             "the enclosing unknown table is not double-reported: {:?}",
+            findings.warning_lines()
+        );
+    }
+
+    #[test]
+    fn plane_key_inside_arrays_is_fatal() {
+        // Codex #1063 r1 P1: an array of tables, an inline array and a
+        // nested array all hid plane keys from a tables-only walk.
+        let src = "[[testnet]]
+network_id = 'x0x.testnet'
+
+[gossip]
+extra = [{ mdns_enabled = false }]
+deep = [[{ network_id = 'x' }]]
+";
+        let (_, findings) = analyze(src).expect("parses");
+        assert_eq!(
+            findings.misplaced_plane_keys,
+            vec![
+                "gossip.deep[0][0].network_id".to_string(),
+                "gossip.extra[0].mdns_enabled".to_string(),
+                "testnet[0].network_id".to_string(),
+            ]
+        );
+        assert!(findings.plane_error().is_some());
+        assert!(
+            findings.warning_lines().is_empty(),
+            "enclosing ignored arrays are not double-reported: {:?}",
             findings.warning_lines()
         );
     }
