@@ -14268,7 +14268,8 @@ impl Agent {
     /// Returns `None` when the accept loop has stopped (e.g. after shutdown).
     /// Protocols with a registered acceptor
     /// ([`Self::register_stream_acceptor`]) are routed there instead — this
-    /// default sink never sees them.
+    /// default sink never sees them. Forward protocols without an acceptor
+    /// are reset instead of entering this sink.
     pub async fn next_incoming_stream(&self) -> Option<streams::PeerStream> {
         let mut rx = self.stream_accept.receiver().lock().await;
         rx.recv().await
@@ -14286,8 +14287,8 @@ impl Agent {
     /// Exactly one acceptor may be live per protocol: a duplicate
     /// registration fails with
     /// [`error::NetworkError::StreamAcceptorConflict`]. Dropping the
-    /// acceptor deregisters it — subsequent streams for the protocol fall
-    /// back to the default sink ([`Self::next_incoming_stream`]).
+    /// acceptor deregisters it — subsequent forward streams are reset;
+    /// other protocols fall back to the default sink ([`Self::next_incoming_stream`]).
     ///
     /// # Errors
     /// [`error::NetworkError::StreamAcceptorConflict`] if an acceptor is
@@ -14523,7 +14524,7 @@ impl Agent {
                     tracing::debug!(
                         target: "x0x::streams",
                         protocol = ?protocol,
-                        "incoming-stream channel full; dropping accepted stream"
+                        "incoming-stream channel full or closed (no acceptor); resetting stream"
                     );
                 }
             }
@@ -14685,7 +14686,7 @@ impl Agent {
                         tracing::debug!(
                             target: "x0x::streams",
                             protocol = ?protocol,
-                            "incoming-stream channel full; dropping accepted stream"
+                            "incoming-stream channel full or closed (no acceptor); resetting stream"
                         );
                     }
                 });
