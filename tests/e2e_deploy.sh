@@ -252,8 +252,10 @@ LRCONF
         chmod 0755 /etc/cron.hourly/x0x-logrotate
         # #1071: refuse a config logrotate cannot parse (a typo here once
         # silently disabled the whole log budget).
-        if /usr/sbin/logrotate -d /etc/logrotate.conf 2>&1 | grep -qiE "^error|duplicate log entry"; then
-            echo "logrotate config invalid after x0x-logcap install" >&2
+        lr_out=$(/usr/sbin/logrotate -d /etc/logrotate.conf 2>&1)
+        lr_rc=$?
+        if [ "$lr_rc" -ne 0 ] || printf "%s\n" "$lr_out" | grep -qiE "^error|duplicate log entry"; then
+            echo "logrotate config invalid after x0x-logcap install (rc=$lr_rc)" >&2
             exit 1
         fi
         /usr/sbin/logrotate -f /etc/logrotate.conf >/dev/null 2>&1 || true
