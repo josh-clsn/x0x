@@ -30291,3 +30291,6 @@ mod asymmetric_capability_convergence_tests;
 
 #[cfg(test)]
 mod legacy_bus_interop_tests;
+
+#[cfg(test)]
+mod d08_tests;
