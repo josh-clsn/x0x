@@ -10806,7 +10806,11 @@ async fn run_pending_owner_anchored_clear(
     let clear_key_log = clear_key.clone();
     let clear_outcome = Box::pin(async move {
         persist_named_groups_quarantine_clear_gated(clear_state.as_ref(), |groups| {
-            let Some(info) = groups.get_mut(&clear_key) else {
+            // #732: resolve BOTH spellings — the apply's resolved key is
+            // usual, but a stable-spelling clear must reach an alias-keyed
+            // record too.
+            let Some(info) = crate::server::resolve_group_entry_mut_locked(groups, &clear_key)
+            else {
                 return false;
             };
             if !info
@@ -21221,9 +21225,11 @@ async fn owner_certified_seal_with_eviction(
             let mut fork_marker_cleared;
             let commit = {
                 let groups = state.named_groups.read().await;
-                // ADR0066-LOOKUP-WAIVER: `id` was already resolved by `seal_group_state`'s own 404-first lookup;
-                // a miss here returns 404 without sealing, so it fails closed.
-                let Some(info) = groups.get(id) else {
+                // #732 (N19-B r2): resolve BOTH spellings through the shared
+                // resolver — the seal's 404-first lookup may have resolved a
+                // stable spelling over an alias-keyed map. A miss returns 404
+                // without sealing, so it fails closed.
+                let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, id) else {
                     return Some(Err(not_found("group not found")));
                 };
                 let mut next = info.clone();
@@ -21284,7 +21290,11 @@ async fn owner_certified_seal_with_eviction(
                     let clear_key = id.to_string();
                     let clear_kp = state.agent.identity().user_keypair();
                     match persist_named_groups_quarantine_clear_gated(state, |groups| {
-                        let Some(info) = groups.get_mut(&clear_key) else {
+                        // #732: resolve BOTH spellings (the seal route's id
+                        // may be the stable one over an alias-keyed map).
+                        let Some(info) =
+                            crate::server::resolve_group_entry_mut_locked(groups, &clear_key)
+                        else {
                             return false;
                         };
                         let had_marker = info.fork_quarantine.is_some();

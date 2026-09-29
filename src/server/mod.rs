@@ -2986,6 +2986,26 @@ fn parse_machine_id_hex(hex_str: &str) -> Result<MachineId, String> {
 /// check, `stores`' TreeKEM protector and the manual clear route all resolve
 /// here. A quarantine-relevant lookup that spells this rule out again is a
 /// defect the `adr0066_lookup_guard` fixture is there to catch.
+/// #732 both-spellings resolution for a MUTABLE roster entry (the mut
+/// sibling of [`resolve_group_entry_locked`]): the exact map key first,
+/// else the entry whose STABLE id matches. Quarantine-clear closures use
+/// this so a clear requested under either spelling reaches the record the
+/// map actually holds (N19-B r2 CI fix).
+pub(in crate::server) fn resolve_group_entry_mut_locked<'a>(
+    groups: &'a mut HashMap<String, x0x::groups::GroupInfo>,
+    group_id: &str,
+) -> Option<&'a mut x0x::groups::GroupInfo> {
+    let key: String = if groups.contains_key(group_id) {
+        group_id.to_string()
+    } else {
+        groups
+            .iter()
+            .find(|(_, info)| info.stable_group_id() == group_id)
+            .map(|(k, _)| k.clone())?
+    };
+    groups.get_mut(&key)
+}
+
 pub(in crate::server) fn resolve_group_entry_locked<'a>(
     groups: &'a HashMap<String, x0x::groups::GroupInfo>,
     group_id: &str,
