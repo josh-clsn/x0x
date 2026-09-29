@@ -7,9 +7,21 @@ Eight workflows in `.github/workflows/`:
 - **release.yml**: Multi-platform builds (7 targets), macOS code signing, publishes to crates.io. Also generates `release-manifest.json` and signature for the self-update system (see [`upgrade-system.md`](upgrade-system.md)).
 - **build.yml**: PR validation
 - **sign-skill.yml**: GPG-signs `SKILL.md` (manual dispatch)
-- **integration.yml**: integration and soak tests on pushes/PRs to `main`
+- **integration.yml**: integration and soak tests on pushes to `main` and on PRs to any base
 - **adr-governance.yml**: ADR checks on PRs touching `docs/adr/**` or `.adr-kit.yaml`
 - **claude.yml**: Claude Code responses to issue/PR review comments
+
+## PR CI and main protection (ADR 0087, charter D15)
+
+- `ci.yml`, `build.yml`, `integration.yml` and `security.yml` run on pull requests to **any** base branch,
+  so a PR into an integration or stacked branch gets full CI. CI-only mirror PRs to `main` are no longer needed.
+  Push-triggered runs are still `main` only.
+- `main` is protected by a repository ruleset: changes land only through pull requests, force-push and deletion
+  are blocked, and the required checks are `Format Check`, `Clippy Lint`, `Test Suite`, `Documentation` and
+  `Build linux-x64-gnu`. There is no bypass.
+- `v*` tags can be created, moved or deleted only by repository admins (tag ruleset). Every agent currently acts
+  as the `dirvine` admin account, so this and the `release` environment reviewer are procedural gates, not
+  technical separation between agents and David (a separate bot identity was declined, D15).
 
 ## Release CI Gate (#128)
 
