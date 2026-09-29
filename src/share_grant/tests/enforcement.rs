@@ -638,9 +638,16 @@ async fn raw_direct_spoof_gains_neither_grant_nor_owner_trust() {
     let dm = crate::direct::DirectMessaging::new();
     for (agent, real) in [(own, m_own), (w.b1, w.mb)] {
         assert!(dm.mark_raw_direct_sender_connected(agent, real, true).await);
-        assert!(!dm.mark_raw_direct_sender_connected(agent, mx, false).await);
-        // Catches the #898 mutation (unverified claim marks connected).
-        assert_eq!(dm.get_machine_id(&agent).await, Some(real));
+        // The BINDING assertion runs FIRST: with the #898 gate reverted the
+        // call both returns true and rebinds, and this test's red must come
+        // from the rebind state itself, not from the boolean.
+        let refused = dm.mark_raw_direct_sender_connected(agent, mx, false).await;
+        assert_eq!(
+            dm.get_machine_id(&agent).await,
+            Some(real),
+            "the unverified MX claim must not rebind the agent (#898)"
+        );
+        assert!(!refused, "and the unverified claim is refused");
     }
 
     // Propagate whatever DirectMessaging now says into the discovery cache,
