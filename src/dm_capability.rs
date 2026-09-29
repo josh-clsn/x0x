@@ -193,10 +193,48 @@ impl CapabilityAdvert {
                     max_envelope_bytes: v1.capabilities.max_envelope_bytes,
                     kem_public_key: v1.capabilities.kem_public_key,
                     digest_support: false,
+                    application_registry: Default::default(),
                 },
                 signature: v1.signature,
             })
         })
+    }
+}
+
+/// Optional trailing field on a frozen capability advert (ADR 0093).
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct RegistryTrailer {
+    pub registry: crate::dm::CapabilityRegistry,
+    pub signature: Vec<u8>,
+}
+
+pub(crate) const REGISTRY_TRAILER_MAGIC: &[u8] = b"X0CR";
+
+impl RegistryTrailer {
+    /// Bind the registry to exactly this base announcement, including its
+    /// agent, machine, timestamp and KEM material. Legacy signature stays intact.
+    pub fn signed_bytes(&self, advert: &CapabilityAdvert) -> Result<Vec<u8>, postcard::Error> {
+        let mut bytes = b"x0x-capability-registry-v1\0".to_vec();
+        bytes.extend_from_slice(&advert.signed_bytes()?);
+        bytes.extend_from_slice(&self.registry.version.to_be_bytes());
+        bytes.extend_from_slice(&self.registry.bits.to_be_bytes());
+        Ok(bytes)
+    }
+
+    pub fn from_advert(bytes: &[u8]) -> Result<Option<Self>, postcard::Error> {
+        // Only the frozen base can carry this extension. Historical inline
+        // digest adverts remain readable but carry no application bits.
+        let Ok((_, tail)) = postcard::take_from_bytes::<CapabilityAdvertV1Wire>(bytes) else {
+            return Ok(None);
+        };
+        let Some(tail) = tail.strip_prefix(REGISTRY_TRAILER_MAGIC) else {
+            return Ok(None);
+        };
+        let (trailer, rest) = postcard::take_from_bytes(tail)?;
+        if !rest.is_empty() {
+            return Err(postcard::Error::DeserializeBadEncoding);
+        }
+        Ok(Some(trailer))
     }
 }
 
@@ -333,6 +371,19 @@ impl CapabilityStore {
     pub fn lookup(&self, agent_id: &AgentId) -> Option<DmCapabilities> {
         self.lookup_binding(agent_id)
             .map(|binding| binding.capabilities)
+    }
+
+    /// Refuse unsupported typed payloads before any transport or ACK waiter
+    /// exists. Every initial send and retry uses this same gate (ADR 0093).
+    pub fn require_payload_capability(
+        &self,
+        recipient: &AgentId,
+        payload: &[u8],
+    ) -> Result<(), crate::dm::DmError> {
+        self.lookup(recipient)
+            .map(|caps| caps.application_registry)
+            .unwrap_or_default()
+            .require_payload(payload)
     }
 
     /// Look up a peer's capability together with the machine that signed it.
@@ -575,6 +626,7 @@ impl CapabilityStore {
         // on-demand mode never emits).
         let mut capabilities = capabilities;
         capabilities.digest_support = false;
+        capabilities.application_registry = Default::default();
         if let Some(ext) = fresh_digest_ext(&inner.digest_exts, agent_id.as_bytes(), now) {
             if ext.machine_id == *machine_id.as_bytes() {
                 capabilities.digest_support = ext.digest_support;

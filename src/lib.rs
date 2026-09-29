@@ -6742,11 +6742,30 @@ impl Agent {
         // whose advert we simply have not heard yet must not be reported as
         // incapable, but the refusal must still be bounded — the whole point
         // of the 409 is that it is fast and deterministic, never a hang.
-        if config.require_durable_app_ack
-            && !capability_binding_supports_durable_ack(advert_binding.as_ref())
+        if (config.require_durable_app_ack
+            && !capability_binding_supports_durable_ack(advert_binding.as_ref()))
+            || advert_binding
+                .as_ref()
+                .map(|binding| binding.capabilities.application_registry)
+                .unwrap_or_default()
+                .require_payload(&payload)
+                .is_err()
         {
             self.refresh_strict_dm_capability(*to).await;
             advert_binding = self.capability_store.lookup_binding(to);
+        }
+        // ADR 0093: inspect the same fresh binding that selects the recipient
+        // below. A targeted advert refresh is allowed, but no product payload
+        // or ACK waiter exists until the named bit is known.
+        if let Err(error) = advert_binding
+            .as_ref()
+            .map(|binding| binding.capabilities.application_registry)
+            .unwrap_or_default()
+            .require_payload(&payload)
+        {
+            tracing::info!(recipient = %hex::encode(to.as_bytes()), %error,
+                "typed delivery retained pending recipient capability");
+            return Err(error);
         }
         let advert_machine = advert_binding.as_ref().map(|binding| binding.machine_id);
         let advert_cap = advert_binding.map(|binding| binding.capabilities);

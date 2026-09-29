@@ -486,6 +486,9 @@ pub(in crate::server) async fn direct_send(
                 // the peer state is not what it requires — and never a silent
                 // downgrade. Callers retry, surface "peer needs upgrade", or
                 // resend with `require_durable_app_ack = false`.
+                x0x::dm::DmError::RecipientUpgradeRequired { .. } => {
+                    (StatusCode::CONFLICT, "recipient_upgrade_required")
+                }
                 x0x::dm::DmError::AckSemanticsUnavailable(_) => {
                     (StatusCode::CONFLICT, "recipient_ack_semantics_unavailable")
                 }
