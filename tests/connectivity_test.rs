@@ -434,14 +434,14 @@ async fn unverified_raw_claim_cannot_promote_into_discovery_cache() {
     );
 
     // The spoof: M2 prefixes A's id; the listener computed verified=false
-    // and made exactly this call.
-    assert!(
-        !local
-            .direct_messaging()
-            .mark_raw_direct_sender_connected(a_id, m2.machine_id(), false)
-            .await,
-        "the unverified claim must be refused"
-    );
+    // and made exactly this call. The boolean is captured, NOT asserted
+    // here: with the #898 gate reverted the call both returns true and
+    // rebinds, and this test's red must come from the rebind state below,
+    // not from the boolean.
+    let refused = local
+        .direct_messaging()
+        .mark_raw_direct_sender_connected(a_id, m2.machine_id(), false)
+        .await;
     // The promotion: connect_to_agent reads DirectMessaging and rewrites
     // the discovery cache when the mapped machine is live. With the gate
     // held, A stays on M1 in BOTH structures.
@@ -462,6 +462,7 @@ async fn unverified_raw_claim_cannot_promote_into_discovery_cache() {
         resolved.machine_id, m1,
         "the discovery cache must still route A to M1"
     );
+    assert!(!refused, "and the unverified claim was refused");
 
     local.shutdown().await;
     m2.shutdown().await;

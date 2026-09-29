@@ -1814,24 +1814,30 @@ mod tests {
         assert_eq!(dm.get_machine_id(&agent_a).await, Some(m1));
 
         // Spoof: M2 prefixes A's id; the listener computed verified=false.
-        assert!(
-            !dm.mark_raw_direct_sender_connected(agent_a, m2, false)
-                .await
-        );
+        // The BINDING assertions run FIRST: with the #898 gate reverted the
+        // call both returns true and rebinds, and this test's red must come
+        // from the rebind state itself, not from the boolean.
+        let refused = dm
+            .mark_raw_direct_sender_connected(agent_a, m2, false)
+            .await;
         assert_eq!(
             dm.get_machine_id(&agent_a).await,
             Some(m1),
-            "an unverified claim must not move A's connected machine"
+            "an unverified claim must not move A's connected machine (#898 rebind)"
         );
         assert_eq!(dm.lookup_agent(&m2).await, None, "M2 must not map to A");
+        assert!(!refused, "and the unverified claim is refused");
 
         // A never-seen agent claimed unverified is not registered at all.
         let agent_b = AgentId([0xB1; 32]);
+        let refused_b = dm
+            .mark_raw_direct_sender_connected(agent_b, m2, false)
+            .await;
         assert!(
-            !dm.mark_raw_direct_sender_connected(agent_b, m2, false)
-                .await
+            !dm.is_connected(&agent_b).await,
+            "an unverified claim must not register a never-seen agent (#898 rebind)"
         );
-        assert!(!dm.is_connected(&agent_b).await);
+        assert!(!refused_b);
 
         // A verified move still updates the binding.
         assert!(dm.mark_raw_direct_sender_connected(agent_a, m2, true).await);
