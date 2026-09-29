@@ -516,6 +516,32 @@ mod tests {
         assert_eq!(result.as_deref(), Some("127.0.0.1:12700"));
     }
 
+    // Inert architectural regression: installation must belong to the daemon's
+    // authenticated upgrade transaction, never this standalone CLI module.
+    #[test]
+    fn standalone_upgrade_cannot_replace_or_restart_daemon() {
+        let source = include_str!("upgrade.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+        for forbidden in [".perform_upgrade(", ".spawn(", "/shutdown"] {
+            assert!(
+                !production.contains(forbidden),
+                "standalone upgrade must use POST /upgrade/apply, found {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_api_token_uses_daemon_filename() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let x0x_dir = dir.path().join("x0x");
+        std::fs::create_dir_all(&x0x_dir).expect("create x0x dir");
+        std::fs::write(x0x_dir.join("api-token"), "test-token\n").expect("write token");
+        assert_eq!(read_api_token_in(dir.path()).as_deref(), Some("test-token"));
+    }
+
     #[test]
     fn read_api_token_returns_none_without_token_file() {
         // An isolated data dir with no token file means no configured token
@@ -532,7 +558,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let x0x_dir = dir.path().join("x0x");
         std::fs::create_dir_all(&x0x_dir).expect("create x0x dir");
-        std::fs::write(x0x_dir.join("api.token"), "  \n").expect("write token file");
+        std::fs::write(x0x_dir.join("api-token"), "  \n").expect("write token file");
 
         let result = read_api_token_in(dir.path());
         assert!(result.is_none(), "whitespace-only token must be ignored");
