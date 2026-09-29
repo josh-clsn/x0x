@@ -6742,11 +6742,25 @@ impl Agent {
         // whose advert we simply have not heard yet must not be reported as
         // incapable, but the refusal must still be bounded — the whole point
         // of the 409 is that it is fast and deterministic, never a hang.
-        if config.require_durable_app_ack
-            && !capability_binding_supports_durable_ack(advert_binding.as_ref())
+        if (config.require_durable_app_ack
+            && !capability_binding_supports_durable_ack(advert_binding.as_ref()))
+            || self
+                .capability_store
+                .require_payload_capability(to, &payload)
+                .is_err()
         {
             self.refresh_strict_dm_capability(*to).await;
             advert_binding = self.capability_store.lookup_binding(to);
+        }
+        // ADR 0093: only positive, current advert evidence of missing support
+        // holds product payloads. Unknown capabilities keep existing behaviour.
+        if let Err(error) = self
+            .capability_store
+            .require_payload_capability(to, &payload)
+        {
+            tracing::info!(recipient = %hex::encode(to.as_bytes()), %error,
+                "typed delivery retained pending recipient capability");
+            return Err(error);
         }
         let advert_machine = advert_binding.as_ref().map(|binding| binding.machine_id);
         let advert_cap = advert_binding.map(|binding| binding.capabilities);
@@ -30292,3 +30306,6 @@ mod asymmetric_capability_convergence_tests;
 
 #[cfg(test)]
 mod legacy_bus_interop_tests;
+
+#[cfg(test)]
+mod d08_tests;

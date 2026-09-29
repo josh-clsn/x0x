@@ -1358,3 +1358,55 @@ async fn slow_targets_do_not_serialise_the_fast_one() -> Result<()> {
     state.agent.shutdown().await;
     Ok(())
 }
+
+/// D08: CI-only (networked fixture). A transport-v2 peer with no application
+/// bit must leave the actual requester's durable obligation intact.
+#[tokio::test]
+async fn d08_requester_offer_without_bit_remains_durably_queued() -> Result<()> {
+    let plane = format!("d08-offer-{}", rand::random::<u32>());
+    let (state, _dir) = networked_test_state(&plane).await?;
+    let group_id = insert_local_public_group(&state, &"d8".repeat(16)).await;
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    pending_join_request(&state, &group_id, "d08", &local_hex).await;
+    let recipient = crate::identity::AgentId([0xd8; 32]);
+    let mut caps = x0x::dm::DmCapabilities::v2_durable_gossip_ready(vec![1; 1184]);
+    caps.application_registry = Default::default();
+    state.agent.insert_capability_for_testing(
+        recipient,
+        crate::identity::MachineId([0xd9; 32]),
+        caps,
+    );
+    let obligation = obligation_for(
+        &group_id,
+        "d08",
+        &local_hex,
+        &hex::encode(recipient.as_bytes()),
+        vec![0xa5; 96],
+    );
+    insert_requester_offer_obligation(&state, obligation)
+        .await
+        .expect("queue offer");
+    let error = state
+        .agent
+        .send_direct_with_config(
+            &recipient,
+            GROUP_PREDECESSOR_RELAY_DM_PREFIX.to_vec(),
+            predecessor_relay_legacy_delivery_config(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        x0x::dm::DmError::RecipientUpgradeRequired { .. }
+    ));
+    requester_offer_step(&state).await;
+    let snapshot =
+        crate::server::routes::named_groups::requester_offer::requester_offer_snapshot(&state)
+            .await;
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].request_id, "d08");
+    let disk = std::fs::read_to_string(&state.requester_offer_outbox_path)?;
+    assert!(disk.contains("d08"), "pending offer survives restart");
+    state.agent.shutdown().await;
+    Ok(())
+}
