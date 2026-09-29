@@ -385,6 +385,7 @@ def write_config(path: Path, api_port: int, quic_port: int, data_dir: str) -> No
     path.write_text(
         "\n".join(
             [
+                'network_id = "x0x.localtest"',
                 f'api_address = "127.0.0.1:{api_port}"',
                 f'bind_address = "0.0.0.0:{quic_port}"',
                 f'data_dir = "{data_dir}"',
@@ -447,6 +448,7 @@ def start_daemons() -> tuple[str, str]:
 
     remote_config = "\n".join(
         [
+            'network_id = "x0x.localtest"',
             f'api_address = "127.0.0.1:{REMOTE_API}"',
             f'bind_address = "0.0.0.0:{REMOTE_QUIC}"',
             f'data_dir = "{REMOTE_DIR}"',

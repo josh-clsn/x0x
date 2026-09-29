@@ -108,6 +108,15 @@ All notable changes to this project will be documented in this file.
   `docs/diagnostics.md`.
 ### Fixed
 
+- **Named instances must set `network_id` (release note).** A named instance
+  (`x0xd --name <n>`) whose config file sets no top-level `network_id` now
+  refuses to start: "named instance '<n>' has no network_id; set network_id =
+  \"x0x.testnet\" (or another plane) at the top level, or omit --name for the
+  prod plane". Before, it silently joined `x0x.prod`. **Action on upgrade:** add
+  `network_id` to the config of every named instance that has one (use
+  `"x0x.prod"` to keep joining prod). A named instance with no config file at
+  all (`install.sh --name`, `x0x daemon start --name`) is unaffected and still
+  joins `x0x.prod` with a warning. The unnamed default instance is unchanged.
 - **A misplaced `network_id` no longer puts a daemon on the prod plane (N7).**
   `network_id` or `mdns_enabled` under a config section (e.g. `[gossip]`) was
   silently ignored, so the daemon joined `x0x.prod`; the testnet ran on prod

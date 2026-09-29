@@ -308,9 +308,22 @@ fn collect_plane_keys(prefix: &str, value: &toml::Value, out: &mut Vec<String>) 
     }
 }
 
-/// The warning for a named instance (`--name`) that joins the prod plane only
-/// because its config sets no top-level `network_id` (N7). Warn-only: a named
-/// local instance joining prod is supported usage.
+/// The startup error for a named instance (`--name`) whose config file sets no
+/// top-level `network_id` (David, 2026-09-29): it would silently join prod.
+#[must_use]
+pub fn named_instance_missing_network_id(instance: &str) -> String {
+    format!(
+        "named instance '{instance}' has no network_id; set network_id = \"x0x.testnet\" \
+         (or another plane, e.g. \"{plane}\" for prod) at the top level of its config \
+         file, or omit --name for the prod plane",
+        plane = super::state::PROD_PLANE_ID
+    )
+}
+
+/// The warning for a named instance (`--name`) running WITHOUT a config file,
+/// which therefore joins the prod plane (N7). Warn-only: `install.sh --name`
+/// and `x0x daemon start --name` write no config file, and a named instance
+/// with a file but no `network_id` is refused at startup instead.
 #[must_use]
 pub fn named_instance_plane_warning(instance: &str, network_id: Option<&str>) -> Option<String> {
     if network_id.is_some() {
