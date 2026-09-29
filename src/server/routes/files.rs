@@ -483,6 +483,14 @@ pub(in crate::server) async fn file_reject_handler(
 // Self-update (gossip-based + GitHub fallback)
 // ---------------------------------------------------------------------------
 
+/// Decode a transfer frame together with its transport-supplied sender.
+pub(in crate::server) fn decode_file_message(
+    message: &x0x::direct::DirectMessage,
+) -> Option<(&AgentId, x0x::files::FileMessage)> {
+    let payload = serde_json::from_slice(&message.payload).ok()?;
+    Some((&message.sender, payload))
+}
+
 /// Dispatch an incoming `FileMessage` from the direct messaging channel.
 pub(in crate::server) async fn handle_file_message(
     state: &Arc<AppState>,
@@ -1294,6 +1302,48 @@ async fn handle_file_complete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Inert: only DirectMessage construction and JSON decoding; no agent,
+    // AppState, tasks, sockets, filesystem writes, or daemon startup.
+    #[test]
+    fn n19_file_frames_require_verified_sender() {
+        let sender = AgentId([0x19; 32]);
+        let machine = x0x::identity::MachineId([0x20; 32]);
+        let frames = [
+            serde_json::json!({"type": "file-offer", "transfer_id": "id", "filename": "file", "size": 1, "sha256": "hash", "chunk_size": 1, "total_chunks": 1}),
+            serde_json::json!({"type": "file-chunk", "transfer_id": "id", "sequence": 0, "data": "eA=="}),
+            serde_json::json!({"type": "file-complete", "transfer_id": "id", "sha256": "hash"}),
+            serde_json::json!({"type": "file-accept", "transfer_id": "id"}),
+            serde_json::json!({"type": "file-reject", "transfer_id": "id", "reason": "no"}),
+            serde_json::json!({"type": "file-chunk-ack", "transfer_id": "id", "sequence": 0}),
+        ];
+        for frame in frames {
+            let payload = serde_json::to_vec(&frame).expect("serialize frame");
+            let mut message = x0x::direct::DirectMessage::new(sender, machine, payload);
+            // A raw peer claiming a known sender cannot enter ANY transfer arm.
+            assert!(
+                decode_file_message(&message).is_none(),
+                "unverified {} must not be attributed to its claimed sender",
+                frame["type"]
+            );
+            message.verified = true;
+            let (accepted_sender, accepted) = decode_file_message(&message)
+                .expect("verified frame must still reach the consumer");
+            assert_eq!(*accepted_sender, sender);
+            assert_eq!(
+                serde_json::to_value(accepted).expect("serialize accepted"),
+                frame
+            );
+        }
+        let malformed = x0x::direct::DirectMessage::new_verified(
+            sender,
+            machine,
+            b"not json".to_vec(),
+            true,
+            None,
+        );
+        assert!(decode_file_message(&malformed).is_none());
+    }
 
     #[test]
     fn safe_file_transfer_id_accepts_canonical_uuid() {

@@ -54,8 +54,8 @@ pub(super) use discovery::{
 };
 pub(super) use exec::{exec_cancel, exec_diagnostics, exec_run, exec_sessions};
 pub(super) use files::{
-    file_accept_handler, file_reject_handler, file_send_handler, file_transfer_status_handler,
-    file_transfers_handler, handle_file_message, FileChunkAckSlot,
+    decode_file_message, file_accept_handler, file_reject_handler, file_send_handler,
+    file_transfer_status_handler, file_transfers_handler, handle_file_message, FileChunkAckSlot,
 };
 pub(super) use grants::{grants_issue, grants_list, grants_received, grants_revoke};
 pub(super) use groups::{
@@ -111,12 +111,11 @@ pub(super) use named_groups::{
     PendingJoinRefusal, PendingJoinResult, PendingListenerAdmission, PendingTreeKemMetadataEvent,
     PendingWelcome, PendingWelcomeReceive, PredecessorRelayObligation, PublicGroupBootstrap,
     TreeKemCatchupRequest, TreeKemCatchupResponse, TreeKemMemberKeyPackageCache,
-    WelcomeBlobMessage, WelcomeFetchWaiter, CAUSAL_ENVELOPE_MAX_BYTES,
-    CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
-    CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
-    DIRECTORY_RESUBSCRIBE_JITTER_MS, GROUP_PREDECESSOR_RELAY_DM_PREFIX,
-    GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE,
+    WelcomeFetchWaiter, CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
+    DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
+    GROUP_PREDECESSOR_RELAY_DM_PREFIX, GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE,
 };
 pub(super) use network::{
     ack_diagnostics, bootstrap_cache_stats, connectivity_diagnostics, dm_diagnostics,

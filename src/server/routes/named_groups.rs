@@ -35668,6 +35668,14 @@ where
     Ok(received)
 }
 
+/// Decode a transfer frame together with its transport-supplied sender.
+pub(in crate::server) fn decode_welcome_blob_message(
+    message: &x0x::direct::DirectMessage,
+) -> Option<(&AgentId, WelcomeBlobMessage)> {
+    let payload = serde_json::from_slice(&message.payload).ok()?;
+    Some((&message.sender, payload))
+}
+
 pub(in crate::server) async fn handle_welcome_blob_message(
     state: &Arc<AppState>,
     sender: &AgentId,
@@ -36076,6 +36084,47 @@ pub(in crate::server) type WelcomeFetchWaiter =
 // below rather than duplicating a 150-field literal.
 pub(in crate::server) mod tests {
     use super::*;
+
+    // Inert: only DirectMessage construction and JSON decoding; no agent,
+    // AppState, tasks, sockets, filesystem writes, or daemon startup.
+    #[test]
+    fn n19_welcome_blob_frames_require_verified_sender() {
+        let sender = AgentId([0x19; 32]);
+        let machine = x0x::identity::MachineId([0x20; 32]);
+        let frames = [
+            serde_json::json!({"type": "fetch_request", "group_id": "group", "welcome_id": "id"}),
+            serde_json::json!({"type": "offer", "group_id": "group", "welcome_id": "id", "byte_len": 1, "chunk_size": 1, "total_chunks": 1, "blake3_hex": "hash"}),
+            serde_json::json!({"type": "chunk", "welcome_id": "id", "sequence": 0, "data": "eA=="}),
+            serde_json::json!({"type": "chunk_ack", "welcome_id": "id", "sequence": 0}),
+            serde_json::json!({"type": "complete", "welcome_id": "id"}),
+        ];
+        for frame in frames {
+            let payload = serde_json::to_vec(&frame).expect("serialize frame");
+            let mut message = x0x::direct::DirectMessage::new(sender, machine, payload);
+            // A raw peer claiming a known sender cannot enter ANY transfer arm.
+            assert!(
+                decode_welcome_blob_message(&message).is_none(),
+                "unverified {} must not be attributed to its claimed sender",
+                frame["type"]
+            );
+            message.verified = true;
+            let (accepted_sender, accepted) = decode_welcome_blob_message(&message)
+                .expect("verified frame must still reach the consumer");
+            assert_eq!(*accepted_sender, sender);
+            assert_eq!(
+                serde_json::to_value(accepted).expect("serialize accepted"),
+                frame
+            );
+        }
+        let malformed = x0x::direct::DirectMessage::new_verified(
+            sender,
+            machine,
+            b"not json".to_vec(),
+            true,
+            None,
+        );
+        assert!(decode_welcome_blob_message(&malformed).is_none());
+    }
 
     use super::super::super::sse::SseEvent;
     use super::super::super::state::DaemonUpdateConfig;
