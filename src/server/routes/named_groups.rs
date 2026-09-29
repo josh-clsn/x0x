@@ -4808,7 +4808,7 @@ async fn try_adopt_member_added_across_gap(
     e: x0x::groups::state_commit::ApplyError,
     chain: &[x0x::groups::state_commit::RetainedCommit],
     head_attestation: Option<HeadAttestation>,
-) -> Option<(x0x::groups::GroupInfo, bool)> {
+) -> Option<x0x::groups::GroupInfo> {
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     let adoptable = matches!(
         e,
@@ -4827,7 +4827,7 @@ async fn try_adopt_member_added_across_gap(
     let base_policy_hash = x0x::groups::compute_policy_hash(&current.policy);
     // NOTE: the caller's `None` arm owns the rejection COUNTER (one count
     // per refused apply, regardless of which check refused).
-    let refuse = |reason: &'static str| -> Option<(x0x::groups::GroupInfo, bool)> {
+    let refuse = |reason: &'static str| -> Option<x0x::groups::GroupInfo> {
         tracing::warn!(
             group_id = %LogHexId::group(stable_id),
             member = agent_id,
@@ -4994,22 +4994,24 @@ async fn try_adopt_member_added_across_gap(
             // groups, but that is a test of the POLICY while `no_anchor` is
             // the MARKER's own claim — §2 makes the marker's claim
             // authoritative, so both are asserted here.
-            // N19-B: the adoption no longer clears the marker itself. It
-            // reports the clear is DUE; the caller persists the sealed
-            // record (marker retained) through the full #457 transaction
-            // and only then runs the durable-gated clear transition.
-            let owner_anchored_clear_due =
-                current.policy.admission.owner_certified_user_id().is_some()
-                    && adopted.fork_quarantine.as_ref().is_some_and(|marker| {
-                        marker.owner_anchored_clear_permitted(commit.revision)
-                    });
+            if current.policy.admission.owner_certified_user_id().is_some()
+                && adopted
+                    .fork_quarantine
+                    .as_ref()
+                    .is_some_and(|marker| marker.owner_anchored_clear_permitted(commit.revision))
+            {
+                adopted.fork_quarantine = None;
+                // Slice 4: every clear re-arms the evidence gate — the
+                // next authenticated conflict re-quarantines.
+                adopted.reset_fork_evidence_after_quarantine_clear();
+            }
             tracing::info!(
                 group_id = %LogHexId::group(stable_id),
                 member = agent_id,
                 commit_revision = commit.revision,
                 "MemberAdded: joiner RECONSTRUCTED and adopted the authority chain (#458 r4)"
             );
-            Some((adopted, owner_anchored_clear_due))
+            Some(adopted)
         }
         Err(adopt_err) => {
             tracing::warn!(
@@ -5270,23 +5272,20 @@ where
     persist_named_groups_mutation_with_gss_guard(state, &gss_publication_guard, mutate).await
 }
 
-/// N19 part B (durable-gated fork-quarantine clear; the #1070 review's
-/// "part B"): run a containment-carrying mutation against a private
-/// CANDIDATE and publish it to the live map ONLY once the candidate is
-/// DURABLY persisted (`Ok(AtomicWriteOutcome::Durable)`). Every other
-/// outcome — pre-rename error, `NotReplaced`, and post-rename
-/// `ReplacedNotDurable` — leaves the live map untouched: consumers
-/// (WS/SSE quarantine annotations, session gates, KV contexts, the
-/// task-ingest gate) never observe a cleared marker without dir-fsync'd
-/// evidence on disk. After a `ReplacedNotDurable` the file may hold the
-/// cleared content while the fsync is unconfirmed — memory stays
-/// quarantined, the fail-closed direction; a crash then reloads whatever
-/// survived, never a memory-clear-without-evidence.
+/// N19-B: the manual quarantine-clear transition. The mutation runs
+/// against a private CANDIDATE — the live map (every consumer: WS/SSE
+/// annotations, session gates, KV contexts, the task-ingest gate) never
+/// shows the clear while the write is in flight. Outcomes follow the
+/// #759 Watson ruling:
+/// - `Durable` → publish the cleared candidate (the route notifies).
+/// - `ReplacedNotDurable` → publish the cleared candidate TOO (memory
+///   matches the visible destination), the route still refuses and
+///   withholds every notification/effect.
+/// - `NotReplaced` / `Err` → the live map stays ARMED (fail closed).
 ///
-/// Locks: roster persistence P then G, the same order
-/// [`persist_named_groups_mutation`] takes, and every containment-carrying
-/// writer goes through that pair (#732 r8 chokepoints), so the
-/// compare-and-commit below cannot interleave with one.
+/// Locks: roster persistence P then G, the persist_named_groups_mutation
+/// order; the candidate commit is a compare-and-commit so a writer that
+/// bypassed the pair (none exists — the #732 r8 chokepoints) fails closed.
 pub(in crate::server) async fn persist_named_groups_quarantine_clear_gated<F>(
     state: &AppState,
     mutate: F,
@@ -5310,18 +5309,19 @@ where
             encode_named_groups_store_excluding_pending_stubs(state, &candidate, None)?;
         save_named_groups_store_checked(state, &legacy_json, &home_suite_json).await
     };
-    if matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
+    if matches!(
+        outcome,
+        Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::ReplacedNotDurable)
+    ) {
         let mut groups = state.named_groups.write().await;
         if *groups == before {
             *groups = candidate;
         } else {
-            // No writer can reach this today (every containment writer takes
-            // P+G); if one ever does, fail closed: keep memory, surface it.
             tracing::error!(
-                "N19-B: the live named-groups map diverged during a durable-gated                  quarantine clear — keeping memory, refusing the commit"
+                "N19-B: the live named-groups map diverged during a gated                  quarantine clear — keeping memory, refusing the commit"
             );
             return Err(std::io::Error::other(
-                "named-groups map changed during the durable-gated quarantine clear",
+                "named-groups map changed during the gated quarantine clear",
             ));
         }
     }
@@ -9667,7 +9667,6 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
         // Durable (a rolled-back candidate restored its marker, so a clear
         // that did not stick must not notify).
         let mut iteration_cleared = std::collections::BTreeSet::new();
-        let mut iteration_pending_clear: Option<(String, String, u64)> = None;
         let applied = Box::pin(apply_named_group_metadata_event_inner_serialized(
             state,
             pending.event.clone(),
@@ -9678,7 +9677,6 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
             None,
             &mut replay_group_id,
             &mut iteration_cleared,
-            &mut iteration_pending_clear,
             None,
             true, // lock_already_held
             true, // roster_lock_already_held
@@ -9732,12 +9730,6 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
             // (Rolled-back and visible-but-not-durable candidates keep their
             // marker, per the Watson ruling that withholds post-persist
             // effects, so they must not notify.)
-            run_pending_owner_anchored_clear(
-                state,
-                iteration_pending_clear.take(),
-                cleared_quarantine,
-            )
-            .await;
             cleared_quarantine.append(&mut iteration_cleared);
             // B5: persist succeeded — now refresh the card cache and
             // record the membership event. These were deferred from the
@@ -10453,7 +10445,6 @@ async fn apply_named_group_metadata_event_with_binding(
     // #1023: a seat event's certificate sidecar, captured before `event`
     // moves and installed only after every apply guard has dropped.
     let roster_sidecar = seat_cert_fetch::member_added_sidecar(&event);
-    let mut pending_owner_anchored_clear: Option<(String, String, u64)> = None;
     let applied = Box::pin(apply_named_group_metadata_event_inner_serialized(
         state,
         event,
@@ -10464,7 +10455,6 @@ async fn apply_named_group_metadata_event_with_binding(
         None,
         &mut replay_group_id,
         &mut cleared_quarantine,
-        &mut pending_owner_anchored_clear,
         bound_join_attempt,
         false,
         false,
@@ -10474,8 +10464,6 @@ async fn apply_named_group_metadata_event_with_binding(
     if let Some(gid) = replay_group_id {
         replay_pending_causal_approvals(state, &gid, &mut cleared_quarantine).await;
     }
-    run_pending_owner_anchored_clear(state, pending_owner_anchored_clear, &mut cleared_quarantine)
-        .await;
     resume_task_ingest_after_durable_clear(state, &cleared_quarantine).await;
     hydrate_from_member_added_sidecar(state, roster_sidecar).await;
     if applied.accepted {
@@ -10738,7 +10726,6 @@ async fn apply_named_group_metadata_event_inner(
     let mut cleared_quarantine = std::collections::BTreeSet::new();
     // #1023: as in `apply_named_group_metadata_event_with_binding`.
     let roster_sidecar = seat_cert_fetch::member_added_sidecar(&event);
-    let mut pending_owner_anchored_clear: Option<(String, String, u64)> = None;
     let applied = Box::pin(apply_named_group_metadata_event_inner_serialized(
         state,
         event,
@@ -10749,7 +10736,6 @@ async fn apply_named_group_metadata_event_inner(
         None,
         &mut replay_group_id,
         &mut cleared_quarantine,
-        &mut pending_owner_anchored_clear,
         None,
         false,
         false,
@@ -10761,8 +10747,6 @@ async fn apply_named_group_metadata_event_inner(
             replay_pending_causal_approvals(state, &gid, &mut cleared_quarantine).await;
         }
     }
-    run_pending_owner_anchored_clear(state, pending_owner_anchored_clear, &mut cleared_quarantine)
-        .await;
     resume_task_ingest_after_durable_clear(state, &cleared_quarantine).await;
     hydrate_from_member_added_sidecar(state, roster_sidecar).await;
     if applied.accepted {
@@ -10787,69 +10771,6 @@ async fn apply_named_group_metadata_event_inner(
 /// the drain re-checks suspension and marker identity under the pinned
 /// roster — which is why the late/re-quarantined window needs no extra
 /// fencing; a MISSED durable clear is the defect this closes.
-/// N19-B: run a deferred owner-anchored fork-quarantine clear (recorded by
-/// the MemberAdded arm — mandate path or tier-1 adoption) as its own
-/// DURABLE-GATED transition, after every apply guard has dropped. The arm
-/// durably persisted the sealed record with the marker RETAINED; only a
-/// `Durable` outcome here clears it (and feeds the task-ingest resume set
-/// with both spellings). A non-durable clear keeps the marker — containment
-/// fails closed — and is logged.
-async fn run_pending_owner_anchored_clear(
-    state: &Arc<AppState>,
-    pending: Option<(String, String, u64)>,
-    cleared_quarantine: &mut std::collections::BTreeSet<String>,
-) {
-    let Some((clear_key, clear_stable, clear_revision)) = pending else {
-        return;
-    };
-    let clear_state = Arc::clone(state);
-    let clear_key_log = clear_key.clone();
-    let clear_outcome = Box::pin(async move {
-        persist_named_groups_quarantine_clear_gated(clear_state.as_ref(), |groups| {
-            // #732: resolve BOTH spellings — the apply's resolved key is
-            // usual, but a stable-spelling clear must reach an alias-keyed
-            // record too.
-            let Some(info) = crate::server::resolve_group_entry_mut_locked(groups, &clear_key)
-            else {
-                return false;
-            };
-            if !info
-                .fork_quarantine
-                .as_ref()
-                .is_some_and(|marker| marker.owner_anchored_clear_permitted(clear_revision))
-            {
-                return false;
-            }
-            info.fork_quarantine = None;
-            info.reset_fork_evidence_after_quarantine_clear();
-            true
-        })
-        .await
-    })
-    .await;
-    match clear_outcome {
-        Ok(AtomicWriteOutcome::Durable) => {
-            state
-                .groups_diagnostics
-                .record_fork_quarantine_owner_anchored_clear(&clear_key_log);
-            tracing::info!(
-                group_id = %LogHexId::group(&clear_key_log),
-                revision = clear_revision,
-                "ADR-0064: owner-anchored commit durably cleared the fork quarantine"
-            );
-            cleared_quarantine.insert(clear_key_log);
-            cleared_quarantine.insert(clear_stable);
-        }
-        outcome => {
-            tracing::warn!(
-                group_id = %LogHexId::group(&clear_key_log),
-                ?outcome,
-                "N19-B: owner-anchored quarantine clear was not directory-durable — marker kept"
-            );
-        }
-    }
-}
-
 pub(in crate::server) async fn resume_task_ingest_after_durable_clear(
     state: &Arc<AppState>,
     cleared: &std::collections::BTreeSet<String>,
@@ -10877,8 +10798,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
     envelope_bytes: Option<&[u8]>,
     predecessor_first_seen_ms: Option<u64>,
     replay_group_id: &mut Option<String>,
-    _cleared_quarantine: &mut std::collections::BTreeSet<String>,
-    pending_owner_anchored_clear: &mut Option<(String, String, u64)>,
+    cleared_quarantine: &mut std::collections::BTreeSet<String>,
     bound_join_attempt: Option<&str>,
     lock_already_held: bool,
     roster_lock_already_held: bool,
@@ -11229,10 +11149,6 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 None
             };
             let current = info.clone();
-            // N19-B: an owner-anchored quarantine clear (the mandate-valid
-            // arm below, or the tier-1 adoption in the Err branch) is
-            // DURABLE-GATED — the flag survives to this arm's persist site.
-            let mut owner_anchored_clear_due = false;
             let mut next = match apply_stateful_event_with_evidence(
                 state,
                 &resolved_group_key,
@@ -11333,12 +11249,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         adopt_attestation,
                     ))
                     .await;
-                    // N19-B: the adoption reports whether an owner-anchored
-                    // quarantine clear is DUE; the clear itself runs as a
-                    // durable-gated transition after this arm's persist.
                     match adopted {
-                        Some((mut next, adoption_clear_due)) => {
-                            owner_anchored_clear_due = adoption_clear_due;
+                        Some(mut next) => {
                             if attestation_corroborates {
                                 if let Some(lineage) = next.invite_lineage.as_mut() {
                                     lineage.corroborated = true;
@@ -11557,16 +11469,21 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                                 // would get an automatic clear and
                                 // silently contradict the manual-only
                                 // rule.
-                                // N19-B: the mandate arm records that an
-                                // owner-anchored clear is DUE instead of
-                                // clearing `next` here — the clear runs as a
-                                // durable-gated transition after the arm's
-                                // Durable persist, so a non-durable write can
-                                // never publish a cleared marker.
                                 if next.fork_quarantine.as_ref().is_some_and(|marker| {
                                     marker.owner_anchored_clear_permitted(commit.revision)
                                 }) {
-                                    owner_anchored_clear_due = true;
+                                    next.fork_quarantine = None;
+                                    next.reset_fork_evidence_after_quarantine_clear();
+                                    state
+                                        .groups_diagnostics
+                                        .record_fork_quarantine_owner_anchored_clear(
+                                            &resolved_group_key,
+                                        );
+                                    tracing::info!(
+                                        group_id = %LogHexId::group(&resolved_group_key),
+                                        revision = commit.revision,
+                                        "ADR-0064: mandate-carrying MemberAdded cleared the fork quarantine (owner-anchored commit)"
+                                    );
                                 }
                                 // #759 item 1: this clear (and the tier-1
                                 // adoption's) does NOT resume task ingest
@@ -11878,32 +11795,22 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 persist_named_group_info(state, &resolved_group_key, next.clone()).await,
                 Ok(AtomicWriteOutcome::Durable)
             ) {
-                // N19-B: the marker was never cleared in `next`, so a
-                // non-durable apply leaves containment fully intact — in
-                // memory AND on disk.
                 return ApplyMetadataResult::REJECTED;
             }
-            // N19-B (#759 item 1 successor): the owner-anchored clear (the
-            // mandate-valid arm above, or the tier-1 adoption) is its own
-            // DURABLE-GATED transition, run only now that the sealed record
-            // itself is Durable. A non-durable clear keeps the marker and
-            // the event still applied — containment fails closed. Record
-            // both spellings on success so the resume's alias-robust
-            // matcher cannot lose the group to exact-string filtering. The
-            // resume itself runs LATER, in the guard-free wrappers
-            // (`apply_named_group_metadata_event` / `_inner`) via
-            // `resume_task_ingest_after_durable_clear`: it awaits
-            // `TaskList` write then `named_groups` read, which this arm's
-            // membership and roster guards forbid.
-            if owner_anchored_clear_due {
-                // N19-B: record the due clear; the wrapper runs the
-                // durable-gated transition after every guard drops (the
-                // arm's async frame is at the 2 MiB test-stack edge).
-                *pending_owner_anchored_clear = Some((
-                    resolved_group_key.clone(),
-                    current.stable_group_id().to_string(),
-                    commit.revision,
-                ));
+            // #759 item 1: a Some→None fork-quarantine transition here is
+            // an owner-anchored clear (the mandate-valid arm above, or the
+            // tier-1 adoption inside `try_adopt_member_added_across_gap` —
+            // no other writer in this arm removes a marker), and the Durable
+            // check above is what makes it REAL. Record both spellings so
+            // the resume's alias-robust matcher cannot lose the group to
+            // exact-string filtering. The resume itself runs LATER, in the
+            // guard-free wrappers (`apply_named_group_metadata_event` /
+            // `_inner`) via `resume_task_ingest_after_durable_clear`: it
+            // awaits `TaskList` write then `named_groups` read, which this
+            // arm's membership and roster guards forbid.
+            if current.fork_quarantine.is_some() && next.fork_quarantine.is_none() {
+                cleared_quarantine.insert(resolved_group_key.clone());
+                cleared_quarantine.insert(current.stable_group_id().to_string());
             }
             // #477 C5 (r6 item 2 → r7): this commit SEATED the local agent
             // durably — finalize its pending join attempt HERE, while this
@@ -14908,9 +14815,11 @@ pub(in crate::server) async fn clear_group_quarantine(
         owner_key_ok = true;
     }
     let cleared_by = if owner_key_ok { "owner-key" } else { "force" };
-    // N19-B: the clear runs against a CANDIDATE and reaches the live map
-    // only on a Durable outcome — a non-durable save (including a
-    // post-rename `ReplacedNotDurable`) leaves the marker everywhere.
+    // N19-B: the clear runs against a CANDIDATE — memory never shows it
+    // while the write is in flight; NotReplaced/Err leave the map armed,
+    // and a visible-but-not-durable replacement follows the #759 Watson
+    // ruling (memory matches the destination, the route refuses and
+    // withholds every effect).
     let outcome = persist_named_groups_quarantine_clear_gated(&state, |groups| {
         // #732 r8: one slot is enough. An alias sibling used to stay quarantined
         // after a successful clear; `enforce_containment_invariant` now copies
@@ -14922,7 +14831,10 @@ pub(in crate::server) async fn clear_group_quarantine(
         // decided about, and the invariant above spreads it. A concurrent rename
         // of the key is the only way it misses, and then it is a no-op that
         // leaves the marker in place — never a clear of the wrong group.
-        if let Some(info) = groups.get_mut(&map_key) {
+        let Some(info) = crate::server::resolve_group_entry_mut_locked(groups, &map_key) else {
+            return false;
+        };
+        {
             info.fork_quarantine = None;
             // ADR-0064 slice 4: the manual clear also re-arms the
             // evidence gate — the next authenticated conflict
@@ -21147,29 +21059,26 @@ async fn owner_certified_seal_with_eviction(
                     // guard: the drain takes `TaskList` write then
                     // `named_groups` read, which this guard forbids.
                     let mut fork_marker_cleared = false;
-                    // N19-B: same transaction, but candidate-gated — the
-                    // flag/marker clear reaches the live map only on Durable.
-                    let persist_outcome =
-                        persist_named_groups_quarantine_clear_gated(state, |groups| {
-                            // ADR0066-LOOKUP-WAIVER: `clear_key` mirrors the id `seal_group_state` resolved the record with;
-                            // a miss leaves the marker set on disk AND in memory, so it fails closed.
-                            if let Some(info) = groups.get_mut(&clear_key) {
-                                info.owner_cert_reverify_required = false;
-                                let had_marker = info.fork_quarantine.is_some();
-                                // ADR-0064 slice 4 (slice-1 review non-blocking
-                                // (1)): the EVICTION arm of the explicit seal
-                                // route clears the fork marker under the SAME
-                                // fence as the all-clean arm — the local
-                                // install holds the owner USER key (#469 A1b
-                                // fence) and the sealed revision (bumped by
-                                // the eviction seals) is strictly greater
-                                // than the evidenced one.
-                                info.clear_fork_quarantine_on_explicit_owner_seal(owner_user_key);
-                                fork_marker_cleared = had_marker && info.fork_quarantine.is_none();
-                            }
-                            true
-                        })
-                        .await;
+                    let persist_outcome = persist_named_groups_mutation(state, |groups| {
+                        // ADR0066-LOOKUP-WAIVER: `clear_key` mirrors the id `seal_group_state` resolved the record with;
+                        // a miss leaves the marker set on disk AND in memory, so it fails closed.
+                        if let Some(info) = groups.get_mut(&clear_key) {
+                            info.owner_cert_reverify_required = false;
+                            let had_marker = info.fork_quarantine.is_some();
+                            // ADR-0064 slice 4 (slice-1 review non-blocking
+                            // (1)): the EVICTION arm of the explicit seal
+                            // route clears the fork marker under the SAME
+                            // fence as the all-clean arm — the local
+                            // install holds the owner USER key (#469 A1b
+                            // fence) and the sealed revision (bumped by
+                            // the eviction seals) is strictly greater
+                            // than the evidenced one.
+                            info.clear_fork_quarantine_on_explicit_owner_seal(owner_user_key);
+                            fork_marker_cleared = had_marker && info.fork_quarantine.is_none();
+                        }
+                        true
+                    })
+                    .await;
                     if !matches!(persist_outcome, Ok(AtomicWriteOutcome::Durable)) {
                         tracing::warn!(
                             group_id = %id,
@@ -21222,14 +21131,12 @@ async fn owner_certified_seal_with_eviction(
             // Deferred initialization: every path that falls through the
             // `commit` block below has assigned the flag (the block's early
             // returns diverge), so there is no dead initializer to read.
-            let mut fork_marker_cleared;
+            let fork_marker_cleared;
             let commit = {
                 let groups = state.named_groups.read().await;
-                // #732 (N19-B r2): resolve BOTH spellings through the shared
-                // resolver — the seal's 404-first lookup may have resolved a
-                // stable spelling over an alias-keyed map. A miss returns 404
-                // without sealing, so it fails closed.
-                let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, id) else {
+                // ADR0066-LOOKUP-WAIVER: `id` was already resolved by `seal_group_state`'s own 404-first lookup;
+                // a miss here returns 404 without sealing, so it fails closed.
+                let Some(info) = groups.get(id) else {
                     return Some(Err(not_found("group not found")));
                 };
                 let mut next = info.clone();
@@ -21249,29 +21156,12 @@ async fn owner_certified_seal_with_eviction(
                 // and only when the local install holds the owner USER key
                 // (the #469 A1b fence) and the sealed revision is strictly
                 // greater than the evidenced revision.
-                // N19-B: `next` RETAINS the marker — the clear is the
-                // durable-gated transaction after the seal's Durable
-                // persist (clear_due above computed the same predicate).
-                fork_marker_cleared = false;
-                drop(groups);
-                // N19-B (r2): the seal persists through the FULL #457
-                // transaction — journaled TreeKEM snapshot rebind and live
-                // restore included — with the marker RETAINED in `next`.
-                // The clear itself is a separate durable-gated transition
-                // below, so a non-durable seal can never publish a cleared
-                // marker and the rebind repair the arm always had stays.
-                let owner_user_key_for_clear = state.agent.identity().user_keypair();
-                let clear_due = next.fork_quarantine.as_ref().is_some_and(|marker| {
-                    marker.owner_anchored_clear_permitted(next.state_revision)
-                }) && next.policy.admission.owner_certified_user_id().is_some_and(
-                    |owner| {
-                        owner_user_key_for_clear.as_ref().is_some_and(|kp| {
-                            crate::identity::UserId::from_public_key(kp.public_key()) == *owner
-                        })
-                    },
+                next.clear_fork_quarantine_on_explicit_owner_seal(
+                    state.agent.identity().user_keypair(),
                 );
-                let sealed_next = next.clone();
-                let _sealed_ret = sealed_next;
+                fork_marker_cleared =
+                    info.fork_quarantine.is_some() && next.fork_quarantine.is_none();
+                drop(groups);
                 if !matches!(
                     persist_named_group_info(state, id, next).await,
                     Ok(AtomicWriteOutcome::Durable)
@@ -21280,40 +21170,6 @@ async fn owner_certified_seal_with_eviction(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "named-group state is not directory-durable",
                     )));
-                }
-                // N19-B (r2): the durable-gated marker clear, run only now
-                // that the sealed record is Durable. It re-checks the
-                // production predicate (owner axis, owner key held, sealed
-                // revision strictly greater) against the live record inside
-                // the candidate.
-                if clear_due {
-                    let clear_key = id.to_string();
-                    let clear_kp = state.agent.identity().user_keypair();
-                    match persist_named_groups_quarantine_clear_gated(state, |groups| {
-                        // #732: resolve BOTH spellings (the seal route's id
-                        // may be the stable one over an alias-keyed map).
-                        let Some(info) =
-                            crate::server::resolve_group_entry_mut_locked(groups, &clear_key)
-                        else {
-                            return false;
-                        };
-                        let had_marker = info.fork_quarantine.is_some();
-                        info.clear_fork_quarantine_on_explicit_owner_seal(clear_kp);
-                        had_marker && info.fork_quarantine.is_none()
-                    })
-                    .await
-                    {
-                        Ok(AtomicWriteOutcome::Durable) => {
-                            fork_marker_cleared = true;
-                        }
-                        outcome => {
-                            tracing::warn!(
-                                group_id = %id,
-                                ?outcome,
-                                "N19-B: all-clean seal's quarantine clear was not directory-durable — marker kept"
-                            );
-                        }
-                    }
                 }
                 commit
             };
@@ -32809,9 +32665,9 @@ pub(in crate::server) async fn save_named_groups_checked_unlocked(
     save_named_groups_store_checked(state, &legacy_json, &home_suite_json).await
 }
 
-/// The checked save with a caller-supplied encoded store — the durable-gated
-/// quarantine-clear transition (N19-B) serializes its CANDIDATE here without
-/// ever publishing it to the live map first.
+/// The checked save with a caller-supplied encoded store — the gated
+/// quarantine-clear transition (N19-B) serializes its CANDIDATE here
+/// without ever publishing it to the live map first.
 async fn save_named_groups_store_checked(
     state: &AppState,
     legacy_json: &str,

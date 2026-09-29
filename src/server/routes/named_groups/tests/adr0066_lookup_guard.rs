@@ -332,12 +332,12 @@ fn adr0066_lookup_guard_still_sees_the_waived_census() {
     assert_eq!(
         sites.len(),
         11,
-        "#732 census: 11 single-spelling roster lookups remain on quarantine \
+        "#732 census: 12 single-spelling roster lookups remain on quarantine \
          paths, each waived at the site (8 at the original 15-line window, 4 \
-         more once review of #750 widened it to 25; N19-B r2 resolved the \
-         all-clean seal's read through resolve_group_entry_locked, so the \
-         census dropped from 12 to 11 — that site no longer spells the \
-         lookup itself). If you added or removed one, say so here:\n{sites:#?}"
+         more once review of #750 widened it to 25; N19-B routes the manual \
+         clear's closure through resolve_group_entry_mut_locked, so that \
+         site no longer spells the lookup itself — 12 -> 11). If you added \
+         or removed one, say so here:\n{sites:#?}"
     );
     assert!(
         sites.iter().all(|site| site.waived),

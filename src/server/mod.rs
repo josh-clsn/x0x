@@ -2990,7 +2990,7 @@ fn parse_machine_id_hex(hex_str: &str) -> Result<MachineId, String> {
 /// sibling of [`resolve_group_entry_locked`]): the exact map key first,
 /// else the entry whose STABLE id matches. Quarantine-clear closures use
 /// this so a clear requested under either spelling reaches the record the
-/// map actually holds (N19-B r2 CI fix).
+/// map actually holds (N19-B).
 pub(in crate::server) fn resolve_group_entry_mut_locked<'a>(
     groups: &'a mut HashMap<String, x0x::groups::GroupInfo>,
     group_id: &str,
@@ -3348,7 +3348,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
                 None,
                 &mut replay_group_id,
                 &mut cleared_after,
-                &mut None,
                 None,
                 true,
                 false,
@@ -3803,7 +3802,6 @@ async fn handle_predecessor_relay_typed_payload_inner(
                 Some(admission_first_seen_ms),
                 &mut replay_group_id,
                 &mut cleared_after,
-                &mut None,
                 None,
                 true, // lock_already_held
                 false,
