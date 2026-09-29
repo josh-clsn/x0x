@@ -5272,6 +5272,62 @@ where
     persist_named_groups_mutation_with_gss_guard(state, &gss_publication_guard, mutate).await
 }
 
+/// N19-B: the manual quarantine-clear transition. The mutation runs
+/// against a private CANDIDATE — the live map (every consumer: WS/SSE
+/// annotations, session gates, KV contexts, the task-ingest gate) never
+/// shows the clear while the write is in flight. Outcomes follow the
+/// #759 Watson ruling:
+/// - `Durable` → publish the cleared candidate (the route notifies).
+/// - `ReplacedNotDurable` → publish the cleared candidate TOO (memory
+///   matches the visible destination), the route still refuses and
+///   withholds every notification/effect.
+/// - `NotReplaced` / `Err` → the live map stays ARMED (fail closed).
+///
+/// Locks: roster persistence P then G, the persist_named_groups_mutation
+/// order; the candidate commit is a compare-and-commit so a writer that
+/// bypassed the pair (none exists — the #732 r8 chokepoints) fails closed.
+pub(in crate::server) async fn persist_named_groups_quarantine_clear_gated<F>(
+    state: &AppState,
+    mutate: F,
+) -> std::io::Result<AtomicWriteOutcome>
+where
+    F: FnOnce(&mut HashMap<String, x0x::groups::GroupInfo>) -> bool,
+{
+    let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+    let before = {
+        let groups = state.named_groups.read().await;
+        groups.clone()
+    };
+    let mut candidate = before.clone();
+    if !mutate(&mut candidate) {
+        return Ok(AtomicWriteOutcome::NotReplaced);
+    }
+    enforce_containment_invariant(&mut candidate, &before);
+    let outcome = {
+        let _gss_publication_guard = state.gss_publication_gate.write().await;
+        let (legacy_json, home_suite_json) =
+            encode_named_groups_store_excluding_pending_stubs(state, &candidate, None)?;
+        save_named_groups_store_checked(state, &legacy_json, &home_suite_json).await
+    };
+    if matches!(
+        outcome,
+        Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::ReplacedNotDurable)
+    ) {
+        let mut groups = state.named_groups.write().await;
+        if *groups == before {
+            *groups = candidate;
+        } else {
+            tracing::error!(
+                "N19-B: the live named-groups map diverged during a gated                  quarantine clear — keeping memory, refusing the commit"
+            );
+            return Err(std::io::Error::other(
+                "named-groups map changed during the gated quarantine clear",
+            ));
+        }
+    }
+    outcome
+}
+
 /// The roster mutation core for a caller that already owns the GSS writer.
 /// A borrowed guard is the capability: causal replay can enter here while
 /// retaining its P→G transaction without reacquiring the non-reentrant G.
@@ -14759,7 +14815,12 @@ pub(in crate::server) async fn clear_group_quarantine(
         owner_key_ok = true;
     }
     let cleared_by = if owner_key_ok { "owner-key" } else { "force" };
-    let outcome = persist_named_groups_mutation(&state, |groups| {
+    // N19-B: the clear runs against a CANDIDATE — memory never shows it
+    // while the write is in flight; NotReplaced/Err leave the map armed,
+    // and a visible-but-not-durable replacement follows the #759 Watson
+    // ruling (memory matches the destination, the route refuses and
+    // withholds every effect).
+    let outcome = persist_named_groups_quarantine_clear_gated(&state, |groups| {
         // #732 r8: one slot is enough. An alias sibling used to stay quarantined
         // after a successful clear; `enforce_containment_invariant` now copies
         // this slot's containment — ABSENCE included — to every spelling before
@@ -14770,7 +14831,10 @@ pub(in crate::server) async fn clear_group_quarantine(
         // decided about, and the invariant above spreads it. A concurrent rename
         // of the key is the only way it misses, and then it is a no-op that
         // leaves the marker in place — never a clear of the wrong group.
-        if let Some(info) = groups.get_mut(&map_key) {
+        let Some(info) = crate::server::resolve_group_entry_mut_locked(groups, &map_key) else {
+            return false;
+        };
+        {
             info.fork_quarantine = None;
             // ADR-0064 slice 4: the manual clear also re-arms the
             // evidence gate — the next authenticated conflict
@@ -32594,6 +32658,21 @@ fn encode_named_groups_store_excluding_pending_stubs(
 pub(in crate::server) async fn save_named_groups_checked_unlocked(
     state: &AppState,
 ) -> std::io::Result<AtomicWriteOutcome> {
+    let (legacy_json, home_suite_json) = {
+        let groups = state.named_groups.read().await;
+        encode_named_groups_store_excluding_pending_stubs(state, &groups, None)?
+    };
+    save_named_groups_store_checked(state, &legacy_json, &home_suite_json).await
+}
+
+/// The checked save with a caller-supplied encoded store — the gated
+/// quarantine-clear transition (N19-B) serializes its CANDIDATE here
+/// without ever publishing it to the live map first.
+async fn save_named_groups_store_checked(
+    state: &AppState,
+    legacy_json: &str,
+    home_suite_json: &str,
+) -> std::io::Result<AtomicWriteOutcome> {
     // (#470 fault cells are checked after the deterministic-interleave
     // hook below so tests can race a concurrent writer between the
     // mutation and the rollback for EVERY fault variant.)
@@ -32605,10 +32684,7 @@ pub(in crate::server) async fn save_named_groups_checked_unlocked(
     // direction is covered below — if the named write does not land, the
     // sidecar is restored to its pre-write bytes, so the ordinary save
     // never leaves (sidecar new / named old) on the non-journaled path.
-    let (legacy_json, home_suite_json) = {
-        let groups = state.named_groups.read().await;
-        encode_named_groups_store_excluding_pending_stubs(state, &groups, None)?
-    };
+    let (legacy_json, home_suite_json) = (legacy_json.to_string(), home_suite_json.to_string());
     #[cfg(test)]
     {
         let hook = state
