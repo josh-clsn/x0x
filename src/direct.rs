@@ -1332,6 +1332,25 @@ impl DirectMessaging {
         self.diagnostics
             .incoming_envelopes_total
             .fetch_add(1, Ordering::Relaxed);
+        // N12: a sender the trust policy REJECTS (an explicitly blocked
+        // contact, or a machine that fails the contact's pin) is delivered
+        // to NO consumer. Every raw-prefix consumer reads this bus - SSE
+        // `/direct/events`, the WS tap and the background file/welcome/
+        // join-result/control/catch-up/bootstrap/meta listeners - and the
+        // typed-route gate already refuses exactly these two decisions;
+        // the generic fallback must not be the hole that re-admits them.
+        if matches!(
+            trust_decision,
+            Some(TrustDecision::RejectBlocked | TrustDecision::RejectMachineMismatch)
+        ) {
+            self.record_incoming_trust_rejected(sender_agent_id);
+            tracing::debug!(
+                target: "x0x::direct",
+                sender = %crate::logging::LogAgentId::from(&sender_agent_id),
+                "raw direct frame from a trust-rejected sender dropped before any consumer"
+            );
+            return 0;
+        }
         let now_ms = now_unix_ms_lossy();
         self.with_peer_diagnostics(sender_agent_id, |peer| {
             peer.last_recv_at_ms = Some(now_ms);

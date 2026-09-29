@@ -4002,6 +4002,24 @@ async fn dispatch_raw_direct_after_gates(
         }
     }
 
+    // N12: an UNVERIFIED frame whose bytes claim a typed protocol route is
+    // not a user DM. The typed router already refuses unverified frames;
+    // such a frame must not fall through to the generic bus either, where
+    // SSE/WS consumers would show its payload as an ordinary direct
+    // message. An unverified frame that matches no typed route keeps the
+    // documented contract: deliver with `verified: false`, the consumer
+    // decides.
+    if !verified && dm_inbox::InboxPipeline::typed_route_recognizes(typed_routes, &data) {
+        tracing::debug!(
+            target: "x0x::direct",
+            stage = "recv_unverified_typed_suppressed",
+            sender = %network::hex_prefix(&sender.0, 4),
+            payload_bytes = data.len(),
+            "unverified typed-protocol frame dropped before the generic bus"
+        );
+        return dm_inbox::TypedRouteOutcome::RejectedPrefix;
+    }
+
     if let (Some(history), Some(record)) = (
         history_handle,
         raw_dm_history_record(
@@ -20482,6 +20500,158 @@ mod tests {
         record.validate().expect("raw DM history record is valid");
     }
 
+    /// N12 (raw-path Blocked delivery): the raw 0x10 path must NOT deliver
+    /// a BLOCKED sender — or a sender whose machine fails the contact's
+    /// machine pin — to the generic direct bus. Every raw-prefix consumer
+    /// reads that bus: SSE `/direct/events`, the WS tap, and the background
+    /// file/welcome/join-result/control/catch-up/bootstrap/meta listeners.
+    /// The typed-route gate already refuses exactly these two decisions;
+    /// before N12 the generic fallback delivered them anyway.
+    #[tokio::test]
+    async fn raw_path_rejected_trust_never_reaches_generic_consumers() {
+        let dm = direct::DirectMessaging::new();
+        let mut generic = dm.subscribe();
+        let sender = identity::AgentId([0x91; 32]);
+        let machine_id = identity::MachineId([0x92; 32]);
+        for decision in [
+            trust::TrustDecision::RejectBlocked,
+            trust::TrustDecision::RejectMachineMismatch,
+        ] {
+            let payload = format!("blocked-send-{decision:?}").into_bytes();
+            let delivered = dm
+                .handle_incoming(
+                    machine_id,
+                    sender,
+                    payload.clone(),
+                    true,
+                    Some(decision),
+                    None,
+                )
+                .await;
+            assert_eq!(
+                delivered, 0,
+                "a trust-rejected sender is delivered to no consumer ({decision:?})"
+            );
+            assert!(
+                generic.try_recv().is_none(),
+                "a trust-rejected sender must not reach the generic bus ({decision:?})"
+            );
+        }
+        // The identical sender with an accepting decision IS delivered: the
+        // trust gate is the only thing that changed.
+        let accepted = b"same sender, accepted".to_vec();
+        let delivered = dm
+            .handle_incoming(
+                machine_id,
+                sender,
+                accepted.clone(),
+                true,
+                Some(trust::TrustDecision::Accept),
+                None,
+            )
+            .await;
+        assert_eq!(delivered, 1, "an accepted sender is delivered");
+        assert_eq!(
+            generic.try_recv().expect("accepted delivery").payload,
+            accepted
+        );
+        // Unknown and AcceptWithFlag keep the documented contract: deliver
+        // with the tag, the consumer decides.
+        for decision in [
+            trust::TrustDecision::Unknown,
+            trust::TrustDecision::AcceptWithFlag,
+        ] {
+            let payload = format!("tagged-{decision:?}").into_bytes();
+            let delivered = dm
+                .handle_incoming(
+                    machine_id,
+                    sender,
+                    payload.clone(),
+                    true,
+                    Some(decision),
+                    None,
+                )
+                .await;
+            assert_eq!(delivered, 1, "({decision:?})");
+            assert_eq!(
+                generic.try_recv().expect("tagged delivery").payload,
+                payload,
+                "({decision:?})"
+            );
+        }
+    }
+
+    /// N12 (typed-frame leak, second half): an UNVERIFIED frame whose bytes
+    /// claim a typed protocol route is not a user DM. The typed router
+    /// already refuses unverified frames; before N12 such a frame fell
+    /// through to the generic bus and its payload was shown to SSE/WS
+    /// consumers as an ordinary direct message. An unverified frame that
+    /// does NOT claim a typed route keeps the documented contract (deliver
+    /// with `verified: false`, the consumer decides).
+    #[tokio::test]
+    async fn raw_path_unverified_typed_frame_is_not_shown_as_a_user_dm() {
+        let dm = direct::DirectMessaging::new();
+        let mut generic = dm.subscribe();
+        let (typed_tx, mut typed_rx) = tokio::sync::mpsc::channel(4);
+        let routes = vec![dm_inbox::DmTypedPayloadRoute {
+            prefix: b"TEST-TYPED-ROUTE\n".to_vec(),
+            sender: typed_tx,
+            durable_completion: false,
+            validator: None,
+        }];
+        let sender = identity::AgentId([0x93; 32]);
+        let machine_id = identity::MachineId([0x94; 32]);
+        let typed_bytes = b"TEST-TYPED-ROUTE\nunverified-protocol-frame".to_vec();
+
+        dispatch_raw_direct_after_gates(
+            &dm,
+            None,
+            &routes,
+            RawDirectDelivery {
+                sender,
+                machine_id,
+                data: typed_bytes.clone(),
+                verified: false,
+                trust_decision: Some(trust::TrustDecision::Unknown),
+                observed_origin: None,
+                digest: direct::dm_payload_digest_hex(&typed_bytes),
+            },
+        )
+        .await;
+        assert!(
+            generic.try_recv().is_none(),
+            "an unverified typed frame must not be shown as a user DM"
+        );
+        assert!(
+            typed_rx.try_recv().is_err(),
+            "unverified payload never reaches typed route"
+        );
+
+        // Control: an unverified ORDINARY payload is still delivered with
+        // `verified: false` — the documented consumer-decides contract.
+        let ordinary = b"hello from an unverified stranger".to_vec();
+        dispatch_raw_direct_after_gates(
+            &dm,
+            None,
+            &routes,
+            RawDirectDelivery {
+                sender,
+                machine_id,
+                data: ordinary.clone(),
+                verified: false,
+                trust_decision: Some(trust::TrustDecision::Unknown),
+                observed_origin: None,
+                digest: direct::dm_payload_digest_hex(&ordinary),
+            },
+        )
+        .await;
+        let shown = generic
+            .try_recv()
+            .expect("unverified ordinary DMs keep the consumer-decides contract");
+        assert_eq!(shown.payload, ordinary);
+        assert!(!shown.verified);
+    }
+
     #[tokio::test]
     async fn raw_post_validation_routes_verified_typed_before_generic_broadcast() {
         let dm = direct::DirectMessaging::new();
@@ -20563,11 +20733,12 @@ mod tests {
             },
         )
         .await;
-        let unverified = generic
-            .try_recv()
-            .expect("unverified retains generic handling");
-        assert_eq!(unverified.payload, typed_bytes);
-        assert!(!unverified.verified);
+        // N12: an unverified frame claiming a typed route is neither
+        // routed (unverified) nor shown as a user DM on the generic bus.
+        assert!(
+            generic.try_recv().is_none(),
+            "unverified typed frame must not reach the generic bus"
+        );
         assert!(
             typed_rx.try_recv().is_err(),
             "unverified payload never reaches typed route"
@@ -20588,13 +20759,11 @@ mod tests {
             },
         )
         .await;
-        let rejected = generic
-            .try_recv()
-            .expect("rejected trust retains existing generic handling");
-        assert_eq!(rejected.payload, typed_bytes);
-        assert_eq!(
-            rejected.trust_decision,
-            Some(trust::TrustDecision::RejectMachineMismatch)
+        // N12: a trust-rejected sender is delivered to no consumer at
+        // all - not the typed route and not the generic bus.
+        assert!(
+            generic.try_recv().is_none(),
+            "rejected trust must not reach the generic bus"
         );
         assert!(
             typed_rx.try_recv().is_err(),

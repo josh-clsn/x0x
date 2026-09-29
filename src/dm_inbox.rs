@@ -2318,6 +2318,14 @@ impl InboxPipeline {
         }
     }
 
+    /// Whether these bytes are a COMPLETE match for a registered typed
+    /// route (prefix and validator): a protocol frame, not a user DM.
+    /// Non-consuming - the caller decides what to do with it (N12: an
+    /// unverified typed frame must not fall through to the generic bus).
+    pub(crate) fn typed_route_recognizes(routes: &[DmTypedPayloadRoute], payload: &[u8]) -> bool {
+        Self::matching_typed_route(routes, payload).0.is_some()
+    }
+
     /// Shared prefix dispatch for verified gossip and post-validation raw direct
     /// payloads. Recognition suppresses generic fan-out even if the bounded
     /// channel is unavailable; it does not establish handler acceptance.
