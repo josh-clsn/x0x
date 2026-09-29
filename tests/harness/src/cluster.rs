@@ -467,7 +467,7 @@ pub async fn cluster() -> &'static AgentCluster {
 ///
 /// Hermetic: the pair gets its own gossip plane, so it neither sees nor is seen
 /// by other x0x daemons on the machine. See
-/// [`pair_with_extra_config_and_node_env`] for why that is not the default.
+/// `pair_with_extra_config_and_node_env` for why that is not the default.
 pub async fn pair() -> AgentPair {
     pair_with_extra_config("").await
 }

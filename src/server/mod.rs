@@ -90,7 +90,7 @@ use routes::{
     update_task, withdraw_group_state, AtomicWriteOutcome, ControlBlobMessage, ControlBlobState,
     JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent, PendingListenerAdmission,
     PredecessorRelayObligation, PublicGroupBootstrap, SelfPublishedReleaseManifests,
-    TreeKemCatchupRequest, TreeKemCatchupResponse, WelcomeBlobMessage, CAUSAL_ENVELOPE_MAX_BYTES,
+    TreeKemCatchupRequest, TreeKemCatchupResponse, CAUSAL_ENVELOPE_MAX_BYTES,
     CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
     CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
     CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
@@ -1781,11 +1781,10 @@ pub async fn serve_with_options(
             let mut rx = file_state.agent.subscribe_direct();
             loop {
                 let Some(msg) = rx.recv().await else { break };
-                let Ok(file_msg) = serde_json::from_slice::<x0x::files::FileMessage>(&msg.payload)
-                else {
-                    continue; // not a file message
+                let Some((sender, file_msg)) = routes::decode_file_message(&msg) else {
+                    continue; // unverified sender or not a file message
                 };
-                handle_file_message(&file_state, &msg.sender, file_msg).await;
+                handle_file_message(&file_state, sender, file_msg).await;
             }
         }));
     }
@@ -1830,7 +1829,8 @@ pub async fn serve_with_options(
             let mut rx = welcome_state.agent.subscribe_direct();
             loop {
                 let Some(msg) = rx.recv().await else { break };
-                let Ok(welcome_msg) = serde_json::from_slice::<WelcomeBlobMessage>(&msg.payload)
+                let Some((sender, welcome_msg)) =
+                    routes::named_groups::decode_welcome_blob_message(&msg)
                 else {
                     continue;
                 };
@@ -1841,7 +1841,7 @@ pub async fn serve_with_options(
                     len = msg.payload.len(),
                     verified = msg.verified,
                 );
-                handle_welcome_blob_message(&welcome_state, &msg.sender, welcome_msg).await;
+                handle_welcome_blob_message(&welcome_state, sender, welcome_msg).await;
             }
         }));
     }
