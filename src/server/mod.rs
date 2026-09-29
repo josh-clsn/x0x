@@ -1782,7 +1782,7 @@ pub async fn serve_with_options(
             loop {
                 let Some(msg) = rx.recv().await else { break };
                 let Some((sender, file_msg)) = routes::decode_file_message(&msg) else {
-                    continue; // not a file message
+                    continue; // unverified sender or not a file message
                 };
                 handle_file_message(&file_state, sender, file_msg).await;
             }

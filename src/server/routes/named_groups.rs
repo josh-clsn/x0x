@@ -35668,10 +35668,15 @@ where
     Ok(received)
 }
 
-/// Decode a transfer frame together with its transport-supplied sender.
+/// Decode a transfer frame only after the DM layer verified its sender.
+/// Raw QUIC sender IDs are self-asserted until their AgentId/MachineId binding
+/// is verified; carrying that unchecked claim into a transfer permits spoofing.
 pub(in crate::server) fn decode_welcome_blob_message(
     message: &x0x::direct::DirectMessage,
 ) -> Option<(&AgentId, WelcomeBlobMessage)> {
+    if !message.verified {
+        return None;
+    }
     let payload = serde_json::from_slice(&message.payload).ok()?;
     Some((&message.sender, payload))
 }
