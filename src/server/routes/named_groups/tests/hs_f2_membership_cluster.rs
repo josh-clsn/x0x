@@ -8851,6 +8851,233 @@ async fn non_durable_owner_seal_does_not_notify_759() -> Result<()> {
 /// drain the held delta here and fail the withheld-effect assertions.
 /// Only the Durable-gated boolean draws the line this test and its
 /// `NotReplaced` sibling both hold.
+/// N19-B follow-up (Codex r2 P2): a successful seal on a group whose
+/// TreeKEM snapshot is STALE-BUT-REPAIRABLE (metadata-only mismatch: the
+/// envelope binding still equals the named binding; only named-side
+/// metadata advanced) and which has NO live TreeKEM instance. The seal
+/// must repair the binding, restore the live instance
+/// (`rebind_restore_live_group`), and — when the marker is one the seal
+/// may clear — clear it durably; an ordinary `no_anchor` marker stays for
+/// the manual clear, which then clears DURABLY through the gated
+/// transition. Red when the seal's persist loses the #457 rebind/restore
+/// or when the manual clear is reverted to the publish-first helper.
+#[tokio::test]
+async fn n19b_treekem_seal_repairs_snapshot_and_manual_clear_is_durable() -> Result<()> {
+    let fixture = member_joined_treekem_fixture(0x6E, 0x6E).await?;
+    let state = &fixture.state;
+    let group_id = fixture.group_id.clone();
+
+    // Seed the on-disk snapshot bound at the CURRENT revision while the
+    // group is live (the same shape issue457's repair test seeds).
+    let seeded = state
+        .named_groups
+        .read()
+        .await
+        .get(&group_id)
+        .cloned()
+        .unwrap();
+    let seeded = persist_named_group_info(state, &group_id, seeded).await;
+    assert!(
+        matches!(seeded, Ok(AtomicWriteOutcome::Durable)),
+        "seed persist must be durable"
+    );
+
+    // Force the repairable mismatch: advance the named state WITHOUT
+    // rebinding the envelope (a stale on-disk envelope), then drop the
+    // live TreeKEM instance — restarted-into-the-wedge, minus the restart.
+    {
+        let mut groups = state.named_groups.write().await;
+        let info = groups.get_mut(&group_id).expect("group");
+        info.roster_revision = info.roster_revision.saturating_add(1);
+        info.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
+    }
+    let forced =
+        persist_named_groups_mutation(state, |groups| groups.get(&group_id).is_some()).await;
+    assert!(
+        matches!(forced, Ok(AtomicWriteOutcome::Durable)),
+        "forced stale persist must be durable"
+    );
+    state.treekem_groups.write().await.remove(&group_id);
+
+    // An ordinary group's marker: no owner axis, so NO seal may clear it —
+    // only the manual clear can (ADR-0066 §2).
+    {
+        let mut groups = state.named_groups.write().await;
+        let live = groups.get_mut(&group_id).expect("group");
+        let header = live.terminal_commit_header();
+        live.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: live.state_revision.saturating_sub(1),
+            state_hash: "evidenced-conflict-hash".to_string(),
+            committed_by: hex::encode(state.agent.agent_id().as_bytes()),
+            observed_at_ms: now_millis_u64(),
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: header.clone(),
+                conflicting_commit: header,
+                classification: None,
+            },
+            no_anchor: true,
+        });
+    }
+
+    // The reseal-class mutation (a rename through the real update route —
+    // the same #457 chokepoint `POST /groups/:id/state/seal`'s arms and
+    // every metadata mutator flow through; the plain reseal ROUTE itself
+    // refuses this fixture because `seal_commit_owner_certified` wants
+    // certificate state only the OwnerCertified fixtures mint — an
+    // OwnerCertified+TreeKEM seal fixture is tracked W3 test debt):
+    // succeeds, REPAIRS the binding, RESTORES the live instance.
+    let response = update_named_group(
+        State(Arc::clone(state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+        Json(UpdateGroupRequest {
+            name: Some("n19b-resealed".to_string()),
+            description: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the reseal-class mutation succeeds"
+    );
+    assert!(
+        state.treekem_groups.read().await.contains_key(&group_id),
+        "the persist's #457 transaction restored the live TreeKEM instance"
+    );
+
+    // The manual clear — the N19-B gated transition — clears DURABLY.
+    let stable_id = {
+        let groups = state.named_groups.read().await;
+        groups
+            .get(&group_id)
+            .expect("group")
+            .stable_group_id()
+            .to_string()
+    };
+    let req: ClearQuarantineRequest = serde_json::from_value(
+        serde_json::json!({ "force": true, "reason": "n19b treekem repair" }),
+    )?;
+    let response =
+        clear_group_quarantine(State(Arc::clone(state)), Path(stable_id.clone()), Json(req))
+            .await
+            .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::OK, "the manual clear succeeds: {body}");
+    assert!(
+        !state
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .expect("group")
+            .is_fork_quarantined(),
+        "the marker is gone from memory"
+    );
+    let reloaded =
+        load_named_groups_merged(&state.named_groups_path, &state.home_suite_groups_path).await?;
+    assert!(
+        !reloaded.values().any(|info| info.is_fork_quarantined()),
+        "the durable store carries the clear across a restart"
+    );
+    Ok(())
+}
+
+/// N19-B follow-up, discriminator: the manual clear runs against a
+/// CANDIDATE — while the durable write is IN FLIGHT the live map still
+/// shows the marker (no consumer can observe a clear that has not landed).
+/// Uses the save interleave hook (the #470 deterministic race point,
+/// after the candidate is encoded, before any write). RED when the manual
+/// route is reverted to the publish-first mutation helper.
+#[tokio::test]
+async fn n19b_manual_clear_candidate_is_invisible_mid_write() -> Result<()> {
+    let fixture = member_joined_treekem_fixture(0x6F, 0x6F).await?;
+    let state = &fixture.state;
+    let group_id = fixture.group_id.clone();
+    {
+        let mut groups = state.named_groups.write().await;
+        let live = groups.get_mut(&group_id).expect("group");
+        let header = live.terminal_commit_header();
+        live.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: live.state_revision.saturating_sub(1),
+            state_hash: "evidenced-conflict-hash".to_string(),
+            committed_by: hex::encode(state.agent.agent_id().as_bytes()),
+            observed_at_ms: now_millis_u64(),
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: header.clone(),
+                conflicting_commit: header,
+                classification: None,
+            },
+            no_anchor: true,
+        });
+    }
+    let stable_id = {
+        let groups = state.named_groups.read().await;
+        groups
+            .get(&group_id)
+            .expect("group")
+            .stable_group_id()
+            .to_string()
+    };
+
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    *state
+        .named_groups_save_after_snapshot_notify
+        .lock()
+        .expect("save race hook poisoned") = Some((Arc::clone(&reached), Arc::clone(&release)));
+
+    let clear_state = Arc::clone(state);
+    let clear_id = stable_id.clone();
+    let clear = tokio::spawn(async move {
+        let req: ClearQuarantineRequest = serde_json::from_value(
+            serde_json::json!({ "force": true, "reason": "n19b mid-write" }),
+        )
+        .expect("request");
+        clear_group_quarantine(State(clear_state), Path(clear_id), Json(req))
+            .await
+            .into_response()
+    });
+    reached.notified().await;
+    *state
+        .named_groups_save_after_snapshot_notify
+        .lock()
+        .expect("save race hook poisoned") = None;
+    // MID-WRITE: the candidate is encoded and the write is about to land —
+    // the live map must still show the marker (the clear is not published
+    // until the outcome is known).
+    assert!(
+        state
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .expect("group")
+            .is_fork_quarantined(),
+        "N19-B: mid-write, the live map still shows the marker — the candidate is not published until the outcome"
+    );
+    release.notify_one();
+    let response = clear.await.expect("clear task");
+    let (status, body) = response_json(response).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the clear completes durably: {body}"
+    );
+    assert!(
+        !state
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .expect("group")
+            .is_fork_quarantined(),
+        "the durable clear publishes"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn replaced_not_durable_owner_seal_withholds_the_notification_759() -> Result<()> {
     let (state, _dir, group_id, sync, task_id) =
