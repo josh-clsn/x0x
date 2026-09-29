@@ -1763,7 +1763,13 @@ async fn try_outbound_v2(
     }
     // Read the peer's connect-response byte.
     let mut resp = [0u8; 1];
-    if stream.recv_mut().read_exact(&mut resp).await.is_err() {
+    if let Err(error) = stream.recv_mut().read_exact(&mut resp).await {
+        tracing::info!(
+            target: "x0x::forward",
+            peer = %hex::encode(peer_agent.as_bytes()),
+            %error,
+            "outbound forward v2: peer closed/reset before connect response — closing local TCP"
+        );
         return OutboundOutcome::Done;
     }
     finish_outbound(stream, resp, peer_agent, tcp).await;
@@ -1802,7 +1808,13 @@ async fn drive_outbound_v1(
         return;
     }
     let mut resp = [0u8; 1];
-    if stream.recv_mut().read_exact(&mut resp).await.is_err() {
+    if let Err(error) = stream.recv_mut().read_exact(&mut resp).await {
+        tracing::info!(
+            target: "x0x::forward",
+            peer = %hex::encode(peer_agent.as_bytes()),
+            %error,
+            "outbound forward v1: peer closed/reset before connect response — closing local TCP"
+        );
         return;
     }
     finish_outbound(stream, resp, peer_agent, tcp).await;
