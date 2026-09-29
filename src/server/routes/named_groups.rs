@@ -5272,6 +5272,64 @@ where
     persist_named_groups_mutation_with_gss_guard(state, &gss_publication_guard, mutate).await
 }
 
+/// N19 part B (durable-gated fork-quarantine clear; the #1070 review's
+/// "part B"): run a containment-carrying mutation against a private
+/// CANDIDATE and publish it to the live map ONLY once the candidate is
+/// DURABLY persisted (`Ok(AtomicWriteOutcome::Durable)`). Every other
+/// outcome — pre-rename error, `NotReplaced`, and post-rename
+/// `ReplacedNotDurable` — leaves the live map untouched: consumers
+/// (WS/SSE quarantine annotations, session gates, KV contexts, the
+/// task-ingest gate) never observe a cleared marker without dir-fsync'd
+/// evidence on disk. After a `ReplacedNotDurable` the file may hold the
+/// cleared content while the fsync is unconfirmed — memory stays
+/// quarantined, the fail-closed direction; a crash then reloads whatever
+/// survived, never a memory-clear-without-evidence.
+///
+/// Locks: roster persistence P then G, the same order
+/// [`persist_named_groups_mutation`] takes, and every containment-carrying
+/// writer goes through that pair (#732 r8 chokepoints), so the
+/// compare-and-commit below cannot interleave with one.
+pub(in crate::server) async fn persist_named_groups_quarantine_clear_gated<F>(
+    state: &AppState,
+    mutate: F,
+) -> std::io::Result<AtomicWriteOutcome>
+where
+    F: FnOnce(&mut HashMap<String, x0x::groups::GroupInfo>) -> bool,
+{
+    let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+    let before = {
+        let groups = state.named_groups.read().await;
+        groups.clone()
+    };
+    let mut candidate = before.clone();
+    if !mutate(&mut candidate) {
+        return Ok(AtomicWriteOutcome::NotReplaced);
+    }
+    enforce_containment_invariant(&mut candidate, &before);
+    let outcome = {
+        let _gss_publication_guard = state.gss_publication_gate.write().await;
+        let (legacy_json, home_suite_json) =
+            encode_named_groups_store_excluding_pending_stubs(state, &candidate, None)?;
+        save_named_groups_store_checked(state, &legacy_json, &home_suite_json).await
+    };
+    if matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
+        let mut groups = state.named_groups.write().await;
+        if *groups == before {
+            *groups = candidate;
+        } else {
+            // No writer can reach this today (every containment writer takes
+            // P+G); if one ever does, fail closed: keep memory, surface it.
+            tracing::error!(
+                "N19-B: the live named-groups map diverged during a durable-gated                  quarantine clear — keeping memory, refusing the commit"
+            );
+            return Err(std::io::Error::other(
+                "named-groups map changed during the durable-gated quarantine clear",
+            ));
+        }
+    }
+    outcome
+}
+
 /// The roster mutation core for a caller that already owns the GSS writer.
 /// A borrowed guard is the capability: causal replay can enter here while
 /// retaining its P→G transaction without reacquiring the non-reentrant G.
@@ -14759,7 +14817,10 @@ pub(in crate::server) async fn clear_group_quarantine(
         owner_key_ok = true;
     }
     let cleared_by = if owner_key_ok { "owner-key" } else { "force" };
-    let outcome = persist_named_groups_mutation(&state, |groups| {
+    // N19-B: the clear runs against a CANDIDATE and reaches the live map
+    // only on a Durable outcome — a non-durable save (including a
+    // post-rename `ReplacedNotDurable`) leaves the marker everywhere.
+    let outcome = persist_named_groups_quarantine_clear_gated(&state, |groups| {
         // #732 r8: one slot is enough. An alias sibling used to stay quarantined
         // after a successful clear; `enforce_containment_invariant` now copies
         // this slot's containment — ABSENCE included — to every spelling before
@@ -20995,26 +21056,29 @@ async fn owner_certified_seal_with_eviction(
                     // guard: the drain takes `TaskList` write then
                     // `named_groups` read, which this guard forbids.
                     let mut fork_marker_cleared = false;
-                    let persist_outcome = persist_named_groups_mutation(state, |groups| {
-                        // ADR0066-LOOKUP-WAIVER: `clear_key` mirrors the id `seal_group_state` resolved the record with;
-                        // a miss leaves the marker set on disk AND in memory, so it fails closed.
-                        if let Some(info) = groups.get_mut(&clear_key) {
-                            info.owner_cert_reverify_required = false;
-                            let had_marker = info.fork_quarantine.is_some();
-                            // ADR-0064 slice 4 (slice-1 review non-blocking
-                            // (1)): the EVICTION arm of the explicit seal
-                            // route clears the fork marker under the SAME
-                            // fence as the all-clean arm — the local
-                            // install holds the owner USER key (#469 A1b
-                            // fence) and the sealed revision (bumped by
-                            // the eviction seals) is strictly greater
-                            // than the evidenced one.
-                            info.clear_fork_quarantine_on_explicit_owner_seal(owner_user_key);
-                            fork_marker_cleared = had_marker && info.fork_quarantine.is_none();
-                        }
-                        true
-                    })
-                    .await;
+                    // N19-B: same transaction, but candidate-gated — the
+                    // flag/marker clear reaches the live map only on Durable.
+                    let persist_outcome =
+                        persist_named_groups_quarantine_clear_gated(state, |groups| {
+                            // ADR0066-LOOKUP-WAIVER: `clear_key` mirrors the id `seal_group_state` resolved the record with;
+                            // a miss leaves the marker set on disk AND in memory, so it fails closed.
+                            if let Some(info) = groups.get_mut(&clear_key) {
+                                info.owner_cert_reverify_required = false;
+                                let had_marker = info.fork_quarantine.is_some();
+                                // ADR-0064 slice 4 (slice-1 review non-blocking
+                                // (1)): the EVICTION arm of the explicit seal
+                                // route clears the fork marker under the SAME
+                                // fence as the all-clean arm — the local
+                                // install holds the owner USER key (#469 A1b
+                                // fence) and the sealed revision (bumped by
+                                // the eviction seals) is strictly greater
+                                // than the evidenced one.
+                                info.clear_fork_quarantine_on_explicit_owner_seal(owner_user_key);
+                                fork_marker_cleared = had_marker && info.fork_quarantine.is_none();
+                            }
+                            true
+                        })
+                        .await;
                     if !matches!(persist_outcome, Ok(AtomicWriteOutcome::Durable)) {
                         tracing::warn!(
                             group_id = %id,
@@ -21098,8 +21162,14 @@ async fn owner_certified_seal_with_eviction(
                 fork_marker_cleared =
                     info.fork_quarantine.is_some() && next.fork_quarantine.is_none();
                 drop(groups);
+                // N19-B: the seal-and-clear records publish to the live map
+                // only on a Durable outcome (candidate-gated).
+                let clear_next = next.clone();
                 if !matches!(
-                    persist_named_group_info(state, id, next).await,
+                    persist_named_groups_quarantine_clear_gated(state, |groups| {
+                        store_named_group_info_locked(groups, id, clear_next)
+                    })
+                    .await,
                     Ok(AtomicWriteOutcome::Durable)
                 ) {
                     return Some(Err(api_error(
@@ -32594,6 +32664,21 @@ fn encode_named_groups_store_excluding_pending_stubs(
 pub(in crate::server) async fn save_named_groups_checked_unlocked(
     state: &AppState,
 ) -> std::io::Result<AtomicWriteOutcome> {
+    let (legacy_json, home_suite_json) = {
+        let groups = state.named_groups.read().await;
+        encode_named_groups_store_excluding_pending_stubs(state, &groups, None)?
+    };
+    save_named_groups_store_checked(state, &legacy_json, &home_suite_json).await
+}
+
+/// The checked save with a caller-supplied encoded store — the durable-gated
+/// quarantine-clear transition (N19-B) serializes its CANDIDATE here without
+/// ever publishing it to the live map first.
+async fn save_named_groups_store_checked(
+    state: &AppState,
+    legacy_json: &str,
+    home_suite_json: &str,
+) -> std::io::Result<AtomicWriteOutcome> {
     // (#470 fault cells are checked after the deterministic-interleave
     // hook below so tests can race a concurrent writer between the
     // mutation and the rollback for EVERY fault variant.)
@@ -32605,10 +32690,7 @@ pub(in crate::server) async fn save_named_groups_checked_unlocked(
     // direction is covered below — if the named write does not land, the
     // sidecar is restored to its pre-write bytes, so the ordinary save
     // never leaves (sidecar new / named old) on the non-journaled path.
-    let (legacy_json, home_suite_json) = {
-        let groups = state.named_groups.read().await;
-        encode_named_groups_store_excluding_pending_stubs(state, &groups, None)?
-    };
+    let (legacy_json, home_suite_json) = (legacy_json.to_string(), home_suite_json.to_string());
     #[cfg(test)]
     {
         let hook = state

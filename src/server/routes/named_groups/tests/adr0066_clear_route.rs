@@ -98,6 +98,83 @@ async fn call_clear(
     response_json(response).await
 }
 
+/// N19 part B (durable-gated clear): a fork-quarantine clear may only
+/// become visible in MEMORY once the clearing state is DURABLY persisted.
+/// The shared mutation helper publishes the candidate to the live map
+/// BEFORE the save and RETAINS it after a post-rename non-durable
+/// outcome (`ReplacedNotDurable`: the file may hold the cleared content
+/// but the parent-dir fsync is unconfirmed). Consumers read the live map —
+/// WS/SSE quarantine annotations, session gates, KV contexts, task-ingest
+/// gates — so a non-durable clear must leave the marker in memory, in the
+/// fail-closed direction, whatever the (unconfirmed) file happens to hold.
+#[tokio::test]
+async fn n19b_manual_clear_keeps_the_marker_when_not_directory_durable() -> Result<()> {
+    for fault in [
+        SaveFault::ReplacedNotDurable,
+        SaveFault::ReplacedNotDurableAfterWrite,
+    ] {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let (alias_key, stable_id) = seed_alias_keyed_group(
+            &state,
+            &"6e".repeat(16),
+            &"b2".repeat(32),
+            ordinary_policy(),
+        )
+        .await?;
+
+        let _fault = set_save_fault(&state, fault);
+        let (status, body) = call_clear(
+            &state,
+            &stable_id,
+            serde_json::json!({ "force": true, "reason": "n19b non-durable clear" }),
+        )
+        .await?;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a non-durable clear must refuse ({fault:?}): {body}"
+        );
+        drop(_fault);
+        assert!(
+            marker_still_set(&state, &alias_key).await,
+            "N19-B: the live map keeps the marker until the clear is DURABLE ({fault:?})"
+        );
+    }
+    Ok(())
+}
+
+/// N19 part B, green control: with no fault the clear is durable, becomes
+/// visible in memory, and survives a reload of the persisted store.
+#[tokio::test]
+async fn n19b_manual_clear_commits_memory_only_after_durability() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let (alias_key, stable_id) = seed_alias_keyed_group(
+        &state,
+        &"7e".repeat(16),
+        &"c3".repeat(32),
+        ordinary_policy(),
+    )
+    .await?;
+    let (status, body) = call_clear(
+        &state,
+        &stable_id,
+        serde_json::json!({ "force": true, "reason": "n19b durable clear" }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !marker_still_set(&state, &alias_key).await,
+        "a durable clear is visible in memory"
+    );
+    let reloaded =
+        load_named_groups_merged(&state.named_groups_path, &state.home_suite_groups_path).await?;
+    assert!(
+        !reloaded.values().any(|info| info.is_fork_quarantined()),
+        "the durable store carries the clear across a restart"
+    );
+    Ok(())
+}
+
 /// The defect, stated as behaviour: the STABLE id clears an alias-keyed
 /// group. Before #732 this exact call answered 404 while the group sat in the
 /// map, quarantined, with no other exit.
