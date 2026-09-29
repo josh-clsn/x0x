@@ -25,7 +25,8 @@
 //! Inbound streams that clear both gates (below) and the protocol handshake
 //! are routed by the prefix byte: [`crate::Agent::register_stream_acceptor`]
 //! installs the single consumer for a protocol (e.g. the T4 forwarder owns
-//! `ForwardV1`/`ForwardV2`); protocols without a registered acceptor fall
+//! `ForwardV1`/`ForwardV2`); unregistered forward protocols are reset promptly.
+//! Other protocols without a registered acceptor fall
 //! back to the default channel drained by
 //! [`crate::Agent::next_incoming_stream`]. Every channel is bounded — a
 //! stalled consumer causes new streams to be reset, never buffered
@@ -89,7 +90,8 @@ pub const STREAM_ACCEPTOR_CAPACITY: usize = 64;
 /// Once a stream has cleared the identity gate, the connect-ACL gate, and
 /// the protocol handshake, the dispatch task routes it by its protocol-prefix
 /// byte: a protocol with a registered [`StreamAcceptor`] goes to that
-/// acceptor's bounded channel; anything else goes to the default channel
+/// acceptor's bounded channel; unregistered forward protocols are reset.
+/// Other protocols go to the default channel
 /// drained by [`crate::Agent::next_incoming_stream`]. Either way a full
 /// channel drops (resets) the stream — backpressure is never hidden behind
 /// unbounded buffering.
@@ -133,7 +135,9 @@ impl StreamAccept {
     }
 
     /// The dispatch channel for `protocol`: the registered acceptor's sender
-    /// when one is live, otherwise the default channel. The lookup runs in
+    /// when one is live, otherwise a closed channel for forward protocols
+    /// (so dispatch drops/resets the stream), or the default channel for others.
+    /// The lookup runs in
     /// the per-stream dispatch task (after the prefix read), so registration
     /// ordering relative to in-flight streams is well-defined: a stream
     /// routes by the registry state at dispatch time.
@@ -148,7 +152,13 @@ impl StreamAccept {
         acceptors
             .get(&protocol.as_u8())
             .cloned()
-            .unwrap_or_else(|| self.tx.clone())
+            .unwrap_or_else(|| match protocol {
+                // Never retain a forward handshake in the undrained default sink.
+                StreamProtocol::ForwardV1 | StreamProtocol::ForwardV2 => {
+                    tokio::sync::mpsc::channel(1).0
+                }
+                _ => self.tx.clone(),
+            })
     }
 
     /// The registered acceptor's sender for `protocol`, and ONLY that: never
@@ -230,7 +240,8 @@ impl StreamAccept {
 /// causes new streams to be reset rather than buffered.
 ///
 /// Dropping the acceptor deregisters it: subsequent streams for the protocol
-/// route to the default channel ([`crate::Agent::next_incoming_stream`]).
+/// are reset for forwarding, or route to the default channel otherwise
+/// ([`crate::Agent::next_incoming_stream`]).
 pub struct StreamAcceptor {
     protocol: StreamProtocol,
     rx: tokio::sync::mpsc::Receiver<PeerStream>,
@@ -879,6 +890,36 @@ mod tests {
         ));
     }
 
+    /// Inert regression: reserving delivery must fail immediately when no
+    /// forwarder exists, rather than queueing a handshake in an undrained sink.
+    #[test]
+    fn forward_without_acceptor_rejects_delivery() {
+        let accept = std::sync::Arc::new(StreamAccept::new(8));
+        for protocol in [StreamProtocol::ForwardV1, StreamProtocol::ForwardV2] {
+            let sender = accept.sender_for(protocol);
+            assert!(
+                matches!(
+                    sender.try_reserve(),
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(()))
+                ),
+                "{protocol:?} must reject delivery instead of retaining a waiting handshake"
+            );
+        }
+    }
+
+    #[test]
+    fn forward_acceptor_drop_rejects_delivery() {
+        let accept = std::sync::Arc::new(StreamAccept::new(8));
+        for protocol in [StreamProtocol::ForwardV1, StreamProtocol::ForwardV2] {
+            let consumer = accept.register(protocol).expect("register forwarder");
+            let sender = accept.sender_for(protocol);
+            assert!(sender.same_channel(&consumer.tx));
+            assert!(sender.try_reserve().is_ok());
+            drop(consumer);
+            assert!(accept.sender_for(protocol).is_closed());
+        }
+    }
+
     // Acceptor registry: one acceptor per protocol; drop deregisters; a stale
     // drop must not clobber a re-registered successor; routing falls back to
     // the default channel for unregistered protocols; channels are bounded.
@@ -906,7 +947,7 @@ mod tests {
             .sender_for(StreamProtocol::SocksV1)
             .same_channel(&first.tx));
         assert!(accept
-            .sender_for(StreamProtocol::ForwardV1)
+            .sender_for(StreamProtocol::SyncV1)
             .same_channel(accept.sender()));
 
         // Drop deregisters: re-registration succeeds and routing follows.
