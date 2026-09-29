@@ -370,7 +370,7 @@ pub(in crate::server) async fn resolve_home(state: &Arc<AppState>) -> HomeResolu
 /// `OwnerCertified(owner)` Home-shaped AND our own agent is an active
 /// member. Anything else (injected metadata, a foreign owner's Home, a
 /// group we were removed from) is not trusted.
-pub(in crate::server) async fn find_home(
+pub(crate) async fn find_home(
     state: &AppState,
     owner: &crate::identity::UserId,
 ) -> Option<(String, crate::groups::GroupInfo)> {
@@ -798,7 +798,7 @@ enum ProvisionStep {
     AwaitOwnerSync,
 }
 
-pub(in crate::server) async fn provision_home(state: &Arc<AppState>) {
+pub(crate) async fn provision_home(state: &Arc<AppState>) {
     let _ = provision_home_steps(state, false).await;
 }
 
@@ -866,7 +866,11 @@ async fn home_creator_rank(state: &AppState) -> u32 {
 /// - a committed record makes a canonical Home known (it will then yield);
 /// - a session with an owner device completes and this device is the
 ///   designated creator (rank 0): that session either delivered the pointer
-///   or showed that the device it reached advertises none;
+///   or showed that the device it reached advertises none — #863 makes
+///   "advertises none" TRUSTWORTHY: every session (both directions)
+///   materializes the local Home pointer into the Tier-1 store BEFORE the
+///   version-vector exchange, so a peer holding an unpublished Home can no
+///   longer answer with an empty HomePointer vector;
 /// - or `(rank + 1) × wait` has passed since the wait began.
 ///
 /// A completed session that brought no pointer releases ONLY the rank-0
@@ -3854,6 +3858,344 @@ pub(in crate::server::routes) mod tests {
             response_json(get_home(State(Arc::clone(follower))).await.into_response()).await?;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["state"], "elsewhere", "{body}");
+        Ok(())
+    }
+
+    /// WHY (#863): provisioning does NOT publish the Home pointer — only a
+    /// sync pass (or, post-fix, a session) does. That gap is the hole: a
+    /// peer holding an unpublished Home answers a session's version-vector
+    /// exchange with an EMPTY HomePointer kind. `materialize_local_home_
+    /// pointer` (what every session path now runs first) closes it. With
+    /// the helper disabled (the fail-before) the canonical pointer stays
+    /// None and both assertions below fail.
+    #[tokio::test]
+    async fn materialize_local_home_pointer_publishes_an_unpublished_local_home(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x8C; 32]).await?;
+        // The server startup attaches the daemon view to the sync
+        // service; owned_state skips startup, so mirror it here.
+        sync_of(&state)?.attach_view(Arc::new(super::super::DaemonView::new(Arc::clone(&state))));
+        provision_home(&state).await;
+        let sync = sync_of(&state)?;
+        assert!(
+            sync.canonical_home().await.is_none(),
+            "the #863 gap: a freshly provisioned Home is unpublished"
+        );
+        sync.materialize_local_home_pointer().await;
+        let canonical = sync.canonical_home().await.expect("published");
+        let (gid, _) = find_home(&state, &owner_of(&state)).await.expect("Home");
+        assert_eq!(canonical.group_id, gid);
+        // The version vector now ADVERTISES the HomePointer kind — an
+        // empty vector from this peer is henceforth genuine proof it
+        // holds no Home.
+        let vector = sync.store().version_vector().await;
+        assert!(vector.iter().any(|kv| {
+            kv.kind == crate::owner_sync::SyncKind::HomePointer && !kv.entries.is_empty()
+        }));
+        Ok(())
+    }
+
+    /// WHY (#863, the reported duplicate): the rank-0 wait may treat an
+    /// empty session as "no Home exists" only because every session now
+    /// PUBLISHES the peer's local Home pointer before the exchange. Model:
+    /// the follower holds a Home whose pointer is unpublished; its
+    /// session-side publication runs; the session delivers exactly what
+    /// the follower ADVERTISES; the leader's wait yields on the POINTER —
+    /// it reports "elsewhere" and creates nothing. With the publication
+    /// disabled (the fail-before) nothing is advertised, the empty session
+    /// releases rank 0, and the leader creates a duplicate Home.
+    #[tokio::test]
+    async fn rank_zero_adopts_an_unpublished_peer_home_instead_of_duplicating() -> anyhow::Result<()>
+    {
+        let (dir_a, dir_b) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let a = owned_state(dir_a.path(), [0x8D; 32]).await?;
+        let b = owned_state(dir_b.path(), [0x8D; 32]).await?;
+        for state in [&a, &b] {
+            // Mirror the server-startup view attachment (see above).
+            sync_of(state)?.attach_view(Arc::new(super::super::DaemonView::new(Arc::clone(state))));
+        }
+        let (ma, mb) = (a.agent.machine_id(), b.agent.machine_id());
+        anyhow::ensure!(ma != mb, "distinct machines");
+        enroll_machine(&a, mb.0).await?;
+        enroll_machine(&b, ma.0).await?;
+        let (leader, follower) = if ma.0 < mb.0 { (&a, &b) } else { (&b, &a) };
+        let (leader_machine, follower_machine) =
+            (leader.agent.machine_id(), follower.agent.machine_id());
+
+        // The follower already holds a Home whose pointer is unpublished
+        // (created since its last reconcile pass — the #863 gap).
+        provision_home(follower).await;
+        assert_eq!(home_shaped_group_count(follower).await, 1);
+        assert!(
+            sync_of(follower)?.canonical_home().await.is_none(),
+            "the follower's Home is real but unpublished"
+        );
+
+        // The leader (rank 0 — the only lower machine id) defers.
+        let task = provision_home_at_startup(leader, std::time::Duration::from_secs(600))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("leader must defer"))?;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // A session happens: both sides run the session-side publication
+        // the production session paths run; the merge delivers exactly
+        // what the follower ADVERTISES; both sides record the session.
+        sync_of(follower)?.materialize_local_home_pointer().await;
+        sync_of(leader)?.materialize_local_home_pointer().await;
+        if let Some(canonical) = sync_of(follower)?.canonical_home().await {
+            commit_canonical_home(leader, &canonical.group_id).await?;
+        }
+        sync_of(leader)?
+            .store()
+            .set_session_status(&follower_machine, true)
+            .await;
+        sync_of(follower)?
+            .store()
+            .set_session_status(&leader_machine, true)
+            .await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), task).await??;
+        assert_eq!(
+            home_shaped_group_count(leader).await,
+            0,
+            "#863: the leader ADOPTED the follower's Home — no duplicate"
+        );
+        let (status, body) =
+            response_json(get_home(State(Arc::clone(leader))).await.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "elsewhere", "{body}");
+        Ok(())
+    }
+
+    /// Loopback-only transport for the #1040 two-device test: no bootstrap
+    /// peers, no mDNS, no port mapping, so nothing outside the test is dialed.
+    fn loopback_network_config() -> crate::network::NetworkConfig {
+        crate::network::NetworkConfig {
+            bind_addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
+            bootstrap_nodes: Vec::new(),
+            port_mapping_enabled: false,
+            mdns_enabled: false,
+            ..crate::network::NetworkConfig::default()
+        }
+    }
+
+    /// An owned device with a live loopback transport, wired the way daemon
+    /// startup wires owner sync (device store installed, daemon view
+    /// attached), but WITHOUT `join_network`: no gossip runtime runs, so no
+    /// identity announcement can be sent or received. Only the stream
+    /// accept loop is started. The discovery cache therefore starts, and
+    /// stays, empty — the #1040 state of a restarted owner device.
+    async fn owned_networked_state(
+        data_dir: &std::path::Path,
+        owner_seed: [u8; 32],
+    ) -> anyhow::Result<Arc<AppState>> {
+        let user = crate::identity::UserKeypair::from_seed(&owner_seed)?;
+        let agent = Arc::new(
+            crate::Agent::builder()
+                .with_machine_key(data_dir.join("machine.key"))
+                .with_agent_key_path(data_dir.join("agent.key"))
+                .with_agent_cert_path(data_dir.join("agent.cert"))
+                .with_user_key(user)
+                .with_contact_store_path(data_dir.join("contacts.json"))
+                .with_peer_cache_dir(data_dir.join("peers"))
+                .with_network_config(loopback_network_config())
+                .build()
+                .await?,
+        );
+        agent.start_stream_accept_loop();
+        let state =
+            super::super::named_groups::tests::secure_endpoint_test_state_at(data_dir, agent)
+                .await?;
+        let sync = sync_of(&state)?;
+        state
+            .agent
+            .install_owner_device_store(Arc::clone(sync.store()));
+        sync.attach_view(Arc::new(super::super::DaemonView::new(Arc::clone(&state))));
+        Ok(state)
+    }
+
+    /// The device's bound loopback address.
+    async fn loopback_addr(state: &AppState) -> anyhow::Result<std::net::SocketAddr> {
+        let network = state
+            .agent
+            .network()
+            .ok_or_else(|| anyhow::anyhow!("networked fixture"))?;
+        let addr = network
+            .bound_addr()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("bound address"))?;
+        Ok(if addr.ip().is_unspecified() {
+            std::net::SocketAddr::from(([127, 0, 0, 1], addr.port()))
+        } else {
+            addr
+        })
+    }
+
+    /// Seed `state`'s bootstrap cache with `peer`'s address, as a restarted
+    /// device's persisted peer cache would hold it.
+    async fn remember_peer_address(
+        state: &AppState,
+        peer: crate::identity::MachineId,
+        addr: std::net::SocketAddr,
+    ) -> anyhow::Result<()> {
+        let cache = state
+            .agent
+            .network()
+            .and_then(|network| network.bootstrap_cache())
+            .ok_or_else(|| anyhow::anyhow!("networked fixture has a bootstrap cache"))?;
+        cache
+            .add_from_connection(ant_quic::PeerId(peer.0), vec![addr], None)
+            .await;
+        Ok(())
+    }
+
+    /// Whether `state`'s discovery cache has any agent on `machine` — true
+    /// only once an identity announcement from that machine was delivered.
+    async fn knows_an_agent_on(
+        state: &AppState,
+        machine: crate::identity::MachineId,
+    ) -> anyhow::Result<bool> {
+        Ok(state
+            .agent
+            .discovered_agents()
+            .await?
+            .iter()
+            .any(|agent| agent.machine_id == machine))
+    }
+
+    /// Wait until `store` records one more successful session than `before`.
+    async fn next_successful_session(
+        mut sessions: tokio::sync::watch::Receiver<u64>,
+        before: u64,
+        what: &str,
+    ) -> anyhow::Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while *sessions.borrow_and_update() == before {
+                sessions.changed().await?;
+            }
+            anyhow::Ok(())
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "#1040: {what}: no owner-sync session completed without an identity announcement"
+            )
+        })?
+    }
+
+    /// WHY (#1040, R20 Home 13/16): an owner device that restarts has an
+    /// EMPTY discovery cache. Until one of its enrolled owner machine's
+    /// identity announcements arrives — over two minutes on a loaded host —
+    /// it could neither dial that machine (`machine not in discovery cache`)
+    /// nor accept its transport-authenticated `SyncV1` stream
+    /// (`deny_not_verified`). The #824 wait then kept Home at
+    /// `provisioning_pending`. The owner-signed enrollment alone must carry
+    /// owner sync in both directions, with no announcement ever delivered,
+    /// and Home must settle.
+    ///
+    /// Fails before the fix: the restarted device's pass stops at the
+    /// discovery miss, no session completes, and Home stays pending.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn restarted_owner_device_with_empty_discovery_cache_syncs_both_ways_and_settles_home(
+    ) -> anyhow::Result<()> {
+        let (dir_a, dir_b) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let seed = [0x9E; 32];
+        // `running` holds the owner's Home; `restarted` just came back up.
+        let running = owned_networked_state(dir_a.path(), seed).await?;
+        let restarted = owned_networked_state(dir_b.path(), seed).await?;
+        let (m_running, m_restarted) = (running.agent.machine_id(), restarted.agent.machine_id());
+        anyhow::ensure!(m_running != m_restarted, "distinct machines");
+        enroll_machine(&running, m_restarted.0).await?;
+        enroll_machine(&restarted, m_running.0).await?;
+
+        provision_home(&running).await;
+        assert_eq!(home_shaped_group_count(&running).await, 1);
+        let (running_home, _) = find_home(running.as_ref(), &owner_of(&running))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("running device Home"))?;
+
+        let task = provision_home_at_startup(&restarted, std::time::Duration::from_secs(600))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("the restarted owner device must defer (#824)"))?;
+        let (status, body) = response_json(
+            get_home(State(Arc::clone(&restarted)))
+                .await
+                .into_response(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "provisioning_pending", "{body}");
+
+        // Each side's persisted peer cache remembers the other's address;
+        // neither discovery cache knows any agent on the other machine.
+        remember_peer_address(&restarted, m_running, loopback_addr(&running).await?).await?;
+        remember_peer_address(&running, m_restarted, loopback_addr(&restarted).await?).await?;
+        assert!(!knows_an_agent_on(&restarted, m_running).await?);
+        assert!(!knows_an_agent_on(&running, m_restarted).await?);
+
+        // TO the other device: the restarted device dials, the running
+        // device must admit the inbound SyncV1 stream.
+        let before = *sync_of(&running)?.store().successful_sessions_rx().borrow();
+        let inbound = sync_of(&running)?.store().successful_sessions_rx();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            sync_of(&restarted)?.sync_all(),
+        )
+        .await?;
+        next_successful_session(inbound, before, "restarted -> running").await?;
+
+        // FROM the other device: the running device dials, the restarted
+        // device must admit the inbound SyncV1 stream.
+        let before = *sync_of(&restarted)?
+            .store()
+            .successful_sessions_rx()
+            .borrow();
+        let inbound = sync_of(&restarted)?.store().successful_sessions_rx();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            sync_of(&running)?.sync_all(),
+        )
+        .await?;
+        next_successful_session(inbound, before, "running -> restarted").await?;
+
+        for (state, peer, who) in [
+            (&restarted, m_running, "restarted"),
+            (&running, m_restarted, "running"),
+        ] {
+            let statuses = sync_of(state)?.store().session_statuses().await;
+            assert_eq!(
+                statuses.get(&peer.0).map(|s| s.last_session_ok),
+                Some(true),
+                "{who}: the last session with the other owner device must have succeeded"
+            );
+        }
+
+        // Home left provisioning_pending: the restarted device adopted the
+        // running device's Home instead of waiting or minting a duplicate.
+        tokio::time::timeout(std::time::Duration::from_secs(20), task)
+            .await
+            .map_err(|_| anyhow::anyhow!("#1040: Home provisioning stayed pending"))??;
+        let (status, body) = response_json(
+            get_home(State(Arc::clone(&restarted)))
+                .await
+                .into_response(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "elsewhere", "{body}");
+        assert_eq!(body["canonical_group_id"], running_home.as_str());
+        assert_eq!(home_shaped_group_count(&restarted).await, 0);
+
+        // None of this rode on an identity announcement.
+        assert!(
+            !knows_an_agent_on(&restarted, m_running).await?,
+            "an identity announcement was delivered; the test no longer proves #1040"
+        );
+        assert!(
+            !knows_an_agent_on(&running, m_restarted).await?,
+            "an identity announcement was delivered; the test no longer proves #1040"
+        );
         Ok(())
     }
 

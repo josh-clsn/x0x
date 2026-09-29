@@ -715,6 +715,8 @@ async fn issue457_treekem_unavailable_rejection_is_counted() -> Result<()> {
         recovery_authority_signature_b64: None,
         recovery_authority_commit: None,
         signature_b64: BASE64.encode(signature.as_bytes()),
+
+        certificate_b64: None,
     };
     state.treekem_groups.write().await.remove(&group_id);
 
@@ -753,10 +755,6 @@ struct Issue458Stage {
     joiner_hex: String,
 }
 
-async fn issue458_stage(group_byte: u8, rename_first: bool) -> Result<Issue458Stage> {
-    issue458_stage_with_policy(group_byte, rename_first, owner_certified_policy_owner_f3).await
-}
-
 /// The r6b tier-2 fixtures use an ORDINARY (invite-only, no owner axis)
 /// policy — #458 was reproduced on exactly these groups.
 fn owner_certified_policy_owner_f3(owner_kp: &UserKeypair) -> x0x::groups::GroupPolicy {
@@ -766,10 +764,31 @@ fn owner_certified_policy_owner_f3(owner_kp: &UserKeypair) -> x0x::groups::Group
 fn invite_only_policy(_owner_kp: &UserKeypair) -> x0x::groups::GroupPolicy {
     x0x::groups::GroupPolicy::default()
 }
+async fn issue458_stage(group_byte: u8, rename_first: bool) -> Result<Issue458Stage> {
+    issue458_stage_with_policy_n(
+        group_byte,
+        usize::from(rename_first),
+        owner_certified_policy_owner_f3,
+    )
+    .await
+}
 
 async fn issue458_stage_with_policy<F>(
     group_byte: u8,
     rename_first: bool,
+    policy_fn: F,
+) -> Result<Issue458Stage>
+where
+    F: Fn(&UserKeypair) -> x0x::groups::GroupPolicy,
+{
+    issue458_stage_with_policy_n(group_byte, usize::from(rename_first), policy_fn).await
+}
+
+/// #846 r3: the stage builder with N intervening commits between the
+/// invite base and the join (the single-rename stage is `renames = 1`).
+async fn issue458_stage_with_policy_n<F>(
+    group_byte: u8,
+    renames: usize,
     policy_fn: F,
 ) -> Result<Issue458Stage>
 where
@@ -810,20 +829,30 @@ where
     let joiner_cert = issue_joiner_cert(&owner_kp, &joiner)?;
     announce_full_cert(authority.as_ref(), joiner_cert).await;
 
-    // The intermediate commit between invite base and join: a rename
-    // (exactly the E1 P1/P4 sequence — POST /home/rename between invite
-    // mint and join accept).
-    if rename_first {
+    // The intervening commits between invite base and join: the first is
+    // the E1 rename (exactly the P1/P4 sequence — POST /home/rename
+    // between invite mint and join accept); each further one varies the
+    // description (a distinct state hash per step, so multi-commit gaps
+    // can be staged for #846).
+    for step in 0..renames {
+        let request = if step == 0 {
+            UpdateGroupRequest {
+                name: Some("Renamed mid-join".to_string()),
+                description: None,
+            }
+        } else {
+            UpdateGroupRequest {
+                name: None,
+                description: Some(format!("genuine-intervening-{step}")),
+            }
+        };
         let response = update_named_group(
             State(Arc::clone(&authority)),
             axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
                 durable: true,
             }),
             Path(group_id.clone()),
-            Json(UpdateGroupRequest {
-                name: Some("Renamed mid-join".to_string()),
-                description: None,
-            }),
+            Json(request),
         )
         .await
         .into_response();
@@ -1497,6 +1526,7 @@ async fn issue458r2_adoption_refuses_commit_signed_by_non_actor() -> Result<()> 
             &signer,
         )?;
         NamedGroupMetadataEvent::MemberAdded {
+            roster_certificates_b64: Vec::new(),
             group_id: stage.group_id.clone(),
             revision,
             actor,
@@ -3822,6 +3852,7 @@ async fn issue458r4_removed_admin_fork_rejected() -> Result<()> {
         &attacker,
     )?;
     let fork_event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stage.group_id.clone(),
         revision: stub.roster_revision + 2,
         actor: attacker_hex.clone(),
@@ -4000,6 +4031,7 @@ async fn issue458r5_stale_joiner_removed_admin_fork_rejected() -> Result<()> {
         &attacker,
     )?;
     let fork_event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stage.group_id.clone(),
         revision: stub.roster_revision + 2,
         actor: attacker_hex.clone(),
@@ -4182,6 +4214,7 @@ async fn issue458r5_withdrawn_link_refused() -> Result<()> {
         &signer,
     )?;
     let event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stage.group_id.clone(),
         revision: terminal.revision,
         actor: stage.authority_hex.clone(),
@@ -4350,6 +4383,7 @@ async fn r6c_targeted_refusal(
         _ => panic!("stage member_added"),
     };
     let event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stage.group_id.clone(),
         revision: terminal.revision,
         actor: stage.authority_hex.clone(),
@@ -5137,6 +5171,7 @@ async fn adr0064_apply_commit(
         &commit,
         None,
         false,
+        None,
         x0x::groups::ActionKind::AdminOrHigher,
         |next| {
             next.description = mutation;
@@ -5549,6 +5584,7 @@ async fn adr0064_s4_removed_admin_fork_to_joiner_quarantines() -> Result<()> {
     let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
     use base64::Engine as _;
     let event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stage.group_id.clone(),
         revision: terminal.revision,
         actor: a_hex.clone(),
@@ -5647,6 +5683,7 @@ async fn adr0064_s4_removed_admin_fork_to_joiner_quarantines() -> Result<()> {
         &a_kp,
     )?;
     let event2 = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stage.group_id.clone(),
         revision: stranger_terminal.revision,
         actor: a_hex.clone(),
@@ -6029,6 +6066,7 @@ async fn stale_base_treekem_fork_with_replayed_owner_attestation_still_quarantin
     let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
     use base64::Engine as _;
     let event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stage.group_id.clone(),
         revision: terminal.revision,
         actor: a_hex.clone(),
@@ -6252,6 +6290,7 @@ async fn stale_base_treekem_sibling_terminal_with_genuine_owner_attestation_quar
     let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
     use base64::Engine as _;
     let event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stage.group_id.clone(),
         revision: sibling.revision,
         actor: b_hex.clone(),
@@ -6302,6 +6341,305 @@ async fn stale_base_treekem_sibling_terminal_with_genuine_owner_attestation_quar
         marker.snapshot.classification.as_deref(),
         Some("signer_only")
     );
+    Ok(())
+}
+
+/// WHY #842 (Rule 9): the authority's certificate caches can miss a
+/// joiner whose announce has not propagated (the R12 Home blocker — 100
+/// rejections across the whole 120 s window). The join event now carries
+/// the joiner's AgentCertificate, verified inline against the policy
+/// owner, so admission no longer depends on announce propagation. A
+/// PRESENT-but-invalid certificate (wrong owner) is a definitive refusal.
+#[tokio::test]
+async fn owner_certified_join_carried_certificate_admits_without_cache() -> Result<()> {
+    // #842 (Rule 9): the authority's certificate caches can miss a joiner
+    // whose announce has not propagated (the R12 Home blocker — 100
+    // rejections across the whole 120 s window). The join event now
+    // carries the joiner's AgentCertificate, verified inline against the
+    // policy owner, so admission no longer depends on announce
+    // propagation. A PRESENT-but-invalid certificate (foreign owner) is a
+    // definitive refusal.
+    let (authority, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "b5".repeat(32);
+    let authority_hex = hex::encode(authority.agent.agent_id().as_bytes());
+    insert_owner_group(
+        authority.as_ref(),
+        &group_id,
+        owner_certified_policy(&owner_kp),
+        "unused-stage-secret",
+    )
+    .await;
+    // A FRESH invite for a FRESH joiner.
+    let joiner_kp = AgentKeypair::generate()?;
+    let member_hex = hex::encode(joiner_kp.agent_id().as_bytes());
+    let invite_secret = format!("issue842-{member_hex}");
+    {
+        let mut groups = authority.named_groups.write().await;
+        let info = groups.get_mut(&group_id).expect("authority group");
+        info.record_issued_invite(invite_secret.clone(), 0, 0, x0x::groups::GroupRole::Member);
+    }
+    // The joiner's certificate exists, but the authority's cached view of
+    // it is STRIPPED — the announce-propagation gap.
+    let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
+    announce_full_cert(authority.as_ref(), joiner_cert.clone()).await;
+    {
+        let cache = authority.agent.identity_discovery_cache();
+        let mut cache = cache.write().await;
+        cache.retain(|agent, _| hex::encode(agent.as_bytes()) != member_hex);
+    }
+
+    // BASE behavior: a join WITHOUT the carried certificate is refused.
+    let (member_id, _mh, _pk, mut event) = signed_member_joined_event_for_test(
+        &joiner_kp,
+        &group_id,
+        &authority_hex,
+        &invite_secret,
+        x0x::groups::GroupRole::Member,
+    )?;
+    let result =
+        apply_named_group_metadata_event(&authority, event.clone(), member_id, true, None).await;
+    assert!(
+        !result.accepted,
+        "cache-stripped: the plain join is refused (the R12 failure)"
+    );
+    {
+        let row = diagnostics_row(authority.as_ref(), &group_id).await;
+        assert_eq!(
+            row.counters
+                .member_joined_events_rejected_owner_cert_pending,
+            1,
+            "the plain refusal is the owner-cert-pending rejection"
+        );
+    }
+
+    // #842: the same join WITH the carried certificate is admitted.
+    use base64::Engine as _;
+    if let NamedGroupMetadataEvent::MemberJoined {
+        certificate_b64, ..
+    } = &mut event
+    {
+        *certificate_b64 = Some(
+            base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&joiner_cert)?),
+        );
+    }
+    let result = apply_named_group_metadata_event(&authority, event, member_id, true, None).await;
+    assert!(
+        result.accepted,
+        "the carried certificate admits the join (#842)"
+    );
+    {
+        let groups = authority.named_groups.read().await;
+        let info = groups.get(&group_id).expect("authority group");
+        assert!(
+            info.has_active_member(&member_hex),
+            "the joiner is seated after the carried-cert admission"
+        );
+    }
+
+    // Negative: a certificate signed by a DIFFERENT user key (foreign
+    // owner) is a definitive refusal — not evidence-in-flight.
+    let (authority2, _dir2, owner2_kp) = owner_authority_state().await?;
+    let group2 = "b6".repeat(32);
+    let authority2_hex = hex::encode(authority2.agent.agent_id().as_bytes());
+    insert_owner_group(
+        authority2.as_ref(),
+        &group2,
+        owner_certified_policy(&owner2_kp),
+        "unused-stage-secret-2",
+    )
+    .await;
+    let joiner2_kp = AgentKeypair::generate()?;
+    let member2_hex = hex::encode(joiner2_kp.agent_id().as_bytes());
+    let secret2 = format!("issue842-{member2_hex}");
+    {
+        let mut groups = authority2.named_groups.write().await;
+        let info = groups.get_mut(&group2).expect("authority group 2");
+        info.record_issued_invite(secret2.clone(), 0, 0, x0x::groups::GroupRole::Member);
+    }
+    let foreign_kp = UserKeypair::from_seed(&[0xF7u8; 32])?;
+    let foreign_cert = issue_joiner_cert(&foreign_kp, &joiner2_kp)?;
+    let (member2, _mh2, _pk2, mut event2) = signed_member_joined_event_for_test(
+        &joiner2_kp,
+        &group2,
+        &authority2_hex,
+        &secret2,
+        x0x::groups::GroupRole::Member,
+    )?;
+    if let NamedGroupMetadataEvent::MemberJoined {
+        certificate_b64, ..
+    } = &mut event2
+    {
+        *certificate_b64 = Some(
+            base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&foreign_cert)?),
+        );
+    }
+    let result2 = apply_named_group_metadata_event(&authority2, event2, member2, true, None).await;
+    assert!(
+        !result2.accepted,
+        "a foreign-owner certificate is refused definitively"
+    );
+    {
+        let groups = authority2.named_groups.read().await;
+        let info = groups.get(&group2).expect("authority group 2");
+        assert!(
+            !info.has_active_member(&member2_hex),
+            "the foreign-cert joiner is not seated"
+        );
+    }
+    // Admission-critical negatives (#850 review items a-d).
+    // Helper: a fresh authority group + invite + a join signed by the
+    // given joiner whose event carries the given certificate.
+    async fn neg_join_with_cert(
+        joiner: &AgentKeypair,
+        cert: &x0x::identity::AgentCertificate,
+    ) -> (Arc<AppState>, ApplyMetadataResult, String) {
+        let (auth, _d, okp) = owner_authority_state().await.expect("neg authority");
+        let gid = "b7".repeat(32);
+        let auth_hex = hex::encode(auth.agent.agent_id().as_bytes());
+        insert_owner_group(auth.as_ref(), &gid, owner_certified_policy(&okp), "seed").await;
+        let jh = hex::encode(joiner.agent_id().as_bytes());
+        let secret = format!("issue842-neg-{jh}");
+        {
+            let mut groups = auth.named_groups.write().await;
+            groups
+                .get_mut(&gid)
+                .expect("neg group")
+                .record_issued_invite(secret.clone(), 0, 0, x0x::groups::GroupRole::Member);
+        }
+        let (mid, _mh, _pk, mut ev) = signed_member_joined_event_for_test(
+            joiner,
+            &gid,
+            &auth_hex,
+            &secret,
+            x0x::groups::GroupRole::Member,
+        )
+        .expect("neg event");
+        use base64::Engine as _;
+        if let NamedGroupMetadataEvent::MemberJoined {
+            certificate_b64, ..
+        } = &mut ev
+        {
+            *certificate_b64 = Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode(bincode::serialize(cert).expect("cert ser")),
+            );
+        }
+        let res = apply_named_group_metadata_event(&auth, ev, mid, true, None).await;
+        (auth, res, gid)
+    }
+
+    // (a) WRONG AGENT / replay: the joiner carries ANOTHER agent valid
+    // owner-signed certificate. AgentMismatch: refused, not seated, and
+    // the join is NOT retained as pending (definitive refusal).
+    {
+        let other_kp = AgentKeypair::generate()?;
+        let others_cert = issue_joiner_cert(&owner_kp, &other_kp)?;
+        let (auth, res, gid) = neg_join_with_cert(&joiner_kp, &others_cert).await;
+        assert!(!res.accepted, "wrong-agent certificate: refused");
+        let jh = hex::encode(joiner_kp.agent_id().as_bytes());
+        let groups = auth.named_groups.read().await;
+        assert!(
+            !groups
+                .get(&gid)
+                .expect("neg group a")
+                .has_active_member(&jh),
+            "wrong-agent joiner not seated"
+        );
+        drop(groups);
+        let pending = auth.owner_cert_pending_joins.read().await;
+        assert!(
+            pending.get(&join_result_key(&gid, &jh)).is_none(),
+            "a definitive AgentMismatch refusal is NOT retained as pending"
+        );
+    }
+
+    // (b) REVOKED: the revocation lookup inside the INLINE admission
+    // path. The revoked joiner as event SENDER is refused earlier
+    // (Enforcement point 4), so this drives owner_certified_admission_
+    // check DIRECTLY with a revoked member + the carried cert and
+    // asserts Err(Revoked) — the only test that catches removal of the
+    // revocation lookup in the inline branch.
+    {
+        let (auth, _d, okp) = owner_authority_state().await?;
+        let gid = "b8".repeat(32);
+        insert_owner_group(auth.as_ref(), &gid, owner_certified_policy(&okp), "seed").await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let record = x0x::revocation::RevocationRecord::sign(
+            x0x::revocation::RevokedSubject::Agent(joiner_kp.agent_id()),
+            joiner_kp.public_key(),
+            joiner_kp.secret_key(),
+            now,
+            Some("#850 negative: revoked joiner".to_string()),
+        )?;
+        auth.agent
+            .revocation_set()
+            .write()
+            .await
+            .verify_and_insert(record, Some(&joiner_cert))?;
+        {
+            let mut groups = auth.named_groups.write().await;
+            groups.get_mut(&gid).expect("neg group b").add_member(
+                hex::encode(joiner_kp.agent_id().as_bytes()),
+                x0x::groups::GroupRole::Member,
+                Some(hex::encode(auth.agent.agent_id().as_bytes())),
+                None,
+            );
+        }
+        let info = {
+            let groups = auth.named_groups.read().await;
+            groups.get(&gid).expect("neg group b").clone()
+        };
+        let outcome = owner_certified_admission_check(
+            &auth,
+            &info,
+            &hex::encode(joiner_kp.agent_id().as_bytes()),
+            Some(&joiner_cert),
+        )
+        .await;
+        assert_eq!(
+            outcome.map(|_| ()),
+            Err(x0x::groups::owner_cert::OwnerCertFailure::Revoked),
+            "a revoked agent is refused by the INLINE admission check despite a valid cert"
+        );
+    }
+
+    // Control: the same neg_join_with_cert setup ADMITS a fresh joiner
+    // with a valid owner-signed cert, so a setup fault cannot make (a)
+    // or (c) pass vacuously.
+    {
+        let fresh_kp = AgentKeypair::generate()?;
+        let fresh_cert = issue_joiner_cert(&owner_kp, &fresh_kp)?;
+        let (_auth, res, gid) = neg_join_with_cert(&fresh_kp, &fresh_cert).await;
+        assert!(res.accepted, "control: a valid cert is admitted");
+        let groups = _auth.named_groups.read().await;
+        assert!(
+            groups
+                .get(&gid)
+                .expect("control group")
+                .has_active_member(&hex::encode(fresh_kp.agent_id().as_bytes())),
+            "control: the fresh joiner is seated"
+        );
+    }
+    // (c) EXPIRED: an owner-signed certificate with not_after in the
+    // past. Refused.
+    {
+        let expired = x0x::identity::AgentCertificate::issue_for_public_key(
+            &owner_kp,
+            joiner_kp.public_key().as_bytes(),
+            Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .saturating_sub(2 * 24 * 60 * 60),
+            ),
+        )?;
+        let (_auth, res, _gid) = neg_join_with_cert(&joiner_kp, &expired).await;
+        assert!(!res.accepted, "expired certificate: refused");
+    }
     Ok(())
 }
 
@@ -6741,6 +7079,784 @@ async fn issue820_non_treekem_sibling_requires_exact_terminal_attestation() -> R
     Ok(())
 }
 
+/// WHY #846 (Rule 9): while an owner-anchored stale-base gap is pending
+/// (queued terminal + owner v2 head attestation), a catch-up responder
+/// that is an ACTIVE MEMBER of the joiner current view may still be a
+/// FORKING responder. Its divergent intervening commits must NOT be
+/// adopted: the served chain must lead to the pending owner-attested
+/// head before anything applies. Genuine chain control included.
+#[tokio::test]
+async fn forking_catchup_responder_adopts_nothing_under_anchored_gap() -> Result<()> {
+    let stage = issue458_stage(0xBC, true).await?;
+    let (joiner_state, _jdir) = joiner_state_for(&stage).await?;
+    let owner_kp = UserKeypair::from_seed(&[0xF3u8; 32])?;
+    let (stub, b_kp, link, genuine) = two_admin_real_invite_stub(&stage).await?;
+    joiner_state
+        .named_groups
+        .write()
+        .await
+        .insert(stage.group_id.clone(), stub.clone());
+    let joiner_epoch = Some(1u64);
+    let attestation = HeadAttestation::sign_for_terminal(
+        stub.stable_group_id(),
+        &genuine,
+        &stage.joiner_hex,
+        joiner_epoch,
+        &owner_kp,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    let joiner_kp = AgentKeypair::from_bytes(&stage.joiner_key_bytes.0, &stage.joiner_key_bytes.1)?;
+    let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
+    use base64::Engine as _;
+    let terminal_event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
+        group_id: stage.group_id.clone(),
+        revision: stub.state_revision,
+        actor: hex::encode(stage.authority.agent.agent_id().as_bytes()),
+        agent_id: stage.joiner_hex.clone(),
+        display_name: None,
+        treekem_commit_b64: None,
+        treekem_welcome_b64: None,
+        welcome_ref: None,
+        treekem_epoch: joiner_epoch,
+        treekem_key_package_hash: None,
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
+        certificate_b64: Some(
+            base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&joiner_cert)?),
+        ),
+        owner_mandate: None,
+        commit: Some(genuine.clone()),
+    };
+    let key = join_result_key(&stage.group_id, &stage.joiner_hex);
+    joiner_state
+        .pending_adoption_chains
+        .lock()
+        .unwrap()
+        .insert(key.clone(), vec![link.clone()]);
+    joiner_state
+        .pending_head_attestations
+        .lock()
+        .unwrap()
+        .insert(key, attestation);
+    let result = apply_named_group_metadata_event(
+        &joiner_state,
+        as_treekem_join_result(&terminal_event),
+        stage.authority.agent.agent_id(),
+        true,
+        None,
+    )
+    .await;
+    assert!(!result.accepted, "TreeKEM never adopts across the gap");
+    let revision_before = {
+        let groups = joiner_state.named_groups.read().await;
+        groups
+            .get(&stage.group_id)
+            .expect("stub retained")
+            .state_revision
+    };
+    assert!(revision_before < genuine.revision, "the gap is open");
+
+    // B (active admin in the stub) serves a DIVERGENT intermediate: a
+    // correctly-signed commit linking from the stub head but on its OWN
+    // chain — never reaching the attested head (the parent of genuine).
+    let authority_kp =
+        AgentKeypair::from_bytes(&stage.authority_key_bytes.0, &stage.authority_key_bytes.1)?;
+    let _ = &authority_kp;
+    let policy_hash = x0x::groups::compute_policy_hash(&stub.policy);
+    let mut fork_meta = stub.public_meta();
+    fork_meta.description = "forking-responder-intermediate".to_string();
+    let fork_link = forge_retained_link(
+        &stage.group_id,
+        &policy_hash,
+        revision_before.saturating_add(1),
+        Some(stub.state_hash.clone()),
+        x0x::groups::state_commit::roster_projection(&stub.members_v2),
+        fork_meta,
+        &b_kp,
+    );
+    let b_hex = hex::encode(b_kp.agent_id().as_bytes());
+    let fork_event = NamedGroupMetadataEvent::MemberRemoved {
+        group_id: stage.group_id.clone(),
+        revision: revision_before.saturating_add(1),
+        actor: b_hex.clone(),
+        agent_id: b_hex,
+        treekem_commit_b64: None,
+        treekem_epoch: joiner_epoch,
+        secret_epoch: None,
+        commit: Some(fork_link.commit.clone()),
+    };
+    crate::server::routes::named_groups::CATCHUP_846_GATE_FIRED
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    handle_treekem_catchup_response(
+        &joiner_state,
+        &b_kp.agent_id(),
+        true,
+        TreeKemCatchupResponse {
+            message_type: "treekem_catchup_response".to_string(),
+            group_id: stage.group_id.clone(),
+            events: vec![fork_event],
+            truncated: false,
+        },
+    )
+    .await;
+    assert!(
+        crate::server::routes::named_groups::CATCHUP_846_GATE_FIRED
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "#846: the ATTESTATION GATE refused the divergent response (not merely an apply refusal)"
+    );
+    {
+        let groups = joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("stub retained");
+        assert_eq!(
+            info.state_revision, revision_before,
+            "#846: a forking responder divergent intermediate adopts NOTHING"
+        );
+        assert!(
+            !info.is_fork_quarantined(),
+            "the refusal is a silent gate, not a quarantine"
+        );
+    }
+
+    Ok(())
+}
+/// #846 (gate-row-2 companion): the SAME forking-responder shape as
+/// `forking_catchup_responder_adopts_nothing_under_anchored_gap`, but the
+/// divergent page is a POLICY update — an ordinary stateful event the apply
+/// path has NO attested-sequence rule for, whose commit evaluates clean
+/// against the stub (links from the stub head, the stub's own roster root,
+/// security binding and meta hash; only the policy hash diverges). So the
+/// assertions here are on GROUP STATE alone, with no `cfg(test)` flag: the
+/// stub's revision, state hash and discoverability must be untouched, and
+/// the durable anchored-gap record must stay ARMED. With the catch-up gate
+/// disabled (the #846 bug), this exact page is adopted by the ordinary
+/// path — revision advances and discoverability flips — and the assertions
+/// go red.
+#[tokio::test]
+async fn forking_catchup_policy_page_leaves_group_state_untouched() -> Result<()> {
+    let stage = issue458_stage(0xBC, true).await?;
+    let (joiner_state, _jdir) = joiner_state_for(&stage).await?;
+    let owner_kp = UserKeypair::from_seed(&[0xF3u8; 32])?;
+    let (stub, b_kp, link, genuine) = two_admin_real_invite_stub(&stage).await?;
+    joiner_state
+        .named_groups
+        .write()
+        .await
+        .insert(stage.group_id.clone(), stub.clone());
+    let joiner_epoch = Some(1u64);
+    let attestation = HeadAttestation::sign_for_terminal(
+        stub.stable_group_id(),
+        &genuine,
+        &stage.joiner_hex,
+        joiner_epoch,
+        &owner_kp,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    let joiner_kp = AgentKeypair::from_bytes(&stage.joiner_key_bytes.0, &stage.joiner_key_bytes.1)?;
+    let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
+    use base64::Engine as _;
+    let terminal_event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
+        group_id: stage.group_id.clone(),
+        revision: stub.state_revision,
+        actor: hex::encode(stage.authority.agent.agent_id().as_bytes()),
+        agent_id: stage.joiner_hex.clone(),
+        display_name: None,
+        treekem_commit_b64: None,
+        treekem_welcome_b64: None,
+        welcome_ref: None,
+        treekem_epoch: joiner_epoch,
+        treekem_key_package_hash: None,
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
+        certificate_b64: Some(
+            base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&joiner_cert)?),
+        ),
+        owner_mandate: None,
+        commit: Some(genuine.clone()),
+    };
+    let key = join_result_key(&stage.group_id, &stage.joiner_hex);
+    joiner_state
+        .pending_adoption_chains
+        .lock()
+        .unwrap()
+        .insert(key.clone(), vec![link.clone()]);
+    joiner_state
+        .pending_head_attestations
+        .lock()
+        .unwrap()
+        .insert(key, attestation);
+    let result = apply_named_group_metadata_event(
+        &joiner_state,
+        as_treekem_join_result(&terminal_event),
+        stage.authority.agent.agent_id(),
+        true,
+        None,
+    )
+    .await;
+    assert!(!result.accepted, "TreeKEM never adopts across the gap");
+    let revision_before = {
+        let groups = joiner_state.named_groups.read().await;
+        groups
+            .get(&stage.group_id)
+            .expect("stub retained")
+            .state_revision
+    };
+    assert!(revision_before < genuine.revision, "the gap is open");
+    assert!(
+        crate::server::routes::named_groups::catchup_846_gate_armed(
+            joiner_state
+                .named_groups
+                .read()
+                .await
+                .get(&stage.group_id)
+                .expect("stub retained")
+        ),
+        "precondition: the durable anchored-gap record arms the gate"
+    );
+
+    // B (active admin in the stub) serves a DIVERGENT POLICY page: a
+    // correctly-signed commit that links from the stub head and carries the
+    // stub's own roster root, security binding and meta hash — only the
+    // policy (and its hash) diverge, flipping discoverability. The owner's
+    // attested sequence covers neither this commit nor any chain through
+    // it, so the gate must refuse the page; the commit otherwise evaluates
+    // clean, so ONLY the gate stands between this page and adoption.
+    let mut fork_policy = stub.policy.clone();
+    fork_policy.discoverability = match stub.policy.discoverability {
+        x0x::groups::GroupDiscoverability::Hidden => {
+            x0x::groups::GroupDiscoverability::ListedToContacts
+        }
+        _ => x0x::groups::GroupDiscoverability::Hidden,
+    };
+    assert_ne!(
+        x0x::groups::compute_policy_hash(&fork_policy),
+        x0x::groups::compute_policy_hash(&stub.policy),
+        "the page is divergent"
+    );
+    let fork_commit = x0x::groups::GroupStateCommit::sign(
+        stage.group_id.clone(),
+        revision_before.saturating_add(1),
+        Some(stub.state_hash.clone()),
+        x0x::groups::compute_roster_root(&stub.members_v2),
+        x0x::groups::compute_policy_hash(&fork_policy),
+        x0x::groups::compute_public_meta_hash(&stub.public_meta()),
+        stub.security_binding.clone(),
+        false,
+        crate::server::now_millis_u64(),
+        &b_kp,
+    )?;
+    let b_hex = hex::encode(b_kp.agent_id().as_bytes());
+    let policy_event = NamedGroupMetadataEvent::PolicyUpdated {
+        group_id: stage.group_id.clone(),
+        revision: revision_before.saturating_add(1),
+        actor: b_hex,
+        policy: fork_policy,
+        commit: Some(fork_commit),
+    };
+    handle_treekem_catchup_response(
+        &joiner_state,
+        &b_kp.agent_id(),
+        true,
+        TreeKemCatchupResponse {
+            message_type: "treekem_catchup_response".to_string(),
+            group_id: stage.group_id.clone(),
+            events: vec![policy_event],
+            truncated: false,
+        },
+    )
+    .await;
+    {
+        let groups = joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("stub retained");
+        assert_eq!(
+            info.state_revision, revision_before,
+            "#846: a forking responder's divergent policy page adopts NOTHING"
+        );
+        assert_eq!(
+            info.state_hash, stub.state_hash,
+            "#846: the stub's state hash is untouched by the refused page"
+        );
+        assert_eq!(
+            info.policy.discoverability, stub.policy.discoverability,
+            "#846: the divergent policy never lands"
+        );
+        assert!(
+            crate::server::routes::named_groups::catchup_846_gate_armed(info),
+            "#846: the durable anchored-gap record stays ARMED for an honest responder"
+        );
+    }
+
+    Ok(())
+}
+
+/// #846 unit: the per-page admission walk.
+#[test]
+fn catchup_page_within_attested_sequence_table() {
+    let mk = |rev: u64, prev: &str, hash: &str| x0x::groups::GroupStateCommit {
+        group_id: "c1".repeat(32),
+        revision: rev,
+        prev_state_hash: Some(prev.to_string()),
+        state_hash: hash.to_string(),
+        roster_root: String::new(),
+        policy_hash: String::new(),
+        public_meta_hash: String::new(),
+        security_binding: None,
+        withdrawn: false,
+        committed_by: "aa".repeat(32),
+        committed_at: 0,
+        signer_public_key: String::new(),
+        signature: String::new(),
+    };
+    let ev =
+        |commit: x0x::groups::GroupStateCommit| NamedGroupMetadataEvent::GroupMetadataUpdated {
+            group_id: "c1".repeat(32),
+            revision: commit.revision,
+            actor: "aa".repeat(32),
+            name: None,
+            description: None,
+            commit: Some(commit),
+        };
+    let base = "b".repeat(64);
+    let h1 = "1".repeat(64);
+    let h2 = "2".repeat(64);
+    let h3 = "3".repeat(64);
+    let seq = vec![h1.clone(), h2.clone(), h3.clone()];
+    let l1 = mk(1, &base, &h1);
+    let l2 = mk(2, &h1, &h2);
+    let l3 = mk(3, &h2, &h3);
+    // Full honest chain in one page: admitted.
+    assert!(catchup_page_within_attested_sequence(
+        &[ev(l1.clone()), ev(l2.clone()), ev(l3.clone())],
+        &base,
+        &seq,
+    ));
+    // Page 1 of a multi-commit gap (prefix ending mid-sequence): admitted.
+    assert!(catchup_page_within_attested_sequence(
+        &[ev(l1.clone())],
+        &base,
+        &seq
+    ));
+    // Fork: correctly linked but the WRONG next hash: refused.
+    let fork = mk(1, &base, &"f".repeat(64));
+    assert!(!catchup_page_within_attested_sequence(
+        &[ev(fork)],
+        &base,
+        &seq
+    ));
+    // Broken linking mid-page: refused.
+    let orphan = mk(2, &"9".repeat(64), &h2);
+    assert!(!catchup_page_within_attested_sequence(
+        &[ev(mk(1, &base, &h1)), ev(orphan)],
+        &base,
+        &seq,
+    ));
+    // Skipped step (l1 then l3): refused.
+    assert!(!catchup_page_within_attested_sequence(
+        &[ev(mk(1, &base, &h1)), ev(mk(3, &h1, &h3))],
+        &base,
+        &seq,
+    ));
+    // Page 2 ALONE, after page 1 applied (current == sequence[0]): the
+    // cursor must pick sequence[1] — the r2 bug restarted at
+    // sequence[0] every page, so the multi-commit gap never converged
+    // (review item 1).
+    assert!(catchup_page_within_attested_sequence(
+        &[ev(l2.clone()), ev(l3.clone())],
+        &h1,
+        &seq
+    ));
+    // A fork served as page 2 of the same gap (links from the advanced
+    // cursor but the wrong next hash): refused.
+    assert!(!catchup_page_within_attested_sequence(
+        &[ev(mk(2, &h1, &"f".repeat(64)))],
+        &h1,
+        &seq
+    ));
+    // Replaying page 1 after it applied (its prev no longer links):
+    // refused.
+    assert!(!catchup_page_within_attested_sequence(
+        &[ev(l1.clone())],
+        &h1,
+        &seq
+    ));
+}
+
+/// #846 r3 (review item 2): an HONEST multi-commit gap converges page by
+/// page through handle_treekem_catchup_response with the gate PROVABLY
+/// ARMED before every page — one event per page (the production cap).
+/// The authority's REAL chain (two intervening commits, then the sealed
+/// terminal) is served link by link; each intervening page must be
+/// ADMITTED by the armed gate AND APPLIED (state_revision and
+/// state_hash advance to the served commit), which is exactly the
+/// cursor state the next page's admission is derived from. The terminal
+/// page must clear the gate too. Its APPLY needs real TreeKEM Welcome
+/// material and stays refused at this unit level — only the gate's
+/// admission is asserted there. On the r2 head (1ead6c7) page 2 was
+/// gate-refused (the walker restarted at sequence[0] every page) and,
+/// once the terminal queue drained without retention, page 2 only
+/// passed because the gate had DISARMED — this test fails on both
+/// counts there (the fail-before).
+#[tokio::test]
+async fn honest_multicommit_gap_converges_page_by_page_under_gate() -> Result<()> {
+    // TWO intervening commits between the invite base and the join, so
+    // page 2 is an intervening commit, not just the terminal.
+    let stage = issue458_stage_with_policy_n(0xBD, 2, owner_certified_policy_owner_f3).await?;
+    let (joiner_state, _jdir) = joiner_state_for(&stage).await?;
+
+    // The joiner stub: the REAL invite-base state on the TreeKEM plane,
+    // roster clock at the terminal's revision so the frontier gate lets
+    // the terminal through to the refused-adoption arm (the #818/R10
+    // fixture shape — that arm writes the durable record and queues the
+    // terminal this gate protects).
+    let mut stub = stage.base_info.clone();
+    stub.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+    stub.roster_revision = stub
+        .roster_revision
+        .max(member_added_revision(&stage.member_added));
+    stub.invite_lineage = Some(x0x::groups::InviteLineage {
+        base_revision: stub.state_revision,
+        base_hash: stub.state_hash.clone(),
+        base_roster_root: String::new(),
+        seated_at_revision: None,
+        corroborated: false,
+        fork_evidence: None,
+        anchored_gap_refusal: None,
+    });
+    joiner_state
+        .named_groups
+        .write()
+        .await
+        .insert(stage.group_id.clone(), stub.clone());
+
+    let chain = stage_intervening_chain(&stage, stub.state_revision).await;
+    assert_eq!(chain.len(), 2, "the stage carries two intervening commits");
+    let treekem_event = as_treekem_join_result(&stage.member_added);
+    let (terminal_commit, terminal_epoch) = match &treekem_event {
+        NamedGroupMetadataEvent::MemberAdded {
+            commit: Some(commit),
+            treekem_epoch,
+            ..
+        } => (commit.clone(), *treekem_epoch),
+        _ => panic!("stage carries a MemberAdded with a commit"),
+    };
+    let owner_kp = UserKeypair::from_seed(&[0xF3u8; 32])?;
+    let attestation = HeadAttestation::sign_for_terminal(
+        stub.stable_group_id(),
+        &terminal_commit,
+        &stage.joiner_hex,
+        terminal_epoch,
+        &owner_kp,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    let key = join_result_key(&stage.group_id, &stage.joiner_hex);
+    joiner_state
+        .pending_adoption_chains
+        .lock()
+        .unwrap()
+        .insert(key.clone(), chain.clone());
+    joiner_state
+        .pending_head_attestations
+        .lock()
+        .unwrap()
+        .insert(key, attestation);
+
+    // The terminal arrives while the joiner is still at the base: the
+    // gap is refused and the durable record is written (gate arms).
+    let authority = stage.authority.agent.agent_id();
+    let result = apply_named_group_metadata_event(
+        &joiner_state,
+        treekem_event.clone(),
+        authority,
+        true,
+        None,
+    )
+    .await;
+    assert!(!result.accepted, "TreeKEM never adopts across the gap");
+
+    // The record's attested sequence: every intervening link's hash,
+    // ending with the terminal's own.
+    let mut sequence: Vec<String> = chain
+        .iter()
+        .map(|link| link.commit.state_hash.clone())
+        .collect();
+    sequence.push(terminal_commit.state_hash.clone());
+    {
+        let groups = joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("stub retained");
+        let record = info
+            .invite_lineage
+            .as_ref()
+            .and_then(|lineage| lineage.anchored_gap_refusal.as_ref())
+            .expect("the refused gap wrote the durable record");
+        assert_eq!(record.attested_chain_hashes, sequence);
+        assert_eq!(record.terminal_state_hash, terminal_commit.state_hash);
+        assert_eq!(record.terminal_revision, terminal_commit.revision);
+        assert!(
+            crate::server::routes::named_groups::catchup_846_gate_armed(info),
+            "the gate is armed off the durable record before any page"
+        );
+    }
+
+    // Serve the attested sequence ONE EVENT PER PAGE (the production
+    // cap): every intervening page must be admitted by the STILL-ARMED
+    // gate AND applied — revision and hash advance to the served
+    // commit, which is the cursor the next page is derived from.
+    for link in &chain {
+        let meta = link.meta.clone().expect("sealed meta retained");
+        let page_event = NamedGroupMetadataEvent::GroupMetadataUpdated {
+            group_id: stage.group_id.clone(),
+            revision: link.commit.revision,
+            actor: hex::encode(authority.as_bytes()),
+            name: Some(meta.name.clone()),
+            description: Some(meta.description.clone()),
+            commit: Some(link.commit.clone()),
+        };
+        {
+            let groups = joiner_state.named_groups.read().await;
+            let info = groups.get(&stage.group_id).expect("stub retained");
+            assert!(
+                crate::server::routes::named_groups::catchup_846_gate_armed(info),
+                "the gate is STILL ARMED before revision {} (durable record, \
+                 not the drained queue)",
+                link.commit.revision
+            );
+        }
+        crate::server::routes::named_groups::CATCHUP_846_GATE_FIRED
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        handle_treekem_catchup_response(
+            &joiner_state,
+            &authority,
+            true,
+            TreeKemCatchupResponse {
+                message_type: "treekem_catchup_response".to_string(),
+                group_id: stage.group_id.clone(),
+                events: vec![page_event],
+                truncated: false,
+            },
+        )
+        .await;
+        assert!(
+            !crate::server::routes::named_groups::CATCHUP_846_GATE_FIRED
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the honest page passed the gate"
+        );
+        let groups = joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("stub retained");
+        assert_eq!(
+            info.state_revision, link.commit.revision,
+            "the honest page was ADOPTED (revision advanced)"
+        );
+        assert_eq!(
+            info.state_hash, link.commit.state_hash,
+            "the honest page was ADOPTED (hash advanced)"
+        );
+    }
+
+    // Terminal page: the cursor (now at the last applied link's hash)
+    // must reach the terminal hash and ADMIT the page. The seat itself
+    // needs real TreeKEM Welcome material and stays refused at this
+    // unit level — the gate's admission is the assertion.
+    {
+        let groups = joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("stub retained");
+        assert!(
+            crate::server::routes::named_groups::catchup_846_gate_armed(info),
+            "the gate is still armed before the terminal page (the seat has not applied)"
+        );
+    }
+    crate::server::routes::named_groups::CATCHUP_846_GATE_FIRED
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    handle_treekem_catchup_response(
+        &joiner_state,
+        &authority,
+        true,
+        TreeKemCatchupResponse {
+            message_type: "treekem_catchup_response".to_string(),
+            group_id: stage.group_id.clone(),
+            events: vec![treekem_event],
+            truncated: false,
+        },
+    )
+    .await;
+    assert!(
+        !crate::server::routes::named_groups::CATCHUP_846_GATE_FIRED
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "the terminal page passed the gate (cursor derived from the applied links)"
+    );
+    Ok(())
+}
+
+/// #850 review item 3 / #876 item 5 (size): what does a cert-carrying
+/// join event REALLY weigh? Two shapes, both measured with real
+/// cryptography:
+///
+/// - The minimal (non-TreeKEM) MemberJoined with a real certificate must
+///   still fit the 49,152-byte DM budget — that path has no blob escape.
+/// - A Home-shaped join (real TreeKEM key package + real certificate)
+///   legitimately EXCEEDS the budget (the R15 live event measured
+///   51,546 B) — it travels as a staged control blob, which #876 makes
+///   reliable (release-on-completed-fetch + bounded staging retry).
+///
+/// The pre-#876 test asserted the Home shape fit; it used an
+/// unrepresentative payload (no key package), which is exactly the gap
+/// #876 closes (the fail-before: the old assertion is false of the real
+/// shape).
+#[test]
+fn cert_carrying_member_joined_sizes_are_representative() -> Result<()> {
+    let joiner_kp = AgentKeypair::generate()?;
+    let owner_kp = UserKeypair::from_seed(&[0xF3u8; 32])?;
+    let cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
+    let (_mid, _mh, _pk, mut event) = signed_member_joined_event_for_test(
+        &joiner_kp,
+        &"b9".repeat(32),
+        &"aa".repeat(32),
+        "size-check-secret",
+        x0x::groups::GroupRole::Member,
+    )?;
+    use base64::Engine as _;
+    let cert_b64 = base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&cert)?);
+    if let NamedGroupMetadataEvent::MemberJoined {
+        certificate_b64, ..
+    } = &mut event
+    {
+        *certificate_b64 = Some(cert_b64.clone());
+    }
+    let minimal = serde_json::to_vec(&event)?;
+    assert!(
+        minimal.len() <= x0x::dm::MAX_PAYLOAD_BYTES,
+        "minimal cert-carrying MemberJoined is {} bytes, must fit the {} DM budget",
+        minimal.len(),
+        x0x::dm::MAX_PAYLOAD_BYTES
+    );
+
+    // The Home shape: a REAL TreeKEM key package rides along.
+    let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(joiner_kp.agent_id(), &[0xB9; 32])?;
+    let key_package_b64 =
+        base64::engine::general_purpose::STANDARD.encode(prepared.key_package_bytes());
+    if let NamedGroupMetadataEvent::MemberJoined {
+        treekem_key_package_b64,
+        certificate_b64,
+        ..
+    } = &mut event
+    {
+        *treekem_key_package_b64 = Some(key_package_b64);
+        *certificate_b64 = Some(cert_b64);
+    }
+    let home_shaped = serde_json::to_vec(&event)?;
+    // #876 r2 (review item 4b): ASSERT the representative band — the
+    // real key package + cert really are in the payload (a fixture that
+    // silently drops them fails here). The >-DM-budget shape (the
+    // welcome-carrying join RESULT) is asserted in
+    // home_control_payload_size.rs.
+    assert!(
+        home_shaped.len() > 30_000 && home_shaped.len() <= x0x::dm::MAX_PAYLOAD_BYTES,
+        "cert+keypackage MemberJoined measured {} bytes — outside the representative band",
+        home_shaped.len()
+    );
+    Ok(())
+}
+
+/// #846 (review item 2): a STALE armed record on group A must not block
+/// catch-up for group B — the arm check is per-group and matches the
+/// exact queued terminal.
+#[tokio::test]
+async fn stale_record_in_one_group_does_not_block_another() -> Result<()> {
+    let stage = issue458_stage(0xBE, true).await?;
+    let (joiner_state, _jdir) = joiner_state_for(&stage).await?;
+    let (stub, _b_kp, link, genuine) = two_admin_real_invite_stub(&stage).await?;
+    joiner_state
+        .named_groups
+        .write()
+        .await
+        .insert(stage.group_id.clone(), stub.clone());
+    // Arm group A: record + a queued terminal for A (the terminal that
+    // will never link here).
+    {
+        let mut groups = joiner_state.named_groups.write().await;
+        let lineage = groups
+            .get_mut(&stage.group_id)
+            .expect("stub")
+            .invite_lineage
+            .as_mut()
+            .expect("lineage");
+        lineage.anchored_gap_refusal = Some(x0x::groups::AnchoredGapRefusal {
+            reason: "owner_attested_stale_base_gap".to_string(),
+            head_revision: genuine.revision.saturating_sub(1),
+            head_state_hash: genuine.prev_state_hash.clone().unwrap_or_default(),
+            terminal_revision: genuine.revision,
+            terminal_state_hash: genuine.state_hash.clone(),
+            committed_by: hex::encode(stage.authority.agent.agent_id().as_bytes()),
+            occurrences: 1,
+            first_observed_at_ms: 0,
+            last_observed_at_ms: 0,
+            attested_chain_hashes: vec![link.commit.state_hash.clone(), genuine.state_hash.clone()],
+            by_reason: Default::default(),
+        });
+    }
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(PendingTreeKemMetadataEvent {
+        event: as_treekem_join_result(&NamedGroupMetadataEvent::MemberAdded {
+            roster_certificates_b64: Vec::new(),
+            group_id: stage.group_id.clone(),
+            revision: genuine.revision,
+            actor: hex::encode(stage.authority.agent.agent_id().as_bytes()),
+            agent_id: stage.joiner_hex.clone(),
+            display_name: None,
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: Some(1),
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
+            certificate_b64: None,
+            owner_mandate: None,
+            commit: Some(genuine.clone()),
+        }),
+        sender: stage.authority.agent.agent_id(),
+        queued_at: std::time::Instant::now(),
+    });
+    joiner_state
+        .treekem_pending_events
+        .write()
+        .await
+        .insert(stage.group_id.clone(), queue);
+
+    // GROUP B: an ordinary catch-up response (no record, no queued
+    // terminal for B) must NOT hit the gate.
+    let other_group = "bf".repeat(32);
+    {
+        let mut groups = joiner_state.named_groups.write().await;
+        let mut info = stub.clone();
+        info.invite_lineage = None;
+        groups.insert(other_group.clone(), info);
+    }
+    let _ = link;
+    crate::server::routes::named_groups::CATCHUP_846_GATE_FIRED
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    // Any well-formed response for B: the gate must not fire (the handler
+    // may refuse for OTHER reasons — the assertion is only that the GATE
+    // is not what refused it).
+    handle_treekem_catchup_response(
+        &joiner_state,
+        &stage.authority.agent.agent_id(),
+        true,
+        TreeKemCatchupResponse {
+            message_type: "treekem_catchup_response".to_string(),
+            group_id: other_group,
+            events: vec![],
+            truncated: false,
+        },
+    )
+    .await;
+    assert!(
+        !crate::server::routes::named_groups::CATCHUP_846_GATE_FIRED
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "a stale record on group A did not arm the gate for group B"
+    );
+    Ok(())
+}
 /// Build a REAL invite-join stub for the two-admin stale-base shape: a
 /// sealed base containing the authority and admin B (so B walks validly
 /// from the base), a genuine authority link L and terminal T, and the
@@ -6910,6 +8026,7 @@ async fn real_invite_stale_base_gap_is_classified_anchored_and_queued() -> Resul
     let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
     use base64::Engine as _;
     let event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stage.group_id.clone(),
         revision: stub.state_revision,
         actor: hex::encode(stage.authority.agent.agent_id().as_bytes()),
@@ -7058,6 +8175,7 @@ async fn real_invite_removed_admin_sibling_is_classified_and_quarantined() -> Re
     let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
     use base64::Engine as _;
     let event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stage.group_id.clone(),
         revision: stub.state_revision,
         actor: b_hex.clone(),
@@ -7399,6 +8517,7 @@ async fn adr0064_s4_removed_admin_fork_replay_under_held_lock_no_deadlock() -> R
     let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
     use base64::Engine as _;
     let event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stage.group_id.clone(),
         revision: terminal.revision,
         actor: a_hex.clone(),
@@ -7444,6 +8563,7 @@ async fn adr0064_s4_removed_admin_fork_replay_under_held_lock_no_deadlock() -> R
             None,
             true,
             true,
+            None,
         ),
     )
     .await;

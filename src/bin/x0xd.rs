@@ -375,6 +375,26 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+    // ADR-0070 §3: SIGHUP re-reads the connect/exec ACL floors and API
+    // overlays. A rejected reload keeps the last good ACL (the reason is
+    // logged and surfaced in /diagnostics/connect and /diagnostics/exec).
+    #[cfg(unix)]
+    {
+        let acl_reload = handle.acl_reload_trigger();
+        tokio::spawn(async move {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                Ok(mut sighup) => {
+                    while sighup.recv().await.is_some() {
+                        match acl_reload.reload().await {
+                            Ok(()) => tracing::info!("SIGHUP: ACL reload applied"),
+                            Err(e) => tracing::warn!("SIGHUP: {e}"),
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("failed to install SIGHUP handler: {e}"),
+            }
+        });
+    }
 
     // #368/#371: bounded shutdown. saorsa-gossip 0.5.71's IHAVE flusher is a
     // detached loop with no shutdown handle; once the node is torn down its
@@ -611,6 +631,14 @@ async fn load_config(path: &str) -> Result<DaemonConfig> {
     Ok(config)
 }
 
+/// Whether the stdout log layer emits ANSI colour codes.
+///
+/// #1036: colour the stdout log only for an interactive terminal, and never
+/// when `NO_COLOR` is set (<https://no-color.org/>).
+fn log_ansi_enabled(stdout_is_terminal: bool, no_color: bool) -> bool {
+    stdout_is_terminal && !no_color
+}
+
 /// Initialize structured logging.
 ///
 /// Filter resolution order:
@@ -701,6 +729,13 @@ fn init_logging(level: &str, format: &str) -> Result<WorkerGuard> {
     // that is tens of thousands of serialised syscalls competing with the very
     // tasks that must stay responsive for the API watchdog's `/health` probe.
     // `non_blocking` hands formatted lines to a dedicated writer thread instead.
+    // #1036: ANSI colour codes only when stdout is an interactive terminal.
+    // Under systemd/journald (and in log files) escape sequences are noise
+    // that inflates syslog and breaks grep.
+    let stdout_ansi = log_ansi_enabled(
+        std::io::IsTerminal::is_terminal(&std::io::stdout()),
+        std::env::var_os("NO_COLOR").is_some(),
+    );
     let (stdout_writer, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
 
     let stdout_layer: Box<dyn tracing_subscriber::Layer<_> + Send + Sync + 'static> =
@@ -708,10 +743,15 @@ fn init_logging(level: &str, format: &str) -> Result<WorkerGuard> {
             Box::new(
                 tracing_subscriber::fmt::layer()
                     .json()
+                    .with_ansi(false)
                     .with_writer(stdout_writer),
             )
         } else {
-            Box::new(tracing_subscriber::fmt::layer().with_writer(stdout_writer))
+            Box::new(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(stdout_ansi)
+                    .with_writer(stdout_writer),
+            )
         };
 
     let file_layer: Option<Box<dyn tracing_subscriber::Layer<_> + Send + Sync + 'static>> =
@@ -720,11 +760,16 @@ fn init_logging(level: &str, format: &str) -> Result<WorkerGuard> {
                 let writer = std::sync::Mutex::new(f);
                 if format == "json" {
                     Some(Box::new(
-                        tracing_subscriber::fmt::layer().json().with_writer(writer),
+                        tracing_subscriber::fmt::layer()
+                            .json()
+                            .with_ansi(false)
+                            .with_writer(writer),
                     ))
                 } else {
                     Some(Box::new(
-                        tracing_subscriber::fmt::layer().with_writer(writer),
+                        tracing_subscriber::fmt::layer()
+                            .with_ansi(false)
+                            .with_writer(writer),
                     ))
                 }
             }
@@ -760,6 +805,23 @@ fn init_logging(level: &str, format: &str) -> Result<WorkerGuard> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn logs_are_uncoloured_unless_stdout_is_a_terminal() {
+        // #1036: journald/syslog captured ANSI escapes from every WARN line.
+        assert!(
+            !super::log_ansi_enabled(false, false),
+            "non-TTY must not be coloured"
+        );
+        assert!(
+            super::log_ansi_enabled(true, false),
+            "an interactive TTY keeps colour"
+        );
+        assert!(
+            !super::log_ansi_enabled(true, true),
+            "NO_COLOR disables colour"
+        );
+    }
+
     use super::*;
     use x0x::server::InstanceName;
 

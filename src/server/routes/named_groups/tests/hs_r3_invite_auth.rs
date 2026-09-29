@@ -868,6 +868,7 @@ async fn fork_evidence_records_once_and_survives_in_the_durable_record() -> Resu
             &commit,
             None,
             false,
+            None,
             x0x::groups::ActionKind::AdminOrHigher,
             |next| {
                 next.description = mutation;
@@ -2234,6 +2235,7 @@ async fn r4_apply_through_wrapper(
         &commit,
         None,
         lock_held,
+        None,
         x0x::groups::ActionKind::AdminOrHigher,
         |next| {
             next.description = mutation;
@@ -2855,6 +2857,7 @@ async fn every_stateful_event_variant_routes_conflicts_through_the_wrapper() -> 
         .await?;
         let added_hex = hex::encode(AgentKeypair::generate()?.agent_id().as_bytes());
         let event = NamedGroupMetadataEvent::MemberAdded {
+            roster_certificates_b64: Vec::new(),
             group_id: group_id.clone(),
             revision: 1,
             actor: authority_hex.clone(),

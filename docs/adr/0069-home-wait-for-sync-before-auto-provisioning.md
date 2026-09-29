@@ -1,7 +1,10 @@
 # ADR 0069: Home Auto-Provisioning Waits for Owner Sync
 
-- **Status:** Proposed
-- **Date:** 2026-09-24
+- **Status:** Proposed. To be accepted **as a record of shipped behaviour**
+  (charter decision D11, 2026-09-29) and superseded by ADR 0088 (prov., the
+  group-protocol liveness contract, which replaces Home auto-provisioning with an
+  explicit owner group).
+- **Date:** 2026-09-24 (updated 2026-09-29 for #863 and #1040)
 - **Decision owners:** David Irvine (product decision on PR #826: wait for sync
   before auto-provisioning), Claude (drafting)
 - **Reviewers:** — (human review pending; the implementation had cross-model
@@ -20,7 +23,10 @@
   bounded wait instead of an immediate create. The election, the `!withdrawn`
   predicate, and the retired-pointer exception in ADR 0060 are unchanged.
 - **Related:** issue #824; PR #826 (merged into the #802 candidate,
-  `codex/final-acceptance-candidate`, merge `71cb954`); commits `2d55d40`,
+  `codex/final-acceptance-candidate`, merge `71cb954`; on main since #802
+  landed as `952ed18`); #863 / PR #884 (pointer published before every
+  session); #1040 / PR #1044 and [ADR 0084](./0084-enrolled-owner-sync-admission.md)
+  (enrollment-only owner-sync admission); commits `2d55d40`,
   `245196f`, `ec27fd7`; #449; [ADR 0065](./0065-duplicate-home-inventory-retirement-deferred.md)
   (duplicates are inventoried, not retired); `docs/api-reference.md` (`GET /home`,
   `POST /home/seat`)
@@ -194,17 +200,24 @@ against duplicates the deferral cannot prevent (see Negative).
   90 s at rank 0, and `(rank + 1) × 90 s` in general. This is the accepted cost
   of option 1.
 - **Enrollment is a precondition.** Owner sync refuses unenrolled peers in both
-  directions. A device that has only a copied `user.key` and is never enrolled
+  directions. Since #1040 (ADR 0084), enrollment is also *sufficient* for a
+  restarted device to reach its enrolled owner machines: before that, a device
+  restarted with an empty discovery cache could neither accept nor dial its
+  enrolled peer until a gossip identity announcement arrived, so the wait could
+  run out its full deadline on a loaded network (R20 Home, `provisioning_pending`
+  for more than 120 s). A device that has only a copied `user.key` and is never enrolled
   (`/sync/devices/enroll`) cannot receive the pointer. After its wait it creates
   a duplicate, just later. The R11 fixture had to be changed to pair devices
   (`245196f`). The `ambiguous_home` guard is what protects seating in this case.
-- **Residual: an empty session releases rank 0 early.** The rank-0 device is
-  released by any successful session. If that session is with an owner device
-  that holds a Home but has not yet minted its pointer (inbound sessions do not
-  publish the serving device's pointer first), the new device can still create
-  a duplicate. The pointer is minted on the holder's own sync pass, so the
-  window is limited to Homes created or changed within the last pass. This was
-  raised by Greptile on PR #826 and is not closed here.
+- **Residual (closed by #863): an empty session released rank 0 early.** As
+  first shipped, the rank-0 device was released by any successful session, even
+  one with an owner device that held a Home but had not yet minted its pointer,
+  so the new device could still create a duplicate. PR #884 closed this: every
+  session, inbound and outbound, publishes the local Home pointer **before** the
+  version-vector exchange (`session_with_home_publication`), so an empty
+  `HomePointer` vector is genuine proof that the peer has no Home. Mixed-version
+  note: a peer older than #884 still does not publish first, so the residual
+  remains against such peers.
 - **The fallback trusts the timer, not proof.** A partitioned leader and a
   timed-out follower can each create a Home. ADR 0060's election still resolves
   which one is canonical. The loser is inventoried by ADR 0065, not retired.
@@ -257,10 +270,16 @@ temp dirs) in `src/server/routes/home.rs`:
 
 PR #826's CI mirror (#827 at `012ed3c`) was 27/27 green.
 
+#863 (PR #884) adds `session_path_publishes_home_pointer_before_the_exchange`
+(`src/server/routes/sync.rs`) and `rank_zero_adopts_an_unpublished_peer_home_instead_of_duplicating`
+(`src/server/routes/home.rs`). #1040 (PR #1044) adds
+`restarted_owner_device_with_empty_discovery_cache_syncs_both_ways_and_settles_home`
+(`src/server/routes/home.rs`), red before the fix.
+
 **Not yet validated:** a multi-device live run in which an enrolled late device
-receives the pointer within its wait and never creates a Home. The R11 fixture
-must pair devices for owner sync, and its poll timeout must cover
-`(rank + 1) × 90 s`. The empty-session residual above has no regression test.
+receives the pointer within its wait and never creates a Home. Home never passed
+a full fixture round from R9 to R20 (charter §2); release-gate row 3a (Home
+provisioning with an owner restart mid-run) is the live check for v0.46.0.
 
 Review triggers: any change to `HOME_POINTER_SYNC_WAIT`, `DEFAULT_SYNC_INTERVAL`
 or `SESSION_TIMEOUT`; any new writer of the `("home")` register (it must take
@@ -269,6 +288,8 @@ option 2).
 
 ## Notes for AI-assisted work
 
-Drafted by Claude from PR #826, issue #824 and the code at `a926575`. It must not
-be marked Accepted without human review. ADR 0038 is Accepted and is amended
+Drafted by Claude from PR #826, issue #824 and the code at `a926575`; updated
+2026-09-29 for #863 and #1040 against main. It must not be marked Accepted without
+human review; D11 accepts it as a record only, and ADR 0088 is expected to
+supersede it. ADR 0038 is Accepted and is amended
 only by reference here. Its body is not edited.

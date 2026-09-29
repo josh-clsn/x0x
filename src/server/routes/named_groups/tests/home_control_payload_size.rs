@@ -62,6 +62,8 @@ async fn real_home_seat_control_envelopes_exceed_direct_message_limit() -> Resul
         recovery_authority_signature_b64: None,
         recovery_authority_commit: None,
         signature_b64: String::new(),
+
+        certificate_b64: None,
     };
     next.security_binding = treekem_recovery_security_binding(epoch, &direct_recovery);
     let mandate = mint_owner_mandate_for_seat(
@@ -90,6 +92,7 @@ async fn real_home_seat_control_envelopes_exceed_direct_message_limit() -> Resul
     let welcome_ref =
         stage_treekem_welcome(&state, &stable_group_id, &member_hex, out.welcome).await;
     let event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stable_group_id.clone(),
         revision,
         actor: authority_hex.clone(),
@@ -134,6 +137,7 @@ async fn real_home_seat_control_envelopes_exceed_direct_message_limit() -> Resul
         event: Box::new(event.clone()),
         chain,
         head_attestation: Some(Box::new(head)),
+        roster_certificates_b64: Vec::new(),
     };
     let result_len = serde_json::to_vec(&result)?.len();
     let result_bytes = serde_json::to_vec(&result)?;
@@ -221,6 +225,8 @@ async fn real_home_seat_control_envelopes_exceed_direct_message_limit() -> Resul
         recovery_authority_signature_b64: None,
         recovery_authority_commit: None,
         signature_b64: String::new(),
+
+        certificate_b64: None,
     };
     after.security_binding = treekem_recovery_security_binding(second_epoch, &second_recovery);
     let second_mandate = mint_owner_mandate_for_seat(
@@ -256,6 +262,7 @@ async fn real_home_seat_control_envelopes_exceed_direct_message_limit() -> Resul
     let second_welcome_ref =
         stage_treekem_welcome(&state, &stable_group_id, &second_hex, second_out.welcome).await;
     let second_event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stable_group_id.clone(),
         revision: after.roster_revision,
         actor: authority_hex,
@@ -330,6 +337,7 @@ impl BoundJoinerScenario {
             event: Box::new(self.event.clone()),
             chain: self.chain.clone(),
             head_attestation: Some(Box::new(self.head_attestation.clone())),
+            roster_certificates_b64: Vec::new(),
         }
     }
 }
@@ -408,6 +416,8 @@ async fn build_bound_joiner_scenario(dir: &std::path::Path) -> Result<BoundJoine
         recovery_authority_signature_b64: None,
         recovery_authority_commit: None,
         signature_b64: String::new(),
+
+        certificate_b64: None,
     };
     next.security_binding = treekem_recovery_security_binding(epoch, &direct_recovery);
     let mandate = mint_owner_mandate_for_seat(
@@ -434,6 +444,7 @@ async fn build_bound_joiner_scenario(dir: &std::path::Path) -> Result<BoundJoine
     // INLINE welcome: the joiner consumes its Welcome from the event bytes,
     // so adoption stays socket-free (no welcome fetch transfer).
     let event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
         group_id: stable_group_id.clone(),
         revision,
         actor: authority_hex.clone(),
@@ -464,6 +475,22 @@ async fn build_bound_joiner_scenario(dir: &std::path::Path) -> Result<BoundJoine
         owner,
     )
     .expect("owner signs head attestation");
+    // #876 r2 (review item 4b): the JOIN RESULT the owner stages for the
+    // joiner (event + chain + attestation) is the R15-shaped ~51.5 KB
+    // control-blob payload — it must EXCEED the DM budget, or the blob
+    // path stops being exercised by reality.
+    let result_wire = serde_json::to_vec(&JoinResultMessage::Result {
+        event: Box::new(event.clone()),
+        chain: chain.clone(),
+        head_attestation: Some(Box::new(head.clone())),
+        roster_certificates_b64: Vec::new(),
+    })?;
+    assert!(
+        result_wire.len() > crate::dm::MAX_PAYLOAD_BYTES,
+        "join-result wire is {} bytes, must exceed the {} DM budget",
+        result_wire.len(),
+        crate::dm::MAX_PAYLOAD_BYTES
+    );
     // Pre-join member state: the member itself, knowing only the group
     // stub, with a live pending attempt addressed to it.
     let joiner = secure_endpoint_test_state_at(&joiner_dir, joiner_agent).await?;
@@ -504,6 +531,7 @@ async fn build_bound_joiner_scenario(dir: &std::path::Path) -> Result<BoundJoine
             event: Box::new(event.clone()),
             chain: chain.clone(),
             head_attestation: Some(Box::new(head.clone())),
+            roster_certificates_b64: Vec::new(),
         })?
         .len()
             > crate::dm::MAX_PAYLOAD_BYTES

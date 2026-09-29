@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime
 import json
 import time
 import uuid
@@ -15,7 +16,11 @@ from typing import Any
 
 from e2e_tunnel import start_ssh_tunnel, stop_ssh_tunnel
 from e2e_vps_groups import load_tokens
-from e2e_vps_kv import Api, Evidence, ServiceCustody, enc, poll
+from e2e_vps_kv import (Api, Evidence, ServiceCustody, enc, poll, safe_error_outcome,
+                        safe_identifier, with_poll_timeout)
+from e2e_vps_private_kv import STATE_SYNC_COUNTERS
+
+U64_MAX = 2**64 - 1
 
 
 def removed_group_refusal(result: tuple[int, dict[str, Any]]) -> bool:
@@ -32,9 +37,92 @@ def revoked_listing_refusal(result: tuple[int, dict[str, Any]]) -> bool:
                 and body["candidates"][0].get("can_import") is False))
 
 
+def observer_value_matches(result: tuple[int, dict[str, Any]], expected: str) -> bool:
+    status, body = result
+    if not isinstance(body, dict):
+        return False
+    raw = body.get("value")
+    if status != 200 or not isinstance(raw, str):
+        return False
+    try:
+        return base64.b64decode(raw, validate=True) == expected.encode()
+    except ValueError:
+        return False
+
+
+def observer_response_class(result: tuple[int, dict[str, Any]] | None) -> str:
+    if result is None:
+        return "no_response"
+    status, body = result
+    if not isinstance(body, dict):
+        return "invalid_body"
+    if status != 200:
+        # Report only fixed error classes. API error text can contain sensitive
+        # request details, so never copy the raw response body into evidence.
+        error = body.get("error")
+        normalized = (error.strip().lower().replace("_", " ").replace("-", " ")
+                      if isinstance(error, str) else "")
+        if status == 404:
+            return {
+                "group not found": "group_not_found",
+                "store not found": "store_not_found",
+                "key not found": "key_not_found",
+            }.get(normalized, "http_error")
+        if status == 401:
+            return "authentication_denied"
+        if status == 403:
+            return "permission_denied"
+        return "http_error"
+    raw = body.get("value")
+    if not isinstance(raw, str):
+        return "missing_value"
+    try:
+        base64.b64decode(raw, validate=True)
+    except ValueError:
+        return "invalid_value"
+    return "value_present"
+
+
+
+def harness_failure(error: Exception) -> dict[str, Any]:
+    """Assertion row for an exception that aborted the scenario (see poll_timeout_text)."""
+    return with_poll_timeout({"label": f"harness {type(error).__name__}", "passed": False}, error)
+
 class LegacyScenario:
     def __init__(self, clients: dict[str, Api], evidence: Evidence, timeout: float) -> None:
         self.c, self.e, self.timeout = clients, evidence, timeout
+        # Paired `/diagnostics/state-sync` rows (#1021 shape). Kept apart from
+        # evidence.polls so poll-outcome consumers are unchanged.
+        self.state_sync: list[dict[str, Any]] = []
+
+    def capture_state_sync(self, phase: str, roles: dict[str, str], sid: str,
+                           app: str | None = None) -> None:
+        """Record one store's state-sync counters on each role's node, in pairs.
+
+        Only the documented integer counters, the HTTP status, an allow-listed
+        error class and the sample time are kept; never a body or error text.
+        A capture failure is recorded, never raised, so the original failure
+        (or the scenario) stands.
+        """
+        for role, node in roles.items():
+            row: dict[str, Any] = {
+                "phase": phase, "role": role, "node": node, "app": app,
+                "store_topic": safe_identifier(sid),
+                "sampled_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "http_status": None, "error_class": None, "topic_open": False, "counters": {}}
+            try:
+                status, body = self.c[node].request("GET", "/diagnostics/state-sync")
+                row["http_status"] = status if type(status) is int else None
+                stores = body.get("stores") if status == 200 and isinstance(body, dict) else None
+                counters = stores.get(sid) if isinstance(stores, dict) else None
+                if isinstance(counters, dict):
+                    row["topic_open"] = True
+                    row["counters"] = {name: counters[name] for name in STATE_SYNC_COUNTERS
+                                       if type(counters.get(name)) is int
+                                       and 0 <= counters[name] <= U64_MAX}
+            except Exception as error:
+                row["error_class"] = safe_error_outcome(error)["error_class"]
+            self.state_sync.append(row)
 
     def call(self, node: str, method: str, path: str, body: dict[str, Any] | None = None,
              accepted: tuple[int, ...] = (200, 201)) -> dict[str, Any]:
@@ -80,7 +168,14 @@ class LegacyScenario:
     def barrier_absence(self, observer: str, writer: str, sid: str, forbidden: str) -> None:
         barrier = f"barrier-{uuid.uuid4().hex}"
         self.e.check("valid writer barrier accepted", self.put(writer, sid, barrier, "barrier") == 200)
-        poll("valid barrier converges", self.timeout, lambda: self.read(observer, sid, barrier), lambda r: r == (200, "barrier"))
+        try:
+            poll("valid barrier converges", self.timeout, lambda: self.read(observer, sid, barrier), lambda r: r == (200, "barrier"),
+                 lambda facts, last: self.e.record_poll(
+                     facts, operation="valid_barrier_converges", node=observer, writer=writer,
+                     response_class=f"status_{last[0]}" if last else "no_response"))
+        except Exception:
+            self.capture_state_sync("barrier_failure", {"writer": writer, "observer": observer}, sid)
+            raise
         deadline = time.monotonic() + min(self.timeout, 3.0)
         observations = 0
         while True:
@@ -99,8 +194,12 @@ class LegacyScenario:
 
     def await_observer_snapshot(self, observer: str, sid: str, app: str) -> None:
         poll(f"{app} observer imported value", self.timeout,
-             lambda: self.read(observer, sid, "legacy-imported"),
-             lambda r: r == (200, f"legacy-{app}"))
+             lambda: self.c[observer].request("GET", f"/stores/{enc(sid)}/legacy-imported"),
+             lambda r: observer_value_matches(r, f"legacy-{app}"),
+             lambda facts, last: self.e.record_poll(
+                 facts, operation="legacy_observer_imported_value", node=observer, app=app,
+                 response_class=observer_response_class(last),
+                 value_matches_expected=last is not None and observer_value_matches(last, f"legacy-{app}")))
         poll(f"{app} observer tombstone", self.timeout,
              lambda: self.read(observer, sid, "legacy-removed"), lambda r: r[0] == 404)
 
@@ -193,9 +292,17 @@ class LegacyScenario:
             self.e.check(f"{app} active value imported", self.read(writer, destination_id, "legacy-imported") == (200, f"legacy-{app}"))
             self.e.check(f"{app} tombstone retained", self.read(writer, destination_id, "legacy-removed")[0] == 404)
             self.e.check(f"{app} destination content preserved", self.read(writer, destination_id, "destination-only") == (200, f"local-{app}"))
+            pair = {"writer": writer, "observer": observer}
+            # Baseline before the observer opens the store, so a failure
+            # snapshot can be read as deltas (Codex's #1021 gap).
+            self.capture_state_sync("baseline_before_observer_open", pair, destination_id, app)
             observer_store = self.call(observer, "POST", f"/groups/{enc(gid)}/stores", {"name": app})["id"]
             self.e.check(f"{app} observer deterministic id", observer_store == destination_id)
-            self.await_observer_snapshot(observer, observer_store, app)
+            try:
+                self.await_observer_snapshot(observer, observer_store, app)
+            except Exception:
+                self.capture_state_sync("observer_imported_value_failure", pair, destination_id, app)
+                raise
             records.append((app, destination_id, source_id, digest, key, receipt))
 
         restart_writer(gid)
@@ -228,6 +335,7 @@ def main() -> int:
     endpoints = {n: tokens[n][0] for n in a.nodes}
     if len(set(endpoints.values())) != 4: p.error("four distinct endpoints are required")
     tunnels, clients, evidence = {}, {}, Evidence(); custody = ServiceCustody(endpoints); success = False
+    scenario = LegacyScenario(clients, evidence, a.poll_timeout)
     def health(node: str) -> None:
         client = clients.get(node)
         if client is None: raise RuntimeError("health client unavailable")
@@ -250,21 +358,21 @@ def main() -> int:
             custody.stop(observer)
             custody.restart(writer)
             health(writer)
-        LegacyScenario(clients, evidence, a.poll_timeout).run(
+        scenario.run(
             owner, writer, observer, revoked,
             lambda: custody.stop(owner),
             restart_writer_without_provider,
         )
         success = True
     except Exception as error:
-        evidence.assertions.append({"label": f"harness {type(error).__name__}", "passed": False})
+        evidence.assertions.append(harness_failure(error))
     finally:
         for error in custody.restore(health): success = False; evidence.assertions.append({"label": error, "passed": False})
         for node, tunnel in list(tunnels.items()):
             try: stop_ssh_tunnel(tunnel)
             except Exception as error: success = False; evidence.assertions.append({"label": f"cleanup {node} {type(error).__name__}", "passed": False})
         try:
-            with open(a.report, "w", encoding="utf-8") as out: json.dump({"scenario": "legacy-normal-success", "assertions": evidence.assertions, "polls": evidence.polls}, out, indent=2)
+            with open(a.report, "w", encoding="utf-8") as out: json.dump({"scenario": "legacy-normal-success", "assertions": evidence.assertions, "polls": evidence.polls, "state_sync": scenario.state_sync}, out, indent=2)
         except Exception: success = False
     return 0 if success and all(x["passed"] for x in evidence.assertions) else 1
 

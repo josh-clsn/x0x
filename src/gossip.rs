@@ -9,6 +9,7 @@ pub mod participation;
 pub mod pubsub;
 pub(crate) mod relay_fanout;
 pub mod runtime;
+pub(crate) mod stale_targets;
 pub(crate) mod wire;
 
 pub use config::{GossipConfig, LeafBytePolicy};

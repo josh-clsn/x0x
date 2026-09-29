@@ -651,7 +651,16 @@ pub fn make_owner_checkpoint(params: OwnerCheckpointParams<'_>) -> Result<OwnerC
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MergeOutcome {
     Applied,
-    Rejected,
+    SubsumedCheckpoint,
+    Rejected(MergeRejection),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MergeRejection {
+    GroupSignedAuthority,
+    UnauthorizedWriter,
+    AnonymousWriter,
+    AmbiguousDelta,
 }
 
 /// A replicated key-value store using CRDTs with access control.
@@ -811,6 +820,43 @@ where
     T: serde::Deserialize<'de> + Default,
 {
     Ok(T::deserialize(deserializer).unwrap_or_default())
+}
+
+/// The exact serde shape of [`KvStore`] as persisted inside **v1** snapshot
+/// files (`X0XKVS1\0`), i.e. by every release up to and including v0.45.0.
+///
+/// FROZEN — never edit. Field order and serde attributes mirror
+/// `git show v0.45.0:src/kv/store.rs` byte-for-byte in encoding terms. A v1
+/// snapshot body is `bincode(store) || u64 seq_counter`, so the store is NOT
+/// at stream end: any field appended to [`KvStore`] after v0.45.0 (e.g.
+/// `last_history_endorser`) would consume the leading bytes of `seq_counter`
+/// and fail every v0.45.0 file. v1 files are therefore decoded through this
+/// frozen shape and converted with [`KvStore::from_v1_snapshot_shape`];
+/// fields added since v0.45.0 take their defaults.
+#[derive(Deserialize)]
+pub(crate) struct KvStoreV1SnapshotShape {
+    id: KvStoreId,
+    keys: OrSet<String>,
+    entries: HashMap<String, KvEntry>,
+    name: LwwRegister<String>,
+    #[serde(default = "default_policy")]
+    policy: AccessPolicy,
+    #[serde(default)]
+    owner: Option<AgentId>,
+    #[serde(default)]
+    allowed_writers: HashSet<AgentId>,
+    #[serde(default)]
+    version: u64,
+    #[serde(default, deserialize_with = "de_tolerant")]
+    latest_checkpoint: Option<OwnerCheckpoint>,
+    #[serde(default, deserialize_with = "de_tolerant")]
+    highest_checkpoint_seq: u64,
+    #[serde(default, deserialize_with = "de_tolerant")]
+    anchor_channel: AnchorChannel,
+    #[serde(default, deserialize_with = "de_tolerant")]
+    policy_version: u64,
+    #[serde(default, deserialize_with = "de_tolerant")]
+    ownership_conflict: Option<(AgentId, AgentId)>,
 }
 
 fn default_policy() -> AccessPolicy {
@@ -1182,6 +1228,46 @@ impl KvStore {
     /// version-derived floor, is what makes this bound exact.)
     pub(crate) fn restore_seq_counter(&self, floor: u64) {
         self.seq_counter.fetch_max(floor, Ordering::Relaxed);
+    }
+
+    /// Convert a store decoded through the frozen v1 (≤ v0.45.0) snapshot
+    /// shape into the current in-memory form. Every field added after
+    /// v0.45.0 takes its default; the struct literal is exhaustive so a new
+    /// `KvStore` field cannot be added without deciding its v1 default here.
+    pub(crate) fn from_v1_snapshot_shape(v1: KvStoreV1SnapshotShape) -> Self {
+        let KvStoreV1SnapshotShape {
+            id,
+            keys,
+            entries,
+            name,
+            policy,
+            owner,
+            allowed_writers,
+            version,
+            latest_checkpoint,
+            highest_checkpoint_seq,
+            anchor_channel,
+            policy_version,
+            ownership_conflict,
+        } = v1;
+        Self {
+            id,
+            keys,
+            entries,
+            name,
+            policy,
+            owner,
+            allowed_writers,
+            version,
+            latest_checkpoint,
+            highest_checkpoint_seq,
+            anchor_channel,
+            policy_version,
+            ownership_conflict,
+            last_history_endorser: None,
+            seq_counter: default_seq_counter(),
+            secure: None,
+        }
     }
 
     /// Get the current version.
@@ -1769,7 +1855,8 @@ impl KvStore {
             return Ok(());
         }
         let seq = self.reserve_sequences(1)?;
-        self.put_with_reserved_sequence(key, value, content_type, peer_id, seq)
+        self.put_with_reserved_sequence(key, value, content_type, peer_id, seq)?;
+        Ok(())
     }
 
     /// Validate deterministic content constraints before reserving a local
@@ -1804,7 +1891,7 @@ impl KvStore {
         content_type: String,
         peer_id: PeerId,
         seq: u64,
-    ) -> Result<()> {
+    ) -> Result<Vec<String>> {
         if value.len() > crate::kv::entry::MAX_INLINE_SIZE {
             return Err(KvError::ValueTooLarge {
                 size: value.len(),
@@ -1816,7 +1903,7 @@ impl KvStore {
         if matches!(self.policy, AccessPolicy::AppendOnly) {
             if let Some(existing) = self.get(&key) {
                 if existing.value == value && existing.content_type == content_type {
-                    return Ok(()); // idempotent re-put of identical content
+                    return Ok(Vec::new()); // idempotent re-put of identical content
                 }
                 return Err(KvError::ImmutableKey(key));
             }
@@ -1847,12 +1934,13 @@ impl KvStore {
         // just the write. `authorize_put` gates only the incoming key, so
         // without this the local replica would keep the writer's over-cap
         // lex-high keys that every remote evicts at step 4.
-        if let Some(writer) = self_keyed_writer {
-            self.enforce_self_keyed_live_set(&writer);
-        }
+        let evicted = match self_keyed_writer {
+            Some(writer) => self.enforce_self_keyed_live_set(&writer),
+            None => Vec::new(),
+        };
 
         self.version += 1;
-        Ok(())
+        Ok(evicted)
     }
 
     /// Get an entry by key.
@@ -2010,9 +2098,13 @@ impl KvStore {
     /// `admitted`. Both the remote merge (step 4 of
     /// [`merge_delta_self_keyed`](Self::merge_delta_self_keyed)) and the
     /// local put path call this, so neither side can hold keys the other
-    /// drops.
-    fn evict_outside_admitted(&mut self, writer: &AgentId, admitted: &HashSet<&str>) {
-        let stale: Vec<String> = self
+    /// drops. Returns the evicted keys, sorted.
+    fn evict_outside_admitted(
+        &mut self,
+        writer: &AgentId,
+        admitted: &HashSet<&str>,
+    ) -> Vec<String> {
+        let mut stale: Vec<String> = self
             .keys
             .elements()
             .into_iter()
@@ -2023,6 +2115,8 @@ impl KvStore {
             let _ = self.keys.remove(key);
             self.entries.remove(key);
         }
+        stale.sort();
+        stale
     }
 
     /// Enforce the `SelfKeyed` live-set cap after a LOCAL put of a key bound
@@ -2030,10 +2124,12 @@ impl KvStore {
     /// recomputed over the post-put live set. [`authorize_put`](Self::authorize_put)
     /// only gates the incoming key; without this the local replica could
     /// hold 65 keys while every remote holds the admitted 64.
-    fn enforce_self_keyed_live_set(&mut self, writer: &AgentId) {
+    ///
+    /// Returns the evicted keys, sorted.
+    fn enforce_self_keyed_live_set(&mut self, writer: &AgentId) -> Vec<String> {
         let candidates = self.self_keyed_candidates(writer, &HashMap::new());
         let admitted = Self::self_keyed_admitted(&candidates);
-        self.evict_outside_admitted(writer, &admitted);
+        self.evict_outside_admitted(writer, &admitted)
     }
 
     /// `AccessPolicy::SelfKeyed` merge path (issue #340).
@@ -2133,7 +2229,13 @@ impl KvStore {
         //    delivery order (I7). Shared with the local put path
         //    (`enforce_self_keyed_live_set`) so neither side can hold keys
         //    the other drops.
-        self.evict_outside_admitted(w, &admitted);
+        let evicted = self.evict_outside_admitted(w, &admitted);
+        if !evicted.is_empty() {
+            tracing::debug!(
+                evicted = evicted.len(),
+                "self_keyed merge evicted writer keys outside the lowest-N admitted set"
+            );
+        }
         // The name is LWW metadata, not directory content — merge it like
         // every other policy so replicas converge on the creator's name.
         if let Some(name_register) = &delta.name_update {
@@ -2225,7 +2327,7 @@ impl KvStore {
                 "rejected group-signed delta carrying non-content authority for store {}",
                 self.id
             );
-            return Ok(MergeOutcome::Rejected);
+            return Ok(MergeOutcome::Rejected(MergeRejection::GroupSignedAuthority));
         }
         // Authoritative full-snapshot checkpoint adoption (cold-recovery path):
         // if the checkpoint's content root matches the relayed entry set, adopt
@@ -2254,7 +2356,7 @@ impl KvStore {
                     self.highest_checkpoint_seq,
                     self.id
                 );
-                return Ok(MergeOutcome::Rejected);
+                return Ok(MergeOutcome::SubsumedCheckpoint);
             }
         }
         // Access control: reject unauthorized writes
@@ -2265,7 +2367,7 @@ impl KvStore {
                     hex::encode(writer_id.as_bytes()),
                     self.id
                 );
-                return Ok(MergeOutcome::Rejected); // Silent rejection — don't propagate errors for spam
+                return Ok(MergeOutcome::Rejected(MergeRejection::UnauthorizedWriter));
             }
         } else {
             // No writer identity applies nothing under ANY policy: the
@@ -2275,7 +2377,7 @@ impl KvStore {
             // sync is wired — it is no longer an anonymous-merge escape
             // hatch.
             tracing::warn!("rejected anonymous delta for store {}", self.id);
-            return Ok(MergeOutcome::Rejected);
+            return Ok(MergeOutcome::Rejected(MergeRejection::AnonymousWriter));
         }
 
         // Canonical-map gate, ALL policies: a delta carrying the same key in
@@ -2292,7 +2394,7 @@ impl KvStore {
                     "rejected ambiguous delta for store {}: key {key:?} appears in both added and updated",
                     self.id
                 );
-                return Ok(MergeOutcome::Rejected);
+                return Ok(MergeOutcome::Rejected(MergeRejection::AmbiguousDelta));
             }
         }
 
@@ -3040,6 +3142,12 @@ impl KvStore {
     #[must_use]
     pub fn last_history_endorser(&self) -> Option<&AgentId> {
         self.last_history_endorser.as_ref()
+    }
+
+    /// Test seam: set the persisted endorser directly (snapshot-format tests).
+    #[cfg(test)]
+    pub(crate) fn set_last_history_endorser_for_test(&mut self, endorser: Option<AgentId>) {
+        self.last_history_endorser = endorser;
     }
 
     /// Generate a delta containing all state (for initial sync).
@@ -6899,6 +7007,58 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_subsumption_is_distinct_from_admission_rejection() {
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner = kp.agent_id();
+        let topic = "store/checkpoint-subsumption-outcome";
+        let id = KvStoreId::for_topic_owner(topic, &owner);
+        let stale = forged_snapshot(id, owner, &kp, topic, &[("deleted", b"old")], 1);
+        let current = forged_snapshot(id, owner, &kp, topic, &[("live", b"new")], 2);
+        let mut replica =
+            KvStore::new_replica(id, String::new(), Some(owner), AnchorChannel::RestParam);
+        assert_eq!(
+            replica
+                .merge_delta_with_outcome(&current, peer(9), Some(&agent(9)))
+                .expect("current checkpoint"),
+            MergeOutcome::Applied
+        );
+        let version = replica.current_version();
+        assert_eq!(
+            replica
+                .merge_delta_with_outcome(&stale, peer(1), Some(&owner))
+                .expect("stale checkpoint"),
+            MergeOutcome::SubsumedCheckpoint
+        );
+        assert_eq!(replica.current_version(), version);
+        assert!(
+            replica.get("deleted").is_none(),
+            "stale echo cannot resurrect a key"
+        );
+        assert!(replica.get("live").is_some());
+
+        let unauthorized = KvStoreDelta::new(0);
+        assert_eq!(
+            replica
+                .merge_delta_with_outcome(&unauthorized, peer(9), Some(&agent(9)))
+                .expect("unauthorized merge"),
+            MergeOutcome::Rejected(MergeRejection::UnauthorizedWriter)
+        );
+        let mut ambiguous = KvStoreDelta::new(0);
+        let entry = KvEntry::new("ambiguous".into(), b"value".to_vec(), "text/plain".into());
+        ambiguous
+            .added
+            .insert("ambiguous".into(), (entry.clone(), (peer(1), 1)));
+        ambiguous.updated.insert("ambiguous".into(), entry);
+        assert_eq!(
+            replica
+                .merge_delta_with_outcome(&ambiguous, peer(1), Some(&owner))
+                .expect("ambiguous merge"),
+            MergeOutcome::Rejected(MergeRejection::AmbiguousDelta)
+        );
+        assert!(replica.get("ambiguous").is_none());
+    }
+
+    #[test]
     fn rejected_truncated_checkpoint_does_not_poison_later_legit_flow() {
         // WHY: interaction with the PR #230 stale-delta gate. A rejected
         // forged checkpoint must not advance the high-water mark (else it
@@ -7532,6 +7692,94 @@ mod tests {
             local.get(high.last().expect("64 high keys")).is_none(),
             "the lex-highest key is evicted locally, not only on remotes"
         );
+    }
+
+    /// The store half of `KvStoreHandle::put_with_outcome`: reserve a
+    /// sequence and put. Returns the evicted keys it reports.
+    fn put_reporting_evictions(store: &mut KvStore, key: String) -> Vec<String> {
+        let seq = store.reserve_sequences(1).expect("reserve");
+        store
+            .put_with_reserved_sequence(key, b"v".to_vec(), "text/plain".to_string(), peer(1), seq)
+            .expect("put")
+    }
+
+    /// Fill `w`'s SelfKeyed quota with keys `<w>/<i:03>` for `range`,
+    /// going through `authorize_put` + put like the daemon's put path.
+    fn fill_self_keyed(store: &mut KvStore, w: &AgentId, range: std::ops::Range<usize>) {
+        for i in range {
+            let key = hex_key(w, Some(&format!("{i:03}")));
+            store.authorize_put(w, &key, b"v").expect("within quota");
+            let evicted = put_reporting_evictions(store, key);
+            assert!(evicted.is_empty(), "filling up to the cap evicts nothing");
+        }
+    }
+
+    #[test]
+    fn selfkeyed_over_quota_put_reports_exactly_the_evicted_key() {
+        // WHY (#849): ADR-0047 lowest-N admission is kept, but the 65th put
+        // used to evict the writer's lex-highest key with no signal. The put
+        // must name exactly the key it evicted, and nothing else may go.
+        let w = agent(7);
+        let mut store = self_keyed_store();
+        fill_self_keyed(&mut store, &w, 1..MAX_SELFKEYED_KEYS_PER_AGENT + 1);
+        let low = hex_key(&w, Some("000"));
+        store
+            .authorize_put(&w, &low, b"v")
+            .expect("a lex-low key is admitted");
+        let evicted = put_reporting_evictions(&mut store, low.clone());
+        let highest = hex_key(&w, Some(&format!("{MAX_SELFKEYED_KEYS_PER_AGENT:03}")));
+        assert_eq!(
+            evicted,
+            vec![highest.clone()],
+            "exactly the lex-highest key"
+        );
+        assert!(store.get(&highest).is_none(), "the reported key is gone");
+        assert!(store.get(&low).is_some(), "the new key is stored");
+        for i in 1..MAX_SELFKEYED_KEYS_PER_AGENT {
+            assert!(
+                store.get(&hex_key(&w, Some(&format!("{i:03}")))).is_some(),
+                "unreported keys must survive: {i:03}"
+            );
+        }
+        assert_eq!(store.active_keys().len(), MAX_SELFKEYED_KEYS_PER_AGENT);
+    }
+
+    #[test]
+    fn selfkeyed_under_quota_put_reports_no_eviction() {
+        // WHY (#849): a writer must be able to tell a harmless put from one
+        // that cost it a key, so an under-quota put reports an empty list.
+        let w = agent(7);
+        let mut store = self_keyed_store();
+        fill_self_keyed(&mut store, &w, 0..MAX_SELFKEYED_KEYS_PER_AGENT - 1);
+        let key = hex_key(&w, Some("999"));
+        store
+            .authorize_put(&w, &key, b"v")
+            .expect("the 64th key fits");
+        let evicted = put_reporting_evictions(&mut store, key);
+        assert!(evicted.is_empty(), "no eviction under quota: {evicted:?}");
+        assert_eq!(store.active_keys().len(), MAX_SELFKEYED_KEYS_PER_AGENT);
+    }
+
+    #[test]
+    fn selfkeyed_new_highest_key_is_not_admitted_and_evicts_nothing() {
+        // WHY (#849 + ADR-0047): when the new key itself sorts last, the
+        // lowest-N rule refuses it rather than evicting a live key. The
+        // refusal must say the key was not admitted, and every existing
+        // key must survive.
+        let w = agent(7);
+        let mut store = self_keyed_store();
+        fill_self_keyed(&mut store, &w, 0..MAX_SELFKEYED_KEYS_PER_AGENT);
+        let before: HashSet<String> = store.active_keys().into_iter().cloned().collect();
+        let err = store
+            .authorize_put(&w, &hex_key(&w, Some("999")), b"v")
+            .expect_err("a new lex-highest key over quota is refused");
+        assert!(matches!(err, KvError::AgentQuotaExceeded { .. }), "{err:?}");
+        assert!(
+            err.to_string().contains("NOT admitted"),
+            "the refusal must state the key was not admitted: {err}"
+        );
+        let after: HashSet<String> = store.active_keys().into_iter().cloned().collect();
+        assert_eq!(after, before, "a refused put evicts nothing");
     }
 
     #[test]

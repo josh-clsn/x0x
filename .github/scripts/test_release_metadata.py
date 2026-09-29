@@ -32,6 +32,35 @@ EXPECTED_PROMOTED_JOB_NEEDS = {
 }
 
 
+# Jobs that sign, create, or publish a release, or read signing/publish
+# secrets. Each must run in the tag-restricted `release` environment.
+EXPECTED_RELEASE_ENVIRONMENT_JOBS = ['build-release', 'sign-release', 'create-release']
+EXPECTED_PROMOTED_ENVIRONMENT_JOBS = ['publish-clawhub', 'publish-crates']
+
+
+def parse_workflow_environments(text):
+    """Map each job id to its job-level `environment:` value (or None)."""
+    environments = {}
+    current = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if line.startswith('  ') and not line.startswith('   ') \
+                and stripped.endswith(':'):
+            current = stripped[:-1]
+            environments[current] = None
+        elif current and line.startswith('    environment:') \
+                and not line.startswith('     '):
+            environments[current] = stripped[len('environment:'):].strip()
+    return environments
+
+
+def environment_violations(text, expected, workflow_name):
+    environments = parse_workflow_environments(text)
+    return [f'{job} in {workflow_name} must declare environment: release '
+            f'(declared: {environments.get(job)!r})'
+            for job in expected if environments.get(job) != 'release']
+
+
 def parse_workflow_needs(text):
     """Map each release.yml job id to its exact `needs` job ids.
 
@@ -268,29 +297,56 @@ class ReleaseCardTests(unittest.TestCase):
                 self.assertIn('Release must target a valid release tag ref',
                               result.stderr)
 
-    def test_strict_semver_prerelease_build_shapes_pass_ref_gate(self):
-        # SemVer 2.0.0 (semver.org): prerelease identifiers split by '.',
-        # each numeric-without-leading-zero or alphanumeric; build
-        # identifiers may be numeric WITH leading zeros. Every legal
-        # shape must clear the ref gate (and only then fail here on the
-        # metadata mismatch against this fixture's 0.45.0 files).
-        refs = [
-            'refs/tags/v1.2.3-rc.1',
-            'refs/tags/v1.2.3-0.3.7',
-            'refs/tags/v1.2.3-x.7.z.92',
-            'refs/tags/v1.2.3-0a.1-b',
-            'refs/tags/v1.2.3+build.001',
-            'refs/tags/v1.2.3+001',
-            'refs/tags/v1.2.3-rc.1+build.5',
+    def set_fixture_version(self, version):
+        # Rewrite the fixture's three version sources (from the pristine repo
+        # copies) so metadata agrees with `version`; a refusal can then only
+        # come from the tag gate, not from a metadata mismatch.
+        for name, old in (('Cargo.toml', f'version = "{self.version}"'),
+                          ('SKILL.md', f'version: {self.version}'),
+                          (str(CARD), f'"version": "{self.version}"')):
+            text = (ROOT / name).read_text()
+            self.assertIn(old, text)
+            (self.root / name).write_text(
+                text.replace(old, old.replace(self.version, version), 1))
+
+    def test_prerelease_and_build_tags_are_refused_even_when_metadata_matches(self):
+        # WHY (charter N3): a release enters the daemon auto-update feed and
+        # is published to crates.io and ClawHub. Prerelease/build tags used
+        # to clear the ref gate, so one would have shipped as soon as
+        # Cargo.toml/SKILL.md/agent.json carried the same suffix. Only exact
+        # vMAJOR.MINOR.PATCH may release: refused before any rule runs, with
+        # or without --ref, even when every version file agrees with the tag.
+        tags = [
+            'v0.46.0-rc.1',
+            'v0.46.0-alpha',
+            'v0.46.0+build',
+            'v0.46.0-rc.1+build.5',
+            'v1.2.3-0.3.7',
+            'v1.2.3-x.7.z.92',
+            'v1.2.3+001',
         ]
-        for ref in refs:
-            with self.subTest(ref=ref):
-                result = self.run_validator(ref[len('refs/tags/'):], ref=ref)
-                self.assertEqual(result.returncode, 1,
+        for tag in tags:
+            self.set_fixture_version(tag[1:])
+            for ref in (f'refs/tags/{tag}', None):
+                with self.subTest(tag=tag, ref=ref):
+                    result = self.run_validator(tag, ref=ref)
+                    self.assertEqual(result.returncode, 1,
+                                     result.stdout + result.stderr)
+                    self.assertIn(
+                        'Release must target a valid release tag ref'
+                        if ref else
+                        'Release tag must be exactly vMAJOR.MINOR.PATCH',
+                        result.stderr)
+                    self.assertNotIn('Running version_sync', result.stdout)
+
+        # Control: the same fixture rewrite to a plain version releases, so
+        # the refusals above are the tag gate and not broken metadata.
+        self.set_fixture_version('0.46.0')
+        for ref in ('refs/tags/v0.46.0', None):
+            with self.subTest(control=ref):
+                result = self.run_validator('v0.46.0', ref=ref)
+                self.assertEqual(result.returncode, 0,
                                  result.stdout + result.stderr)
-                self.assertNotIn('Release must target a valid release tag ref',
-                                 result.stderr)
-                self.assertIn('Release tag version:', result.stdout)
 
     def test_strict_semver_violations_are_refused(self):
         # The old pattern accepted these: `[0-9A-Za-z.-]+` allowed empty
@@ -324,17 +380,19 @@ class ReleaseCardTests(unittest.TestCase):
 
     def test_workflow_validate_step_enforces_strict_semver_shapes(self):
         # The Release workflow's first job passes the real GITHUB_REF to
-        # the validator: legal prerelease/build metadata clears the ref
-        # gate (failing only on the metadata mismatch), illegal shapes
+        # the validator: a plain vX.Y.Z clears the ref gate (failing only on
+        # the metadata mismatch); prerelease/build tags and illegal shapes
         # are refused with the ref-gate message before any side effect.
-        legal = self.run_release_validate_step(
-            'refs/tags/v1.2.3-rc.1+build.001', 'v1.2.3-rc.1+build.001')
+        legal = self.run_release_validate_step('refs/tags/v1.2.3', 'v1.2.3')
         self.assertEqual(legal.returncode, 1, legal.stdout + legal.stderr)
         self.assertNotIn('Release must target a valid release tag ref',
                          legal.stderr)
         self.assertIn('does not match release tag', legal.stdout)
 
-        for ref in ['refs/tags/v1.2.3-01', 'refs/tags/v1.2.3-rc..1',
+        for ref in ['refs/tags/v0.46.0-rc.1', 'refs/tags/v0.46.0-alpha',
+                    'refs/tags/v0.46.0+build',
+                    'refs/tags/v1.2.3-rc.1+build.001',
+                    'refs/tags/v1.2.3-01', 'refs/tags/v1.2.3-rc..1',
                     'refs/tags/v1.2.3+build.', 'refs/tags/v1.2.3\n',
                     'refs/tags/v1.2.3-rc.1+build.001 extra']:
             with self.subTest(ref=ref.rstrip('\n')):
@@ -355,11 +413,11 @@ class ReleaseCardTests(unittest.TestCase):
                       result.stderr)
 
     def test_valid_ref_shape_but_mismatched_metadata_fails(self):
-        # Prerelease-shaped tags are valid refs; they must still fail on the
-        # metadata-mismatch rules rather than the ref-form gate.
-        result = self.run_validator('v999.0.0-rc.1', ref='refs/tags/v999.0.0-rc.1')
+        # A well-formed release tag must still fail on the metadata-mismatch
+        # rules rather than the ref-form gate.
+        result = self.run_validator('v999.0.0', ref='refs/tags/v999.0.0')
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn('does not match release tag v999.0.0-rc.1', result.stdout)
+        self.assertIn('does not match release tag v999.0.0', result.stdout)
         self.assertNotIn('Release must target', result.stderr)
 
     def test_ref_argument_is_rejected_outside_release_tag_mode(self):
@@ -433,7 +491,10 @@ class ReleaseCardTests(unittest.TestCase):
         for overrides in (
                 {'RELEASE_DRAFT': 'true'},
                 {'RELEASE_PRERELEASE': 'true'},
-                {'RELEASE_TAG': 'v999.0.0'}):
+                {'RELEASE_TAG': 'v999.0.0'},
+                # A prerelease tag published without GitHub's prerelease
+                # flag must still be refused by the tag gate.
+                {'RELEASE_TAG': f'v{self.version}-rc.1'}):
             with self.subTest(overrides=overrides):
                 refused = subprocess.run(
                     ['bash', '-c', promoted_gate], cwd=self.root,
@@ -553,6 +614,106 @@ class ReleaseCardTests(unittest.TestCase):
             with self.subTest(missing=missing):
                 _, failed = run_case(missing)
                 self.assertNotEqual(failed.returncode, 0)
+
+
+class ReleaseEnvironmentAndLockTests(unittest.TestCase):
+    LOCK_GUARD_STEP = 'Require committed, current Cargo.lock'
+
+    def test_signing_and_publish_jobs_run_in_release_environment(self):
+        # WHY (charter N6): signing keys and publish tokens must only be
+        # reachable from the tag-restricted `release` environment, so a
+        # rewired job or a branch run cannot sign or publish.
+        release = (ROOT / WORKFLOW).read_text()
+        promoted = (ROOT / PROMOTED_WORKFLOW).read_text()
+        for violation in (
+                environment_violations(release, EXPECTED_RELEASE_ENVIRONMENT_JOBS,
+                                       'release.yml')
+                + environment_violations(promoted, EXPECTED_PROMOTED_ENVIRONMENT_JOBS,
+                                         'publish-promoted-release.yml')):
+            with self.subTest(violation=violation):
+                self.fail(violation)
+
+        # Negative control: dropping one declaration must be flagged.
+        tampered = release.replace('    environment: release\n', '', 1)
+        self.assertTrue(environment_violations(
+            tampered, EXPECTED_RELEASE_ENVIRONMENT_JOBS, 'release.yml'))
+
+        # The environment admits only v* tag refs. release.yml runs on tag
+        # pushes (a dispatch is refused off-tag by its first job) and the
+        # promotion workflow only on `release: published`, whose GITHUB_REF
+        # is refs/tags/<tag_name>. A branch/workflow_run trigger here would
+        # be rejected by the environment policy.
+        self.assertIn("  push:\n    tags:\n      - 'v*'\n", release)
+        self.assertNotIn('workflow_run', release)
+        self.assertIn('on:\n  release:\n    types: [published]\n', promoted)
+        self.assertNotIn('workflow_run', promoted)
+
+    def test_release_never_regenerates_the_lock(self):
+        # WHY (charter D04/D05): the release must ship the Cargo.lock CI
+        # tested on the tagged commit. A `cargo generate-lockfile` in the
+        # release re-resolved against the live registry at tag time (and
+        # dirtied the tracked lock, which custody then refuses).
+        release = (ROOT / WORKFLOW).read_text()
+        for forbidden in ('generate-lockfile', 'cargo update'):
+            self.assertFalse(forbidden in release,
+                             f'release.yml must not run `{forbidden}`')
+        job = release[release.index('\n  resolve-release-lock:\n'):
+                      release.index('\n  build-release:\n')]
+        self.assertLess(job.index(f'- name: {self.LOCK_GUARD_STEP}'),
+                        job.index('release_artifact_custody.py resolve'))
+
+    @unittest.skipUnless(shutil.which('cargo') and shutil.which('git'),
+                         'cargo and git are required to exercise the lock guard')
+    def test_lock_guard_refuses_missing_untracked_and_stale_locks(self):
+        spec = importlib.util.spec_from_file_location('validator_guard', ROOT / VALIDATOR)
+        validator = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(validator)
+        guard = validator.extract_step_run_block(str(ROOT / WORKFLOW), self.LOCK_GUARD_STEP)
+
+        def fixture(temp):
+            repo = Path(temp)
+            for crate in ('app', 'dep'):
+                (repo / crate / 'src').mkdir(parents=True)
+                (repo / crate / 'src' / 'lib.rs').write_text('')
+            (repo / 'dep' / 'Cargo.toml').write_text(
+                '[package]\nname = "dep"\nversion = "0.1.0"\nedition = "2021"\n')
+            (repo / 'app' / 'Cargo.toml').write_text(
+                '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n')
+            (repo / 'Cargo.toml').write_text('[workspace]\nmembers = ["app"]\n'
+                                             'resolver = "2"\n')
+            for command in (['git', 'init', '-q'],
+                            ['cargo', 'generate-lockfile', '--offline']):
+                subprocess.run(command, cwd=repo, check=True, capture_output=True)
+            return repo
+
+        def run(repo):
+            return subprocess.run(['bash', '-c', guard], cwd=repo, capture_output=True,
+                                  text=True, env=dict(os.environ, GITHUB_SHA='fixture'))
+
+        def track(repo):
+            subprocess.run(['git', 'add', '-A'], cwd=repo, check=True)
+
+        with tempfile.TemporaryDirectory() as temp:
+            repo = fixture(temp)
+            untracked = run(repo)
+            self.assertNotEqual(untracked.returncode, 0)
+            self.assertIn('Cargo.lock is not committed', untracked.stdout)
+
+            track(repo)
+            self.assertEqual(run(repo).returncode, 0, run(repo).stdout)
+
+            # Stale: Cargo.toml gains a dependency the committed lock lacks.
+            manifest = repo / 'app' / 'Cargo.toml'
+            manifest.write_text(manifest.read_text()
+                                + '\n[dependencies]\ndep = { path = "../dep" }\n')
+            stale = run(repo)
+            self.assertNotEqual(stale.returncode, 0)
+            self.assertIn('Committed Cargo.lock is stale', stale.stdout)
+
+            (repo / 'Cargo.lock').unlink()
+            missing = run(repo)
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertIn('Cargo.lock is not committed', missing.stdout)
 
 
 if __name__ == '__main__':

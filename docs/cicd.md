@@ -30,9 +30,29 @@ commit.
 - `ci.yml` is not triggered by the tag push itself (it gates on branch
   `main`), so the observed run is the one from when the commit was merged.
 
-To exercise it locally, push a scratch tag on a commit with intentionally-red
-CI (e.g. a draft/prerelease) and confirm `require-green-ci` fails before any
-artifact is built; delete the tag/release afterward.
+To exercise it locally, push a scratch `vX.Y.Z` tag on a commit with
+intentionally-red CI and confirm `require-green-ci` fails before any artifact
+is built; delete the tag/release afterward. (A prerelease-shaped tag such as
+`v0.46.0-rc.1` never reaches this gate; see below.)
+
+## Release inputs (v0.46.0 gate row 6)
+
+- **Tags**: only an exact `vMAJOR.MINOR.PATCH` tag can release.
+  `validate_release_metadata.py --mode release_tag` refuses prerelease
+  (`-rc.1`, `-alpha`) and build-metadata (`+build`) tags in the first job,
+  even when Cargo.toml, SKILL.md, and agent.json carry the same suffix.
+- **Dependency graph**: `Cargo.lock` is tracked. `resolve-release-lock` fails
+  if the lock is missing, untracked, or stale (`cargo metadata --locked`), and
+  otherwise captures the committed lock. The release never runs
+  `cargo generate-lockfile`, so it ships the graph CI tested on the tagged
+  commit.
+- **Environment**: `build-release`, `sign-release`, and `create-release` in
+  `release.yml`, and `publish-clawhub` and `publish-crates` in
+  `publish-promoted-release.yml`, run in the `release` environment, which
+  admits only `v*` tag refs. The promotion workflow runs on
+  `release: published`, whose ref is `refs/tags/<tag>`.
+- `.github/scripts/test_release_metadata.py` asserts all three statically,
+  and runs the lock guard against a fixture repository.
 
 ## Convergence Release Gate (manual, pre-tag)
 
