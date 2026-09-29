@@ -816,9 +816,9 @@ curl -X POST "http://$API/upgrade/apply" -H "Authorization: Bearer $TOKEN"   # U
 x0x upgrade --check                 # standalone CLI check only (no daemon involved)
 ```
 
-> ⚠️ **v0.46: do not use `x0x upgrade --apply` on a machine with a running daemon.** The standalone updater swaps the binary under the live daemon and relaunches it with self-update off (N2, fix in progress). Upgrade a running daemon with `POST /upgrade/apply` (above). `x0x upgrade --apply` is only for a machine where no daemon is running.
+`x0x upgrade`, `x0x upgrade --apply`, and `x0x upgrade --force` refuse installation and direct callers to authenticated `POST /upgrade/apply`. This also applies when no daemon is running: the CLI cannot prove that no other instance is using the installed binary. `x0x upgrade --check` remains a standalone, read-only GitHub release check; `--check --force` fetches the current manifest regardless of version.
 
-Two separate updaters: the `x0x upgrade` CLI is dispatched before any daemon client exists and updates the CLI/binary on disk (see the warning above); the daemon REST surface updates the daemon and is governed by the daemon config. `[update] enabled = false` disables the daemon side (`GET /upgrade` → `{"update_available":false,"reason":"updates disabled"}`). `--skip-update-check` disables MORE than the check for that one daemon process — it also turns off the process's self-update install/restart paths, including `POST /upgrade/apply` (which then returns `"self-update disabled for this process"`); it composes with `[update] enabled` (both must allow an apply). Neither flag governs the standalone CLI updater. Verified-release manifests only. See [docs/upgrade-system.md](https://github.com/saorsa-labs/x0x/blob/main/docs/upgrade-system.md).
+The daemon REST surface owns installation and restart and is governed by the daemon config. `[update] enabled = false` disables the daemon side (`GET /upgrade` → `{"update_available":false,"reason":"updates disabled"}`). `--skip-update-check` also disables the process's self-update install/restart paths, including `POST /upgrade/apply` (which returns `"self-update disabled for this process"`); both it and `[update] enabled` must allow an apply. Verified-release manifests only. See [docs/upgrade-system.md](https://github.com/saorsa-labs/x0x/blob/main/docs/upgrade-system.md).
 
 > ℹ️ **Downgrade safety (#451, fixed in v0.41.0):** Home state now lives in a sidecar; a v0.40.x binary reads the legacy store and starts cleanly, so a failed upgrade that respawns the previous binary no longer crash-loops. Still back up the data dir before upgrading an owned install, and expect Home features to be absent while downgraded.
 
@@ -997,7 +997,7 @@ Status: **GA** = working as specified · **caveat #N** = open issue, see §7.4 �
 | Voice 1:1 (datagram + fallback) | library (`voice` feature) | `--example voice_call` | GA (lib) · 2nd concurrent call refused (typed `SessionConflict` via `start_lane`; `IoError`-wrapped via trait `start()`) |
 | Diagnostics (11 areas) | `/diagnostics/*` | `x0x diagnostics <area>` | GA |
 | Durable history | `/history*` | `x0x history scopes/list/message/search/stats/purge` | GA (local-only; Tier-2 Home backfill designed, not shipped — §4.10, §5.1) |
-| Self-update | daemon: `/upgrade(+/apply)` · CLI: standalone | `x0x upgrade --check/--apply` | GA |
+| Self-update | daemon: `/upgrade(+/apply)` · CLI: read-only check | `x0x upgrade --check`; authenticated `POST /upgrade/apply` to install | GA |
 
 ---
 
