@@ -879,6 +879,36 @@ mod tests {
         ));
     }
 
+    /// Inert regression: reserving delivery must fail immediately when no
+    /// forwarder exists, rather than queueing a handshake in an undrained sink.
+    #[test]
+    fn forward_without_acceptor_rejects_delivery() {
+        let accept = std::sync::Arc::new(StreamAccept::new(8));
+        for protocol in [StreamProtocol::ForwardV1, StreamProtocol::ForwardV2] {
+            let sender = accept.sender_for(protocol);
+            assert!(
+                matches!(
+                    sender.try_reserve(),
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(()))
+                ),
+                "{protocol:?} must reject delivery instead of retaining a waiting handshake"
+            );
+        }
+    }
+
+    #[test]
+    fn forward_acceptor_drop_rejects_delivery() {
+        let accept = std::sync::Arc::new(StreamAccept::new(8));
+        for protocol in [StreamProtocol::ForwardV1, StreamProtocol::ForwardV2] {
+            let consumer = accept.register(protocol).expect("register forwarder");
+            let sender = accept.sender_for(protocol);
+            assert!(sender.same_channel(&consumer.tx));
+            assert!(sender.try_reserve().is_ok());
+            drop(consumer);
+            assert!(accept.sender_for(protocol).is_closed());
+        }
+    }
+
     // Acceptor registry: one acceptor per protocol; drop deregisters; a stale
     // drop must not clobber a re-registered successor; routing falls back to
     // the default channel for unregistered protocols; channels are bounded.
@@ -906,7 +936,7 @@ mod tests {
             .sender_for(StreamProtocol::SocksV1)
             .same_channel(&first.tx));
         assert!(accept
-            .sender_for(StreamProtocol::ForwardV1)
+            .sender_for(StreamProtocol::SyncV1)
             .same_channel(accept.sender()));
 
         // Drop deregisters: re-registration succeeds and routing follows.

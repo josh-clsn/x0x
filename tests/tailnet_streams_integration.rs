@@ -179,7 +179,7 @@ async fn peer_stream_echoes_1mib_both_directions() {
     let alice_for_open = Arc::clone(&alice);
     let open_task = tokio::spawn(async move {
         alice_for_open
-            .open_peer_stream(&bob_agent_id, StreamProtocol::ForwardV1)
+            .open_peer_stream(&bob_agent_id, StreamProtocol::SocksV1)
             .await
             .expect("open stream")
     });
@@ -189,9 +189,9 @@ async fn peer_stream_echoes_1mib_both_directions() {
     let mut alice_stream = open_task.await.expect("open task");
 
     assert_eq!(alice_stream.peer(), bob.machine_id());
-    assert_eq!(alice_stream.protocol(), StreamProtocol::ForwardV1);
+    assert_eq!(alice_stream.protocol(), StreamProtocol::SocksV1);
     assert_eq!(bob_stream.peer(), alice.machine_id());
-    assert_eq!(bob_stream.protocol(), StreamProtocol::ForwardV1);
+    assert_eq!(bob_stream.protocol(), StreamProtocol::SocksV1);
 
     // 1 MiB each direction. QUIC flow control means the writer blocks until the
     // reader drains, so each direction is a concurrent (write || read) pair.
@@ -289,7 +289,7 @@ async fn accept_loop_not_stalled_by_missing_prefix() {
         .await
         .expect("open raw stream");
 
-    // (2) alice then opens a normal ForwardV1 stream (writes its prefix).
+    // (2) alice then opens a normal SocksV1 stream (writes its prefix).
     //     Paced behind the raw open: ant-quic's connection driver can
     //     permanently strand the first frames of burst-opened streams on an
     //     otherwise-idle connection (see `acceptor_channel_is_bounded`), and
@@ -305,7 +305,7 @@ async fn accept_loop_not_stalled_by_missing_prefix() {
         let alice_for_open = Arc::clone(&alice);
         let normal = tokio::spawn(async move {
             alice_for_open
-                .open_peer_stream(&bob_agent_id, StreamProtocol::ForwardV1)
+                .open_peer_stream(&bob_agent_id, StreamProtocol::SocksV1)
                 .await
                 .expect("open normal stream")
         });
@@ -321,7 +321,7 @@ async fn accept_loop_not_stalled_by_missing_prefix() {
         }
     }
     let surfaced = surfaced.expect("accept loop was stalled by the missing-prefix stream");
-    assert_eq!(surfaced.protocol(), StreamProtocol::ForwardV1);
+    assert_eq!(surfaced.protocol(), StreamProtocol::SocksV1);
 }
 
 // ---------------------------------------------------------------------------
@@ -843,6 +843,43 @@ async fn backpressure_throttles_writer_with_bounded_buffering() {
     );
 }
 
+/// N10: a default peer has no forward consumer; the handshake must fail
+/// promptly instead of waiting in the default incoming-stream queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "two-agent loopback; binds UDP. CI-only N10 forward reset proof."]
+async fn forward_without_acceptor_resets_handshake() {
+    let dir = TempDir::new().expect("tmpdir");
+    let Some(alice) = build_agent(&dir, "alice").await else {
+        return;
+    };
+    let Some(bob) = build_agent(&dir, "bob").await else {
+        return;
+    };
+    let alice = Arc::new(alice);
+    let bob = Arc::new(bob);
+    alice.join_network().await.expect("alice joins");
+    bob.join_network().await.expect("bob joins");
+    link_pair(&alice, &bob).await;
+
+    for protocol in [StreamProtocol::ForwardV1, StreamProtocol::ForwardV2] {
+        let mut stream = alice
+            .open_peer_stream(&bob.agent_id(), protocol)
+            .await
+            .expect("open forward stream");
+        let mut response = [0u8; 1];
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            stream.recv_mut().read_exact(&mut response),
+        )
+        .await
+        .expect("forward handshake hung without an acceptor");
+        assert!(
+            result.is_err(),
+            "missing forwarder must close/reset the stream"
+        );
+    }
+}
+
 /// Large-transfer integrity: 8 MiB deterministic pattern each direction over
 /// one stream, SHA-256 verified.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -868,7 +905,7 @@ async fn large_transfer_integrity_8mib() {
     link_pair(&alice, &bob).await;
 
     let mut alice_stream = alice
-        .open_peer_stream(&bob.agent_id(), StreamProtocol::ForwardV2)
+        .open_peer_stream(&bob.agent_id(), StreamProtocol::SocksV1)
         .await
         .expect("open stream");
     let mut bob_stream = take_incoming(&bob, Duration::from_secs(15))
