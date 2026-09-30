@@ -501,6 +501,7 @@ async fn raw_frame_from_wrong_machine_stays_unverified_with_registry_binding() {
 /// RecipientUndiscovered for the whole announcement cadence.
 #[tokio::test]
 async fn cold_node_sends_first_after_reconnect_within_seconds() {
+    let joined_at = tokio::time::Instant::now();
     let a_dir = TempDir::new().unwrap();
     let b_dir = TempDir::new().unwrap();
     let a = build_agent(&a_dir).await;
@@ -514,9 +515,28 @@ async fn cold_node_sends_first_after_reconnect_within_seconds() {
         .await
         .expect("b announces");
 
+    // The fixture config has no bootstrap and no mDNS — connect the two
+    // nodes explicitly (the production equivalent of the bootstrap dial),
+    // or b's listener has no transport over which to hear a.
+    let a_addr = a.bound_addr().await.expect("a bound");
+    let b_network = b.network().expect("b network");
+    b_network.connect_addr(a_addr).await.expect("b dials a");
+    let a_peer = ant_quic::PeerId(a.machine_id().0);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    while !b_network.is_connected(&a_peer).await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "initial dial deadline"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
     // Let b discover a (the warm precondition the fixture relies on).
+    // Generous deadline: under CI coverage load the two-node gossip
+    // mesh can take tens of seconds — this wait is fixture setup, the
+    // #1091 contract is the 10 s send window after the reconnect.
     let a_id = a.agent_id();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         if b.discovered_agent_for_testing(&a_id).await.is_some() {
             break;
@@ -527,19 +547,66 @@ async fn cold_node_sends_first_after_reconnect_within_seconds() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-
+    // Drain BOTH background announce sources before going cold, or the
+    // test could not discriminate the reconnect trigger: (1) join_network
+    // schedules a DELAYED second announce ~3 s after join (fresh message
+    // id — it lands even after PlumTree dedupe); (2) the join-time
+    // connect storm consumes the reconnect gate's leading edge and
+    // schedules its coalesced TRAILING fire at +30 s. A real restart is
+    // down for longer than the gate window, so the model waits past it —
+    // after this point the heartbeat cadence (600 s) is the only other
+    // announcer and the peer's next leading edge is the feature under
+    // test.
+    let background_announces_drained = joined_at + std::time::Duration::from_secs(32);
+    if tokio::time::Instant::now() < background_announces_drained {
+        tokio::time::sleep(background_announces_drained - tokio::time::Instant::now()).await;
+    }
     // THE COLD STATE: b's discovery cache and binding registry emptied —
     // exactly what a restart leaves behind.
     b.clear_identity_resolution_for_testing().await;
     assert!(b.discovered_agent_for_testing(&a_id).await.is_none());
 
-    // A transport (re)connect: b dials a again. Both sides' reconnect
-    // gates fire (each sees a machine that was not connected just
-    // before), a re-announces, and b's cache refills.
+    // A GENUINE reconnect — the transport shape a daemon restart
+    // produces: the existing connection is torn down (so each listener's
+    // connected-machines set forgets the peer), then b redials. A bare
+    // connect_addr while already connected emits no new PeerConnected and
+    // the reconnect gate would never fire.
     let a_addr = a.bound_addr().await.expect("a bound");
     let b_network = b.network().expect("b network");
-    b_network.connect_addr(a_addr).await.expect("b redials a");
     let a_peer = ant_quic::PeerId(a.machine_id().0);
+    let b_peer = ant_quic::PeerId(b.machine_id().0);
+    b_network
+        .disconnect(&a_peer)
+        .await
+        .expect("b drops the a connection");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    while b_network.is_connected(&a_peer).await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "disconnect deadline"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // a's listener must observe the disconnect too, or the redial is not
+    // a NEW machine on a's side and a would not re-announce.
+    let a_network = a.network().expect("a network");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    while a_network.is_connected(&b_peer).await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a-side disconnect deadline"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // Give both listeners a beat to process the PeerDisconnected events
+    // BEFORE the redial: on the non-dialing side the close event (from
+    // the old transport) and the accept event (from the new one) come
+    // from different objects with no ordering guarantee — a redial that
+    // races the queue lands as Connected-then-Disconnected and the peer
+    // never counts as new. A real restart separates these by seconds.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    // Redial: this IS a machine that was not connected just before.
+    b_network.connect_addr(a_addr).await.expect("b redials a");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
     while !b_network.is_connected(&a_peer).await {
         assert!(tokio::time::Instant::now() < deadline, "redial deadline");

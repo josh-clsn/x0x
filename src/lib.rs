@@ -271,6 +271,11 @@ pub struct Agent {
     /// Default false; sender bus fallback is unchanged. Bus-only senders
     /// cannot reach this inbox when enabled.
     skip_legacy_dm_bus: bool,
+    /// #1091 test seam: when false (default true) the reconnect re-announcer's
+    /// listener signal is suppressed; tests that model announcement timing
+    /// orthogonally (e.g. the R17 hydrate ladder) set it so the reconnect
+    /// beat cannot race their fixtures.
+    reconnect_reannounce_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Agent self-name (ADR-0036 display_name). Interior-mutable so
     /// `PUT /profile` updates apply to the next heartbeat without a
     /// restart; `None` announces anonymously (no self_name field).
@@ -8236,6 +8241,13 @@ impl Agent {
     }
 
     /// Test seam (#1091): read one discovery-cache entry.
+    /// #1091 test seam: suppress reconnect-triggered re-announces (see
+    /// the field docs). Production default is enabled.
+    pub fn disable_reconnect_reannounce_for_testing(&self) {
+        self.reconnect_reannounce_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub async fn discovered_agent_for_testing(
         &self,
         agent: &identity::AgentId,
@@ -13368,12 +13380,13 @@ impl Agent {
         // the global gate lives there.
         let (reconnect_tx, reconnect_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         self.spawn_reconnect_reannouncer(reconnect_rx);
-        // #1091: the machines this listener currently sees connected — the
-        // re-announce signal fires only for a machine that was NOT connected
-        // just before (duplicate Connected events for live peers do not
-        // re-trigger; the global 30 s gate bounds the rest).
-        let mut connected_machines: std::collections::HashSet<[u8; 32]> =
-            std::collections::HashSet::new();
+        // #1091: per-machine last-seen-connected times for the re-announce
+        // signal. Keyed on STALENESS, not membership: duplicate Connected
+        // events for live peers do not re-trigger (freshness < window),
+        // while a reconnect after an unobserved remote close still fires —
+        // the global 30 s gate bounds the rest.
+        let mut connected_machines: std::collections::HashMap<[u8; 32], std::time::Instant> =
+            std::collections::HashMap::new();
         if self
             .network_event_listener_started
             .swap(true, std::sync::atomic::Ordering::AcqRel)
@@ -13400,6 +13413,8 @@ impl Agent {
         // Clones for the lifecycle watcher task (Task 1 moves the originals).
         let lifecycle_machine_cache = std::sync::Arc::clone(&machine_cache);
         let lifecycle_reconnects = std::sync::Arc::clone(&active_reconnects);
+        let reconnect_reannounce_enabled =
+            std::sync::Arc::clone(&self.reconnect_reannounce_enabled);
         self.spawn_tracked(async move {
             let mut rx = network.subscribe();
             tracing::info!("Network event reconciliation listener started");
@@ -13422,13 +13437,28 @@ impl Agent {
 
                 match event {
                     network::NetworkEvent::PeerConnected { peer_id, address } => {
-                        // #1091: a transport (re)connect to a machine that was
-                        // not connected just before re-triggers our own
+                        // #1091: a transport (re)connect re-triggers our own
                         // identity re-announce (globally rate-limited in the
                         // re-announcer task). Fired REGARDLESS of whether we
                         // can resolve this machine — the restarted PEER is
-                        // the one that cannot resolve us.
-                        if connected_machines.insert(peer_id) {
+                        // the one that cannot resolve us. The freshness key
+                        // is per-machine STALENESS, not set membership: a
+                        // remote-initiated close is not always surfaced to
+                        // this listener (the accept side may learn the loss
+                        // late or never), so a stale entry must not swallow
+                        // the restarted peer's reconnect. Net effect: at
+                        // most one signal per machine per window, on top of
+                        // the global gate.
+                        let now = std::time::Instant::now();
+                        let signal_reconnect =
+                            connected_machines.get(&peer_id).is_none_or(|last| {
+                                now.duration_since(*last) >= RECONNECT_REANNOUNCE_WINDOW
+                            });
+                        if signal_reconnect
+                            && reconnect_reannounce_enabled
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            connected_machines.insert(peer_id, now);
                             let _ = reconnect_tx.send(());
                         }
                         let machine_id = identity::MachineId(peer_id);
@@ -13517,6 +13547,10 @@ impl Agent {
                         }
                     }
                     network::NetworkEvent::PeerDisconnected { peer_id, reason } => {
+                        eprintln!(
+                            "DBG1091D: PeerDisconnected {:?} reason={:?}",
+                            peer_id, reason
+                        );
                         connected_machines.remove(&peer_id);
                         let machine_id = identity::MachineId(peer_id);
                         let cached_agent_id = {
@@ -14985,6 +15019,17 @@ impl Agent {
                 let mut gate = announce_gate.lock().await;
                 if gate.on_reconnect(now) {
                     drop(gate);
+                    // Settle delay: the signal arrives at transport-connect
+                    // time, but the gossip overlay needs a graft tick before
+                    // the re-established link carries a publish (the join
+                    // path's ~3 s delayed announce exists for the same
+                    // reason). Publishing immediately would reach nobody and
+                    // the announcement is not retried.
+                    let settle = tokio::time::sleep(std::time::Duration::from_secs(2));
+                    tokio::select! {
+                        _ = token.cancelled() => break,
+                        _ = settle => {},
+                    }
                     if let Err(e) = ctx.announce().await {
                         tracing::warn!("reconnect-triggered identity re-announcement failed: {e}");
                     } else {
@@ -17012,6 +17057,9 @@ impl AgentBuilder {
             network,
             gossip_runtime,
             skip_legacy_dm_bus: self.skip_legacy_dm_bus,
+            reconnect_reannounce_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                true,
+            )),
             bootstrap_cache,
             gossip_cache_adapter,
             machine_kem,
