@@ -1036,7 +1036,7 @@ mod recovery_scope_tests {
     use super::*;
     use crate::groups::{GroupAdmission, GroupInfo, GroupPolicyPreset, GroupRole};
     use crate::identity::{AgentId, UserId};
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::HashMap;
     use std::time::{Duration, Instant};
 
     // Inert post-apply state: no Agent/AppState, transport, filesystem or tasks.
@@ -1082,22 +1082,22 @@ mod recovery_scope_tests {
     }
 
     #[test]
-    fn joiner_fetches_are_bounded_by_event_digests() {
+    fn recovery_skipped_when_roster_moved_on() {
         let (mut info, local, event) = fixture(1);
-        let referenced: BTreeSet<_> = info
-            .active_members()
-            .filter_map(|seat| seat.certificate_digest.clone())
-            .collect();
-        // Another commit can land between apply and recovery. Its new seat
-        // must not leak into this event's requests.
+        // Positive control: on the event's own roster the joiner does fetch,
+        // so the skip below is not a vacuous pass.
+        assert!(!missing_roster_certificate_digests(&info, &local, &event).is_empty());
+        // Another commit lands between apply and recovery. The roster root no
+        // longer matches the event, so this event's proactive recovery is
+        // skipped entirely rather than widened to the later seat. Known
+        // limitation (#1056): back-to-back joins fall back to the seal-path
+        // #946 fetch.
         info.add_member("later-seat".into(), GroupRole::Member, None, None);
         info.members_v2
             .get_mut("later-seat")
             .expect("seat")
             .certificate_digest = Some("later-digest".into());
-        let requests = missing_roster_certificate_digests(&info, &local, &event);
-        assert!(requests.len() <= referenced.len());
-        assert!(requests.iter().all(|digest| referenced.contains(digest)));
+        assert!(missing_roster_certificate_digests(&info, &local, &event).is_empty());
     }
 
     #[test]
