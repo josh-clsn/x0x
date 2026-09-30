@@ -274,6 +274,12 @@ pub struct Agent {
     /// Default false; sender bus fallback is unchanged. Bus-only senders
     /// cannot reach this inbox when enabled.
     skip_legacy_dm_bus: bool,
+    /// #1135: gossip publishes that reached ZERO eager peers
+    /// (best-effort fan-out; solo node, or every eligible peer
+    /// cooled/excluded). Surfaced via /diagnostics/gossip so an
+    /// absent-message convergence stall is distinguishable from a slow
+    /// one.
+    gossip_zero_fanout_publishes: std::sync::atomic::AtomicU64,
     /// Agent self-name (ADR-0036 display_name). Interior-mutable so
     /// `PUT /profile` updates apply to the next heartbeat without a
     /// restart; `None` announces anonymously (no self_name field).
@@ -11381,7 +11387,7 @@ impl Agent {
                 "gossip runtime not initialized - configure agent with network first",
             ))
         })?;
-        runtime
+        let fanout = runtime
             .pubsub()
             .publish_with_fanout(topic.to_string(), bytes::Bytes::from(payload))
             .await
@@ -11390,7 +11396,23 @@ impl Agent {
                     "publish failed: {}",
                     e
                 )))
-            })
+            })?;
+        // #1135: a zero-fanout publish is a silent best-effort miss
+        // (solo node, or every eligible peer cooled/excluded) — count
+        // it so /diagnostics/gossip can distinguish an absent message
+        // from a slow one.
+        if fanout == 0 {
+            self.gossip_zero_fanout_publishes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(fanout)
+    }
+
+    /// #1135: how many gossip publishes reached zero eager peers.
+    #[must_use]
+    pub fn gossip_zero_fanout_publishes(&self) -> u64 {
+        self.gossip_zero_fanout_publishes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     // Same publish path and error mapping; test-only send-stage observation.
@@ -17195,6 +17217,7 @@ impl AgentBuilder {
             network,
             gossip_runtime,
             skip_legacy_dm_bus: self.skip_legacy_dm_bus,
+            gossip_zero_fanout_publishes: std::sync::atomic::AtomicU64::new(0),
             bootstrap_cache,
             gossip_cache_adapter,
             machine_kem,
@@ -20651,6 +20674,41 @@ fn spawn_relay_dm_listener(
 
 #[cfg(test)]
 mod tests {
+
+    /// #1135: a gossip publish that reaches zero eager peers is counted
+    /// (`publish_with_fanout` == 0 on a solo node), so
+    /// /diagnostics/gossip can distinguish an absent message from a
+    /// slow one.
+    #[tokio::test]
+    async fn zero_fanout_publishes_are_counted() {
+        let dir = tempfile::TempDir::new().expect("dir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback")),
+                bootstrap_nodes: vec![],
+                mdns_enabled: false,
+                ..network::NetworkConfig::default()
+            })
+            .build()
+            .await
+            .expect("agent");
+        agent.join_network().await.expect("join");
+        let before = agent.gossip_zero_fanout_publishes();
+        let fanout = agent
+            .publish_with_fanout("x0x/test/zero-fanout", vec![1, 2, 3])
+            .await
+            .expect("solo publish still succeeds locally");
+        assert_eq!(fanout, 0, "solo node has no eager peer");
+        assert_eq!(
+            agent.gossip_zero_fanout_publishes(),
+            before + 1,
+            "the zero-fanout miss must be counted"
+        );
+        agent.shutdown().await;
+    }
+
     mod own_agent_certificate_lookup_797 {
         use super::*;
 
