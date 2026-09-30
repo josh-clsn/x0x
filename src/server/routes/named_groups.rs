@@ -36318,6 +36318,7 @@ pub(in crate::server) mod tests {
     mod home_control_payload_size;
     mod hs_f2_membership_cluster;
     mod hs_r3_invite_auth;
+    mod issue1139_back_to_back_join;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;
