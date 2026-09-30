@@ -86,19 +86,22 @@ impl CapabilityRegistry {
 
     /// Require the bit for a typed product payload. Ordinary DMs are unchanged.
     pub fn require_payload(self, payload: &[u8]) -> std::result::Result<(), DmError> {
-        let required = if payload.starts_with(crate::share_grant::SHARE_GRANT_DM_PREFIX) {
-            Some((Self::SHARE_GRANT_V1, "share_grant_v1"))
-        } else if payload.starts_with(b"X0X-GROUP-PREDECESSOR-RELAY-V1\n") {
-            Some((Self::PREDECESSOR_OFFER_V1, "predecessor_offer_v1"))
-        } else {
-            None
-        };
-        if let Some((bit, capability)) = required {
+        if let Some((bit, capability)) = Self::required_for_payload(payload) {
             if !self.supports(bit) {
                 return Err(DmError::RecipientUpgradeRequired { capability });
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn required_for_payload(payload: &[u8]) -> Option<(u64, &'static str)> {
+        if payload.starts_with(crate::share_grant::SHARE_GRANT_DM_PREFIX) {
+            Some((Self::SHARE_GRANT_V1, "share_grant_v1"))
+        } else if payload.starts_with(b"X0X-GROUP-PREDECESSOR-RELAY-V1\n") {
+            Some((Self::PREDECESSOR_OFFER_V1, "predecessor_offer_v1"))
+        } else {
+            None
+        }
     }
 
     /// Unknown registry versions never imply support.
@@ -743,6 +746,14 @@ pub enum DmError {
         /// Required named registry bit (ADR 0093).
         capability: &'static str,
     },
+
+    /// The recipient's agent is not yet DISCOVERED locally (no discovery
+    /// cache entry and no binding evidence — the post-restart send-first
+    /// shape of #1091). Distinct from key-material absence: retry as soon
+    /// as identity discovery repopulates (the peer's re-announce), which
+    /// the reconnect-triggered re-announce bounds to seconds.
+    #[error("recipient_undiscovered: {0} — awaiting the peer's identity announcement; retry")]
+    RecipientUndiscovered(String),
 
     /// Recipient's AgentCard / capability advert is not known locally, or
     /// their KEM public key is missing. Caller should retry after a

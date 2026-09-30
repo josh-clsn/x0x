@@ -215,6 +215,13 @@ async fn two_daemon_admin_seals_from_a_members_responder() -> Result<()> {
     let plane = format!("r17v2-two-{}", rand::random::<u32>());
     let (a, _a_dir) = networked_test_state(&plane).await?;
     let (b, _b_dir) = networked_test_state(&plane).await?;
+    // #1091: the reconnect re-announcer fires a harness-identity beat at
+    // connect time whose ARRIVAL is nondeterministic; landing between the
+    // hand-installed discovery cert and the seal it drops that cert
+    // (ADR-0038 digest coupling — intended). This fixture pins the
+    // hydrate ladder, not announce timing, so the beat is suppressed.
+    a.agent.disable_reconnect_reannounce_for_testing();
+    b.agent.disable_reconnect_reannounce_for_testing();
     let owner = x0x::identity::UserKeypair::generate().expect("owner key");
     // M: never started — its owner is offline.
     let m_kp = x0x::identity::AgentKeypair::generate().expect("member key");

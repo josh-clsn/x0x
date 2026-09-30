@@ -345,6 +345,8 @@ struct CachedDigestExt {
 }
 
 struct CachedAdvert {
+    // Order card KEM refreshes independently of the verified advert lifetime.
+    card_created_at_unix_ms: Option<u64>,
     verified_advert: bool,
     capabilities: DmCapabilities,
     machine_id: [u8; 32],
@@ -567,6 +569,7 @@ impl CapabilityStore {
         inner.adverts.insert(
             *agent_id.as_bytes(),
             CachedAdvert {
+                card_created_at_unix_ms: None,
                 verified_advert: true,
                 capabilities,
                 machine_id: *machine_id.as_bytes(),
@@ -636,6 +639,10 @@ impl CapabilityStore {
     /// lowering a live binding, which would make strict sends fail until the
     /// next mesh refresh.
     ///
+    /// A current verified advert from the same machine retains its runtime
+    /// capabilities and signed lifetime; a newer card refreshes only KEM material.
+    /// Cards never authorize application bits or extend an advert's lifetime.
+    ///
     /// Returns `true` when the card material was inserted.
     pub fn insert_from_card(
         &self,
@@ -672,7 +679,7 @@ impl CapabilityStore {
                 capabilities.digest_support = ext.digest_support;
             }
         }
-        if let Some(existing) = inner.adverts.get(agent_id.as_bytes()) {
+        if let Some(existing) = inner.adverts.get_mut(agent_id.as_bytes()) {
             if created_at_unix_ms < existing.created_at_unix_ms {
                 return false;
             }
@@ -680,6 +687,22 @@ impl CapabilityStore {
                 && existing.capabilities.max_protocol_version > capabilities.max_protocol_version
             {
                 return false;
+            }
+            if now <= existing.expires_at
+                && existing.verified_advert
+                && existing.machine_id == *machine_id.as_bytes()
+            {
+                let material_timestamp = existing
+                    .card_created_at_unix_ms
+                    .unwrap_or(existing.created_at_unix_ms);
+                if created_at_unix_ms <= material_timestamp {
+                    // An ambiguous card must never erase verified evidence.
+                    return false;
+                }
+                existing.capabilities.kem_public_key = capabilities.kem_public_key;
+                existing.capabilities.kem_algorithm = capabilities.kem_algorithm;
+                existing.card_created_at_unix_ms = Some(created_at_unix_ms);
+                return true;
             }
             if created_at_unix_ms == existing.created_at_unix_ms {
                 let material_is_identical = existing.machine_id == *machine_id.as_bytes()
@@ -699,6 +722,7 @@ impl CapabilityStore {
         inner.adverts.insert(
             *agent_id.as_bytes(),
             CachedAdvert {
+                card_created_at_unix_ms: Some(created_at_unix_ms),
                 verified_advert: false,
                 capabilities,
                 machine_id: *machine_id.as_bytes(),
@@ -1466,6 +1490,7 @@ mod digest_diagnostic_tests {
 
     fn base(expires_at: Instant, digest_support: bool) -> CachedAdvert {
         CachedAdvert {
+            card_created_at_unix_ms: None,
             verified_advert: true,
             capabilities: DmCapabilities {
                 digest_support,
