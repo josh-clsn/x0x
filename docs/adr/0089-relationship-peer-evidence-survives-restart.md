@@ -1,6 +1,7 @@
 # ADR 0089: Relationship-Peer Evidence Survives Restart (Evidence Rule, Slice 1)
 
-- **Status:** Proposed
+- **Status:** Accepted
+- **Accepted:** 2026-09-30 by David Irvine (as written; relayed by Root, who verified the r4 diff at 6571d6c). The status change was applied by Claude (x0x-32) at his instruction.
 - **Date:** 2026-09-30
 - **Decision owners:** David Irvine (decision; charter D29), Claude x0x-32 (drafting)
 - **Reviewers:** Codex or OMP (cross-model review); David Irvine (acceptance, required before any code merges)
@@ -346,18 +347,12 @@ Removing a record, or any of these conditions failing, removes its authority **i
 
 The Hello term is O(C), and the load and refresh-write terms are O(R). `Lookup` is **rate-bounded** by the §6 budgets (≤ 256 KiB/s served, ≤ 16 outstanding sent); it is not shown to be O(C). None of these grows with N.
 
-## Open Questions for David
+## Decisions recorded at acceptance (David, 2026-09-30)
 
-1. **Contacts.** Should trusted contacts (not group, grant or enrollment peers) be relationship peers?
-   - Excluded here, per E-D10.
-   - Including them widens recovery for 1:1 DMs, and grows the store and the `Lookup` authorization surface.
-2. **Pre-identity admission.** `EvidenceV1` is admitted from any transport-authenticated machine.
-   - The alternative is to admit only enrolled machines and machines named by a stored record. That is tighter, but a moved peer or a new group member then can't send a `Hello` until gossip.
-   - The bounds in §6 are what make open admission safe. Keep it open?
-3. **Lifetimes: RULED (David, 2026-09-30).**
-   - **Stored-authority lifetime L = 7 days**, re-validated by any fresh `Hello` (§3).
-   - **Ingest window W = 15 min**, today's advert TTL. It was not ruled separately and follows from the existing TTL.
-   - **The exposure is stated in §3:** a replay accepted inside W can become stored authority for up to 7 days, unless a newer advert naming another machine arrives or a revocation lands. Today that authority lasts about 900 s.
+1. **Contacts are excluded from this slice.** Trusted contacts that are not group, grant or enrollment peers stay TTL-only (E-D10). Widening this needs a later ADR.
+2. **Open pre-identity admission is accepted.** `EvidenceV1` is admitted from any transport-authenticated machine, with the responder authorization, budgets and implementation conditions of §6.
+3. **Ingest window W = 15 min**, today's advert TTL.
+4. **Stored-authority lifetime L = 7 days, re-validated by any fresh `Hello` (§3).** The extension of authorization lifetime from about 900 s to up to 7 days for relationship peers, stated in §3 and §9, is accepted.
 
 ## Consequences
 
@@ -455,4 +450,4 @@ The Hello term is O(C), and the load and refresh-write terms are O(R). `Lookup` 
 - **Never mark `verified` from a record naming a different machine.**
 - **A `Hello` carries only the sender's own evidence.** A `Lookup` reply is re-verified and served only to authorized requesters.
 - **Never overwrite an unreadable evidence file.**
-- **Must not be marked Accepted without David's review.**
+- **Accepted by David 2026-09-30; the body is now immutable.** Changes need a superseding ADR, or a README errata entry for factual corrections.
