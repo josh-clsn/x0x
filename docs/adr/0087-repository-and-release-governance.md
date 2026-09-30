@@ -2,7 +2,8 @@
 
 <!-- File name: docs/adr/0087-repository-and-release-governance.md -->
 
-- **Status:** Proposed
+- **Status:** Accepted
+- **Accepted:** 2026-09-30 by David Irvine (accepted as written, including the "dependency change" definition in rule 8 and rule 4's requirement that release-workflow changes are merged by David; status change applied by Claude at his instruction)
 - **Date:** 2026-09-30
 - **Decision owners:** David Irvine (decisions D04, D05, D15 and D36, and
   the ADR process rule from the 2026-09-30 design health check; acceptance),
