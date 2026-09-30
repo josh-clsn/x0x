@@ -100,7 +100,14 @@ This directory contains architecture decision records for x0x.
 - [ADR 0062: Recover Ordinary Home Persistence as One Durable Pair](./0062-home-persistence-pair-recovery.md) (proposed 2026-09-06) — #471: ordinary-pair undo intent, truthful recovery-required results and exclusive journal ownership; commit ambiguity, caller fencing and downgrade policy require human design review before implementation.
 
 
-**ADR 0093 capability registry allocations** are recorded in 0093's own table (its allocation procedure): bit 2 `peer_evidence_v1`, reserved by [ADR 0089](./0089-relationship-peer-evidence-survives-restart.md) (proposed; effective when 0089 is Accepted).
+**ADR 0093 capability registry** (the canonical allocation table since ADR 0089 amended 0093's allocation procedure; ADR 0093 itself is immutable):
+
+| Bit | Name | Meaning | Allocated by |
+| --- | --- | --- | --- |
+| 0 | `share_grant_v1` | Understands and validates the ShareGrant v1 typed DM | ADR 0093 |
+| 1 | `predecessor_offer_v1` | Understands the predecessor/requester offer route and its application handling | ADR 0093 |
+| 2 | `peer_evidence_v1` | Accepts `EvidenceV1` (stream protocol 0x06) evidence Hello/Lookup streams | ADR 0089 (reserved; effective when 0089 is Accepted; must not be advertised before then) |
+| 3–63 | unallocated | Must not be advertised until allocated | — |
 
 ## Errata (Accepted ADRs are immutable; corrections recorded here)
 

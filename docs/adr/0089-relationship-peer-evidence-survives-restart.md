@@ -11,7 +11,7 @@
   - This ADR adopts a persistent binding store **for relationship peers only**, as an *addition* to stateless origin attestation, which stays as it is.
   - ADR 0021's rule that origin authentication "MUST work with zero prior discovery-cache state" still holds.
 - **Also:**
-  - Allocates [ADR 0093](./0093-capability-advert-registry.md) registry bit 2 through 0093's allocation procedure (a README registry note plus the code constant; 0093 itself is not edited).
+  - **Amends [ADR 0093](./0093-capability-advert-registry.md)'s allocation procedure** (0093 is Accepted and not edited, since Accepted files are immutable and CI enforces that). 0093 says "Allocate a bit by a reviewed ADR updating this table". From this ADR on, **the canonical allocation table is the "ADR 0093 capability registry" table in `docs/adr/README.md`**: bits 0 and 1 as in 0093, and bits added by later ADRs. This ADR adds bit 2, `peer_evidence_v1`, effective when 0089 is Accepted, plus the code constant. No other part of 0093 changes.
   - The persisted file follows [ADR 0085](./0085-persisted-binary-formats-are-versioned.md).
 - **Vision requirement and goals:**
   - **R3** (all my machines connected);
@@ -134,6 +134,20 @@ Each signed component is judged **on its own**. The pair is never judged by its 
 | Different machine M_new, and only the advert is available | the old record is **removed** | set to `(t_new, M_new)` | **yes**, in the same snapshot |
 | Revocation, relationship ended, or age exceeded | removed | unchanged | yes |
 
+**Moves are durable before they take effect (r4, the Root/David crash-rollback item).** A move is **accepted** only once it is on disk. The order is:
+1. Observe ingest-fresh, verified evidence of A on M_new ≠ M_r.
+2. **Suspend** the old record (A, M_r) in memory. `usable()` returns `None` for it from this moment, which fails closed.
+3. Build the new snapshot: the new record, or none if only the advert is known, and the watermark `(t_new, M_new)`.
+4. Write it through to disk immediately, bypassing the 60 s coalescing: temp file, fsync, rename, fsync the directory.
+5. **Only then** make the new record usable and drop the suspended old one.
+
+**What a crash does.**
+- A crash **after** step 4 restarts with the new snapshot. The old machine's authority is **not** restored.
+- A crash **before** step 4 completes means the move was never accepted. The old snapshot comes back, and the move is re-learned from the next fresh evidence: A's `Hello`, a `Lookup` reply, or gossip.
+- A failed write leaves the old record suspended (fail closed) until the next retry, and is counted (`evidence_move_write_failed`).
+
+Move writes are rate-limited only by the rate of moves, at most one per agent per ingest of new evidence. They are not subject to the 60 s coalescing. Other material changes stay coalesced.
+
 **Watermark cap.**
 - Watermarks are capped at **4096**.
 - When full, a watermark is evicted only if its agent has **no** stored record, has been out of the relationship set the longest, and its `t` is older than L. That means it can no longer disqualify anything usable.
@@ -249,8 +263,7 @@ Removing a record, or any of these conditions failing, removes its authority **i
 **Capability bit.** This ADR allocates ADR 0093 bit 2, **`peer_evidence_v1`**, meaning "accepts `EvidenceV1`".
 - A current verified advert lacking the bit means the `Hello` is skipped.
 - Unknown state means one try per connection. A reset marks the connection "no evidence" until it drops.
-- The allocation follows ADR 0093's own procedure ("Allocate a bit by a reviewed ADR updating this table"). This PR adds the bit-2 row to **0093's canonical registry table**, marked as reserved by ADR 0089 and effective when 0089 is Accepted, together with the code constant in S5.
-- That table edit is the one change to an Accepted ADR that 0093's text itself authorises. No other part of 0093 is edited.
+- **Allocation route:** ADR 0093 is Accepted and immutable. This ADR amends its allocation procedure so the canonical table is the "ADR 0093 capability registry" table in `docs/adr/README.md`. Bit 2 is added there, marked reserved by 0089 and effective on acceptance, together with the code constant in S5.
 
 ### 7. Mixed versions
 
@@ -283,7 +296,7 @@ Removing a record, or any of these conditions failing, removes its authority **i
   - a certificate changes;
   - a stored component is older than L/2 while newer live same-machine bytes exist (a refresh, so stored records stay inside L).
 - A routine same-machine re-announcement is **not** material.
-- At most one write per 60 s, and only if dirty. A dirty store is also flushed on clean shutdown.
+- At most one write per 60 s, and only if dirty. A dirty store is also flushed on clean shutdown. **The exception is moves:** they are written through synchronously before they take effect (§3).
 - **File hard cap:** ≤ **16 MiB** in total. That is records (≤ 15 MiB) plus watermarks (≤ 4096 × 80 B ≈ 320 KiB) plus framing. An insert that would exceed it is refused.
 - **Writes.**
   - **Worst case:** 1440 writes/day × 16 MiB ≈ 22.5 GiB/day, only if a material change arrives every minute.
@@ -352,7 +365,7 @@ The Hello term is O(C), and the load and refresh-write terms are O(R). `Lookup` 
 
 - **Relationship peers with a usable record recover after a restart.** DM, Welcome push and fetch, file offers, grants, owner sync and the raw durable-ACK receipt all work without waiting 600 s.
 - **The #1088/#1091 and grant-after-restart gaps close by construction,** and lifetime checks sit at one point of use.
-- **Recovery is point-to-point.** It is O(C) plus O(R) per node, not O(N) global re-announces (goal E).
+- **Recovery is point-to-point.** It is O(C) for Hellos, plus O(R) for load and refresh writes, plus a separate rate-bounded `Lookup` term (≤ 256 KiB/s served, ≤ 16 outstanding) per node. It is not O(N) global re-announces (goal E).
 
 ### Negative / Trade-offs
 
@@ -382,7 +395,7 @@ The Hello term is O(C), and the load and refresh-write terms are O(R). `Lookup` 
   - a record past the use limit is unusable;
   - a record disqualified by a move watermark is rejected, including across a restart;
   - **routine refresh then restart:** a stored record, then 3 routine same-machine refreshes, then a restart; the record is still usable (Codex r2 blocker (a));
-  - **move:** after a move, the record and watermark are replaced or removed in one snapshot; kill the process between events and restart; the persisted state is coherent;
+  - **move:** after a move, the record and watermark are replaced or removed in one snapshot. **Kill test:** crash just after the move is accepted (after fsync), then restart; `usable(A, M_old)` must be `None` and the old machine's authority must not come back. Crash before the fsync: the move was not accepted, and the old record is restored until the next fresh evidence. A failed move write keeps the old record suspended;
   - the watermark survives record eviction;
   - **at the 4096 cap:** only eligible watermarks are evicted, and otherwise the incoming record is refused (`evidence_watermark_full`).
 - **Point of use (§4), each tested *after* load:**

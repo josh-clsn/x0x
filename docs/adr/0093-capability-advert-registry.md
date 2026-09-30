@@ -60,8 +60,7 @@ The version identifies the bitmap's interpretation, not the software release.
 | --- | --- | --- |
 | 0 | `share_grant_v1` | Understands and validates the ShareGrant v1 typed DM |
 | 1 | `predecessor_offer_v1` | Understands the predecessor/requester offer route and its application handling |
-| 2 | `peer_evidence_v1` | Accepts `EvidenceV1` (stream protocol 0x06) evidence Hello/Lookup streams. Reserved by [ADR 0089](./0089-relationship-peer-evidence-survives-restart.md); effective when 0089 is Accepted; must not be advertised before then |
-| 3–63 | unallocated | Must not be advertised until allocated |
+| 2–63 | unallocated | Must not be advertised until allocated |
 
 Allocate a bit by a reviewed ADR updating this table, the named code constant,
 the sender gate and a compatibility regression test. Never reuse a bit or
