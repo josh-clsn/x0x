@@ -13547,10 +13547,6 @@ impl Agent {
                         }
                     }
                     network::NetworkEvent::PeerDisconnected { peer_id, reason } => {
-                        eprintln!(
-                            "DBG1091D: PeerDisconnected {:?} reason={:?}",
-                            peer_id, reason
-                        );
                         connected_machines.remove(&peer_id);
                         let machine_id = identity::MachineId(peer_id);
                         let cached_agent_id = {
