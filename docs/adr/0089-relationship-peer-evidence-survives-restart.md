@@ -11,7 +11,7 @@
   - This ADR adopts a persistent binding store **for relationship peers only**, as an *addition* to stateless origin attestation, which stays as it is.
   - ADR 0021's rule that origin authentication "MUST work with zero prior discovery-cache state" still holds.
 - **Also:**
-  - Allocates [ADR 0093](./0093-capability-advert-registry.md) registry bit 2, following 0093's allocation procedure.
+  - Allocates [ADR 0093](./0093-capability-advert-registry.md) registry bit 2 through 0093's allocation procedure (a README registry note plus the code constant; 0093 itself is not edited).
   - The persisted file follows [ADR 0085](./0085-persisted-binary-formats-are-versioned.md).
 - **Vision requirement and goals:**
   - **R3** (all my machines connected);
@@ -46,7 +46,7 @@ The only recovery clock is the peer's next 600 s announcement. Each security tig
 - **Grants.** `evaluate_grant_access` (`src/share_grant.rs:~785`) needs the in-memory binding plus a cached certificate, so a grant is inert after a restart.
 - **#1092, the stopgap (D31).** It re-broadcasts the node's own announcement on reconnect, which puts point-to-point recovery on a global bus:
   - every re-announce costs every node about 7.4 KB and at least one ML-DSA verify;
-  - a fleet restart at N = 1000 is O(N) per node (see Costs).
+  - a fleet restart at N = 1000 is O(N) per node (see §10).
 
 The design health check (R1) judges this a design flaw, not a set of bugs. The node needs durable, self-verifying evidence about the peers it has a relationship with, and a cheap point-to-point way to refresh it.
 
@@ -113,209 +113,286 @@ The set is computed from state that already persists, and is re-evaluated on eac
 
 Everything else stays TTL-only, in memory (E-D10). Trusted contacts are not included in this slice.
 
-### 3. How evidence is used
+### 3. Freshness: acceptance is strict, use is bounded (r2, Codex P1-1)
 
-**On load (startup, in the background, never blocking the API):**
-1. Re-verify every record.
-2. Drop any record that fails verification, is revoked, has an expired certificate, or no longer has a relationship.
-3. Seed `AuthenticatedMachineBindings` from the valid records.
+Each signed component is judged **on its own**. The pair is never judged by its newest timestamp.
 
-After this:
-- The existing `raw_delivery_verified` (`src/lib.rs:3962`) marks a raw frame from (A, M) `verified`. This covers #1088 and #1089.
-- The existing registry-backed grant check (rule 2) and owner trust find the binding.
-
-**Certificates.** `evaluate_grant_access` rule 4 and owner trust read the certificate from the evidence store when the discovery cache has none.
-
-**Send side (#1091).** `send_direct` resolves A's KEM key in this order:
-1. the capability store;
-2. **the evidence advert**;
-3. the contact card.
-
-The strict durable-ACK path may use the evidence advert, because it is agent-signed and machine-bound. It still refuses the unauthenticated contact card, as today. The dial address comes from the evidence announcement when the discovery cache has none.
-
-**The discovery cache is not seeded.** Presence and "online" views stay based on fresh announcements.
-
-**Capability bits (ADR 0093 freshness is unchanged).** A persisted advert's registry bits are treated as **unknown**, not as current support or missing support, until a fresh advert arrives. Per 0093, unknown sends as before. Holding typed sends during a post-restart grace window is D35, not this slice.
-
-### 4. Freshness, staleness and revocation
-
-- **Monotonic.** A record is replaced only by valid evidence whose announcement `announced_at` and advert `created_at` are both newer. An older replay can never roll a binding back. This matches `AuthenticatedMachineBindingCache::record`.
-- **Maximum age.** A record whose newest timestamp is older than **30 days** is not used for `verified` or for sealing. A fresh exchange or pull must refresh it first. The limit is configurable as `[evidence] max_age_days`, with a minimum of 1.
-- **Revocation.** Checked on load, on every ADR-0018 revocation insert, and at the point of use. A record is removed when:
-  - its agent, machine or (agent, machine) binding is revoked;
-  - its certificate user is revoked;
-  - its certificate expires;
-  - its enrollment is gone, which includes an unenroll (#1055).
-- **Relationship ends.** When a member is removed, a grant expires or is revoked, or a device is unenrolled:
-  - the record is removed within one sweep (60 s);
-  - it stops being used immediately at the point of use.
-- **Machine moves (known residual).** If A moved to a new machine while this node was down, the old record keeps verifying frames from A's *previous* machine until newer evidence arrives. Frames from the new machine stay unverified, which fails closed.
-  - That previous machine held A's key under the same owner.
-  - A hostile previous machine is handled by the ADR-0043 retired-binding revocation, which removes the record.
-
-### 5. Wire: the on-connect exchange and the pull lookup (`EvidenceV1`)
-
-**A new ADR-0022 stream protocol, `EvidenceV1 = 0x06`.** There is no new gossip topic and no broadcast.
-
-- **Admission.**
-  - Admitted from any **transport-authenticated** machine, including one with no known agent. That is the restart case, which today's gate denies with `deny_not_verified`.
-  - The content is self-authenticating, so admission grants no trust. It only lets bytes arrive, under the bounds in §6.
-  - Nothing received is persisted unless it is valid (§1) **and** names a relationship peer (§2). Evidence for strangers only refreshes the in-memory TTL caches.
-- **Hello (on connect).** When a connection to machine M comes up, and M either hosts a relationship peer or is an enrolled machine, each side sends one `Hello` in each direction:
-  - It carries the sender's **own** current `announcement` and `advert` bytes, plus its certificate digest. The certificate itself is sent only if the peer's `Hello` did not already name that digest.
-  - The receiver accepts a `Hello` only if its (A, M) names **the transport-authenticated M**. A peer can present evidence only about itself.
-- **Pull (on demand).**
-  - Used when a send, a raw frame or a grant check needs agent X and holds no valid record.
-  - The node sends `Lookup { agent_id: X }` to at most **3** connected machines that share a relationship context with X: the same group, the same owner, or the grant counterparty.
-  - The reply is `Found { announcement, advert, certificate? }` for X, or `NotFound`. It is served only from the responder's own identity or its valid evidence store.
-  - The requester re-verifies everything (§1), so a lying responder can only withhold evidence or serve older evidence, which monotonicity then ignores.
-- **Framing.** A 1-byte message type, then a length-prefixed bincode body.
-  - The evidence parts are carried as their existing signed wire bytes, verbatim. There is no re-encoding, so no new signature scheme.
-  - Each message is at most **32 KiB**.
-- **Capability bit.** ADR 0093 registry **bit 2, `peer_evidence_v1`**: "accepts `EvidenceV1` streams".
-  - A sender with a current verified advert lacking the bit skips the stream.
-  - With unknown advert state, which is the restart case, it tries once per connection. A reset (see §7) marks the connection "no evidence" until it drops.
-
-### 6. Bounds (goal E)
-
-**Costs.** One ML-DSA-65 verify is taken as ≤ 1.5 ms. That is the conservative saturated-VPS figure from #656; it is much less on idle hosts.
-
-| Item | Cost |
+| Rule | Limit |
 |---|---|
-| Record on disk | about 23 KB. The store is capped at **512 records (about 12 MB)**, evicting in the order group-member, then grant-party, then enrolled-device, oldest first. |
-| Load at startup | 4 verifies per record (announcement, advert base, advert trailer, certificate). R = 50 takes about 0.3 s of CPU; the 512 cap takes ≤ 3 s. It runs in the background. |
-| `Hello` | about 23 KB each way (about 16 KB when the certificate digest is known) and ≤ 4 verifies at the receiver. **At most one per connection establishment** per machine; reconnect flaps are limited to one `Hello` per machine per 60 s. |
-| `Lookup` | ≤ 23 KB reply and ≤ 4 verifies. The requester makes at most 1 lookup per target per 30 s, to ≤ 3 responders. A responder answers ≤ 8 lookups/s per connection and ≤ 32 lookups/s in total, and excess is refused. |
-| Stream admission | a global cap of **32 evidence verifies/s** per node. Excess `Hello`/`Lookup` bodies are dropped unverified; they are retried on the next connection or the next pull. |
+| **Future skew** (every component, always) | `announced_at` and advert `created_at` are each ≤ now + 5 min. |
+| **Ingest freshness** (evidence arriving from the network: gossip, `Hello` or `Lookup`) | Each component must be at most **30 min** old (2 × the advert TTL of 900 s). An older component is rejected, so a stale agent advert cannot be paired with a fresh machine announcement. |
+| **Use limit** (a stored record after a restart) | Each component must be at most **30 days** old (`[evidence] max_age_days`, minimum 1). Past that, the record is treated as absent and needs a fresh `Hello` or `Lookup`. |
+| **Watermark** (persisted, per agent) | The highest advert `created_at` ever accepted for agent A, and the machine it named. A record for A is accepted, or used, only if its advert `created_at` ≥ A's watermark. A newer advert naming M_new permanently disqualifies older adverts naming M_old. |
 
-**Per-node cost when the whole fleet restarts,** with C = connections per node (typically 8, capped by `max_connections`) and R = relationship peers:
+**Watermark storage.**
+- Watermarks are kept in the same file.
+- They outlive evicted records, with a separate cap of 4096 agents × about 80 B.
+- They are never lowered.
 
-| Fleet size | This ADR (per node) | #1092 re-announce (per node) |
+**What this bounds.**
+- A former machine M_old that kept its machine key can present A's old advert only while that advert is at most 30 min old, and only to a node that has never accepted a newer advert for A.
+- That is the same exposure as today's in-memory 900 s capability TTL.
+- After that, the ADR-0043 retired-binding revocation still removes it.
+
+**The rollback claim is corrected.**
+- Replacing `peer-evidence.bin` with an older genuine copy **does** roll back the watermark and can restore an old binding.
+- That needs write access to the data directory, which already allows replacing the node's own keys (the ADR 0015 posture). It is out of scope, not "only colder".
+- Tampering *without* genuine old signed bytes still cannot forge anything.
+
+### 4. How evidence is used: at the point of use, never copied (r2, Codex P1-2, P2-3)
+
+The store is **consulted**, never used to seed another cache. There is one call:
+
+`peer_evidence.usable(agent, machine, now) -> Option<EvidenceView>`
+
+It returns a view only if the record exists and all of these hold, re-evaluated on **every call**:
+- the record verified at load or ingest;
+- it names exactly (agent, machine);
+- every component is within the use limit;
+- the advert is at or above the watermark;
+- the certificate, if present, is unexpired **now**;
+- agent A is still in `relationship_set()` **now**;
+- none of the agent, machine, (agent, machine) binding or certificate user is revoked **now**.
+
+Removing a record, or any of these conditions failing, removes its authority **immediately**. No other cache holds a derived copy.
+
+**Consumers, each falling back to the store only when its current source has nothing:**
+
+| Consumer | Today's source (origin/main) | Evidence fallback |
 |---|---|---|
-| N = 100 | ≤ min(C, R) Hellos: typical 8 × 23 KB = **184 KB**, **32 verifies** (worst case C = 64: 1.5 MB, 256 verifies) | N announcements received: 100 × 7.4 KB = **740 KB**, ≥ **100 verifies** |
-| N = 1000 | **unchanged**: 184 KB, 32 verifies (worst case 1.5 MB, 256 verifies) | 1000 × 7.4 KB = **7.4 MB**, ≥ **1000 verifies (≥ 1.5 s CPU)** per re-announce round |
+| Raw delivery `verified` (#1088/#1089) | discovery cache or `AuthenticatedMachineBindings` (`raw_delivery_verified`, `src/lib.rs:3962`) | `usable(A, M)` is `Some`, with cert expiry taken from the view |
+| Raw durable-ACK sender key (P2-3) | discovery `agent_public_key` (`src/lib.rs:13740-13761`) | the agent key from the view's announcement |
+| Send-side KEM key (#1091) | `capability_store`, then the contact card | order becomes capability store, then **view advert**, then contact card. The strict durable-ACK path accepts the view, never the card. |
+| Dial address | discovery | the view's announcement addresses |
+| Grant rule 2 binding / rule 4 certificate | registry / discovery certificate | `usable(A, M)` / the view's certificate |
+| Owner trust certificate | discovery certificate | the view's certificate |
 
-The exchange is O(C), independent of N. The re-announce is O(N) on a global topic.
+`AuthenticatedMachineBindings` keeps being filled **only from live evidence**, as today. The store never writes to it. **The discovery cache and ADR-0093 bits are not seeded.** A stored advert's registry bits are treated as unknown.
+
+### 5. What recovers, and what does not (r2, Codex P2-4)
+
+**Guaranteed within the §10 bounds after a restart:** a relationship peer with a **usable stored record**.
+
+**Not guaranteed, with the defined path for each:**
+
+| Case | Path |
+|---|---|
+| **No file** (first 0.46 start, or an unreadable file) | Cold. On connect, a `Hello` arrives from any peer that sends one (§6). Otherwise `Lookup`, then gossip. |
+| **Record past the use limit, evicted, or below the watermark** | Treated as absent: `Lookup` to eligible peers, then gossip. |
+| **Contact-only peer** (not a relationship) | Excluded in this slice (E-D10): gossip only, as today. See Open Questions. |
+| **Moved peer with no eligible connected intermediary** | Its record names the old machine and verifies nothing new. Recovery waits for its `Hello` when it connects, or for gossip. |
+| **Traffic before the background load finishes** | See below. |
+
+**Traffic before the background load finishes.**
+- Raw frames and sends that would consult the store wait on a **load barrier**. The wait is bounded: at most 5 s, and at most 64 frames or 1 MiB queued.
+- When the barrier releases, they are evaluated normally. On a timeout they are evaluated as if no record existed, which fails closed exactly as today.
+- Sends return the retryable `RecipientUndiscovered` (from #1092) instead of a terminal error.
+
+### 6. Wire: `EvidenceV1` (r2, Codex P2-5)
+
+**Protocol.** A new ADR-0022 stream protocol, `EvidenceV1 = 0x06`.
+- It is admitted from any **transport-authenticated** machine, even with no known agent.
+- It goes only to the evidence acceptor, never the default channel. This is the same narrow pattern as ADR 0084.
+
+**Framing.**
+- A 1-byte type, then a length-prefixed bincode body.
+- Signed parts are carried verbatim.
+- A message is at most 32 KiB, and a stream carries exactly one request and one reply.
+
+**Hello (on connect).** Each side sends its **own** current announcement and advert, plus its certificate digest. The certificate itself follows only if the peer lacks it.
+- **Sent** when the connected machine is enrolled, or hosts an agent with a usable stored record or a live relationship.
+- **Accepted** only if (A, M) names the transport-authenticated machine and every component passes §3 ingest freshness. Then the evidence is stored if A is a relationship peer. Otherwise it only refreshes the in-memory TTL caches.
+
+**Lookup (pull).** `Lookup { agent_id: X }` is answered with `Found { announcement, advert, certificate? }` or `NotFound`.
+
+**Responder authorization.** The responder serves a request only if all of these hold, and otherwise answers `NotFound` without signalling why:
+- the requesting transport machine hosts an agent R that is itself one of the responder's relationship peers, with a usable record or live evidence;
+- R and X share a relationship context at the responder: the same group roster, the same owner (both enrolled to the responder's owner), or one is the grant counterparty of the other;
+- the reply is built only from the responder's own identity or a usable stored record, never from TTL caches of strangers.
+
+**Responder budgets.**
+- Per requesting machine: ≤ 2 open `EvidenceV1` streams, ≤ 1 `Lookup` per 2 s and ≤ **64 KiB/s** of replies.
+- Globally: ≤ **256 KiB/s** of replies and ≤ 32 evidence verifies/s, including verifies of `Hello`s received.
+- Every stream has a **5 s deadline** covering the first byte to the end of the body. Incomplete or slow streams are reset, and the reset counts against the budget.
+- Anything over budget gets `NotFound` or a reset. It is never queued.
+
+**Requester budgets.**
+- ≤ 1 `Lookup` per target per 30 s, to ≤ 3 responders.
+- ≤ 16 outstanding `Lookup`s in total.
+- Replies are re-verified in full (§1, §3) and are never trusted on their own.
+
+**Capability bit.** This ADR allocates ADR 0093 bit 2, **`peer_evidence_v1`**, meaning "accepts `EvidenceV1`".
+- A current verified advert lacking the bit means the `Hello` is skipped.
+- Unknown state means one try per connection. A reset marks the connection "no evidence" until it drops.
+- The allocation is recorded in the ADR 0093 registry through its procedure: a registry note in `docs/adr/README.md` and the code constant. ADR 0093 itself is Accepted and is not edited.
 
 ### 7. Mixed versions
 
-- **v0.45 and earlier map the unknown protocol byte `0x06` to `None` and reset the stream.** That costs one round trip per connection, with no effect on state.
-- **The 0.46 side still uses its persisted evidence.** The evidence it holds for a 0.45 peer came from that peer's own gossip announcement and advert, which 0.45 publishes.
-- **Row 4b** (a restarted rc sender to a 0.45 receiver within 5 min) is covered by persisted evidence alone.
-- **The #1092 reconnect re-announce** is retired once `EvidenceV1` ships:
-  - A 0.45 peer that restarts still learns about us from our regular 600 s heartbeat. That is its existing behaviour.
-  - The typed `RecipientUndiscovered` error from #1092 stays.
+- **v0.45 maps the unknown byte `0x06` to `None` and resets the stream** (`src/streams.rs:464-471` on main). The 0.45 behaviour must be proven by a test against the **released v0.45.0 binary** (Validation): the reset, then ordinary DM traffic on the same connection.
+- **The 0.46 side uses stored evidence for 0.45 peers,** because 0.45 publishes the announcement and advert pair, and stores it only if the peer is a relationship peer.
+- **Row 4b** (a restarted rc sender to a 0.45 receiver within 5 min) is covered by stored evidence. It fails over to gossip when no record exists.
+- **The #1092 reconnect re-announce** is retired once `EvidenceV1` ships. `RecipientUndiscovered` stays.
 
-### 8. Storage format (ADR 0085)
+### 8. Storage (r2, Codex P2-7)
 
 **File layout.**
-- **Path:** `<data_dir>/peer-evidence.bin`.
-- **Layout:** `X0PEV1\0\0` (8 bytes), then bincode `EvidenceFileV1 { records: Vec<EvidenceRecordV1> }`, with the fields of §1.
-- **Positional encoding:** any change to the shape needs a new magic and a frozen v1 decoder, per ADR 0085 rules 1 and 2. Bodies must be consumed exactly.
+- **Path:** `<data_dir>/peer-evidence.bin`, magic `X0PEV1\0\0`, then bincode `EvidenceFileV1 { records, watermarks }`.
+- **Rules:** ADR 0085 rules 1, 2 and 6, with exact consumption.
 
-**Reading and writing.**
-- **Unreadable file:** an unknown magic or a failed decode starts the node **without** evidence. The file is left untouched and a WARN is logged; it is never deleted.
-- **Writes:** atomic (temp file, fsync, rename), debounced to at most one per 10 s.
+**Record limits (enforced at ingest, not estimates).**
+- announcement ≤ 8 KiB, advert ≤ 12 KiB, certificate ≤ 10 KiB, so a record is ≤ **30 KiB**;
+- ≤ **512 records** (store hard cap ≤ 15 MiB) and ≤ **4096 watermarks** (about 330 KiB);
+- eviction order: group-member, then grant-party, then enrolled-device, least recently used first.
 
-**Downgrade.** v0.45 never reads this file, so a downgrade ignores it and a re-upgrade reuses it.
+**An unreadable file is never replaced.**
+- On an unknown magic or a failed decode, the store runs **memory-only for the lifetime of the process**. It never writes to or renames over that path.
+- A WARN names the file.
+- Recovery is manual: move the file aside.
+- A test proves the file is byte-identical after the process has received fresh evidence.
 
-**Fixture.** A fixture file generated by the released encoder is added when the format ships (ADR 0085 rule 6).
+**Write coalescing.**
+- The file is rewritten only on a **material change**: a record or watermark is added or removed, a binding changes machine, the certificate changes, or a record's stored components are more than 7 days older than live evidence (so they stay inside the use limit).
+- A routine re-announcement with a newer timestamp and the same content is **not** material.
+- At most one write per 60 s, and only if dirty. A dirty store is also flushed on clean shutdown.
+- **Worst case:** 1440 writes/day × 15 MiB = 21 GiB/day, reached only if a material change arrives every minute. Expected: a few writes per day. `evidence_writes` and `evidence_bytes_written` are counters, and the goal-E budget for them is set by E0 measurement.
+
+**Downgrade.** v0.45 never reads the file. A re-upgrade reuses it, and a test covers the round trip.
 
 ### 9. Security argument: #898 and #1070 still hold
 
-1. **Nothing becomes `verified` without authenticated evidence naming this transport-authenticated machine.**
-   - The store admits only mutual signed evidence (§1).
-   - The raw path still compares the claimed (A, M) against it.
-   - A frame from (A, M′) with a record for (A, M) stays `verified = false` and never rebinds. This is the #898 rule.
-2. **Disk tamper cannot forge anything.**
-   - Every record is re-verified on load.
-   - The worst tamper can do is delete or roll back records, which only makes the node colder. Monotonicity stops a rolled-back file from overriding newer in-memory evidence.
-3. **A replay of genuine old evidence** is ignored while newer evidence is held. It is bounded by the 30-day maximum age and removed by revocation.
-4. **A peer cannot inject bindings for others through `Hello`.** Pull answers are verified end to end and cannot be forged.
-5. **Revocation and expiry apply** on load, on insert and at the point of use (§4). A revoked sender is dropped exactly as today (`peer_revoked` follows `verified`).
-6. **The #1070 gates are unchanged.** They now receive `verified = true` for relationship peers after a restart, which is what #1070 intended.
-7. **Strangers gain nothing.** They are never persisted, and their evidence only refreshes the existing TTL caches (E-D10).
-8. **No secrets at rest are added.** The file holds only public keys, signatures and certificates, so ADR 0015 is unchanged.
+1. **Nothing becomes `verified` without evidence naming this transport-authenticated machine.**
+   - It must be mutual signed evidence, individually fresh at ingest (§3), and currently usable (§4).
+   - A frame from (A, M′) with a record for (A, M) stays unverified and never rebinds.
+2. **Replay.**
+   - A stale advert cannot be paired with a fresh announcement, because ingest freshness is per component.
+   - A superseded binding cannot come back while the watermark holds.
+   - The residual is the same as today's 900 s capability TTL, plus a local-disk rollback, which is out of scope under ADR 0015.
+3. **Lifetime enforcement is at the point of use.** Revocation, certificate expiry, the age limit and relationship removal take effect on the next call, because the store's authority is never copied (§4).
+4. **`Hello` carries only the sender's own evidence.** `Lookup` replies are fully re-verified.
+5. **Amplification is bounded by the responder** (§6), not by requester goodwill.
+6. **The #1070 gates are unchanged.** They now receive `verified = true` for usable relationship peers after a restart.
+7. **Strangers are never stored and never served** (E-D10).
+8. **Nothing secret is at rest:** only public keys, signatures and certificates (ADR 0015).
+
+### 10. Costs: measured, estimated and enforced (r2, Codex P2-6)
+
+**Verify cost is an assumption to be measured.** `t_v` = one ML-DSA-65 verify.
+- 1.5 ms is the saturated-VPS figure from #656 and is used here as a pessimistic **assumption**, not a bound.
+- S1 must benchmark `t_v` on the fleet's VPS class and on a Mac, and update this table.
+
+| Item | Enforced ceiling | Typical estimate |
+|---|---|---|
+| Startup load (R records, 4 verifies each) | R ≤ 512, so 2048 verifies (about 3 s at 1.5 ms, in the background) | R ≈ 50: 200 verifies |
+| `Hello` in and out, per connection establishment | 1 per machine per 60 s; ≤ 32 KiB each way | about 16–23 KiB each way; 4 verifies inbound |
+| `Lookup` served | 64 KiB/s per requester; 256 KiB/s total | rare: only on a cache miss |
+| `Lookup` sent | 16 outstanding; 1 per target per 30 s × 3 responders | rare |
+| Evidence verifies (all inbound) | 32/s | — |
+| Disk | ≤ 15 MiB; ≤ 1 write per 60 s | a few writes per day |
+
+**Fleet restart, per node, full duplex,** with C = connections (typical 8, capped by `max_connections`) and R = relationship records:
+
+| | This ADR | #1092 re-announce |
+|---|---|---|
+| **N = 100** | load: 4R verifies (R = 50: 200). Hellos: 2 × min(C, R) × about 23 KiB, which is about **368 KiB** at C = 8, plus 4 × min(C, R) verifies inbound = **32**. Worst case at C = 64: about 2.9 MiB, 256 verifies. Lookups: ≤ 256 KiB/s served. | receive about 100 × 7.4 KB = **740 KB** and ≥ 100 verifies, per re-announce round |
+| **N = 1000** | **the same as N = 100.** The load, Hello and Lookup terms depend on R and C, not N. | about **7.4 MB** and ≥ **1000 verifies** per round |
+
+The exchange terms are O(C), and the load term is O(R). Neither grows with N.
+
+## Open Questions for David
+
+1. **Contacts.** Should trusted contacts (not group, grant or enrollment peers) be relationship peers?
+   - Excluded here, per E-D10.
+   - Including them widens recovery for 1:1 DMs, and grows the store and the `Lookup` authorization surface.
+2. **Pre-identity admission.** `EvidenceV1` is admitted from any transport-authenticated machine.
+   - The alternative is to admit only enrolled machines and machines named by a stored record. That is tighter, but a moved peer or a new group member then can't send a `Hello` until gossip.
+   - The bounds in §6 are what make open admission safe. Keep it open?
+3. **Ingest freshness window of 30 min.** A shorter window narrows the replay exposure in §3, but rejects evidence from peers whose adverts are late (clock skew, or advert publish delays after their own restart). 30 min matches today's TTL exposure.
 
 ## Consequences
 
 ### Positive
 
-- **Immediate recovery after a restart.** DM, Welcome push and fetch, file offers, grants and owner sync to known peers work straight away, with no 600 s wait. #1088, #1091 and the grant-after-restart gap close by construction, not by patching one path at a time.
-- **ADR 0084 becomes a special case.** The on-connect `Hello` gives the enrolled machine's agent directly.
-- **Efficiency.** Point-to-point, O(C) recovery replaces O(N) global re-announces (goal E).
+- **Relationship peers with a usable record recover after a restart.** DM, Welcome push and fetch, file offers, grants, owner sync and the raw durable-ACK receipt all work without waiting 600 s.
+- **The #1088/#1091 and grant-after-restart gaps close by construction,** and lifetime checks sit at one point of use.
+- **Recovery is point-to-point.** It is O(C) plus O(R) per node, not O(N) global re-announces (goal E).
 
 ### Negative / Trade-offs
 
-- **New surfaces.** A new stream protocol, a new persisted file (≤ about 12 MB) and a new ADR 0093 bit.
-- **Machine-move residual.** A peer that moved machines while this node was down can still be verified on its old machine until fresh evidence arrives (§4).
-- **Background verify cost at startup:** ≤ 3 s of CPU at the record cap.
-- **A persisted advert's capability bits are unknown after restart.** Mixed-version typed sends right after a restart behave as before (D35 is separate).
-- **The relationship set is only as fresh as local state.** A member added elsewhere is a stranger until this node applies that roster change.
+- **New surfaces:** a new stream protocol with pre-identity admission (bounded, §6), a new persisted file (≤ 15 MiB), a load barrier (≤ 5 s) and a new ADR 0093 bit.
+- **Not every case recovers immediately.** No file, an expired or evicted record, contact-only peers and moved peers without an intermediary are not guaranteed (§5).
+- **Replay residual:** at most 30 min of ingest freshness, plus local-disk rollback (§3).
+- **Stored capability bits stay unknown after a restart** (D35 is separate).
 
 ### Neutral / Operational
 
-- **Diagnostics counters:** `evidence_loaded`, `evidence_rejected_on_load{reason}`, `evidence_hello_sent/received`, `evidence_lookup_sent/served/refused`, `evidence_bytes_{in,out}` and `evidence_verifies`. They feed the goal-E budgets.
-- **ADR 0021's stateless attestation is kept unchanged.** This store is an addition for the raw lane and the send side, which attestation does not cover.
+- **Diagnostics counters:** `evidence_{loaded,rejected_on_load{reason},usable_hits,usable_misses{reason}}`, `evidence_hello_{sent,received,refused}`, `evidence_lookup_{sent,served,refused,unauthorized}`, `evidence_bytes_{in,out,written}`, `evidence_verifies`, `evidence_writes` and `evidence_load_barrier_waits`.
+- **ADR 0021's stateless attestation is unchanged.**
 
 ## Validation
 
 **Unit tests (inert):**
-- **Round-trip and format:**
-  - the format round-trips;
-  - a v1 fixture from the released encoder loads;
-  - an unknown magic starts cold, with the file untouched;
-  - trailing bytes are rejected.
-- **Tamper and rejection:**
-  - tampering with any signature, id or key is rejected on load;
-  - a mismatched (A, M) pair is rejected;
-  - an older record never replaces a newer one;
-  - a record past the maximum age is not used.
-- **Revocation on load:**
-  - a revoked agent, machine or binding is dropped;
-  - a revoked certificate user is dropped;
-  - an expired certificate is dropped;
-  - an unenrolled device is dropped.
-- **Relationship changes:** removing a member, revoking or expiring a grant, or unenrolling a device evicts the record, and use stops immediately.
-- **Cap and E-D10:** the cap evicts in the stated order, and evidence about a stranger is never persisted.
-- **Raw path:**
-  - an empty discovery cache plus an evidence record for (A, M) gives a raw frame from (A, M) `verified = true`;
-  - a frame from (A, M′) stays unverified (#898);
-  - a revoked A is dropped.
+- **Format:**
+  - a round-trip;
+  - a fixture from the released encoder;
+  - an unknown magic leaves the store memory-only, and the file stays **byte-identical after fresh evidence arrives**;
+  - trailing bytes are rejected;
+  - the per-component byte limits hold;
+  - the 512-record and 4096-watermark caps hold.
+- **Freshness (§3):**
+  - a stale advert plus a fresh announcement is rejected at ingest;
+  - a future-skewed component is rejected;
+  - a record past the use limit is unusable;
+  - a record below the watermark is rejected, including across a restart;
+  - the watermark survives record eviction.
+- **Point of use (§4), each tested *after* load:**
+  - revoking the agent, machine, binding or certificate user makes `usable()` return `None` on the next call;
+  - so do certificate expiry at the next call, and removing the relationship (member removed, grant expired or revoked, device unenrolled);
+  - the store never writes to `AuthenticatedMachineBindings`.
+- **Raw path and ACK:**
+  - with an empty discovery cache plus a usable record, a frame from (A, M) is verified;
+  - (A, M′) is not;
+  - a revoked A is dropped;
+  - the raw durable ACK verifies against the record's agent key.
 - **`EvidenceV1`:**
-  - a `Hello` naming a machine other than the transport machine is refused;
-  - a `Lookup` reply is verified and never trusted on its own;
-  - the rate caps and the 32 KiB limit hold;
-  - a reset from an old peer marks the connection and is not retried.
+  - a `Hello` naming another machine is refused;
+  - a stale component in a `Hello` is refused;
+  - an **unauthorized `Lookup` gets `NotFound`**;
+  - a hostile requester is held to 64 KiB/s, 2 open streams and 1 lookup per 2 s;
+  - slow and incomplete streams are reset at 5 s;
+  - reconnect churn is held to 1 `Hello` per 60 s;
+  - the global verify cap holds;
+  - an old-peer reset is marked once.
+- **Load barrier:**
+  - a raw frame and a send arriving during load are held, then evaluated;
+  - a timeout fails closed;
+  - the send returns `RecipientUndiscovered`.
 
 **Integration (CI, isolated), red on origin/main and green on the fix:**
-- **Welcome:** restart B cold, and warm A pushes a Welcome. The seat must leave `pending_authority_commit` within **5 s**.
-- **DM:** restart B cold, and **B sends first** to A. The DM must succeed within **10 s**.
-- **Grant:** restart the host of a granted agent. The grantee's first request must be admitted within **10 s**.
-- **Owner sync:** restart an owner device cold. The owner-sync session must complete within one pass (≤ 60 s), with no gossip announcement needed.
+- **Welcome:** restart B cold with a usable record; warm A pushes a Welcome; the seat leaves `pending_authority_commit` within 5 s.
+- **DM:** restart B cold; **B sends first**; the DM and its **durable receipt** complete within 10 s.
+- **Grant:** restart the grant host; the first request is admitted within 10 s.
+- **Owner sync:** restart an owner device cold; owner sync completes within one pass (≤ 60 s) with no gossip announcement.
+- **No file:** the first start after upgrade recovers through `Hello` or `Lookup`; this is a timed measurement, not a pass/fail bound.
+- **Expired record:** an expired or evicted record recovers through `Lookup`.
+- **Contact-only peer:** it waits for gossip (a pinned current limitation).
+- **Traffic during load:** sends and frames arriving during load are held by the barrier, then complete.
 
-**D30 release-gate row, restart-cold** (a CI test plus a testnet row):
-- Restart a node with cold caches.
-- Within the bounds above, run each of these:
-  - a DM both ways;
-  - a TreeKEM join with Welcome;
-  - a file offer;
-  - owner sync.
-- **Row 4b:** a restarted rc sender reaches a **0.45** receiver within 5 min. Persisted evidence alone should do it in about 10 s.
-
-**Cost check:**
-- Record the fleet-restart bytes and verifies per node on the testnet against §6.
-- **E-D17:** delivered must equal published for every flow in the gate row.
+**D30 release-gate row, restart-cold (CI test plus a testnet row):**
+- Restart a node cold. Within the bounds above, run a DM both ways, a TreeKEM join with Welcome, a file offer and owner sync.
+- **Row 4b:** a restarted rc sender reaches a 0.45 receiver within 5 min.
+- **0.45 interop:** use the **released v0.45.0 binary** (the CI release artifact) in the isolated harness. Confirm the `EvidenceV1` reset, then ordinary DM traffic on the same connection, and that the 0.46 side marks the connection and doesn't retry.
+- **Cost:** record the fleet-restart bytes, verifies and writes per node against §10. E-D17 requires delivered == published for every gate-row flow.
 
 **Review triggers:**
-- any change to the record contents, the relationship set, the 30-day maximum age, the caps, or `EvidenceV1` admission;
-- any proposal to persist strangers or to seed the discovery cache from the store.
+- any change to the freshness limits, the watermark, `usable()` conditions, the relationship set, the caps, the budgets or `EvidenceV1` admission;
+- any proposal to persist strangers, or to seed another cache from the store.
 
 ## Notes for AI-assisted work
 
-- **Persist signed source bytes, never derived fields,** and re-verify them on load.
-- **Never mark `verified` from a record naming a different machine** than the transport-authenticated one.
-- **A `Hello` carries only the sender's own evidence.** Only a `Lookup` reply may carry a third party's, and the requester re-verifies it.
-- **Do not seed the discovery cache or capability bits from the store.**
-- **Do not persist strangers.**
-- **Must not be marked Accepted without David's review.** This ADR is Proposed.
+- **Persist the verified signed wire bytes** (never re-serialized structs), and re-verify them on load.
+- **The store is consulted at the point of use and is never copied into other caches.**
+- **Freshness is per component.** Ingest (30 min) and use (30 days) are separate limits.
+- **Never mark `verified` from a record naming a different machine.**
+- **A `Hello` carries only the sender's own evidence.** A `Lookup` reply is re-verified and served only to authorized requesters.
+- **Never overwrite an unreadable evidence file.**
+- **Must not be marked Accepted without David's review.**
