@@ -1309,6 +1309,15 @@ fn usize_to_u64_saturating(value: usize) -> u64 {
 /// Stream type byte for direct messages (distinct from gossip: 0, 1, 2).
 pub const DIRECT_MESSAGE_STREAM_TYPE: u8 = 0x10;
 
+/// Whether a raw delivery came from its claimed host's transport or relay injection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DirectIngress {
+    Transport,
+    Relay,
+}
+
+type DirectEvent = (AntPeerId, Bytes, DirectIngress);
+
 /// Stream type byte for application-level relayed DMs (X0X-0070b).
 /// Sits immediately above [`DIRECT_MESSAGE_STREAM_TYPE`] in the
 /// reserved DM region. Older peers without the X0X-0070b receiver
@@ -1953,8 +1962,8 @@ pub struct NetworkNode {
     /// Clone derive shares state; fed by the spawn_observer task.
     churn: Arc<ChurnCounters>,
     /// Receiver channel for direct messages (separate from gossip).
-    direct_tx: mpsc::Sender<(AntPeerId, Bytes)>,
-    direct_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(AntPeerId, Bytes)>>>,
+    direct_tx: mpsc::Sender<DirectEvent>,
+    direct_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<DirectEvent>>>,
     /// Receiver channel for inbound [`crate::peer_relay::RelayedDm`]
     /// envelopes (X0X-0070b). Demuxed by [`RELAYED_DM_STREAM_TYPE`] at
     /// the wire layer; the consumer is the per-agent relay-DM handler
@@ -4503,8 +4512,14 @@ impl NetworkNode {
     ///
     /// Tuple of (sender_peer_id, payload_with_agent_id).
     pub async fn recv_direct(&self) -> Option<(AntPeerId, Bytes)> {
-        let mut rx = self.direct_rx.lock().await;
-        rx.recv().await
+        self.recv_direct_with_ingress()
+            .await
+            .map(|(peer, payload, _)| (peer, payload))
+    }
+
+    /// Preserve relay provenance for recovery routing in the raw listener.
+    pub(crate) async fn recv_direct_with_ingress(&self) -> Option<DirectEvent> {
+        self.direct_rx.lock().await.recv().await
     }
 
     /// Receive the next inbound [`crate::peer_relay::RelayedDm`].
@@ -4546,7 +4561,8 @@ impl NetworkNode {
     ///
     /// Used by the relay-DM handler's `DeliverLocally` arm to make a
     /// relayed envelope land on the canonical direct-DM listener
-    /// indistinguishably from a packet that traversed the direct path.
+    /// with relay provenance retained for evidence recovery. The synthesized
+    /// origin machine is not a transport-authenticated routing hint.
     /// `peer_id` should be the *original* sender's MachineId-as-PeerId
     /// (synthesised from `relayed.inner.sender_machine_id`); `payload`
     /// must follow the existing wire shape
@@ -4565,7 +4581,7 @@ impl NetworkNode {
     ) -> NetworkResult<()> {
         warn_forward_channel_pressure(&self.direct_tx, peer_id, None, "direct_tx (relay-inject)");
         self.direct_tx
-            .send((peer_id, payload))
+            .send((peer_id, payload, DirectIngress::Relay))
             .await
             .map_err(|e| NetworkError::ConnectionFailed(format!("inject direct: {e}")))
     }
@@ -4778,7 +4794,9 @@ impl NetworkNode {
                                 peer_id
                             );
                             let size = payload.len();
-                            if !direct_spill.forward((peer_id, payload), size) {
+                            if !direct_spill
+                                .forward((peer_id, payload, DirectIngress::Transport), size)
+                            {
                                 error!("Failed to forward direct message: spill forwarder closed");
                                 break;
                             }

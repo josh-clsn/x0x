@@ -516,6 +516,60 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn s4_relay_ingress_cannot_seed_host_hints_or_spawn_lookup() {
+        let runtime = Arc::new(EvidenceRuntime::default());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let notify = Arc::clone(&entered);
+        assert!(runtime
+            .lookup_responder
+            .set(Arc::new(move |_| {
+                let notify = Arc::clone(&notify);
+                Box::pin(async move { notify.notify_one() })
+            }))
+            .is_ok());
+        let agent = AgentId([1; 32]);
+        let machine = MachineId([2; 32]);
+        let now = dm_capability::now_unix_ms();
+        let authority = crate::raw_delivery_from_ingress(
+            None,
+            None,
+            Some(&runtime),
+            agent,
+            machine,
+            now,
+            crate::network::DirectIngress::Relay,
+        );
+        assert_eq!(authority, (false, false, None));
+        assert_eq!(runtime.wire_limits.lookups.available_permits(), 16);
+        tokio::task::yield_now().await;
+        assert!(runtime.lookup_hints.machines(agent).is_empty());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), entered.notified())
+                .await
+                .is_err()
+        );
+
+        // The same claim on a direct transport still drives S4 recovery;
+        // neither lane upgrades the triggering frame's authority.
+        assert_eq!(
+            crate::raw_delivery_from_ingress(
+                None,
+                None,
+                Some(&runtime),
+                agent,
+                machine,
+                now,
+                crate::network::DirectIngress::Transport,
+            ),
+            authority
+        );
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(runtime.lookup_hints.machines(agent), vec![machine]);
+    }
+
+    #[tokio::test]
     async fn s4_raw_lookup_silent_responder_does_not_block_other_peer() {
         // Inert raw receive queue plus the production authority/scheduling and
         // dispatch functions. The Lookup transport is an unanswered duplex,
