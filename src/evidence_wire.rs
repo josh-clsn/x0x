@@ -126,6 +126,10 @@ pub(crate) struct Limits {
     state: Mutex<State>,
     allocations: Arc<tokio::sync::Semaphore>,
     lookups: Arc<tokio::sync::Semaphore>,
+    // Strangers may occupy at most half of the aggregate byte reservation.
+    stranger_allocations: Arc<tokio::sync::Semaphore>,
+    prefix: Mutex<HashMap<MachineId, usize>>,
+    pub(crate) prefix_refused: std::sync::atomic::AtomicU64,
 }
 impl Default for Limits {
     fn default() -> Self {
@@ -133,6 +137,9 @@ impl Default for Limits {
             state: Mutex::new(State::default()),
             lookups: Arc::new(tokio::sync::Semaphore::new(16)),
             allocations: Arc::new(tokio::sync::Semaphore::new(TOTAL_ALLOCATION_CAP)),
+            stranger_allocations: Arc::new(tokio::sync::Semaphore::new(TOTAL_ALLOCATION_CAP / 2)),
+            prefix: Mutex::new(HashMap::new()),
+            prefix_refused: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -155,8 +162,41 @@ impl State {
     }
 }
 impl Limits {
-    pub(crate) fn admit(self: &Arc<Self>, machine: MachineId) -> Option<Lease> {
+    /// Only machines without known agents or verified enrollment use this
+    /// pool. Entries exist only while a lease is alive, across all connections.
+    pub(crate) fn admit_prefix(self: &Arc<Self>, machine: MachineId) -> Option<PrefixLease> {
+        let admitted = self.prefix.lock().ok().and_then(|mut slots| {
+            if slots.values().sum::<usize>() >= 32 || slots.get(&machine).copied().unwrap_or(0) >= 2
+            {
+                return None;
+            }
+            *slots.entry(machine).or_default() += 1;
+            Some(PrefixLease {
+                limits: Arc::clone(self),
+                machine,
+            })
+        });
+        if admitted.is_none() {
+            self.prefix_refused
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.reset(machine);
+            tracing::info!(target: "x0x::streams", ?machine,
+                outcome = "deny_pre_identity_capacity", "pre-identity stream refused; resetting");
+        }
+        admitted
+    }
+
+    pub(crate) fn admit(self: &Arc<Self>, machine: MachineId, relationship: bool) -> Option<Lease> {
         let now = Instant::now();
+        let stranger_permit = if relationship {
+            None
+        } else {
+            Some(
+                Arc::clone(&self.stranger_allocations)
+                    .try_acquire_many_owned(ALLOCATION_RESERVATION as u32)
+                    .ok()?,
+            )
+        };
         let permit = Arc::clone(&self.allocations)
             .try_acquire_many_owned(ALLOCATION_RESERVATION as u32)
             .ok()?;
@@ -171,6 +211,7 @@ impl Limits {
             machine,
             deadline: now + DEADLINE,
             _permit: permit,
+            _stranger_permit: stranger_permit,
         })
     }
     fn charge(&self, machine: MachineId, bytes: usize) -> bool {
@@ -274,6 +315,38 @@ impl Limits {
     }
 }
 
+pub(crate) struct PrefixLease {
+    limits: Arc<Limits>,
+    machine: MachineId,
+}
+impl Drop for PrefixLease {
+    fn drop(&mut self) {
+        if let Ok(mut slots) = self.limits.prefix.lock() {
+            if let Some(count) = slots.get_mut(&self.machine) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    slots.remove(&self.machine);
+                }
+            }
+        }
+    }
+}
+
+/// Enrollment or a currently usable evidence record protects allocation
+/// capacity. Transport claims and discovery entries alone cannot claim it.
+pub(crate) async fn reserved_peer(
+    store: Option<&crate::peer_evidence::PeerEvidenceStore>,
+    owner: &crate::owner_trust::OwnerTrust,
+    revoked: &tokio::sync::RwLock<crate::revocation::RevocationSet>,
+    machine: MachineId,
+) -> bool {
+    if revoked.read().await.is_machine_revoked(&machine) {
+        return false;
+    }
+    owner.is_enrolled_owner_machine(revoked, &machine).await
+        || store.is_some_and(|s| s.has_machine(machine, dm_capability::now_unix_ms()))
+}
+
 /// Held across queueing, reading, verification and replying; dropping resets
 /// release both the machine slot and the aggregate reservation, even on abort.
 pub(crate) struct Lease {
@@ -281,6 +354,7 @@ pub(crate) struct Lease {
     machine: MachineId,
     pub(crate) deadline: Instant,
     _permit: tokio::sync::OwnedSemaphorePermit,
+    _stranger_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 impl Drop for Lease {
     fn drop(&mut self) {
@@ -349,10 +423,11 @@ pub(crate) fn ingest_hello(
             .cloned()
             .and_then(|s| s.certificate_for(ann.agent_id, machine, ann.cert_digest, now));
     }
-    if !limits.verify() {
-        return Err(invalid("evidence verify budget"));
-    }
-    let view = Arc::new(record.verify(now, W_MS).map_err(io::Error::other)?);
+    let view = Arc::new(
+        record
+            .verify_budgeted(now, W_MS, &mut || limits.verify())
+            .map_err(io::Error::other)?,
+    );
     if let Some(cert) = &view.certificate {
         if announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone())) != ann.cert_digest {
             return Err(invalid("certificate digest mismatch"));
@@ -669,7 +744,16 @@ impl Context {
         let lease = self
             .runtime
             .wire_limits
-            .admit(machine)
+            .admit(
+                machine,
+                reserved_peer(
+                    self.runtime.store().as_deref(),
+                    &self.owner,
+                    &self.revoked,
+                    machine,
+                )
+                .await,
+            )
             .ok_or_else(|| invalid("evidence stream budget"))?;
         let (kind, body) = tokio::time::timeout_at(lease.deadline, async {
             let (mut send, mut recv) = self
@@ -924,11 +1008,11 @@ mod tests {
     async fn s3_hostile_requester_shares_all_connection_budgets() {
         let limits = Arc::new(Limits::default());
         let m = MachineId([1; 32]);
-        let first_connection = limits.admit(m).unwrap();
-        let second_connection = limits.admit(m).unwrap();
-        assert!(limits.admit(m).is_none());
+        let first_connection = limits.admit(m, false).unwrap();
+        let second_connection = limits.admit(m, false).unwrap();
+        assert!(limits.admit(m, false).is_none());
         drop(first_connection);
-        let third_connection = limits.admit(m).unwrap();
+        let third_connection = limits.admit(m, false).unwrap();
         assert!(limits.request(m, false));
         assert!(!limits.request(m, false));
         limits.disconnect(m); // reconnect cannot reset the rate or byte windows
@@ -949,9 +1033,9 @@ mod tests {
         let limits = Arc::new(Limits::default());
         let mut leases = Vec::new();
         for id in 0..(TOTAL_ALLOCATION_CAP / ALLOCATION_RESERVATION) {
-            leases.push(limits.admit(MachineId([id as u8; 32])).unwrap());
+            leases.push(limits.admit(MachineId([id as u8; 32]), true).unwrap());
         }
-        assert!(limits.admit(MachineId([99; 32])).is_none());
+        assert!(limits.admit(MachineId([99; 32]), true).is_none());
         drop(leases);
         assert_eq!(limits.allocations.available_permits(), TOTAL_ALLOCATION_CAP);
         for id in 0..4 {
@@ -965,6 +1049,39 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(limits.verify());
         assert!(limits.charge(MachineId([5; 32]), 64 * 1024));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn s3_strangers_cannot_exhaust_relationship_reservations() {
+        let limits = Arc::new(Limits::default());
+        let mut strangers = Vec::new();
+        // Four identities could previously consume all eight reservations.
+        for id in 0..2 {
+            for _ in 0..2 {
+                strangers.push(limits.admit(MachineId([id; 32]), false).unwrap());
+            }
+        }
+        assert!(limits.admit(MachineId([2; 32]), false).is_none());
+        assert!(limits.admit(MachineId([3; 32]), false).is_none());
+        let mut related = Vec::new();
+        for id in 4..6 {
+            for _ in 0..2 {
+                related.push(limits.admit(MachineId([id; 32]), true).unwrap());
+            }
+        }
+        assert_eq!(limits.allocations.available_permits(), 0);
+        assert!(limits.admit(MachineId([6; 32]), true).is_none());
+        drop(related);
+        // Releasing protected slots does not let strangers borrow them.
+        assert!(limits.admit(MachineId([2; 32]), false).is_none());
+        drop(strangers.pop());
+        assert!(limits.admit(MachineId([2; 32]), false).is_some());
+        drop(strangers);
+        assert_eq!(limits.allocations.available_permits(), TOTAL_ALLOCATION_CAP);
+        assert_eq!(
+            limits.stranger_allocations.available_permits(),
+            TOTAL_ALLOCATION_CAP / 2
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1023,7 +1140,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn s3_slow_body_deadline_includes_queue_delay_and_releases_budget() {
         let limits = Arc::new(Limits::default());
-        let lease = limits.admit(MachineId([1; 32])).unwrap();
+        let lease = limits.admit(MachineId([1; 32]), false).unwrap();
         tokio::time::advance(Duration::from_secs(4)).await; // queued acceptor
         let (_tx, mut rx) = tokio::io::duplex(32);
         let start = Instant::now();

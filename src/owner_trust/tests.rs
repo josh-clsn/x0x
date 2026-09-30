@@ -871,3 +871,161 @@ async fn no_device_store_or_no_owner_admits_nothing() {
     m.trust.install_device_store(Arc::clone(&m.devices));
     assert!(!m.sync_v1_admitted().await, "ownerless install");
 }
+
+/// Inert production admission regression: no QUIC node, sockets, or gossip.
+#[tokio::test(start_paused = true)]
+async fn s3_stream_gate_silent_strangers_cannot_block_known_or_enrolled_sync() {
+    use crate::streams::{read_protocol_prefix, StreamProtocol, PREFIX_READ_TIMEOUT};
+    use tokio::io::AsyncWriteExt;
+    let (_owner, f) = Fixture::same_owner().await;
+    let limits = Arc::new(crate::evidence_wire::Limits::default());
+    let mut held = Vec::new();
+    let mut silent_writers = Vec::new();
+    for id in 0..16 {
+        let machine = MachineId([id; 32]);
+        for _ in 0..2 {
+            let admission = crate::Agent::admit_stream_before_prefix(
+                &f.cache,
+                &f.contacts,
+                &f.revocations,
+                &f.move_state,
+                &f.connect_policy,
+                &f.trust,
+                &machine,
+                &limits,
+            )
+            .await
+            .unwrap();
+            assert!(admission.agents.is_none());
+            assert!(admission.prefix.is_some());
+            let (tx, mut rx) = tokio::io::duplex(1);
+            silent_writers.push(tx);
+            held.push(tokio::spawn(async move {
+                let _admission = admission;
+                tokio::time::timeout(PREFIX_READ_TIMEOUT, read_protocol_prefix(&mut rx)).await
+            }));
+        }
+        assert!(crate::Agent::admit_stream_before_prefix(
+            &f.cache,
+            &f.contacts,
+            &f.revocations,
+            &f.move_state,
+            &f.connect_policy,
+            &f.trust,
+            &machine,
+            &limits,
+        )
+        .await
+        .is_none());
+    }
+    tokio::task::yield_now().await; // All silent readers are now pending.
+    assert!(limits.admit_prefix(MachineId([99; 32])).is_none());
+    assert_eq!(
+        limits
+            .prefix_refused
+            .load(std::sync::atomic::Ordering::Relaxed),
+        17
+    );
+    let start = tokio::time::Instant::now();
+    // Exercise the same pre-prefix admission as the production accept loop.
+    let known = crate::Agent::admit_stream_before_prefix(
+        &f.cache,
+        &f.contacts,
+        &f.revocations,
+        &f.move_state,
+        &f.connect_policy,
+        &f.trust,
+        &f.machine_id,
+        &limits,
+    )
+    .await
+    .unwrap();
+    assert_eq!(known.agents, Some(vec![f.agent_id]));
+    assert!(known.prefix.is_none());
+    let (mut tx, mut rx) = tokio::io::duplex(1);
+    tx.write_u8(StreamProtocol::SyncV1.as_u8()).await.unwrap();
+    assert_eq!(
+        read_protocol_prefix(&mut rx).await.unwrap(),
+        StreamProtocol::SyncV1
+    );
+    assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+    assert!(held.iter().all(|task| !task.is_finished()));
+    // The enrolled-only path also bypasses the saturated pool and still
+    // admits only owner sync when no agent is known.
+    f.cache.write().await.clear();
+    let enrolled = crate::Agent::admit_stream_before_prefix(
+        &f.cache,
+        &f.contacts,
+        &f.revocations,
+        &f.move_state,
+        &f.connect_policy,
+        &f.trust,
+        &f.machine_id,
+        &limits,
+    )
+    .await
+    .unwrap();
+    assert!(enrolled.agents.is_none() && enrolled.prefix.is_none());
+    let delivered = crate::Agent::route_enrolled_owner_sync(
+        &f.cache,
+        &f.revocations,
+        &f.trust,
+        &f.machine_id,
+        StreamProtocol::SyncV1,
+        || true,
+    )
+    .await;
+    assert!(matches!(
+        delivered,
+        crate::EnrolledOwnerSyncRoute::Admitted(true)
+    ));
+    for task in held {
+        task.abort();
+        let _ = task.await;
+    }
+    assert!(limits.admit_prefix(MachineId([99; 32])).is_some());
+}
+
+#[tokio::test]
+async fn s3_stream_gate_known_denial_precedes_prefix_admission() {
+    let (_owner, mut f) = Fixture::same_owner().await;
+    f.trust = OwnerTrust::new(None, AuthenticatedMachineBindings::default());
+    let limits = Arc::new(crate::evidence_wire::Limits::default());
+    assert!(crate::Agent::admit_stream_before_prefix(
+        &f.cache,
+        &f.contacts,
+        &f.revocations,
+        &f.move_state,
+        &f.connect_policy,
+        &f.trust,
+        &f.machine_id,
+        &limits,
+    )
+    .await
+    .is_none());
+    assert_eq!(
+        limits
+            .prefix_refused
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+}
+
+#[tokio::test]
+async fn s3_enrolled_machine_gets_reserved_evidence_capacity_without_discovery() {
+    let (_owner, f) = UnknownMachine::enrolled().await;
+    let limits = Arc::new(crate::evidence_wire::Limits::default());
+    let strangers: Vec<_> = (0..4)
+        .map(|id| limits.admit(MachineId([id; 32]), false).unwrap())
+        .collect();
+    let related =
+        crate::evidence_wire::reserved_peer(None, &f.trust, &f.revocations, f.machine_id).await;
+    assert!(related);
+    assert!(limits.admit(f.machine_id, related).is_some());
+    let stranger = MachineId([99; 32]);
+    let related =
+        crate::evidence_wire::reserved_peer(None, &f.trust, &f.revocations, stranger).await;
+    assert!(!related);
+    assert!(limits.admit(stranger, related).is_none());
+    drop(strangers);
+}

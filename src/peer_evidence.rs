@@ -201,7 +201,20 @@ fn announcement_ms(a: &IdentityAnnouncementV3) -> Result<u64> {
         .checked_mul(1000)
         .ok_or(EvidenceError::Invalid("timestamp overflow"))
 }
-fn verify_advert(bytes: &[u8], key: &[u8], now: u64, age: u64) -> Result<CapabilityAdvert> {
+fn charge_verify(charge: &mut impl FnMut() -> bool) -> Result<()> {
+    if charge() {
+        Ok(())
+    } else {
+        Err(EvidenceError::Invalid("evidence verify budget"))
+    }
+}
+fn verify_advert(
+    bytes: &[u8],
+    key: &[u8],
+    now: u64,
+    age: u64,
+    charge: &mut impl FnMut() -> bool,
+) -> Result<CapabilityAdvert> {
     if bytes.len() > ADVERT_CAP {
         return Err(EvidenceError::Invalid("advert cap"));
     }
@@ -209,8 +222,11 @@ fn verify_advert(bytes: &[u8], key: &[u8], now: u64, age: u64) -> Result<Capabil
         .map_err(|_| EvidenceError::Invalid("advert encoding"))?;
     if advert.protocol_version != crate::dm_capability_service::ADVERT_PROTOCOL_VERSION
         || !fresh(advert.created_at_unix_ms, now, age)
-        || !signature_check(|| crate::dm_capability_service::verify_advert_signature(&advert, key))
     {
+        return Err(EvidenceError::Invalid("advert signature or freshness"));
+    }
+    charge_verify(charge)?;
+    if !signature_check(|| crate::dm_capability_service::verify_advert_signature(&advert, key)) {
         return Err(EvidenceError::Invalid("advert signature or freshness"));
     }
     if let Some(trailer) = trailer {
@@ -222,6 +238,7 @@ fn verify_advert(bytes: &[u8], key: &[u8], now: u64, age: u64) -> Result<Capabil
         let signature =
             ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&trailer.signature)
                 .map_err(|_| EvidenceError::Invalid("trailer signature"))?;
+        charge_verify(charge)?;
         signature_check(|| {
             ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(&key, &bytes, &signature)
         })
@@ -245,8 +262,19 @@ impl EvidenceRecordV1 {
     }
     /// Verify signed bytes once at load (L) or network ingest (W).
     pub fn verify(&self, now: u64, max_age_ms: u64) -> Result<EvidenceView> {
+        self.verify_budgeted(now, max_age_ms, &mut || true)
+    }
+    /// Charge immediately before each actual signature verification, including
+    /// optional advert trailers and certificates, and failed signatures.
+    pub(crate) fn verify_budgeted(
+        &self,
+        now: u64,
+        max_age_ms: u64,
+        charge: &mut impl FnMut() -> bool,
+    ) -> Result<EvidenceView> {
         self.bounds()?;
         let announcement = announce_v3::deserialize_v3(&self.announcement)?;
+        charge_verify(charge)?;
         signature_check(|| announcement.verify())
             .map_err(|_| EvidenceError::Invalid("announcement signature"))?;
         if !fresh(announcement_ms(&announcement)?, now, max_age_ms) {
@@ -257,6 +285,7 @@ impl EvidenceRecordV1 {
             &announcement.agent_public_key,
             now,
             max_age_ms,
+            charge,
         )?;
         if advert.agent_id != *announcement.agent_id.as_bytes()
             || advert.machine_id != *announcement.machine_id.as_bytes()
@@ -278,6 +307,7 @@ impl EvidenceRecordV1 {
                 {
                     return Err(EvidenceError::Invalid("certificate trailing bytes"));
                 }
+                charge_verify(charge)?;
                 signature_check(|| cert.verify())
                     .map_err(|_| EvidenceError::Invalid("certificate signature"))?;
                 if cert.agent_id().ok() != Some(announcement.agent_id)
@@ -866,7 +896,7 @@ impl PeerEvidenceStore {
     /// Verified advert-only move: removes old authority and writes the watermark
     /// atomically. The agent key is hash-checked by the advert verifier.
     pub fn ingest_move_advert(&self, bytes: &[u8], agent_key: &[u8], now: u64) -> Result<()> {
-        let advert = verify_advert(bytes, agent_key, now, W_MS)?;
+        let advert = verify_advert(bytes, agent_key, now, W_MS, &mut || true)?;
         let a = AgentId(advert.agent_id);
         let m = MachineId(advert.machine_id);
         let _mutation = self.lock_mutation()?;
@@ -1880,6 +1910,95 @@ mod tests {
         assert!(reopened.usable(p.a(), p.m(), NOW + 180_000).is_some());
         assert!(reopened.live(p.a(), NOW + 180_000).is_none());
     }
+    #[tokio::test(start_paused = true)]
+    async fn s3_verify_budget_charges_each_signature_and_stops_before_crypto() {
+        let p = Peer::new();
+        let mut record = p.record(NOW, NOW);
+        let cert = AgentCertificate::issue(&UserKeypair::generate().unwrap(), &p.agent).unwrap();
+        record.certificate = Some(cert.to_storage_bytes().unwrap());
+        let mut ann = announce_v3::deserialize_v3(&record.announcement).unwrap();
+        ann.cert_digest = announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert));
+        ann.sign_v3_1(p.machine.secret_key()).unwrap();
+        record.announcement = announce_v3::serialize_v3_1(&ann).unwrap();
+        let limits = crate::evidence_wire::Limits::default();
+        let capture = VerifiedWireCapture::default();
+        let ingest = |record| {
+            crate::evidence_wire::ingest_hello(None, &capture, &limits, p.m(), record, NOW)
+        };
+        VERIFY_CALLS.set(0);
+        for _ in 0..8 {
+            ingest(record.clone()).unwrap();
+        }
+        assert_eq!(VERIFY_CALLS.get(), 32, "eight Hellos cost 32 signatures");
+        assert!(ingest(record.clone()).is_err());
+        assert_eq!(VERIFY_CALLS.get(), 32, "budget rejection runs no crypto");
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        VERIFY_CALLS.set(0);
+        // Absent certificates cost three, absent trailers cost two.
+        let no_cert = p.record(NOW, NOW);
+        ingest(no_cert.clone()).unwrap();
+        assert_eq!(VERIFY_CALLS.get(), 3);
+        let mut base = no_cert;
+        let (advert, _) = CapabilityAdvert::decode_evidence(&base.advert).unwrap();
+        base.advert = postcard::to_stdvec(&advert).unwrap();
+        ingest(base.clone()).unwrap();
+        assert_eq!(VERIFY_CALLS.get(), 5);
+        for _ in 0..6 {
+            ingest(record.clone()).unwrap();
+        }
+        assert_eq!(VERIFY_CALLS.get(), 29);
+        assert!(ingest(record.clone()).is_err());
+        assert_eq!(
+            VERIFY_CALLS.get(),
+            32,
+            "exhaustion stops before certificate verification"
+        );
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        VERIFY_CALLS.set(0);
+        let mut bad = announce_v3::deserialize_v3(&base.announcement).unwrap();
+        bad.machine_signature[0] ^= 1;
+        base.announcement = announce_v3::serialize_v3_1(&bad).unwrap();
+        for _ in 0..32 {
+            assert!(ingest(base.clone()).is_err());
+        }
+        assert_eq!(
+            VERIFY_CALLS.get(),
+            32,
+            "failed signatures also consume credit"
+        );
+        assert!(ingest(record).is_err());
+        assert_eq!(VERIFY_CALLS.get(), 32);
+    }
+
+    #[tokio::test]
+    async fn s3_recorded_machine_gets_reserved_capacity_only_while_usable() {
+        let p = Peer::new();
+        let (_dir, policy, store) = setup(&p);
+        let now = crate::dm_capability::now_unix_ms();
+        store
+            .ingest(p.record(now, now), IngestSource::Hello, now)
+            .unwrap();
+        let owner = crate::owner_trust::OwnerTrust::new(
+            None,
+            crate::dm_inbox::AuthenticatedMachineBindings::default(),
+        );
+        let revoked = tokio::sync::RwLock::new(crate::revocation::RevocationSet::new());
+        let limits = Arc::new(crate::evidence_wire::Limits::default());
+        let strangers: Vec<_> = (0..4)
+            .map(|id| limits.admit(MachineId([id; 32]), false).unwrap())
+            .collect();
+        let related =
+            crate::evidence_wire::reserved_peer(Some(&store), &owner, &revoked, p.m()).await;
+        assert!(related);
+        assert!(limits.admit(p.m(), related).is_some());
+        policy.peers.lock().unwrap().clear();
+        let related =
+            crate::evidence_wire::reserved_peer(Some(&store), &owner, &revoked, p.m()).await;
+        assert!(!related);
+        assert!(limits.admit(p.m(), related).is_none());
+        drop(strangers);
+    }
+
     #[test]
     fn s3_hello_ingest_binds_transport_and_refreshes_each_component() {
         let p = Peer::new();

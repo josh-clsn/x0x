@@ -321,7 +321,9 @@ impl Context {
         let lease = self
             .runtime
             .wire_limits
-            .admit(machine)
+            // Lookup targets are chosen only from relationship-context
+            // peers, so the pull runs in the reserved (non-stranger) pool.
+            .admit(machine, true)
             .ok_or_else(|| invalid("lookup stream budget"))?;
         let mut reset = ResetOnDrop {
             limits: Arc::clone(&self.runtime.wire_limits),
@@ -812,9 +814,9 @@ mod tests {
     async fn s4_hostile_requester_not_found_bytes_and_deadline() {
         let limits = Arc::new(Limits::default());
         let machine = MachineId([4; 32]);
-        let first = limits.admit(machine).unwrap();
-        let second = limits.admit(machine).unwrap();
-        assert!(limits.admit(machine).is_none());
+        let first = limits.admit(machine, false).unwrap();
+        let second = limits.admit(machine, false).unwrap();
+        assert!(limits.admit(machine, false).is_none());
         assert!(limits.request(machine, false));
         assert!(!limits.request(machine, false));
         limits.disconnect(machine);
@@ -831,7 +833,7 @@ mod tests {
         assert!(limits.charge(machine, 64 * 1024 - 5));
         assert!(!limits.charge(machine, 1));
         drop((first, second));
-        let lease = limits.admit(machine).unwrap();
+        let lease = limits.admit(machine, false).unwrap();
         let (_send, mut recv) = tokio::io::duplex(32);
         assert!(
             tokio::time::timeout_at(lease.deadline, read_message(&mut recv))
