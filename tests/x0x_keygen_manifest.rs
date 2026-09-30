@@ -39,7 +39,19 @@ fn run_manifest(
     key_path: &Path,
     output_dir: &Path,
 ) -> Result<Output, Box<dyn Error>> {
-    Ok(Command::new(bin_path())
+    run_manifest_with_base(version, assets_dir, skill_path, key_path, output_dir, None)
+}
+
+fn run_manifest_with_base(
+    version: &str,
+    assets_dir: &Path,
+    skill_path: &Path,
+    key_path: &Path,
+    output_dir: &Path,
+    base_url: Option<&str>,
+) -> Result<Output, Box<dyn Error>> {
+    let mut command = Command::new(bin_path());
+    command
         .args(["manifest", "--version", version, "--assets-dir"])
         .arg(assets_dir)
         .args(["--skill-path"])
@@ -47,8 +59,20 @@ fn run_manifest(
         .args(["--key"])
         .arg(key_path)
         .args(["--output-dir"])
-        .arg(output_dir)
-        .output()?)
+        .arg(output_dir);
+    if let Some(base_url) = base_url {
+        command.args(["--base-url"]).arg(base_url);
+    }
+    Ok(command.output()?)
+}
+
+fn signed_fixture(root: &Path) -> Result<ManifestFixture, Box<dyn Error>> {
+    let fixture = create_manifest_fixture(root)?;
+    std::fs::write(
+        fixture.assets_dir.join("x0x-linux-x64-gnu.tar.gz.sig"),
+        b"signature",
+    )?;
+    Ok(fixture)
 }
 
 struct ManifestFixture {
@@ -161,5 +185,118 @@ fn manifest_succeeds_when_archive_signature_exists() -> Result<(), Box<dyn Error
         return Err("manifest signature was not written".into());
     }
 
+    Ok(())
+}
+
+/// DEFAULT UNCHANGED (row 7b ruling): without --base-url every URL is
+/// byte-identical to the GitHub release form the workflow has always
+/// produced — archive, signature AND skill, full string equality.
+#[test]
+fn manifest_default_urls_are_byte_identical_to_the_github_release_form(
+) -> Result<(), Box<dyn Error>> {
+    let tempdir = tempfile::tempdir()?;
+    let fixture = signed_fixture(tempdir.path())?;
+
+    let output = run_manifest(
+        "0.46.0",
+        &fixture.assets_dir,
+        &fixture.skill_path,
+        &fixture.key_path,
+        &fixture.output_dir,
+    )?;
+    if !output.status.success() {
+        return Err(format!("manifest failed\n{}", command_failure(&output)).into());
+    }
+
+    let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+        fixture.output_dir.join("release-manifest.json"),
+    )?)?;
+    let asset = manifest["assets"][0]
+        .get("archive_url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("no archive_url")?;
+    let sig = manifest["assets"][0]
+        .get("signature_url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("no signature_url")?;
+    let skill = manifest["skill_url"].as_str().ok_or("no skill_url")?;
+
+    assert_eq!(
+        asset,
+        "https://github.com/saorsa-labs/x0x/releases/download/v0.46.0/x0x-linux-x64-gnu.tar.gz"
+    );
+    assert_eq!(
+        sig,
+        "https://github.com/saorsa-labs/x0x/releases/download/v0.46.0/x0x-linux-x64-gnu.tar.gz.sig"
+    );
+    assert_eq!(
+        skill,
+        "https://github.com/saorsa-labs/x0x/releases/download/v0.46.0/SKILL.md"
+    );
+    Ok(())
+}
+
+/// With --base-url, every URL points under the given base — the row 7b
+/// rehearsal shape (a node-local origin, no GitHub). A trailing slash
+/// must not double up.
+#[test]
+fn manifest_base_url_redirects_every_asset_url() -> Result<(), Box<dyn Error>> {
+    let tempdir = tempfile::tempdir()?;
+    let fixture = signed_fixture(tempdir.path())?;
+
+    let output = run_manifest_with_base(
+        "0.46.1",
+        &fixture.assets_dir,
+        &fixture.skill_path,
+        &fixture.key_path,
+        &fixture.output_dir,
+        Some("http://127.0.0.1:8443/"),
+    )?;
+    if !output.status.success() {
+        return Err(format!("manifest failed\n{}", command_failure(&output)).into());
+    }
+
+    let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+        fixture.output_dir.join("release-manifest.json"),
+    )?)?;
+    assert_eq!(
+        manifest["assets"][0]["archive_url"],
+        "http://127.0.0.1:8443/v0.46.1/x0x-linux-x64-gnu.tar.gz"
+    );
+    assert_eq!(
+        manifest["assets"][0]["signature_url"],
+        "http://127.0.0.1:8443/v0.46.1/x0x-linux-x64-gnu.tar.gz.sig"
+    );
+    assert_eq!(
+        manifest["skill_url"],
+        "http://127.0.0.1:8443/v0.46.1/SKILL.md"
+    );
+    Ok(())
+}
+
+/// Nonsense schemes refuse before anything is written, so no rehearsal
+/// manifest can silently end up relative or non-http.
+#[test]
+fn manifest_base_url_rejects_non_http_schemes() -> Result<(), Box<dyn Error>> {
+    for bad in ["ftp://example.org", "/relative", ""] {
+        let tempdir = tempfile::tempdir()?;
+        let fixture = signed_fixture(tempdir.path())?;
+        let output = run_manifest_with_base(
+            "0.46.1",
+            &fixture.assets_dir,
+            &fixture.skill_path,
+            &fixture.key_path,
+            &fixture.output_dir,
+            Some(bad),
+        )?;
+        assert!(
+            !output.status.success(),
+            "--base-url {bad:?} must be refused"
+        );
+        assert!(
+            !fixture.output_dir.join("release-manifest.json").exists(),
+            "no manifest may be written for a refused --base-url"
+        );
+    }
     Ok(())
 }
