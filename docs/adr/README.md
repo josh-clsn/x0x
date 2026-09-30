@@ -216,7 +216,7 @@ ADR 0060 as a record; ADR 0093 adds the capability-advert registry (D08).
 | --- | --- | --- | --- |
 | 0 | `share_grant_v1` | Understands and validates the ShareGrant v1 typed DM | ADR 0093 |
 | 1 | `predecessor_offer_v1` | Understands the predecessor/requester offer route and its application handling | ADR 0093 |
-| 2 | `peer_evidence_v1` | Accepts `EvidenceV1` (stream protocol 0x06) evidence Hello/Lookup streams | ADR 0089 (accepted 2026-09-30; advertised once the S5 implementation ships) |
+| 2 | `peer_evidence_v1` | Accepts `EvidenceV1` (stream protocol 0x06) evidence Hello/Lookup streams | ADR 0089 (accepted 2026-09-30; advertised since the S5 slice) |
 | 3–63 | unallocated | Must not be advertised until allocated | — |
 
 ## Errata (Accepted ADRs are immutable; corrections recorded here)

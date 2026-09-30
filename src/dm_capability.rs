@@ -431,6 +431,32 @@ impl CapabilityStore {
         Ok(())
     }
 
+    /// Whether the newest CURRENT VERIFIED advert signed by `machine`
+    /// supports `bit` (ADR 0089 S5 / ADR 0093 bit 2).
+    ///
+    /// `Some(false)` — a current verified advert that lacks the bit —
+    /// lets callers skip evidence Hello/Lookup to that machine.
+    /// `None` (unknown: no current verified advert for the machine,
+    /// or only card-only/expired state) keeps the ADR 0093 rule: send
+    /// once and let the peer's behaviour decide.
+    pub fn machine_registry_supports(&self, machine: &MachineId, bit: u64) -> Option<bool> {
+        let Ok(inner) = self.inner.lock() else {
+            return None;
+        };
+        let now = Instant::now();
+        inner
+            .adverts
+            .values()
+            .filter(|entry| {
+                entry.verified_advert
+                    && entry.machine_id == machine.0
+                    && entry.machine_id != [0; 32]
+                    && now <= entry.expires_at
+            })
+            .max_by_key(|entry| entry.created_at_unix_ms)
+            .map(|entry| entry.capabilities.application_registry.supports(bit))
+    }
+
     /// Look up a peer's capability together with the machine that signed it.
     pub fn lookup_binding(&self, agent_id: &AgentId) -> Option<CapabilityBinding> {
         self.lookup_binding_at(agent_id, Instant::now())
@@ -1662,5 +1688,63 @@ mod digest_diagnostic_tests {
         assert!(view["rows"][0]["base_advert"].is_null());
         assert_eq!(view["rows"][0]["fresh_forward_downgrade_baseline"], false);
         assert_eq!(store.digest_diagnostic_snapshot(now, None).rows.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod s5_bit2_tests {
+    use super::*;
+    use crate::dm::CapabilityRegistry;
+
+    fn caps_with(bits: u64) -> crate::dm::DmCapabilities {
+        let mut caps = crate::dm::DmCapabilities::v1_gossip_ready(vec![42; 1184]);
+        caps.application_registry = CapabilityRegistry { version: 1, bits };
+        caps
+    }
+
+    #[test]
+    fn current_registry_advertises_peer_evidence_v1() {
+        let registry = CapabilityRegistry::current();
+        assert!(registry.supports(CapabilityRegistry::PEER_EVIDENCE_V1));
+        assert!(registry.supports(CapabilityRegistry::SHARE_GRANT_V1));
+        assert!(registry.supports(CapabilityRegistry::PREDECESSOR_OFFER_V1));
+    }
+
+    #[test]
+    fn machine_registry_supports_distinguishes_known_lacking_from_unknown() {
+        let store = CapabilityStore::new();
+        let machine = MachineId([7; 32]);
+        let agent = AgentId([9; 32]);
+        // Unknown: no advert at all — ADR 0093 says still send.
+        assert_eq!(
+            store.machine_registry_supports(&machine, CapabilityRegistry::PEER_EVIDENCE_V1),
+            None
+        );
+        // A current verified advert WITHOUT bit 2 — skip the Hello/Lookup.
+        let now = crate::dm_capability::now_unix_ms();
+        store.insert(agent, machine, caps_with(0), now);
+        assert_eq!(
+            store.machine_registry_supports(&machine, CapabilityRegistry::PEER_EVIDENCE_V1),
+            Some(false)
+        );
+        // ... and one WITH bit 2 sends.
+        store.insert(
+            agent,
+            machine,
+            caps_with(CapabilityRegistry::PEER_EVIDENCE_V1),
+            now + 1,
+        );
+        assert_eq!(
+            store.machine_registry_supports(&machine, CapabilityRegistry::PEER_EVIDENCE_V1),
+            Some(true)
+        );
+        // Other machines stay unknown.
+        assert_eq!(
+            store.machine_registry_supports(
+                &MachineId([8; 32]),
+                CapabilityRegistry::PEER_EVIDENCE_V1
+            ),
+            None
+        );
     }
 }

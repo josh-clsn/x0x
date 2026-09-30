@@ -121,6 +121,50 @@ struct State {
     targets: HashMap<AgentId, Instant>,
 }
 
+/// ADR 0089 S5 diagnostics counters for the evidence wire, surfaced via
+/// `/diagnostics` (`peer_evidence`). Atomics on `Limits`, which every
+/// connection, acceptor and outbound exchange already shares.
+#[derive(Default)]
+pub(crate) struct WireCounters {
+    pub(crate) evidence_hello_sent: std::sync::atomic::AtomicU64,
+    pub(crate) evidence_hello_received: std::sync::atomic::AtomicU64,
+    pub(crate) evidence_hello_refused: std::sync::atomic::AtomicU64,
+    pub(crate) evidence_lookup_sent: std::sync::atomic::AtomicU64,
+    pub(crate) evidence_lookup_served: std::sync::atomic::AtomicU64,
+    pub(crate) evidence_lookup_refused: std::sync::atomic::AtomicU64,
+    pub(crate) evidence_lookup_unauthorized: std::sync::atomic::AtomicU64,
+    pub(crate) evidence_bytes_in: std::sync::atomic::AtomicU64,
+    pub(crate) evidence_bytes_out: std::sync::atomic::AtomicU64,
+    pub(crate) evidence_verifies: std::sync::atomic::AtomicU64,
+}
+
+impl WireCounters {
+    fn bump(field: &std::sync::atomic::AtomicU64) {
+        field.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn add(field: &std::sync::atomic::AtomicU64, bytes: usize) {
+        field.fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The `/diagnostics` shape (ADR 0089 §Neutral/Operational).
+    pub(crate) fn json(&self) -> serde_json::Value {
+        use std::sync::atomic::Ordering::Relaxed;
+        serde_json::json!({
+            "evidence_hello_sent": self.evidence_hello_sent.load(Relaxed),
+            "evidence_hello_received": self.evidence_hello_received.load(Relaxed),
+            "evidence_hello_refused": self.evidence_hello_refused.load(Relaxed),
+            "evidence_lookup_sent": self.evidence_lookup_sent.load(Relaxed),
+            "evidence_lookup_served": self.evidence_lookup_served.load(Relaxed),
+            "evidence_lookup_refused": self.evidence_lookup_refused.load(Relaxed),
+            "evidence_lookup_unauthorized": self.evidence_lookup_unauthorized.load(Relaxed),
+            "evidence_bytes_in": self.evidence_bytes_in.load(Relaxed),
+            "evidence_bytes_out": self.evidence_bytes_out.load(Relaxed),
+            "evidence_verifies": self.evidence_verifies.load(Relaxed),
+        })
+    }
+}
+
 /// Shared by every connection, acceptor, and outbound exchange on this node.
 pub(crate) struct Limits {
     state: Mutex<State>,
@@ -130,6 +174,7 @@ pub(crate) struct Limits {
     stranger_allocations: Arc<tokio::sync::Semaphore>,
     prefix: Mutex<HashMap<MachineId, usize>>,
     pub(crate) prefix_refused: std::sync::atomic::AtomicU64,
+    pub(crate) counters: WireCounters,
 }
 impl Default for Limits {
     fn default() -> Self {
@@ -140,6 +185,7 @@ impl Default for Limits {
             stranger_allocations: Arc::new(tokio::sync::Semaphore::new(TOTAL_ALLOCATION_CAP / 2)),
             prefix: Mutex::new(HashMap::new()),
             prefix_refused: std::sync::atomic::AtomicU64::new(0),
+            counters: WireCounters::default(),
         }
     }
 }
@@ -247,6 +293,7 @@ impl Limits {
             return false;
         }
         s.verifies.add(now, 1);
+        WireCounters::bump(&self.counters.evidence_verifies);
         true
     }
     fn request(&self, machine: MachineId, hello: bool) -> bool {
@@ -366,7 +413,10 @@ impl Drop for Lease {
     }
 }
 
-async fn read_message(reader: &mut (impl AsyncRead + Unpin)) -> io::Result<(u8, Vec<u8>)> {
+async fn read_message(
+    reader: &mut (impl AsyncRead + Unpin),
+    limits: &Limits,
+) -> io::Result<(u8, Vec<u8>)> {
     let kind = reader.read_u8().await?;
     let length = reader.read_u32().await? as usize;
     if length > MESSAGE_CAP - 5 {
@@ -379,6 +429,7 @@ async fn read_message(reader: &mut (impl AsyncRead + Unpin)) -> io::Result<(u8, 
     if reader.read(&mut [0u8; 1]).await? != 0 {
         return Err(invalid("evidence trailing frame"));
     }
+    WireCounters::add(&limits.counters.evidence_bytes_in, length + 5);
     Ok((kind, body))
 }
 async fn write_message(
@@ -394,7 +445,20 @@ async fn write_message(
     writer.write_u8(kind).await?;
     writer.write_u32(body.len() as u32).await?;
     writer.write_all(body).await?;
-    writer.shutdown().await
+    writer.shutdown().await?;
+    let framed = body.len() as u64 + 5;
+    WireCounters::add(&limits.counters.evidence_bytes_out, framed as usize);
+    match kind {
+        // Outbound Hello (connect path or simultaneous reply).
+        HELLO => WireCounters::bump(&limits.counters.evidence_hello_sent),
+        // Outbound Lookup request.
+        LOOKUP => WireCounters::bump(&limits.counters.evidence_lookup_sent),
+        // A served Lookup answer. NOT_FOUND is charged the same as FOUND
+        // (ADR 0089 §6 responder budgets).
+        FOUND | NOT_FOUND => WireCounters::bump(&limits.counters.evidence_lookup_served),
+        _ => {}
+    }
+    Ok(())
 }
 
 pub(crate) fn ingest_hello(
@@ -520,6 +584,10 @@ pub(crate) struct Context {
     template: crate::IdentityAnnouncement,
     own_cert: crate::announce_blob::SharedCertPair,
     capabilities: Arc<tokio::sync::watch::Sender<crate::dm::DmCapabilities>>,
+    /// Current verified adverts, for the ADR 0093 bit-2 Hello/Lookup
+    /// gate (S5): a peer whose current verified advert LACKS
+    /// `peer_evidence_v1` gets no evidence traffic; unknown still sends.
+    caps: Arc<crate::dm_capability::CapabilityStore>,
     discovery: Arc<tokio::sync::RwLock<HashMap<AgentId, crate::DiscoveredAgent>>>,
     machines: Arc<tokio::sync::RwLock<HashMap<MachineId, crate::DiscoveredMachine>>>,
     owner: crate::owner_trust::OwnerTrust,
@@ -610,19 +678,31 @@ impl Context {
         let machine = stream.peer();
         let (mut send, mut recv) = stream.into_split();
         let result = tokio::time::timeout_at(lease.deadline, async {
-            let (kind, body) = read_message(&mut recv).await?;
+            let (kind, body) = read_message(&mut recv, &self.runtime.wire_limits).await?;
             if !self.runtime.wait(0).await {
                 return Err(invalid("evidence load deadline"));
             }
             match kind {
                 LOOKUP => {
                     if !self.runtime.wire_limits.request(machine, false) {
+                        WireCounters::bump(
+                            &self.runtime.wire_limits.counters.evidence_lookup_refused,
+                        );
                         return Err(invalid("lookup rate"));
                     }
                     let target: AgentId = codec().deserialize(&body).map_err(io::Error::other)?;
                     drop(body);
                     let context = Arc::clone(&self);
                     let authorized = context.authorized(machine, target).await;
+                    if !authorized {
+                        WireCounters::bump(
+                            &self
+                                .runtime
+                                .wire_limits
+                                .counters
+                                .evidence_lookup_unauthorized,
+                        );
+                    }
                     let serving_lease = Arc::clone(&lease);
                     let reply = tokio::task::spawn_blocking(move || {
                         let _lease = serving_lease;
@@ -636,6 +716,13 @@ impl Context {
                     .map_err(io::Error::other)??;
                     // Membership/revocation may have changed while signing.
                     let reply = if reply.is_some() && !self.authorized(machine, target).await {
+                        WireCounters::bump(
+                            &self
+                                .runtime
+                                .wire_limits
+                                .counters
+                                .evidence_lookup_unauthorized,
+                        );
                         None
                     } else {
                         reply
@@ -650,9 +737,20 @@ impl Context {
                 }
                 HELLO | CERTIFICATE => {
                     if kind == HELLO && !self.runtime.wire_limits.request(machine, true) {
+                        WireCounters::bump(
+                            &self.runtime.wire_limits.counters.evidence_hello_refused,
+                        );
                         return Err(invalid("Hello rate"));
                     }
-                    let hello: Hello = decode::hello(&body)?;
+                    let hello = match decode::hello(&body) {
+                        Ok(hello) => hello,
+                        Err(e) => {
+                            WireCounters::bump(
+                                &self.runtime.wire_limits.counters.evidence_hello_refused,
+                            );
+                            return Err(e);
+                        }
+                    };
                     drop(body);
                     if kind == CERTIFICATE {
                         let ann = announce_v3::deserialize_v3(&hello.announcement)
@@ -664,9 +762,15 @@ impl Context {
                                 ann.cert_digest,
                             )
                         {
+                            WireCounters::bump(
+                                &self.runtime.wire_limits.counters.evidence_hello_refused,
+                            );
                             return Err(invalid("unsolicited certificate"));
                         }
                     } else if hello.certificate.is_some() {
+                        WireCounters::bump(
+                            &self.runtime.wire_limits.counters.evidence_hello_refused,
+                        );
                         return Err(invalid("unsolicited certificate"));
                     }
                     let have = hello.have_certificate;
@@ -678,7 +782,20 @@ impl Context {
                         context.ingest(machine, record)
                     })
                     .await
-                    .map_err(io::Error::other)??;
+                    .map_err(io::Error::other)
+                    .and_then(|result| result.map_err(io::Error::other))
+                    .inspect(|_| {
+                        if kind == HELLO {
+                            WireCounters::bump(
+                                &self.runtime.wire_limits.counters.evidence_hello_received,
+                            );
+                        }
+                    })
+                    .inspect_err(|_| {
+                        WireCounters::bump(
+                            &self.runtime.wire_limits.counters.evidence_hello_refused,
+                        );
+                    })?;
                     if kind == CERTIFICATE {
                         return write_message(
                             &mut send,
@@ -767,7 +884,7 @@ impl Context {
             drop(hello);
             write_message(&mut send, &self.runtime.wire_limits, machine, kind, &body).await?;
             drop(body);
-            read_message(&mut recv).await
+            read_message(&mut recv, &self.runtime.wire_limits).await
         })
         .await
         .map_err(io::Error::other)??;
@@ -789,6 +906,18 @@ impl Context {
             .await,
             Ok(Ok(()))
         ) {
+            return;
+        }
+        // ADR 0089 S5 / ADR 0093 bit 2: a CURRENT VERIFIED advert from
+        // this machine that lacks `peer_evidence_v1` means it cannot
+        // accept an EvidenceV1 stream — skip the Hello (and its one
+        // try). Unknown state (no current verified advert for the
+        // machine) still sends, per ADR 0093.
+        if self
+            .caps
+            .machine_registry_supports(&machine, crate::dm::CapabilityRegistry::PEER_EVIDENCE_V1)
+            == Some(false)
+        {
             return;
         }
         if !self.runtime.wait(0).await
@@ -873,6 +1002,7 @@ impl crate::Agent {
             template,
             own_cert: Arc::clone(&self.own_cert_pair),
             capabilities: Arc::clone(&self.dm_capabilities_tx),
+            caps: Arc::clone(&self.capability_store),
             discovery: Arc::clone(&self.identity_discovery_cache),
             machines: Arc::clone(&self.machine_discovery_cache),
             owner: self.owner_trust.clone(),
@@ -1095,7 +1225,10 @@ mod tests {
         write_message(&mut tx, &limits, m, NOT_FOUND, &[])
             .await
             .unwrap();
-        assert_eq!(read_message(&mut rx).await.unwrap(), (NOT_FOUND, vec![]));
+        assert_eq!(
+            read_message(&mut rx, &limits).await.unwrap(),
+            (NOT_FOUND, vec![])
+        );
         assert!(limits.charge(m, RESET_CHARGE));
         assert_eq!(
             limits.state.lock().unwrap().machines[&m].bytes.total,
@@ -1124,7 +1257,7 @@ mod tests {
         // released-binary interop gate, which must still run in Linux CI.
         assert!(!(1..=5).contains(&prefix));
         drop(old_peer);
-        assert!(read_message(&mut local).await.is_err());
+        assert!(read_message(&mut local, &limits).await.is_err());
         for _ in 0..100 {
             assert!(!limits.begin_hello(m, true));
         }
@@ -1146,11 +1279,15 @@ mod tests {
         tokio::time::advance(Duration::from_secs(4)).await; // queued acceptor
         let (_tx, mut rx) = tokio::io::duplex(32);
         let start = Instant::now();
-        assert!(
-            tokio::time::timeout_at(lease.deadline, read_message(&mut rx))
-                .await
-                .is_err()
-        );
+        assert!(tokio::time::timeout_at(lease.deadline, {
+            let inner = Limits::default();
+            let mut rx = &mut rx;
+            async move {
+                let _ = read_message(&mut rx, &inner).await;
+            }
+        })
+        .await
+        .is_err());
         assert_eq!(Instant::now().duration_since(start), Duration::from_secs(1));
         drop(lease);
         assert_eq!(limits.allocations.available_permits(), TOTAL_ALLOCATION_CAP);
@@ -1160,12 +1297,17 @@ mod tests {
     async fn s3_malformed_or_incomplete_frames_are_bounded() {
         let mut oversized = vec![HELLO];
         oversized.extend_from_slice(&(MESSAGE_CAP as u32).to_be_bytes());
-        assert!(read_message(&mut oversized.as_slice()).await.is_err());
-        let (mut tx, mut rx) = tokio::io::duplex(32);
-        tx.write_all(&[HELLO, 0, 0, 0, 2, 0]).await.unwrap();
-        assert!(tokio::time::timeout(DEADLINE, read_message(&mut rx))
+        let limits = Limits::default();
+        assert!(read_message(&mut oversized.as_slice(), &limits)
             .await
             .is_err());
+        let (mut tx, mut rx) = tokio::io::duplex(32);
+        tx.write_all(&[HELLO, 0, 0, 0, 2, 0]).await.unwrap();
+        assert!(
+            tokio::time::timeout(DEADLINE, read_message(&mut rx, &limits))
+                .await
+                .is_err()
+        );
         let malformed = vec![255; MESSAGE_CAP - 5];
         assert!(decode::hello(&malformed).is_err());
         let mut hostile_length = u64::MAX.to_le_bytes().to_vec();

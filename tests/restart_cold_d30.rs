@@ -18,10 +18,9 @@
 //! Every test restarts a node the way a daemon restart does — a FRESH
 //! process-equivalent instance built on the SAME identity and data
 //! directories, so every in-memory cache (discovery, capability
-//! adverts, authenticated bindings) starts empty. On main each
-//! assertion is expected RED (the restarted node cannot resolve its
-//! peers for ~600 s: #1091 send side, #1088 receive side); the
-//! corresponding slice's PR un-ignores its group.
+//! adverts, authenticated bindings) starts empty. ADR 0089 S5 un-ignored
+//! them: 30a recovers through the S2 store at the point of use, 30b
+//! through the S4 responder-authorized Lookup.
 //!
 //! Harness: 30a/30b drive the embeddable `x0x::server::serve` API
 //! in-process over loopback (the `server_inprocess.rs` pattern) with a
@@ -256,10 +255,8 @@ impl Node {
 
     async fn agent_id_hex(&self) -> String {
         let body: Value = self.get("/agent").await.json().await.expect("agent json");
-        body["data"]["agent_id"]
-            .as_str()
-            .expect("agent_id")
-            .to_string()
+        // ApiResponse flattens its data: agent_id rides at the top level.
+        body["agent_id"].as_str().expect("agent_id").to_string()
     }
 
     /// This node has the OTHER agent in its discovery cache (the warm
@@ -453,7 +450,6 @@ async fn join_completes(b: &Node, group_id: &str, bound: Duration) -> (bool, boo
 /// announcement (#1091); S2's stored evidence answers at the point of
 /// use.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "enable with ADR 0089 S2 (#1128)"]
 async fn restart_cold_dm_sent_first_completes_within_5s() {
     let root = tempfile::tempdir().expect("tempdir");
     let (a, mut b) = warm_pair(root.path()).await;
@@ -500,7 +496,6 @@ async fn restart_cold_dm_sent_first_completes_within_5s() {
 /// authority, the Welcome must be installed, and B's seat must leave
 /// `pending_authority_commit`, all within 30 s of the restart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "enable with ADR 0089 S2 (#1128)"]
 async fn restart_cold_treekem_join_existing_peer_within_30s() {
     let root = tempfile::tempdir().expect("tempdir");
     let (a, mut b) = warm_pair(root.path()).await;
@@ -540,7 +535,6 @@ async fn restart_cold_treekem_join_existing_peer_within_30s() {
 /// 5 s. The accept→complete continuation afterwards is not the gated
 /// bound, but it must still work.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "enable with ADR 0089 S2 (#1128)"]
 async fn restart_cold_file_offer_reaches_peer_within_5s() {
     let root = tempfile::tempdir().expect("tempdir");
     let (a, mut b) = warm_pair(root.path()).await;
@@ -559,26 +553,38 @@ async fn restart_cold_file_offer_reaches_peer_within_5s() {
     b.restart().await;
 
     let started = Instant::now();
-    let offered: Value = b
-        .post(
-            "/files/send",
-            serde_json::json!({
-                "agent_id": a_hex,
-                "filename": "d30-offer.bin",
-                "size": contents.len(),
-                "sha256": sha256,
-                "path": file_path.to_string_lossy(),
-            }),
-        )
-        .await
-        .json()
-        .await
-        .expect("file send json");
-    assert_eq!(offered["ok"], true, "file send: {offered:?}");
-    let transfer_id = offered["transfer_id"]
-        .as_str()
-        .expect("transfer_id")
-        .to_string();
+    // The offer POST retries inside the gate on the retryable
+    // cold-resolution refusal (503 recipient_undiscovered) — the
+    // sender's documented recovery, same as the DM test.
+    let mut transfer_id = None;
+    while started.elapsed() < Duration::from_secs(5) {
+        let offered: Value = b
+            .post(
+                "/files/send",
+                serde_json::json!({
+                    "agent_id": a_hex,
+                    "filename": "d30-offer.bin",
+                    "size": contents.len(),
+                    "sha256": sha256,
+                    "path": file_path.to_string_lossy(),
+                }),
+            )
+            .await
+            .json()
+            .await
+            .expect("file send json");
+        if offered["ok"] == true {
+            transfer_id = Some(
+                offered["transfer_id"]
+                    .as_str()
+                    .expect("transfer_id")
+                    .to_string(),
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let transfer_id = transfer_id.expect("D30(a): the offer send must succeed within 5 s");
 
     // THE GATE: A sees the incoming offer within 5 s.
     let mut seen = false;
@@ -668,7 +674,6 @@ async fn build_owned_agent(dir: &Path, name: &str, owner_seed: [u8; 32]) -> x0x:
 /// 30 s. On main the restarted B cannot resolve A to open the SyncV1
 /// stream; S2's stored evidence recovers it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "enable with ADR 0089 S2 (#1128)"]
 async fn restart_cold_owner_sync_converges_within_30s() {
     use x0x::owner_sync::{OwnerEnrollment, OwnerSyncService, SyncKind, SyncValue};
 
@@ -739,6 +744,12 @@ async fn restart_cold_owner_sync_converges_within_30s() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(b_knows_a, "warm-up: b never discovered a");
+    // Persisted pre-restart state: the devices are TRUSTED contacts
+    // BOTH ways (contacts.json survives the restart; the SyncV1 trust
+    // gate on each side reads it). The tier-1 transport harness does
+    // the same.
+    b.set_contact_trusted_for_testing(a.agent_id()).await;
+    a.set_contact_trusted_for_testing(b.agent_id()).await;
 
     // THE RESTART: drop b's service, shut the agent down, and rebuild a
     // fresh one on the SAME files (fresh process state, same identity
@@ -747,6 +758,13 @@ async fn restart_cold_owner_sync_converges_within_30s() {
     b.shutdown().await;
     let b = std::sync::Arc::new(build_owned_agent(root.path(), "b", owner_seed).await);
     b.join_network().await.expect("restarted b joins");
+    // The production restart redials its configured bootstrap peers; the
+    // loopback stand-in redials the known peer address the same way.
+    b.network()
+        .expect("restarted b network")
+        .connect_addr(a_addr)
+        .await
+        .expect("restarted b redials a");
     let service_b = OwnerSyncService::new(std::sync::Arc::clone(&b), &root.path().join("sync-b"))
         .await
         .expect("restarted b sync service");
@@ -810,7 +828,6 @@ async fn restart_cold_owner_sync_converges_within_30s() {
 /// complete — Welcome installed, seat out of `pending_authority_commit`
 /// — within the same 30 s bound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "enable with ADR 0089 S4 (Lookup)"]
 async fn restart_cold_treekem_join_new_relationship_within_30s() {
     let root = tempfile::tempdir().expect("tempdir");
     let (a, mut b) = warm_pair(root.path()).await;

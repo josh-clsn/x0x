@@ -318,6 +318,14 @@ impl EvidenceRuntime {
             .into();
         value["evidence_lookup_skipped"] =
             self.evidence_lookup_skipped.load(Ordering::Relaxed).into();
+        // ADR 0089 S5: the wire counters (hello/lookup/bytes/verifies)
+        // ride the same `peer_evidence` diagnostics object.
+        let wire = self.wire_limits.counters.json();
+        if let Some(object) = wire.as_object() {
+            for (key, counter) in object {
+                value[key.clone()] = counter.clone();
+            }
+        }
         value
     }
     pub(crate) fn store(&self) -> Option<Arc<PeerEvidenceStore>> {
