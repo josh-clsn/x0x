@@ -1883,6 +1883,15 @@ pub(in crate::server::routes) mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
+    /// Exercise the rank-0 wait from the duplex owner-sync regression test.
+    pub(in crate::server::routes) async fn wait_for_rank_zero_owner_sync_round(
+        state: &Arc<AppState>,
+        wait: std::time::Duration,
+    ) {
+        assert_eq!(super::home_creator_rank(state).await, 0);
+        super::wait_for_owner_sync_round(state, wait).await;
+    }
+
     /// Owned test state: user key (deterministic seed so the owner id is
     /// stable across the "restart" arm) + builder-issued agent certificate.
     pub(in crate::server::routes) async fn owned_state(

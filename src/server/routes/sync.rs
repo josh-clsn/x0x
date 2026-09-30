@@ -501,6 +501,8 @@ mod tests {
     /// must RECEIVE the HomePointer record. Reverting the session-path
     /// composition (the materialization removed) leaves the initiator's
     /// store without it (the fail-before).
+    /// #1097: a pre-rename publication failure must fail both sessions and
+    /// leave the rank-0 peer waiting; clearing the fault permits publication.
     #[tokio::test]
     async fn session_path_publishes_home_pointer_before_the_exchange() {
         use crate::server::routes::home::tests::owned_state;
@@ -512,6 +514,13 @@ mod tests {
         let b = owned_state(dir_b.path(), [0x8E; 32])
             .await
             .expect("state b");
+        // The pointerless initiator must be rank 0: a falsely successful
+        // empty session would release its Home provisioning wait.
+        let (dir_a, _dir_b, a, b) = if a.agent.machine_id().0 > b.agent.machine_id().0 {
+            (dir_a, dir_b, a, b)
+        } else {
+            (dir_b, dir_a, b, a)
+        };
         // Views attached exactly as the server startup does.
         for state in [&a, &b] {
             state
@@ -551,6 +560,85 @@ mod tests {
         crate::server::routes::home::provision_home(&a).await;
         assert!(sync_a.canonical_home().await.is_none(), "unpublished");
 
+        let waiting = crate::server::routes::home::tests::wait_for_rank_zero_owner_sync_round(
+            &b,
+            std::time::Duration::from_secs(3_600),
+        );
+        tokio::pin!(waiting);
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+        let sessions_a = sync_a.store().successful_sessions_rx();
+        let sessions_b = sync_b.store().successful_sessions_rx();
+        let before_a = *sessions_a.borrow();
+        let before_b = *sessions_b.borrow();
+
+        // Inject an I/O failure BEFORE rename, without losing enrollment:
+        // a file in place of the sync directory prevents temp-file creation.
+        let sync_dir = dir_a.path().join("sync");
+        let saved_sync_dir = dir_a.path().join("sync-saved");
+        std::fs::rename(&sync_dir, &saved_sync_dir).expect("save sync directory");
+        std::fs::write(&sync_dir, b"not a directory").expect("block persistence");
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let responder = async {
+            let (mut recv, mut send) = tokio::io::split(server);
+            sync_a
+                .session_with_home_publication(
+                    &mut send, &mut recv, owner_kp, &machine_a, &machine_b,
+                )
+                .await
+            // Drop both halves on return, as the production caller does,
+            // so the peer observes EOF when publication fails.
+        };
+        let initiator = async {
+            let (mut recv, mut send) = tokio::io::split(client);
+            sync_b
+                .session_with_home_publication(
+                    &mut send, &mut recv, owner_kp, &machine_b, &machine_a,
+                )
+                .await
+        };
+        let (responder_out, initiator_out) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(responder, initiator)
+            })
+            .await
+            .expect("both session ends must terminate");
+        // Mirror handle_inbound / dial_and_sync's outcome accounting.
+        sync_a
+            .store()
+            .set_session_status(&machine_b, responder_out.is_ok())
+            .await;
+        sync_b
+            .store()
+            .set_session_status(&machine_a, initiator_out.is_ok())
+            .await;
+        assert!(
+            matches!(&responder_out, Err(crate::owner_sync::SyncError::Io(_))),
+            "pre-rename publication failure must fail the responder: {responder_out:?}"
+        );
+        assert!(
+            initiator_out.is_err(),
+            "peer session must fail: {initiator_out:?}"
+        );
+        for (sync, peer) in [(sync_a, machine_b), (sync_b, machine_a)] {
+            assert!(!sync.store().session_statuses().await[&peer.0].last_session_ok);
+            assert!(
+                sync.canonical_home().await.is_none(),
+                "mint rolled back / no pointer received"
+            );
+            assert!(
+                sync.store().poisoned_reason().is_none(),
+                "pre-rename failure does not poison"
+            );
+        }
+        assert_eq!(*sessions_a.borrow(), before_a, "no responder success");
+        assert_eq!(*sessions_b.borrow(), before_b, "no initiator success");
+        assert!(
+            futures_util::poll!(waiting.as_mut()).is_pending(),
+            "failed publication must not release the rank-0 Home wait"
+        );
+        std::fs::remove_file(&sync_dir).expect("clear persistence fault");
+        std::fs::rename(&saved_sync_dir, &sync_dir).expect("restore sync directory");
+
         let (client, server) = tokio::io::duplex(64 * 1024);
         let (mut b_recv, mut b_send) = tokio::io::split(server);
         let (mut a_recv, mut a_send) = tokio::io::split(client);
@@ -585,6 +673,10 @@ mod tests {
             .await
             .expect("a's Home");
         assert_eq!(canonical.group_id, gid);
+        assert!(
+            futures_util::poll!(waiting.as_mut()).is_ready(),
+            "successful pointer publication releases the rank-0 Home wait"
+        );
     }
 
     /// WHY: the profile mirror must never regress to defaults while the
