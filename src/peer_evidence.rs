@@ -112,10 +112,34 @@ pub struct MoveWatermarkV1 {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EvidenceFileV1 {
     /// Signed records.
+    #[serde(serialize_with = "serialize_sorted_agents")]
     pub records: HashMap<AgentId, EvidenceRecordV1>,
     /// Move protection survives record eviction.
+    #[serde(serialize_with = "serialize_sorted_agents")]
     pub watermarks: HashMap<AgentId, MoveWatermarkV1>,
 }
+// Array keys have the same frozen wire encoding as the AgentId newtype.
+fn serialize_sorted_agents<S: serde::Serializer, V: Serialize>(
+    map: &HashMap<AgentId, V>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    map.iter()
+        .map(|(id, value)| (id.as_bytes(), value))
+        .collect::<std::collections::BTreeMap<_, _>>()
+        .serialize(serializer)
+}
+
+#[cfg(test)]
+thread_local! {
+    // Thread-local so parallel inert tests cannot perturb a counting assertion.
+    static VERIFY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+fn signature_check<T>(verify: impl FnOnce() -> T) -> T {
+    #[cfg(test)]
+    VERIFY_CALLS.with(|count| count.set(count.get() + 1));
+    verify()
+}
+
 fn options() -> impl Options {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
@@ -182,7 +206,7 @@ fn verify_advert(bytes: &[u8], key: &[u8], now: u64, age: u64) -> Result<Capabil
         .map_err(|_| EvidenceError::Invalid("advert encoding"))?;
     if advert.protocol_version != crate::dm_capability_service::ADVERT_PROTOCOL_VERSION
         || !fresh(advert.created_at_unix_ms, now, age)
-        || !crate::dm_capability_service::verify_advert_signature(&advert, key)
+        || !signature_check(|| crate::dm_capability_service::verify_advert_signature(&advert, key))
     {
         return Err(EvidenceError::Invalid("advert signature or freshness"));
     }
@@ -195,8 +219,10 @@ fn verify_advert(bytes: &[u8], key: &[u8], now: u64, age: u64) -> Result<Capabil
         let signature =
             ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&trailer.signature)
                 .map_err(|_| EvidenceError::Invalid("trailer signature"))?;
-        ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(&key, &bytes, &signature)
-            .map_err(|_| EvidenceError::Invalid("trailer signature"))?;
+        signature_check(|| {
+            ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(&key, &bytes, &signature)
+        })
+        .map_err(|_| EvidenceError::Invalid("trailer signature"))?;
     }
     advert.capabilities.application_registry = Default::default();
     Ok(advert)
@@ -214,18 +240,11 @@ impl EvidenceRecordV1 {
         }
         Ok(())
     }
-    fn ordering_view(&self, now: u64) -> Result<EvidenceView> {
-        let mut pair = self.clone();
-        pair.certificate = None;
-        pair.verify(now, u64::MAX)
-    }
-
-    /// Re-verify all signed bytes. Use W for network ingest, L for stored use.
+    /// Verify signed bytes once at load (L) or network ingest (W).
     pub fn verify(&self, now: u64, max_age_ms: u64) -> Result<EvidenceView> {
         self.bounds()?;
         let announcement = announce_v3::deserialize_v3(&self.announcement)?;
-        announcement
-            .verify()
+        signature_check(|| announcement.verify())
             .map_err(|_| EvidenceError::Invalid("announcement signature"))?;
         if !fresh(announcement_ms(&announcement)?, now, max_age_ms) {
             return Err(EvidenceError::Invalid("announcement freshness"));
@@ -256,7 +275,7 @@ impl EvidenceRecordV1 {
                 {
                     return Err(EvidenceError::Invalid("certificate trailing bytes"));
                 }
-                cert.verify()
+                signature_check(|| cert.verify())
                     .map_err(|_| EvidenceError::Invalid("certificate signature"))?;
                 if cert.agent_id().ok() != Some(announcement.agent_id)
                     || cert.is_expired(now / 1000)
@@ -275,7 +294,8 @@ impl EvidenceRecordV1 {
     }
 }
 /// Current policy, queried at every use. Implementations must read current
-/// state, not the stored relation flags. Lock ordering: store then policy.
+/// state, not the stored relation flags. Point-of-use checks run without the
+/// store lock. Mutations may take policy locks while holding the store lock.
 /// Methods must not re-enter the evidence store.
 pub trait EvidencePolicy: Send + Sync {
     /// Current relationship flags; zero means stranger.
@@ -409,10 +429,17 @@ pub struct EvidenceCounters {
     /// Snapshot bytes written.
     pub evidence_bytes_written: u64,
 }
+#[derive(Clone)]
+struct CachedRecord {
+    wire: EvidenceRecordV1,
+    view: Arc<EvidenceView>,
+}
 #[derive(Default)]
 struct State {
     file: EvidenceFileV1,
-    live: HashMap<AgentId, EvidenceRecordV1>,
+    // Process-only views, populated only after verifying the corresponding wire.
+    verified: HashMap<AgentId, Arc<EvidenceView>>,
+    live: HashMap<AgentId, CachedRecord>,
     suspended: HashSet<AgentId>,
     pending_moves: HashMap<AgentId, MoveWatermarkV1>,
     last_used: HashMap<AgentId, u64>,
@@ -429,8 +456,13 @@ pub struct PeerEvidenceStore {
     max_age: u64,
     policy: Arc<dyn EvidencePolicy>,
     state: Mutex<State>,
+    // Serializes snapshot mutations and disk writes; readers never acquire it.
+    // Always acquire before state, and release state before any disk write.
+    mutation: Mutex<()>,
     #[cfg(test)]
     fail_write: std::sync::atomic::AtomicU8,
+    #[cfg(test)]
+    slow_write: Mutex<Option<Arc<SlowWrite>>>,
 }
 impl PeerEvidenceStore {
     /// Open and verify an existing snapshot. Unreadable files are preserved for
@@ -460,12 +492,19 @@ impl PeerEvidenceStore {
             }
         };
         let max_age = config.max_age_days * DAY_MS;
+        let mut verified = HashMap::new();
         file.records.retain(|a, r| {
-            r.verify(now, max_age).is_ok_and(|v| {
-                v.announcement.agent_id == *a
-                    && !disqualified(&file.watermarks, *a, &v)
-                    && allowed(&*policy, &v, now)
-            })
+            let Ok(view) = r.verify(now, max_age) else {
+                return false;
+            };
+            if view.announcement.agent_id != *a
+                || disqualified(&file.watermarks, *a, &view)
+                || !allowed(&*policy, &view, now)
+            {
+                return false;
+            }
+            verified.insert(*a, Arc::new(view));
+            true
         });
         Ok(Self {
             path,
@@ -474,8 +513,12 @@ impl PeerEvidenceStore {
             policy,
             state: Mutex::new(State {
                 file,
+                verified,
                 ..State::default()
             }),
+            mutation: Mutex::new(()),
+            #[cfg(test)]
+            slow_write: Mutex::new(None),
             #[cfg(test)]
             fail_write: std::sync::atomic::AtomicU8::new(0),
         })
@@ -493,49 +536,81 @@ impl PeerEvidenceStore {
             .lock()
             .map_err(|_| EvidenceError::Invalid("poisoned store lock"))
     }
-    /// Single authority: recheck current policy, component age, certificate,
-    /// signatures, exact machine and watermark on every call.
+    fn lock_mutation(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
+        self.mutation
+            .lock()
+            .map_err(|_| EvidenceError::Invalid("poisoned mutation lock"))
+    }
+    /// Single authority: check current policy, time, certificate expiry, exact
+    /// machine and watermark. Signatures were verified at load or ingest.
     pub fn usable(&self, agent: AgentId, machine: MachineId, now: u64) -> Option<EvidenceView> {
-        let mut state = self.state.lock().ok()?;
-        if state.suspended.contains(&agent) {
+        let view = {
+            let state = self.state.lock().ok()?;
+            if state.suspended.contains(&agent) {
+                return None;
+            }
+            let view = state.verified.get(&agent)?;
+            if view.announcement.machine_id != machine
+                || disqualified(&state.file.watermarks, agent, view)
+            {
+                return None;
+            }
+            Arc::clone(view)
+        };
+        if !current(&view, now, self.max_age) || !allowed(&*self.policy, &view, now) {
             return None;
         }
-        let view = state
-            .file
-            .records
-            .get(&agent)?
-            .verify(now, self.max_age)
-            .ok()?;
-        if view.announcement.agent_id != agent
-            || view.announcement.machine_id != machine
-            || disqualified(&state.file.watermarks, agent, &view)
-            || !allowed(&*self.policy, &view, now)
         {
-            return None;
+            let mut state = self.state.lock().ok()?;
+            // A move/removal may have raced the policy calls. Never return the
+            // old authority if it was suspended or replaced in the meantime.
+            if state.suspended.contains(&agent)
+                || !state
+                    .verified
+                    .get(&agent)
+                    .is_some_and(|v| Arc::ptr_eq(v, &view))
+                || disqualified(&state.file.watermarks, agent, &view)
+            {
+                return None;
+            }
+            state.last_used.insert(agent, now);
         }
-        state.last_used.insert(agent, now);
-        Some(view)
+        Some((*view).clone())
     }
     /// Latest ingest-fresh live wire bytes, kept separately from stored bytes.
     pub fn live(&self, agent: AgentId, now: u64) -> Option<EvidenceRecordV1> {
-        let state = self.state.lock().ok()?;
-        if state.suspended.contains(&agent) {
+        let record = {
+            let state = self.state.lock().ok()?;
+            if state.suspended.contains(&agent) {
+                return None;
+            }
+            state.live.get(&agent)?.clone()
+        };
+        if !current(&record.view, now, W_MS) || !allowed(&*self.policy, &record.view, now) {
             return None;
         }
-        let record = state.live.get(&agent)?;
-        let view = record.verify(now, W_MS).ok()?;
-        (allowed(&*self.policy, &view, now) && !disqualified(&state.file.watermarks, agent, &view))
-            .then(|| record.clone())
+        let state = self.state.lock().ok()?;
+        if state.suspended.contains(&agent)
+            || !state
+                .live
+                .get(&agent)
+                .is_some_and(|r| Arc::ptr_eq(&r.view, &record.view))
+            || disqualified(&state.file.watermarks, agent, &record.view)
+        {
+            return None;
+        }
+        Some(record.wire)
     }
     /// Ingest a complete verified pair. A move returns success only after the
-    /// new snapshot and its parent directory have been synced.
+    /// new snapshot and its parent directory have been synced, unless this
+    /// instance is memory-only (where the move takes effect immediately).
     pub fn ingest(
         &self,
         mut record: EvidenceRecordV1,
         source: IngestSource,
         now: u64,
     ) -> Result<()> {
-        let view = record.verify(now, W_MS)?;
+        let view = Arc::new(record.verify(now, W_MS)?);
         if !allowed(&*self.policy, &view, now) {
             return Err(EvidenceError::Invalid("not a current relationship"));
         }
@@ -543,6 +618,7 @@ impl PeerEvidenceStore {
         let m = view.announcement.machine_id;
         record.relation = self.policy.relation(a, m, view.certificate.as_ref(), now);
         record.stored_at_ms = now;
+        let _mutation = self.lock_mutation()?;
         let mut state = self.lock()?;
         if disqualified(&state.file.watermarks, a, &view)
             || state
@@ -555,9 +631,8 @@ impl PeerEvidenceStore {
         let previous = state
             .live
             .get(&a)
-            .or_else(|| state.file.records.get(&a))
-            .map(|r| r.ordering_view(now))
-            .transpose()?;
+            .map(|r| &r.view)
+            .or_else(|| state.verified.get(&a));
         if let Some(old) = &previous {
             if view.advert.created_at_unix_ms < old.advert.created_at_unix_ms
                 || announcement_ms(&view.announcement)? < announcement_ms(&old.announcement)?
@@ -567,12 +642,7 @@ impl PeerEvidenceStore {
                 return Err(EvidenceError::Invalid("non-monotonic evidence"));
             }
         }
-        let stored = state
-            .file
-            .records
-            .get(&a)
-            .map(|r| r.ordering_view(now))
-            .transpose()?;
+        let stored = state.verified.get(&a);
         let moving = stored
             .as_ref()
             .is_some_and(|v| v.announcement.machine_id != m)
@@ -613,29 +683,32 @@ impl PeerEvidenceStore {
                 )?;
             }
             next.records.insert(a, record.clone());
-            self.evict_records(&state, &mut next, now);
+            let mut verified = state.verified.clone();
+            verified.insert(a, Arc::clone(&view));
+            self.evict_records(&state, &mut next, &verified, now);
             next.encode()?; // Refuse an over-cap insert before committing state.
             if moving {
-                if let Err(e) = self.write(&next) {
-                    state.counters.evidence_move_write_failed += 1;
-                    return Err(e);
-                }
-                self.wrote(&mut state, &next, now)?;
+                drop(state);
+                self.write_move(&next, now)?;
+                state = self.lock()?;
                 state.suspended.remove(&a);
                 state.pending_moves.remove(&a);
             } else {
                 state.dirty = true;
             }
             state.file = next;
+            state.verified = verified;
             let retained: HashSet<_> = state.file.records.keys().copied().collect();
+            state.verified.retain(|id, _| retained.contains(id));
             state.live.retain(|id, _| retained.contains(id));
             state.last_used.retain(|id, _| retained.contains(id));
         }
         if state.file.records.contains_key(&a) {
-            state.live.insert(a, record);
+            state.live.insert(a, CachedRecord { wire: record, view });
             state.last_used.insert(a, now);
         }
-        self.flush_locked(&mut state, now, false)
+        drop(state);
+        self.flush_serialized(now, false)
     }
     /// Verified advert-only move: removes old authority and writes the watermark
     /// atomically. The agent key is hash-checked by the advert verifier.
@@ -643,13 +716,12 @@ impl PeerEvidenceStore {
         let advert = verify_advert(bytes, agent_key, now, W_MS)?;
         let a = AgentId(advert.agent_id);
         let m = MachineId(advert.machine_id);
+        let _mutation = self.lock_mutation()?;
         let mut state = self.lock()?;
         let old = state
-            .file
-            .records
+            .verified
             .get(&a)
-            .ok_or(EvidenceError::Invalid("no stored binding to move"))?
-            .ordering_view(now)?;
+            .ok_or(EvidenceError::Invalid("no stored binding to move"))?;
         if old.announcement.machine_id == m
             || advert.created_at_unix_ms <= old.advert.created_at_unix_ms
             || state
@@ -694,12 +766,11 @@ impl PeerEvidenceStore {
             now,
         )?;
         next.records.remove(&a);
-        if let Err(e) = self.write(&next) {
-            state.counters.evidence_move_write_failed += 1;
-            return Err(e);
-        }
-        self.wrote(&mut state, &next, now)?;
+        drop(state);
+        self.write_move(&next, now)?;
+        let mut state = self.lock()?;
         state.file = next;
+        state.verified.remove(&a);
         state.live.remove(&a);
         state.suspended.remove(&a);
         state.pending_moves.remove(&a);
@@ -753,15 +824,21 @@ impl PeerEvidenceStore {
         next.watermarks.insert(a, mark);
         Ok(())
     }
-    fn evict_records(&self, state: &State, next: &mut EvidenceFileV1, now: u64) {
+    fn evict_records(
+        &self,
+        state: &State,
+        next: &mut EvidenceFileV1,
+        verified: &HashMap<AgentId, Arc<EvidenceView>>,
+        now: u64,
+    ) {
         while next.records.len() > RECORD_CAP {
             let victim = next
                 .records
                 .iter()
                 .min_by_key(|(id, r)| {
-                    let relation = r
-                        .verify(now, self.max_age)
-                        .ok()
+                    let relation = verified
+                        .get(id)
+                        .filter(|v| current(v, now, self.max_age))
                         .map(|v| {
                             self.policy.relation(
                                 **id,
@@ -798,32 +875,42 @@ impl PeerEvidenceStore {
     /// integrated. Tracks how long watermark agents have been absent; after a
     /// restart absent agents tie at the first observation (conservative).
     pub fn maintain(&self, now: u64) -> Result<()> {
-        let mut state = self.lock()?;
-        let ids: Vec<_> = state.file.watermarks.keys().copied().collect();
-        for a in ids {
-            if self.policy.contains_agent(a, now) {
-                state.absent_since.remove(&a);
-            } else {
-                state.absent_since.entry(a).or_insert(now);
-            }
-        }
-        let removed: Vec<_> = state
-            .file
-            .records
+        let _mutation = self.lock_mutation()?;
+        let (file, verified) = {
+            let state = self.lock()?;
+            (state.file.clone(), state.verified.clone())
+        };
+        let absent: Vec<_> = file
+            .watermarks
+            .keys()
+            .map(|a| (*a, !self.policy.contains_agent(*a, now)))
+            .collect();
+        let removed: Vec<_> = verified
             .iter()
-            .filter(|(_, r)| {
-                !r.verify(now, self.max_age)
-                    .is_ok_and(|v| allowed(&*self.policy, &v, now))
+            .filter(|(a, v)| {
+                !current(v, now, self.max_age)
+                    || disqualified(&file.watermarks, **a, v)
+                    || !allowed(&*self.policy, v, now)
             })
             .map(|(a, _)| *a)
             .collect();
+        let mut state = self.lock()?;
+        for (a, absent) in absent {
+            if absent {
+                state.absent_since.entry(a).or_insert(now);
+            } else {
+                state.absent_since.remove(&a);
+            }
+        }
         for a in removed {
             state.file.records.remove(&a);
+            state.verified.remove(&a);
             state.live.remove(&a);
             state.last_used.remove(&a);
             state.dirty = true;
         }
-        self.flush_locked(&mut state, now, false)
+        drop(state);
+        self.flush_serialized(now, false)
     }
 
     /// Remove matching records and live bytes, preserving all watermarks.
@@ -831,6 +918,7 @@ impl PeerEvidenceStore {
         &self,
         predicate: impl Fn(AgentId, &EvidenceRecordV1) -> bool,
     ) -> Result<()> {
+        let _mutation = self.lock_mutation()?;
         let mut state = self.lock()?;
         let removed: Vec<_> = state
             .file
@@ -841,6 +929,7 @@ impl PeerEvidenceStore {
             .collect();
         for a in removed {
             state.file.records.remove(&a);
+            state.verified.remove(&a);
             state.live.remove(&a);
             state.last_used.remove(&a);
             state.dirty = true;
@@ -849,26 +938,38 @@ impl PeerEvidenceStore {
     }
     /// Flush due material changes, or force a dirty flush on clean shutdown.
     pub fn flush(&self, now: u64, shutdown: bool) -> Result<()> {
-        let mut state = self.lock()?;
-        self.flush_locked(&mut state, now, shutdown)
+        let _mutation = self.lock_mutation()?;
+        self.flush_serialized(now, shutdown)
     }
-    fn flush_locked(&self, state: &mut State, now: u64, force: bool) -> Result<()> {
-        if self.memory_only
-            || !state.dirty
-            || (!force
-                && state
-                    .last_write
-                    .is_some_and(|t| now.saturating_sub(t) < 60_000))
-        {
+    // Caller holds mutation throughout snapshot, write and commit.
+    fn flush_serialized(&self, now: u64, force: bool) -> Result<()> {
+        let snapshot = {
+            let state = self.lock()?;
+            if self.memory_only
+                || !state.dirty
+                || (!force
+                    && state
+                        .last_write
+                        .is_some_and(|t| now.saturating_sub(t) < 60_000))
+            {
+                return Ok(());
+            }
+            state.file.clone()
+        };
+        self.write(&snapshot)?;
+        self.wrote(&mut *self.lock()?, &snapshot, now)
+    }
+    fn write_move(&self, next: &EvidenceFileV1, now: u64) -> Result<()> {
+        // No persisted authority exists to protect in this mode. The caller
+        // still applies the record and watermark in one in-memory transaction.
+        if self.memory_only {
             return Ok(());
         }
-        self.write(&state.file)?;
-        let bytes = state.file.encode()?.len();
-        state.counters.evidence_writes += 1;
-        state.counters.evidence_bytes_written += bytes as u64;
-        state.last_write = Some(now);
-        state.dirty = false;
-        Ok(())
+        if let Err(e) = self.write(next) {
+            self.lock()?.counters.evidence_move_write_failed += 1;
+            return Err(e);
+        }
+        self.wrote(&mut *self.lock()?, next, now)
     }
     fn wrote(&self, state: &mut State, file: &EvidenceFileV1, now: u64) -> Result<()> {
         state.counters.evidence_writes += 1;
@@ -901,6 +1002,11 @@ impl PeerEvidenceStore {
             if self.fail_write.load(std::sync::atomic::Ordering::Relaxed) == 3 {
                 std::process::exit(89);
             }
+            #[cfg(test)]
+            if let Some(hook) = self.slow_write.lock().unwrap().clone() {
+                hook.entered.wait();
+                hook.release.wait();
+            }
             f.sync_all()?;
             fs::rename(&tmp, &self.path)?;
             File::open(parent)?.sync_all()?;
@@ -919,6 +1025,18 @@ impl PeerEvidenceStore {
         }
         result
     }
+}
+#[cfg(test)]
+struct SlowWrite {
+    entered: std::sync::Barrier,
+    release: std::sync::Barrier,
+}
+fn current(view: &EvidenceView, now: u64, age: u64) -> bool {
+    announcement_ms(&view.announcement).is_ok_and(|t| fresh(t, now, age))
+        && fresh(view.advert.created_at_unix_ms, now, age)
+        && view.certificate.as_ref().is_none_or(|cert| {
+            !cert.is_expired(now / 1000) && cert.issued_at() <= now.saturating_add(SKEW_MS) / 1000
+        })
 }
 fn allowed(policy: &dyn EvidencePolicy, view: &EvidenceView, now: u64) -> bool {
     let a = view.announcement.agent_id;
@@ -1116,6 +1234,260 @@ mod tests {
             PeerEvidenceStore::open(dir.path(), EvidenceConfig::default(), p.clone(), NOW).unwrap();
         (dir, p, store)
     }
+    #[test]
+    fn cached_views_do_zero_verifies_on_use_and_maintenance() {
+        let p = Peer::new();
+        let (dir, policy, mut store) = setup(&p);
+        let mut record = p.record(NOW, NOW);
+        record.certificate = Some(
+            AgentCertificate::issue_with_expiry(
+                &UserKeypair::generate().unwrap(),
+                &p.agent,
+                Some(NOW / 1000 + 120),
+            )
+            .unwrap()
+            .to_storage_bytes()
+            .unwrap(),
+        );
+        VERIFY_CALLS.set(0);
+        store.ingest(record, IngestSource::Hello, NOW).unwrap();
+        assert_eq!(
+            VERIFY_CALLS.get(),
+            4,
+            "each signed part verified once on ingest"
+        );
+        for reopened in [false, true] {
+            if reopened {
+                VERIFY_CALLS.set(0);
+                store = PeerEvidenceStore::open(
+                    dir.path(),
+                    EvidenceConfig::default(),
+                    policy.clone(),
+                    NOW,
+                )
+                .unwrap();
+                assert_eq!(
+                    VERIFY_CALLS.get(),
+                    4,
+                    "each signed part verified once on load"
+                );
+            }
+            VERIFY_CALLS.set(0);
+            for _ in 0..100 {
+                assert!(store.usable(p.a(), p.m(), NOW).is_some());
+                assert_eq!(store.live(p.a(), NOW).is_some(), !reopened);
+                store.maintain(NOW).unwrap();
+            }
+            policy.revoked.store(true, Ordering::Relaxed);
+            assert!(store.usable(p.a(), p.m(), NOW).is_none());
+            policy.revoked.store(false, Ordering::Relaxed);
+            assert!(store
+                .usable(p.a(), p.m(), NOW + SKEW_MS + 121_000)
+                .is_none());
+            assert_eq!(
+                VERIFY_CALLS.get(),
+                0,
+                "use and maintenance must never verify"
+            );
+        }
+        store.maintain(NOW + SKEW_MS + 121_000).unwrap();
+        assert!(store.lock().unwrap().verified.is_empty());
+        assert_eq!(VERIFY_CALLS.get(), 0, "expiry sweep must never verify");
+    }
+
+    #[test]
+    fn memory_only_moves_apply_without_writes() {
+        for advert_only in [false, true] {
+            let mut p = Peer::new();
+            let (dir, policy, _) = setup(&p);
+            let path = dir.path().join("peer-evidence.bin");
+            let unreadable = b"unknown version: preserve me";
+            fs::write(&path, unreadable).unwrap();
+            let store = PeerEvidenceStore::open(dir.path(), EvidenceConfig::default(), policy, NOW)
+                .unwrap();
+            assert!(store.is_memory_only());
+            store
+                .ingest(p.record(NOW, NOW), IngestSource::Hello, NOW)
+                .unwrap();
+            let old = p.m();
+            let stale = p.record(NOW, NOW);
+            p.machine = MachineKeypair::generate().unwrap();
+            let t = NOW + 1000;
+            let record = p.record(t, t);
+            store.fail_write.store(1, Ordering::Relaxed);
+            if advert_only {
+                store
+                    .ingest_move_advert(&record.advert, p.agent.public_key().as_bytes(), t)
+                    .unwrap();
+                assert!(store.usable(p.a(), old, t).is_none());
+                assert!(!store.lock().unwrap().suspended.contains(&p.a()));
+            }
+            store.ingest(record, IngestSource::Hello, t).unwrap();
+            assert!(store.usable(p.a(), old, t).is_none());
+            assert!(store.usable(p.a(), p.m(), t).is_some());
+            assert!(store.ingest(stale, IngestSource::Hello, t).is_err());
+            assert_eq!(store.lock().unwrap().file.watermarks[&p.a()].machine, p.m());
+            store.flush(t, true).unwrap();
+            assert_eq!(store.counters().unwrap().evidence_writes, 0);
+            assert_eq!(store.counters().unwrap().evidence_move_write_failed, 0);
+            assert_eq!(fs::read(path).unwrap(), unreadable);
+        }
+    }
+
+    #[test]
+    fn other_agent_usable_during_slow_move_write() {
+        for advert_only in [false, true] {
+            let mut p = Peer::new();
+            let other = Peer::new();
+            let (dir, policy, store) = setup(&p);
+            policy.peers.lock().unwrap().insert(other.a(), GROUP);
+            store
+                .ingest(p.record(NOW, NOW), IngestSource::Hello, NOW)
+                .unwrap();
+            store
+                .ingest(other.record(NOW, NOW), IngestSource::Hello, NOW)
+                .unwrap();
+            let store = Arc::new(store);
+            let old = p.m();
+            p.machine = MachineKeypair::generate().unwrap();
+            let t = NOW + 1000;
+            let record = p.record(t, t);
+            let hook = Arc::new(SlowWrite {
+                entered: std::sync::Barrier::new(2),
+                release: std::sync::Barrier::new(2),
+            });
+            *store.slow_write.lock().unwrap() = Some(hook.clone());
+            let writer_store = store.clone();
+            let key = p.agent.public_key().as_bytes().to_vec();
+            let writer = std::thread::spawn(move || {
+                if advert_only {
+                    writer_store.ingest_move_advert(&record.advert, &key, t)
+                } else {
+                    writer_store.ingest(record, IngestSource::Hello, t)
+                }
+            });
+            hook.entered.wait();
+            let reader_store = store.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let a = p.a();
+            let m = p.m();
+            let other_a = other.a();
+            let other_m = other.m();
+            let reader = std::thread::spawn(move || {
+                tx.send((
+                    reader_store.usable(other_a, other_m, t).is_some(),
+                    reader_store.usable(a, old, t).is_none(),
+                    reader_store.usable(a, m, t).is_none(),
+                ))
+                .unwrap();
+            });
+            let result = rx.recv_timeout(std::time::Duration::from_secs(2));
+            // Always unblock the writer before asserting, including on failure.
+            hook.release.wait();
+            writer.join().unwrap().unwrap();
+            reader.join().unwrap();
+            assert_eq!(result.unwrap(), (true, true, true));
+            assert_eq!(store.usable(a, m, t).is_some(), !advert_only);
+            let reopened =
+                PeerEvidenceStore::open(dir.path(), EvidenceConfig::default(), policy, t).unwrap();
+            assert!(reopened.usable(other_a, other_m, t).is_some());
+            assert!(reopened.usable(a, old, t).is_none());
+            assert_eq!(reopened.usable(a, m, t).is_some(), !advert_only);
+        }
+    }
+
+    #[test]
+    fn use_rechecks_snapshot_after_unlocked_policy() {
+        struct PausingPolicy {
+            hook: Mutex<Option<Arc<SlowWrite>>>,
+        }
+        impl EvidencePolicy for PausingPolicy {
+            fn relation(
+                &self,
+                _: AgentId,
+                _: MachineId,
+                _: Option<&AgentCertificate>,
+                _: u64,
+            ) -> u8 {
+                let hook = self.hook.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    hook.entered.wait();
+                    hook.release.wait();
+                }
+                GROUP
+            }
+            fn revoked(&self, _: AgentId, _: MachineId, _: Option<UserId>) -> bool {
+                false
+            }
+            fn contains_agent(&self, _: AgentId, _: u64) -> bool {
+                true
+            }
+        }
+        let p = Peer::new();
+        let dir = tempfile::tempdir().unwrap();
+        let policy = Arc::new(PausingPolicy {
+            hook: Mutex::new(None),
+        });
+        let store = Arc::new(
+            PeerEvidenceStore::open(dir.path(), EvidenceConfig::default(), policy.clone(), NOW)
+                .unwrap(),
+        );
+        store
+            .ingest(p.record(NOW, NOW), IngestSource::Hello, NOW)
+            .unwrap();
+        let hook = Arc::new(SlowWrite {
+            entered: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+        });
+        *policy.hook.lock().unwrap() = Some(hook.clone());
+        let reader_store = store.clone();
+        let a = p.a();
+        let m = p.m();
+        let reader = std::thread::spawn(move || reader_store.usable(a, m, NOW));
+        hook.entered.wait();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer_store = store.clone();
+        let writer = std::thread::spawn(move || {
+            tx.send(writer_store.remove_where(|id, _| id == a)).unwrap()
+        });
+        let removed = rx.recv_timeout(std::time::Duration::from_secs(2));
+        hook.release.wait();
+        writer.join().unwrap();
+        let result = reader.join().unwrap();
+        removed.unwrap().unwrap();
+        assert!(
+            result.is_none(),
+            "removed snapshot cannot authorize after policy returns"
+        );
+    }
+
+    #[test]
+    fn snapshot_encoding_is_independent_of_map_insertion_order() {
+        let p = Peer::new();
+        let record = p.record(NOW, NOW);
+        let mut forward = EvidenceFileV1::default();
+        let mut reverse = EvidenceFileV1::default();
+        for i in 0..8 {
+            let a = AgentId([i; 32]);
+            forward.records.insert(a, record.clone());
+            forward.watermarks.insert(
+                a,
+                MoveWatermarkV1 {
+                    t: NOW + u64::from(i),
+                    machine: p.m(),
+                },
+            );
+        }
+        for i in (0..8).rev() {
+            let a = AgentId([i; 32]);
+            reverse.records.insert(a, forward.records[&a].clone());
+            reverse.watermarks.insert(a, forward.watermarks[&a]);
+        }
+        let encoded = forward.encode().unwrap();
+        assert_eq!(encoded, reverse.encode().unwrap());
+        assert_eq!(EvidenceFileV1::decode(&encoded).unwrap(), forward);
+    }
+
     #[test]
     fn freshness_each_component_and_future_skew() {
         let p = Peer::new();
@@ -1614,6 +1986,8 @@ mod tests {
         let r = p.record(NOW, NOW);
         let mut state = store.lock().unwrap();
         let mut next = EvidenceFileV1::default();
+        let mut verified = HashMap::new();
+        let view = Arc::new(r.verify(NOW, W_MS).unwrap());
         for i in 0..=RECORD_CAP {
             let mut id = [0; 32];
             id[..8].copy_from_slice(&(i as u64).to_le_bytes());
@@ -1621,6 +1995,7 @@ mod tests {
             let mut record = r.clone();
             record.stored_at_ms = NOW + i as u64;
             next.records.insert(a, record);
+            verified.insert(a, Arc::clone(&view));
             policy.peers.lock().unwrap().insert(a, ENROLLED);
         }
         let a = AgentId([0; 32]);
@@ -1636,7 +2011,7 @@ mod tests {
                 machine: p.m(),
             },
         );
-        store.evict_records(&state, &mut next, NOW);
+        store.evict_records(&state, &mut next, &verified, NOW);
         assert_eq!(next.records.len(), RECORD_CAP);
         assert!(!next.records.contains_key(&b));
         assert!(next.records.contains_key(&a));
@@ -1644,11 +2019,11 @@ mod tests {
         next.records.insert(b, r.clone());
         policy.peers.lock().unwrap().insert(b, GRANT);
         state.last_used.insert(a, NOW + 100);
-        store.evict_records(&state, &mut next, NOW);
+        store.evict_records(&state, &mut next, &verified, NOW);
         assert!(!next.records.contains_key(&b));
         next.records.insert(b, r);
         policy.peers.lock().unwrap().insert(b, ENROLLED);
-        store.evict_records(&state, &mut next, NOW);
+        store.evict_records(&state, &mut next, &verified, NOW);
         assert!(!next.records.contains_key(&a));
     }
     #[test]
