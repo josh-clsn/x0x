@@ -63,6 +63,45 @@ fn free_udp_port() -> u16 {
     port
 }
 
+/// The harness config pins every environment-touching knob (root review
+/// P2 on #1129). This socket-free check parses the exact TOML the nodes
+/// serve with and fails if any pin regresses — including the explicit
+/// empty `bootstrap_peers` list: an OMITTED key would make
+/// `resolved_bootstrap_peers()` fall back to the built-in fleet peers,
+/// and these nodes must never dial the testnet (that omission was a real
+/// failure during development: the fleet dials kept the QUIC socket
+/// alive past the shutdown release timeout).
+#[test]
+fn harness_config_pins_the_environment() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let node = Node {
+        name: "pins",
+        root: dir.path().to_path_buf(),
+        quic_port: 45678,
+        plane: "x0x.test.d30.pins".to_string(),
+        bootstrap: Vec::new(),
+        handle: None,
+        api: SocketAddr::from(([127, 0, 0, 1], 0)),
+        token: String::new(),
+    };
+    let config = node.config();
+    assert_eq!(
+        config.resolved_network_id().as_deref(),
+        Some("x0x.test.d30.pins"),
+        "the per-test plane must be pinned, never the prod default"
+    );
+    assert!(
+        config.resolved_bootstrap_peers().is_empty(),
+        "an explicit empty list must REPLACE the built-in fleet peers"
+    );
+    assert!(config.bootstrap_peers.is_some());
+    assert_eq!(
+        config.bind_address,
+        SocketAddr::from(([127, 0, 0, 1], 45678)),
+        "restarts re-bind the fixed QUIC port"
+    );
+}
+
 /// One in-process node: persistent state under `root/<name>/…`, a fixed
 /// QUIC port so restarts re-bind it, and the API token that `serve()`
 /// generates (and reuses across restarts) under the data dir.
@@ -70,6 +109,9 @@ struct Node {
     name: &'static str,
     root: PathBuf,
     quic_port: u16,
+    /// Per-TEST gossip plane, shared by the two nodes of that test and
+    /// unique to it, so no test can ever touch the prod plane.
+    plane: String,
     /// The OTHER node's QUIC address, dialed at startup (loopback
     /// stand-in for the production bootstrap dial).
     bootstrap: Vec<SocketAddr>,
@@ -79,17 +121,20 @@ struct Node {
 }
 
 impl Node {
-    /// First start: creates the identity and data dirs.
+    /// First start: creates the identity and data dirs. `plane` is the
+    /// per-test gossip plane (see the field docs).
     async fn start(
         name: &'static str,
         root: &Path,
         quic_port: u16,
+        plane: &str,
         bootstrap: Vec<SocketAddr>,
     ) -> Self {
         let mut node = Self {
             name,
             root: root.to_path_buf(),
             quic_port,
+            plane: plane.to_string(),
             bootstrap,
             handle: None,
             api: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -99,15 +144,54 @@ impl Node {
         node
     }
 
+    /// Build the daemon config as TOML text, the same surface the
+    /// daemon's own config file uses, so every environment-touching knob
+    /// is explicitly pinned rather than inherited from
+    /// `DaemonConfig::default()` (root review P2 on #1129):
+    ///
+    /// - `[update] enabled = false` — no GitHub startup check (the #1086
+    ///   ~30 s API-bind stall when 443 is closed) and no manifest
+    ///   action, ever;
+    /// - `mdns_enabled = false`, `port_mapping_enabled = false`,
+    ///   `rendezvous_enabled = false` — loopback-only, no LAN, no UPnP;
+    /// - a per-test `network_id` plane — these tests can never touch the
+    ///   prod plane even after S2 un-ignores them;
+    /// - `bootstrap_peers` given explicitly (empty for the first node):
+    ///   `DaemonConfig::resolved_bootstrap_peers()` uses the list
+    ///   VERBATIM and only falls back to the built-in fleet peers when
+    ///   the key is absent, so `Some(list)` REPLACES the hard-coded
+    ///   peers rather than appending to them.
     fn config(&self) -> DaemonConfig {
         let dir = self.root.join(self.name);
-        let mut config = DaemonConfig::default();
-        config.api_address = SocketAddr::from(([127, 0, 0, 1], 0));
-        config.bind_address = SocketAddr::from(([127, 0, 0, 1], self.quic_port));
-        config.bootstrap_peers = Some(self.bootstrap.clone());
-        config.data_dir = dir.join("data");
-        config.identity_dir = Some(dir.join("identity"));
-        config
+        // ALWAYS an explicit list — an omitted key would make
+        // `resolved_bootstrap_peers()` fall back to the built-in fleet
+        // peers, and these nodes must never dial the testnet.
+        let bootstrap = format!(
+            "bootstrap_peers = [{}]",
+            self.bootstrap
+                .iter()
+                .map(|addr| format!("\"{addr}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let text = format!(
+            "bind_address = \"127.0.0.1:{}\"\n\
+             api_address = \"127.0.0.1:0\"\n\
+             data_dir = \"{}\"\n\
+             identity_dir = \"{}\"\n\
+             network_id = \"{}\"\n\
+             mdns_enabled = false\n\
+             port_mapping_enabled = false\n\
+             rendezvous_enabled = false\n\
+             {bootstrap}\n\
+             [update]\n\
+             enabled = false\n",
+            self.quic_port,
+            dir.join("data").display(),
+            dir.join("identity").display(),
+            self.plane,
+        );
+        toml::from_str(&text).expect("daemon config from TOML")
     }
 
     /// (Re)start on the SAME identity and data dirs. A fresh `serve()`
@@ -196,12 +280,14 @@ impl Node {
 /// causes. NO group, grant or enrollment is established here: tests
 /// that need a relationship call [`share_group`] themselves.
 async fn warm_pair(root: &Path) -> (Node, Node) {
+    let plane = format!("x0x.test.d30.{:032x}", rand::random::<u128>());
     let a_port = free_udp_port();
-    let a = Node::start("a", root, a_port, Vec::new()).await;
+    let a = Node::start("a", root, a_port, &plane, Vec::new()).await;
     let b = Node::start(
         "b",
         root,
         free_udp_port(),
+        &plane,
         vec![SocketAddr::from(([127, 0, 0, 1], a_port))],
     )
     .await;
