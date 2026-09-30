@@ -3952,6 +3952,23 @@ struct RawDirectDelivery {
 
 /// The post-validation raw-QUIC delivery path. The listener calls this only
 /// after the revocation, pairing, and expiry gates have passed.
+/// #1088: the DELIVERY `verified` decision for a raw 0x10 frame. The
+/// discovery-cache match alone, OR the AuthenticatedMachineBindings
+/// registry naming THIS transport-authentic machine — guarded so a KNOWN
+/// expired certificate cannot be resurrected by the registry arm (the
+/// is_expired drop gate downstream then refuses the frame). An absent
+/// cache entry (`None`) keeps the pre-#130 fail-open: no expiry is known,
+/// so none is enforced, exactly as the cache-only behaviour did.
+fn raw_delivery_verified(
+    cache_verified: bool,
+    registry_names_this_machine: bool,
+    cert_not_after: Option<u64>,
+    now_unix_secs: u64,
+) -> bool {
+    cache_verified
+        || (registry_names_this_machine && !identity::is_expired(cert_not_after, now_unix_secs))
+}
+
 async fn dispatch_raw_direct_after_gates(
     dm: &direct::DirectMessaging,
     history_handle: Option<&history::HistoryHandle>,
@@ -8111,6 +8128,33 @@ impl Agent {
     ///     }
     /// }
     /// ```
+    /// Test seam for #1088's frame-level listener tests (unit and the
+    /// connectivity integration file): the authenticated machine-binding
+    /// registry the raw delivery path consults.
+    pub fn authenticated_machine_bindings_for_testing(
+        &self,
+    ) -> dm_inbox::AuthenticatedMachineBindings {
+        std::sync::Arc::clone(&self.authenticated_machine_bindings)
+    }
+
+    /// Test seam for #1088: record an authenticated machine binding the
+    /// way the inbox records one after a verified fresh machine-key
+    /// attestation.
+    pub async fn record_authenticated_binding_for_testing(
+        &self,
+        agent: identity::AgentId,
+        machine: identity::MachineId,
+        announced_at: u64,
+    ) {
+        dm_inbox::record_authenticated_machine_binding(
+            &self.authenticated_machine_bindings,
+            agent,
+            machine,
+            announced_at,
+        )
+        .await;
+    }
+
     pub async fn recv_direct_annotated(&self) -> Option<direct::DirectMessage> {
         self.recv_direct_inner().await
     }
@@ -13545,14 +13589,44 @@ impl Agent {
                     digest = %digest,
                 );
 
-                // Verify AgentId→MachineId binding against identity discovery cache.
-                let (verified, cert_not_after) = {
+                // Verify AgentId→MachineId binding for DELIVERY (#1088):
+                // the identity discovery cache, OR the
+                // AuthenticatedMachineBindings registry — the registry entry
+                // is authenticated evidence of the same quality (a verified
+                // identity announcement or a fresh machine-key attestation
+                // over an agent-signed envelope; recorded on the inbox path
+                // at inbound_origin_attested). Post-restart the discovery
+                // cache is empty until the peer's next announcement (~600 s
+                // cadence), which left every raw frame delivered
+                // `verified=false` and dropped by the #1070 gates (Welcome,
+                // files, join-result, control-blob) for that whole window —
+                // the g46r2 finding-3 stalls.
+                //
+                // Expiry guard: when the cache DOES know the peer's
+                // `cert_not_after` and it is expired, the registry arm must
+                // not resurrect verification — the frame stays unverified and
+                // the is_expired drop gate below handles it. An absent cache
+                // entry keeps the pre-#130 fail-open (`None` = no expiry
+                // known), unchanged from the cache-only behaviour.
+                let (cache_verified, cert_not_after) = {
                     let cache = discovery_cache.read().await;
                     cache
                         .get(&sender)
                         .map(|entry| (entry.machine_id == machine_id, entry.cert_not_after))
                         .unwrap_or((false, None))
                 };
+                let registry_names_this_machine = crate::dm_inbox::authenticated_machine_binding(
+                    &authenticated_machine_bindings,
+                    &sender,
+                )
+                .await
+                .is_some_and(|bound| bound == machine_id);
+                let verified = raw_delivery_verified(
+                    cache_verified,
+                    registry_names_this_machine,
+                    cert_not_after,
+                    Agent::unix_timestamp_secs(),
+                );
 
                 // Evaluate trust for the (AgentId, MachineId) pair.
                 let trust_decision = {
@@ -13693,22 +13767,14 @@ impl Agent {
                 // binding matches this transport-authentic machine, OR an
                 // AuthenticatedMachineBindings entry (C1) names THIS machine
                 // for the sender — a moved agent whose announcement is too
-                // stale for the discovery cache (raw-path `verified` stays
-                // false) still updates once its authenticated binding lands,
-                // matching the #927 evidence rule. The DELIVERY annotation
-                // keeps the raw `verified`; only the routing write is eased.
-                let binding_names_this_machine = crate::dm_inbox::authenticated_machine_binding(
-                    &authenticated_machine_bindings,
-                    &sender,
-                )
-                .await
-                .is_some_and(|bound| bound == machine_id);
-                dm.mark_raw_direct_sender_connected(
-                    sender,
-                    machine_id,
-                    verified || binding_names_this_machine,
-                )
-                .await;
+                // stale for the discovery cache still updates once its
+                // authenticated binding lands, matching the #927 evidence
+                // rule. Since #1088 the registry arm is computed once, above,
+                // and is already part of the DELIVERY `verified` (with the
+                // expiry guard); an unverified claim — no cache match AND no
+                // registry binding naming THIS machine — still never rebinds.
+                dm.mark_raw_direct_sender_connected(sender, machine_id, verified)
+                    .await;
 
                 // Issue #120: opt-in coarsened origin token from the live
                 // connection table (the same source add_from_connection()
@@ -20517,6 +20583,45 @@ mod tests {
         assert_eq!(record.payload, payload);
         assert_eq!(record.provenance, history::Provenance::VerifiedEnvelope);
         record.validate().expect("raw DM history record is valid");
+    }
+
+    /// #1088: the raw DELIVERY `verified` decision — the registry arm
+    /// (a fresh machine-key attestation's binding) must verify a frame from
+    /// a post-restart node whose discovery cache is still empty, a KNOWN
+    /// expired certificate must not be resurrected by it, and a binding for
+    /// a DIFFERENT machine must not. This pins the arithmetic the raw loop
+    /// delegates to `raw_delivery_verified`; the frame-level behaviour
+    /// (SSE/WS annotation, the #1070 decode gates) is the loop's use of it
+    /// and is covered by the CI listener tests.
+    #[test]
+    fn raw_delivery_verified_registry_arm() {
+        let now = 1_800_000_000u64;
+        // Post-restart shape: cache empty (no match, no cert), registry
+        // names THIS machine — the g46r2 finding-3 case.
+        assert!(raw_delivery_verified(false, true, None, now));
+        // Cache hit unchanged.
+        assert!(raw_delivery_verified(true, false, None, now));
+        // #898 preserved: no cache match AND no registry binding -> false.
+        assert!(!raw_delivery_verified(false, false, None, now));
+        // Registry binding for a DIFFERENT machine -> false.
+        assert!(!raw_delivery_verified(false, false, None, now));
+        // A KNOWN expired cert (past the clock-skew grace) is not
+        // resurrected by the registry arm...
+        assert!(!raw_delivery_verified(
+            false,
+            true,
+            Some(now - 100_000),
+            now
+        ));
+        // ...one inside the EXPIRY_CLOCK_SKEW_SECS grace still is (the
+        // downstream is_expired gate allows the same grace), and a valid
+        // known cert is fine.
+        assert!(raw_delivery_verified(false, true, Some(now - 1), now));
+        assert!(raw_delivery_verified(false, true, Some(now + 3_600), now));
+        // The cache arm keeps its historical shape (an expired cached cert
+        // matches the machine but the downstream is_expired gate drops it;
+        // this helper reports the BINDING only, as before).
+        assert!(raw_delivery_verified(true, false, Some(now - 1), now));
     }
 
     /// N12 (raw-path Blocked delivery): the raw 0x10 path must NOT deliver
