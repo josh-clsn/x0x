@@ -122,8 +122,8 @@ Accepted ADR); **ruled** = decided by David, work outstanding or ongoing;
 
 Each row records David's ruling, not the charter's recommendation. They
 differ for D08 (the capability bit moved into v0.46), D10 (ratified as-is),
-D14 (dedicated hosts), D15 (no bot identity), D16 (the promoted-admin call),
-D19 (scope revised 2026-09-29) and D29 (an ADR 0089 slice pulled into v0.46).
+D14 (dedicated hosts), D15 (no bot identity), D19 (scope revised 2026-09-29)
+and D29 (an ADR 0089 slice pulled into v0.46).
 
 | Id | Ruling (one line) | Status |
 |---|---|---|
@@ -142,7 +142,7 @@ D19 (scope revised 2026-09-29) and D29 (an ADR 0089 slice pulled into v0.46).
 | D13 | #646 (invites stop past 20 Active+Banned members) is a product limit, not parked; fixed in W4. | Ruled |
 | D14 | Testnet evidence runs on **dedicated testnet hosts**, sealed from production. David chose dedicated hosts over the open "dedicated hosts or 4 vCPU" option. | Ruled |
 | D15 | CI runs on PRs to every base; `main` has a ruleset with required checks and no bypass; `v*` tags are admin-only. **No bot identity:** David declined the recommended separate agent identity, so agents act as the admin account. | Implemented; recorded by ADR 0087 (Proposed) |
-| D16 | Ruled: a promoted admin with carried evidence may admit while the owner is offline. ADR 0088 carries the rest of the liveness contract the charter recommended: any active admin may redeem; stale-base gaps catch up (D34 names who attests); Home becomes an explicit owner group (OwnerCertified checked at admission, revoke by eviction); a simulation harness reproduces each failure first. | Pending ADR 0088 (prov.), W3 |
+| D16 | Group liveness contract, **ruled in full (David, 2026-09-29)**: a promoted admin carrying the evidence may admit while the owner device is offline, and any active admin may redeem invites; stale ordinary-group joiners catch up; Home becomes an explicit owner group, with the owner certificate checked at admission; the simulation harness must reproduce each failure first. D34 closes the three holes this left (who attests catch-up, eviction on revocation, certificate size). | Pending ADR 0088 (prov.), W3 |
 | D17 | Trust gates decide only from in-band evidence plus persisted state, through one `Authority::decide`. | Pending ADR 0089 (prov.), W3 |
 | D18 | One group crypto (TreeKEM only) and one acknowledged-delivery primitive (`Outbox<T>`), enforced in CI: no new bespoke queues in fix PRs. | Pending ADRs 0090, 0091 (prov.), W3 |
 | D19 | Scope, **revised by David on 2026-09-29** (it supersedes the 09-28 "network-and-trust layer" wording): x0x is the glue between people, their machines and their agents and does not provide agents. Core: shared places, sharing whole agent teams, and efficiency (goal E). Headline requirement: any agent that sees x0x knows how to use it. R8 media calling and the loro notes merge path are lower priority, not in scope now. | Pending ADR 0095 (prov.), after promotion |
