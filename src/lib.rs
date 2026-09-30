@@ -3095,6 +3095,84 @@ pub struct AgentBuilder {
 }
 
 /// Context captured by the background identity heartbeat task.
+/// #1091: the reconnect re-announce gate. A node re-broadcasts its own
+/// signed identity announcement when it sees a transport-level (re)connect
+/// to a machine that was not connected just before — REGARDLESS of whether
+/// it can resolve that machine (the restarted peer is the one that cannot
+/// resolve US; resolving-or-not on our side must not gate the trigger).
+/// Globally rate-limited per node (the storm-control lesson of sg 0.5.75 /
+/// #380 GRAFT): at most one reconnect-triggered re-announce per
+/// [`RECONNECT_REANNOUNCE_WINDOW`], with a COALESCED trailing fire when
+/// more reconnects arrived inside the window — a fleet-wide rolling
+/// restart of N nodes inside ~15 s produces at most
+/// N × ceil(window / 30 s) re-announces, not a per-peer fan-out.
+#[derive(Debug)]
+pub(crate) struct ReconnectReannounceGate {
+    last_fire: Option<std::time::Instant>,
+    trailing_pending: bool,
+}
+
+/// The global per-node window for reconnect-triggered re-announces.
+pub(crate) const RECONNECT_REANNOUNCE_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+impl ReconnectReannounceGate {
+    fn new() -> Self {
+        Self {
+            last_fire: None,
+            trailing_pending: false,
+        }
+    }
+
+    /// Leading edge: may we fire right now?
+    fn should_fire(&self, now: std::time::Instant) -> bool {
+        match self.last_fire {
+            None => true,
+            Some(last) => now.duration_since(last) >= RECONNECT_REANNOUNCE_WINDOW,
+        }
+    }
+
+    /// A reconnect arrived. Fire immediately when allowed; otherwise mark a
+    /// trailing fire so the burst still produces exactly one more announce
+    /// at the window's end.
+    fn on_reconnect(&mut self, now: std::time::Instant) -> bool {
+        if self.should_fire(now) {
+            self.last_fire = Some(now);
+            self.trailing_pending = false;
+            true
+        } else {
+            self.trailing_pending = true;
+            false
+        }
+    }
+
+    /// The trailing coalesced fire, consumed by the re-announcer task when
+    /// the window closes.
+    fn take_trailing(&mut self, now: std::time::Instant) -> bool {
+        if self.trailing_pending && self.should_fire(now) {
+            self.last_fire = Some(now);
+            self.trailing_pending = false;
+            return true;
+        }
+        false
+    }
+
+    /// When the next trailing fire may land (None when nothing is pending).
+    fn next_due(&self) -> Option<std::time::Instant> {
+        if !self.trailing_pending {
+            return None;
+        }
+        self.last_fire
+            .map(|last| last + RECONNECT_REANNOUNCE_WINDOW)
+    }
+}
+
+impl Default for ReconnectReannounceGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 struct HeartbeatContext {
     /// ADR-0043: this machine's enrolled ML-KEM public bytes (publishes
     /// on the V3 machine announce); `None` disables V3 publication.
@@ -8050,7 +8128,9 @@ impl Agent {
     fn map_raw_quic_dm_error(err: error::NetworkError) -> dm::DmError {
         match err {
             error::NetworkError::AgentNotFound(_) => {
-                dm::DmError::RecipientKeyUnavailable(err.to_string())
+                // #1091: an unresolved agent is a DISCOVERY gap (retry when
+                // the peer re-announces), not missing key material.
+                dm::DmError::RecipientUndiscovered(err.to_string())
             }
             error::NetworkError::AgentNotConnected(_)
             | error::NetworkError::NotConnected(_)
@@ -8153,6 +8233,30 @@ impl Agent {
             announced_at,
         )
         .await;
+    }
+
+    /// Test seam (#1091): read one discovery-cache entry.
+    pub async fn discovered_agent_for_testing(
+        &self,
+        agent: &identity::AgentId,
+    ) -> Option<crate::DiscoveredAgent> {
+        self.identity_discovery_cache
+            .read()
+            .await
+            .get(agent)
+            .cloned()
+    }
+
+    /// Test seam (#1091): empty the identity discovery cache AND the
+    /// authenticated machine-binding registry — the post-restart cold
+    /// state for send-first resolution.
+    pub async fn clear_identity_resolution_for_testing(&self) {
+        self.identity_discovery_cache.write().await.clear();
+        // The binding cache exposes no bulk clear by design; a fresh
+        // empty cache is the same cold state a restart starts from.
+        *self.authenticated_machine_bindings.write().await =
+            dm_inbox::AuthenticatedMachineBindingCache::default();
+        self.direct_messaging.clear_resolution_for_testing().await;
     }
 
     pub async fn recv_direct_annotated(&self) -> Option<direct::DirectMessage> {
@@ -13259,6 +13363,17 @@ impl Agent {
     /// agent-level direct messaging registry so inbound accepted connections are
     /// usable for reverse direct sends before the first inbound direct payload.
     fn start_network_event_listener(&self) {
+        // #1091: reconnect-triggered self re-announce. The listener signals
+        // the re-announcer task (which owns the announcement machinery);
+        // the global gate lives there.
+        let (reconnect_tx, reconnect_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        self.spawn_reconnect_reannouncer(reconnect_rx);
+        // #1091: the machines this listener currently sees connected — the
+        // re-announce signal fires only for a machine that was NOT connected
+        // just before (duplicate Connected events for live peers do not
+        // re-trigger; the global 30 s gate bounds the rest).
+        let mut connected_machines: std::collections::HashSet<[u8; 32]> =
+            std::collections::HashSet::new();
         if self
             .network_event_listener_started
             .swap(true, std::sync::atomic::Ordering::AcqRel)
@@ -13307,6 +13422,15 @@ impl Agent {
 
                 match event {
                     network::NetworkEvent::PeerConnected { peer_id, address } => {
+                        // #1091: a transport (re)connect to a machine that was
+                        // not connected just before re-triggers our own
+                        // identity re-announce (globally rate-limited in the
+                        // re-announcer task). Fired REGARDLESS of whether we
+                        // can resolve this machine — the restarted PEER is
+                        // the one that cannot resolve us.
+                        if connected_machines.insert(peer_id) {
+                            let _ = reconnect_tx.send(());
+                        }
                         let machine_id = identity::MachineId(peer_id);
                         let cached_agent_id = {
                             let cache = cache.read().await;
@@ -13393,6 +13517,7 @@ impl Agent {
                         }
                     }
                     network::NetworkEvent::PeerDisconnected { peer_id, reason } => {
+                        connected_machines.remove(&peer_id);
                         let machine_id = identity::MachineId(peer_id);
                         let cached_agent_id = {
                             let cache = cache.read().await;
@@ -14803,6 +14928,100 @@ impl Agent {
     /// # Errors
     ///
     /// Returns an error if a required network or gossip component is missing.
+    /// #1091: the reconnect re-announcer. Owns the global
+    /// [`ReconnectReannounceGate`]; every signal from the network event
+    /// listener (a transport (re)connect to a previously-unconnected
+    /// machine) is rate-limited to one self re-announce per
+    /// [`RECONNECT_REANNOUNCE_WINDOW`], with one coalesced trailing fire
+    /// for bursts. The announcement is the ordinary signed identity
+    /// announcement (same builder as the heartbeat, same ingest
+    /// verification: signature, EP1 expiry, revocation), so a restarted
+    /// peer's discovery cache AND AuthenticatedMachineBindings refill
+    /// within one gossip hop of its reconnect — the #1091 send-side stall
+    /// and the #1088 receive-side window close together.
+    fn spawn_reconnect_reannouncer(&self, mut rx: tokio::sync::mpsc::UnboundedReceiver<()>) {
+        let runtime = match self.gossip_runtime.as_ref() {
+            Some(runtime) => std::sync::Arc::clone(runtime),
+            None => return,
+        };
+        let Some(network) = self.network.as_ref() else {
+            return;
+        };
+        let allow_local_discovery_addrs = allow_local_discovery_addresses(network.config());
+        let network = std::sync::Arc::clone(network);
+        let ctx = HeartbeatContext {
+            identity: std::sync::Arc::clone(&self.identity),
+            runtime,
+            network,
+            selection_skew: std::sync::Arc::clone(&self.selection_skew),
+            interval_secs: self.heartbeat_interval_secs,
+            cache: std::sync::Arc::clone(&self.identity_discovery_cache),
+            machine_cache: std::sync::Arc::clone(&self.machine_discovery_cache),
+            user_identity_consented: std::sync::Arc::clone(&self.user_identity_consented),
+            allow_local_discovery_addrs,
+            revocation_set: std::sync::Arc::clone(&self.revocation_set),
+            last_revocation_generation: std::sync::atomic::AtomicU64::new(0),
+            heartbeat_tick: std::sync::atomic::AtomicU64::new(0),
+            verified_cert_tx: std::sync::Arc::clone(&self.verified_cert_tx),
+            machine_kem_public: self.machine_kem_public_key(),
+            move_state: std::sync::Arc::clone(&self.move_state),
+            legacy_announce: self.legacy_announce,
+            self_name: std::sync::Arc::clone(&self.self_name),
+            self_name_ever_set: std::sync::Arc::clone(&self.self_name_ever_set),
+        };
+        let gate = std::sync::Arc::new(tokio::sync::Mutex::new(ReconnectReannounceGate::new()));
+        let announce_gate = std::sync::Arc::clone(&gate);
+        let token = self.shutdown_token.clone();
+        self.spawn_tracked(async move {
+            loop {
+                let fire = tokio::select! {
+                    _ = token.cancelled() => break,
+                    recv = rx.recv() => recv.is_some(),
+                };
+                if !fire {
+                    break;
+                }
+                let now = std::time::Instant::now();
+                let mut gate = announce_gate.lock().await;
+                if gate.on_reconnect(now) {
+                    drop(gate);
+                    if let Err(e) = ctx.announce().await {
+                        tracing::warn!("reconnect-triggered identity re-announcement failed: {e}");
+                    } else {
+                        tracing::debug!(
+                            "reconnect-triggered identity re-announcement sent (#1091)"
+                        );
+                    }
+                    continue;
+                }
+                // Coalesced trailing fire: wait for the window to close.
+                while let Some(due) = gate.next_due() {
+                    let wait = tokio::time::sleep_until(tokio::time::Instant::from_std(due));
+                    tokio::select! {
+                        _ = token.cancelled() => break,
+                        _ = wait => {},
+                        recv = rx.recv() => {
+                            if recv.is_none() {
+                                break;
+                            }
+                            // More reconnects inside the window stay coalesced.
+                        }
+                    }
+                    let now = std::time::Instant::now();
+                    if gate.take_trailing(now) {
+                        drop(gate);
+                        if let Err(e) = ctx.announce().await {
+                            tracing::warn!(
+                                "reconnect-triggered identity re-announcement failed: {e}"
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
     pub async fn start_identity_heartbeat(&self) -> error::Result<()> {
         let mut handle_guard = self.heartbeat_handle.lock().await;
         // Shutdown race (issue #116): a still-bootstrapping join_network can call
@@ -20622,6 +20841,58 @@ mod tests {
         // matches the machine but the downstream is_expired gate drops it;
         // this helper reports the BINDING only, as before).
         assert!(raw_delivery_verified(true, false, Some(now - 1), now));
+    }
+
+    /// #1091: the reconnect re-announce gate — global per-node rate limit
+    /// with leading-edge fire and one coalesced trailing fire per window.
+    /// A burst of reconnects inside the window produces exactly one
+    /// immediate announce plus one at the window's end; a fleet-wide
+    /// rolling restart of N nodes inside ~15 s is bounded by
+    /// N × ceil(window / 30 s) re-announces, never a per-peer fan-out.
+    #[test]
+    fn reconnect_reannounce_gate_leading_edge_and_coalescing() {
+        let t0 = std::time::Instant::now();
+        let mut gate = ReconnectReannounceGate::new();
+
+        // First reconnect ever: fires immediately (leading edge).
+        assert!(gate.on_reconnect(t0));
+        // A burst of 5 more reconnects inside the window: none fire; all
+        // coalesce into one trailing fire.
+        for _ in 0..5 {
+            assert!(!gate.on_reconnect(t0 + std::time::Duration::from_secs(2)));
+        }
+        assert_eq!(
+            gate.next_due(),
+            Some(t0 + RECONNECT_REANNOUNCE_WINDOW),
+            "the trailing fire is due exactly one window after the leading edge"
+        );
+        // Inside the window the trailing fire is not yet allowed...
+        assert!(!gate.take_trailing(t0 + std::time::Duration::from_secs(29)));
+        // ...at the window's end it fires exactly once.
+        assert!(gate.take_trailing(t0 + RECONNECT_REANNOUNCE_WINDOW));
+        assert!(!gate.take_trailing(t0 + RECONNECT_REANNOUNCE_WINDOW));
+        // The NEXT reconnect (past the window) fires on the leading edge
+        // again, and a quiet period after it leaves nothing pending.
+        assert!(gate.on_reconnect(t0 + std::time::Duration::from_secs(120)));
+        assert_eq!(gate.next_due(), None);
+    }
+
+    /// #1091: a reconnect that arrives exactly at the window boundary
+    /// fires on the leading edge (no extra trailing fire scheduled).
+    #[test]
+    fn reconnect_reannounce_gate_boundary_and_churn() {
+        let t0 = std::time::Instant::now();
+        let mut gate = ReconnectReannounceGate::new();
+        assert!(gate.on_reconnect(t0));
+        // Churn: connect/disconnect cycles of the SAME machine inside the
+        // window — the LISTENER suppresses duplicates via its connected
+        // set; the gate sees at most one signal per machine per cycle and
+        // still only ever emits one trailing fire.
+        assert!(!gate.on_reconnect(t0 + std::time::Duration::from_secs(10)));
+        assert!(!gate.on_reconnect(t0 + std::time::Duration::from_secs(20)));
+        // Exactly at the boundary the leading edge re-arms.
+        assert!(gate.on_reconnect(t0 + RECONNECT_REANNOUNCE_WINDOW));
+        assert_eq!(gate.next_due(), None);
     }
 
     /// N12 (raw-path Blocked delivery): the raw 0x10 path must NOT deliver

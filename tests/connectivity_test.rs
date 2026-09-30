@@ -488,6 +488,83 @@ async fn raw_frame_from_wrong_machine_stays_unverified_with_registry_binding() {
     );
 }
 
+/// #1091 (the send-first reproduction, CI): a node whose identity
+/// resolution state is COLD (the post-restart shape — discovery cache and
+/// binding registry empty) must still be able to SEND FIRST to a peer it
+/// is transport-connected to, within seconds. The reconnect-triggered
+/// self re-announce refills the cold node's cache from the peer's
+/// re-announce (the peer sees the (re)connect and re-announces too).
+///
+/// Cold state is produced with the test seam (clear both structures)
+/// followed by a transport reconnect, so the gate fires exactly as it
+/// would after a daemon restart. On the reverted tree the send fails with
+/// RecipientUndiscovered for the whole announcement cadence.
+#[tokio::test]
+async fn cold_node_sends_first_after_reconnect_within_seconds() {
+    let a_dir = TempDir::new().unwrap();
+    let b_dir = TempDir::new().unwrap();
+    let a = build_agent(&a_dir).await;
+    let b = build_agent(&b_dir).await;
+    a.join_network().await.expect("a join");
+    b.join_network().await.expect("b join");
+    a.announce_identity(false, false)
+        .await
+        .expect("a announces");
+    b.announce_identity(false, false)
+        .await
+        .expect("b announces");
+
+    // Let b discover a (the warm precondition the fixture relies on).
+    let a_id = a.agent_id();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if b.discovered_agent_for_testing(&a_id).await.is_some() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "b never discovered a"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // THE COLD STATE: b's discovery cache and binding registry emptied —
+    // exactly what a restart leaves behind.
+    b.clear_identity_resolution_for_testing().await;
+    assert!(b.discovered_agent_for_testing(&a_id).await.is_none());
+
+    // A transport (re)connect: b dials a again. Both sides' reconnect
+    // gates fire (each sees a machine that was not connected just
+    // before), a re-announces, and b's cache refills.
+    let a_addr = a.bound_addr().await.expect("a bound");
+    let b_network = b.network().expect("b network");
+    b_network.connect_addr(a_addr).await.expect("b redials a");
+    let a_peer = ant_quic::PeerId(a.machine_id().0);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    while !b_network.is_connected(&a_peer).await {
+        assert!(tokio::time::Instant::now() < deadline, "redial deadline");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // B SENDS FIRST — within 10 s of the reconnect it must succeed.
+    let send = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            match b.send_direct(&a_id, b"1091 cold send".to_vec()).await {
+                Ok(_) => return true,
+                Err(x0x::dm::DmError::RecipientUndiscovered(_)) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(other) => panic!("unexpected send error: {other:?}"),
+            }
+        }
+    })
+    .await;
+    assert!(
+        send.unwrap_or(false),
+        "#1091: the cold node must send first within 10 s of the reconnect"
+    );
+}
+
 #[tokio::test]
 async fn machine_for_agent_returns_linked_endpoint() {
     let dir = TempDir::new().unwrap();

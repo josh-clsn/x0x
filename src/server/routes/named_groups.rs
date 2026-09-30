@@ -35501,7 +35501,9 @@ enum WelcomeFetchSendError {
 
 fn classify_welcome_fetch_send_error(error: x0x::dm::DmError) -> WelcomeFetchSendError {
     match error {
-        x0x::dm::DmError::Timeout { .. } => {
+        x0x::dm::DmError::Timeout { .. } | x0x::dm::DmError::RecipientUndiscovered(_) => {
+            // #1091: an undiscovered recipient is a transient discovery gap
+            // — keep waiting/retrying, never abort the fetch.
             WelcomeFetchSendError::ReceiptUnconfirmed(error.to_string())
         }
         _ => WelcomeFetchSendError::Failed(error.to_string()),
