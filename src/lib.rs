@@ -160,7 +160,7 @@ pub mod dm;
 /// store to decide whether to use the gossip DM path or fall back to
 /// raw-QUIC for a given recipient.
 pub mod dm_capability;
-/// Inert relationship-peer evidence store (ADR 0089 S1).
+/// Relationship-peer evidence store and point-of-use runtime (ADR 0089).
 pub mod peer_evidence;
 
 /// Bounded per-peer DM digest diagnostic observations.
@@ -4117,17 +4117,40 @@ fn raw_delivery_binding(
         .unwrap_or((false, false, None))
 }
 
-/// #1088: registry evidence verifies raw delivery only while its certificate
-/// is current. Both arms use the selected binding's expiry at the downstream
-/// drop gate; None retains compatibility with peers without certificates.
+/// #1088/#1098: neither live authority arm verifies an expired certificate.
+/// The downstream drop gate uses the same expiry; None retains compatibility
+/// with peers without certificates.
 fn raw_delivery_verified(
     cache_verified: bool,
     registry_names_this_machine: bool,
     cert_not_after: Option<u64>,
     now_unix_secs: u64,
 ) -> bool {
-    cache_verified
-        || (registry_names_this_machine && !identity::is_expired(cert_not_after, now_unix_secs))
+    (cache_verified || registry_names_this_machine)
+        && !identity::is_expired(cert_not_after, now_unix_secs)
+}
+
+/// Select live authority first; stored authority never overrides a known
+/// binding, even if the known binding names another transport machine.
+fn raw_delivery_with_evidence(
+    cache: Option<&DiscoveredAgent>,
+    registry: Option<dm_inbox::AuthenticatedMachineBinding>,
+    evidence: Option<&peer_evidence::EvidenceRuntime>,
+    agent: identity::AgentId,
+    machine: identity::MachineId,
+    now: u64,
+) -> (bool, bool, Option<u64>) {
+    let (cached, registered, expiry) = raw_delivery_binding(cache, registry, machine);
+    let live = raw_delivery_verified(cached, registered, expiry, now / 1000);
+    if cache.is_some() || registry.is_some() {
+        return (live, live, expiry);
+    }
+    let view = evidence.and_then(|e| e.usable(agent, machine, now));
+    let expiry = view
+        .as_ref()
+        .and_then(|v| v.certificate.as_ref())
+        .and_then(identity::AgentCertificate::not_after);
+    (view.is_some(), false, expiry)
 }
 
 async fn dispatch_raw_direct_after_gates(
@@ -5242,6 +5265,50 @@ impl Agent {
         Ok(outcome)
     }
 
+    /// Dial from a freshly checked evidence view, without creating any agent
+    /// binding or discovery entry. ant-quic authenticates the expected machine.
+    async fn connect_from_evidence(
+        &self,
+        agent: identity::AgentId,
+    ) -> Option<connectivity::ConnectOutcome> {
+        if !self.peer_evidence().wait(0).await {
+            return None;
+        }
+        let view = self
+            .peer_evidence()
+            .usable_agent(agent, dm_capability::now_unix_ms())?;
+        let machine = view.announcement.machine_id;
+        if self
+            .recipient_pairing_denied(&agent, &machine)
+            .await
+            .is_some()
+        {
+            return None;
+        }
+        let network = self.network.as_ref()?;
+        let peer = ant_quic::PeerId(machine.0);
+        if network.is_connected(&peer).await {
+            return Some(connectivity::ConnectOutcome::AlreadyConnected);
+        }
+        let addrs = filter_discovery_announcement_addrs(
+            view.announcement.addresses.clone(),
+            allow_local_discovery_addresses(network.config()),
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            network.connect_peer_with_addrs(peer, addrs),
+        )
+        .await;
+        self.peer_evidence()
+            .usable(agent, machine, dm_capability::now_unix_ms())?;
+        Some(match result {
+            Ok(Ok((addr, connected))) if connected == peer => {
+                connectivity::ConnectOutcome::Direct(addr)
+            }
+            _ => connectivity::ConnectOutcome::Unreachable,
+        })
+    }
+
     async fn connect_to_agent_inner(
         &self,
         agent_id: &identity::AgentId,
@@ -5260,9 +5327,39 @@ impl Agent {
             cache.get(agent_id).cloned()
         };
 
+        // A live identity can legitimately carry no dial hints. Borrow the
+        // stored addresses only for that exact live machine, never rebind it.
+        let mut discovered = discovered;
+        if discovered
+            .as_ref()
+            .is_some_and(|entry| entry.addresses.is_empty())
+            && self.peer_evidence().wait(0).await
+        {
+            if let Some(entry) = discovered.as_mut() {
+                if let Some(view) = self.peer_evidence().usable(
+                    *agent_id,
+                    entry.machine_id,
+                    dm_capability::now_unix_ms(),
+                ) {
+                    let local_scope = self
+                        .network
+                        .as_ref()
+                        .is_some_and(|n| allow_local_discovery_addresses(n.config()));
+                    entry.addresses = filter_discovery_announcement_addrs(
+                        view.announcement.addresses.clone(),
+                        local_scope,
+                    );
+                }
+            }
+        }
+
         let agent = match discovered {
             Some(a) => a,
             None => {
+                if let Some(outcome) = self.connect_from_evidence(*agent_id).await {
+                    return Ok(outcome);
+                }
+
                 tracing::info!(
                     target: "x0x::connect",
                     stage = "connect_to_agent",
@@ -6947,11 +7044,29 @@ impl Agent {
         let send_started = std::time::Instant::now();
         let mut stages = dm::DurableSendStages::default();
         let mut advert_binding = self.capability_store.lookup_binding(to);
+        let evidence_ready = if advert_binding.is_none() {
+            self.peer_evidence().wait(payload.len()).await
+        } else {
+            true
+        };
+        if advert_binding.is_none() && !evidence_ready {
+            return Err(dm::DmError::RecipientUndiscovered(
+                "peer evidence startup barrier unavailable".into(),
+            ));
+        }
+        let stored_cap = if advert_binding.is_none() {
+            self.peer_evidence()
+                .usable_agent(*to, dm_capability::now_unix_ms())
+        } else {
+            None
+        };
+
         // ADR 0030 §2: one forced targeted refresh before refusing. A daemon
         // whose advert we simply have not heard yet must not be reported as
         // incapable, but the refusal must still be bounded — the whole point
         // of the 409 is that it is fast and deterministic, never a hang.
         if (config.require_durable_app_ack
+            && stored_cap.is_none()
             && !capability_binding_supports_durable_ack(advert_binding.as_ref()))
             || self
                 .capability_store
@@ -6983,6 +7098,23 @@ impl Agent {
             .is_some_and(|caps| caps.gossip_inbox && !caps.kem_public_key.is_empty());
         let (cap, cap_machine, cap_source) = if advert_gossip_ready {
             (advert_cap, advert_machine, "advert_cache")
+        } else if advert_cap.is_none() && stored_cap.is_some() {
+            // Re-check after the refresh await; never retain authority across it.
+            match self
+                .peer_evidence()
+                .usable_agent(*to, dm_capability::now_unix_ms())
+            {
+                Some(view) => (
+                    Some(view.advert.capabilities.clone()),
+                    Some(view.announcement.machine_id),
+                    "peer_evidence",
+                ),
+                None => {
+                    return Err(dm::DmError::RecipientUndiscovered(
+                        "peer evidence no longer usable".into(),
+                    ))
+                }
+            }
         } else if config.require_durable_app_ack {
             // Strict semantics need a signed, machine-bound capability from
             // the TTL-bounded runtime cache. The unbound contact-card fallback
@@ -7156,6 +7288,19 @@ impl Agent {
                     self.direct_messaging.record_outgoing_failed(*to);
                     return Err(dm::DmError::RecipientKeyInvalid(reason));
                 }
+            }
+        }
+
+        if cap_source == "peer_evidence" {
+            let _ = self.connect_from_evidence(*to).await;
+            let still_usable = cap_machine.and_then(|m| {
+                self.peer_evidence()
+                    .usable(*to, m, dm_capability::now_unix_ms())
+            });
+            if still_usable.is_none() {
+                return Err(dm::DmError::RecipientUndiscovered(
+                    "peer evidence no longer usable".into(),
+                ));
             }
         }
 
@@ -7506,6 +7651,19 @@ impl Agent {
             }
         }
 
+        if cached_machine_id.is_none() && registry_machine_id.is_none() {
+            if let Some(view) = self
+                .peer_evidence()
+                .usable_agent(*agent_id, dm_capability::now_unix_ms())
+            {
+                if network
+                    .is_connected(&ant_quic::PeerId(view.announcement.machine_id.0))
+                    .await
+                {
+                    return Some(view.announcement.machine_id);
+                }
+            }
+        }
         None
     }
 
@@ -7646,6 +7804,16 @@ impl Agent {
         };
         let registry_machine_id = self.direct_messaging.get_machine_id(agent_id).await;
 
+        let evidence_machine = if cached_machine_id.is_none()
+            && registry_machine_id.is_none()
+            && self.peer_evidence().wait(0).await
+        {
+            self.peer_evidence()
+                .usable_agent(*agent_id, dm_capability::now_unix_ms())
+                .map(|v| v.announcement.machine_id)
+        } else {
+            None
+        };
         let (mut machine_id, mut resolution) = match (cached_machine_id, registry_machine_id) {
             (Some(id), _) if network.is_connected(&ant_quic::PeerId(id.0)).await => {
                 (id, "cached_connected")
@@ -7662,6 +7830,11 @@ impl Agent {
             (Some(id), None) => (id, "cached_not_connected"),
             (Some(id), Some(_)) => (id, "cached_both_disconnected"),
             (None, Some(id)) => (id, "registry_not_connected"),
+            (None, None) if evidence_machine.is_some() => {
+                let id = evidence_machine.ok_or(error::NetworkError::AgentNotFound(agent_id.0))?;
+                let _ = self.connect_from_evidence(*agent_id).await;
+                (id, "peer_evidence")
+            }
             (None, None) => {
                 tracing::debug!(
                     target: "x0x::direct",
@@ -7767,6 +7940,15 @@ impl Agent {
                     resolution = "discovery_redial";
                 }
             }
+        }
+
+        if resolution == "peer_evidence"
+            && self
+                .peer_evidence()
+                .usable(*agent_id, machine_id, dm_capability::now_unix_ms())
+                .is_none()
+        {
+            return Err(error::NetworkError::AgentNotFound(agent_id.0));
         }
 
         // ADR-0043 §9 (review r5 H5): ANY machine reassignment above
@@ -10237,7 +10419,7 @@ impl Agent {
                     cert_digest,
                 };
                 // Keep the verified X0A3/X0A4 body verbatim, after the existing
-                // signature, timestamp, trust and revocation gates. S1 has no reader.
+                // signature, timestamp, trust and revocation gates. The S2 worker pairs it.
                 if announce_v3::is_v3_payload(&raw_payload) {
                     evidence_capture_store.evidence_wire.capture(
                         announcement.agent_id, true, &raw_payload,
@@ -13796,6 +13978,86 @@ impl Agent {
         });
     }
 
+    /// Start ADR 0089 after installing the live relationship stores. Loading
+    /// runs off the async executor; consumers wait at most five seconds.
+    /// The group predicate returns `None` while its live roster is locked.
+    /// Such a read fails closed without making a durable removal.
+    pub fn start_peer_evidence(
+        &self,
+        data_dir: std::path::PathBuf,
+        config: peer_evidence::EvidenceConfig,
+        groups: std::sync::Arc<dyn Fn(identity::AgentId) -> Option<bool> + Send + Sync>,
+    ) -> Result<(), peer_evidence::EvidenceError> {
+        config.validate()?;
+        let policy = std::sync::Arc::new(peer_evidence::RuntimePolicy::new(
+            self.agent_id(),
+            self.owner_trust.clone(),
+            std::sync::Arc::clone(&self.revocation_set),
+        ));
+        policy.set_groups(groups);
+        let evidence = std::sync::Arc::clone(&self.capability_store.evidence);
+        self.owner_trust.install_evidence(&evidence);
+        if !evidence.start(
+            data_dir,
+            config,
+            policy,
+            std::sync::Arc::clone(&self.capability_store.evidence_wire),
+        ) {
+            return Ok(());
+        }
+        let capture = std::sync::Arc::clone(&self.capability_store.evidence_wire);
+        let discovery = std::sync::Arc::clone(&self.identity_discovery_cache);
+        let token = self.shutdown_token.clone();
+        self.spawn_tracked(async move {
+            let mut last_maintenance = 0;
+            let mut processed = peer_evidence::GossipPairing::default();
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        if let Some(store) = evidence.store() {
+                            let _ = tokio::task::spawn_blocking(move || store.flush(dm_capability::now_unix_ms(), true)).await;
+                        }
+                        break;
+                    }
+                    _ = tick.tick() => {}
+                    _ = capture.changed.notified() => {}
+                }
+                let Some(store) = evidence.store() else { continue; };
+                let now = dm_capability::now_unix_ms();
+                let mut records = Vec::new();
+                for agent in capture.agents(now) {
+                    let (Some(announcement), Some(advert)) = (capture.get(agent, true, now), capture.get(agent, false, now)) else { continue; };
+                    let certificate = discovery.read().await.get(&agent).and_then(|d| d.agent_certificate.as_ref()).and_then(|c| c.to_storage_bytes().ok());
+                    let Ok(ann) = announce_v3::deserialize_v3(&announcement) else { continue; };
+                    let cert = certificate.as_deref().and_then(|c| identity::AgentCertificate::from_storage_bytes(c).ok());
+                    if !store.related(agent, ann.machine_id, cert.as_ref(), now) { continue; }
+                    records.push((agent, peer_evidence::EvidenceRecordV1 { announcement, advert, certificate, relation: 0, stored_at_ms: now }));
+                }
+                let maintain = now.saturating_sub(last_maintenance) >= 60_000;
+                if maintain { last_maintenance = now; }
+                processed.retain_fresh(&capture, now);
+                let mut attempts = std::mem::take(&mut processed);
+                if let Ok(attempts) = tokio::task::spawn_blocking(move || {
+                    for (agent, record) in records {
+                        let _ = attempts.ingest(&store, agent, record, now);
+                    }
+                    if maintain { let _ = store.maintain(now); }
+                    let _ = store.flush(now, false);
+                    attempts
+                }).await {
+                    processed = attempts;
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// ADR 0089 counters and point-of-use handle. No authority cache is seeded.
+    pub fn peer_evidence(&self) -> &std::sync::Arc<peer_evidence::EvidenceRuntime> {
+        &self.capability_store.evidence
+    }
+
     /// Start the direct message listener background task.
     ///
     /// This task reads raw direct messages from the network layer and
@@ -13814,6 +14076,7 @@ impl Agent {
         let Some(network) = self.network.as_ref().map(std::sync::Arc::clone) else {
             return;
         };
+        let evidence = std::sync::Arc::clone(&self.capability_store.evidence);
         let dm = std::sync::Arc::clone(&self.direct_messaging);
         let discovery_cache = std::sync::Arc::clone(&self.identity_discovery_cache);
         let contact_store = std::sync::Arc::clone(&self.contact_store);
@@ -13828,15 +14091,27 @@ impl Agent {
 
         self.spawn_tracked(async move {
             tracing::info!(target: "x0x::direct", stage = "listener", "direct message listener started");
+            use futures::StreamExt;
+            let mut pending = futures::stream::FuturesUnordered::new();
             loop {
                 // direct_tx is a NetworkNode struct field that outlives
                 // network.shutdown(), so recv_direct() does not return None on
                 // shutdown; the token is what stops this loop now.
                 let recv = tokio::select! {
+                    biased;
                     _ = token.cancelled() => break,
-                    r = network.recv_direct() => r,
+                    ready = pending.next(), if !pending.is_empty() => ready,
+                    r = network.recv_direct() => {
+                        let Some((peer, payload)) = r else { break; };
+                        let barrier = std::sync::Arc::clone(&evidence);
+                        pending.push(async move {
+                            let usable = barrier.wait(payload.len()).await;
+                            (peer, payload, usable)
+                        });
+                        continue;
+                    }
                 };
-                let Some((ant_peer_id, payload)) = recv else {
+                let Some((ant_peer_id, payload, evidence_ready)) = recv else {
                     tracing::warn!(
                         target: "x0x::direct",
                         stage = "listener",
@@ -13886,16 +14161,10 @@ impl Agent {
                     &sender,
                 )
                 .await;
-                let (cache_verified, registry_names_this_machine, cert_not_after) = {
+                let (verified, live_verified, cert_not_after) = {
                     let cache = discovery_cache.read().await;
-                    raw_delivery_binding(cache.get(&sender), registry, machine_id)
+                    raw_delivery_with_evidence(cache.get(&sender), registry, evidence_ready.then_some(evidence.as_ref()), sender, machine_id, dm_capability::now_unix_ms())
                 };
-                let verified = raw_delivery_verified(
-                    cache_verified,
-                    registry_names_this_machine,
-                    cert_not_after,
-                    Agent::unix_timestamp_secs(),
-                );
 
                 // Evaluate trust for the (AgentId, MachineId) pair.
                 let trust_decision = {
@@ -14015,6 +14284,9 @@ impl Agent {
                                 .map(|entry| entry.agent_public_key.clone())
                                 .filter(|key| !key.is_empty())
                         };
+                        let sender_public_key = if sender_public_key.is_none() && evidence_ready && verified {
+                            evidence.usable(sender, machine_id, dm_capability::now_unix_ms()).map(|v| v.announcement.agent_public_key.clone())
+                        } else { sender_public_key };
                         if let Some(sender_public_key) = sender_public_key {
                             let inbox = dm_inbox_service.lock().await;
                             if let Some(service) = inbox.as_ref() {
@@ -14042,7 +14314,7 @@ impl Agent {
                 // and is already part of the DELIVERY `verified` (with the
                 // expiry guard and #1098 timestamp supersession); an
                 // unverified or superseded claim still never rebinds.
-                dm.mark_raw_direct_sender_connected(sender, machine_id, verified)
+                dm.mark_raw_direct_sender_connected(sender, machine_id, live_verified)
                     .await;
 
                 // Issue #120: opt-in coarsened origin token from the live
@@ -20998,10 +21270,15 @@ mod tests {
         // known cert is fine.
         assert!(raw_delivery_verified(false, true, Some(now - 1), now));
         assert!(raw_delivery_verified(false, true, Some(now + 3_600), now));
-        // The cache arm keeps its historical shape (an expired cached cert
-        // matches the machine but the downstream is_expired gate drops it;
-        // this helper reports the BINDING only, as before).
+        // The cache arm observes the same expiry grace and fails closed
+        // before delivery verification, as well as at the downstream gate.
         assert!(raw_delivery_verified(true, false, Some(now - 1), now));
+        assert!(!raw_delivery_verified(
+            true,
+            false,
+            Some(now - 100_000),
+            now
+        ));
     }
 
     /// #1098 acceptance: a newer cached move supersedes the old registry.

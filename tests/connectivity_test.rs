@@ -1144,3 +1144,238 @@ fn nat_type_port_restricted_still_attempts_direct_but_is_not_verified() {
     assert!(info.should_attempt_direct());
     assert!(info.needs_coordination());
 }
+
+// ADR 0089 S2: signed fixture from the warm peer, loaded by a fresh Agent.
+// No discovery/binding/capability cache is seeded by this harness.
+async fn persist_s2_evidence(dir: &TempDir, remote: &Agent) {
+    use x0x::peer_evidence::{EvidenceFileV1, EvidenceRecordV1, GROUP};
+    let now = now_secs();
+    let identity = remote.identity();
+    let announcement = x0x::IdentityAnnouncement {
+        agent_id: remote.agent_id(),
+        machine_id: remote.machine_id(),
+        agent_public_key: identity.agent_keypair().public_key().as_bytes().to_vec(),
+        machine_public_key: identity.machine_keypair().public_key().as_bytes().to_vec(),
+        user_id: None,
+        agent_certificate: None,
+        machine_signature: vec![],
+        self_name: None,
+        addresses: vec![remote.bound_addr().await.unwrap()],
+        announced_at: now,
+        nat_type: None,
+        can_receive_direct: Some(true),
+        is_relay: None,
+        is_coordinator: None,
+        reachable_via: vec![],
+        relay_candidates: vec![],
+    };
+    let mut announcement = x0x::announce_v3::IdentityAnnouncementV3::build_from_v2(
+        &announcement,
+        identity.machine_keypair().secret_key(),
+        0,
+    )
+    .unwrap();
+    announcement
+        .sign_v3_1(identity.machine_keypair().secret_key())
+        .unwrap();
+    let mut advert = x0x::dm_capability::CapabilityAdvert {
+        protocol_version: x0x::dm_capability_service::ADVERT_PROTOCOL_VERSION,
+        agent_id: remote.agent_id().0,
+        machine_id: remote.machine_id().0,
+        created_at_unix_ms: now * 1000,
+        capabilities: x0x::dm::DmCapabilities::pending(),
+        signature: vec![],
+    };
+    advert.signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        identity.agent_keypair().secret_key(),
+        &advert.signed_bytes().unwrap(),
+    )
+    .unwrap()
+    .as_bytes()
+    .to_vec();
+    let record = EvidenceRecordV1 {
+        announcement: x0x::announce_v3::serialize_v3_1(&announcement).unwrap(),
+        advert: postcard::to_stdvec(&advert).unwrap(),
+        certificate: None,
+        relation: GROUP,
+        stored_at_ms: now * 1000,
+    };
+    let mut file = EvidenceFileV1::default();
+    file.records.insert(remote.agent_id(), record);
+    std::fs::write(dir.path().join("peer-evidence.bin"), file.encode().unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn s2_cold_raw_frame_uses_stored_evidence_and_removal_stops_verification() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let local_dir = TempDir::new().unwrap();
+    let remote_dir = TempDir::new().unwrap();
+    let remote = build_agent(&remote_dir).await;
+    persist_s2_evidence(&local_dir, &remote).await;
+    let local = build_agent(&local_dir).await;
+    let related = Arc::new(AtomicBool::new(true));
+    let current = related.clone();
+    let sender = remote.agent_id();
+    local
+        .start_peer_evidence(
+            local_dir.path().to_owned(),
+            Default::default(),
+            Arc::new(move |a| Some(a == sender && current.load(Ordering::Relaxed))),
+        )
+        .unwrap();
+    assert!(local.peer_evidence().wait(0).await);
+    local.join_network().await.unwrap();
+    assert!(local.discovered_agent_for_testing(&sender).await.is_none());
+    let mut received = local.direct_messaging().subscribe();
+    send_registry_test_frame(&local, &remote, sender).await;
+    let message = tokio::time::timeout(std::time::Duration::from_secs(5), received.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(message.verified);
+    assert!(local.discovered_agent_for_testing(&sender).await.is_none());
+    assert!(
+        local
+            .direct_messaging()
+            .get_machine_id(&sender)
+            .await
+            .is_none(),
+        "stored authority must not enter the routing registry"
+    );
+    related.store(false, Ordering::Relaxed);
+    send_registry_test_frame(&local, &remote, sender).await;
+    let message = tokio::time::timeout(std::time::Duration::from_secs(5), received.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!message.verified);
+    local.shutdown().await;
+    remote.shutdown().await;
+}
+
+#[tokio::test]
+async fn s2_cold_sender_dials_stored_address_without_an_announcement() {
+    use std::sync::Arc;
+    let local_dir = TempDir::new().unwrap();
+    let remote_dir = TempDir::new().unwrap();
+    let remote = build_agent(&remote_dir).await;
+    persist_s2_evidence(&local_dir, &remote).await;
+    let local = build_agent(&local_dir).await;
+    let peer = remote.agent_id();
+    local
+        .start_peer_evidence(
+            local_dir.path().to_owned(),
+            Default::default(),
+            Arc::new(move |a| Some(a == peer)),
+        )
+        .unwrap();
+    assert!(local.peer_evidence().wait(0).await);
+    // Neither node joins gossip: no announcement can rescue resolution.
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        local.send_direct(&peer, b"S2 cold sender".to_vec()),
+    )
+    .await
+    .unwrap();
+    assert!(result.is_ok(), "{result:?}");
+    assert!(local.discovered_agent_for_testing(&peer).await.is_none());
+    assert!(local.capability_store().lookup_binding(&peer).is_none());
+    assert!(local
+        .direct_messaging()
+        .get_machine_id(&peer)
+        .await
+        .is_none());
+    local.shutdown().await;
+    remote.shutdown().await;
+}
+
+#[tokio::test]
+async fn s2_cold_raw_durable_ack_completes_from_stored_sender_key() {
+    use std::sync::Arc;
+    use x0x::dm::{DmAckOutcome, DmEnvelope, EnvelopeBuilder, DM_PROTOCOL_DURABLE_ACK};
+    let local_dir = TempDir::new().unwrap();
+    let remote_dir = TempDir::new().unwrap();
+    let remote = build_agent(&remote_dir).await;
+    persist_s2_evidence(&local_dir, &remote).await;
+    let local = build_agent(&local_dir).await;
+    let sender = remote.agent_id();
+    local
+        .start_peer_evidence(
+            local_dir.path().to_owned(),
+            Default::default(),
+            Arc::new(move |a| Some(a == sender)),
+        )
+        .unwrap();
+    assert!(local.peer_evidence().wait(0).await);
+    local.join_network().await.unwrap();
+    local
+        .start_dm_inbox(
+            Arc::new(x0x::groups::kem_envelope::AgentKemKeypair::generate().unwrap()),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    let waiter = local.dm_inflight_acks().register_for_protocol(
+        [89; 16],
+        DM_PROTOCOL_DURABLE_ACK,
+        sender,
+        Some(remote.machine_id()),
+    );
+    let now = now_secs() * 1000;
+    let mut ack = DmEnvelope {
+        protocol_version: DM_PROTOCOL_DURABLE_ACK,
+        request_id: [90; 16],
+        sender_agent_id: sender.0,
+        sender_machine_id: remote.machine_id().0,
+        recipient_agent_id: local.agent_id().0,
+        created_at_unix_ms: now,
+        expires_at_unix_ms: now + 60_000,
+        body: EnvelopeBuilder::build_ack_body([89; 16], DmAckOutcome::Accepted),
+        signature: vec![],
+        origin_attestation: None,
+    };
+    ack.signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        remote.identity().agent_keypair().secret_key(),
+        &ack.signed_bytes().unwrap(),
+    )
+    .unwrap()
+    .as_bytes()
+    .to_vec();
+    let mut attestation = x0x::dm::DmOriginAttestation::for_envelope(
+        &ack,
+        remote
+            .identity()
+            .machine_keypair()
+            .public_key()
+            .as_bytes()
+            .to_vec(),
+    );
+    attestation
+        .sign(remote.identity().machine_keypair())
+        .unwrap();
+    ack.origin_attestation = Some(attestation);
+    let net = remote.network().unwrap();
+    net.connect_addr(local.bound_addr().await.unwrap())
+        .await
+        .unwrap();
+    net.send_direct(
+        &ant_quic::PeerId(local.machine_id().0),
+        sender.as_bytes(),
+        &ack.to_wire_bytes().unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap(),
+        DmAckOutcome::Accepted
+    );
+    assert!(local.discovered_agent_for_testing(&sender).await.is_none());
+    local.shutdown().await;
+    remote.shutdown().await;
+}

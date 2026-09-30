@@ -51,6 +51,7 @@ use crate::DiscoveredAgent;
 #[derive(Clone, Default)]
 pub struct OwnerTrust {
     local_owner: Option<UserId>,
+    evidence: Arc<std::sync::RwLock<std::sync::Weak<crate::peer_evidence::EvidenceRuntime>>>,
     devices: Arc<std::sync::RwLock<Option<Arc<OwnerSyncStore>>>>,
     /// The agent's authenticated agent→machine bindings (#890). The default
     /// is an empty cache, which owner-trusts nothing.
@@ -91,11 +92,43 @@ impl OwnerTrust {
     pub fn new(local_owner: Option<UserId>, bindings: AuthenticatedMachineBindings) -> Self {
         Self {
             local_owner,
+            evidence: Default::default(),
             devices: Arc::new(std::sync::RwLock::new(None)),
             bindings,
             grants: Arc::new(std::sync::RwLock::new(None)),
             grant_outbox: Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    pub(crate) fn install_evidence(&self, evidence: &Arc<crate::peer_evidence::EvidenceRuntime>) {
+        if let Ok(mut slot) = self.evidence.write() {
+            *slot = Arc::downgrade(evidence);
+        }
+    }
+    pub(crate) fn evidence(&self) -> Option<Arc<crate::peer_evidence::EvidenceRuntime>> {
+        self.evidence.read().ok()?.upgrade()
+    }
+    pub(crate) fn evidence_relation(
+        &self,
+        agent: AgentId,
+        machine: MachineId,
+        cert: Option<&AgentCertificate>,
+        revoked: &RevocationSet,
+        now: u64,
+    ) -> Option<u8> {
+        let mut relation = 0;
+        if let (Some(owner), Some(devices)) = (self.local_owner, self.device_store()) {
+            if devices.evidence_enrolled(&machine, &owner, now)? {
+                relation |= crate::peer_evidence::ENROLLED;
+            }
+        }
+        if self
+            .share_grant_store()
+            .is_some_and(|g| g.evidence_related(agent, cert, revoked, now / 1000))
+        {
+            relation |= crate::peer_evidence::GRANT;
+        }
+        Some(relation)
     }
 
     /// Install the #926 grant redelivery outbox. Every clone sees it.
@@ -200,7 +233,7 @@ impl OwnerTrust {
         if rejected(base) {
             return crate::share_grant::GrantAccess::default();
         }
-        let access = crate::share_grant::evaluate_grant_access(
+        let access = crate::share_grant::evaluate_grant_access_with_evidence(
             &store,
             &self.bindings,
             discovery_cache,
@@ -208,6 +241,7 @@ impl OwnerTrust {
             agent_id,
             machine_id,
             unix_now_secs(),
+            self.evidence().as_deref(),
         )
         .await;
         // Final contact read, as in `evaluate_pair`: a `Blocked` or re-pin
@@ -302,6 +336,12 @@ impl OwnerTrust {
         };
         match crate::dm_inbox::authenticated_machine_binding(&self.bindings, agent_id).await {
             Some(bound) if bound == *machine_id => {}
+            None if self
+                .evidence()
+                .and_then(|e| {
+                    e.usable(*agent_id, *machine_id, unix_now_secs().saturating_mul(1000))
+                })
+                .is_some() => {}
             _ => return false,
         }
         let cert = {
@@ -310,6 +350,13 @@ impl OwnerTrust {
                 .get(agent_id)
                 .and_then(|entry| entry.agent_certificate.clone())
         };
+        let cert = cert.or_else(|| {
+            self.evidence()
+                .and_then(|e| {
+                    e.usable(*agent_id, *machine_id, unix_now_secs().saturating_mul(1000))
+                })
+                .and_then(|v| v.certificate.clone())
+        });
         let Some(cert) = cert else {
             return false;
         };

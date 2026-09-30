@@ -36168,6 +36168,66 @@ pub(in crate::server) type WelcomeFetchWaiter =
 pub(in crate::server) mod tests {
     use super::*;
 
+    #[test]
+    fn s2_welcome_decodes_from_reverified_cold_evidence() {
+        use x0x::peer_evidence::{
+            EvidenceConfig, EvidenceFileV1, EvidencePolicy, PeerEvidenceStore,
+        };
+        struct Related;
+        impl EvidencePolicy for Related {
+            fn relation(
+                &self,
+                _: AgentId,
+                _: x0x::identity::MachineId,
+                _: Option<&x0x::identity::AgentCertificate>,
+                _: u64,
+            ) -> u8 {
+                x0x::peer_evidence::GROUP
+            }
+            fn revoked(
+                &self,
+                _: AgentId,
+                _: x0x::identity::MachineId,
+                _: Option<x0x::identity::UserId>,
+            ) -> bool {
+                false
+            }
+            fn contains_agent(&self, _: AgentId, _: u64) -> bool {
+                true
+            }
+        }
+        let bytes = include_bytes!("../../../tests/fixtures/peer_evidence_v1.bin");
+        let file = EvidenceFileV1::decode(bytes).unwrap();
+        let (&agent, record) = file.records.iter().next().unwrap();
+        let now = record.stored_at_ms;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("peer-evidence.bin"), bytes).unwrap();
+        let store = PeerEvidenceStore::open(
+            dir.path(),
+            EvidenceConfig::default(),
+            Arc::new(Related),
+            now,
+        )
+        .unwrap();
+        let view = store.usable_agent(agent, now).unwrap();
+        let payload = serde_json::to_vec(&WelcomeBlobMessage::Complete {
+            welcome_id: "cold-welcome".into(),
+        })
+        .unwrap();
+        let mut message =
+            x0x::direct::DirectMessage::new(agent, view.announcement.machine_id, payload);
+        message.verified = store.usable(agent, message.machine_id, now).is_some();
+        assert!(decode_welcome_blob_message(&message).is_some());
+        message.verified = store
+            .usable(
+                agent,
+                message.machine_id,
+                now + 8 * x0x::peer_evidence::DAY_MS,
+            )
+            .is_some();
+        assert!(decode_welcome_blob_message(&message).is_none());
+    }
+
     // Inert: only DirectMessage construction and JSON decoding; no agent,
     // AppState, tasks, sockets, filesystem writes, or daemon startup.
     #[test]

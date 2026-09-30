@@ -797,10 +797,14 @@ pub struct SessionSummary {
     pub shipped: usize,
 }
 
+type VerifiedEnrollmentOwners = BTreeMap<[u8; 32], (UserId, OwnerEnrollment)>;
+
 pub struct OwnerSyncStore {
     dir: PathBuf,
     records: tokio::sync::RwLock<BTreeMap<(SyncKind, String), VersionedRecord>>,
     devices: tokio::sync::RwLock<BTreeMap<[u8; 32], OwnerEnrollment>>,
+    // Verified once on load/enroll, consulted under the devices read lock.
+    evidence_owners: std::sync::RwLock<VerifiedEnrollmentOwners>,
     last_session: tokio::sync::RwLock<BTreeMap<[u8; 32], DeviceSyncStatus>>,
     generation_tx: tokio::sync::watch::Sender<u64>,
     /// #824: count of successful sessions with an owner device, inbound or
@@ -907,11 +911,21 @@ impl OwnerSyncStore {
             .into_iter()
             .map(|d| (d.machine_id, d))
             .collect::<BTreeMap<_, _>>();
+        let evidence_owners = devices
+            .iter()
+            .filter_map(|(m, e)| {
+                let key = MlDsaPublicKey::from_bytes(&e.owner_public_key).ok()?;
+                let owner = UserId(derive_peer_id_from_public_key(&key).0);
+                e.verify_owner(&owner).ok()?;
+                Some((*m, (owner, e.clone())))
+            })
+            .collect();
         let (generation_tx, _) = tokio::sync::watch::channel(0);
         Ok(Self {
             dir,
             records: tokio::sync::RwLock::new(records),
             devices: tokio::sync::RwLock::new(devices),
+            evidence_owners: std::sync::RwLock::new(evidence_owners),
             last_session: tokio::sync::RwLock::new(BTreeMap::new()),
             generation_tx,
             sessions_ok_tx: tokio::sync::watch::channel(0).0,
@@ -1112,6 +1126,30 @@ impl OwnerSyncStore {
             .is_some_and(|e| e.verify_owner(owner).is_ok() && e.is_current_at(now_unix_ms()))
     }
 
+    /// Current enrollment for evidence policy, with zero signature checks.
+    /// A writer in flight fails closed. The verification index is changed
+    /// under the devices write lock, so deletion/rollback is immediately seen.
+    pub(crate) fn evidence_enrolled(
+        &self,
+        machine: &MachineId,
+        owner: &UserId,
+        now: u64,
+    ) -> Option<bool> {
+        let Ok(devices) = self.devices.try_read() else {
+            return None;
+        };
+        let Ok(verified) = self.evidence_owners.read() else {
+            return None;
+        };
+        Some(
+            verified.get(&machine.0).is_some_and(|(u, record)| {
+                u == owner && devices.get(&machine.0).is_some_and(|e| e == record)
+            }) && devices
+                .get(&machine.0)
+                .is_some_and(|e| e.is_current_at(now)),
+        )
+    }
+
     /// Store a (verified-by-caller) enrollment, keeping the latest
     /// `enrolled_at_ms` per machine so a replayed older enrollment cannot
     /// rewind the clock. The new expiry replaces any previous one.
@@ -1127,6 +1165,12 @@ impl OwnerSyncStore {
         if let Some(err) = self.poison_refusal() {
             return Err(err);
         }
+        // Preserve the store's verified-by-caller contract. Invalid material
+        // stays incapable of contributing evidence, just as is_enrolled denies it.
+        let verified_owner = MlDsaPublicKey::from_bytes(&enrollment.owner_public_key)
+            .ok()
+            .map(|key| UserId(derive_peer_id_from_public_key(&key).0))
+            .filter(|owner| enrollment.verify_owner(owner).is_ok());
         let mut devices = self.devices.write().await;
         let previous = devices.get(&enrollment.machine_id).cloned();
         let keep = previous
@@ -1153,6 +1197,13 @@ impl OwnerSyncStore {
                     }
                 }
                 return Err(e);
+            }
+            if let Ok(mut verified) = self.evidence_owners.write() {
+                if let Some(owner) = verified_owner {
+                    verified.insert(enrollment.machine_id, (owner, enrollment.clone()));
+                } else {
+                    verified.remove(&enrollment.machine_id);
+                }
             }
         }
         drop(devices);
@@ -1181,6 +1232,9 @@ impl OwnerSyncStore {
             }
         } else {
             return Ok(false);
+        }
+        if let Ok(mut verified) = self.evidence_owners.write() {
+            verified.remove(&machine.0);
         }
         drop(devices);
         self.kick();
@@ -3220,6 +3274,29 @@ mod tests {
         assert!(
             matches!(result, Err(SyncError::BadSignature(_))),
             "tampered payload must fail signature verification, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn s2_enrollment_verification_index_checks_exact_current_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = OwnerSyncStore::load(dir.path()).await.unwrap();
+        let owner = owner_kp(1);
+        let m = machine(7);
+        let mut enrollment = OwnerEnrollment::sign(m, &owner, 1_000, None).unwrap();
+        store.enroll(enrollment.clone()).await.unwrap();
+        assert_eq!(
+            store.evidence_enrolled(&m, &owner.user_id(), now_unix_ms()),
+            Some(true)
+        );
+        // The index must not authorize different signed fields just because
+        // the old signature bytes survived a failed write-through mutation.
+        enrollment.enrolled_at_ms += 1;
+        store.set_fail_after_rename_for_testing(true);
+        assert!(store.enroll(enrollment).await.is_err());
+        assert_eq!(
+            store.evidence_enrolled(&m, &owner.user_id(), now_unix_ms()),
+            Some(false)
         );
     }
 

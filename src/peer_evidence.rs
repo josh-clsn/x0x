@@ -1,6 +1,6 @@
-//! ADR 0089 S1: inert, self-verifying relationship evidence.
+//! ADR 0089: self-verifying relationship evidence.
 //!
-//! No runtime authority consumer is connected in S1. Callers supply current
+//! Runtime consumers consult verified views at each use. Callers supply current
 //! relationship/revocation policy; views must never be copied into other caches.
 //! All times are Unix milliseconds. Certificate issuance is not a heartbeat:
 //! W/L apply to announcement/advert, while certificates have their own expiry.
@@ -9,6 +9,9 @@ use crate::{
     dm_capability::CapabilityAdvert,
     identity::{AgentCertificate, AgentId, MachineId, UserId},
 };
+mod runtime;
+pub use runtime::{EvidenceRuntime, RuntimePolicy};
+
 use bincode::Options;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -298,6 +301,12 @@ impl EvidenceRecordV1 {
 /// store lock. Mutations may take policy locks while holding the store lock.
 /// Methods must not re-enter the evidence store.
 pub trait EvidencePolicy: Send + Sync {
+    /// Changes when a policy read was unavailable. Maintenance must not turn
+    /// transient lock contention into a durable relationship removal.
+    fn unavailable_epoch(&self) -> u64 {
+        0
+    }
+
     /// Current relationship flags; zero means stranger.
     fn relation(
         &self,
@@ -306,7 +315,8 @@ pub trait EvidencePolicy: Send + Sync {
         cert: Option<&AgentCertificate>,
         now_ms: u64,
     ) -> u8;
-    /// Includes agent, machine, binding and certificate-user revocations.
+    /// Checks agent, machine and binding revocations. The certificate user is
+    /// available to policies with a user revocation subject; RuntimePolicy has none.
     fn revoked(&self, agent: AgentId, machine: MachineId, user: Option<UserId>) -> bool;
     /// Used to protect watermarks even when their record is absent.
     fn contains_agent(&self, agent: AgentId, now_ms: u64) -> bool;
@@ -418,8 +428,16 @@ pub enum IngestSource {
     Hello,
 }
 /// Counters owned by the store; diagnostics wiring is a later slice.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct EvidenceCounters {
+    /// Records successfully re-verified at startup.
+    pub evidence_loaded: u64,
+    /// Point-of-use authority hits.
+    pub evidence_usable_hits: u64,
+    /// Point-of-use refusals, grouped by reason.
+    pub evidence_usable_misses: HashMap<String, u64>,
+    /// Records refused at startup, by reason.
+    pub evidence_rejected_on_load: HashMap<String, u64>,
     /// Failed synchronous move writes.
     pub evidence_move_write_failed: u64,
     /// Incoming moves refused at a protected watermark cap.
@@ -493,16 +511,31 @@ impl PeerEvidenceStore {
         };
         let max_age = config.max_age_days * DAY_MS;
         let mut verified = HashMap::new();
+        let mut counters = EvidenceCounters::default();
         file.records.retain(|a, r| {
-            let Ok(view) = r.verify(now, max_age) else {
-                return false;
+            let view = match r.verify(now, max_age) {
+                Ok(view) => view,
+                Err(error) => {
+                    *counters
+                        .evidence_rejected_on_load
+                        .entry(error.to_string())
+                        .or_default() += 1;
+                    return false;
+                }
             };
+            let epoch = policy.unavailable_epoch();
+            let permitted = allowed(&*policy, &view, now);
             if view.announcement.agent_id != *a
                 || disqualified(&file.watermarks, *a, &view)
-                || !allowed(&*policy, &view, now)
+                || (!permitted && policy.unavailable_epoch() == epoch)
             {
+                *counters
+                    .evidence_rejected_on_load
+                    .entry("identity, watermark or policy".into())
+                    .or_default() += 1;
                 return false;
             }
+            counters.evidence_loaded += 1;
             verified.insert(*a, Arc::new(view));
             true
         });
@@ -514,6 +547,7 @@ impl PeerEvidenceStore {
             state: Mutex::new(State {
                 file,
                 verified,
+                counters,
                 ..State::default()
             }),
             mutation: Mutex::new(()),
@@ -543,25 +577,54 @@ impl PeerEvidenceStore {
     }
     /// Single authority: check current policy, time, certificate expiry, exact
     /// machine and watermark. Signatures were verified at load or ingest.
-    pub fn usable(&self, agent: AgentId, machine: MachineId, now: u64) -> Option<EvidenceView> {
-        let view = {
-            let state = self.state.lock().ok()?;
-            if state.suspended.contains(&agent) {
-                return None;
+    pub fn usable(
+        &self,
+        agent: AgentId,
+        machine: MachineId,
+        now: u64,
+    ) -> Option<Arc<EvidenceView>> {
+        let result = self.check_usable(agent, machine, now);
+        if let Ok(mut state) = self.state.lock() {
+            match &result {
+                Ok(_) => state.counters.evidence_usable_hits += 1,
+                Err(reason) => {
+                    *state
+                        .counters
+                        .evidence_usable_misses
+                        .entry((*reason).into())
+                        .or_default() += 1
+                }
             }
-            let view = state.verified.get(&agent)?;
+        }
+        result.ok()
+    }
+    fn check_usable(
+        &self,
+        agent: AgentId,
+        machine: MachineId,
+        now: u64,
+    ) -> std::result::Result<Arc<EvidenceView>, &'static str> {
+        let view = {
+            let state = self.state.lock().map_err(|_| "store_lock")?;
+            if state.suspended.contains(&agent) {
+                return Err("suspended_or_superseded");
+            }
+            let view = state.verified.get(&agent).ok_or("missing")?;
             if view.announcement.machine_id != machine
                 || disqualified(&state.file.watermarks, agent, view)
             {
-                return None;
+                return Err("machine_or_watermark");
             }
             Arc::clone(view)
         };
-        if !current(&view, now, self.max_age) || !allowed(&*self.policy, &view, now) {
-            return None;
+        if !current(&view, now, self.max_age) {
+            return Err("age_or_certificate_expiry");
+        }
+        if !allowed(&*self.policy, &view, now) {
+            return Err("relationship_or_revocation");
         }
         {
-            let mut state = self.state.lock().ok()?;
+            let mut state = self.state.lock().map_err(|_| "store_lock")?;
             // A move/removal may have raced the policy calls. Never return the
             // old authority if it was suspended or replaced in the meantime.
             if state.suspended.contains(&agent)
@@ -571,11 +634,32 @@ impl PeerEvidenceStore {
                     .is_some_and(|v| Arc::ptr_eq(v, &view))
                 || disqualified(&state.file.watermarks, agent, &view)
             {
-                return None;
+                return Err("suspended_or_superseded");
             }
             state.last_used.insert(agent, now);
         }
-        Some((*view).clone())
+        Ok(view)
+    }
+    pub(crate) fn related(
+        &self,
+        agent: AgentId,
+        machine: MachineId,
+        cert: Option<&AgentCertificate>,
+        now: u64,
+    ) -> bool {
+        self.policy.relation(agent, machine, cert, now) != 0
+    }
+    /// Resolve an unknown machine, then run the same point-of-use authority check.
+    pub fn usable_agent(&self, agent: AgentId, now: u64) -> Option<Arc<EvidenceView>> {
+        let machine = self
+            .state
+            .lock()
+            .ok()?
+            .verified
+            .get(&agent)?
+            .announcement
+            .machine_id;
+        self.usable(agent, machine, now)
     }
     /// Latest ingest-fresh live wire bytes, kept separately from stored bytes.
     pub fn live(&self, agent: AgentId, now: u64) -> Option<EvidenceRecordV1> {
@@ -875,6 +959,7 @@ impl PeerEvidenceStore {
     /// integrated. Tracks how long watermark agents have been absent; after a
     /// restart absent agents tie at the first observation (conservative).
     pub fn maintain(&self, now: u64) -> Result<()> {
+        let epoch = self.policy.unavailable_epoch();
         let _mutation = self.lock_mutation()?;
         let (file, verified) = {
             let state = self.lock()?;
@@ -894,6 +979,9 @@ impl PeerEvidenceStore {
             })
             .map(|(a, _)| *a)
             .collect();
+        if self.policy.unavailable_epoch() != epoch {
+            return Ok(());
+        }
         let mut state = self.lock()?;
         for (a, absent) in absent {
             if absent {
@@ -1058,11 +1146,84 @@ fn disqualified(
     })
 }
 
-/// Bounded, process-only prerequisite capture. No S1 authority consumer reads
-/// this cache. Strangers may occupy this TTL cache, never the persistent store.
+/// Process-only gossip attempt cache, including refusals. It grants no authority.
+#[derive(Default)]
+pub(crate) struct GossipPairing {
+    processed: HashMap<AgentId, PairAttempt>,
+}
+struct PairAttempt {
+    fingerprint: [u8; 32],
+    unavailable_epoch: u64,
+    last_used: u64,
+}
+impl GossipPairing {
+    /// None means this exact input and policy epoch were already attempted.
+    pub(crate) fn ingest(
+        &mut self,
+        store: &PeerEvidenceStore,
+        agent: AgentId,
+        record: EvidenceRecordV1,
+        now: u64,
+    ) -> Option<Result<()>> {
+        let mut hash = blake3::Hasher::new();
+        hash.update(&record.announcement);
+        hash.update(&record.advert);
+        if let Some(cert) = &record.certificate {
+            hash.update(cert);
+        }
+        let fingerprint = *hash.finalize().as_bytes();
+        let epoch = store.policy.unavailable_epoch();
+        if let Some(previous) = self.processed.get_mut(&agent) {
+            previous.last_used = now;
+            if previous.fingerprint == fingerprint && previous.unavailable_epoch == epoch {
+                return None;
+            }
+        }
+        let result = store.ingest(record, IngestSource::Gossip, now);
+        if self.processed.len() >= RECORD_CAP && !self.processed.contains_key(&agent) {
+            // Same bounded LRU ordering as the evidence store, including ties.
+            if let Some(victim) = self
+                .processed
+                .iter()
+                .min_by_key(|(id, attempt)| (attempt.last_used, *id.as_bytes()))
+                .map(|(id, _)| *id)
+            {
+                self.processed.remove(&victim);
+            }
+        }
+        self.processed.insert(
+            agent,
+            PairAttempt {
+                fingerprint,
+                // Include unavailability observed by this attempt so a refusal
+                // does not itself force another verification on the next tick.
+                unavailable_epoch: store.policy.unavailable_epoch(),
+                last_used: now,
+            },
+        );
+        Some(result)
+    }
+
+    pub(crate) fn retain_fresh(&mut self, capture: &VerifiedWireCapture, now: u64) {
+        let Ok(entries) = capture.inner.lock() else {
+            return;
+        };
+        self.processed.retain(|agent, _| {
+            [0, 1].into_iter().all(|part| {
+                entries
+                    .get(&(*agent, part))
+                    .is_some_and(|wire| fresh(wire.timestamp, now, W_MS))
+            })
+        });
+    }
+}
+
+/// Bounded, process-only verified capture for pairing. Strangers may occupy
+/// this TTL cache, never the persistent relationship store.
 #[derive(Default)]
 pub struct VerifiedWireCapture {
     inner: Mutex<HashMap<(AgentId, u8), CapturedWire>>,
+    pub(crate) changed: tokio::sync::Notify,
 }
 struct CapturedWire {
     bytes: Vec<u8>,
@@ -1112,6 +1273,22 @@ impl VerifiedWireCapture {
                 timestamp,
             },
         );
+        self.changed.notify_one();
+    }
+    /// Agents with fresh captured material; bounded to the capture cap.
+    pub(crate) fn agents(&self, now: u64) -> Vec<AgentId> {
+        self.inner
+            .lock()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|(_, v)| fresh(v.timestamp, now, W_MS))
+                    .map(|((a, _), _)| *a)
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
     /// Return exact captured bytes for future pairing, provided still fresh.
     pub fn get(&self, agent: AgentId, announcement: bool, now: u64) -> Option<Vec<u8>> {
@@ -1135,9 +1312,18 @@ mod tests {
     struct Policy {
         peers: Mutex<HashMap<AgentId, u8>>,
         revoked: AtomicBool,
+        unavailable: AtomicBool,
+        epoch: std::sync::atomic::AtomicU64,
     }
     impl EvidencePolicy for Policy {
+        fn unavailable_epoch(&self) -> u64 {
+            self.epoch.load(Ordering::Relaxed)
+        }
         fn relation(&self, a: AgentId, _: MachineId, _: Option<&AgentCertificate>, _: u64) -> u8 {
+            if self.unavailable.load(Ordering::Relaxed) {
+                self.epoch.fetch_add(1, Ordering::Relaxed);
+                return 0;
+            }
             self.peers.lock().unwrap().get(&a).copied().unwrap_or(0)
         }
         fn revoked(&self, _: AgentId, _: MachineId, _: Option<UserId>) -> bool {
@@ -1273,6 +1459,11 @@ mod tests {
                 );
             }
             VERIFY_CALLS.set(0);
+            let first = store.usable(p.a(), p.m(), NOW).unwrap();
+            assert!(
+                Arc::ptr_eq(&first, &store.usable(p.a(), p.m(), NOW).unwrap()),
+                "per-frame lookup must clone only the Arc"
+            );
             for _ in 0..100 {
                 assert!(store.usable(p.a(), p.m(), NOW).is_some());
                 assert_eq!(store.live(p.a(), NOW).is_some(), !reopened);
@@ -2333,6 +2524,668 @@ mod tests {
             assert!(store.usable(p.a(), p.m(), NOW).is_none(), "subject {kind}");
         }
     }
+    #[tokio::test]
+    async fn s2_loaded_raw_authority_is_live_and_never_seeds_bindings() {
+        let mut p = Peer::new();
+        let now = crate::dm_capability::now_unix_ms();
+        let (dir, policy, store) = setup(&p);
+        let mut record = p.record(now, now);
+        record.certificate = Some(
+            AgentCertificate::issue_with_expiry(
+                &UserKeypair::generate().unwrap(),
+                &p.agent,
+                Some(now / 1000 + 10),
+            )
+            .unwrap()
+            .to_storage_bytes()
+            .unwrap(),
+        );
+        store.ingest(record, IngestSource::Hello, now).unwrap();
+        drop(store);
+        let runtime = Arc::new(EvidenceRuntime::default());
+        runtime.start(
+            dir.path().to_owned(),
+            EvidenceConfig::default(),
+            policy.clone(),
+            Arc::default(),
+        );
+        assert!(runtime.wait(100).await);
+        let binding = Arc::new(tokio::sync::RwLock::new(
+            crate::dm_inbox::AuthenticatedMachineBindingCache::default(),
+        ));
+        let verify = |machine, at| {
+            crate::raw_delivery_with_evidence(None, None, Some(&runtime), p.a(), machine, at).0
+        };
+        assert!(
+            verify(p.m(), now),
+            "#1088: cold discovery uses the loaded record"
+        );
+        assert!(!verify(MachineId([9; 32]), now));
+        assert!(
+            !verify(p.m(), now + SKEW_MS + 11_000),
+            "expiry checked on the next frame"
+        );
+        policy.revoked.store(true, Ordering::Relaxed);
+        assert!(!verify(p.m(), now));
+        policy.revoked.store(false, Ordering::Relaxed);
+        policy.peers.lock().unwrap().clear();
+        assert!(!verify(p.m(), now));
+        policy.peers.lock().unwrap().insert(p.a(), GROUP);
+        assert!(verify(p.m(), now));
+        let first = runtime.usable_agent(p.a(), now).unwrap();
+        assert!(Arc::ptr_eq(
+            &first,
+            &runtime.usable_agent(p.a(), now).unwrap()
+        ));
+        assert_eq!(runtime.diagnostics()["evidence_loaded"], 1);
+        assert!(
+            crate::dm_inbox::authenticated_machine_binding(&binding, &p.a())
+                .await
+                .is_none()
+        );
+        let old = p.m();
+        p.machine = MachineKeypair::generate().unwrap();
+        runtime
+            .store()
+            .unwrap()
+            .ingest(
+                p.record(now + 1000, now + 1000),
+                IngestSource::Hello,
+                now + 1000,
+            )
+            .unwrap();
+        assert!(
+            !crate::raw_delivery_with_evidence(None, None, Some(&runtime), p.a(), old, now + 1000)
+                .0
+        );
+        assert!(
+            crate::raw_delivery_with_evidence(None, None, Some(&runtime), p.a(), p.m(), now + 1000)
+                .0
+        );
+    }
+
+    #[tokio::test]
+    async fn s2_raw_live_supersession_and_expiry_cannot_fall_back_to_evidence_1098() {
+        let p = Peer::new();
+        let now = crate::dm_capability::now_unix_ms();
+        let secs = now / 1000;
+        let (dir, policy, store) = setup(&p);
+        store
+            .ingest(p.record(now, now), IngestSource::Hello, now)
+            .unwrap();
+        drop(store);
+        let runtime = Arc::new(EvidenceRuntime::default());
+        runtime.start(
+            dir.path().to_owned(),
+            EvidenceConfig::default(),
+            policy,
+            Arc::default(),
+        );
+        assert!(runtime.wait(0).await);
+        let bindings = crate::dm_inbox::AuthenticatedMachineBindings::default();
+        crate::dm_inbox::record_authenticated_machine_binding(&bindings, p.a(), p.m(), secs).await;
+        let registry =
+            crate::dm_inbox::authenticated_machine_binding_evidence(&bindings, &p.a()).await;
+        let moved = MachineId([9; 32]);
+        let mut cache = crate::discovered_agent_fixture(9, secs + 1, &[], None);
+        cache.agent_id = p.a();
+        // A newer cached move (including a timestamp tie) beats the old
+        // registry. The still-usable stored old binding cannot resurrect it.
+        for (announced_at, winner) in [(secs + 1, moved), (secs, moved), (secs - 1, p.m())] {
+            cache.announced_at = announced_at;
+            for machine in [p.m(), moved] {
+                let (verified, live, _) = crate::raw_delivery_with_evidence(
+                    Some(&cache),
+                    registry,
+                    Some(&runtime),
+                    p.a(),
+                    machine,
+                    now,
+                );
+                assert_eq!((verified, live), (machine == winner, machine == winner));
+            }
+        }
+        // Expired discovery cannot fall back to either cert-less registry
+        // evidence or the valid stored record, regardless of which is newer.
+        cache.machine_id = p.m();
+        cache.cert_not_after = Some(secs - 1000);
+        for announced_at in [secs - 1, secs + 1] {
+            cache.announced_at = announced_at;
+            let (verified, live, expiry) = crate::raw_delivery_with_evidence(
+                Some(&cache),
+                registry,
+                Some(&runtime),
+                p.a(),
+                p.m(),
+                now,
+            );
+            assert_eq!((verified, live), (false, false));
+            assert_eq!(expiry, cache.cert_not_after);
+        }
+        crate::dm_inbox::record_authenticated_machine_binding_with_expiry(
+            &bindings,
+            p.a(),
+            p.m(),
+            secs + 2,
+            Some(secs - 1000),
+        )
+        .await;
+        let registry =
+            crate::dm_inbox::authenticated_machine_binding_evidence(&bindings, &p.a()).await;
+        let (verified, live, expiry) =
+            crate::raw_delivery_with_evidence(None, registry, Some(&runtime), p.a(), p.m(), now);
+        assert_eq!((verified, live), (false, false));
+        assert_eq!(expiry, Some(secs - 1000));
+        // With both live sources absent, stored authority verifies this frame
+        // without acquiring the authority to seed the reverse-routing cache.
+        assert_eq!(
+            crate::raw_delivery_with_evidence(None, None, Some(&runtime), p.a(), p.m(), now),
+            (true, false, None),
+        );
+    }
+
+    #[test]
+    fn s2_pairing_verifies_each_outcome_once_until_fingerprint_or_epoch_changes() {
+        for refusal in [
+            Some("agent/machine mismatch"),
+            Some("non-monotonic evidence"),
+            Some("move watermark"),
+            Some("not a current relationship"),
+            None,
+        ] {
+            let mut p = Peer::new();
+            let (_dir, policy, store) = setup(&p);
+            let mut record = p.record(NOW, NOW);
+            let mut changed = p.record(NOW + 1000, NOW + 1000);
+            match refusal {
+                Some("agent/machine mismatch") => {
+                    p.machine = MachineKeypair::generate().unwrap();
+                    record.advert = p.record(NOW, NOW).advert;
+                    changed.advert = p.record(NOW + 1000, NOW + 1000).advert;
+                }
+                Some("non-monotonic evidence") => {
+                    store
+                        .ingest(
+                            p.record(NOW + 60_000, NOW + 60_000),
+                            IngestSource::Gossip,
+                            NOW,
+                        )
+                        .unwrap();
+                }
+                Some("move watermark") => {
+                    store.lock().unwrap().file.watermarks.insert(
+                        p.a(),
+                        MoveWatermarkV1 {
+                            t: NOW + 60_000,
+                            machine: MachineKeypair::generate().unwrap().machine_id(),
+                        },
+                    );
+                }
+                Some("not a current relationship") => {
+                    policy.unavailable.store(true, Ordering::Relaxed)
+                }
+                _ => {}
+            }
+            let mut pairing = GossipPairing::default();
+            VERIFY_CALLS.set(0);
+            let outcome = pairing.ingest(&store, p.a(), record.clone(), NOW).unwrap();
+            match refusal {
+                Some(reason) => assert!(
+                    matches!(outcome, Err(EvidenceError::Invalid(actual)) if actual == reason)
+                ),
+                None => assert!(outcome.is_ok()),
+            }
+            for tick in 1..30 {
+                assert!(pairing
+                    .ingest(&store, p.a(), record.clone(), NOW + tick * 1000)
+                    .is_none());
+            }
+            assert_eq!(
+                VERIFY_CALLS.get(),
+                3,
+                "one verification of each signed part over 30 ticks: {refusal:?}"
+            );
+
+            assert!(pairing
+                .ingest(&store, p.a(), changed.clone(), NOW + 30_000)
+                .is_some());
+            for tick in 31..60 {
+                assert!(pairing
+                    .ingest(&store, p.a(), changed.clone(), NOW + tick * 1000)
+                    .is_none());
+            }
+            assert_eq!(
+                VERIFY_CALLS.get(),
+                6,
+                "changed fingerprint retries exactly once: {refusal:?}"
+            );
+
+            policy.unavailable.store(false, Ordering::Relaxed);
+            policy.epoch.fetch_add(1, Ordering::Relaxed);
+            let outcome = pairing
+                .ingest(&store, p.a(), changed.clone(), NOW + 60_000)
+                .unwrap();
+            if refusal == Some("not a current relationship") {
+                assert!(
+                    outcome.is_ok(),
+                    "policy recovery accepts the unchanged pair"
+                );
+            }
+            for tick in 61..90 {
+                assert!(pairing
+                    .ingest(&store, p.a(), changed.clone(), NOW + tick * 1000)
+                    .is_none());
+            }
+            assert_eq!(
+                VERIFY_CALLS.get(),
+                9,
+                "advanced policy epoch retries exactly once: {refusal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn s2_pairing_fingerprint_cache_is_bounded_lru_and_expires_with_capture() {
+        let p = Peer::new();
+        let (_dir, _, store) = setup(&p);
+        let mut pairing = GossipPairing::default();
+        let record = EvidenceRecordV1 {
+            announcement: vec![],
+            advert: vec![],
+            certificate: None,
+            relation: 0,
+            stored_at_ms: NOW,
+        };
+        let agent = |i: usize| {
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            AgentId(bytes)
+        };
+        for i in 0..RECORD_CAP {
+            assert!(pairing
+                .ingest(&store, agent(i), record.clone(), NOW + i as u64)
+                .unwrap()
+                .is_err());
+        }
+        // Cache hits update recency too, so agent 1 is now the LRU victim.
+        assert!(pairing
+            .ingest(&store, agent(0), record.clone(), NOW + RECORD_CAP as u64)
+            .is_none());
+        assert!(pairing
+            .ingest(
+                &store,
+                agent(RECORD_CAP),
+                record,
+                NOW + RECORD_CAP as u64 + 1
+            )
+            .is_some());
+        assert_eq!(pairing.processed.len(), RECORD_CAP);
+        assert!(pairing.processed.contains_key(&agent(0)));
+        assert!(!pairing.processed.contains_key(&agent(1)));
+
+        let capture = VerifiedWireCapture::default();
+        capture.capture(agent(0), true, &[1], NOW, NOW);
+        capture.capture(agent(0), false, &[2], NOW, NOW);
+        capture.capture(agent(2), true, &[1], NOW, NOW);
+        pairing.retain_fresh(&capture, NOW);
+        assert_eq!(
+            pairing.processed.len(),
+            1,
+            "only complete fresh pairs remain"
+        );
+        pairing.retain_fresh(&capture, NOW + W_MS + 1);
+        assert!(pairing.processed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn s2_capture_pairs_verbatim_bytes_when_relationship_appears() {
+        let p = Peer::new();
+        let now = crate::dm_capability::now_unix_ms();
+        let record = p.record(now, now);
+        let dir = tempfile::tempdir().unwrap();
+        let agent = crate::Agent::builder()
+            .with_identity_dir(dir.path())
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_user_key_path(dir.path().join("user.key"))
+            .with_agent_cert_path(dir.path().join("agent.cert"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .build()
+            .await
+            .unwrap();
+        let related = Arc::new(AtomicBool::new(false));
+        let current = related.clone();
+        let peer = p.a();
+        agent
+            .start_peer_evidence(
+                dir.path().to_owned(),
+                EvidenceConfig::default(),
+                Arc::new(move |a| Some(a == peer && current.load(Ordering::Relaxed))),
+            )
+            .unwrap();
+        assert!(agent.peer_evidence().wait(0).await);
+        agent
+            .capability_store
+            .evidence_wire
+            .capture(peer, true, &record.announcement, now, now);
+        let message = crate::gossip::PubSubMessage {
+            topic: "x0x/caps/v1".into(),
+            payload: record.advert.clone().into(),
+            sender: Some(peer),
+            sender_public_key: Some(p.agent.public_key().as_bytes().to_vec()),
+            verified: true,
+            trust_level: None,
+            raw_envelope: None,
+        };
+        assert!(
+            crate::dm_capability_service::ingest_verified_capability_advert(
+                &agent.capability_store,
+                agent.agent_id(),
+                &message
+            )
+        );
+        assert!(agent.peer_evidence().usable_agent(peer, now).is_none());
+        related.store(true, Ordering::Relaxed);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while agent.peer_evidence().usable_agent(peer, now).is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let store = agent.peer_evidence().store().unwrap();
+        let live = store.live(peer, now).unwrap();
+        assert_eq!(live.announcement, record.announcement);
+        assert_eq!(live.advert, record.advert);
+        related.store(false, Ordering::Relaxed);
+        assert!(agent.peer_evidence().usable_agent(peer, now).is_none());
+        store.maintain(now + 60_000).unwrap();
+        assert!(store.lock().unwrap().file.records.is_empty());
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn s2_cold_send_resolves_kem_and_strict_ack_without_an_announcement() {
+        let p = Peer::new();
+        let now = crate::dm_capability::now_unix_ms();
+        let (dir, _, store) = setup(&p);
+        let mut record = p.record(now, now);
+        let mut advert = CapabilityAdvert::decode_evidence(&record.advert).unwrap().0;
+        advert.capabilities.gossip_inbox = true;
+        advert.capabilities.max_protocol_version = crate::dm::DM_PROTOCOL_DURABLE_ACK;
+        advert.capabilities.kem_public_key =
+            crate::groups::kem_envelope::AgentKemKeypair::generate()
+                .unwrap()
+                .public_bytes;
+        advert.signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            p.agent.secret_key(),
+            &advert.signed_bytes().unwrap(),
+        )
+        .unwrap()
+        .as_bytes()
+        .to_vec();
+        record.advert = postcard::to_stdvec(&advert).unwrap();
+        store.ingest(record, IngestSource::Hello, now).unwrap();
+        drop(store);
+        let agent = crate::Agent::builder()
+            .with_identity_dir(dir.path())
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_user_key_path(dir.path().join("user.key"))
+            .with_agent_cert_path(dir.path().join("agent.cert"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .build()
+            .await
+            .unwrap();
+        let peer = p.a();
+        agent
+            .start_peer_evidence(
+                dir.path().to_owned(),
+                EvidenceConfig::default(),
+                Arc::new(move |a| Some(a == peer)),
+            )
+            .unwrap();
+        assert!(agent.peer_evidence().wait(0).await);
+        assert!(agent.identity_discovery_cache.read().await.is_empty());
+        assert!(agent.capability_store.lookup_binding(&peer).is_none());
+        let config = crate::dm::DmSendConfig {
+            require_durable_app_ack: true,
+            ..Default::default()
+        };
+        let error = agent
+            .send_direct_with_config(&peer, b"cold strict send".to_vec(), config)
+            .await
+            .unwrap_err();
+        // The inert agent has no transport. Getting this far proves the real
+        // send resolved and validated the stored KEM and strict ACK binding.
+        assert!(
+            matches!(error, crate::dm::DmError::LocalGossipUnavailable(_)),
+            "{error:?}"
+        );
+        assert!(agent.identity_discovery_cache.read().await.is_empty());
+        assert!(agent.capability_store.lookup_binding(&peer).is_none());
+        assert!(crate::dm_inbox::authenticated_machine_binding(
+            &agent.authenticated_machine_bindings,
+            &peer
+        )
+        .await
+        .is_none());
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn s2_raw_durable_ack_key_after_load_authenticates_and_completes_waiter() {
+        use crate::dm::{DmAckOutcome, DmEnvelope, EnvelopeBuilder, DM_PROTOCOL_DURABLE_ACK};
+        let p = Peer::new();
+        let now = crate::dm_capability::now_unix_ms();
+        let (dir, policy, store) = setup(&p);
+        store
+            .ingest(p.record(now, now), IngestSource::Hello, now)
+            .unwrap();
+        drop(store);
+        let store =
+            PeerEvidenceStore::open(dir.path(), EvidenceConfig::default(), policy, now).unwrap();
+        let view = store.usable(p.a(), p.m(), now).unwrap();
+        let mut ack = DmEnvelope {
+            protocol_version: DM_PROTOCOL_DURABLE_ACK,
+            request_id: [81; 16],
+            sender_agent_id: p.a().0,
+            sender_machine_id: p.m().0,
+            recipient_agent_id: [82; 32],
+            created_at_unix_ms: now,
+            expires_at_unix_ms: now + 60_000,
+            body: EnvelopeBuilder::build_ack_body([80; 16], DmAckOutcome::Accepted),
+            signature: Vec::new(),
+            origin_attestation: None,
+        };
+        ack.signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            p.agent.secret_key(),
+            &ack.signed_bytes().unwrap(),
+        )
+        .unwrap()
+        .as_bytes()
+        .to_vec();
+        let ack = DmEnvelope::from_wire_bytes(&ack.to_wire_bytes().unwrap()).unwrap();
+        assert!(crate::dm_inbox::verify_envelope_signature(
+            &ack,
+            &view.announcement.agent_public_key
+        ));
+        let inflight = crate::dm::InFlightAcks::new();
+        let waiter =
+            inflight.register_for_protocol([80; 16], DM_PROTOCOL_DURABLE_ACK, p.a(), Some(p.m()));
+        let crate::dm::DmBody::Ack(body) = ack.body else {
+            panic!("ACK");
+        };
+        assert!(inflight.resolve_for_protocol(
+            &body.acks_request_id,
+            ack.protocol_version,
+            p.a(),
+            p.m(),
+            body.outcome
+        ));
+        assert_eq!(waiter.await.unwrap(), DmAckOutcome::Accepted);
+    }
+
+    #[tokio::test]
+    async fn s2_grant_rules_two_four_and_owner_trust_use_loaded_evidence() {
+        use crate::share_grant::{Grantee, ShareCap, ShareGrant, ShareGrantStore};
+        let p = Peer::new();
+        let local = Peer::new();
+        let owner = UserKeypair::generate().unwrap();
+        let peer_owner = UserKeypair::generate().unwrap();
+        let now = crate::dm_capability::now_unix_ms();
+        let (dir, policy, store) = setup(&p);
+        let mut record = p.record(now, now);
+        record.certificate = Some(
+            AgentCertificate::issue(&peer_owner, &p.agent)
+                .unwrap()
+                .to_storage_bytes()
+                .unwrap(),
+        );
+        store.ingest(record, IngestSource::Hello, now).unwrap();
+        drop(store);
+        let bindings = Arc::new(tokio::sync::RwLock::new(
+            crate::dm_inbox::AuthenticatedMachineBindingCache::default(),
+        ));
+        let owner_trust =
+            crate::owner_trust::OwnerTrust::new(Some(owner.user_id()), bindings.clone());
+        let grants = Arc::new(ShareGrantStore::in_memory(local.a(), Some(owner.user_id())));
+        grants
+            .accept(
+                ShareGrant::sign(
+                    &owner,
+                    [87; 32],
+                    Grantee::User(peer_owner.user_id()),
+                    vec![local.a()],
+                    vec![ShareCap::Dm],
+                    now / 1000 - 1,
+                    now / 1000 + 60,
+                )
+                .unwrap(),
+                now / 1000,
+            )
+            .await
+            .unwrap();
+        owner_trust.install_share_grant_store(grants.clone());
+        let revocations = Arc::new(tokio::sync::RwLock::new(
+            crate::revocation::RevocationSet::new(),
+        ));
+        let runtime = Arc::new(EvidenceRuntime::default());
+        owner_trust.install_evidence(&runtime);
+        let live_policy = Arc::new(RuntimePolicy::new(
+            local.a(),
+            owner_trust.clone(),
+            revocations.clone(),
+        ));
+        runtime.start(
+            dir.path().to_owned(),
+            EvidenceConfig::default(),
+            live_policy,
+            Arc::default(),
+        );
+        assert!(runtime.wait(0).await);
+        let discovery = tokio::sync::RwLock::new(HashMap::new());
+        let access = crate::share_grant::evaluate_grant_access_with_evidence(
+            &grants,
+            &bindings,
+            &discovery,
+            &revocations,
+            &p.a(),
+            &p.m(),
+            now / 1000,
+            Some(&runtime),
+        )
+        .await;
+        assert!(
+            access.dm,
+            "both binding and user certificate resolve after restart"
+        );
+        // A busy live policy denies this frame but cannot erase persisted
+        // authority during housekeeping; the next frame retries normally.
+        let write_guard = revocations.write().await;
+        assert!(runtime.usable(p.a(), p.m(), now).is_none());
+        runtime.store().unwrap().maintain(now).unwrap();
+        drop(write_guard);
+        assert!(runtime.usable(p.a(), p.m(), now).is_some());
+        let denied = crate::share_grant::evaluate_grant_access_with_evidence(
+            &grants,
+            &bindings,
+            &discovery,
+            &revocations,
+            &p.a(),
+            &MachineId([9; 32]),
+            now / 1000,
+            Some(&runtime),
+        )
+        .await;
+        assert!(denied.is_empty());
+        assert!(
+            runtime.usable(p.a(), p.m(), now + 61_000).is_none(),
+            "expired grant removes the relationship immediately"
+        );
+        assert!(discovery.read().await.is_empty());
+        assert!(
+            crate::dm_inbox::authenticated_machine_binding(&bindings, &p.a())
+                .await
+                .is_none()
+        );
+
+        // Owner trust needs both enrollment and a same-owner certificate.
+        let mut record = p.record(now + 1000, now + 1000);
+        record.certificate = Some(
+            AgentCertificate::issue(&owner, &p.agent)
+                .unwrap()
+                .to_storage_bytes()
+                .unwrap(),
+        );
+        let fixture =
+            PeerEvidenceStore::open(dir.path(), EvidenceConfig::default(), policy, now).unwrap();
+        fixture
+            .ingest(record, IngestSource::Hello, now + 1000)
+            .unwrap();
+        fixture.flush(now + 1000, true).unwrap();
+        drop(fixture);
+        let devices = Arc::new(
+            crate::owner_sync::OwnerSyncStore::load(dir.path())
+                .await
+                .unwrap(),
+        );
+        devices
+            .enroll(
+                crate::owner_sync::OwnerEnrollment::sign(p.m(), &owner, now - 1000, None).unwrap(),
+            )
+            .await
+            .unwrap();
+        owner_trust.install_device_store(devices.clone());
+        let runtime = Arc::new(EvidenceRuntime::default());
+        owner_trust.install_evidence(&runtime);
+        runtime.start(
+            dir.path().to_owned(),
+            EvidenceConfig::default(),
+            Arc::new(RuntimePolicy::new(
+                local.a(),
+                owner_trust.clone(),
+                revocations.clone(),
+            )),
+            Arc::default(),
+        );
+        assert!(runtime.wait(0).await);
+        assert!(
+            owner_trust
+                .is_owner_trusted(&discovery, &revocations, &p.a(), &p.m())
+                .await
+        );
+        devices.unenroll(&p.m()).await.unwrap();
+        assert!(runtime.usable(p.a(), p.m(), now + 1000).is_none());
+        assert!(
+            !owner_trust
+                .is_owner_trusted(&discovery, &revocations, &p.a(), &p.m())
+                .await
+        );
+    }
+
     #[test]
     #[ignore = "CPU-only t_v benchmark; run explicitly on Mac and fleet VPS (crypto dependencies optimized in test profile)"]
     fn verify_benchmark_t_v() {

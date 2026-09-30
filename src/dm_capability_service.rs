@@ -210,6 +210,9 @@ pub(crate) fn ingest_verified_capability_advert(
         advert.created_at_unix_ms,
     );
     if inserted {
+        store
+            .evidence
+            .observe_advert(&message.payload, sender_pubkey);
         store.evidence_wire.capture(
             AgentId(advert.agent_id),
             false,

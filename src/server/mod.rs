@@ -1258,6 +1258,26 @@ pub async fn serve_with_options(
         }));
     }
 
+    // ADR 0089: relationship sources are installed before load verification.
+    let evidence_state = Arc::downgrade(&state);
+    agent.start_peer_evidence(
+        config.data_dir.clone(),
+        config.evidence.clone(),
+        Arc::new(move |peer| {
+            let state = evidence_state.upgrade()?;
+            let Ok(groups) = state.named_groups.try_read() else {
+                return None;
+            };
+            let local = hex::encode(state.agent.agent_id().as_bytes());
+            let peer = hex::encode(peer.as_bytes());
+            Some(groups.values().any(|g| {
+                !g.withdrawn
+                    && g.members_v2.get(&local).is_some_and(|m| m.is_active())
+                    && g.members_v2.get(&peer).is_some_and(|m| m.is_active())
+            }))
+        }),
+    )?;
+
     // ADR-0041 Tier-1: bridge the sync service to live daemon state and
     // start the periodic + on-change pass loop (shuts down with the watch).
     if let Some(sync) = state.owner_sync.as_ref() {
