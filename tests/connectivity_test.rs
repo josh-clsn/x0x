@@ -344,6 +344,150 @@ async fn reachability_returns_correct_info_from_cache() {
 }
 
 /// Inserting an agent discovery record also creates the machine endpoint link.
+/// #1088 (g46r2 finding 3): a raw Direct frame whose (agent, machine)
+/// binding is named by the AUTHENTICATED BINDINGS REGISTRY — evidence a
+/// fresh machine-key attestation recorded — must be DELIVERED `verified`
+/// even when the discovery cache is still empty (the post-restart shape;
+/// the cache only refills at the peer's next identity announcement,
+/// ~600 s). Before the fix the registry arm eased ROUTING only, so every
+/// raw frame arrived `verified=false` and the #1070 gates (Welcome, files,
+/// join-result, control-blob) dropped it for the whole window.
+///
+/// This is the frame-level twin of the unverified-claim test above: same
+/// harness, opposite arm. The registry binding here is recorded the way
+/// the inbox records it (record_authenticated_machine_binding over a
+/// verified attestation); no cache entry is inserted.
+#[tokio::test]
+async fn raw_frame_backed_by_registry_binding_is_delivered_verified() {
+    let local_dir = TempDir::new().unwrap();
+    let m2_dir = TempDir::new().unwrap();
+    let local = build_agent(&local_dir).await;
+    let m2 = build_agent(&m2_dir).await;
+    local.join_network().await.expect("local join network");
+
+    // A is NOT inserted into the discovery cache — the post-restart state.
+    let a_id: [u8; 32] = [0x88u8; 32];
+    let claimed = a_id;
+
+    // The registry binding: the inbox records (agent -> machine) after a
+    // VERIFIED fresh machine-key attestation. Record exactly that pairing
+    // for m2's machine.
+    let m2_machine_id = m2.machine_id();
+    local
+        .record_authenticated_binding_for_testing(
+            x0x::identity::AgentId(a_id),
+            m2_machine_id,
+            now_secs(),
+        )
+        .await;
+
+    let local_addr = local.bound_addr().await.expect("local bound");
+    let m2_network = m2.network().expect("m2 network");
+    m2_network
+        .connect_addr(local_addr)
+        .await
+        .expect("dial local");
+    let local_peer = ant_quic::PeerId(local.machine_id().0);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    while !m2_network.is_connected(&local_peer).await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "local never became transport-connected to m2"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    m2_network
+        .send_direct(&local_peer, &claimed, b"1088 registry-backed frame")
+        .await
+        .expect("registry-backed raw direct send");
+
+    let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(msg) = local.recv_direct_annotated().await {
+                return msg;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the registry-backed DM must be delivered");
+    assert_eq!(delivered.sender.as_bytes(), &a_id);
+    assert!(
+        delivered.verified,
+        "#1088: a raw frame whose binding the registry names for THIS machine is delivered verified"
+    );
+    assert_eq!(
+        local
+            .direct_messaging()
+            .get_machine_id(&x0x::identity::AgentId(a_id))
+            .await,
+        Some(m2_machine_id),
+        "the routing write re-binds through the same evidence"
+    );
+    let _ = m2_machine_id;
+}
+
+/// #1088 negative control: a registry binding for a DIFFERENT machine must
+/// NOT verify the frame (and, per #898, must not rebind either).
+#[tokio::test]
+async fn raw_frame_from_wrong_machine_stays_unverified_with_registry_binding() {
+    let local_dir = TempDir::new().unwrap();
+    let m2_dir = TempDir::new().unwrap();
+    let local = build_agent(&local_dir).await;
+    let m2 = build_agent(&m2_dir).await;
+    local.join_network().await.expect("local join network");
+
+    let a_id: [u8; 32] = [0x89u8; 32];
+    let claimed = a_id;
+    let other_machine = x0x::identity::MachineId([0x77u8; 32]);
+    local
+        .record_authenticated_binding_for_testing(
+            x0x::identity::AgentId(a_id),
+            other_machine,
+            now_secs(),
+        )
+        .await;
+
+    let local_addr = local.bound_addr().await.expect("local bound");
+    let m2_network = m2.network().expect("m2 network");
+    m2_network
+        .connect_addr(local_addr)
+        .await
+        .expect("dial local");
+    let local_peer = ant_quic::PeerId(local.machine_id().0);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    while !m2_network.is_connected(&local_peer).await {
+        assert!(tokio::time::Instant::now() < deadline, "connect deadline");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    m2_network
+        .send_direct(&local_peer, &claimed, b"1088 wrong machine")
+        .await
+        .expect("wrong-machine raw direct send");
+    let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(msg) = local.recv_direct_annotated().await {
+                return msg;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("delivered (annotated)");
+    assert!(
+        !delivered.verified,
+        "#898 preserved: a registry binding for a DIFFERENT machine does not verify"
+    );
+    assert_eq!(
+        local
+            .direct_messaging()
+            .get_machine_id(&x0x::identity::AgentId(a_id))
+            .await,
+        None,
+        "and it never rebinds"
+    );
+}
+
 #[tokio::test]
 async fn machine_for_agent_returns_linked_endpoint() {
     let dir = TempDir::new().unwrap();
