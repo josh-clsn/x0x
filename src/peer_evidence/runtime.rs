@@ -3,7 +3,12 @@ use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Live group membership predicate. A busy/missing policy fails closed.
+pub(crate) type GroupContext = dyn Fn(AgentId, AgentId) -> Option<bool> + Send + Sync;
+
 type GroupPolicy = dyn Fn(AgentId) -> Option<bool> + Send + Sync;
+
+#[cfg(test)]
+type LookupResponder = dyn Fn(AgentId) -> futures::future::BoxFuture<'static, ()> + Send + Sync;
 
 /// Reads current relationship and revocation stores at every use, without crypto.
 pub struct RuntimePolicy {
@@ -93,6 +98,11 @@ impl EvidencePolicy for RuntimePolicy {
 
 /// Bounded startup barrier shared by raw frames and sends. Views are ephemeral.
 pub struct EvidenceRuntime {
+    #[cfg(test)]
+    pub(crate) lookup_responder: std::sync::OnceLock<Arc<LookupResponder>>,
+    pub(crate) lookup_context: std::sync::OnceLock<std::sync::Weak<crate::evidence_wire::Context>>,
+    pub(crate) group_context: std::sync::RwLock<Option<Arc<GroupContext>>>,
+    pub(crate) lookup_hints: crate::evidence_wire::lookup::RoutingHints,
     pub(crate) wire_limits: Arc<crate::evidence_wire::Limits>,
     store: std::sync::OnceLock<Arc<PeerEvidenceStore>>,
     ready: tokio_util::sync::CancellationToken,
@@ -105,10 +115,17 @@ pub struct EvidenceRuntime {
     pub evidence_barrier_timeout: AtomicU64,
     /// Operations refused by the aggregate queue bounds.
     pub evidence_barrier_overflow: AtomicU64,
+    /// Lookups skipped because all outstanding Lookup permits were occupied.
+    pub evidence_lookup_skipped: AtomicU64,
 }
 impl Default for EvidenceRuntime {
     fn default() -> Self {
         Self {
+            #[cfg(test)]
+            lookup_responder: Default::default(),
+            lookup_context: Default::default(),
+            group_context: Default::default(),
+            lookup_hints: Default::default(),
             wire_limits: Arc::new(crate::evidence_wire::Limits::default()),
             store: Default::default(),
             ready: Default::default(),
@@ -118,10 +135,77 @@ impl Default for EvidenceRuntime {
             evidence_load_barrier_waits: AtomicU64::new(0),
             evidence_barrier_timeout: AtomicU64::new(0),
             evidence_barrier_overflow: AtomicU64::new(0),
+            evidence_lookup_skipped: AtomicU64::new(0),
         }
     }
 }
 impl EvidenceRuntime {
+    /// Install a live shared-roster predicate, including local membership.
+    /// Unavailable policy reads fail closed; no membership snapshot is cached.
+    pub fn set_group_context(&self, context: Arc<GroupContext>) {
+        if let Ok(mut slot) = self.group_context.write() {
+            *slot = Some(context);
+        }
+    }
+    /// Pull missing relationship evidence over bounded connected-peer streams.
+    /// Callers must re-read their authoritative sources after this await.
+    pub(crate) async fn lookup(&self, agent: AgentId, machine: Option<MachineId>) {
+        let Some(permit) = self.lookup_permit() else {
+            return;
+        };
+        self.lookup_with_permit(agent, machine, permit).await;
+    }
+
+    /// Reserve before spawning: raw frames never wait for a Lookup or queue
+    /// unbounded tasks behind the shared outstanding-Lookup limit.
+    pub(crate) fn spawn_lookup(self: &Arc<Self>, agent: AgentId, machine: MachineId) {
+        let Some(permit) = self.lookup_permit() else {
+            return;
+        };
+        let runtime = Arc::clone(self);
+        tokio::spawn(async move {
+            runtime
+                .lookup_with_permit(agent, Some(machine), permit)
+                .await;
+        });
+    }
+
+    fn lookup_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let permit = self.wire_limits.try_lookup_permit();
+        if permit.is_none() {
+            self.evidence_lookup_skipped.fetch_add(1, Ordering::Relaxed);
+        }
+        permit
+    }
+
+    async fn lookup_with_permit(
+        &self,
+        agent: AgentId,
+        machine: Option<MachineId>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
+        // Only the raw receive path supplies a transport-authenticated machine.
+        // Its claimed agent is a routing hint, never evidence authority.
+        if let Some(machine) = machine {
+            self.lookup_hints.record(agent, machine);
+        }
+        let now = crate::dm_capability::now_unix_ms();
+        let usable = match machine {
+            Some(machine) => self.usable(agent, machine, now),
+            None => self.usable_agent(agent, now),
+        };
+        if usable.is_some() {
+            return;
+        }
+        #[cfg(test)]
+        if let Some(responder) = self.lookup_responder.get() {
+            responder(agent).await;
+            return;
+        }
+        if let Some(context) = self.lookup_context.get().and_then(std::sync::Weak::upgrade) {
+            context.lookup(agent, permit).await;
+        }
+    }
     /// Start exactly one background re-verification; invalid files stay untouched.
     pub(crate) fn start(
         self: &Arc<Self>,
@@ -232,6 +316,8 @@ impl EvidenceRuntime {
             .evidence_barrier_overflow
             .load(Ordering::Relaxed)
             .into();
+        value["evidence_lookup_skipped"] =
+            self.evidence_lookup_skipped.load(Ordering::Relaxed).into();
         value
     }
     pub(crate) fn store(&self) -> Option<Arc<PeerEvidenceStore>> {

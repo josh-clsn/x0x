@@ -27,6 +27,27 @@ pub(super) fn hello(body: &[u8]) -> io::Result<Hello> {
     })
 }
 
+#[derive(Deserialize)]
+struct BorrowedFound<'a> {
+    #[serde(borrow)]
+    announcement: &'a [u8],
+    #[serde(borrow)]
+    advert: &'a [u8],
+    certificate: Option<&'a [u8]>,
+}
+
+pub(super) fn found(body: &[u8]) -> io::Result<EvidenceRecordV1> {
+    let wire: BorrowedFound<'_> = codec().deserialize(body).map_err(io::Error::other)?;
+    parts(wire.announcement, wire.advert, wire.certificate)?;
+    Ok(EvidenceRecordV1 {
+        announcement: wire.announcement.to_vec(),
+        advert: wire.advert.to_vec(),
+        certificate: wire.certificate.map(<[u8]>::to_vec),
+        relation: 0,
+        stored_at_ms: 0,
+    })
+}
+
 // Consume fixed-size elements without allocation and reject impossible size
 // hints before the ordinary announcement decoder can reserve them.
 struct DiscardSeq<T>(PhantomData<T>);

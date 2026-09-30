@@ -4154,6 +4154,58 @@ fn raw_delivery_with_evidence(
     (view.is_some(), false, expiry)
 }
 
+/// Freeze this frame's authority before scheduling recovery for later frames.
+fn raw_delivery_and_schedule_lookup(
+    cache: Option<&DiscoveredAgent>,
+    registry: Option<dm_inbox::AuthenticatedMachineBinding>,
+    evidence: Option<&std::sync::Arc<peer_evidence::EvidenceRuntime>>,
+    agent: identity::AgentId,
+    machine: identity::MachineId,
+    now: u64,
+) -> (bool, bool, Option<u64>) {
+    let authority = raw_delivery_with_evidence(
+        cache,
+        registry,
+        evidence.map(std::sync::Arc::as_ref),
+        agent,
+        machine,
+        now,
+    );
+    if !authority.0 {
+        if let Some(evidence) = evidence {
+            evidence.spawn_lookup(agent, machine);
+        }
+    }
+    authority
+}
+
+/// Relay injection supplies a synthesized origin, not a direct host claim.
+/// Preserve delivery authority, but never seed routing hints or spawn recovery
+/// from that origin. Direct frames freeze authority before scheduling Lookup.
+fn raw_delivery_from_ingress(
+    cache: Option<&DiscoveredAgent>,
+    registry: Option<dm_inbox::AuthenticatedMachineBinding>,
+    evidence: Option<&std::sync::Arc<peer_evidence::EvidenceRuntime>>,
+    agent: identity::AgentId,
+    machine: identity::MachineId,
+    now: u64,
+    ingress: network::DirectIngress,
+) -> (bool, bool, Option<u64>) {
+    match ingress {
+        network::DirectIngress::Transport => {
+            raw_delivery_and_schedule_lookup(cache, registry, evidence, agent, machine, now)
+        }
+        network::DirectIngress::Relay => raw_delivery_with_evidence(
+            cache,
+            registry,
+            evidence.map(std::sync::Arc::as_ref),
+            agent,
+            machine,
+            now,
+        ),
+    }
+}
+
 async fn dispatch_raw_direct_after_gates(
     dm: &direct::DirectMessaging,
     history_handle: Option<&history::HistoryHandle>,
@@ -5275,6 +5327,7 @@ impl Agent {
         if !self.peer_evidence().wait(0).await {
             return None;
         }
+        self.peer_evidence().lookup(agent, None).await;
         let view = self
             .peer_evidence()
             .usable_agent(agent, dm_capability::now_unix_ms())?;
@@ -7054,6 +7107,10 @@ impl Agent {
             return Err(dm::DmError::RecipientUndiscovered(
                 "peer evidence startup barrier unavailable".into(),
             ));
+        }
+        if advert_binding.is_none() {
+            self.peer_evidence().lookup(*to, None).await;
+            advert_binding = self.capability_store.lookup_binding(to);
         }
         let stored_cap = if advert_binding.is_none() {
             self.peer_evidence()
@@ -14103,17 +14160,17 @@ impl Agent {
                     biased;
                     _ = token.cancelled() => break,
                     ready = pending.next(), if !pending.is_empty() => ready,
-                    r = network.recv_direct() => {
-                        let Some((peer, payload)) = r else { break; };
+                    r = network.recv_direct_with_ingress() => {
+                        let Some((peer, payload, ingress)) = r else { break; };
                         let barrier = std::sync::Arc::clone(&evidence);
                         pending.push(async move {
                             let usable = barrier.wait(payload.len()).await;
-                            (peer, payload, usable)
+                            (peer, payload, ingress, usable)
                         });
                         continue;
                     }
                 };
-                let Some((ant_peer_id, payload, evidence_ready)) = recv else {
+                let Some((ant_peer_id, payload, ingress, evidence_ready)) = recv else {
                     tracing::warn!(
                         target: "x0x::direct",
                         stage = "listener",
@@ -14165,7 +14222,7 @@ impl Agent {
                 .await;
                 let (verified, live_verified, cert_not_after) = {
                     let cache = discovery_cache.read().await;
-                    raw_delivery_with_evidence(cache.get(&sender), registry, evidence_ready.then_some(evidence.as_ref()), sender, machine_id, dm_capability::now_unix_ms())
+                    raw_delivery_from_ingress(cache.get(&sender), registry, evidence_ready.then_some(&evidence), sender, machine_id, dm_capability::now_unix_ms(), ingress)
                 };
 
                 // Evaluate trust for the (AgentId, MachineId) pair.

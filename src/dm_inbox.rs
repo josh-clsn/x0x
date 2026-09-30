@@ -145,6 +145,7 @@ pub(crate) struct AuthenticatedMachineBinding {
 #[derive(Debug)]
 pub struct AuthenticatedMachineBindingCache {
     entries: std::collections::HashMap<AgentId, AuthenticatedMachineBinding>,
+    by_machine: std::collections::BTreeSet<([u8; 32], [u8; 32])>,
     capacity: usize,
     recency: std::collections::BTreeSet<(std::time::Instant, u64, [u8; 32])>,
     clock: u64,
@@ -154,6 +155,7 @@ impl Default for AuthenticatedMachineBindingCache {
     fn default() -> Self {
         Self {
             entries: std::collections::HashMap::new(),
+            by_machine: Default::default(),
             recency: std::collections::BTreeSet::new(),
             capacity: AUTHENTICATED_MACHINE_BINDING_CAPACITY,
             clock: 0,
@@ -162,10 +164,20 @@ impl Default for AuthenticatedMachineBindingCache {
 }
 
 impl AuthenticatedMachineBindingCache {
+    /// Indexed routing candidates only; authority is rechecked at point of use.
+    pub(crate) fn agents_on_machine(&self, machine: MachineId, limit: usize) -> Vec<AgentId> {
+        self.by_machine
+            .range((machine.0, [0; 32])..=(machine.0, [255; 32]))
+            .take(limit)
+            .map(|(_, agent)| AgentId(*agent))
+            .collect()
+    }
+
     #[cfg(test)]
     fn with_capacity(capacity: usize) -> Self {
         Self {
             entries: std::collections::HashMap::new(),
+            by_machine: Default::default(),
             recency: std::collections::BTreeSet::new(),
             capacity: capacity.max(1),
             clock: 0,
@@ -197,6 +209,8 @@ impl AuthenticatedMachineBindingCache {
                 .remove(&(existing.last_used.0, existing.last_used.1, agent_id.0));
             existing.last_used = tick;
             if announced_at >= existing.announced_at {
+                self.by_machine.remove(&(existing.machine_id.0, agent_id.0));
+                self.by_machine.insert((machine_id.0, agent_id.0));
                 existing.machine_id = machine_id;
                 existing.announced_at = announced_at;
                 existing.cert_not_after = cert_not_after;
@@ -212,6 +226,8 @@ impl AuthenticatedMachineBindingCache {
                 self.recency.remove(&oldest_key);
                 let evicted_agent = AgentId(oldest_key.2);
                 if let Some(evicted_binding) = self.entries.remove(&evicted_agent) {
+                    self.by_machine
+                        .remove(&(evicted_binding.machine_id.0, evicted_agent.0));
                     tracing::warn!(
                         agent = %hex::encode(evicted_agent.as_bytes()),
                         machine = %hex::encode(evicted_binding.machine_id.as_bytes()),
@@ -222,6 +238,7 @@ impl AuthenticatedMachineBindingCache {
             }
         }
 
+        self.by_machine.insert((machine_id.0, agent_id.0));
         self.entries.insert(
             agent_id,
             AuthenticatedMachineBinding {
@@ -5116,6 +5133,15 @@ mod tests {
 
         let binding = bindings.write().await.resolve(&sender).expect("binding");
         assert_eq!(binding, machine_b);
+        assert!(bindings
+            .read()
+            .await
+            .agents_on_machine(machine_a, 16)
+            .is_empty());
+        assert_eq!(
+            bindings.read().await.agents_on_machine(machine_b, 16),
+            vec![sender]
+        );
     }
 
     #[test]
@@ -5133,6 +5159,13 @@ mod tests {
         assert!(bindings.resolve(&agent_a).is_some());
         assert!(bindings.resolve(&agent_b).is_none());
         assert!(bindings.resolve(&agent_c).is_some());
+        assert!(bindings
+            .agents_on_machine(MachineId([0x02; 32]), 16)
+            .is_empty());
+        assert_eq!(
+            bindings.agents_on_machine(MachineId([0x01; 32]), 16),
+            vec![agent_a]
+        );
     }
 
     /// A DM whose originating MACHINE is revoked (but whose agent-id is clean)

@@ -1,5 +1,4 @@
-//! ADR 0089 S3: bounded, machine-authenticated, point-to-point self evidence.
-//! Lookup serving is deliberately fail-closed until S4 installs context checks.
+//! ADR 0089: bounded Hello and relationship-context Lookup evidence.
 use crate::{
     announce_v3, dm_capability,
     identity::{AgentId, MachineId},
@@ -20,6 +19,7 @@ use tokio::{
 };
 
 mod decode;
+pub(crate) mod lookup;
 
 const MESSAGE_CAP: usize = 32 * 1024;
 // Reserve the frame, decoded vectors, and signed-part verification copies.
@@ -37,6 +37,7 @@ const LOOKUP: u8 = 2;
 const CERTIFICATE: u8 = 3;
 const NOT_FOUND: u8 = 4;
 const ACK: u8 = 5;
+const FOUND: u8 = 6;
 
 fn invalid(reason: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason)
@@ -117,12 +118,14 @@ struct State {
     machines: HashMap<MachineId, MachineBudget>,
     bytes: Window,
     verifies: Window,
+    targets: HashMap<AgentId, Instant>,
 }
 
 /// Shared by every connection, acceptor, and outbound exchange on this node.
 pub(crate) struct Limits {
     state: Mutex<State>,
     allocations: Arc<tokio::sync::Semaphore>,
+    lookups: Arc<tokio::sync::Semaphore>,
     // Strangers may occupy at most half of the aggregate byte reservation.
     stranger_allocations: Arc<tokio::sync::Semaphore>,
     prefix: Mutex<HashMap<MachineId, usize>>,
@@ -132,6 +135,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             state: Mutex::new(State::default()),
+            lookups: Arc::new(tokio::sync::Semaphore::new(16)),
             allocations: Arc::new(tokio::sync::Semaphore::new(TOTAL_ALLOCATION_CAP)),
             stranger_allocations: Arc::new(tokio::sync::Semaphore::new(TOTAL_ALLOCATION_CAP / 2)),
             prefix: Mutex::new(HashMap::new()),
@@ -507,7 +511,8 @@ fn mint_hello(
     })
 }
 
-struct Context {
+pub(crate) struct Context {
+    bindings: crate::dm_inbox::AuthenticatedMachineBindings,
     runtime: Arc<EvidenceRuntime>,
     capture: Arc<crate::peer_evidence::VerifiedWireCapture>,
     network: Arc<crate::network::NetworkNode>,
@@ -516,6 +521,7 @@ struct Context {
     own_cert: crate::announce_blob::SharedCertPair,
     capabilities: Arc<tokio::sync::watch::Sender<crate::dm::DmCapabilities>>,
     discovery: Arc<tokio::sync::RwLock<HashMap<AgentId, crate::DiscoveredAgent>>>,
+    machines: Arc<tokio::sync::RwLock<HashMap<MachineId, crate::DiscoveredMachine>>>,
     owner: crate::owner_trust::OwnerTrust,
     revoked: Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>,
 }
@@ -610,20 +616,37 @@ impl Context {
             }
             match kind {
                 LOOKUP => {
-                    // S3 reserves/framing-checks Lookup but discloses no evidence.
-                    // Even NotFound consumes rate and byte credit.
                     if !self.runtime.wire_limits.request(machine, false) {
                         return Err(invalid("lookup rate"));
                     }
-                    let _: AgentId = codec().deserialize(&body).map_err(io::Error::other)?;
-                    write_message(
-                        &mut send,
-                        &self.runtime.wire_limits,
-                        machine,
-                        NOT_FOUND,
-                        &[],
-                    )
+                    let target: AgentId = codec().deserialize(&body).map_err(io::Error::other)?;
+                    drop(body);
+                    let context = Arc::clone(&self);
+                    let authorized = context.authorized(machine, target).await;
+                    let serving_lease = Arc::clone(&lease);
+                    let reply = tokio::task::spawn_blocking(move || {
+                        let _lease = serving_lease;
+                        if authorized {
+                            context.lookup_reply(target)
+                        } else {
+                            Ok(None)
+                        }
+                    })
                     .await
+                    .map_err(io::Error::other)??;
+                    // Membership/revocation may have changed while signing.
+                    let reply = if reply.is_some() && !self.authorized(machine, target).await {
+                        None
+                    } else {
+                        reply
+                    };
+                    let (kind, body) = match reply {
+                        Some(reply) => {
+                            (FOUND, codec().serialize(&reply).map_err(io::Error::other)?)
+                        }
+                        None => (NOT_FOUND, Vec::new()),
+                    };
+                    write_message(&mut send, &self.runtime.wire_limits, machine, kind, &body).await
                 }
                 HELLO | CERTIFICATE => {
                     if kind == HELLO && !self.runtime.wire_limits.request(machine, true) {
@@ -842,6 +865,7 @@ impl crate::Agent {
             return;
         };
         let context = Arc::new(Context {
+            bindings: Arc::clone(&self.authenticated_machine_bindings),
             runtime: Arc::clone(self.peer_evidence()),
             capture: Arc::clone(&self.capability_store.evidence_wire),
             network: Arc::clone(network),
@@ -850,9 +874,14 @@ impl crate::Agent {
             own_cert: Arc::clone(&self.own_cert_pair),
             capabilities: Arc::clone(&self.dm_capabilities_tx),
             discovery: Arc::clone(&self.identity_discovery_cache),
+            machines: Arc::clone(&self.machine_discovery_cache),
             owner: self.owner_trust.clone(),
             revoked: Arc::clone(&self.revocation_set),
         });
+        let _ = self
+            .peer_evidence()
+            .lookup_context
+            .set(Arc::downgrade(&context));
         // Subscribe synchronously, before spawning: don't lose early connects.
         let mut events = network.subscribe();
         let token = self.shutdown_token.clone();

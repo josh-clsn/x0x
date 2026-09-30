@@ -488,6 +488,7 @@ struct State {
     file: EvidenceFileV1,
     // Process-only views, populated only after verifying the corresponding wire.
     verified: HashMap<AgentId, Arc<EvidenceView>>,
+    by_machine: std::collections::BTreeSet<([u8; 32], [u8; 32])>,
     live: HashMap<AgentId, CachedRecord>,
     suspended: HashSet<AgentId>,
     pending_moves: HashMap<AgentId, MoveWatermarkV1>,
@@ -577,6 +578,10 @@ impl PeerEvidenceStore {
             policy,
             state: Mutex::new(State {
                 file,
+                by_machine: verified
+                    .iter()
+                    .map(|(a, v)| (v.announcement.machine_id.0, a.0))
+                    .collect(),
                 verified,
                 counters,
                 ..State::default()
@@ -691,6 +696,19 @@ impl PeerEvidenceStore {
             .announcement
             .machine_id;
         self.usable(agent, machine, now)
+    }
+    /// Indexed candidates only; never substitutes for `usable` checks.
+    pub(crate) fn agents_on_machine(&self, machine: MachineId, limit: usize) -> Vec<AgentId> {
+        self.state
+            .lock()
+            .map(|s| {
+                s.by_machine
+                    .range((machine.0, [0; 32])..=(machine.0, [255; 32]))
+                    .take(limit)
+                    .map(|(_, a)| AgentId(*a))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
     /// Whether a currently usable relationship record names this machine.
     pub(crate) fn has_machine(&self, machine: MachineId, now: u64) -> bool {
@@ -869,6 +887,11 @@ impl PeerEvidenceStore {
             state.verified = verified;
             let retained: HashSet<_> = state.file.records.keys().copied().collect();
             state.verified.retain(|id, _| retained.contains(id));
+            state.by_machine = state
+                .verified
+                .iter()
+                .map(|(a, v)| (v.announcement.machine_id.0, a.0))
+                .collect();
             state.live.retain(|id, _| retained.contains(id));
             state.last_used.retain(|id, _| retained.contains(id));
         }
@@ -946,7 +969,11 @@ impl PeerEvidenceStore {
         self.write_move(&next, now)?;
         let mut state = self.lock()?;
         state.file = next;
-        state.verified.remove(&a);
+        if let Some(view) = state.verified.remove(&a) {
+            state
+                .by_machine
+                .remove(&(view.announcement.machine_id.0, a.0));
+        }
         state.live.remove(&a);
         state.suspended.remove(&a);
         state.pending_moves.remove(&a);
@@ -1084,7 +1111,11 @@ impl PeerEvidenceStore {
         }
         for a in removed {
             state.file.records.remove(&a);
-            state.verified.remove(&a);
+            if let Some(view) = state.verified.remove(&a) {
+                state
+                    .by_machine
+                    .remove(&(view.announcement.machine_id.0, a.0));
+            }
             state.live.remove(&a);
             state.last_used.remove(&a);
             state.dirty = true;
@@ -1109,7 +1140,11 @@ impl PeerEvidenceStore {
             .collect();
         for a in removed {
             state.file.records.remove(&a);
-            state.verified.remove(&a);
+            if let Some(view) = state.verified.remove(&a) {
+                state
+                    .by_machine
+                    .remove(&(view.announcement.machine_id.0, a.0));
+            }
             state.live.remove(&a);
             state.last_used.remove(&a);
             state.dirty = true;
