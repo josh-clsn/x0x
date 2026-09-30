@@ -13,6 +13,10 @@ Eight workflows in `.github/workflows/`:
 
 ## PR CI and main protection (ADR 0087, charter D15)
 
+Recorded in [ADR 0087](adr/0087-repository-and-release-governance.md) (Proposed);
+the rulings D04, D05, D15 and D36 are summarised in
+[`design/x0x-direction.md`](design/x0x-direction.md).
+
 - `ci.yml`, `build.yml`, `integration.yml` and `security.yml` run on pull requests to **any** base branch,
   so a PR into an integration or stacked branch gets full CI. CI-only mirror PRs to `main` are no longer needed.
   Push-triggered runs are still `main` only.
