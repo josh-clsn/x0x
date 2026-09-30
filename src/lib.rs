@@ -276,6 +276,11 @@ pub struct Agent {
     /// orthogonally (e.g. the R17 hydrate ladder) set it so the reconnect
     /// beat cannot race their fixtures.
     reconnect_reannounce_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// #1091 STOPGAP: absence tracker shared with the network event
+    /// listener (D31 r2: trigger on ≥20 s absence since the machine's last
+    /// observed PeerDisconnected). Shared so the test seam can note a
+    /// fabricated absence the transport gap hides from fixtures.
+    reconnect_absence_tracker: std::sync::Arc<std::sync::Mutex<ReconnectAbsenceTracker>>,
     /// Agent self-name (ADR-0036 display_name). Interior-mutable so
     /// `PUT /profile` updates apply to the next heartbeat without a
     /// restart; `None` announces anonymously (no self_name field).
@@ -3111,6 +3116,52 @@ pub struct AgentBuilder {
 /// more reconnects arrived inside the window — a fleet-wide rolling
 /// restart of N nodes inside ~15 s produces at most
 /// N × ceil(window / 30 s) re-announces, not a per-peer fan-out.
+/// #1091 STOPGAP (D31 ruling, superseded by the D29 ADR-0089 slice):
+/// per-machine last-`PeerDisconnected` times. A `PeerConnected` for a
+/// machine whose recorded disconnect is at least
+/// [`RECONNECT_REANNOUNCE_ABSENCE`] old (20 s — a real restart, not a
+/// transient flap) triggers this node's identity re-announce; the global
+/// [`ReconnectReannounceGate`] still rate-limits it to one per 30 s
+/// node-wide. Keyed on the disconnect time, NOT the last signal: a
+/// flapping peer (absent < 20 s) never triggers, and the record is
+/// consumed only when a signal fires, so a later reconnect after a
+/// fresh long outage still can.
+#[derive(Debug, Default)]
+struct ReconnectAbsenceTracker {
+    last_disconnected: std::collections::HashMap<[u8; 32], std::time::Instant>,
+}
+
+impl ReconnectAbsenceTracker {
+    fn record_disconnected(&mut self, peer: [u8; 32], at: std::time::Instant) {
+        self.last_disconnected.insert(peer, at);
+    }
+
+    /// True (consuming the record) when the peer's last observed
+    /// disconnect is at least `absence` old; false (record kept)
+    /// otherwise. A never-disconnected peer never triggers — join-time
+    /// announcements already cover fresh machines.
+    fn take_signal_if_absent(
+        &mut self,
+        peer: &[u8; 32],
+        now: std::time::Instant,
+        absence: std::time::Duration,
+    ) -> bool {
+        match self.last_disconnected.get(peer) {
+            Some(t) if now.duration_since(*t) >= absence => {
+                self.last_disconnected.remove(peer);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// #1091 STOPGAP: a peer must have been absent this long before its
+/// reconnect re-triggers our identity re-announce (D31 r2: 20 s — catches
+/// real restarts, daemons down 15–30 s, while transient flaps stay under
+/// the threshold).
+const RECONNECT_REANNOUNCE_ABSENCE: std::time::Duration = std::time::Duration::from_secs(20);
+
 #[derive(Debug)]
 pub(crate) struct ReconnectReannounceGate {
     last_fire: Option<std::time::Instant>,
@@ -8243,6 +8294,16 @@ impl Agent {
     /// Test seam (#1091): read one discovery-cache entry.
     /// #1091 test seam: suppress reconnect-triggered re-announces (see
     /// the field docs). Production default is enabled.
+    /// #1091 test seam: note that `peer` was last seen disconnecting at
+    /// `absent_since` — the observation the accept-side transport gap can
+    /// hide from fixtures (production loss detection records it for real).
+    pub fn note_peer_absent_for_testing(&self, peer: [u8; 32], absent_since: std::time::Instant) {
+        self.reconnect_absence_tracker
+            .lock()
+            .expect("absence tracker lock")
+            .record_disconnected(peer, absent_since);
+    }
+
     pub fn disable_reconnect_reannounce_for_testing(&self) {
         self.reconnect_reannounce_enabled
             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -13380,13 +13441,11 @@ impl Agent {
         // the global gate lives there.
         let (reconnect_tx, reconnect_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         self.spawn_reconnect_reannouncer(reconnect_rx);
-        // #1091: per-machine last-seen-connected times for the re-announce
-        // signal. Keyed on STALENESS, not membership: duplicate Connected
-        // events for live peers do not re-trigger (freshness < window),
-        // while a reconnect after an unobserved remote close still fires —
-        // the global 30 s gate bounds the rest.
-        let mut connected_machines: std::collections::HashMap<[u8; 32], std::time::Instant> =
-            std::collections::HashMap::new();
+        // #1091 STOPGAP (D31): the re-announce signal keys on per-machine
+        // ABSENCE — a PeerConnected triggers only when that machine's last
+        // observed PeerDisconnected is ≥ RECONNECT_REANNOUNCE_ABSENCE old.
+        // The global 30 s gate in the re-announcer bounds the rate.
+        let absence_tracker = std::sync::Arc::clone(&self.reconnect_absence_tracker);
         if self
             .network_event_listener_started
             .swap(true, std::sync::atomic::Ordering::AcqRel)
@@ -13437,28 +13496,25 @@ impl Agent {
 
                 match event {
                     network::NetworkEvent::PeerConnected { peer_id, address } => {
-                        // #1091: a transport (re)connect re-triggers our own
-                        // identity re-announce (globally rate-limited in the
-                        // re-announcer task). Fired REGARDLESS of whether we
-                        // can resolve this machine — the restarted PEER is
-                        // the one that cannot resolve us. The freshness key
-                        // is per-machine STALENESS, not set membership: a
-                        // remote-initiated close is not always surfaced to
-                        // this listener (the accept side may learn the loss
-                        // late or never), so a stale entry must not swallow
-                        // the restarted peer's reconnect. Net effect: at
-                        // most one signal per machine per window, on top of
-                        // the global gate.
-                        let now = std::time::Instant::now();
-                        let signal_reconnect =
-                            connected_machines.get(&peer_id).is_none_or(|last| {
-                                now.duration_since(*last) >= RECONNECT_REANNOUNCE_WINDOW
-                            });
-                        if signal_reconnect
+                        // #1091 STOPGAP (D31, superseded by the D29
+                        // ADR-0089 slice): a transport reconnect
+                        // after a ≥20 s observed absence re-triggers our own
+                        // identity re-announce (globally rate-limited in
+                        // the re-announcer task). Fired REGARDLESS of
+                        // whether we can resolve this machine — the
+                        // restarted PEER is the one that cannot resolve us.
+                        // A flapping peer (absent < 20 s) never triggers.
+                        let signal_reconnect = absence_tracker
+                            .lock()
+                            .expect("absence tracker lock")
+                            .take_signal_if_absent(
+                                &peer_id,
+                                std::time::Instant::now(),
+                                RECONNECT_REANNOUNCE_ABSENCE,
+                            )
                             && reconnect_reannounce_enabled
-                                .load(std::sync::atomic::Ordering::Relaxed)
-                        {
-                            connected_machines.insert(peer_id, now);
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                        if signal_reconnect {
                             let _ = reconnect_tx.send(());
                         }
                         let machine_id = identity::MachineId(peer_id);
@@ -13547,7 +13603,10 @@ impl Agent {
                         }
                     }
                     network::NetworkEvent::PeerDisconnected { peer_id, reason } => {
-                        connected_machines.remove(&peer_id);
+                        absence_tracker
+                            .lock()
+                            .expect("absence tracker lock")
+                            .record_disconnected(peer_id, std::time::Instant::now());
                         let machine_id = identity::MachineId(peer_id);
                         let cached_agent_id = {
                             let cache = cache.read().await;
@@ -17055,6 +17114,9 @@ impl AgentBuilder {
             skip_legacy_dm_bus: self.skip_legacy_dm_bus,
             reconnect_reannounce_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 true,
+            )),
+            reconnect_absence_tracker: std::sync::Arc::new(std::sync::Mutex::new(
+                ReconnectAbsenceTracker::default(),
             )),
             bootstrap_cache,
             gossip_cache_adapter,
@@ -20919,6 +20981,54 @@ mod tests {
         // again, and a quiet period after it leaves nothing pending.
         assert!(gate.on_reconnect(t0 + std::time::Duration::from_secs(120)));
         assert_eq!(gate.next_due(), None);
+    }
+
+    /// #1091 STOPGAP (D31): the re-announce signal fires only for a peer
+    /// whose last observed disconnect is at least the 20 s absence
+    /// threshold old — a flapping peer never triggers, a fresh machine
+    /// (never disconnected) never triggers, and the record is consumed
+    /// only when the signal fires.
+    #[test]
+    fn reconnect_absence_tracker_requires_twenty_second_absence() {
+        let t0 = std::time::Instant::now();
+        let mut tracker = ReconnectAbsenceTracker::default();
+        let peer = [7u8; 32];
+
+        // Never disconnected: join-time announcements cover fresh machines.
+        assert!(!tracker.take_signal_if_absent(&peer, t0, RECONNECT_REANNOUNCE_ABSENCE));
+
+        // Transient flap: absent 10 s (or 19 s) does NOT trigger, and
+        // the record survives so a later >=20 s absence still can.
+        tracker.record_disconnected(peer, t0);
+        assert!(!tracker.take_signal_if_absent(
+            &peer,
+            t0 + std::time::Duration::from_secs(10),
+            RECONNECT_REANNOUNCE_ABSENCE
+        ));
+        assert!(!tracker.take_signal_if_absent(
+            &peer,
+            t0 + RECONNECT_REANNOUNCE_ABSENCE - std::time::Duration::from_secs(1),
+            RECONNECT_REANNOUNCE_ABSENCE
+        ));
+        // At the threshold it fires exactly once, consuming the record.
+        assert!(tracker.take_signal_if_absent(
+            &peer,
+            t0 + RECONNECT_REANNOUNCE_ABSENCE,
+            RECONNECT_REANNOUNCE_ABSENCE
+        ));
+        assert!(!tracker.take_signal_if_absent(
+            &peer,
+            t0 + std::time::Duration::from_secs(600),
+            RECONNECT_REANNOUNCE_ABSENCE
+        ));
+
+        // A NEW outage re-arms it: the latest disconnect wins.
+        tracker.record_disconnected(peer, t0 + std::time::Duration::from_secs(600));
+        assert!(tracker.take_signal_if_absent(
+            &peer,
+            t0 + std::time::Duration::from_secs(600) + RECONNECT_REANNOUNCE_ABSENCE,
+            RECONNECT_REANNOUNCE_ABSENCE
+        ));
     }
 
     /// #1091: a reconnect that arrives exactly at the window boundary

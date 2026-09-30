@@ -547,19 +547,18 @@ async fn cold_node_sends_first_after_reconnect_within_seconds() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    // Drain BOTH background announce sources before going cold, or the
-    // test could not discriminate the reconnect trigger: (1) join_network
-    // schedules a DELAYED second announce ~3 s after join (fresh message
-    // id — it lands even after PlumTree dedupe); (2) the join-time
-    // connect storm consumes the reconnect gate's leading edge and
-    // schedules its coalesced TRAILING fire at +30 s. A real restart is
-    // down for longer than the gate window, so the model waits past it —
-    // after this point the heartbeat cadence (600 s) is the only other
-    // announcer and the peer's next leading edge is the feature under
-    // test.
-    let background_announces_drained = joined_at + std::time::Duration::from_secs(32);
-    if tokio::time::Instant::now() < background_announces_drained {
-        tokio::time::sleep(background_announces_drained - tokio::time::Instant::now()).await;
+    // Drain the join-time announce sources before going cold, or the test
+    // could not discriminate the reconnect trigger: join_network schedules
+    // a DELAYED second announce ~3 s after join (fresh message id — it
+    // lands even after PlumTree dedupe). Under the D31 stopgap the join
+    // storm no longer consumes any gate budget (fresh machines have no
+    // absence record and never signal), so only the delayed announce
+    // needs draining; after this point the heartbeat cadence (600 s) is
+    // the only other announcer and the peer's absence-triggered
+    // re-announce is the feature under test.
+    let delayed_announce_drained = joined_at + std::time::Duration::from_secs(6);
+    if tokio::time::Instant::now() < delayed_announce_drained {
+        tokio::time::sleep(delayed_announce_drained - tokio::time::Instant::now()).await;
     }
     // THE COLD STATE: b's discovery cache and binding registry emptied —
     // exactly what a restart leaves behind.
@@ -567,10 +566,9 @@ async fn cold_node_sends_first_after_reconnect_within_seconds() {
     assert!(b.discovered_agent_for_testing(&a_id).await.is_none());
 
     // A GENUINE reconnect — the transport shape a daemon restart
-    // produces: the existing connection is torn down (so each listener's
-    // connected-machines set forgets the peer), then b redials. A bare
-    // connect_addr while already connected emits no new PeerConnected and
-    // the reconnect gate would never fire.
+    // produces: the existing connection is torn down, then b redials.
+    // A bare connect_addr while already connected emits no new
+    // PeerConnected and the trigger would never fire.
     let a_addr = a.bound_addr().await.expect("a bound");
     let b_network = b.network().expect("b network");
     let a_peer = ant_quic::PeerId(a.machine_id().0);
@@ -598,14 +596,19 @@ async fn cold_node_sends_first_after_reconnect_within_seconds() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    // Give both listeners a beat to process the PeerDisconnected events
-    // BEFORE the redial: on the non-dialing side the close event (from
-    // the old transport) and the accept event (from the new one) come
-    // from different objects with no ordering guarantee — a redial that
-    // races the queue lands as Connected-then-Disconnected and the peer
-    // never counts as new. A real restart separates these by seconds.
+    // D31 r2: the trigger keys on b's last observed PeerDisconnected
+    // being ≥20 s old. The accept-side transport gap means a's listener
+    // may never see this fixture's clean close (production loss
+    // detection records it), so the observation is noted directly — the
+    // record a real 30 s restart outage would have left on a's tracker.
+    a.note_peer_absent_for_testing(
+        b.machine_id().0,
+        std::time::Instant::now() - std::time::Duration::from_secs(30),
+    );
+    // Settle before the redial so no late PeerDisconnected can overwrite
+    // the noted absence; a real restart separates these by minutes.
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    // Redial: this IS a machine that was not connected just before.
+    // Redial: this IS a machine that was absent for ≥20 s.
     b_network.connect_addr(a_addr).await.expect("b redials a");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
     while !b_network.is_connected(&a_peer).await {
