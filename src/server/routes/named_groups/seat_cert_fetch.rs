@@ -45,9 +45,11 @@ pub(in crate::server) const CERT_FETCH_REQUESTED_TTL_MS: u64 = 60_000;
 pub(in crate::server) const CERT_FETCH_ANSWER_INTERVAL_MS: u64 = 30_000;
 /// Responder: how long a failed roster/cache lookup is negatively cached.
 pub(in crate::server) const CERT_FETCH_MISS_TTL_MS: u64 = 60_000;
-/// Absolute cap on the responder suppression map and the deadline-stamp
-/// map (both are keyed by peer-supplied values).
+/// Absolute cap on request, responder suppression and deadline-stamp maps
+/// (all are keyed by peer-supplied values).
 pub(in crate::server) const CERT_FETCH_CACHE_MAX_ENTRIES: usize = 4096;
+/// Bound the recovery traffic caused by one accepted MemberAdded.
+const CERT_FETCH_PER_APPLY_MAX: usize = 16;
 /// How long a certificate-unobtainable seal refusal stays RETRYABLE
 /// before the typed (terminal) refusal is staged.
 pub(in crate::server) const CERT_EVIDENCE_DEADLINE_MS: u64 = 10 * 60_000;
@@ -119,16 +121,9 @@ pub(in crate::server) fn publish_group_cert_fetch(
             .cert_fetch_requested
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Sweep expired entries while we hold the lock (bounded by the
-        // roster-scale digest universe).
-        requested.retain(|_, at| {
-            let elapsed_ms = now.duration_since(*at).as_millis() as u64;
-            elapsed_ms < CERT_FETCH_REQUESTED_TTL_MS
-        });
-        if requested.contains_key(digest_hex) {
+        if !reserve_cert_fetch(&mut requested, digest_hex, now) {
             return;
         }
-        requested.insert(digest_hex.to_string(), now);
     }
     let request = GroupCertFetchRequest {
         group_id: stable_group_id.to_string(),
@@ -139,10 +134,10 @@ pub(in crate::server) fn publish_group_cert_fetch(
         return;
     };
     // Rate-limited by the in-flight dedup above (once per digest per TTL).
-    tracing::info!(
+    tracing::debug!(
         group_id = %LogHexId::group(stable_group_id),
         cert_digest = %LogHexId::new("digest", digest_hex),
-        "#946: group-scoped certificate fetch request sent"
+        "#946: group-scoped certificate fetch request scheduled"
     );
     let mut payload = Vec::with_capacity(GROUP_CERT_FETCH_DOMAIN.len() + json.len());
     payload.extend_from_slice(GROUP_CERT_FETCH_DOMAIN);
@@ -150,8 +145,13 @@ pub(in crate::server) fn publish_group_cert_fetch(
     let topic = metadata_topic.to_string();
     let pubsub = state.agent.pubsub();
     let digest_hex = digest_hex.to_string();
+    // Spread simultaneous recovery across members and digests without
+    // sleeping in the apply path or holding any membership/cache guard.
+    let delay =
+        std::time::Duration::from_millis(rand::Rng::gen_range(&mut rand::thread_rng(), 25..=250));
     tokio::spawn(async move {
         let Some(pubsub) = pubsub else { return };
+        tokio::time::sleep(delay).await;
         if let Err(e) = pubsub.publish(topic, bytes::Bytes::from(payload)).await {
             tracing::debug!(
                 cert_digest = %digest_hex,
@@ -160,6 +160,35 @@ pub(in crate::server) fn publish_group_cert_fetch(
             );
         }
     });
+}
+
+/// Reserve a request in the bounded TTL cache. Kept separate from transport
+/// so admission and eviction can be tested without an Agent or runtime.
+fn reserve_cert_fetch(
+    requested: &mut std::collections::HashMap<String, std::time::Instant>,
+    digest_hex: &str,
+    now: std::time::Instant,
+) -> bool {
+    requested
+        .retain(|_, at| (now.duration_since(*at).as_millis() as u64) < CERT_FETCH_REQUESTED_TTL_MS);
+    if requested.contains_key(digest_hex) {
+        tracing::debug!(cert_digest = %LogHexId::new("digest", digest_hex),
+            "#946: duplicate certificate fetch request dropped");
+        return false;
+    }
+    if requested.len() >= CERT_FETCH_CACHE_MAX_ENTRIES {
+        if let Some(oldest) = requested
+            .iter()
+            .min_by_key(|(_, at)| **at)
+            .map(|(key, _)| key.clone())
+        {
+            requested.remove(&oldest);
+            tracing::debug!(cert_digest = %LogHexId::new("digest", &oldest),
+                "#946: oldest certificate fetch tracking entry evicted at capacity");
+        }
+    }
+    requested.insert(digest_hex.to_string(), now);
+    true
 }
 
 /// `true` while this node's own request for `digest_hex` is in flight.
@@ -760,21 +789,112 @@ pub(in crate::server) fn attach_roster_certificates_to_member_added(
     set_sidecar(event, Vec::new());
 }
 
-/// #1023 receiver side: the certificate sidecar a `MemberAdded` carries,
-/// keyed by the event's group id, captured before the apply consumes the
-/// event. `None` for every other event and for an empty sidecar.
+/// MemberAdded certificate context captured before apply consumes the event.
+#[derive(Debug, PartialEq)]
+pub(in crate::server) struct MemberAddedCertificates {
+    pub group_id: String,
+    pub certificates: Vec<String>,
+    pub seated_member: String,
+    pub roster_root: Option<String>,
+}
+
+/// Preserve even an empty legacy sidecar for post-apply recovery.
 pub(in crate::server) fn member_added_sidecar(
     event: &super::NamedGroupMetadataEvent,
-) -> Option<(String, Vec<String>)> {
+) -> Option<MemberAddedCertificates> {
     match event {
         super::NamedGroupMetadataEvent::MemberAdded {
             group_id,
+            agent_id,
+            commit,
             roster_certificates_b64,
             ..
-        } if !roster_certificates_b64.is_empty() => {
-            Some((group_id.clone(), roster_certificates_b64.clone()))
-        }
+        } => Some(MemberAddedCertificates {
+            group_id: group_id.clone(),
+            certificates: roster_certificates_b64.clone(),
+            seated_member: agent_id.clone(),
+            roster_root: commit.as_ref().map(|commit| commit.roster_root.clone()),
+        }),
         _ => None,
+    }
+}
+
+/// Select the requests published by one accepted apply, independently of I/O.
+fn missing_roster_certificate_digests(
+    info: &crate::groups::GroupInfo,
+    local_hex: &str,
+    event: &MemberAddedCertificates,
+) -> Vec<String> {
+    if info.withdrawn
+        || info.policy.admission.owner_certified_user_id().is_none()
+        || !info.has_active_member(local_hex)
+    {
+        return Vec::new();
+    }
+    // MemberAdded references its roster through the signed root, not an
+    // explicit digest list. A later apply may have won the lock meanwhile:
+    // never use that later roster to widen this event's recovery scope.
+    let Some(root) = event.roster_root.as_deref() else {
+        return Vec::new();
+    };
+    if crate::groups::state_commit::compute_roster_root(&info.members_v2) != root {
+        tracing::debug!("#1023: certificate recovery skipped after roster changed");
+        return Vec::new();
+    }
+    // The joiner's own certificate travels separately in certificate_b64.
+    let sidecar_digests = info
+        .active_members()
+        .filter(|seat| {
+            seat.agent_id != event.seated_member
+                && (seat.certificate_digest.is_some() || seat.certificate.is_some())
+        })
+        .count();
+    if local_hex != event.seated_member && event.certificates.len() >= sidecar_digests {
+        return Vec::new();
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut digests: Vec<_> = info
+        .active_members()
+        .filter(|seat| seat.certificate.is_none())
+        .filter_map(|seat| seat.certificate_digest.clone())
+        .filter(|digest| seen.insert(digest.clone()))
+        .take(CERT_FETCH_PER_APPLY_MAX + 1)
+        .collect();
+    if digests.len() > CERT_FETCH_PER_APPLY_MAX {
+        tracing::debug!(group_id = %LogHexId::group(info.stable_group_id()),
+            limit = CERT_FETCH_PER_APPLY_MAX,
+            "#1023: excess per-apply certificate fetch requests dropped; seal retry can recover");
+        digests.truncate(CERT_FETCH_PER_APPLY_MAX);
+    }
+    digests
+}
+
+/// Recover certificates omitted by a trimmed or legacy seat event while
+/// its authority is likely still online. Admission is not certificate
+/// readiness: any remaining digest-only seat still blocks a later seal.
+/// Called after an authenticated, accepted apply and sidecar hydration,
+/// with no membership guard held. Uses #946's existing request TTL, response
+/// validation and bounded cache; no join-attempt state or wire fields change.
+pub(in crate::server) async fn request_missing_roster_certificates(
+    state: &AppState,
+    event: &MemberAddedCertificates,
+) {
+    let (topic, stable_id, digests) = {
+        let groups = state.named_groups.read().await;
+        let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, &event.group_id)
+        else {
+            return;
+        };
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let digests = missing_roster_certificate_digests(info, &local_hex, event);
+        (
+            info.metadata_topic.clone(),
+            info.stable_group_id().to_string(),
+            digests,
+        )
+    };
+    for digest in digests {
+        publish_group_cert_fetch(state, &topic, &stable_id, &digest);
     }
 }
 
@@ -908,5 +1028,136 @@ pub(in crate::server) async fn hydrate_from_roster_certificate_sidecar(
             );
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod recovery_scope_tests {
+    use super::*;
+    use crate::groups::{GroupAdmission, GroupInfo, GroupPolicyPreset, GroupRole};
+    use crate::identity::{AgentId, UserId};
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    // Inert post-apply state: no Agent/AppState, transport, filesystem or tasks.
+    // The returned plan is the sole input to the production publish loop.
+    fn fixture(other_seats: u8) -> (GroupInfo, String, MemberAddedCertificates) {
+        let local = AgentId([1; 32]);
+        let local_hex = hex::encode(local.as_bytes());
+        let mut info = GroupInfo::with_policy(
+            "scope".into(),
+            String::new(),
+            local,
+            "group".into(),
+            GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        info.policy.admission = GroupAdmission::OwnerCertified(UserId([2; 32]));
+        for n in 2..other_seats + 2 {
+            let member = hex::encode([n; 32]);
+            info.add_member(member.clone(), GroupRole::Member, None, None);
+            info.members_v2
+                .get_mut(&member)
+                .expect("seat")
+                .certificate_digest = Some(hex::encode([n + 1; 32]));
+        }
+        let event = MemberAddedCertificates {
+            group_id: "group".into(),
+            certificates: Vec::new(),
+            seated_member: local_hex.clone(),
+            roster_root: Some(crate::groups::state_commit::compute_roster_root(
+                &info.members_v2,
+            )),
+        };
+        (info, local_hex, event)
+    }
+
+    #[test]
+    fn non_joiner_untrimmed_member_added_publishes_zero_fetches() {
+        let (info, local, mut event) = fixture(2);
+        event.seated_member = hex::encode([2; 32]);
+        // All other referenced certificates were carried. Local unresolved
+        // state must not turn an ordinary join into a roster-wide fetch storm.
+        event.certificates = vec!["carried".into()];
+        assert!(missing_roster_certificate_digests(&info, &local, &event).is_empty());
+    }
+
+    #[test]
+    fn recovery_skipped_when_roster_moved_on() {
+        let (mut info, local, event) = fixture(1);
+        // Positive control: on the event's own roster the joiner does fetch,
+        // so the skip below is not a vacuous pass.
+        assert!(!missing_roster_certificate_digests(&info, &local, &event).is_empty());
+        // Another commit lands between apply and recovery. The roster root no
+        // longer matches the event, so this event's proactive recovery is
+        // skipped entirely rather than widened to the later seat. Known
+        // limitation (#1056): back-to-back joins fall back to the seal-path
+        // #946 fetch.
+        info.add_member("later-seat".into(), GroupRole::Member, None, None);
+        info.members_v2
+            .get_mut("later-seat")
+            .expect("seat")
+            .certificate_digest = Some("later-digest".into());
+        assert!(missing_roster_certificate_digests(&info, &local, &event).is_empty());
+    }
+
+    #[test]
+    fn one_apply_requests_at_most_sixteen_certificates() {
+        let (info, local, event) = fixture(40);
+        assert_eq!(
+            missing_roster_certificate_digests(&info, &local, &event).len(),
+            16
+        );
+    }
+
+    #[test]
+    fn trimmed_non_joiner_and_legacy_joiner_can_recover() {
+        let (info, local, mut event) = fixture(3);
+        assert_eq!(
+            missing_roster_certificate_digests(&info, &local, &event).len(),
+            3
+        );
+        event.seated_member = hex::encode([2; 32]);
+        event.certificates = vec!["carried".into()];
+        assert_eq!(
+            missing_roster_certificate_digests(&info, &local, &event).len(),
+            3
+        );
+    }
+
+    #[test]
+    fn an_event_without_a_roster_commit_cannot_trigger_a_roster_scan() {
+        let (info, local, mut event) = fixture(3);
+        event.roster_root = None;
+        assert!(missing_roster_certificate_digests(&info, &local, &event).is_empty());
+    }
+
+    #[test]
+    fn full_cache_admits_another_groups_request_by_evicting_oldest() {
+        let now = Instant::now();
+        let mut requested: HashMap<_, _> = (0..CERT_FETCH_CACHE_MAX_ENTRIES)
+            .map(|n| (format!("group-a-{n}"), now - Duration::from_millis(1)))
+            .collect();
+        requested.insert("group-a-0".into(), now - Duration::from_secs(1));
+        assert!(reserve_cert_fetch(&mut requested, "group-b-digest", now));
+        assert_eq!(requested.len(), CERT_FETCH_CACHE_MAX_ENTRIES);
+        assert!(!requested.contains_key("group-a-0"));
+        assert!(requested.contains_key("group-b-digest"));
+    }
+
+    #[test]
+    fn duplicate_suppression_and_expiry_remain_intact() {
+        let now = Instant::now();
+        let mut requested = HashMap::new();
+        assert!(reserve_cert_fetch(&mut requested, "digest", now));
+        assert!(!reserve_cert_fetch(
+            &mut requested,
+            "digest",
+            now + Duration::from_secs(1)
+        ));
+        assert!(reserve_cert_fetch(
+            &mut requested,
+            "digest",
+            now + Duration::from_secs(60)
+        ));
     }
 }
