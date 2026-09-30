@@ -1,0 +1,134 @@
+ADR 0089 S1 validation receipt — 2026-09-30
+
+Branch: feat/adr0089-s1-evidence-store
+Accepted-ADR base: 4b3a570
+Implementation: e951242ad8505d92498291b2eefd033fed709872
+
+Scope
+Inert evidence store. No store is constructed by the daemon and no runtime
+consumer reads evidence authority. No stream, wire-format, routing, discovery,
+binding-registry, send, trust or receive-authority behavior was switched over.
+The existing verified ingest paths retain bounded, TTL-only verbatim source
+bytes for future S2 pairing. Evidence config validates 1..=7 days (default 7).
+The input .adr0089-impl-plan.md remains untracked and unchanged.
+
+Files
+src/peer_evidence.rs: frozen V1 types/codec, verification, freshness, policy,
+  relationship computation, live bytes, store, atomic snapshots, counters,
+  bounded capture, inert tests and t_v benchmark.
+src/dm_capability.rs: exact evidence advert decoder and inert wire capture.
+src/dm_capability_service.rs: capture accepted advert bytes after verification.
+src/lib.rs: module export and post-verification X0A3/X0A4 body capture.
+src/server/state.rs: optional [evidence] configuration.
+src/bin/x0xd.rs: validate evidence configuration before startup.
+tests/fixtures/peer_evidence_v1.bin: first V1 encoder fixture.
+tests/fixtures/peer_evidence_v1.PROVENANCE.txt: encoder provenance and SHA-256.
+
+Public API
+EvidenceConfig { max_age_days }, validate().
+EvidenceRecordV1 { announcement, advert, certificate, relation, stored_at_ms },
+  verify(now_ms, max_age_ms).
+EvidenceFileV1 { records, watermarks }, encode()/decode(); MoveWatermarkV1.
+EvidenceView: verified announcement, advert (registry unknown), optional cert.
+PeerEvidenceStore::open(data_dir, config, Arc<dyn EvidencePolicy>, now_ms).
+  usable(agent, machine, now_ms) -> Option<EvidenceView> is the sole authority.
+  ingest(record, Gossip|Hello, now_ms), ingest_move_advert(bytes,key,now_ms),
+  live(agent,now_ms), remove_where(predicate), maintain(now_ms),
+  flush(now_ms, shutdown), counters(), is_memory_only().
+EvidencePolicy supplies current relationship and all revocation decisions;
+  it is called on every use and must not re-enter the store.
+RelationshipInputs/relationship_set resolve current enrollments, grants and
+  active shared-group rosters, with verified records for machine/user mapping.
+VerifiedWireCapture::get returns original bytes; S1 has no runtime reader.
+S2 must wire current policy, startup load, periodic maintenance/flush and
+  shutdown flush. It must never copy authority into another cache.
+
+Checks (all exit 0)
+  cargo fmt --all
+  cargo fmt --all -- --check
+  cargo clippy --workspace --all-features --all-targets --offline -- -D warnings
+  RUSTDOCFLAGS='-D warnings' cargo doc --all-features --no-deps --offline
+  cargo test --lib peer_evidence::tests --offline -- --nocapture
+Unit result: 25 passed, 0 failed, 3 intentionally ignored, 3821 filtered out.
+Only new inert tests ran. No daemon, network or full-suite test was executed.
+The process-kill test runs only its own inert child test, exiting at the
+before-file-fsync and after-directory-fsync checkpoints (expected exit 89).
+
+Per-test results (prefix peer_evidence::tests::)
+PASS all_revocation_subjects_rechecked_after_load
+PASS cap_refuses_incoming_move_without_dropping_watermarks
+PASS capture_preserves_verbatim_wire_and_ttl
+PASS component_30_kib_and_file_16_mib_caps
+PASS config_default_min_max_and_certificate_expiry
+PASS crash_checkpoints_before_and_after_fsync_and_failed_move_suspension
+PASS durable_move_process_kill
+PASS failed_move_retry_and_advert_only_move
+PASS freshness_each_component_and_future_skew
+PASS maintenance_removes_expired_relationships_and_keeps_watermarks
+PASS material_changes_coalesce_and_clean_shutdown_flushes
+PASS mismatched_agent_machine_and_certificate
+PASS monotonicity_strangers_and_live_policy_after_load
+PASS move_atomic_durable_restart_and_watermark_replay
+PASS record_cap_eviction_priority_then_lru_and_watermark_survival
+PASS relationship_sources_enrollment_grants_and_active_groups_only
+PASS roundtrip_unknown_magic_trailing_and_tampered_load
+PASS routine_refresh_restart_preserves_stored_authority_and_live_bytes
+PASS stored_freshness_is_per_component_and_configured_lifetime
+PASS tamper_each_signed_part_and_exact_consumption
+PASS unreadable_files_stay_byte_identical_after_ingest_and_flush
+PASS use_limit_hello_revalidation_and_half_life_refresh
+PASS v1_encoder_fixture_loads_and_roundtrips
+PASS verified_ingest_captures_advert_verbatim_and_rejects_forgery
+PASS watermark_cap_protects_records_relationships_and_young_entries
+
+Explicit auxiliary runs
+PASS generate_initial_v1_fixture (one-time create_new; --ignored --exact).
+PASS verify_benchmark_t_v (--ignored --exact --nocapture).
+crash_process_child is intentionally ignored in the ordinary selector and is
+  exercised twice by durable_move_process_kill, not a standalone passing test.
+
+Benchmark
+Command:
+  cargo test --lib peer_evidence::tests::verify_benchmark_t_v --offline -- --ignored --exact --nocapture
+Target: macos-aarch64. CPU model query was denied by the sandbox.
+2000 verifies after 100 warmups, fixed 4096-byte message, real ML-DSA-65 keys.
+mean t_v = 0.125681 ms; 2048 * t_v = 0.257395 s (crypto-only projection).
+Test profile: x0x debug assertions enabled; Cargo.toml explicitly compiles
+  ant-quic, fips204, saorsa-pqc and keccak at opt-level 3 for tests.
+This is not a release-build measurement or an end-to-end startup-load result.
+Fleet VPS measurement is NOT RUN: this task permits no network execution.
+Run the same CPU-only selector on the fleet VPS class and record its CPU,
+profile, load and t_v before claiming ADR section 10's fleet timing gate.
+
+Format fixture
+SHA-256: 387e4cdfb4659ac763a8420713d2ce0d340714f4cda1775eaa8442f51942baea
+The fixture is from S1's initial encoder, not a released executable. No
+released X0PEV1 encoder exists yet. ADR 0085 release-artifact provenance and
+real downgrade/re-upgrade validation remain release gates.
+
+ADR-author questions / interpretations for review
+1. The plan's 30-day store/config bullets conflict with Accepted ADR section 3.
+   This implementation follows the Accepted default 7, min 1, max 7. Please
+   correct the plan, not the immutable Accepted ADR.
+2. W/L age-check announcement and advert timestamps independently. Certificates
+   retain their existing signed issuance/future-skew and expiry rules; their
+   issuance date is NOT treated as a 15-minute heartbeat. Requiring newly issued
+   owner certificates for every Hello would invalidate normal long-lived certs.
+   Certificate bytes use AgentCertificate's existing storage encoding, checked
+   for exact canonical consumption; all original supplied bytes are retained.
+   Please confirm this resolves the plan's ambiguous 'each part' wording.
+3. An unreadable store is permanently memory-only. Complete fresh initial
+   records may be used in memory, but a move cannot meet the durability rule:
+   it fails closed and stays suspended, with evidence_move_write_failed counted.
+   Please confirm this combined interpretation of sections 3 and 8.
+4. Time out of the relationship set is tracked in memory by maintain(); after
+   restart absent watermark agents tie at first observation, with agent-ID tie
+   breaking. V1 persists only (t,M), as specified. Exact pre-restart absence
+   ordering would need another versioned field; confirm conservative ties.
+
+Remaining review/release gates
+No cross-model review was performed in this task. No hosted CI, daemon
+integration, VPS benchmark, or released-encoder fixture is claimed. S2-S5 and
+all restart-cold behavioral recovery guarantees remain unimplemented by S1.
+No behavioral red/green run against the pre-S1 daemon was attempted: S1 adds
+an inert API and its unit tests, rather than changing daemon recovery behavior.
