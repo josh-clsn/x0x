@@ -357,6 +357,10 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub groups: DaemonGroupsConfig,
 
+    /// Inert evidence lifetime configuration (ADR 0089).
+    #[serde(default)]
+    pub evidence: x0x::peer_evidence::EvidenceConfig,
+
     /// How often to re-announce identity (seconds).
     #[serde(default = "default_heartbeat_interval")]
     pub(super) heartbeat_interval_secs: u64,
@@ -787,6 +791,7 @@ impl Default for DaemonConfig {
             gossip: x0x::gossip::GossipConfig::default(),
             key_move: KeyMoveConfig::default(),
             groups: DaemonGroupsConfig::default(),
+            evidence: Default::default(),
             ws: DaemonWsConfig::default(),
             heartbeat_interval_secs: default_heartbeat_interval(),
             legacy_announce: false,

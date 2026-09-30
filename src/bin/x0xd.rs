@@ -670,6 +670,10 @@ async fn load_config(path: &str) -> Result<(DaemonConfig, Vec<String>)> {
     // behaviour (a 0-day grace would refuse every recorded-capable
     // authority's absent-mandate event immediately), so unlike unknown
     // keys — warn-only — this refuses startup.
+    config
+        .evidence
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid evidence configuration: {e}"))?;
     if let Err(message) = config.groups.validate() {
         anyhow::bail!("invalid [groups] configuration: {message}");
     }

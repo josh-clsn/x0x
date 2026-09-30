@@ -203,12 +203,22 @@ pub(crate) fn ingest_verified_capability_advert(
         Ok(None) => {}
         Err(_) => return false,
     }
-    store.insert(
+    let inserted = store.insert(
         AgentId(advert.agent_id),
         MachineId(advert.machine_id),
         advert.capabilities,
         advert.created_at_unix_ms,
-    )
+    );
+    if inserted {
+        store.evidence_wire.capture(
+            AgentId(advert.agent_id),
+            false,
+            &message.payload,
+            advert.created_at_unix_ms,
+            now_unix_ms(),
+        );
+    }
+    inserted
 }
 
 /// Verify and ingest one digest extension using the same authenticated

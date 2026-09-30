@@ -160,6 +160,8 @@ pub mod dm;
 /// store to decide whether to use the gossip DM path or fall back to
 /// raw-QUIC for a given recipient.
 pub mod dm_capability;
+/// Inert relationship-peer evidence store (ADR 0089 S1).
+pub mod peer_evidence;
 
 /// Bounded per-peer DM digest diagnostic observations.
 pub mod dm_digest_diagnostics;
@@ -9020,6 +9022,7 @@ impl Agent {
         let own_agent_id = self.agent_id();
         let own_user_id = self.user_id();
         let cache_freshness_ttl_secs = self.identity_ttl_secs;
+        let evidence_capture_store = std::sync::Arc::clone(&self.capability_store);
         let rebroadcast_pubsub = std::sync::Arc::clone(runtime.pubsub());
         let token = self.shutdown_token.clone();
         // Subscribe to revocation records so they are applied on receipt.
@@ -9991,6 +9994,14 @@ impl Agent {
                     agent_public_key: announcement.agent_public_key.clone(),
                     cert_digest,
                 };
+                // Keep the verified X0A3/X0A4 body verbatim, after the existing
+                // signature, timestamp, trust and revocation gates. S1 has no reader.
+                if announce_v3::is_v3_payload(&raw_payload) {
+                    evidence_capture_store.evidence_wire.capture(
+                        announcement.agent_id, true, &raw_payload,
+                        announcement.announced_at.saturating_mul(1000), now.saturating_mul(1000),
+                    );
+                }
                 record_authenticated_machine_binding_from_message(
                     &authenticated_machine_bindings,
                     &msg,
