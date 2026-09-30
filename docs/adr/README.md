@@ -93,6 +93,7 @@ This directory contains architecture decision records for x0x.
 
 ## Proposed
 - [ADR 0051: Peer Relay (X0X-0070) Is a Default-Off, One-Hop DM Fallback](./0051-application-level-peer-relay.md) (proposed 2026-08-29) — signed `RelayHeader` routing (version/dst/src/pubkey/timestamp — no inner-envelope digest, substitution tracked as #437), inner `DmEnvelope` sealed end-to-end, one hop; policy default disabled, contact-required, rate/byte caps; first-eligible selection pending ADR-0035's spread model
+- [ADR 0089: Relationship-Peer Evidence Survives Restart (Evidence Rule, Slice 1)](./0089-relationship-peer-evidence-survives-restart.md) (proposed 2026-09-30; charter D29, pulled into v0.46) — persists mutual signed evidence (machine-signed V3 announcement + agent-signed DM advert with KEM key + optional cert) for relationship peers only (enrolled devices, grant parties, group members), re-verified on load, revocation/age/relationship-checked; seeds the binding registry and the send-side KEM lookup; new `EvidenceV1 = 0x06` stream for an on-connect Hello (own evidence only) and a bounded pull `Lookup`; ADR 0093 bit 2 `peer_evidence_v1`; `peer-evidence.bin` `X0PEV1`; O(C) not O(N) recovery; amends ADR 0021 option 2 for relationship peers; replaces the #1092 re-announce stopgap
 - [ADR 0063: Signed KV legacy gossip compatibility adoption boundary](./0063-signed-kv-legacy-gossip-compatibility-adoption-boundary.md) — draft; V3 pairing preparation only, G0 met and G1–G8 open; disabled pending audited adoption
 
 
