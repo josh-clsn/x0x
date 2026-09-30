@@ -29,6 +29,11 @@ async fn build_agent(dir: &TempDir) -> Agent {
     Agent::builder()
         .with_machine_key(dir.path().join("machine.key"))
         .with_agent_key_path(dir.path().join("agent.key"))
+        .with_user_key_path(dir.path().join("user.key"))
+        .with_agent_cert_path(dir.path().join("agent.cert"))
+        .with_identity_dir(dir.path())
+        .with_contact_store_path(dir.path().join("contacts.json"))
+        .with_peer_cache_dir(dir.path().join("peers"))
         .with_network_config(test_network_config())
         .build()
         .await
@@ -488,6 +493,287 @@ async fn raw_frame_from_wrong_machine_stays_unverified_with_registry_binding() {
     );
 }
 
+/// Send real 0x10 bytes through the #898 loopback listener harness.
+async fn send_registry_test_frame(local: &Agent, remote: &Agent, sender: x0x::identity::AgentId) {
+    let network = remote.network().expect("remote network");
+    network
+        .connect_addr(local.bound_addr().await.expect("local bound"))
+        .await
+        .expect("dial local");
+    let peer = ant_quic::PeerId(local.machine_id().0);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    while !network.is_connected(&peer).await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "transport connect deadline"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    network
+        .send_direct(&peer, sender.as_bytes(), b"1098 retained binding")
+        .await
+        .expect("raw frame send");
+}
+
+/// #1098: TTL eviction must not erase a retained certificate's expiry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raw_frame_expired_registry_without_cache_is_dropped_1098() {
+    let local_dir = TempDir::new().unwrap();
+    let remote_dir = TempDir::new().unwrap();
+    let local = build_agent(&local_dir).await;
+    let remote = build_agent(&remote_dir).await;
+    local.join_network().await.expect("local join network");
+    let sender = x0x::identity::AgentId([0x98; 32]);
+    let now = now_secs();
+    local
+        .record_authenticated_binding_with_expiry_for_testing(
+            sender,
+            remote.machine_id(),
+            now - 2000,
+            Some(now - 1000),
+        )
+        .await;
+    assert!(
+        local.reachability(&sender).await.is_none(),
+        "no discovery entry"
+    );
+    let mut deliveries = local.direct_messaging().subscribe();
+    send_registry_test_frame(&local, &remote, sender).await;
+    // Wait for observable processing, not merely an absence timeout: the
+    // baseline delivers, the fix increments the actual expiry drop counter.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let stats = local.direct_messaging().diagnostics_snapshot().stats;
+            if stats.incoming_dropped_expired > 0 || stats.incoming_delivered_to_subscribe > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("frame processed by listener");
+    let drops = local
+        .direct_messaging()
+        .diagnostics_snapshot()
+        .stats
+        .incoming_dropped_expired;
+    let delivery = deliveries.try_recv();
+    let route = local.direct_messaging().get_machine_id(&sender).await;
+    local.shutdown().await;
+    remote.shutdown().await;
+    assert_eq!(
+        drops, 1,
+        "#1098: retained expired certificate must drop the raw frame"
+    );
+    assert!(
+        delivery.is_none(),
+        "expired frame must not reach subscribers"
+    );
+    assert_eq!(
+        route, None,
+        "expired sender must not establish reverse routing"
+    );
+}
+
+/// #1098: discovery learned a newer move via rebroadcast; the registry
+/// still names the old machine. Its frames stay unverified and never rebind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raw_frame_moved_agent_old_machine_is_unverified_and_never_rebinds_1098() {
+    let local_dir = TempDir::new().unwrap();
+    let old_dir = TempDir::new().unwrap();
+    let local = build_agent(&local_dir).await;
+    let old = build_agent(&old_dir).await;
+    local.join_network().await.expect("local join network");
+    let da = fake_discovered(0x61, vec![], None, Some(true), None, None);
+    let sender = da.agent_id;
+    let new_machine = da.machine_id;
+    local
+        .record_authenticated_binding_for_testing(sender, old.machine_id(), da.announced_at - 10)
+        .await;
+    local.insert_discovered_agent_for_testing(da).await;
+    local
+        .direct_messaging()
+        .mark_raw_direct_sender_connected(sender, new_machine, true)
+        .await;
+    send_registry_test_frame(&local, &old, sender).await;
+    let delivered = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        local.recv_direct_annotated(),
+    )
+    .await
+    .expect("delivery deadline")
+    .expect("frame delivered");
+    let route = local.direct_messaging().get_machine_id(&sender).await;
+    let reverse = local
+        .direct_messaging()
+        .lookup_agent(&old.machine_id())
+        .await;
+    local.shutdown().await;
+    old.shutdown().await;
+    // Check routing first so the red proves the actual rebind defect too.
+    assert_eq!(
+        route,
+        Some(new_machine),
+        "#1098: old machine must not rebind the moved agent"
+    );
+    assert_eq!(
+        reverse, None,
+        "old machine must not acquire a reverse agent mapping"
+    );
+    assert_eq!(delivered.sender, sender);
+    assert!(
+        !delivered.verified,
+        "#1098: superseded registry binding must not verify"
+    );
+}
+
+/// #1091 (the send-first reproduction, CI): a node whose identity
+/// resolution state is COLD (the post-restart shape — discovery cache and
+/// binding registry empty) must still be able to SEND FIRST to a peer it
+/// is transport-connected to, within seconds. The reconnect-triggered
+/// self re-announce refills the cold node's cache from the peer's
+/// re-announce (the peer sees the (re)connect and re-announces too).
+///
+/// Cold state is produced with the test seam (clear both structures)
+/// followed by a transport reconnect, so the gate fires exactly as it
+/// would after a daemon restart. On the reverted tree the send fails with
+/// RecipientUndiscovered for the whole announcement cadence.
+#[tokio::test]
+async fn cold_node_sends_first_after_reconnect_within_seconds() {
+    let joined_at = tokio::time::Instant::now();
+    let a_dir = TempDir::new().unwrap();
+    let b_dir = TempDir::new().unwrap();
+    let a = build_agent(&a_dir).await;
+    let b = build_agent(&b_dir).await;
+    a.join_network().await.expect("a join");
+    b.join_network().await.expect("b join");
+    a.announce_identity(false, false)
+        .await
+        .expect("a announces");
+    b.announce_identity(false, false)
+        .await
+        .expect("b announces");
+
+    // The fixture config has no bootstrap and no mDNS — connect the two
+    // nodes explicitly (the production equivalent of the bootstrap dial),
+    // or b's listener has no transport over which to hear a.
+    let a_addr = a.bound_addr().await.expect("a bound");
+    let b_network = b.network().expect("b network");
+    b_network.connect_addr(a_addr).await.expect("b dials a");
+    let a_peer = ant_quic::PeerId(a.machine_id().0);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    while !b_network.is_connected(&a_peer).await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "initial dial deadline"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // Let b discover a (the warm precondition the fixture relies on).
+    // Generous deadline: under CI coverage load the two-node gossip
+    // mesh can take tens of seconds — this wait is fixture setup, the
+    // #1091 contract is the 10 s send window after the reconnect.
+    let a_id = a.agent_id();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if b.discovered_agent_for_testing(&a_id).await.is_some() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "b never discovered a"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // Drain the join-time announce sources before going cold, or the test
+    // could not discriminate the reconnect trigger: join_network schedules
+    // a DELAYED second announce ~3 s after join (fresh message id — it
+    // lands even after PlumTree dedupe). Under the D31 stopgap the join
+    // storm no longer consumes any gate budget (fresh machines have no
+    // absence record and never signal), so only the delayed announce
+    // needs draining; after this point the heartbeat cadence (600 s) is
+    // the only other announcer and the peer's absence-triggered
+    // re-announce is the feature under test.
+    let delayed_announce_drained = joined_at + std::time::Duration::from_secs(6);
+    if tokio::time::Instant::now() < delayed_announce_drained {
+        tokio::time::sleep(delayed_announce_drained - tokio::time::Instant::now()).await;
+    }
+    // THE COLD STATE: b's discovery cache and binding registry emptied —
+    // exactly what a restart leaves behind.
+    b.clear_identity_resolution_for_testing().await;
+    assert!(b.discovered_agent_for_testing(&a_id).await.is_none());
+
+    // A GENUINE reconnect — the transport shape a daemon restart
+    // produces: the existing connection is torn down, then b redials.
+    // A bare connect_addr while already connected emits no new
+    // PeerConnected and the trigger would never fire.
+    let a_addr = a.bound_addr().await.expect("a bound");
+    let b_network = b.network().expect("b network");
+    let a_peer = ant_quic::PeerId(a.machine_id().0);
+    let b_peer = ant_quic::PeerId(b.machine_id().0);
+    b_network
+        .disconnect(&a_peer)
+        .await
+        .expect("b drops the a connection");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    while b_network.is_connected(&a_peer).await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "disconnect deadline"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // a's listener must observe the disconnect too, or the redial is not
+    // a NEW machine on a's side and a would not re-announce.
+    let a_network = a.network().expect("a network");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    while a_network.is_connected(&b_peer).await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a-side disconnect deadline"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // D31 r2: the trigger keys on b's last observed PeerDisconnected
+    // being ≥20 s old. The accept-side transport gap means a's listener
+    // may never see this fixture's clean close (production loss
+    // detection records it), so the observation is noted directly — the
+    // record a real 30 s restart outage would have left on a's tracker.
+    a.note_peer_absent_for_testing(
+        b.machine_id().0,
+        std::time::Instant::now() - std::time::Duration::from_secs(30),
+    );
+    // Settle before the redial so no late PeerDisconnected can overwrite
+    // the noted absence; a real restart separates these by minutes.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    // Redial: this IS a machine that was absent for ≥20 s.
+    b_network.connect_addr(a_addr).await.expect("b redials a");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    while !b_network.is_connected(&a_peer).await {
+        assert!(tokio::time::Instant::now() < deadline, "redial deadline");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // B SENDS FIRST — within 10 s of the reconnect it must succeed.
+    let send = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            match b.send_direct(&a_id, b"1091 cold send".to_vec()).await {
+                Ok(_) => return true,
+                Err(x0x::dm::DmError::RecipientUndiscovered(_)) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(other) => panic!("unexpected send error: {other:?}"),
+            }
+        }
+    })
+    .await;
+    assert!(
+        send.unwrap_or(false),
+        "#1091: the cold node must send first within 10 s of the reconnect"
+    );
+}
+
 #[tokio::test]
 async fn machine_for_agent_returns_linked_endpoint() {
     let dir = TempDir::new().unwrap();
@@ -741,8 +1027,7 @@ async fn raw_direct_listener_refuses_an_unverified_claim_end_to_end() {
 /// C1 (#898 review): evidence is `verified` OR an authenticated binding
 /// naming THIS machine. A moved agent whose announcement updated
 /// AuthenticatedMachineBindings but is too stale for the discovery cache
-/// (raw `verified` stays false) must still have its routing updated by
-/// the listener. Drives the same real listener path as T1.
+/// must still verify delivery and have its routing updated by the listener. Drives the same real listener path as T1.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_binding_names_the_machine_and_routing_follows() {
     let local_dir = TempDir::new().unwrap();
@@ -753,7 +1038,8 @@ async fn authenticated_binding_names_the_machine_and_routing_follows() {
 
     // The cache still says A@M1 (stale); the AUTHENTICATED binding says
     // A moved to M2 (announcement landed, cache insert did not).
-    let da = fake_discovered(0x51, vec![], None, Some(true), None, None);
+    let mut da = fake_discovered(0x51, vec![], None, Some(true), None, None);
+    da.announced_at -= 10;
     let a_id = da.agent_id;
     let _m1 = da.machine_id;
     local.insert_discovered_agent_for_testing(da).await;
@@ -857,4 +1143,239 @@ fn nat_type_port_restricted_still_attempts_direct_but_is_not_verified() {
     assert!(!info.likely_direct());
     assert!(info.should_attempt_direct());
     assert!(info.needs_coordination());
+}
+
+// ADR 0089 S2: signed fixture from the warm peer, loaded by a fresh Agent.
+// No discovery/binding/capability cache is seeded by this harness.
+async fn persist_s2_evidence(dir: &TempDir, remote: &Agent) {
+    use x0x::peer_evidence::{EvidenceFileV1, EvidenceRecordV1, GROUP};
+    let now = now_secs();
+    let identity = remote.identity();
+    let announcement = x0x::IdentityAnnouncement {
+        agent_id: remote.agent_id(),
+        machine_id: remote.machine_id(),
+        agent_public_key: identity.agent_keypair().public_key().as_bytes().to_vec(),
+        machine_public_key: identity.machine_keypair().public_key().as_bytes().to_vec(),
+        user_id: None,
+        agent_certificate: None,
+        machine_signature: vec![],
+        self_name: None,
+        addresses: vec![remote.bound_addr().await.unwrap()],
+        announced_at: now,
+        nat_type: None,
+        can_receive_direct: Some(true),
+        is_relay: None,
+        is_coordinator: None,
+        reachable_via: vec![],
+        relay_candidates: vec![],
+    };
+    let mut announcement = x0x::announce_v3::IdentityAnnouncementV3::build_from_v2(
+        &announcement,
+        identity.machine_keypair().secret_key(),
+        0,
+    )
+    .unwrap();
+    announcement
+        .sign_v3_1(identity.machine_keypair().secret_key())
+        .unwrap();
+    let mut advert = x0x::dm_capability::CapabilityAdvert {
+        protocol_version: x0x::dm_capability_service::ADVERT_PROTOCOL_VERSION,
+        agent_id: remote.agent_id().0,
+        machine_id: remote.machine_id().0,
+        created_at_unix_ms: now * 1000,
+        capabilities: x0x::dm::DmCapabilities::pending(),
+        signature: vec![],
+    };
+    advert.signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        identity.agent_keypair().secret_key(),
+        &advert.signed_bytes().unwrap(),
+    )
+    .unwrap()
+    .as_bytes()
+    .to_vec();
+    let record = EvidenceRecordV1 {
+        announcement: x0x::announce_v3::serialize_v3_1(&announcement).unwrap(),
+        advert: postcard::to_stdvec(&advert).unwrap(),
+        certificate: None,
+        relation: GROUP,
+        stored_at_ms: now * 1000,
+    };
+    let mut file = EvidenceFileV1::default();
+    file.records.insert(remote.agent_id(), record);
+    std::fs::write(dir.path().join("peer-evidence.bin"), file.encode().unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn s2_cold_raw_frame_uses_stored_evidence_and_removal_stops_verification() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let local_dir = TempDir::new().unwrap();
+    let remote_dir = TempDir::new().unwrap();
+    let remote = build_agent(&remote_dir).await;
+    persist_s2_evidence(&local_dir, &remote).await;
+    let local = build_agent(&local_dir).await;
+    let related = Arc::new(AtomicBool::new(true));
+    let current = related.clone();
+    let sender = remote.agent_id();
+    local
+        .start_peer_evidence(
+            local_dir.path().to_owned(),
+            Default::default(),
+            Arc::new(move |a| Some(a == sender && current.load(Ordering::Relaxed))),
+        )
+        .unwrap();
+    assert!(local.peer_evidence().wait(0).await);
+    local.join_network().await.unwrap();
+    assert!(local.discovered_agent_for_testing(&sender).await.is_none());
+    let mut received = local.direct_messaging().subscribe();
+    send_registry_test_frame(&local, &remote, sender).await;
+    let message = tokio::time::timeout(std::time::Duration::from_secs(5), received.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(message.verified);
+    assert!(local.discovered_agent_for_testing(&sender).await.is_none());
+    assert!(
+        local
+            .direct_messaging()
+            .get_machine_id(&sender)
+            .await
+            .is_none(),
+        "stored authority must not enter the routing registry"
+    );
+    related.store(false, Ordering::Relaxed);
+    send_registry_test_frame(&local, &remote, sender).await;
+    let message = tokio::time::timeout(std::time::Duration::from_secs(5), received.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!message.verified);
+    local.shutdown().await;
+    remote.shutdown().await;
+}
+
+#[tokio::test]
+async fn s2_cold_sender_dials_stored_address_without_an_announcement() {
+    use std::sync::Arc;
+    let local_dir = TempDir::new().unwrap();
+    let remote_dir = TempDir::new().unwrap();
+    let remote = build_agent(&remote_dir).await;
+    persist_s2_evidence(&local_dir, &remote).await;
+    let local = build_agent(&local_dir).await;
+    let peer = remote.agent_id();
+    local
+        .start_peer_evidence(
+            local_dir.path().to_owned(),
+            Default::default(),
+            Arc::new(move |a| Some(a == peer)),
+        )
+        .unwrap();
+    assert!(local.peer_evidence().wait(0).await);
+    // Neither node joins gossip: no announcement can rescue resolution.
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        local.send_direct(&peer, b"S2 cold sender".to_vec()),
+    )
+    .await
+    .unwrap();
+    assert!(result.is_ok(), "{result:?}");
+    assert!(local.discovered_agent_for_testing(&peer).await.is_none());
+    assert!(local.capability_store().lookup_binding(&peer).is_none());
+    assert!(local
+        .direct_messaging()
+        .get_machine_id(&peer)
+        .await
+        .is_none());
+    local.shutdown().await;
+    remote.shutdown().await;
+}
+
+#[tokio::test]
+async fn s2_cold_raw_durable_ack_completes_from_stored_sender_key() {
+    use std::sync::Arc;
+    use x0x::dm::{DmAckOutcome, DmEnvelope, EnvelopeBuilder, DM_PROTOCOL_DURABLE_ACK};
+    let local_dir = TempDir::new().unwrap();
+    let remote_dir = TempDir::new().unwrap();
+    let remote = build_agent(&remote_dir).await;
+    persist_s2_evidence(&local_dir, &remote).await;
+    let local = build_agent(&local_dir).await;
+    let sender = remote.agent_id();
+    local
+        .start_peer_evidence(
+            local_dir.path().to_owned(),
+            Default::default(),
+            Arc::new(move |a| Some(a == sender)),
+        )
+        .unwrap();
+    assert!(local.peer_evidence().wait(0).await);
+    local.join_network().await.unwrap();
+    local
+        .start_dm_inbox(
+            Arc::new(x0x::groups::kem_envelope::AgentKemKeypair::generate().unwrap()),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    let waiter = local.dm_inflight_acks().register_for_protocol(
+        [89; 16],
+        DM_PROTOCOL_DURABLE_ACK,
+        sender,
+        Some(remote.machine_id()),
+    );
+    let now = now_secs() * 1000;
+    let mut ack = DmEnvelope {
+        protocol_version: DM_PROTOCOL_DURABLE_ACK,
+        request_id: [90; 16],
+        sender_agent_id: sender.0,
+        sender_machine_id: remote.machine_id().0,
+        recipient_agent_id: local.agent_id().0,
+        created_at_unix_ms: now,
+        expires_at_unix_ms: now + 60_000,
+        body: EnvelopeBuilder::build_ack_body([89; 16], DmAckOutcome::Accepted),
+        signature: vec![],
+        origin_attestation: None,
+    };
+    ack.signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        remote.identity().agent_keypair().secret_key(),
+        &ack.signed_bytes().unwrap(),
+    )
+    .unwrap()
+    .as_bytes()
+    .to_vec();
+    let mut attestation = x0x::dm::DmOriginAttestation::for_envelope(
+        &ack,
+        remote
+            .identity()
+            .machine_keypair()
+            .public_key()
+            .as_bytes()
+            .to_vec(),
+    );
+    attestation
+        .sign(remote.identity().machine_keypair())
+        .unwrap();
+    ack.origin_attestation = Some(attestation);
+    let net = remote.network().unwrap();
+    net.connect_addr(local.bound_addr().await.unwrap())
+        .await
+        .unwrap();
+    net.send_direct(
+        &ant_quic::PeerId(local.machine_id().0),
+        sender.as_bytes(),
+        &ack.to_wire_bytes().unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap(),
+        DmAckOutcome::Accepted
+    );
+    assert!(local.discovered_agent_for_testing(&sender).await.is_none());
+    local.shutdown().await;
+    remote.shutdown().await;
 }

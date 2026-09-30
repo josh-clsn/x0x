@@ -744,6 +744,14 @@ pub enum DmError {
         capability: &'static str,
     },
 
+    /// The recipient's agent is not yet DISCOVERED locally (no discovery
+    /// cache entry and no binding evidence — the post-restart send-first
+    /// shape of #1091). Distinct from key-material absence: retry as soon
+    /// as identity discovery repopulates (the peer's re-announce), which
+    /// the reconnect-triggered re-announce bounds to seconds.
+    #[error("recipient_undiscovered: {0} — awaiting the peer's identity announcement; retry")]
+    RecipientUndiscovered(String),
+
     /// Recipient's AgentCard / capability advert is not known locally, or
     /// their KEM public key is missing. Caller should retry after a
     /// capability-cache refresh.

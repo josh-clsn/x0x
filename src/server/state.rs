@@ -357,7 +357,7 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub groups: DaemonGroupsConfig,
 
-    /// Inert evidence lifetime configuration (ADR 0089).
+    /// Stored evidence lifetime configuration (ADR 0089).
     #[serde(default)]
     pub evidence: x0x::peer_evidence::EvidenceConfig,
 

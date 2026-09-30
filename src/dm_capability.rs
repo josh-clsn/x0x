@@ -316,8 +316,10 @@ impl DigestSupportExtension {
 /// Senders consult this cache before each `send_direct` call to determine
 /// whether the recipient supports the gossip DM inbox path.
 pub struct CapabilityStore {
-    /// Inert ADR 0089 prerequisite: verified source wire bodies.
-    pub evidence_wire: crate::peer_evidence::VerifiedWireCapture,
+    /// ADR 0089 verified source wire bodies, paired by the runtime worker.
+    pub evidence_wire: std::sync::Arc<crate::peer_evidence::VerifiedWireCapture>,
+    /// ADR 0089 runtime authority; never inserted into capability bits.
+    pub evidence: std::sync::Arc<crate::peer_evidence::EvidenceRuntime>,
     inner: Mutex<CapabilityStoreInner>,
     ttl: Duration,
     /// Adverts and digest extensions the service skipped without an
@@ -381,6 +383,7 @@ impl CapabilityStore {
             ttl: Duration::from_secs(ADVERT_CACHE_TTL_SECS),
             prefiltered_stale_adverts: AtomicU64::new(0),
             evidence_wire: Default::default(),
+            evidence: Default::default(),
         }
     }
 
@@ -392,6 +395,7 @@ impl CapabilityStore {
             ttl,
             prefiltered_stale_adverts: AtomicU64::new(0),
             evidence_wire: Default::default(),
+            evidence: Default::default(),
         }
     }
 

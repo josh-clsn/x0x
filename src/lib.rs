@@ -160,7 +160,7 @@ pub mod dm;
 /// store to decide whether to use the gossip DM path or fall back to
 /// raw-QUIC for a given recipient.
 pub mod dm_capability;
-/// Inert relationship-peer evidence store (ADR 0089 S1).
+/// Relationship-peer evidence store and point-of-use runtime (ADR 0089).
 pub mod peer_evidence;
 
 /// Bounded per-peer DM digest diagnostic observations.
@@ -273,6 +273,16 @@ pub struct Agent {
     /// Default false; sender bus fallback is unchanged. Bus-only senders
     /// cannot reach this inbox when enabled.
     skip_legacy_dm_bus: bool,
+    /// #1091 test seam: when false (default true) the reconnect re-announcer's
+    /// listener signal is suppressed; tests that model announcement timing
+    /// orthogonally (e.g. the R17 hydrate ladder) set it so the reconnect
+    /// beat cannot race their fixtures.
+    reconnect_reannounce_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// #1091 STOPGAP: absence tracker shared with the network event
+    /// listener (D31 r2: trigger on ≥20 s absence since the machine's last
+    /// observed PeerDisconnected). Shared so the test seam can note a
+    /// fabricated absence the transport gap hides from fixtures.
+    reconnect_absence_tracker: std::sync::Arc<std::sync::Mutex<ReconnectAbsenceTracker>>,
     /// Agent self-name (ADR-0036 display_name). Interior-mutable so
     /// `PUT /profile` updates apply to the next heartbeat without a
     /// restart; `None` announces anonymously (no self_name field).
@@ -1610,11 +1620,15 @@ async fn record_authenticated_machine_binding_from_message(
         );
         return false;
     }
-    dm_inbox::record_authenticated_machine_binding(
+    dm_inbox::record_authenticated_machine_binding_with_expiry(
         bindings,
         announcement.agent_id,
         announcement.machine_id,
         announcement.announced_at,
+        announcement
+            .agent_certificate
+            .as_ref()
+            .and_then(identity::AgentCertificate::not_after),
     )
     .await;
     true
@@ -3097,6 +3111,130 @@ pub struct AgentBuilder {
 }
 
 /// Context captured by the background identity heartbeat task.
+/// #1091: the reconnect re-announce gate. A node re-broadcasts its own
+/// signed identity announcement when it sees a transport-level (re)connect
+/// to a machine that was not connected just before — REGARDLESS of whether
+/// it can resolve that machine (the restarted peer is the one that cannot
+/// resolve US; resolving-or-not on our side must not gate the trigger).
+/// Globally rate-limited per node (the storm-control lesson of sg 0.5.75 /
+/// #380 GRAFT): at most one reconnect-triggered re-announce per
+/// [`RECONNECT_REANNOUNCE_WINDOW`], with a COALESCED trailing fire when
+/// more reconnects arrived inside the window — a fleet-wide rolling
+/// restart of N nodes inside ~15 s produces at most
+/// N × ceil(window / 30 s) re-announces, not a per-peer fan-out.
+/// #1091 STOPGAP (D31 ruling, superseded by the D29 ADR-0089 slice):
+/// per-machine last-`PeerDisconnected` times. A `PeerConnected` for a
+/// machine whose recorded disconnect is at least
+/// [`RECONNECT_REANNOUNCE_ABSENCE`] old (20 s — a real restart, not a
+/// transient flap) triggers this node's identity re-announce; the global
+/// [`ReconnectReannounceGate`] still rate-limits it to one per 30 s
+/// node-wide. Keyed on the disconnect time, NOT the last signal: a
+/// flapping peer (absent < 20 s) never triggers, and the record is
+/// consumed only when a signal fires, so a later reconnect after a
+/// fresh long outage still can.
+#[derive(Debug, Default)]
+struct ReconnectAbsenceTracker {
+    last_disconnected: std::collections::HashMap<[u8; 32], std::time::Instant>,
+}
+
+impl ReconnectAbsenceTracker {
+    fn record_disconnected(&mut self, peer: [u8; 32], at: std::time::Instant) {
+        self.last_disconnected.insert(peer, at);
+    }
+
+    /// True (consuming the record) when the peer's last observed
+    /// disconnect is at least `absence` old; false (record kept)
+    /// otherwise. A never-disconnected peer never triggers — join-time
+    /// announcements already cover fresh machines.
+    fn take_signal_if_absent(
+        &mut self,
+        peer: &[u8; 32],
+        now: std::time::Instant,
+        absence: std::time::Duration,
+    ) -> bool {
+        match self.last_disconnected.get(peer) {
+            Some(t) if now.duration_since(*t) >= absence => {
+                self.last_disconnected.remove(peer);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// #1091 STOPGAP: a peer must have been absent this long before its
+/// reconnect re-triggers our identity re-announce (D31 r2: 20 s — catches
+/// real restarts, daemons down 15–30 s, while transient flaps stay under
+/// the threshold).
+const RECONNECT_REANNOUNCE_ABSENCE: std::time::Duration = std::time::Duration::from_secs(20);
+
+#[derive(Debug)]
+pub(crate) struct ReconnectReannounceGate {
+    last_fire: Option<std::time::Instant>,
+    trailing_pending: bool,
+}
+
+/// The global per-node window for reconnect-triggered re-announces.
+pub(crate) const RECONNECT_REANNOUNCE_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+impl ReconnectReannounceGate {
+    fn new() -> Self {
+        Self {
+            last_fire: None,
+            trailing_pending: false,
+        }
+    }
+
+    /// Leading edge: may we fire right now?
+    fn should_fire(&self, now: std::time::Instant) -> bool {
+        match self.last_fire {
+            None => true,
+            Some(last) => now.duration_since(last) >= RECONNECT_REANNOUNCE_WINDOW,
+        }
+    }
+
+    /// A reconnect arrived. Fire immediately when allowed; otherwise mark a
+    /// trailing fire so the burst still produces exactly one more announce
+    /// at the window's end.
+    fn on_reconnect(&mut self, now: std::time::Instant) -> bool {
+        if self.should_fire(now) {
+            self.last_fire = Some(now);
+            self.trailing_pending = false;
+            true
+        } else {
+            self.trailing_pending = true;
+            false
+        }
+    }
+
+    /// The trailing coalesced fire, consumed by the re-announcer task when
+    /// the window closes.
+    fn take_trailing(&mut self, now: std::time::Instant) -> bool {
+        if self.trailing_pending && self.should_fire(now) {
+            self.last_fire = Some(now);
+            self.trailing_pending = false;
+            return true;
+        }
+        false
+    }
+
+    /// When the next trailing fire may land (None when nothing is pending).
+    fn next_due(&self) -> Option<std::time::Instant> {
+        if !self.trailing_pending {
+            return None;
+        }
+        self.last_fire
+            .map(|last| last + RECONNECT_REANNOUNCE_WINDOW)
+    }
+}
+
+impl Default for ReconnectReannounceGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 struct HeartbeatContext {
     /// ADR-0043: this machine's enrolled ML-KEM public bytes (publishes
     /// on the V3 machine announce); `None` disables V3 publication.
@@ -3952,15 +4090,36 @@ struct RawDirectDelivery {
     digest: String,
 }
 
-/// The post-validation raw-QUIC delivery path. The listener calls this only
-/// after the revocation, pairing, and expiry gates have passed.
-/// #1088: the DELIVERY `verified` decision for a raw 0x10 frame. The
-/// discovery-cache match alone, OR the AuthenticatedMachineBindings
-/// registry naming THIS transport-authentic machine — guarded so a KNOWN
-/// expired certificate cannot be resurrected by the registry arm (the
-/// is_expired drop gate downstream then refuses the frame). An absent
-/// cache entry (`None`) keeps the pre-#130 fail-open: no expiry is known,
-/// so none is enforced, exactly as the cache-only behaviour did.
+/// Resolve raw-frame evidence by signed announcement time (#1098).
+/// Discovery wins timestamp ties, so a conflicting cached move cannot be
+/// undone by an equally old registry record. A strictly newer authenticated
+/// registry binding still wins over stale discovery (#898 C1 / #927).
+fn raw_delivery_binding(
+    cache: Option<&DiscoveredAgent>,
+    registry: Option<dm_inbox::AuthenticatedMachineBinding>,
+    machine_id: identity::MachineId,
+) -> (bool, bool, Option<u64>) {
+    if let Some(binding) = registry {
+        if cache.is_none_or(|entry| binding.announced_at > entry.announced_at) {
+            return (
+                false,
+                binding.machine_id == machine_id,
+                // A cert-less attestation cannot erase expiry already known
+                // from discovery (#1088), even if its machine binding is newer.
+                binding
+                    .cert_not_after
+                    .or_else(|| cache.and_then(|entry| entry.cert_not_after)),
+            );
+        }
+    }
+    cache
+        .map(|entry| (entry.machine_id == machine_id, false, entry.cert_not_after))
+        .unwrap_or((false, false, None))
+}
+
+/// #1088: registry evidence verifies raw delivery only while its certificate
+/// is current. Both arms use the selected binding's expiry at the downstream
+/// drop gate; None retains compatibility with peers without certificates.
 fn raw_delivery_verified(
     cache_verified: bool,
     registry_names_this_machine: bool,
@@ -3969,6 +4128,29 @@ fn raw_delivery_verified(
 ) -> bool {
     cache_verified
         || (registry_names_this_machine && !identity::is_expired(cert_not_after, now_unix_secs))
+}
+
+/// Select live authority first; stored authority never overrides a known
+/// binding, even if the known binding names another transport machine.
+fn raw_delivery_with_evidence(
+    cache: Option<&DiscoveredAgent>,
+    registry: Option<dm_inbox::AuthenticatedMachineBinding>,
+    evidence: Option<&peer_evidence::EvidenceRuntime>,
+    agent: identity::AgentId,
+    machine: identity::MachineId,
+    now: u64,
+) -> (bool, bool, Option<u64>) {
+    let (cached, registered, expiry) = raw_delivery_binding(cache, registry, machine);
+    let live = raw_delivery_verified(cached, registered, expiry, now / 1000);
+    if cache.is_some() || registry.is_some() {
+        return (live, live, expiry);
+    }
+    let view = evidence.and_then(|e| e.usable(agent, machine, now));
+    let expiry = view
+        .as_ref()
+        .and_then(|v| v.certificate.as_ref())
+        .and_then(identity::AgentCertificate::not_after);
+    (view.is_some(), false, expiry)
 }
 
 async fn dispatch_raw_direct_after_gates(
@@ -5074,6 +5256,50 @@ impl Agent {
         Ok(outcome)
     }
 
+    /// Dial from a freshly checked evidence view, without creating any agent
+    /// binding or discovery entry. ant-quic authenticates the expected machine.
+    async fn connect_from_evidence(
+        &self,
+        agent: identity::AgentId,
+    ) -> Option<connectivity::ConnectOutcome> {
+        if !self.peer_evidence().wait(0).await {
+            return None;
+        }
+        let view = self
+            .peer_evidence()
+            .usable_agent(agent, dm_capability::now_unix_ms())?;
+        let machine = view.announcement.machine_id;
+        if self
+            .recipient_pairing_denied(&agent, &machine)
+            .await
+            .is_some()
+        {
+            return None;
+        }
+        let network = self.network.as_ref()?;
+        let peer = ant_quic::PeerId(machine.0);
+        if network.is_connected(&peer).await {
+            return Some(connectivity::ConnectOutcome::AlreadyConnected);
+        }
+        let addrs = filter_discovery_announcement_addrs(
+            view.announcement.addresses.clone(),
+            allow_local_discovery_addresses(network.config()),
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            network.connect_peer_with_addrs(peer, addrs),
+        )
+        .await;
+        self.peer_evidence()
+            .usable(agent, machine, dm_capability::now_unix_ms())?;
+        Some(match result {
+            Ok(Ok((addr, connected))) if connected == peer => {
+                connectivity::ConnectOutcome::Direct(addr)
+            }
+            _ => connectivity::ConnectOutcome::Unreachable,
+        })
+    }
+
     async fn connect_to_agent_inner(
         &self,
         agent_id: &identity::AgentId,
@@ -5092,9 +5318,39 @@ impl Agent {
             cache.get(agent_id).cloned()
         };
 
+        // A live identity can legitimately carry no dial hints. Borrow the
+        // stored addresses only for that exact live machine, never rebind it.
+        let mut discovered = discovered;
+        if discovered
+            .as_ref()
+            .is_some_and(|entry| entry.addresses.is_empty())
+            && self.peer_evidence().wait(0).await
+        {
+            if let Some(entry) = discovered.as_mut() {
+                if let Some(view) = self.peer_evidence().usable(
+                    *agent_id,
+                    entry.machine_id,
+                    dm_capability::now_unix_ms(),
+                ) {
+                    let local_scope = self
+                        .network
+                        .as_ref()
+                        .is_some_and(|n| allow_local_discovery_addresses(n.config()));
+                    entry.addresses = filter_discovery_announcement_addrs(
+                        view.announcement.addresses.clone(),
+                        local_scope,
+                    );
+                }
+            }
+        }
+
         let agent = match discovered {
             Some(a) => a,
             None => {
+                if let Some(outcome) = self.connect_from_evidence(*agent_id).await {
+                    return Ok(outcome);
+                }
+
                 tracing::info!(
                     target: "x0x::connect",
                     stage = "connect_to_agent",
@@ -6779,11 +7035,29 @@ impl Agent {
         let send_started = std::time::Instant::now();
         let mut stages = dm::DurableSendStages::default();
         let mut advert_binding = self.capability_store.lookup_binding(to);
+        let evidence_ready = if advert_binding.is_none() {
+            self.peer_evidence().wait(payload.len()).await
+        } else {
+            true
+        };
+        if advert_binding.is_none() && !evidence_ready {
+            return Err(dm::DmError::RecipientUndiscovered(
+                "peer evidence startup barrier unavailable".into(),
+            ));
+        }
+        let stored_cap = if advert_binding.is_none() {
+            self.peer_evidence()
+                .usable_agent(*to, dm_capability::now_unix_ms())
+        } else {
+            None
+        };
+
         // ADR 0030 §2: one forced targeted refresh before refusing. A daemon
         // whose advert we simply have not heard yet must not be reported as
         // incapable, but the refusal must still be bounded — the whole point
         // of the 409 is that it is fast and deterministic, never a hang.
         if (config.require_durable_app_ack
+            && stored_cap.is_none()
             && !capability_binding_supports_durable_ack(advert_binding.as_ref()))
             || self
                 .capability_store
@@ -6810,6 +7084,23 @@ impl Agent {
             .is_some_and(|caps| caps.gossip_inbox && !caps.kem_public_key.is_empty());
         let (cap, cap_machine, cap_source) = if advert_gossip_ready {
             (advert_cap, advert_machine, "advert_cache")
+        } else if advert_cap.is_none() && stored_cap.is_some() {
+            // Re-check after the refresh await; never retain authority across it.
+            match self
+                .peer_evidence()
+                .usable_agent(*to, dm_capability::now_unix_ms())
+            {
+                Some(view) => (
+                    Some(view.advert.capabilities.clone()),
+                    Some(view.announcement.machine_id),
+                    "peer_evidence",
+                ),
+                None => {
+                    return Err(dm::DmError::RecipientUndiscovered(
+                        "peer evidence no longer usable".into(),
+                    ))
+                }
+            }
         } else if config.require_durable_app_ack {
             // Strict semantics need a signed, machine-bound capability from
             // the TTL-bounded runtime cache. The unbound contact-card fallback
@@ -6983,6 +7274,19 @@ impl Agent {
                     self.direct_messaging.record_outgoing_failed(*to);
                     return Err(dm::DmError::RecipientKeyInvalid(reason));
                 }
+            }
+        }
+
+        if cap_source == "peer_evidence" {
+            let _ = self.connect_from_evidence(*to).await;
+            let still_usable = cap_machine.and_then(|m| {
+                self.peer_evidence()
+                    .usable(*to, m, dm_capability::now_unix_ms())
+            });
+            if still_usable.is_none() {
+                return Err(dm::DmError::RecipientUndiscovered(
+                    "peer evidence no longer usable".into(),
+                ));
             }
         }
 
@@ -7333,6 +7637,19 @@ impl Agent {
             }
         }
 
+        if cached_machine_id.is_none() && registry_machine_id.is_none() {
+            if let Some(view) = self
+                .peer_evidence()
+                .usable_agent(*agent_id, dm_capability::now_unix_ms())
+            {
+                if network
+                    .is_connected(&ant_quic::PeerId(view.announcement.machine_id.0))
+                    .await
+                {
+                    return Some(view.announcement.machine_id);
+                }
+            }
+        }
         None
     }
 
@@ -7466,6 +7783,16 @@ impl Agent {
         };
         let registry_machine_id = self.direct_messaging.get_machine_id(agent_id).await;
 
+        let evidence_machine = if cached_machine_id.is_none()
+            && registry_machine_id.is_none()
+            && self.peer_evidence().wait(0).await
+        {
+            self.peer_evidence()
+                .usable_agent(*agent_id, dm_capability::now_unix_ms())
+                .map(|v| v.announcement.machine_id)
+        } else {
+            None
+        };
         let (mut machine_id, mut resolution) = match (cached_machine_id, registry_machine_id) {
             (Some(id), _) if network.is_connected(&ant_quic::PeerId(id.0)).await => {
                 (id, "cached_connected")
@@ -7482,6 +7809,11 @@ impl Agent {
             (Some(id), None) => (id, "cached_not_connected"),
             (Some(id), Some(_)) => (id, "cached_both_disconnected"),
             (None, Some(id)) => (id, "registry_not_connected"),
+            (None, None) if evidence_machine.is_some() => {
+                let id = evidence_machine.ok_or(error::NetworkError::AgentNotFound(agent_id.0))?;
+                let _ = self.connect_from_evidence(*agent_id).await;
+                (id, "peer_evidence")
+            }
             (None, None) => {
                 tracing::debug!(
                     target: "x0x::direct",
@@ -7587,6 +7919,15 @@ impl Agent {
                     resolution = "discovery_redial";
                 }
             }
+        }
+
+        if resolution == "peer_evidence"
+            && self
+                .peer_evidence()
+                .usable(*agent_id, machine_id, dm_capability::now_unix_ms())
+                .is_none()
+        {
+            return Err(error::NetworkError::AgentNotFound(agent_id.0));
         }
 
         // ADR-0043 §9 (review r5 H5): ANY machine reassignment above
@@ -8052,7 +8393,9 @@ impl Agent {
     fn map_raw_quic_dm_error(err: error::NetworkError) -> dm::DmError {
         match err {
             error::NetworkError::AgentNotFound(_) => {
-                dm::DmError::RecipientKeyUnavailable(err.to_string())
+                // #1091: an unresolved agent is a DISCOVERY gap (retry when
+                // the peer re-announces), not missing key material.
+                dm::DmError::RecipientUndiscovered(err.to_string())
             }
             error::NetworkError::AgentNotConnected(_)
             | error::NetworkError::NotConnected(_)
@@ -8155,6 +8498,66 @@ impl Agent {
             announced_at,
         )
         .await;
+    }
+
+    /// Test seam for a retained binding whose certificate has since expired.
+    #[doc(hidden)]
+    pub async fn record_authenticated_binding_with_expiry_for_testing(
+        &self,
+        agent: identity::AgentId,
+        machine: identity::MachineId,
+        announced_at: u64,
+        cert_not_after: Option<u64>,
+    ) {
+        dm_inbox::record_authenticated_machine_binding_with_expiry(
+            &self.authenticated_machine_bindings,
+            agent,
+            machine,
+            announced_at,
+            cert_not_after,
+        )
+        .await;
+    }
+
+    /// Test seam (#1091): read one discovery-cache entry.
+    /// #1091 test seam: suppress reconnect-triggered re-announces (see
+    /// the field docs). Production default is enabled.
+    /// #1091 test seam: note that `peer` was last seen disconnecting at
+    /// `absent_since` — the observation the accept-side transport gap can
+    /// hide from fixtures (production loss detection records it for real).
+    pub fn note_peer_absent_for_testing(&self, peer: [u8; 32], absent_since: std::time::Instant) {
+        self.reconnect_absence_tracker
+            .lock()
+            .expect("absence tracker lock")
+            .record_disconnected(peer, absent_since);
+    }
+
+    pub fn disable_reconnect_reannounce_for_testing(&self) {
+        self.reconnect_reannounce_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub async fn discovered_agent_for_testing(
+        &self,
+        agent: &identity::AgentId,
+    ) -> Option<crate::DiscoveredAgent> {
+        self.identity_discovery_cache
+            .read()
+            .await
+            .get(agent)
+            .cloned()
+    }
+
+    /// Test seam (#1091): empty the identity discovery cache AND the
+    /// authenticated machine-binding registry — the post-restart cold
+    /// state for send-first resolution.
+    pub async fn clear_identity_resolution_for_testing(&self) {
+        self.identity_discovery_cache.write().await.clear();
+        // The binding cache exposes no bulk clear by design; a fresh
+        // empty cache is the same cold state a restart starts from.
+        *self.authenticated_machine_bindings.write().await =
+            dm_inbox::AuthenticatedMachineBindingCache::default();
+        self.direct_messaging.clear_resolution_for_testing().await;
     }
 
     pub async fn recv_direct_annotated(&self) -> Option<direct::DirectMessage> {
@@ -9995,7 +10398,7 @@ impl Agent {
                     cert_digest,
                 };
                 // Keep the verified X0A3/X0A4 body verbatim, after the existing
-                // signature, timestamp, trust and revocation gates. S1 has no reader.
+                // signature, timestamp, trust and revocation gates. The S2 worker pairs it.
                 if announce_v3::is_v3_payload(&raw_payload) {
                     evidence_capture_store.evidence_wire.capture(
                         announcement.agent_id, true, &raw_payload,
@@ -13270,6 +13673,16 @@ impl Agent {
     /// agent-level direct messaging registry so inbound accepted connections are
     /// usable for reverse direct sends before the first inbound direct payload.
     fn start_network_event_listener(&self) {
+        // #1091: reconnect-triggered self re-announce. The listener signals
+        // the re-announcer task (which owns the announcement machinery);
+        // the global gate lives there.
+        let (reconnect_tx, reconnect_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        self.spawn_reconnect_reannouncer(reconnect_rx);
+        // #1091 STOPGAP (D31): the re-announce signal keys on per-machine
+        // ABSENCE — a PeerConnected triggers only when that machine's last
+        // observed PeerDisconnected is ≥ RECONNECT_REANNOUNCE_ABSENCE old.
+        // The global 30 s gate in the re-announcer bounds the rate.
+        let absence_tracker = std::sync::Arc::clone(&self.reconnect_absence_tracker);
         if self
             .network_event_listener_started
             .swap(true, std::sync::atomic::Ordering::AcqRel)
@@ -13296,6 +13709,8 @@ impl Agent {
         // Clones for the lifecycle watcher task (Task 1 moves the originals).
         let lifecycle_machine_cache = std::sync::Arc::clone(&machine_cache);
         let lifecycle_reconnects = std::sync::Arc::clone(&active_reconnects);
+        let reconnect_reannounce_enabled =
+            std::sync::Arc::clone(&self.reconnect_reannounce_enabled);
         self.spawn_tracked(async move {
             let mut rx = network.subscribe();
             tracing::info!("Network event reconciliation listener started");
@@ -13318,6 +13733,27 @@ impl Agent {
 
                 match event {
                     network::NetworkEvent::PeerConnected { peer_id, address } => {
+                        // #1091 STOPGAP (D31, superseded by the D29
+                        // ADR-0089 slice): a transport reconnect
+                        // after a ≥20 s observed absence re-triggers our own
+                        // identity re-announce (globally rate-limited in
+                        // the re-announcer task). Fired REGARDLESS of
+                        // whether we can resolve this machine — the
+                        // restarted PEER is the one that cannot resolve us.
+                        // A flapping peer (absent < 20 s) never triggers.
+                        let signal_reconnect = absence_tracker
+                            .lock()
+                            .expect("absence tracker lock")
+                            .take_signal_if_absent(
+                                &peer_id,
+                                std::time::Instant::now(),
+                                RECONNECT_REANNOUNCE_ABSENCE,
+                            )
+                            && reconnect_reannounce_enabled
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                        if signal_reconnect {
+                            let _ = reconnect_tx.send(());
+                        }
                         let machine_id = identity::MachineId(peer_id);
                         let cached_agent_id = {
                             let cache = cache.read().await;
@@ -13404,6 +13840,10 @@ impl Agent {
                         }
                     }
                     network::NetworkEvent::PeerDisconnected { peer_id, reason } => {
+                        absence_tracker
+                            .lock()
+                            .expect("absence tracker lock")
+                            .record_disconnected(peer_id, std::time::Instant::now());
                         let machine_id = identity::MachineId(peer_id);
                         let cached_agent_id = {
                             let cache = cache.read().await;
@@ -13517,6 +13957,91 @@ impl Agent {
         });
     }
 
+    /// Start ADR 0089 after installing the live relationship stores. Loading
+    /// runs off the async executor; consumers wait at most five seconds.
+    /// The group predicate returns `None` while its live roster is locked.
+    /// Such a read fails closed without making a durable removal.
+    pub fn start_peer_evidence(
+        &self,
+        data_dir: std::path::PathBuf,
+        config: peer_evidence::EvidenceConfig,
+        groups: std::sync::Arc<dyn Fn(identity::AgentId) -> Option<bool> + Send + Sync>,
+    ) -> Result<(), peer_evidence::EvidenceError> {
+        config.validate()?;
+        let policy = std::sync::Arc::new(peer_evidence::RuntimePolicy::new(
+            self.agent_id(),
+            self.owner_trust.clone(),
+            std::sync::Arc::clone(&self.revocation_set),
+        ));
+        policy.set_groups(groups);
+        let evidence = std::sync::Arc::clone(&self.capability_store.evidence);
+        self.owner_trust.install_evidence(&evidence);
+        if !evidence.start(
+            data_dir,
+            config,
+            policy,
+            std::sync::Arc::clone(&self.capability_store.evidence_wire),
+        ) {
+            return Ok(());
+        }
+        let capture = std::sync::Arc::clone(&self.capability_store.evidence_wire);
+        let discovery = std::sync::Arc::clone(&self.identity_discovery_cache);
+        let token = self.shutdown_token.clone();
+        self.spawn_tracked(async move {
+            let mut last_maintenance = 0;
+            let mut processed = std::collections::HashMap::new();
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        if let Some(store) = evidence.store() {
+                            let _ = tokio::task::spawn_blocking(move || store.flush(dm_capability::now_unix_ms(), true)).await;
+                        }
+                        break;
+                    }
+                    _ = tick.tick() => {}
+                    _ = capture.changed.notified() => {}
+                }
+                let Some(store) = evidence.store() else { continue; };
+                let now = dm_capability::now_unix_ms();
+                let mut records = Vec::new();
+                for agent in capture.agents(now) {
+                    let (Some(announcement), Some(advert)) = (capture.get(agent, true, now), capture.get(agent, false, now)) else { continue; };
+                    let certificate = discovery.read().await.get(&agent).and_then(|d| d.agent_certificate.as_ref()).and_then(|c| c.to_storage_bytes().ok());
+                    let Ok(ann) = announce_v3::deserialize_v3(&announcement) else { continue; };
+                    let cert = certificate.as_deref().and_then(|c| identity::AgentCertificate::from_storage_bytes(c).ok());
+                    if !store.related(agent, ann.machine_id, cert.as_ref(), now) { continue; }
+                    let mut hash = blake3::Hasher::new();
+                    hash.update(&announcement); hash.update(&advert);
+                    if let Some(cert) = &certificate { hash.update(cert); }
+                    let fingerprint = *hash.finalize().as_bytes();
+                    if processed.get(&agent) == Some(&fingerprint) && store.usable_agent(agent, now).is_some() { continue; }
+                    records.push((agent, fingerprint, peer_evidence::EvidenceRecordV1 { announcement, advert, certificate, relation: 0, stored_at_ms: now }));
+                }
+                let maintain = now.saturating_sub(last_maintenance) >= 60_000;
+                if maintain { last_maintenance = now; }
+                if let Ok(accepted) = tokio::task::spawn_blocking(move || {
+                    let mut accepted = Vec::new();
+                    for (agent, fingerprint, record) in records {
+                        if store.ingest(record, peer_evidence::IngestSource::Gossip, now).is_ok() { accepted.push((agent, fingerprint)); }
+                    }
+                    if maintain { let _ = store.maintain(now); }
+                    let _ = store.flush(now, false);
+                    accepted
+                }).await {
+                    processed.extend(accepted);
+                    processed.retain(|agent, _| capture.get(*agent, true, now).is_some());
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// ADR 0089 counters and point-of-use handle. No authority cache is seeded.
+    pub fn peer_evidence(&self) -> &std::sync::Arc<peer_evidence::EvidenceRuntime> {
+        &self.capability_store.evidence
+    }
+
     /// Start the direct message listener background task.
     ///
     /// This task reads raw direct messages from the network layer and
@@ -13535,6 +14060,7 @@ impl Agent {
         let Some(network) = self.network.as_ref().map(std::sync::Arc::clone) else {
             return;
         };
+        let evidence = std::sync::Arc::clone(&self.capability_store.evidence);
         let dm = std::sync::Arc::clone(&self.direct_messaging);
         let discovery_cache = std::sync::Arc::clone(&self.identity_discovery_cache);
         let contact_store = std::sync::Arc::clone(&self.contact_store);
@@ -13549,15 +14075,27 @@ impl Agent {
 
         self.spawn_tracked(async move {
             tracing::info!(target: "x0x::direct", stage = "listener", "direct message listener started");
+            use futures::StreamExt;
+            let mut pending = futures::stream::FuturesUnordered::new();
             loop {
                 // direct_tx is a NetworkNode struct field that outlives
                 // network.shutdown(), so recv_direct() does not return None on
                 // shutdown; the token is what stops this loop now.
                 let recv = tokio::select! {
+                    biased;
                     _ = token.cancelled() => break,
-                    r = network.recv_direct() => r,
+                    ready = pending.next(), if !pending.is_empty() => ready,
+                    r = network.recv_direct() => {
+                        let Some((peer, payload)) = r else { break; };
+                        let barrier = std::sync::Arc::clone(&evidence);
+                        pending.push(async move {
+                            let usable = barrier.wait(payload.len()).await;
+                            (peer, payload, usable)
+                        });
+                        continue;
+                    }
                 };
-                let Some((ant_peer_id, payload)) = recv else {
+                let Some((ant_peer_id, payload, evidence_ready)) = recv else {
                     tracing::warn!(
                         target: "x0x::direct",
                         stage = "listener",
@@ -13600,44 +14138,17 @@ impl Agent {
                     digest = %digest,
                 );
 
-                // Verify AgentId→MachineId binding for DELIVERY (#1088):
-                // the identity discovery cache, OR the
-                // AuthenticatedMachineBindings registry — the registry entry
-                // is authenticated evidence of the same quality (a verified
-                // identity announcement or a fresh machine-key attestation
-                // over an agent-signed envelope; recorded on the inbox path
-                // at inbound_origin_attested). Post-restart the discovery
-                // cache is empty until the peer's next announcement (~600 s
-                // cadence), which left every raw frame delivered
-                // `verified=false` and dropped by the #1070 gates (Welcome,
-                // files, join-result, control-blob) for that whole window —
-                // the g46r2 finding-3 stalls.
-                //
-                // Expiry guard: when the cache DOES know the peer's
-                // `cert_not_after` and it is expired, the registry arm must
-                // not resurrect verification — the frame stays unverified and
-                // the is_expired drop gate below handles it. An absent cache
-                // entry keeps the pre-#130 fail-open (`None` = no expiry
-                // known), unchanged from the cache-only behaviour.
-                let (cache_verified, cert_not_after) = {
-                    let cache = discovery_cache.read().await;
-                    cache
-                        .get(&sender)
-                        .map(|entry| (entry.machine_id == machine_id, entry.cert_not_after))
-                        .unwrap_or((false, None))
-                };
-                let registry_names_this_machine = crate::dm_inbox::authenticated_machine_binding(
+                // Select one authoritative binding and its expiry for both
+                // delivery verification and the runtime expiry gate (#1098).
+                let registry = crate::dm_inbox::authenticated_machine_binding_evidence(
                     &authenticated_machine_bindings,
                     &sender,
                 )
-                .await
-                .is_some_and(|bound| bound == machine_id);
-                let verified = raw_delivery_verified(
-                    cache_verified,
-                    registry_names_this_machine,
-                    cert_not_after,
-                    Agent::unix_timestamp_secs(),
-                );
+                .await;
+                let (verified, live_verified, cert_not_after) = {
+                    let cache = discovery_cache.read().await;
+                    raw_delivery_with_evidence(cache.get(&sender), registry, evidence_ready.then_some(evidence.as_ref()), sender, machine_id, dm_capability::now_unix_ms())
+                };
 
                 // Evaluate trust for the (AgentId, MachineId) pair.
                 let trust_decision = {
@@ -13757,6 +14268,9 @@ impl Agent {
                                 .map(|entry| entry.agent_public_key.clone())
                                 .filter(|key| !key.is_empty())
                         };
+                        let sender_public_key = if sender_public_key.is_none() && evidence_ready && verified {
+                            evidence.usable(sender, machine_id, dm_capability::now_unix_ms()).map(|v| v.announcement.agent_public_key.clone())
+                        } else { sender_public_key };
                         if let Some(sender_public_key) = sender_public_key {
                             let inbox = dm_inbox_service.lock().await;
                             if let Some(service) = inbox.as_ref() {
@@ -13782,9 +14296,9 @@ impl Agent {
                 // authenticated binding lands, matching the #927 evidence
                 // rule. Since #1088 the registry arm is computed once, above,
                 // and is already part of the DELIVERY `verified` (with the
-                // expiry guard); an unverified claim — no cache match AND no
-                // registry binding naming THIS machine — still never rebinds.
-                dm.mark_raw_direct_sender_connected(sender, machine_id, verified)
+                // expiry guard and #1098 timestamp supersession); an
+                // unverified or superseded claim still never rebinds.
+                dm.mark_raw_direct_sender_connected(sender, machine_id, live_verified)
                     .await;
 
                 // Issue #120: opt-in coarsened origin token from the live
@@ -14814,6 +15328,111 @@ impl Agent {
     /// # Errors
     ///
     /// Returns an error if a required network or gossip component is missing.
+    /// #1091: the reconnect re-announcer. Owns the global
+    /// [`ReconnectReannounceGate`]; every signal from the network event
+    /// listener (a transport (re)connect to a previously-unconnected
+    /// machine) is rate-limited to one self re-announce per
+    /// [`RECONNECT_REANNOUNCE_WINDOW`], with one coalesced trailing fire
+    /// for bursts. The announcement is the ordinary signed identity
+    /// announcement (same builder as the heartbeat, same ingest
+    /// verification: signature, EP1 expiry, revocation), so a restarted
+    /// peer's discovery cache AND AuthenticatedMachineBindings refill
+    /// within one gossip hop of its reconnect — the #1091 send-side stall
+    /// and the #1088 receive-side window close together.
+    fn spawn_reconnect_reannouncer(&self, mut rx: tokio::sync::mpsc::UnboundedReceiver<()>) {
+        let runtime = match self.gossip_runtime.as_ref() {
+            Some(runtime) => std::sync::Arc::clone(runtime),
+            None => return,
+        };
+        let Some(network) = self.network.as_ref() else {
+            return;
+        };
+        let allow_local_discovery_addrs = allow_local_discovery_addresses(network.config());
+        let network = std::sync::Arc::clone(network);
+        let ctx = HeartbeatContext {
+            identity: std::sync::Arc::clone(&self.identity),
+            runtime,
+            network,
+            selection_skew: std::sync::Arc::clone(&self.selection_skew),
+            interval_secs: self.heartbeat_interval_secs,
+            cache: std::sync::Arc::clone(&self.identity_discovery_cache),
+            machine_cache: std::sync::Arc::clone(&self.machine_discovery_cache),
+            user_identity_consented: std::sync::Arc::clone(&self.user_identity_consented),
+            allow_local_discovery_addrs,
+            revocation_set: std::sync::Arc::clone(&self.revocation_set),
+            last_revocation_generation: std::sync::atomic::AtomicU64::new(0),
+            heartbeat_tick: std::sync::atomic::AtomicU64::new(0),
+            verified_cert_tx: std::sync::Arc::clone(&self.verified_cert_tx),
+            machine_kem_public: self.machine_kem_public_key(),
+            move_state: std::sync::Arc::clone(&self.move_state),
+            legacy_announce: self.legacy_announce,
+            self_name: std::sync::Arc::clone(&self.self_name),
+            self_name_ever_set: std::sync::Arc::clone(&self.self_name_ever_set),
+        };
+        let gate = std::sync::Arc::new(tokio::sync::Mutex::new(ReconnectReannounceGate::new()));
+        let announce_gate = std::sync::Arc::clone(&gate);
+        let token = self.shutdown_token.clone();
+        self.spawn_tracked(async move {
+            loop {
+                let fire = tokio::select! {
+                    _ = token.cancelled() => break,
+                    recv = rx.recv() => recv.is_some(),
+                };
+                if !fire {
+                    break;
+                }
+                let now = std::time::Instant::now();
+                let mut gate = announce_gate.lock().await;
+                if gate.on_reconnect(now) {
+                    drop(gate);
+                    // Settle delay: the signal arrives at transport-connect
+                    // time, but the gossip overlay needs a graft tick before
+                    // the re-established link carries a publish (the join
+                    // path's ~3 s delayed announce exists for the same
+                    // reason). Publishing immediately would reach nobody and
+                    // the announcement is not retried.
+                    let settle = tokio::time::sleep(std::time::Duration::from_secs(2));
+                    tokio::select! {
+                        _ = token.cancelled() => break,
+                        _ = settle => {},
+                    }
+                    if let Err(e) = ctx.announce().await {
+                        tracing::warn!("reconnect-triggered identity re-announcement failed: {e}");
+                    } else {
+                        tracing::debug!(
+                            "reconnect-triggered identity re-announcement sent (#1091)"
+                        );
+                    }
+                    continue;
+                }
+                // Coalesced trailing fire: wait for the window to close.
+                while let Some(due) = gate.next_due() {
+                    let wait = tokio::time::sleep_until(tokio::time::Instant::from_std(due));
+                    tokio::select! {
+                        _ = token.cancelled() => break,
+                        _ = wait => {},
+                        recv = rx.recv() => {
+                            if recv.is_none() {
+                                break;
+                            }
+                            // More reconnects inside the window stay coalesced.
+                        }
+                    }
+                    let now = std::time::Instant::now();
+                    if gate.take_trailing(now) {
+                        drop(gate);
+                        if let Err(e) = ctx.announce().await {
+                            tracing::warn!(
+                                "reconnect-triggered identity re-announcement failed: {e}"
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
     pub async fn start_identity_heartbeat(&self) -> error::Result<()> {
         let mut handle_guard = self.heartbeat_handle.lock().await;
         // Shutdown race (issue #116): a still-bootstrapping join_network can call
@@ -16804,6 +17423,12 @@ impl AgentBuilder {
             network,
             gossip_runtime,
             skip_legacy_dm_bus: self.skip_legacy_dm_bus,
+            reconnect_reannounce_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                true,
+            )),
+            reconnect_absence_tracker: std::sync::Arc::new(std::sync::Mutex::new(
+                ReconnectAbsenceTracker::default(),
+            )),
             bootstrap_cache,
             gossip_cache_adapter,
             machine_kem,
@@ -20633,6 +21258,201 @@ mod tests {
         // matches the machine but the downstream is_expired gate drops it;
         // this helper reports the BINDING only, as before).
         assert!(raw_delivery_verified(true, false, Some(now - 1), now));
+    }
+
+    /// #1098 acceptance: a newer cached move supersedes the old registry.
+    #[tokio::test]
+    async fn raw_delivery_newer_cache_supersedes_registry_1098() {
+        let agent = identity::AgentId([0x98; 32]);
+        let old_machine = identity::MachineId([1; 32]);
+        let new_machine = identity::MachineId([2; 32]);
+        let now = 1_800_000_000;
+        let bindings = dm_inbox::AuthenticatedMachineBindings::default();
+        dm_inbox::record_authenticated_machine_binding(&bindings, agent, old_machine, now - 10)
+            .await;
+        let registry = dm_inbox::authenticated_machine_binding_evidence(&bindings, &agent).await;
+        let mut cache = DiscoveredAgent {
+            agent_id: agent,
+            machine_id: new_machine,
+            announced_at: now,
+            ..test_discovered_agent_for_1098()
+        };
+        let (cached, retained, expiry) = raw_delivery_binding(Some(&cache), registry, old_machine);
+        assert!(
+            !raw_delivery_verified(cached, retained, expiry, now),
+            "#1098: old registry machine must not verify after a cached move"
+        );
+
+        // Equal timestamps fail closed to the cached move.
+        cache.announced_at = now - 10;
+        let (cached, retained, expiry) = raw_delivery_binding(Some(&cache), registry, old_machine);
+        assert!(!raw_delivery_verified(cached, retained, expiry, now));
+        // A newer registry supersedes an older cache in BOTH directions.
+        cache.announced_at = now - 20;
+        for (machine, expected) in [(old_machine, true), (new_machine, false)] {
+            let (cached, retained, expiry) = raw_delivery_binding(Some(&cache), registry, machine);
+            assert_eq!(
+                raw_delivery_verified(cached, retained, expiry, now),
+                expected
+            );
+        }
+        // A newer cert-less attestation must not bypass known cache expiry.
+        cache.cert_not_after = Some(now - 1000);
+        let (cached, retained, expiry) = raw_delivery_binding(Some(&cache), registry, old_machine);
+        assert!(!raw_delivery_verified(cached, retained, expiry, now));
+        assert!(identity::is_expired(expiry, now));
+        cache.cert_not_after = None;
+        // Expiry belongs to the selected binding, including after eviction.
+        dm_inbox::record_authenticated_machine_binding_with_expiry(
+            &bindings,
+            agent,
+            old_machine,
+            now,
+            Some(now - 1000),
+        )
+        .await;
+        // Attestations contain no cert: refreshing one cannot erase expiry.
+        dm_inbox::record_authenticated_machine_binding(&bindings, agent, old_machine, now + 1)
+            .await;
+        // Nor may replay of an older cert-less announcement clear it.
+        dm_inbox::record_authenticated_machine_binding_with_expiry(
+            &bindings,
+            agent,
+            new_machine,
+            now - 1,
+            None,
+        )
+        .await;
+        let registry = dm_inbox::authenticated_machine_binding_evidence(&bindings, &agent).await;
+        for discovery in [None, Some(&cache)] {
+            let (cached, retained, expiry) = raw_delivery_binding(discovery, registry, old_machine);
+            assert_eq!(expiry, Some(now - 1000));
+            assert!(identity::is_expired(expiry, now));
+            assert!(!raw_delivery_verified(cached, retained, expiry, now));
+        }
+    }
+
+    fn test_discovered_agent_for_1098() -> DiscoveredAgent {
+        DiscoveredAgent {
+            self_name: None,
+            cert_digest: None,
+            agent_id: identity::AgentId([0; 32]),
+            machine_id: identity::MachineId([0; 32]),
+            user_id: None,
+            addresses: Vec::new(),
+            announced_at: 0,
+            last_seen: 0,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: None,
+            agent_certificate: None,
+            agent_public_key: Vec::new(),
+        }
+    }
+
+    /// #1091: the reconnect re-announce gate — global per-node rate limit
+    /// with leading-edge fire and one coalesced trailing fire per window.
+    /// A burst of reconnects inside the window produces exactly one
+    /// immediate announce plus one at the window's end; a fleet-wide
+    /// rolling restart of N nodes inside ~15 s is bounded by
+    /// N × ceil(window / 30 s) re-announces, never a per-peer fan-out.
+    #[test]
+    fn reconnect_reannounce_gate_leading_edge_and_coalescing() {
+        let t0 = std::time::Instant::now();
+        let mut gate = ReconnectReannounceGate::new();
+
+        // First reconnect ever: fires immediately (leading edge).
+        assert!(gate.on_reconnect(t0));
+        // A burst of 5 more reconnects inside the window: none fire; all
+        // coalesce into one trailing fire.
+        for _ in 0..5 {
+            assert!(!gate.on_reconnect(t0 + std::time::Duration::from_secs(2)));
+        }
+        assert_eq!(
+            gate.next_due(),
+            Some(t0 + RECONNECT_REANNOUNCE_WINDOW),
+            "the trailing fire is due exactly one window after the leading edge"
+        );
+        // Inside the window the trailing fire is not yet allowed...
+        assert!(!gate.take_trailing(t0 + std::time::Duration::from_secs(29)));
+        // ...at the window's end it fires exactly once.
+        assert!(gate.take_trailing(t0 + RECONNECT_REANNOUNCE_WINDOW));
+        assert!(!gate.take_trailing(t0 + RECONNECT_REANNOUNCE_WINDOW));
+        // The NEXT reconnect (past the window) fires on the leading edge
+        // again, and a quiet period after it leaves nothing pending.
+        assert!(gate.on_reconnect(t0 + std::time::Duration::from_secs(120)));
+        assert_eq!(gate.next_due(), None);
+    }
+
+    /// #1091 STOPGAP (D31): the re-announce signal fires only for a peer
+    /// whose last observed disconnect is at least the 20 s absence
+    /// threshold old — a flapping peer never triggers, a fresh machine
+    /// (never disconnected) never triggers, and the record is consumed
+    /// only when the signal fires.
+    #[test]
+    fn reconnect_absence_tracker_requires_twenty_second_absence() {
+        let t0 = std::time::Instant::now();
+        let mut tracker = ReconnectAbsenceTracker::default();
+        let peer = [7u8; 32];
+
+        // Never disconnected: join-time announcements cover fresh machines.
+        assert!(!tracker.take_signal_if_absent(&peer, t0, RECONNECT_REANNOUNCE_ABSENCE));
+
+        // Transient flap: absent 10 s (or 19 s) does NOT trigger, and
+        // the record survives so a later >=20 s absence still can.
+        tracker.record_disconnected(peer, t0);
+        assert!(!tracker.take_signal_if_absent(
+            &peer,
+            t0 + std::time::Duration::from_secs(10),
+            RECONNECT_REANNOUNCE_ABSENCE
+        ));
+        assert!(!tracker.take_signal_if_absent(
+            &peer,
+            t0 + RECONNECT_REANNOUNCE_ABSENCE - std::time::Duration::from_secs(1),
+            RECONNECT_REANNOUNCE_ABSENCE
+        ));
+        // At the threshold it fires exactly once, consuming the record.
+        assert!(tracker.take_signal_if_absent(
+            &peer,
+            t0 + RECONNECT_REANNOUNCE_ABSENCE,
+            RECONNECT_REANNOUNCE_ABSENCE
+        ));
+        assert!(!tracker.take_signal_if_absent(
+            &peer,
+            t0 + std::time::Duration::from_secs(600),
+            RECONNECT_REANNOUNCE_ABSENCE
+        ));
+
+        // A NEW outage re-arms it: the latest disconnect wins.
+        tracker.record_disconnected(peer, t0 + std::time::Duration::from_secs(600));
+        assert!(tracker.take_signal_if_absent(
+            &peer,
+            t0 + std::time::Duration::from_secs(600) + RECONNECT_REANNOUNCE_ABSENCE,
+            RECONNECT_REANNOUNCE_ABSENCE
+        ));
+    }
+
+    /// #1091: a reconnect that arrives exactly at the window boundary
+    /// fires on the leading edge (no extra trailing fire scheduled).
+    #[test]
+    fn reconnect_reannounce_gate_boundary_and_churn() {
+        let t0 = std::time::Instant::now();
+        let mut gate = ReconnectReannounceGate::new();
+        assert!(gate.on_reconnect(t0));
+        // Churn: connect/disconnect cycles of the SAME machine inside the
+        // window — the LISTENER suppresses duplicates via its connected
+        // set; the gate sees at most one signal per machine per cycle and
+        // still only ever emits one trailing fire.
+        assert!(!gate.on_reconnect(t0 + std::time::Duration::from_secs(10)));
+        assert!(!gate.on_reconnect(t0 + std::time::Duration::from_secs(20)));
+        // Exactly at the boundary the leading edge re-arms.
+        assert!(gate.on_reconnect(t0 + RECONNECT_REANNOUNCE_WINDOW));
+        assert_eq!(gate.next_due(), None);
     }
 
     /// N12 (raw-path Blocked delivery): the raw 0x10 path must NOT deliver
@@ -29159,8 +29979,21 @@ fn verified_identity_origin_message(sender: &identity::AgentKeypair) -> gossip::
 async fn direct_origin_identity_ingest_populates_authenticated_binding() {
     let sender = identity::AgentKeypair::generate().expect("sender keygen");
     let machine = identity::MachineKeypair::generate().expect("machine keygen");
-    let now = 1_000;
-    let announcement = signed_identity_announcement_fixture(sender.agent_id(), &machine, now);
+    let now = Agent::unix_timestamp_secs();
+    let expiry = now + 3600;
+    let owner = identity::UserKeypair::generate().expect("owner keygen");
+    let cert = identity::AgentCertificate::issue_with_expiry(&owner, &sender, Some(expiry))
+        .expect("issue certificate");
+    let mut announcement = signed_identity_announcement_fixture(sender.agent_id(), &machine, now);
+    announcement.user_id = Some(cert.user_id().expect("certificate user"));
+    announcement.agent_certificate = Some(cert);
+    announcement.machine_signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        machine.secret_key(),
+        &bincode::serialize(&announcement.to_unsigned()).expect("serialize announcement"),
+    )
+    .expect("sign announcement")
+    .as_bytes()
+    .to_vec();
     announcement.verify().expect("valid machine announcement");
     let message = verified_identity_origin_message(&sender);
     let bindings = std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -29174,6 +30007,14 @@ async fn direct_origin_identity_ingest_populates_authenticated_binding() {
     assert_eq!(
         dm_inbox::authenticated_machine_binding_for_testing(&bindings, &sender.agent_id()).await,
         Some(machine.machine_id())
+    );
+    assert_eq!(
+        dm_inbox::authenticated_machine_binding_evidence(&bindings, &sender.agent_id())
+            .await
+            .expect("retained evidence")
+            .cert_not_after,
+        Some(expiry),
+        "verified announcement must retain its signed certificate expiry",
     );
 }
 

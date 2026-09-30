@@ -195,8 +195,8 @@ async fn test_send_direct_agent_not_found() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
-        matches!(err, x0x::dm::DmError::RecipientKeyUnavailable(_)),
-        "Expected DmError::RecipientKeyUnavailable, got: {:?}",
+        matches!(err, x0x::dm::DmError::RecipientUndiscovered(_)),
+        "Expected DmError::RecipientUndiscovered (an unresolved agent is a discovery gap, #1091), got: {:?}",
         err
     );
 }
