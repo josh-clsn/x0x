@@ -583,6 +583,9 @@ pub(in crate::server) async fn gossip_diagnostics(
                 Json(serde_json::json!({
                 "ok": true,
                 "uptime_secs": state.start_time.elapsed().as_secs(),
+                // #1135: publishes that reached zero eager peers — an
+                // absent-message stall, not a slow one.
+                "zero_fanout_publishes": state.agent.gossip_zero_fanout_publishes(),
                 "stats": snap,
                 // #945: one participation snapshot feeds both the
                 // top-level field and leaf_egress — no torn reads under load.
