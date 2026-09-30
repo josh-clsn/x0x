@@ -75,12 +75,16 @@ impl CapabilityRegistry {
     pub const SHARE_GRANT_V1: u64 = 1;
     /// Understands predecessor relays and requester offers.
     pub const PREDECESSOR_OFFER_V1: u64 = 1 << 1;
+    /// Accepts `EvidenceV1` (stream protocol 0x06) evidence
+    /// Hello/Lookup streams (ADR 0089, canonical bit 2 in the ADR 0093
+    /// registry table in `docs/adr/README.md`).
+    pub const PEER_EVIDENCE_V1: u64 = 1 << 2;
 
     /// The routes supported by this release's ready receiver.
     pub const fn current() -> Self {
         Self {
             version: 1,
-            bits: Self::SHARE_GRANT_V1 | Self::PREDECESSOR_OFFER_V1,
+            bits: Self::SHARE_GRANT_V1 | Self::PREDECESSOR_OFFER_V1 | Self::PEER_EVIDENCE_V1,
         }
     }
 

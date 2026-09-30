@@ -431,6 +431,32 @@ impl CapabilityStore {
         Ok(())
     }
 
+    /// Whether the newest CURRENT VERIFIED advert signed by `machine`
+    /// supports `bit` (ADR 0089 S5 / ADR 0093 bit 2).
+    ///
+    /// `Some(false)` — a current verified advert that lacks the bit —
+    /// lets callers skip evidence Hello/Lookup to that machine.
+    /// `None` (unknown: no current verified advert for the machine,
+    /// or only card-only/expired state) keeps the ADR 0093 rule: send
+    /// once and let the peer's behaviour decide.
+    pub fn machine_registry_supports(&self, machine: &MachineId, bit: u64) -> Option<bool> {
+        let Ok(inner) = self.inner.lock() else {
+            return None;
+        };
+        let now = Instant::now();
+        inner
+            .adverts
+            .values()
+            .filter(|entry| {
+                entry.verified_advert
+                    && entry.machine_id == machine.0
+                    && entry.machine_id != [0; 32]
+                    && now <= entry.expires_at
+            })
+            .max_by_key(|entry| entry.created_at_unix_ms)
+            .map(|entry| entry.capabilities.application_registry.supports(bit))
+    }
+
     /// Look up a peer's capability together with the machine that signed it.
     pub fn lookup_binding(&self, agent_id: &AgentId) -> Option<CapabilityBinding> {
         self.lookup_binding_at(agent_id, Instant::now())

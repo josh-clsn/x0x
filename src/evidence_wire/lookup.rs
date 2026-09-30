@@ -367,6 +367,18 @@ impl Context {
                 .map(|m| MachineId(m.0))
                 .collect();
             let responders = relations.responders(target, &connected).await;
+            // ADR 0089 S5 / ADR 0093 bit 2: never spend a Lookup on a
+            // machine whose current verified advert lacks
+            // `peer_evidence_v1`; unknown adverts still get the try.
+            let responders: Vec<_> = responders
+                .into_iter()
+                .filter(|machine| {
+                    self.caps.machine_registry_supports(
+                        machine,
+                        crate::dm::CapabilityRegistry::PEER_EVIDENCE_V1,
+                    ) != Some(false)
+                })
+                .collect();
             // A pre-seat send or a disconnected peer must not consume the
             // target cooldown: no Lookup has been sent yet (D30 30b).
             if responders.is_empty() || !self.runtime.wire_limits.claim_target(target) {
@@ -417,7 +429,7 @@ impl Context {
             send.write_u8(StreamProtocol::EvidenceV1.as_u8()).await?;
             let body = codec().serialize(&target).map_err(io::Error::other)?;
             write_message(&mut send, &self.runtime.wire_limits, machine, LOOKUP, &body).await?;
-            let (kind, body) = read_message(&mut recv).await?;
+            let (kind, body) = read_message(&mut recv, &self.runtime.wire_limits).await?;
             if kind != FOUND {
                 return Err(invalid("lookup not found"));
             }
@@ -518,7 +530,8 @@ mod tests {
                 Box::pin(async move {
                     let (_silent_responder, mut recv) = tokio::io::duplex(32);
                     notify.notify_one();
-                    let _ = read_message(&mut recv).await;
+                    let limits = crate::evidence_wire::Limits::default();
+                    let _ = read_message(&mut recv, &limits).await;
                 })
             }))
             .is_ok());
@@ -1377,7 +1390,7 @@ mod tests {
         write_message(&mut send, &limits, machine, NOT_FOUND, &[])
             .await
             .unwrap();
-        assert_eq!(read_message(&mut recv).await.unwrap().0, NOT_FOUND);
+        assert_eq!(read_message(&mut recv, &limits).await.unwrap().0, NOT_FOUND);
         assert_eq!(
             limits.state.lock().unwrap().machines[&machine].bytes.total,
             5
@@ -1388,7 +1401,7 @@ mod tests {
         let lease = limits.admit(machine, false).unwrap();
         let (_send, mut recv) = tokio::io::duplex(32);
         assert!(
-            tokio::time::timeout_at(lease.deadline, read_message(&mut recv))
+            tokio::time::timeout_at(lease.deadline, read_message(&mut recv, &limits))
                 .await
                 .is_err()
         );
