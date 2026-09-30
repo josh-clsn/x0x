@@ -696,7 +696,11 @@ impl Context {
                     let authorized = context.authorized(machine, target).await;
                     if !authorized {
                         WireCounters::bump(
-                            &self.runtime.wire_limits.counters.evidence_lookup_unauthorized,
+                            &self
+                                .runtime
+                                .wire_limits
+                                .counters
+                                .evidence_lookup_unauthorized,
                         );
                     }
                     let serving_lease = Arc::clone(&lease);
@@ -713,7 +717,11 @@ impl Context {
                     // Membership/revocation may have changed while signing.
                     let reply = if reply.is_some() && !self.authorized(machine, target).await {
                         WireCounters::bump(
-                            &self.runtime.wire_limits.counters.evidence_lookup_unauthorized,
+                            &self
+                                .runtime
+                                .wire_limits
+                                .counters
+                                .evidence_lookup_unauthorized,
                         );
                         None
                     } else {
@@ -783,11 +791,10 @@ impl Context {
                             );
                         }
                     })
-                    .map_err(|e| {
+                    .inspect_err(|_| {
                         WireCounters::bump(
                             &self.runtime.wire_limits.counters.evidence_hello_refused,
                         );
-                        e
                     })?;
                     if kind == CERTIFICATE {
                         return write_message(
@@ -906,10 +913,10 @@ impl Context {
         // accept an EvidenceV1 stream — skip the Hello (and its one
         // try). Unknown state (no current verified advert for the
         // machine) still sends, per ADR 0093.
-        if self.caps.machine_registry_supports(
-            &machine,
-            crate::dm::CapabilityRegistry::PEER_EVIDENCE_V1,
-        ) == Some(false)
+        if self
+            .caps
+            .machine_registry_supports(&machine, crate::dm::CapabilityRegistry::PEER_EVIDENCE_V1)
+            == Some(false)
         {
             return;
         }
@@ -1218,7 +1225,6 @@ mod tests {
         write_message(&mut tx, &limits, m, NOT_FOUND, &[])
             .await
             .unwrap();
-        let limits = Limits::default();
         assert_eq!(
             read_message(&mut rx, &limits).await.unwrap(),
             (NOT_FOUND, vec![])
@@ -1251,7 +1257,6 @@ mod tests {
         // released-binary interop gate, which must still run in Linux CI.
         assert!(!(1..=5).contains(&prefix));
         drop(old_peer);
-        let limits = Limits::default();
         assert!(read_message(&mut local, &limits).await.is_err());
         for _ in 0..100 {
             assert!(!limits.begin_hello(m, true));
@@ -1274,17 +1279,15 @@ mod tests {
         tokio::time::advance(Duration::from_secs(4)).await; // queued acceptor
         let (_tx, mut rx) = tokio::io::duplex(32);
         let start = Instant::now();
-        assert!(
-            tokio::time::timeout_at(lease.deadline, {
-                let inner = Limits::default();
-                let mut rx = &mut rx;
-                async move {
-                    let _ = read_message(&mut rx, &inner).await;
-                }
-            })
-            .await
-            .is_err()
-        );
+        assert!(tokio::time::timeout_at(lease.deadline, {
+            let inner = Limits::default();
+            let mut rx = &mut rx;
+            async move {
+                let _ = read_message(&mut rx, &inner).await;
+            }
+        })
+        .await
+        .is_err());
         assert_eq!(Instant::now().duration_since(start), Duration::from_secs(1));
         drop(lease);
         assert_eq!(limits.allocations.available_permits(), TOTAL_ALLOCATION_CAP);
@@ -1295,7 +1298,9 @@ mod tests {
         let mut oversized = vec![HELLO];
         oversized.extend_from_slice(&(MESSAGE_CAP as u32).to_be_bytes());
         let limits = Limits::default();
-        assert!(read_message(&mut oversized.as_slice(), &limits).await.is_err());
+        assert!(read_message(&mut oversized.as_slice(), &limits)
+            .await
+            .is_err());
         let (mut tx, mut rx) = tokio::io::duplex(32);
         tx.write_all(&[HELLO, 0, 0, 0, 2, 0]).await.unwrap();
         assert!(

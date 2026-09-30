@@ -627,7 +627,6 @@ async fn raw_frame_moved_agent_old_machine_is_unverified_and_never_rebinds_1098(
     );
 }
 
-
 #[tokio::test]
 async fn machine_for_agent_returns_linked_endpoint() {
     let dir = TempDir::new().unwrap();

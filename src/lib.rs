@@ -15132,7 +15132,7 @@ impl Agent {
                     _ = token.cancelled() => break,
                     r = network.accept_bi() => r,
                 };
-                let (ant_peer_id, mut send, mut recv) = match accepted {
+                let (ant_peer_id, send, recv) = match accepted {
                     Ok(triple) => triple,
                     Err(e) => {
                         tracing::warn!(target: "x0x::streams", error=%e, "accept_bi failed; continuing");
@@ -15145,10 +15145,11 @@ impl Agent {
                     &discovery_cache, &contact_store, &revocation_set, &move_state,
                     &connect_policy, &owner_trust, &machine_id, &evidence.wire_limits,
                 ).await else {
-                    // Refuse explicitly with RESET_STREAM / STOP_SENDING.
+                    // Drop both halves unfinished, as on every other denial
+                    // before surfacing. ant-quic sends RESET_STREAM with
+                    // DROPPED_UNFINISHED_ERROR_CODE (ADR 0022), not code 0,
+                    // and STOP_SENDING for the receive half.
                     // Capacity refusal is counted and logged by admit_prefix.
-                    let _ = send.reset(ant_quic::VarInt::from_u32(0));
-                    let _ = recv.stop(ant_quic::VarInt::from_u32(0));
                     continue;
                 };
                 let dispatch = Agent::dispatch_admitted_stream(
@@ -15177,8 +15178,6 @@ impl Agent {
     /// # Errors
     ///
     /// Returns an error if a required network or gossip component is missing.
-    /// #1091: the reconnect re-announcer. Owns the global
-
     pub async fn start_identity_heartbeat(&self) -> error::Result<()> {
         let mut handle_guard = self.heartbeat_handle.lock().await;
         // Shutdown race (issue #116): a still-bootstrapping join_network can call
@@ -21099,9 +21098,6 @@ mod tests {
             agent_public_key: Vec::new(),
         }
     }
-
-
-
 
     /// N12 (raw-path Blocked delivery): the raw 0x10 path must NOT deliver
     /// a BLOCKED sender — or a sender whose machine fails the contact's

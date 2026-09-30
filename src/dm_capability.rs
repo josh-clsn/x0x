@@ -1690,3 +1690,61 @@ mod digest_diagnostic_tests {
         assert_eq!(store.digest_diagnostic_snapshot(now, None).rows.len(), 0);
     }
 }
+
+#[cfg(test)]
+mod s5_bit2_tests {
+    use super::*;
+    use crate::dm::CapabilityRegistry;
+
+    fn caps_with(bits: u64) -> crate::dm::DmCapabilities {
+        let mut caps = crate::dm::DmCapabilities::v1_gossip_ready(vec![42; 1184]);
+        caps.application_registry = CapabilityRegistry { version: 1, bits };
+        caps
+    }
+
+    #[test]
+    fn current_registry_advertises_peer_evidence_v1() {
+        let registry = CapabilityRegistry::current();
+        assert!(registry.supports(CapabilityRegistry::PEER_EVIDENCE_V1));
+        assert!(registry.supports(CapabilityRegistry::SHARE_GRANT_V1));
+        assert!(registry.supports(CapabilityRegistry::PREDECESSOR_OFFER_V1));
+    }
+
+    #[test]
+    fn machine_registry_supports_distinguishes_known_lacking_from_unknown() {
+        let store = CapabilityStore::new();
+        let machine = MachineId([7; 32]);
+        let agent = AgentId([9; 32]);
+        // Unknown: no advert at all — ADR 0093 says still send.
+        assert_eq!(
+            store.machine_registry_supports(&machine, CapabilityRegistry::PEER_EVIDENCE_V1),
+            None
+        );
+        // A current verified advert WITHOUT bit 2 — skip the Hello/Lookup.
+        let now = crate::dm_capability::now_unix_ms();
+        store.insert(agent, machine, caps_with(0), now);
+        assert_eq!(
+            store.machine_registry_supports(&machine, CapabilityRegistry::PEER_EVIDENCE_V1),
+            Some(false)
+        );
+        // ... and one WITH bit 2 sends.
+        store.insert(
+            agent,
+            machine,
+            caps_with(CapabilityRegistry::PEER_EVIDENCE_V1),
+            now + 1,
+        );
+        assert_eq!(
+            store.machine_registry_supports(&machine, CapabilityRegistry::PEER_EVIDENCE_V1),
+            Some(true)
+        );
+        // Other machines stay unknown.
+        assert_eq!(
+            store.machine_registry_supports(
+                &MachineId([8; 32]),
+                CapabilityRegistry::PEER_EVIDENCE_V1
+            ),
+            None
+        );
+    }
+}
