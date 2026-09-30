@@ -598,6 +598,13 @@ impl PeerStream {
     }
 }
 
+/// Admission decided before reading any protocol bytes. A prefix lease is
+/// present only for machines without known agents or verified enrollment.
+pub(crate) struct InboundAdmission {
+    pub(crate) agents: Option<Vec<crate::identity::AgentId>>,
+    pub(crate) prefix: Option<crate::evidence_wire::PrefixLease>,
+}
+
 /// First agent of a stream's agent list, `None` when the list is empty
 /// (enrollment-only `SyncV1` admission, #1040). Backs [`PeerStream::agent`];
 /// a free function so the empty-list case is unit-testable without live QUIC

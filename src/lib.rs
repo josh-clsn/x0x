@@ -15054,9 +15054,61 @@ impl Agent {
         EnrolledOwnerSyncRoute::Admitted(admitted)
     }
 
-    /// Bounded pre-identity dispatch. EvidenceV1 goes exclusively to its
-    /// evidence acceptor; every other prefix applies
-    /// [`Self::route_enrolled_owner_sync`]:
+    /// Keep the main gate-first path independent of strangers' prefix reads.
+    /// Known denials never get a pre-identity exception, including EvidenceV1.
+    #[allow(clippy::too_many_arguments)]
+    async fn admit_stream_before_prefix(
+        discovery_cache: &std::sync::Arc<
+            tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+        >,
+        contact_store: &std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+        revocation_set: &std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+        move_state: &std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>>,
+        connect_policy: &std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
+        owner_trust: &owner_trust::OwnerTrust,
+        machine_id: &identity::MachineId,
+        limits: &std::sync::Arc<evidence_wire::Limits>,
+    ) -> Option<streams::InboundAdmission> {
+        let known = discovery_cache
+            .read()
+            .await
+            .values()
+            .any(|a| a.machine_id == *machine_id);
+        if known {
+            let agents = Self::gate_peer_machine_inbound(
+                discovery_cache,
+                contact_store,
+                revocation_set,
+                move_state,
+                connect_policy,
+                owner_trust,
+                machine_id,
+            )
+            .await
+            .ok()?;
+            return Some(streams::InboundAdmission {
+                agents: Some(agents),
+                prefix: None,
+            });
+        }
+        if owner_trust
+            .is_enrolled_owner_machine(revocation_set, machine_id)
+            .await
+        {
+            return Some(streams::InboundAdmission {
+                agents: None,
+                prefix: None,
+            });
+        }
+        Some(streams::InboundAdmission {
+            agents: None,
+            prefix: Some(limits.admit_prefix(*machine_id)?),
+        })
+    }
+
+    /// Dispatch after gate-first admission. EvidenceV1 goes exclusively to its
+    /// evidence acceptor. Known peers retain their gate result; machines with
+    /// no known agent apply [`Self::route_enrolled_owner_sync`]:
     ///
     /// - An admitted `SyncV1` stream goes to the REGISTERED `SyncV1`
     ///   acceptor only, never the default channel.
@@ -15068,7 +15120,7 @@ impl Agent {
     ///   application bytes surfaced, logged `deny_not_verified` as the
     ///   shared gate would log it.
     #[allow(clippy::too_many_arguments)]
-    async fn dispatch_pre_identity_stream(
+    async fn dispatch_admitted_stream(
         incoming: std::sync::Arc<streams::StreamAccept>,
         discovery_cache: std::sync::Arc<
             tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
@@ -15078,7 +15130,8 @@ impl Agent {
         move_state: std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>>,
         connect_policy: std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
         owner_trust: owner_trust::OwnerTrust,
-        evidence_limits: std::sync::Arc<evidence_wire::Limits>,
+        evidence: std::sync::Arc<peer_evidence::EvidenceRuntime>,
+        admission: streams::InboundAdmission,
         machine_id: identity::MachineId,
         send: ant_quic::HighLevelSendStream,
         mut recv: ant_quic::HighLevelRecvStream,
@@ -15110,13 +15163,27 @@ impl Agent {
                 return;
             }
         };
+        // Keep the pre-identity slot through dispatch, including asynchronous
+        // relationship checks. Evidence bodies then hold a separate reservation
+        // through queueing and verification.
+        let _prefix = admission.prefix;
+        let evidence_limits = &evidence.wire_limits;
         // ADR 0089: transport authentication alone admits only EvidenceV1.
         // Acquire both the machine stream slot and aggregate allocation permit
         // before queueing. The lease carries the original body deadline.
         if protocol == streams::StreamProtocol::EvidenceV1 {
             if let (Some(sender), Some(lease)) = (
                 incoming.registered_sender(protocol),
-                evidence_limits.admit(machine_id),
+                evidence_limits.admit(
+                    machine_id,
+                    evidence_wire::reserved_peer(
+                        evidence.store().as_deref(),
+                        &owner_trust,
+                        &revocation_set,
+                        machine_id,
+                    )
+                    .await,
+                ),
             ) {
                 let mut stream =
                     streams::PeerStream::new(Vec::new(), machine_id, protocol, send, recv);
@@ -15126,6 +15193,14 @@ impl Agent {
                 }
             } else {
                 evidence_limits.reset(machine_id);
+            }
+            return;
+        }
+        if let Some(agents) = admission.agents {
+            let stream = streams::PeerStream::new(agents, machine_id, protocol, send, recv);
+            if incoming.sender_for(protocol).try_send(stream).is_err() {
+                tracing::debug!(target: "x0x::streams", ?protocol,
+                    "incoming-stream channel full or closed; resetting stream");
             }
             return;
         }
@@ -15200,10 +15275,10 @@ impl Agent {
     /// Start the inbound byte-stream accept loop (idempotent).
     ///
     /// Called automatically by [`Agent::join_network`]. The loop is the sole
-    /// transport acceptor. A bounded prefix read selects EvidenceV1's narrow
-    /// ADR 0089 path, ADR 0084 enrollment admission, or the existing identity
-    /// and connect-ACL gates. No other protocol bypasses those gates. Body
-    /// bytes reach only the selected acceptor after admission.
+    /// transport acceptor. Known peers clear the identity and ACL gates before
+    /// any prefix read. Verified enrollment bypasses the pre-identity pool;
+    /// strangers alone use its two-per-machine, 32-total slots. Body bytes
+    /// reach only the selected acceptor after protocol admission.
     fn start_stream_accept_loop(&self) {
         if !self.stream_accept.start_once() {
             return;
@@ -15219,9 +15294,7 @@ impl Agent {
         let owner_trust = self.owner_trust.clone();
         let incoming = std::sync::Arc::clone(&self.stream_accept);
         let token = self.shutdown_token.clone();
-        let evidence_limits = std::sync::Arc::clone(&self.peer_evidence().wire_limits);
-
-        let prefix_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(128));
+        let evidence = std::sync::Arc::clone(self.peer_evidence());
         self.spawn_tracked(async move {
             tracing::info!(target: "x0x::streams", "byte-stream accept loop started");
             loop {
@@ -15229,7 +15302,7 @@ impl Agent {
                     _ = token.cancelled() => break,
                     r = network.accept_bi() => r,
                 };
-                let (ant_peer_id, send, recv) = match accepted {
+                let (ant_peer_id, mut send, mut recv) = match accepted {
                     Ok(triple) => triple,
                     Err(e) => {
                         tracing::warn!(target: "x0x::streams", error=%e, "accept_bi failed; continuing");
@@ -15238,13 +15311,17 @@ impl Agent {
                 };
                 let machine_id = identity::MachineId(ant_peer_id.0);
 
-                // The prefix has its existing timeout. Only EvidenceV1 may
-                // bypass agent admission; all other protocols re-enter the
-                // unchanged ADR 0084 / ADR 0022 gates after the prefix.
-                let Ok(prefix_slot) = std::sync::Arc::clone(&prefix_slots).try_acquire_owned() else {
+                let Some(admission) = Agent::admit_stream_before_prefix(
+                    &discovery_cache, &contact_store, &revocation_set, &move_state,
+                    &connect_policy, &owner_trust, &machine_id, &evidence.wire_limits,
+                ).await else {
+                    // Refuse explicitly with RESET_STREAM / STOP_SENDING.
+                    // Capacity refusal is counted and logged by admit_prefix.
+                    let _ = send.reset(ant_quic::VarInt::from_u32(0));
+                    let _ = recv.stop(ant_quic::VarInt::from_u32(0));
                     continue;
                 };
-                let dispatch = Agent::dispatch_pre_identity_stream(
+                let dispatch = Agent::dispatch_admitted_stream(
                     std::sync::Arc::clone(&incoming),
                     std::sync::Arc::clone(&discovery_cache),
                     std::sync::Arc::clone(&contact_store),
@@ -15252,15 +15329,13 @@ impl Agent {
                     std::sync::Arc::clone(&move_state),
                     std::sync::Arc::clone(&connect_policy),
                     owner_trust.clone(),
-                    std::sync::Arc::clone(&evidence_limits),
+                    std::sync::Arc::clone(&evidence),
+                    admission,
                     machine_id,
                     send,
                     recv,
                 );
-                tokio::spawn(async move {
-                    let _slot = prefix_slot;
-                    dispatch.await;
-                });
+                tokio::spawn(dispatch);
             }
         });
     }
