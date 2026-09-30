@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -23,6 +22,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+
+      # #939: every installer must pin the real release-signing fingerprint,
+      # and it must match the key published with the latest release.
+      - name: Check installer signing-key fingerprints
+        run: python3 scripts/ci/check-installer-fingerprints.py --release
 
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@master
@@ -75,7 +79,7 @@ jobs:
   test:
     name: Test Suite
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v5
 
@@ -100,11 +104,15 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-git-
 
-      # Cargo.lock is intentionally ignored in this application repo. Resolve it
-      # before caching so the target key identifies the dependency graph actually
-      # compiled by the locked test command below.
+      # Resolve an untracked graph before caching; preserve a tracked lock exactly
+      # when an integration candidate pins dependencies for test provenance.
       - name: Resolve test dependency graph
-        run: cargo generate-lockfile
+        run: |
+          if git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
+            cargo metadata --locked --format-version 1 >/dev/null
+          else
+            cargo generate-lockfile
+          fi
 
       - name: Cache target directory
         uses: actions/cache@v5
@@ -212,7 +220,12 @@ jobs:
           key: ${{ runner.os }}-rust-1.95.0-issue703-cargo-${{ hashFiles('Cargo.toml') }}
 
       - name: Resolve acceptance dependency graph
-        run: cargo generate-lockfile
+        run: |
+          if git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
+            cargo metadata --locked --format-version 1 >/dev/null
+          else
+            cargo generate-lockfile
+          fi
 
       - name: Cache acceptance target
         uses: actions/cache@v5
@@ -246,7 +259,7 @@ jobs:
           X0X_SLOW_CONSUMER_PROOF: ${{ runner.temp }}/issue703-signing-test/proof.json
         run: |
           set +e
-          bash scripts/ci/nextest-isolated.sh --all-features --lib -- \
+          bash scripts/ci/nextest-isolated.sh --all-features --lib --cargo-profile signing-acceptance -- \
             --run-ignored ignored-only --no-tests=fail \
             -E 'test(=gossip::pubsub::tests::test_slow_subscriber_isolated_at_100k_messages)'
           status=$?
@@ -283,7 +296,12 @@ jobs:
           toolchain: 1.95.0
 
       - name: Resolve acceptance dependency graph
-        run: cargo generate-lockfile
+        run: |
+          if git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
+            cargo metadata --locked --format-version 1 >/dev/null
+          else
+            cargo generate-lockfile
+          fi
 
       - name: Cache cargo registry and sources
         uses: actions/cache@v5
@@ -367,6 +385,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # #894: scripts/install.ps1 must at least parse under both Windows
+      # PowerShell 5.1 (what `irm | iex` runs on a stock machine) and pwsh 7.
+      - name: Parse-check scripts/install.ps1
+        shell: pwsh
+        run: |
+          $check = '$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path scripts/install.ps1).Path, [ref]$null, [ref]$e); if ($e) { $e | Out-String | Write-Host; exit 1 }'
+          foreach ($exe in @('powershell', 'pwsh')) {
+            & $exe -NoProfile -Command $check
+            if ($LASTEXITCODE -ne 0) { throw "install.ps1 failed to parse under $exe" }
+          }
+
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@master
         with:
@@ -411,7 +440,7 @@ jobs:
   coverage:
     name: Coverage Gate
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v5
 

@@ -109,6 +109,7 @@ mkdir -p /tmp/x0x-cli-alice /tmp/x0x-cli-bob
 
 cat > /tmp/x0x-cli-alice/config.toml <<TOML
 instance_name = "cli-alice"
+network_id = "x0x.prod"
 data_dir = "/tmp/x0x-cli-alice"
 bind_address = "127.0.0.1:19001"
 api_address = "127.0.0.1:19101"
@@ -118,6 +119,7 @@ TOML
 
 cat > /tmp/x0x-cli-bob/config.toml <<TOML
 instance_name = "cli-bob"
+network_id = "x0x.prod"
 data_dir = "/tmp/x0x-cli-bob"
 bind_address = "127.0.0.1:19002"
 api_address = "127.0.0.1:19102"

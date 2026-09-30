@@ -98,6 +98,106 @@ async fn call_clear(
     response_json(response).await
 }
 
+/// N19-B (the manual clear's gated transition): the clear runs against a
+/// CANDIDATE — memory never shows it while the write is in flight, and
+/// the outcome follows the #759 Watson ruling. A pre-rename failure
+/// (`NotReplaced`, forced here by the fault cell) leaves the live map
+/// ARMED; a visible-but-not-durable replacement publishes the cleared
+/// candidate (memory matches the destination) while the route refuses
+/// and withholds every effect.
+#[tokio::test]
+async fn n19b_manual_clear_follows_the_watson_outcomes() -> Result<()> {
+    // (a) NotReplaced: the live map stays armed.
+    {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let (alias_key, stable_id) = seed_alias_keyed_group(
+            &state,
+            &"8e".repeat(16),
+            &"d4".repeat(32),
+            ordinary_policy(),
+        )
+        .await?;
+        let _fault = set_save_fault(&state, SaveFault::NotReplaced);
+        let (status, body) = call_clear(
+            &state,
+            &stable_id,
+            serde_json::json!({ "force": true, "reason": "n19b not-replaced" }),
+        )
+        .await?;
+        drop(_fault);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(
+            marker_still_set(&state, &alias_key).await,
+            "N19-B: a pre-rename failure leaves the marker armed"
+        );
+    }
+    // (b) ReplacedNotDurable: the cleared candidate is what memory holds
+    // (the Watson ruling keeps the visible replacement); the route still
+    // refuses, so no notification or effect ever rides on it.
+    for fault in [
+        SaveFault::ReplacedNotDurable,
+        SaveFault::ReplacedNotDurableAfterWrite,
+    ] {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let (alias_key, stable_id) = seed_alias_keyed_group(
+            &state,
+            &"9e".repeat(16),
+            &"e5".repeat(32),
+            ordinary_policy(),
+        )
+        .await?;
+        let _fault = set_save_fault(&state, fault);
+        let (status, body) = call_clear(
+            &state,
+            &stable_id,
+            serde_json::json!({ "force": true, "reason": "n19b visible-not-durable" }),
+        )
+        .await?;
+        drop(_fault);
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a non-durable clear refuses ({fault:?}): {body}"
+        );
+        assert!(
+            !marker_still_set(&state, &alias_key).await,
+            "N19-B (#759 Watson): the visible replacement is what memory holds ({fault:?})"
+        );
+    }
+    Ok(())
+}
+
+/// N19-B green control: a durable clear publishes, and survives a reload.
+#[tokio::test]
+async fn n19b_manual_clear_commits_memory_only_after_durability() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let (alias_key, stable_id) = seed_alias_keyed_group(
+        &state,
+        &"7e".repeat(16),
+        &"c3".repeat(32),
+        ordinary_policy(),
+    )
+    .await?;
+    let (status, body) = call_clear(
+        &state,
+        &stable_id,
+        serde_json::json!({ "force": true, "reason": "n19b durable clear" }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !marker_still_set(&state, &alias_key).await,
+        "a durable clear is visible in memory"
+    );
+    let reloaded =
+        load_named_groups_merged(&state.named_groups_path, &state.home_suite_groups_path).await?;
+    assert!(
+        !reloaded.values().any(|info| info.is_fork_quarantined()),
+        "the durable store carries the clear across a restart"
+    );
+    Ok(())
+}
+
 /// The defect, stated as behaviour: the STABLE id clears an alias-keyed
 /// group. Before #732 this exact call answered 404 while the group sat in the
 /// map, quarantined, with no other exit.

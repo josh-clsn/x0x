@@ -46,7 +46,7 @@ Stack, bottom to top:
 2. `bootstrap.rs` — hard-coded global peers (`DEFAULT_BOOTSTRAP_PEERS`, UDP 5483) are seed hints only, with retry/backoff.
 3. `gossip/` — thin orchestration over `saorsa-gossip-*`; `GossipRuntime` owns `PubSubManager`.
 4. `presence.rs` — beacons on the Bulk stream, phi-accrual failure detection, FOAF discovery with trust-scoped visibility.
-5. `crdt/` (task lists), `kv/` (replicated KV with access policies), `mls/` (group encryption), `groups/` (named groups; DHT-free discovery via social propagation, BLAKE3 tag shards and presence).
+5. `crdt/` (task lists), `kv/` (replicated KV with access policies), `mls/` (group encryption), `groups/` (named groups; DHT-free discovery via social propagation, BLAKE3 tag shards and presence). Deltas of a group-scoped task list (`x0x.group.<gid>.symphony.<lid>`) in an `MlsEncrypted` group are sealed with the group's current GSS/TreeKEM key, like group KV stores (`crdt/sealed.rs`, #895); personal lists and `SignedPublic` groups stay plaintext.
 6. `server/` + `api/` — `x0xd` REST/WS; `src/api/mod.rs` is the shared endpoint registry that keeps routes and CLI subcommands (`src/cli/`) in sync. `gui/` is embedded HTML via `include_str!`.
 
 Errors: `IdentityError`, `NetworkError`, `PresenceError` in `error.rs`.

@@ -667,7 +667,7 @@ fn write_config(name: &str, data_dir: &std::path::Path, api_address: &str) -> Pa
     // daemon to find — and auto-connect to — a live production daemon on the
     // same machine.
     let body = format!(
-        "bind_address = \"0.0.0.0:0\"\napi_address = \"{api}\"\ndata_dir = \"{dir}\"\nidentity_dir = \"{ident}\"\nlog_level = \"warn\"\nbootstrap_peers = []\nmdns_enabled = false\ninstance_name = \"{name}\"\n",
+        "bind_address = \"0.0.0.0:0\"\napi_address = \"{api}\"\ndata_dir = \"{dir}\"\nidentity_dir = \"{ident}\"\nlog_level = \"warn\"\nbootstrap_peers = []\nmdns_enabled = false\ninstance_name = \"{name}\"\nnetwork_id = \"x0x.prod\"\n",
         api = api_address,
         dir = data_dir.display(),
         ident = identity_dir_for(data_dir).display(),

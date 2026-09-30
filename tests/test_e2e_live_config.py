@@ -33,7 +33,7 @@ class LiveConfigTests(unittest.TestCase):
         self.assertEqual(config["bind_address"], "0.0.0.0:15483")
         self.assertEqual(config["api_address"], "127.0.0.1:19200")
         self.assertEqual(config["log_level"], "warn")
-        self.assertNotIn("network_id", config)
+        self.assertEqual(config["network_id"], "x0x.testnet")
         self.assertEqual(config["update"], {"enabled": False, "gossip_updates": False})
 
     def test_actual_tracked_testnet_authority_is_used(self):
@@ -43,11 +43,13 @@ class LiveConfigTests(unittest.TestCase):
             expected = tomllib.load(stream)["bootstrap_peers"]
         config = tomllib.loads(render_config("test", repository, "/tmp/x0x-e2e-live"))
         self.assertEqual(config["bootstrap_peers"], expected)
+        with authority.open("rb") as stream:
+            self.assertEqual(config["network_id"], tomllib.load(stream)["network_id"])
 
     def test_prod_omits_override_even_without_testnet_authority(self):
         config = tomllib.loads(render_config("prod", self.repository, "data"))
         self.assertNotIn("bootstrap_peers", config)
-        self.assertNotIn("network_id", config)
+        self.assertEqual(config["network_id"], "x0x.prod")
         self.assertEqual(config["update"], {"enabled": False, "gossip_updates": False})
 
     def test_bad_authority_never_falls_back_to_prod(self):

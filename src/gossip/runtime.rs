@@ -3,7 +3,7 @@
 use super::config::GossipConfig;
 use super::pubsub::{PubSubManager, SigningContext};
 use crate::error::NetworkResult;
-use crate::network::NetworkNode;
+use crate::network::{NetworkNode, PubsubTopicPriorityResolver};
 use crate::presence::PresenceWrapper;
 use saorsa_gossip_membership::{HyParViewMembership, MembershipConfig};
 use saorsa_gossip_transport::GossipStreamType;
@@ -393,8 +393,23 @@ async fn run_pubsub_dispatcher(
             }
             continue;
         }
-        match network.receive_pubsub_message().await {
-            Ok((peer, data)) => {
+        match network.receive_pubsub_message_with_session().await {
+            Ok((peer, data, session)) => {
+                // A token whose peer differs from the dequeued frame's peer
+                // is not provenance for those bytes; refuse to dispatch it
+                // rather than relabel the frame.
+                let session = match session {
+                    Some(session) if session.peer == peer => Some(session),
+                    Some(mismatched) => {
+                        tracing::warn!(
+                            dequeued_peer = %peer,
+                            token_peer = %mismatched.peer,
+                            "dropping PubSub frame with peer-mismatched session token"
+                        );
+                        continue;
+                    }
+                    None => None,
+                };
                 let (recv_depth, recv_capacity) =
                     network.gossip_recv_queue_depth(GossipStreamType::PubSub);
                 dispatch_stats.record_dequeue(GossipStreamType::PubSub, recv_depth, recv_capacity);
@@ -413,7 +428,7 @@ async fn run_pubsub_dispatcher(
                 );
                 match tokio::time::timeout(
                     PUBSUB_MESSAGE_HANDLE_TIMEOUT,
-                    pubsub.handle_incoming(peer, data),
+                    pubsub.handle_incoming(peer, session, data),
                 )
                 .await
                 {
@@ -952,6 +967,22 @@ impl GossipRuntime {
         )?;
         pubsub.configure_egress(&config).await?;
         let pubsub = Arc::new(pubsub);
+        // #810: hand the receive pump a TopicId→priority resolver so the
+        // >90% proactive control-frame shed exempts Critical topics (e.g.
+        // `x0x/dm/v1/*` IHAVE/IWANT lazy repair). Weak reference: the
+        // PubSubManager (via its transport) holds the network Arc, so a
+        // strong handle here would create a shutdown leak cycle. While the
+        // manager is gone the pump falls back to the pre-#810 shed behaviour.
+        let weak_pubsub = Arc::downgrade(&pubsub);
+        network.set_pubsub_topic_priority_resolver(PubsubTopicPriorityResolver::new(
+            move |topic| {
+                weak_pubsub
+                    .upgrade()
+                    .map_or(saorsa_gossip_types::TopicPriority::Normal, |manager| {
+                        manager.topic_priority_for(topic)
+                    })
+            },
+        ));
         let dispatch_workers = config.dispatch_workers;
 
         Ok(Self {
@@ -1109,8 +1140,28 @@ impl GossipRuntime {
         let keepalive_membership = Arc::clone(&self.membership);
         let keepalive_network = Arc::clone(&self.network);
         let keepalive_handle = tokio::spawn(async move {
+            // x0x#1036: the same 15 s pass keeps the HyParView active view
+            // bounded by transport connectivity. saorsa-gossip admits
+            // never-connected peers from JOIN/FORWARDJOIN random walks and
+            // never prunes them, so SWIM, shuffle and presence kept sending
+            // to them ("Peer not found") indefinitely.
+            let mut stale_targets = super::stale_targets::StaleTargetTracker::default();
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+
+                let connected: std::collections::HashSet<PeerId> = keepalive_network
+                    .send_ready_peers()
+                    .await
+                    .into_iter()
+                    .map(|peer| PeerId::new(peer.0))
+                    .collect();
+                super::stale_targets::maintain_active_view(
+                    keepalive_membership.as_ref(),
+                    &mut stale_targets,
+                    &connected,
+                    Instant::now(),
+                )
+                .await;
 
                 let peers = keepalive_network.gossip_plane_peers().await;
                 for peer in peers {

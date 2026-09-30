@@ -486,6 +486,9 @@ pub(in crate::server) async fn direct_send(
                 // the peer state is not what it requires — and never a silent
                 // downgrade. Callers retry, surface "peer needs upgrade", or
                 // resend with `require_durable_app_ack = false`.
+                x0x::dm::DmError::RecipientUpgradeRequired { .. } => {
+                    (StatusCode::CONFLICT, "recipient_upgrade_required")
+                }
                 x0x::dm::DmError::AckSemanticsUnavailable(_) => {
                     (StatusCode::CONFLICT, "recipient_ack_semantics_unavailable")
                 }
@@ -623,6 +626,36 @@ fn attach_recipient_ack_diagnostics(
 
 #[cfg(test)]
 mod tests {
+    /// N12 round 2 pin: the static production-prefix table the raw dispatch
+    /// consults before the DM inbox exists must cover every prefix the
+    /// inbox registers in `start_dm_inbox_when_gossip_ready` — including
+    /// the server-layer bootstrap prefix, whose literal the crate-level
+    /// table repeats (dm_inbox cannot import from the server layer). A
+    /// future route added to the inbox must be added to the table too.
+    #[test]
+    fn production_typed_prefix_table_covers_every_inbox_route_prefix() {
+        for prefix in [
+            x0x::exec::EXEC_DM_PREFIX,
+            x0x::dm_inbox::GROUP_PREDECESSOR_RELAY_DM_PREFIX,
+            x0x::share_grant::SHARE_GRANT_DM_PREFIX,
+            x0x::history::classify::GROUP_PUBLIC_MESSAGE_DM_PREFIX,
+            x0x::history::classify::KV_STORE_DELTA_DM_PREFIX,
+            crate::server::routes::public_group_bootstrap_outbox::PUBLIC_GROUP_BOOTSTRAP_DM_PREFIX,
+        ] {
+            let mut payload = prefix.to_vec();
+            payload.extend_from_slice(b"pin");
+            assert!(
+                x0x::dm_inbox::recognized_production_typed_prefix(&payload),
+                "the static table must recognize the production prefix {:?}",
+                String::from_utf8_lossy(prefix)
+            );
+        }
+        // And nothing else: a random ordinary payload is not a protocol frame.
+        assert!(!x0x::dm_inbox::recognized_production_typed_prefix(
+            b"just an ordinary DM"
+        ));
+    }
+
     use super::*;
 
     #[test]

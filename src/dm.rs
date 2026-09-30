@@ -61,6 +61,52 @@ const DM_INBOX_TOPIC_PREFIX: &[u8] = b"x0x/dm/v1/inbox/";
 
 // ─── Wire format types ─────────────────────────────────────────────────────
 
+/// Versioned application compatibility registry (ADR 0093). Bits grant no authority.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityRegistry {
+    /// Registry interpretation; unknown versions fail closed.
+    pub version: u16,
+    /// Named application support bits; unknown bits are ignored.
+    pub bits: u64,
+}
+
+impl CapabilityRegistry {
+    /// Understands the ShareGrant v1 typed route.
+    pub const SHARE_GRANT_V1: u64 = 1;
+    /// Understands predecessor relays and requester offers.
+    pub const PREDECESSOR_OFFER_V1: u64 = 1 << 1;
+
+    /// The routes supported by this release's ready receiver.
+    pub const fn current() -> Self {
+        Self {
+            version: 1,
+            bits: Self::SHARE_GRANT_V1 | Self::PREDECESSOR_OFFER_V1,
+        }
+    }
+
+    /// Require the bit for a typed product payload. Ordinary DMs are unchanged.
+    pub fn require_payload(self, payload: &[u8]) -> std::result::Result<(), DmError> {
+        let required = if payload.starts_with(crate::share_grant::SHARE_GRANT_DM_PREFIX) {
+            Some((Self::SHARE_GRANT_V1, "share_grant_v1"))
+        } else if payload.starts_with(b"X0X-GROUP-PREDECESSOR-RELAY-V1\n") {
+            Some((Self::PREDECESSOR_OFFER_V1, "predecessor_offer_v1"))
+        } else {
+            None
+        };
+        if let Some((bit, capability)) = required {
+            if !self.supports(bit) {
+                return Err(DmError::RecipientUpgradeRequired { capability });
+            }
+        }
+        Ok(())
+    }
+
+    /// Unknown registry versions never imply support.
+    pub fn supports(self, bit: u64) -> bool {
+        self.version == 1 && self.bits & bit == bit
+    }
+}
+
 /// Advertisement of the DM transport capabilities this agent supports.
 ///
 /// Carried on `AgentCard.dm_capabilities` (additive, optional field — cards
@@ -117,6 +163,11 @@ pub struct DmCapabilities {
     /// cannot cover it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub digest_support: bool,
+
+    /// Verified application registry from the signed announcement trailer.
+    /// Never serialized inside the frozen positional capabilities or cards.
+    #[serde(skip)]
+    pub application_registry: CapabilityRegistry,
 }
 
 /// Frozen pre-#437 wire shape of [`DmCapabilities`] — the exact five-field
@@ -179,6 +230,7 @@ impl DmCapabilities {
             // Placeholder material is never published and never
             // represents a wired v2 relay peer.
             digest_support: false,
+            application_registry: CapabilityRegistry::default(),
         }
     }
 
@@ -194,6 +246,7 @@ impl DmCapabilities {
             kem_public_key,
             // #437: this build verifies and enforces inner_digest.
             digest_support: true,
+            application_registry: CapabilityRegistry::current(),
         }
     }
 
@@ -212,6 +265,7 @@ impl DmCapabilities {
             kem_public_key,
             // #437: this build verifies and enforces inner_digest.
             digest_support: true,
+            application_registry: CapabilityRegistry::current(),
         }
     }
 
@@ -223,8 +277,8 @@ impl DmCapabilities {
         self
     }
 
-    /// Project onto the frozen pre-#437 wire shape: every field except
-    /// `digest_support`, in the original field order. The shared frozen
+    /// Project onto the frozen pre-#437 wire shape: no digest or application
+    /// registry extensions, in the original field order. The shared frozen
     /// base of the #448/#450 mixed-fleet fix — see
     /// [`DmCapabilitiesV1Wire`] for why no post-v1 field may ever enter
     /// a signed caps encoding.
@@ -682,6 +736,14 @@ pub(crate) fn millis_since(start: Instant) -> u64 {
 /// Errors surfaced by the gossip DM path. See design doc §"Error model".
 #[derive(Debug, thiserror::Error)]
 pub enum DmError {
+    /// No fresh verified advert supports this route. Retain the obligation
+    /// and retry after the recipient upgrades or advertises again.
+    #[error("recipient_upgrade_required: {capability}")]
+    RecipientUpgradeRequired {
+        /// Required named registry bit (ADR 0093).
+        capability: &'static str,
+    },
+
     /// Recipient's AgentCard / capability advert is not known locally, or
     /// their KEM public key is missing. Caller should retry after a
     /// capability-cache refresh.
@@ -2092,6 +2154,54 @@ fn _type_witness(_: AgentId, _: MachineId) {}
 
 #[cfg(test)]
 mod tests {
+
+    /// #979 r2 (B1 hazard pin): the in-flight ACK registry is keyed by
+    /// request id ALONE — registering the SAME id twice replaces (and
+    /// closes) the first waiter. This is why the relay fan-out MUST derive
+    /// PER-TARGET request ids: one shared id would make concurrent
+    /// witnesses cancel each other (0 successes).
+    #[tokio::test]
+    async fn shared_request_id_closes_the_first_waiter() {
+        let registry = super::InFlightAcks::new();
+        let id = [0x42u8; 16];
+        let (rx1, _cell1) = registry.register_for_protocol_with_provenance(
+            id,
+            2,
+            crate::identity::AgentId([1; 32]),
+            Some(crate::identity::MachineId([1; 32])),
+        );
+        let (_rx2, _cell2) = registry.register_for_protocol_with_provenance(
+            id,
+            2,
+            crate::identity::AgentId([2; 32]),
+            Some(crate::identity::MachineId([2; 32])),
+        );
+        // The first waiter was replaced: its channel closed.
+        assert!(
+            rx1.await.is_err(),
+            "a shared request id closes the first waiter (the B1 hazard)"
+        );
+        // DISTINCT ids coexist.
+        let (rx3, _cell3) = registry.register_for_protocol_with_provenance(
+            [0x43u8; 16],
+            2,
+            crate::identity::AgentId([3; 32]),
+            Some(crate::identity::MachineId([3; 32])),
+        );
+        let (_rx4, _cell4) = registry.register_for_protocol_with_provenance(
+            [0x44u8; 16],
+            2,
+            crate::identity::AgentId([4; 32]),
+            Some(crate::identity::MachineId([4; 32])),
+        );
+        // rx3 is STILL OPEN: a recv with a short timeout times out rather
+        // than returning closed.
+        let still_open = tokio::time::timeout(std::time::Duration::from_millis(10), rx3)
+            .await
+            .is_err();
+        assert!(still_open, "a distinct id keeps its waiter registered");
+    }
+
     use super::*;
 
     fn dummy_agent_id(seed: u8) -> [u8; 32] {
