@@ -358,7 +358,7 @@ The Hello term is O(C), and the load and refresh-write terms are O(R). `Lookup` 
 
 - **New surfaces:** a new stream protocol with pre-identity admission (bounded, §6), a new persisted file (≤ 16 MiB), a load barrier (≤ 5 s) and a new ADR 0093 bit.
 - **Not every case recovers immediately.** No file, an expired or evicted record, contact-only peers and moved peers without an intermediary are not guaranteed (§5).
-- **Replay residual, larger than today:** a replayed advert at most W old can become stored authority for up to L (today about 900 s), plus local-disk rollback (§3; Open Question 3).
+- **Replay residual, larger than today:** a replayed advert at most W old can become stored authority for up to L (today about 900 s), plus local-disk rollback (§3; L = 7 days by David's ruling).
 - **Stored capability bits stay unknown after a restart** (D35 is separate).
 
 ### Neutral / Operational
