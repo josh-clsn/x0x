@@ -486,6 +486,12 @@ pub(in crate::server) async fn direct_send(
                 // the peer state is not what it requires — and never a silent
                 // downgrade. Callers retry, surface "peer needs upgrade", or
                 // resend with `require_durable_app_ack = false`.
+                x0x::dm::DmError::RecipientUndiscovered(_) => {
+                    // #1091: a discovery gap, not missing key material —
+                    // retryable once the peer re-announces (seconds with
+                    // the reconnect-triggered re-announce).
+                    (StatusCode::SERVICE_UNAVAILABLE, "recipient_undiscovered")
+                }
                 x0x::dm::DmError::RecipientUpgradeRequired { .. } => {
                     (StatusCode::CONFLICT, "recipient_upgrade_required")
                 }
