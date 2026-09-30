@@ -47,29 +47,37 @@ The joiner's poll re-fetches the same result every ~2 s until it times out after
 intervening_events: Vec<NamedGroupMetadataEvent>,
 ```
 
-**Authority.** When a `FetchRequest` carries `from_revision`, the authority takes, from its own TreeKEM membership event log (`treekem_event_log`, written at seal time), the events whose commit revision lies strictly between `from_revision` and the carried event's commit revision. It sends them only when all three hold:
+**Authority.** When a `FetchRequest` carries `from_revision`, and the joiner can pull a control blob (the fetch is verified, sets `accepts_control_blob_ref` and carries an `attempt_id`, which is the blob path's own predicate), the authority takes, from its own TreeKEM membership event log (`treekem_event_log`, written at seal time), the `MemberAdded` events whose commit revision lies strictly between `from_revision` and the carried event's commit revision. It sends them only when all three hold:
 
 - they cover **every** revision in that gap exactly once;
 - there are at most **8** of them (`JOIN_RESULT_INTERVENING_EVENT_CAP`);
 - no revision has two different logged commits.
 
-Otherwise it sends an empty list, which is today's behaviour. Events are sent exactly as logged and never modified. A gap that contains a non-membership commit (a rename) is not in the membership log, so it is never partially covered.
+Otherwise it sends an empty list, which is today's behaviour. Events are sent exactly as logged and never modified. A gap that contains any other commit (a rename, a removal) is never covered, so it is never partially sent. A joiner that cannot pull a blob never receives the carry, so the carry can never push an otherwise-inline result past the 49,152-byte DM budget and suppress its delivery.
 
-**Joiner.** It applies the events only when the bound join attempt is **current**. The existing currency check runs first, so a stale result applies nothing. It also requires that the message is verified, that the list is no longer than the cap, and that every event names the same group; otherwise the whole list is ignored. It then applies them in commit-revision order through the **ordinary** `apply_named_group_metadata_event`, before the result's own event:
+**Joiner.**
 
-- It skips any event at or below its local revision.
-- It stops at the first event that is not accepted.
-- Each event gets exactly the checks it would get if gossip had delivered it: signature, sender authority, prev-hash linkage, owner mandate, TreeKEM pre-Welcome handling.
+- **Binding.** It applies carried events only for a **bound** join attempt on a verified message; an unbound result applies no carry. Each event goes through the bound apply, which re-checks the attempt's currency **under the group's membership lock**. An attempt that goes stale after the handler's pre-check therefore stops further applies.
+- **Preflight, before any mutation.** The whole list is rejected unless:
+  - every entry is a `MemberAdded` for this group, with a commit;
+  - there are at most 8 entries;
+  - revisions are unique and contiguous;
+  - the last revision is exactly the terminal revision − 1;
+  - the first revision is at or below the joiner's local revision + 1, so the list reaches its stub.
+- **Apply.** It applies the list in revision order through the **ordinary** metadata apply, before the result's own event:
+  - It skips events at or below its local revision.
+  - Each event gets exactly the checks it would get if gossip had delivered it: signature, sender authority, prev-hash linkage, owner mandate, TreeKEM pre-Welcome handling.
+  - If the ordinary apply refuses an event, the walk stops and **keeps the prefix already accepted**. Each accepted link is a valid, verified commit in its own right, exactly as if gossip had delivered it, and the joiner is left at a later consistent revision.
 
 The join result's own event then follows the unchanged path, including the #818 classification, the adoption refusal and the chain and attestation context.
 
 **Bounds.**
-- At most 8 events, about 400 KB, carried inside the join-result control blob. The blob path already exists for this message, since the live result is 95 KB, and its cap is 8 MiB.
+- At most 8 events, about 400 KB, carried only inside the join-result control blob. The blob path already exists for this message, since the live result is 95 KB, and its cap is 8 MiB.
 - The control-blob validator rejects a result with more than 8 events.
 - A larger gap, or an authority that restarted since the seal (the log is in memory), falls back to today's path.
 
 **Mixed versions.**
-- A 0.45 joiner ignores the unknown key, so it behaves as today.
+- A 0.45 joiner does not advertise `accepts_control_blob_ref`, so it never receives the key and behaves as today.
 - A 0.45 authority never sends the key; the field defaults to empty, so a 0.46 joiner behaves as today.
 - A fixed authority with nothing to carry omits the key, so the wire is byte-identical to today.
 
@@ -96,6 +104,11 @@ The join result's own event then follows the unchanged path, including the #818 
 - **Red/green:** `issue1139_join_result_alone_converges_second_joiner` fails with the joiner apply disabled and passes with it. With it, J2 ends `active` with TreeKEM installed and no catch-up requested.
 - **Mixed versions:** `issue1139_legacy_join_result_alone_leaves_second_joiner_pending` and `issue1139_intervening_events_field_is_additive_on_the_wire` cover omit-when-empty, decoding without the key, and the legacy behaviour.
 - **Bounds:** `issue1139_authority_serves_only_complete_bounded_gaps` covers the complete-gap rule, the cap, no gap, the joiner past the terminal, and a lost log. `issue1139_joiner_ignores_stale_foreign_or_oversized_carries` covers a stale attempt, a foreign group, and too many events.
+- **Preflight and binding:**
+  - `issue1139_preflight_rejects_malformed_lists` covers every preflight rule.
+  - `issue1139_malformed_carry_applies_no_prefix` shows that a valid first link followed by a bad entry applies nothing.
+  - `issue1139_unbound_result_does_not_apply_carry` covers the unbound result.
+  - `issue1139_carry_only_for_blob_capable_bound_fetches` covers the authority's legacy gate.
 - **Live gate:** the v0.46.0 Home gate rows 3a/3b run with the harness's up-front invite minting unchanged (the stale-invite shape), and must pass.
 - **Review trigger:** revisit when ADR 0088 decides the full liveness contract, or when catch-up moves to control blobs (option 3).
 
