@@ -167,6 +167,29 @@ struct CapabilityAdvertV1Wire {
 }
 
 impl CapabilityAdvert {
+    /// Exact evidence decoder, preserving the historical inline and frozen
+    /// base layouts while refusing unrecognised or trailing extension bytes.
+    pub(crate) fn decode_evidence(
+        bytes: &[u8],
+    ) -> Result<(Self, Option<RegistryTrailer>), postcard::Error> {
+        if let Ok((base, tail)) = postcard::take_from_bytes::<CapabilityAdvertV1Wire>(bytes) {
+            if tail.is_empty() || tail.starts_with(REGISTRY_TRAILER_MAGIC) {
+                let advert = Self::from_postcard(&postcard::to_stdvec(&base)?)?;
+                let trailer = if tail.is_empty() {
+                    None
+                } else {
+                    RegistryTrailer::from_advert(bytes)?
+                };
+                return Ok((advert, trailer));
+            }
+        }
+        let (advert, rest) = postcard::take_from_bytes::<Self>(bytes)?;
+        if !rest.is_empty() {
+            return Err(postcard::Error::DeserializeBadEncoding);
+        }
+        Ok((advert, None))
+    }
+
     /// Two-stage postcard decode for the #437 `digest_support`
     /// transition: the v2 shape (caps may carry `digest_support`) first,
     /// then the byte-exact v1 legacy shape, lifted with
@@ -293,6 +316,8 @@ impl DigestSupportExtension {
 /// Senders consult this cache before each `send_direct` call to determine
 /// whether the recipient supports the gossip DM inbox path.
 pub struct CapabilityStore {
+    /// Inert ADR 0089 prerequisite: verified source wire bodies.
+    pub evidence_wire: crate::peer_evidence::VerifiedWireCapture,
     inner: Mutex<CapabilityStoreInner>,
     ttl: Duration,
     /// Adverts and digest extensions the service skipped without an
@@ -357,6 +382,7 @@ impl CapabilityStore {
             inner: Mutex::new(CapabilityStoreInner::default()),
             ttl: Duration::from_secs(ADVERT_CACHE_TTL_SECS),
             prefiltered_stale_adverts: AtomicU64::new(0),
+            evidence_wire: Default::default(),
         }
     }
 
@@ -367,6 +393,7 @@ impl CapabilityStore {
             inner: Mutex::new(CapabilityStoreInner::default()),
             ttl,
             prefiltered_stale_adverts: AtomicU64::new(0),
+            evidence_wire: Default::default(),
         }
     }
 
