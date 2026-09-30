@@ -4154,6 +4154,31 @@ fn raw_delivery_with_evidence(
     (view.is_some(), false, expiry)
 }
 
+/// Freeze this frame's authority before scheduling recovery for later frames.
+fn raw_delivery_and_schedule_lookup(
+    cache: Option<&DiscoveredAgent>,
+    registry: Option<dm_inbox::AuthenticatedMachineBinding>,
+    evidence: Option<&std::sync::Arc<peer_evidence::EvidenceRuntime>>,
+    agent: identity::AgentId,
+    machine: identity::MachineId,
+    now: u64,
+) -> (bool, bool, Option<u64>) {
+    let authority = raw_delivery_with_evidence(
+        cache,
+        registry,
+        evidence.map(std::sync::Arc::as_ref),
+        agent,
+        machine,
+        now,
+    );
+    if !authority.0 {
+        if let Some(evidence) = evidence {
+            evidence.spawn_lookup(agent, machine);
+        }
+    }
+    authority
+}
+
 async fn dispatch_raw_direct_after_gates(
     dm: &direct::DirectMessaging,
     history_handle: Option<&history::HistoryHandle>,
@@ -14161,21 +14186,6 @@ impl Agent {
                     digest = %digest,
                 );
 
-                if evidence_ready {
-                    let registry = crate::dm_inbox::authenticated_machine_binding_evidence(
-                        &authenticated_machine_bindings, &sender,
-                    ).await;
-                    let verified = {
-                        let cache = discovery_cache.read().await;
-                        raw_delivery_with_evidence(cache.get(&sender), registry, Some(evidence.as_ref()), sender, machine_id, dm_capability::now_unix_ms()).0
-                    };
-                    if !verified {
-                        // The claimed sender is only a bounded routing hint
-                        // for looking up itself on this authenticated transport.
-                        evidence.lookup(sender, Some(machine_id)).await;
-                    }
-                }
-
                 // Select one authoritative binding and its expiry for both
                 // delivery verification and the runtime expiry gate (#1098).
                 let registry = crate::dm_inbox::authenticated_machine_binding_evidence(
@@ -14185,7 +14195,7 @@ impl Agent {
                 .await;
                 let (verified, live_verified, cert_not_after) = {
                     let cache = discovery_cache.read().await;
-                    raw_delivery_with_evidence(cache.get(&sender), registry, evidence_ready.then_some(evidence.as_ref()), sender, machine_id, dm_capability::now_unix_ms())
+                    raw_delivery_and_schedule_lookup(cache.get(&sender), registry, evidence_ready.then_some(&evidence), sender, machine_id, dm_capability::now_unix_ms())
                 };
 
                 // Evaluate trust for the (AgentId, MachineId) pair.

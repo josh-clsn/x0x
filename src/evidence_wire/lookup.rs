@@ -67,6 +67,10 @@ impl From<EvidenceRecordV1> for Found {
 }
 
 impl Limits {
+    pub(crate) fn try_lookup_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.lookups).try_acquire_owned().ok()
+    }
+
     fn claim_target(&self, target: AgentId) -> bool {
         let now = Instant::now();
         let Ok(mut state) = self.state.lock() else {
@@ -345,10 +349,11 @@ impl Context {
         )
     }
 
-    pub(crate) async fn lookup(self: Arc<Self>, target: AgentId) {
-        let Ok(permit) = Arc::clone(&self.runtime.wire_limits.lookups).try_acquire_owned() else {
-            return;
-        };
+    pub(crate) async fn lookup(
+        self: Arc<Self>,
+        target: AgentId,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
         let deadline = Instant::now() + DEADLINE;
         let _ = tokio::time::timeout_at(deadline, async {
             let Some(relations) = self.relations() else {
@@ -497,6 +502,197 @@ mod tests {
         identity::{AgentKeypair, Identity, MachineKeypair},
         peer_evidence::{PeerEvidenceStore, RuntimePolicy},
     };
+
+    #[tokio::test]
+    async fn s4_raw_lookup_silent_responder_does_not_block_other_peer() {
+        // Inert raw receive queue plus the production authority/scheduling and
+        // dispatch functions. The Lookup transport is an unanswered duplex,
+        // never a NetworkNode, socket, or daemon.
+        let runtime = Arc::new(EvidenceRuntime::default());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let notify = Arc::clone(&started);
+        assert!(runtime
+            .lookup_responder
+            .set(Arc::new(move |_| {
+                let notify = Arc::clone(&notify);
+                Box::pin(async move {
+                    let (_silent_responder, mut recv) = tokio::io::duplex(32);
+                    notify.notify_one();
+                    let _ = read_message(&mut recv).await;
+                })
+            }))
+            .is_ok());
+        let dm = crate::direct::DirectMessaging::new();
+        let mut delivered = dm.subscribe();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(AgentId, MachineId)>(2);
+        let evidence = Arc::clone(&runtime);
+        let listener = tokio::spawn(async move {
+            while let Some((sender, machine_id)) = rx.recv().await {
+                let (verified, _, _) = crate::raw_delivery_and_schedule_lookup(
+                    None,
+                    None,
+                    Some(&evidence),
+                    sender,
+                    machine_id,
+                    dm_capability::now_unix_ms(),
+                );
+                let data = b"ordinary raw frame".to_vec();
+                crate::dispatch_raw_direct_after_gates(
+                    &dm,
+                    None,
+                    &[],
+                    crate::RawDirectDelivery {
+                        sender,
+                        machine_id,
+                        digest: crate::direct::dm_payload_digest_hex(&data),
+                        data,
+                        verified,
+                        trust_decision: None,
+                        observed_origin: None,
+                    },
+                )
+                .await;
+            }
+        });
+        let first = (AgentId([1; 32]), MachineId([2; 32]));
+        let other = (AgentId([3; 32]), MachineId([4; 32]));
+        tx.send(first).await.unwrap();
+        tokio::time::timeout(Duration::from_millis(500), started.notified())
+            .await
+            .unwrap();
+        assert_eq!(runtime.wire_limits.lookups.available_permits(), 15);
+        tx.send(other).await.unwrap();
+        tokio::time::timeout(Duration::from_millis(500), async {
+            let frame = delivered.recv().await.unwrap();
+            assert_eq!(frame.sender, first.0);
+            assert!(!frame.verified);
+            let frame = delivered.recv().await.unwrap();
+            assert_eq!(frame.sender, other.0);
+            assert_eq!(frame.machine_id, other.1);
+            assert!(!frame.verified);
+        })
+        .await
+        .expect("another peer must be delivered while Lookup is unanswered");
+        drop(tx);
+        listener.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn s4_raw_lookup_distinct_claim_flood_is_bounded_before_spawn() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let runtime = Arc::new(EvidenceRuntime::default());
+        let started = Arc::new(AtomicUsize::new(0));
+        let release = tokio_util::sync::CancellationToken::new();
+        let count = Arc::clone(&started);
+        let done = release.clone();
+        assert!(runtime
+            .lookup_responder
+            .set(Arc::new(move |_| {
+                let count = Arc::clone(&count);
+                let done = done.clone();
+                Box::pin(async move {
+                    count.fetch_add(1, Ordering::Relaxed);
+                    done.cancelled().await;
+                })
+            }))
+            .is_ok());
+        // An ordinary awaited sender already owns one of the SAME permits.
+        let sender_runtime = Arc::clone(&runtime);
+        let sender = tokio::spawn(async move {
+            sender_runtime.lookup(AgentId([255; 32]), None).await;
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(started.load(Ordering::Relaxed), 1);
+        for i in 0..128 {
+            let authority = crate::raw_delivery_and_schedule_lookup(
+                None,
+                None,
+                Some(&runtime),
+                AgentId([i; 32]),
+                MachineId([42; 32]),
+                dm_capability::now_unix_ms(),
+            );
+            assert!(!authority.0);
+        }
+        // No yield in the flood: permits must already be held by queued jobs,
+        // not first acquired when those jobs eventually get polled.
+        assert_eq!(runtime.wire_limits.lookups.available_permits(), 0);
+        assert_eq!(runtime.diagnostics()["evidence_lookup_skipped"], 113);
+        tokio::task::yield_now().await;
+        assert_eq!(started.load(Ordering::Relaxed), 16);
+        release.cancel();
+        sender.await.unwrap();
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while runtime.wire_limits.lookups.available_permits() != 16 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            started.load(Ordering::Relaxed),
+            16,
+            "skipped jobs must not queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn s4_raw_lookup_only_later_frame_uses_recovered_evidence() {
+        let receiver = Node::new().await;
+        let peer = Node::new().await;
+        receiver.group(&[receiver.a(), peer.a()]);
+        let store = receiver.store();
+        let wire = codec()
+            .serialize(&Found::from(peer.mint().unwrap().into_record()))
+            .unwrap();
+        let runtime = &receiver.relations.runtime;
+        let recovered = Arc::new(tokio::sync::Notify::new());
+        let notify = Arc::clone(&recovered);
+        assert!(runtime
+            .lookup_responder
+            .set(Arc::new(move |target| {
+                let store = Arc::clone(&store);
+                let wire = wire.clone();
+                let notify = Arc::clone(&notify);
+                Box::pin(async move {
+                    ingest_found(
+                        &store,
+                        &Limits::default(),
+                        target,
+                        decode::found(&wire).unwrap(),
+                        dm_capability::now_unix_ms(),
+                    )
+                    .unwrap();
+                    notify.notify_one();
+                })
+            }))
+            .is_ok());
+        let first = crate::raw_delivery_and_schedule_lookup(
+            None,
+            None,
+            Some(runtime),
+            peer.a(),
+            peer.m(),
+            dm_capability::now_unix_ms(),
+        );
+        tokio::time::timeout(Duration::from_millis(500), recovered.notified())
+            .await
+            .unwrap();
+        assert!(!first.0, "the triggering frame must stay unverified");
+        let later = crate::raw_delivery_and_schedule_lookup(
+            None,
+            None,
+            Some(runtime),
+            peer.a(),
+            peer.m(),
+            dm_capability::now_unix_ms(),
+        );
+        assert!(
+            later.0,
+            "a later frame uses the stored, reverified evidence"
+        );
+    }
 
     struct Node {
         dir: tempfile::TempDir,
