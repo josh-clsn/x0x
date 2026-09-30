@@ -390,13 +390,9 @@ class Scenario(SharedScenario):
         gid, owner_id = self.home(owner)
         for node in (writer, late, revoked, admin):
             self.require_home_identity(node, owner_id)
-        # Known limitation #1139 (v0.46): a TreeKEM joiner whose invite base
-        # predates another device's seal stays pending_authority_commit. Mint
-        # each seat invite only after the previous join settled — the
-        # documented workaround — so this gate measures the rest of Home.
         writer_invite = self.home_invite(owner, writer, gid, owner_id)
-        self.join_home(owner, writer, gid, owner_id, writer_invite)
         revoked_invite = self.home_invite(owner, revoked, gid, owner_id)
+        self.join_home(owner, writer, gid, owner_id, writer_invite)
         self.join_home(owner, revoked, gid, owner_id, revoked_invite)
 
         # Every Home device holds the owner key (Home admission needs each
