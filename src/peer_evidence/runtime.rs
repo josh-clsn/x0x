@@ -3,6 +3,8 @@ use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Live group membership predicate. A busy/missing policy fails closed.
+pub(crate) type GroupContext = dyn Fn(AgentId, AgentId) -> Option<bool> + Send + Sync;
+
 type GroupPolicy = dyn Fn(AgentId) -> Option<bool> + Send + Sync;
 
 /// Reads current relationship and revocation stores at every use, without crypto.
@@ -93,6 +95,8 @@ impl EvidencePolicy for RuntimePolicy {
 
 /// Bounded startup barrier shared by raw frames and sends. Views are ephemeral.
 pub struct EvidenceRuntime {
+    pub(crate) lookup_context: std::sync::OnceLock<std::sync::Weak<crate::evidence_wire::Context>>,
+    pub(crate) group_context: std::sync::RwLock<Option<Arc<GroupContext>>>,
     pub(crate) wire_limits: Arc<crate::evidence_wire::Limits>,
     store: std::sync::OnceLock<Arc<PeerEvidenceStore>>,
     ready: tokio_util::sync::CancellationToken,
@@ -109,6 +113,8 @@ pub struct EvidenceRuntime {
 impl Default for EvidenceRuntime {
     fn default() -> Self {
         Self {
+            lookup_context: Default::default(),
+            group_context: Default::default(),
             wire_limits: Arc::new(crate::evidence_wire::Limits::default()),
             store: Default::default(),
             ready: Default::default(),
@@ -122,6 +128,28 @@ impl Default for EvidenceRuntime {
     }
 }
 impl EvidenceRuntime {
+    /// Install a live shared-roster predicate, including local membership.
+    /// Unavailable policy reads fail closed; no membership snapshot is cached.
+    pub fn set_group_context(&self, context: Arc<GroupContext>) {
+        if let Ok(mut slot) = self.group_context.write() {
+            *slot = Some(context);
+        }
+    }
+    /// Pull missing relationship evidence over bounded connected-peer streams.
+    /// Callers must re-read their authoritative sources after this await.
+    pub(crate) async fn lookup(&self, agent: AgentId, machine: Option<MachineId>) {
+        let now = crate::dm_capability::now_unix_ms();
+        let usable = match machine {
+            Some(machine) => self.usable(agent, machine, now),
+            None => self.usable_agent(agent, now),
+        };
+        if usable.is_some() {
+            return;
+        }
+        if let Some(context) = self.lookup_context.get().and_then(std::sync::Weak::upgrade) {
+            context.lookup(agent).await;
+        }
+    }
     /// Start exactly one background re-verification; invalid files stay untouched.
     pub(crate) fn start(
         self: &Arc<Self>,

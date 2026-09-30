@@ -5275,6 +5275,7 @@ impl Agent {
         if !self.peer_evidence().wait(0).await {
             return None;
         }
+        self.peer_evidence().lookup(agent, None).await;
         let view = self
             .peer_evidence()
             .usable_agent(agent, dm_capability::now_unix_ms())?;
@@ -7054,6 +7055,10 @@ impl Agent {
             return Err(dm::DmError::RecipientUndiscovered(
                 "peer evidence startup barrier unavailable".into(),
             ));
+        }
+        if advert_binding.is_none() {
+            self.peer_evidence().lookup(*to, None).await;
+            advert_binding = self.capability_store.lookup_binding(to);
         }
         let stored_cap = if advert_binding.is_none() {
             self.peer_evidence()
@@ -14155,6 +14160,13 @@ impl Agent {
                     raw_bytes,
                     digest = %digest,
                 );
+
+                if evidence_ready
+                    && !discovery_cache.read().await.contains_key(&sender)
+                    && crate::dm_inbox::authenticated_machine_binding_evidence(&authenticated_machine_bindings, &sender).await.is_none()
+                {
+                    evidence.lookup(sender, Some(machine_id)).await;
+                }
 
                 // Select one authoritative binding and its expiry for both
                 // delivery verification and the runtime expiry gate (#1098).

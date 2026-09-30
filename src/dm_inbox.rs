@@ -162,6 +162,11 @@ impl Default for AuthenticatedMachineBindingCache {
 }
 
 impl AuthenticatedMachineBindingCache {
+    /// Candidate bindings for evidence routing, never an authorization result.
+    pub(crate) fn evidence_candidates(&self) -> Vec<(AgentId, AuthenticatedMachineBinding)> {
+        self.entries.iter().map(|(a, b)| (*a, *b)).collect()
+    }
+
     #[cfg(test)]
     fn with_capacity(capacity: usize) -> Self {
         Self {

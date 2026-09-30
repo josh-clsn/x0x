@@ -1259,6 +1259,22 @@ pub async fn serve_with_options(
     }
 
     // ADR 0089: relationship sources are installed before load verification.
+    let context_state = Arc::downgrade(&state);
+    agent
+        .peer_evidence()
+        .set_group_context(Arc::new(move |a, b| {
+            let state = context_state.upgrade()?;
+            let groups = state.named_groups.try_read().ok()?;
+            let local = hex::encode(state.agent.agent_id().as_bytes());
+            let a = hex::encode(a.as_bytes());
+            let b = hex::encode(b.as_bytes());
+            Some(groups.values().any(|g| {
+                !g.withdrawn
+                    && [&local, &a, &b]
+                        .iter()
+                        .all(|id| g.members_v2.get(*id).is_some_and(|m| m.is_active()))
+            }))
+        }));
     let evidence_state = Arc::downgrade(&state);
     agent.start_peer_evidence(
         config.data_dir.clone(),

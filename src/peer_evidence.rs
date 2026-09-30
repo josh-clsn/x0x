@@ -662,6 +662,13 @@ impl PeerEvidenceStore {
             .machine_id;
         self.usable(agent, machine, now)
     }
+    /// Candidate ids only; callers must apply point-of-use checks.
+    pub(crate) fn agents(&self) -> Vec<AgentId> {
+        self.state
+            .lock()
+            .map(|s| s.verified.keys().copied().collect())
+            .unwrap_or_default()
+    }
     /// Whether a currently usable relationship record names this machine.
     pub(crate) fn has_machine(&self, machine: MachineId, now: u64) -> bool {
         let agents: Vec<_> = self
