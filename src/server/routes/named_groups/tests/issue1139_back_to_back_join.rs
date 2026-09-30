@@ -741,3 +741,182 @@ async fn issue1139_standalone_r2_is_silent_then_r1_rescues() -> Result<()> {
     assert!(s.j2.treekem_groups.read().await.contains_key(&s.group_key));
     Ok(())
 }
+
+fn result_with_events(s: &BackToBack, events: Vec<NamedGroupMetadataEvent>) -> JoinResultMessage {
+    match s.j2_result.clone() {
+        JoinResultMessage::Result {
+            event,
+            chain,
+            head_attestation,
+            roster_certificates_b64,
+            ..
+        } => JoinResultMessage::Result {
+            event,
+            chain,
+            head_attestation,
+            roster_certificates_b64,
+            intervening_events: events,
+        },
+        other => other,
+    }
+}
+
+/// A copy of r+1's event with its commit revision and group rewritten —
+/// a structural probe for the preflight only (its signature is stale, so
+/// the ordinary apply would refuse it anyway).
+fn probe_event(s: &BackToBack, revision: u64, group: Option<&str>) -> NamedGroupMetadataEvent {
+    let mut event = s.add_j1.event.clone();
+    if let NamedGroupMetadataEvent::MemberAdded {
+        group_id, commit, ..
+    } = &mut event
+    {
+        if let Some(group) = group {
+            *group_id = group.to_string();
+        }
+        if let Some(commit) = commit.as_mut() {
+            commit.revision = revision;
+        }
+    }
+    event
+}
+
+async fn j2_revision(s: &BackToBack) -> Option<u64> {
+    s.j2.named_groups
+        .read()
+        .await
+        .get(&s.group_key)
+        .map(|i| i.state_revision)
+}
+
+/// WHY (#1139 review r1 P2-2): the joiner validates the WHOLE carried list
+/// before any mutation — kind, group, unique contiguous revisions ending
+/// at terminal−1 and reaching the stub. Pure function, every refusal arm.
+#[tokio::test]
+async fn issue1139_preflight_rejects_malformed_lists() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let g = s.stable_group_id.as_str();
+    let r1 = s.add_j1.commit.revision;
+    let local = r1 - 1;
+    let pre = |local: u64, terminal: u64, events: Vec<NamedGroupMetadataEvent>| {
+        super::super::preflight_join_result_intervening_events(g, local, terminal, events)
+            .map(|v| v.into_iter().map(|(r, _)| r).collect::<Vec<_>>())
+    };
+    assert_eq!(
+        pre(local, r1 + 1, vec![s.add_j1.event.clone()]),
+        Some(vec![r1])
+    );
+    // Gap: r+1 and r+3 carried for terminal r+4 (r+2 missing).
+    assert_eq!(
+        pre(
+            local,
+            r1 + 3,
+            vec![probe_event(&s, r1, None), probe_event(&s, r1 + 2, None)]
+        ),
+        None
+    );
+    // Duplicate revision.
+    assert_eq!(
+        pre(
+            local,
+            r1 + 1,
+            vec![s.add_j1.event.clone(), probe_event(&s, r1, None)]
+        ),
+        None
+    );
+    // A foreign-group entry LATER in an otherwise contiguous list.
+    assert_eq!(
+        pre(
+            local,
+            r1 + 2,
+            vec![
+                s.add_j1.event.clone(),
+                probe_event(&s, r1 + 1, Some(&"ee".repeat(32)))
+            ]
+        ),
+        None
+    );
+    // At or beyond the terminal.
+    assert_eq!(pre(local, r1, vec![s.add_j1.event.clone()]), None);
+    // Does not reach the stub (first link above local+1).
+    assert_eq!(
+        pre(local, r1 + 2, vec![probe_event(&s, r1 + 1, None)]),
+        None
+    );
+    // A MemberAdded without a commit (nothing to order or verify).
+    let mut uncommitted = s.add_j1.event.clone();
+    if let NamedGroupMetadataEvent::MemberAdded { commit, .. } = &mut uncommitted {
+        *commit = None;
+    }
+    assert_eq!(pre(local, r1 + 1, vec![uncommitted]), None);
+    // Over the cap.
+    let cap = super::super::JOIN_RESULT_INTERVENING_EVENT_CAP;
+    assert_eq!(
+        pre(local, r1 + 1, vec![s.add_j1.event.clone(); cap + 1]),
+        None
+    );
+    Ok(())
+}
+
+/// WHY (#1139 review r1 P2-2): a list whose VALID first link is followed by
+/// a malformed entry is rejected before anything applies — the valid r+1
+/// prefix must not land.
+#[tokio::test]
+async fn issue1139_malformed_carry_applies_no_prefix() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let base = j2_revision(&s).await;
+    let r1 = s.add_j1.commit.revision;
+    let foreign_dup = probe_event(&s, r1, Some(&"ee".repeat(32)));
+    deliver_j2(
+        &s,
+        &result_with_events(&s, vec![s.add_j1.event.clone(), foreign_dup]),
+    )
+    .await;
+    assert_eq!(
+        j2_revision(&s).await,
+        base,
+        "the valid r+1 prefix was not applied"
+    );
+    assert_eq!(
+        join_state(&s.j2, &s.group_key).await,
+        "pending_authority_commit"
+    );
+    Ok(())
+}
+
+/// WHY (#1139 review r1 P2-1): carried events apply ONLY for a bound
+/// attempt. An unbound delivery of the same result mutates nothing
+/// through the carry.
+#[tokio::test]
+async fn issue1139_unbound_result_does_not_apply_carry() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let base = j2_revision(&s).await;
+    super::super::handle_join_result_message_bound(
+        &s.j2,
+        &s.authority_id,
+        true,
+        s.j2_result.clone(),
+        None,
+    )
+    .await;
+    assert_eq!(j2_revision(&s).await, base, "unbound carry applied nothing");
+    Ok(())
+}
+
+/// WHY (#1139 review r1 P2-3): the authority attaches the carry only to a
+/// result the joiner can pull as a control blob (the FetchRequest blob-path
+/// predicate), so a legacy joiner's inline result can never be pushed past
+/// the DM budget and dropped.
+#[test]
+fn issue1139_carry_only_for_blob_capable_bound_fetches() {
+    use super::super::join_result_carry_allowed as allowed;
+    assert!(allowed(true, true, true));
+    assert!(
+        !allowed(true, false, true),
+        "legacy joiner: no blob capability"
+    );
+    assert!(!allowed(true, true, false), "no attempt binding");
+    assert!(!allowed(false, true, true), "unverified fetch");
+}
