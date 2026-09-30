@@ -17,12 +17,19 @@ are no FFI bindings.
 - Non-Rust integration: `docs/local-apps.md`
 
 ## Build and test
-- `just --list` for recipes. CI gate: `cargo fmt --all -- --check`,
+- `just --list` for recipes. Local format, lint and docs checks (a subset of CI):
+  `cargo fmt --all -- --check`,
   `cargo clippy --all-targets --all-features -- -D warnings`, and
   `RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps`.
-- `ant-quic` and `saorsa-gossip` are sibling path dependencies (`../ant-quic`,
-  `../saorsa-gossip`); CI symlinks them from `.deps/`. `Cargo.lock` is gitignored,
-  so a new upstream publish can break a fresh resolve without any x0x change.
+  Passing them is not a full preflight. The `main` ruleset requires the
+  Format Check, Clippy Lint, Test Suite, Documentation and Build linux-x64-gnu
+  checks, and CI also runs coverage, parity, integration and
+  deployment-authority jobs; see `.github/workflows/` for the full set.
+- `ant-quic` and `saorsa-gossip-*` are exact-pinned (`=`) crates.io versions in
+  `Cargo.toml`, and `Cargo.lock` is tracked. CI and release builds use
+  `--locked`, so a dependency bump is a deliberate `Cargo.toml` + `Cargo.lock`
+  change. Local work against sibling checkouts (`../ant-quic`, `../saorsa-gossip`)
+  needs a temporary `[patch]`, which must not be committed.
 - **Running tests needs isolation.** Test daemons join the real network, so test
   execution only runs inside a fresh loopback-only Linux network namespace with
   dropped privileges; macOS/Windows fail closed. Use `just test` / `just test-full`
@@ -43,7 +50,7 @@ Keys are bincode-serialized via `storage.rs`, not JSON.
 
 Stack, bottom to top:
 1. `network.rs` — wraps `ant_quic::Node`, implements `GossipTransport`. ant-quic owns mDNS, UPnP, bootstrap cache and connection orchestration.
-2. `bootstrap.rs` — hard-coded global peers (`DEFAULT_BOOTSTRAP_PEERS`, UDP 5483) are seed hints only, with retry/backoff.
+2. `bootstrap.rs` — retry/backoff for the hard-coded seed hints. `DEFAULT_BOOTSTRAP_PEERS` is defined in `network.rs`; it lists UDP/443 first (preferred, traverses networks that block higher UDP ports) and keeps UDP/5483 for pre-ADR-0011 clients. Seeds are hints only.
 3. `gossip/` — thin orchestration over `saorsa-gossip-*`; `GossipRuntime` owns `PubSubManager`.
 4. `presence.rs` — beacons on the Bulk stream, phi-accrual failure detection, FOAF discovery with trust-scoped visibility.
 5. `crdt/` (task lists), `kv/` (replicated KV with access policies), `mls/` (group encryption), `groups/` (named groups; DHT-free discovery via social propagation, BLAKE3 tag shards and presence). Deltas of a group-scoped task list (`x0x.group.<gid>.symphony.<lid>`) in an `MlsEncrypted` group are sealed with the group's current GSS/TreeKEM key, like group KV stores (`crdt/sealed.rs`, #895); personal lists and `SignedPublic` groups stay plaintext.
