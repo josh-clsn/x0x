@@ -129,9 +129,10 @@ const DURABLE_TYPED_COMPLETION_TIMEOUT: Duration = Duration::from_secs(20);
 const AUTHENTICATED_MACHINE_BINDING_CAPACITY: usize = 65_536;
 
 #[derive(Debug, Clone, Copy)]
-struct AuthenticatedMachineBinding {
-    machine_id: MachineId,
-    announced_at: u64,
+pub(crate) struct AuthenticatedMachineBinding {
+    pub(crate) machine_id: MachineId,
+    pub(crate) announced_at: u64,
+    pub(crate) cert_not_after: Option<u64>,
     last_used: (std::time::Instant, u64),
 }
 
@@ -177,6 +178,19 @@ impl AuthenticatedMachineBindingCache {
     }
 
     fn record(&mut self, agent_id: AgentId, machine_id: MachineId, announced_at: u64) {
+        // ADR-0021 attestations carry no user certificate. Preserve any known
+        // certificate expiry: a new machine attestation cannot renew a cert.
+        let cert_not_after = self.entries.get(&agent_id).and_then(|b| b.cert_not_after);
+        self.record_with_expiry(agent_id, machine_id, announced_at, cert_not_after);
+    }
+
+    fn record_with_expiry(
+        &mut self,
+        agent_id: AgentId,
+        machine_id: MachineId,
+        announced_at: u64,
+        cert_not_after: Option<u64>,
+    ) {
         let tick = self.next_tick();
         if let Some(mut existing) = self.entries.get(&agent_id).copied() {
             self.recency
@@ -185,6 +199,7 @@ impl AuthenticatedMachineBindingCache {
             if announced_at >= existing.announced_at {
                 existing.machine_id = machine_id;
                 existing.announced_at = announced_at;
+                existing.cert_not_after = cert_not_after;
             }
             self.entries.insert(agent_id, existing);
             self.recency.insert((tick.0, tick.1, agent_id.0));
@@ -212,6 +227,7 @@ impl AuthenticatedMachineBindingCache {
             AuthenticatedMachineBinding {
                 machine_id,
                 announced_at,
+                cert_not_after,
                 last_used: tick,
             },
         );
@@ -219,6 +235,11 @@ impl AuthenticatedMachineBindingCache {
     }
 
     fn resolve(&mut self, agent_id: &AgentId) -> Option<MachineId> {
+        self.resolve_evidence(agent_id)
+            .map(|binding| binding.machine_id)
+    }
+
+    fn resolve_evidence(&mut self, agent_id: &AgentId) -> Option<AuthenticatedMachineBinding> {
         let tick = self.next_tick();
         let mut binding = self.entries.get(agent_id).copied()?;
         self.recency
@@ -226,7 +247,7 @@ impl AuthenticatedMachineBindingCache {
         binding.last_used = tick;
         self.entries.insert(*agent_id, binding);
         self.recency.insert((tick.0, tick.1, agent_id.0));
-        Some(binding.machine_id)
+        Some(binding)
     }
 }
 
@@ -248,6 +269,27 @@ pub(crate) async fn record_authenticated_machine_binding(
         .write()
         .await
         .record(agent_id, machine_id, announced_at);
+}
+
+/// Record the certificate lifetime from a verified identity announcement.
+pub(crate) async fn record_authenticated_machine_binding_with_expiry(
+    bindings: &AuthenticatedMachineBindings,
+    agent_id: AgentId,
+    machine_id: MachineId,
+    announced_at: u64,
+    cert_not_after: Option<u64>,
+) {
+    bindings
+        .write()
+        .await
+        .record_with_expiry(agent_id, machine_id, announced_at, cert_not_after);
+}
+
+pub(crate) async fn authenticated_machine_binding_evidence(
+    bindings: &AuthenticatedMachineBindings,
+    agent_id: &AgentId,
+) -> Option<AuthenticatedMachineBinding> {
+    bindings.write().await.resolve_evidence(agent_id)
 }
 
 pub(crate) async fn authenticated_machine_binding(
