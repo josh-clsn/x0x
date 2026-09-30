@@ -57,63 +57,25 @@ async fn r17_fixture(
     group_key
 }
 
-/// Give the local admin an owner-issued certificate on its seat AND in the
-/// discovery cache, so the seal's evidence ladder rates the local agent
-/// Clean (the state's own identity certificate is self-issued).
+/// Seat the running identity's owner-issued certificate. Announcement writers
+/// can no longer contradict a synthetic local discovery certificate (#1132).
 async fn install_owner_issued_local_cert(
     state: &AppState,
     owner: &x0x::identity::UserKeypair,
     group_key: &str,
 ) {
-    let local_kp = state.agent.identity().agent_keypair();
-    let local_cert = x0x::identity::AgentCertificate::issue(owner, local_kp).expect("local cert");
-    {
-        let mut groups = state.named_groups.write().await;
-        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
-        let info = groups.get_mut(group_key).expect("fixture");
-        if let Some(seat) = info.members_v2.get_mut(&local_hex) {
-            seat.certificate = Some(local_cert.clone());
-            seat.certificate_digest = Some(seat_cert_digest_of(&local_cert));
-        }
-    }
-    install_discovery_cert(state, &state.agent, &local_cert).await;
-}
-
-/// Record `cert` as `subject`'s discovered certificate in `state`'s
-/// discovery cache (the seal's evidence ladder reads it).
-async fn install_discovery_cert(
-    state: &AppState,
-    subject: &Agent,
-    cert: &x0x::identity::AgentCertificate,
-) {
-    state.agent.identity_discovery_cache().write().await.insert(
-        subject.agent_id(),
-        x0x::DiscoveredAgent {
-            self_name: None,
-            agent_id: subject.agent_id(),
-            machine_id: subject.machine_id(),
-            user_id: cert.user_id().ok(),
-            addresses: Vec::new(),
-            announced_at: 0,
-            last_seen: 0,
-            machine_public_key: Vec::new(),
-            nat_type: None,
-            can_receive_direct: None,
-            is_relay: None,
-            is_coordinator: None,
-            reachable_via: Vec::new(),
-            relay_candidates: Vec::new(),
-            cert_not_after: cert.not_after(),
-            agent_certificate: Some(cert.clone()),
-            agent_public_key: subject
-                .identity()
-                .agent_keypair()
-                .public_key()
-                .as_bytes()
-                .to_vec(),
-            cert_digest: None,
-        },
-    );
+    let local_cert = state
+        .agent
+        .agent_certificate()
+        .expect("owner identity cert");
+    assert_eq!(local_cert.user_id().ok(), Some(owner.user_id()));
+    let mut groups = state.named_groups.write().await;
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    groups
+        .get_mut(group_key)
+        .expect("fixture")
+        .set_member_certificate(&local_hex, local_cert.clone())
+        .expect("local certificate binds its seat");
 }
 
 async fn cache_pair(
@@ -213,16 +175,10 @@ async fn stable_id_of_group(state: &AppState, group_key: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_daemon_admin_seals_from_a_members_responder() -> Result<()> {
     let plane = format!("r17v2-two-{}", rand::random::<u32>());
-    let (a, _a_dir) = networked_test_state(&plane).await?;
-    let (b, _b_dir) = networked_test_state(&plane).await?;
-    // #1091: the reconnect re-announcer fires a harness-identity beat at
-    // connect time whose ARRIVAL is nondeterministic; landing between the
-    // hand-installed discovery cert and the seal it drops that cert
-    // (ADR-0038 digest coupling — intended). This fixture pins the
-    // hydrate ladder, not announce timing, so the beat is suppressed.
-    a.agent.disable_reconnect_reannounce_for_testing();
-    b.agent.disable_reconnect_reannounce_for_testing();
-    let owner = x0x::identity::UserKeypair::generate().expect("owner key");
+    let owner_seed = rand::random::<[u8; 32]>();
+    let owner = x0x::identity::UserKeypair::from_seed(&owner_seed)?;
+    let (a, _a_dir) = networked_owner_test_state(&plane, &owner_seed).await?;
+    let (b, _b_dir) = networked_owner_test_state(&plane, &owner_seed).await?;
     // M: never started — its owner is offline.
     let m_kp = x0x::identity::AgentKeypair::generate().expect("member key");
     let m_cert = x0x::identity::AgentCertificate::issue(&owner, &m_kp).expect("member cert");
@@ -232,8 +188,7 @@ async fn two_daemon_admin_seals_from_a_members_responder() -> Result<()> {
     install_owner_issued_local_cert(&a, &owner, &group_key).await;
     // B: an ACTIVE member with an owner-issued embedded certificate.
     let b_hex = hex::encode(b.agent.agent_id().as_bytes());
-    let b_cert = x0x::identity::AgentCertificate::issue(&owner, b.agent.identity().agent_keypair())
-        .expect("b cert");
+    let b_cert = b.agent.agent_certificate().context("B owner cert")?.clone();
     {
         let mut groups = a.named_groups.write().await;
         let info = groups.get_mut(&group_key).expect("fixture");
@@ -292,6 +247,9 @@ async fn two_daemon_admin_seals_from_a_members_responder() -> Result<()> {
     wait_connected(&a.agent, &b.agent).await?;
     // Eager-set refresh is a 1s tick (see tests/gossip_plane_isolation.rs).
     tokio::time::sleep(Duration::from_millis(1500)).await;
+    // B's real announce/blob path supplies B's certificate. No raw cache
+    // overwrite and no reconnect suppression: all writers stay enabled.
+    announce_owner_cert_to(&a.agent, &b.agent).await?;
     let b_state = Arc::clone(&b);
     let b_key = group_key.clone();
     let b_pump = tokio::spawn(async move {
@@ -338,7 +296,7 @@ async fn two_daemon_admin_seals_from_a_members_responder() -> Result<()> {
         matches!(
             &err,
             x0x::groups::state_commit::ApplyError::OwnerCertMemberPending { members, .. }
-                if members.iter().any(|m| m == &m_hex)
+                if members == &vec![m_hex.clone()]
         ),
         "{err}"
     );
@@ -387,11 +345,7 @@ async fn two_daemon_admin_seals_from_a_members_responder() -> Result<()> {
         "the response hydrate clears the stable-id-keyed refusal window"
     );
 
-    // Seal #2 (the joiner's retry re-drives it): succeeds. B announces its
-    // harness-issued identity, not the owner-issued certificate on its
-    // seat, so A's discovery entry for B is set to what A holds for a Home
-    // member — B's owner-issued certificate — immediately before sealing.
-    install_discovery_cert(&a, &b.agent, &b_cert).await;
+    // Seal #2 succeeds with B's actually announced owner certificate.
     let mut second = a
         .named_groups
         .read()
@@ -612,8 +566,9 @@ async fn terminal_refusal_after_the_deadline() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn seal_success_resets_the_refusal_window() -> Result<()> {
     let plane = format!("r17v2-d-{}", rand::random::<u32>());
-    let (state, _dir) = networked_test_state(&plane).await?;
-    let owner = x0x::identity::UserKeypair::generate().expect("owner key");
+    let owner_seed = rand::random::<[u8; 32]>();
+    let owner = x0x::identity::UserKeypair::from_seed(&owner_seed)?;
+    let (state, _dir) = networked_owner_test_state(&plane, &owner_seed).await?;
     let remote_kp = x0x::identity::AgentKeypair::generate().expect("remote key");
     let remote_cert =
         x0x::identity::AgentCertificate::issue(&owner, &remote_kp).expect("remote cert");
