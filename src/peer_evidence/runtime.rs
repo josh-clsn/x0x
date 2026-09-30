@@ -97,6 +97,7 @@ impl EvidencePolicy for RuntimePolicy {
 pub struct EvidenceRuntime {
     pub(crate) lookup_context: std::sync::OnceLock<std::sync::Weak<crate::evidence_wire::Context>>,
     pub(crate) group_context: std::sync::RwLock<Option<Arc<GroupContext>>>,
+    pub(crate) lookup_hints: crate::evidence_wire::lookup::RoutingHints,
     pub(crate) wire_limits: Arc<crate::evidence_wire::Limits>,
     store: std::sync::OnceLock<Arc<PeerEvidenceStore>>,
     ready: tokio_util::sync::CancellationToken,
@@ -115,6 +116,7 @@ impl Default for EvidenceRuntime {
         Self {
             lookup_context: Default::default(),
             group_context: Default::default(),
+            lookup_hints: Default::default(),
             wire_limits: Arc::new(crate::evidence_wire::Limits::default()),
             store: Default::default(),
             ready: Default::default(),
@@ -138,6 +140,11 @@ impl EvidenceRuntime {
     /// Pull missing relationship evidence over bounded connected-peer streams.
     /// Callers must re-read their authoritative sources after this await.
     pub(crate) async fn lookup(&self, agent: AgentId, machine: Option<MachineId>) {
+        // Only the raw receive path supplies a transport-authenticated machine.
+        // Its claimed agent is a routing hint, never evidence authority.
+        if let Some(machine) = machine {
+            self.lookup_hints.record(agent, machine);
+        }
         let now = crate::dm_capability::now_unix_ms();
         let usable = match machine {
             Some(machine) => self.usable(agent, machine, now),

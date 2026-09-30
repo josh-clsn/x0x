@@ -5,6 +5,50 @@ use std::collections::HashSet;
 
 const LOOKUP_INTERVAL: Duration = Duration::from_secs(30);
 const FANOUT: usize = 3;
+// A hostile host may accumulate arbitrarily many co-resident identities.
+// Bound each indexed source as well as fan-out; excess candidates fail closed.
+const MACHINE_BINDING_LIMIT: usize = 16;
+const HINT_CAP: usize = 128;
+
+/// Untrusted, process-only raw-frame routing claims. Never read by authority paths.
+#[derive(Default)]
+pub(crate) struct RoutingHints(Mutex<VecDeque<(AgentId, MachineId, Instant)>>);
+impl RoutingHints {
+    pub(crate) fn record(&self, agent: AgentId, machine: MachineId) {
+        let Ok(mut hints) = self.0.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        hints.retain(|(a, m, at)| {
+            now.duration_since(*at) < Duration::from_millis(W_MS) && (*a != agent || *m != machine)
+        });
+        if hints.len() == HINT_CAP {
+            hints.pop_front();
+        }
+        hints.push_back((agent, machine, now));
+    }
+
+    fn machines(&self, target: AgentId) -> Vec<MachineId> {
+        let Ok(mut hints) = self.0.lock() else {
+            return Vec::new();
+        };
+        let now = Instant::now();
+        hints.retain(|(_, _, at)| now.duration_since(*at) < Duration::from_millis(W_MS));
+        // Reads refresh LRU order, never the freshness deadline.
+        let mut matches = VecDeque::new();
+        hints.retain(|(a, m, at)| {
+            if *a == target {
+                matches.push_back((*a, *m, *at));
+                false
+            } else {
+                true
+            }
+        });
+        let machines = matches.iter().map(|(_, m, _)| *m).collect();
+        hints.extend(matches);
+        machines
+    }
+}
 
 #[derive(Serialize)]
 pub(super) struct Found {
@@ -71,11 +115,17 @@ struct Relations {
     local: Peer,
     bindings: crate::dm_inbox::AuthenticatedMachineBindings,
     discovery: Arc<tokio::sync::RwLock<HashMap<AgentId, crate::DiscoveredAgent>>>,
+    machines: Arc<tokio::sync::RwLock<HashMap<MachineId, crate::DiscoveredMachine>>>,
+    #[cfg(test)]
+    peer_checks: std::sync::atomic::AtomicUsize,
     owner: crate::owner_trust::OwnerTrust,
     revoked: Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>,
 }
 impl Relations {
     async fn peer(&self, agent: AgentId) -> Option<Peer> {
+        #[cfg(test)]
+        self.peer_checks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if agent == self.local.agent {
             return Some(self.local.clone());
         }
@@ -164,18 +214,19 @@ impl Relations {
             })
     }
 
-    async fn candidates(&self) -> HashSet<AgentId> {
+    async fn machine_agents(&self, machine: MachineId) -> HashSet<AgentId> {
         let mut agents: HashSet<_> = self
             .bindings
             .read()
             .await
-            .evidence_candidates()
+            .agents_on_machine(machine, MACHINE_BINDING_LIMIT)
             .into_iter()
-            .map(|(a, _)| a)
             .collect();
-        agents.extend(self.discovery.read().await.keys().copied());
+        if let Some(entry) = self.machines.read().await.get(&machine) {
+            agents.extend(entry.agent_ids.iter().take(MACHINE_BINDING_LIMIT).copied());
+        }
         if let Some(store) = self.runtime.store() {
-            agents.extend(store.agents());
+            agents.extend(store.agents_on_machine(machine, MACHINE_BINDING_LIMIT));
         }
         agents
     }
@@ -190,15 +241,34 @@ impl Relations {
             return Vec::new();
         }
         let mut eligible = Vec::new();
-        for agent in self.candidates().await {
-            let Some(peer) = self.peer(agent).await else {
-                continue;
-            };
-            if connected.contains(&peer.machine)
-                && self.shared(&self.local, &peer)
-                && (agent == target || self.shared(&peer, &target_peer))
-            {
-                eligible.push((agent, peer.machine));
+        for machine in connected {
+            for agent in self.machine_agents(*machine).await {
+                let Some(peer) = self.peer(agent).await else {
+                    continue;
+                };
+                if peer.machine == *machine
+                    && self.shared(&self.local, &peer)
+                    && (agent == target || self.shared(&peer, &target_peer))
+                {
+                    eligible.push((agent, *machine));
+                }
+            }
+        }
+        // A claim can route ONLY a query for the claimed agent itself. It
+        // neither authorizes an inbound Lookup nor vouches for the reply.
+        // Untrusted claims must not displace a connected, verified own host.
+        if !eligible.iter().any(|(agent, _)| *agent == target) {
+            for machine in self.runtime.lookup_hints.machines(target) {
+                if connected.contains(&machine) {
+                    let hint = Peer {
+                        agent: target,
+                        machine,
+                        cert: None,
+                    };
+                    if self.shared(&self.local, &hint) {
+                        eligible.push((target, machine));
+                    }
+                }
             }
         }
         select(target, eligible)
@@ -213,7 +283,7 @@ impl Relations {
             machine: MachineId([0; 32]),
             cert: None,
         });
-        for agent in self.candidates().await {
+        for agent in self.machine_agents(machine).await {
             let Some(requester) = self.peer(agent).await else {
                 continue;
             };
@@ -252,6 +322,9 @@ impl Context {
             },
             bindings: Arc::clone(&self.bindings),
             discovery: Arc::clone(&self.discovery),
+            machines: Arc::clone(&self.machines),
+            #[cfg(test)]
+            peer_checks: Default::default(),
             owner: self.owner.clone(),
             revoked: Arc::clone(&self.revoked),
         })
@@ -391,12 +464,12 @@ fn ingest_found(
     if view.announcement.agent_id != target {
         return Err(invalid("lookup target mismatch"));
     }
-    if let Some(cert) = &view.certificate {
-        if announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()))
-            != view.announcement.cert_digest
-        {
-            return Err(invalid("certificate digest mismatch"));
-        }
+    let user = view
+        .certificate
+        .as_ref()
+        .and_then(|cert| cert.user_id().ok());
+    if announce_v3::cert_digest(&user, &view.certificate) != view.announcement.cert_digest {
+        return Err(invalid("certificate digest mismatch"));
     }
     store
         .ingest_verified(record, view, IngestSource::Gossip, now)
@@ -507,6 +580,8 @@ mod tests {
                 },
                 bindings: Arc::default(),
                 discovery: Arc::default(),
+                machines: Arc::default(),
+                peer_checks: Default::default(),
                 owner,
                 revoked,
             };
@@ -561,9 +636,13 @@ mod tests {
     async fn s4_30b_restart_then_new_group_pulls_owners_fresh_own_identity() {
         let joiner = Node::new().await;
         let owner = Node::new().await;
-        // The join transport authenticates the hosts; no announce/advert record
-        // from before the restart and no gossip KEM key exists at the joiner.
-        joiner.know(&owner).await;
+        // Raw receive supplies only a claimed agent plus the authenticated
+        // transport machine. No owner binding, discovery, or stored evidence.
+        joiner
+            .relations
+            .runtime
+            .lookup(owner.a(), Some(owner.m()))
+            .await;
         owner.know(&joiner).await;
         let connected = HashSet::from([owner.m()]);
         assert!(joiner
@@ -592,6 +671,51 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        let now = dm_capability::now_unix_ms();
+        assert!(joiner
+            .relations
+            .bindings
+            .read()
+            .await
+            .agents_on_machine(owner.m(), 1)
+            .is_empty());
+        assert!(joiner.relations.peer(owner.a()).await.is_none());
+        assert!(
+            !crate::raw_delivery_with_evidence(
+                None,
+                None,
+                Some(&joiner.relations.runtime),
+                owner.a(),
+                owner.m(),
+                now
+            )
+            .0
+        );
+        assert!(!joiner.relations.authorized(owner.m(), joiner.a()).await);
+        assert!(joiner
+            .relations
+            .responders(joiner.a(), &connected)
+            .await
+            .is_empty());
+        let mut tampered = owner.mint().unwrap().into_record();
+        tampered.advert[100] ^= 1;
+        assert!(ingest_found(
+            &joiner.store(),
+            &Limits::default(),
+            owner.a(),
+            tampered,
+            now
+        )
+        .is_err());
+        assert!(ingest_found(
+            &joiner.store(),
+            &Limits::default(),
+            owner.a(),
+            joiner.mint().unwrap().into_record(),
+            now
+        )
+        .is_err());
+        assert!(joiner.relations.peer(owner.a()).await.is_none());
         let body = codec().serialize(&reply).unwrap();
         ingest_found(
             &joiner.store(),
@@ -605,10 +729,20 @@ mod tests {
             .store()
             .usable_agent(owner.a(), dm_capability::now_unix_ms())
             .unwrap();
+        assert!(
+            crate::raw_delivery_with_evidence(
+                None,
+                None,
+                Some(&joiner.relations.runtime),
+                owner.a(),
+                owner.m(),
+                now
+            )
+            .0
+        );
         assert_eq!(evidence.announcement.machine_id, owner.m());
         assert_eq!(evidence.advert.capabilities.kem_public_key.len(), 1184);
-        // An unrelated connected machine is never a Lookup candidate, even
-        // if it sends a raw frame claiming to be the relationship peer.
+        // Evidence for the owner still never verifies a different machine.
         let moved = MachineId([18; 32]);
         assert!(joiner
             .store()
@@ -619,6 +753,43 @@ mod tests {
             .responders(owner.a(), &HashSet::from([moved]))
             .await
             .is_empty());
+        // A hint from a different transport may route a self-query, but even
+        // the valid reply above cannot verify the owner's claim on that host.
+        joiner
+            .relations
+            .runtime
+            .lookup(owner.a(), Some(moved))
+            .await;
+        assert_eq!(
+            joiner
+                .relations
+                .responders(owner.a(), &HashSet::from([moved]))
+                .await,
+            vec![moved]
+        );
+        assert!(
+            !crate::raw_delivery_with_evidence(
+                None,
+                None,
+                Some(&joiner.relations.runtime),
+                owner.a(),
+                moved,
+                now
+            )
+            .0
+        );
+        assert_eq!(
+            joiner
+                .relations
+                .responders(owner.a(), &HashSet::from([owner.m(), moved]))
+                .await,
+            vec![owner.m()]
+        );
+        assert!(joiner
+            .relations
+            .responders(owner.a(), &HashSet::new())
+            .await
+            .is_empty());
         // No discovery entries or capability bits are installed by Lookup.
         assert!(joiner.relations.discovery.read().await.is_empty());
         joiner.rosters.lock().unwrap().clear();
@@ -626,6 +797,176 @@ mod tests {
             .store()
             .usable_agent(owner.a(), dm_capability::now_unix_ms())
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn s4_machine_resolution_work_is_independent_of_registry_size() {
+        use std::sync::atomic::Ordering;
+        let responder = Node::new().await;
+        let requester = Node::new().await;
+        responder.know(&requester).await;
+        responder.group(&[responder.a(), requester.a()]);
+        // Fill the registry to its production ceiling with unrelated machines.
+        for i in 0u32..65_535 {
+            let mut bytes = [0; 32];
+            bytes[..4].copy_from_slice(&i.to_le_bytes());
+            crate::dm_inbox::record_authenticated_machine_binding(
+                &responder.relations.bindings,
+                AgentId(bytes),
+                MachineId(bytes),
+                1,
+            )
+            .await;
+        }
+        responder.relations.peer_checks.store(0, Ordering::Relaxed);
+        assert!(
+            responder
+                .relations
+                .authorized(requester.m(), responder.a())
+                .await
+        );
+        assert_eq!(
+            responder.relations.peer_checks.swap(0, Ordering::Relaxed),
+            3
+        );
+        assert!(
+            !responder
+                .relations
+                .authorized(MachineId([255; 32]), responder.a())
+                .await
+        );
+        assert_eq!(
+            responder.relations.peer_checks.swap(0, Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            responder
+                .relations
+                .responders(requester.a(), &HashSet::from([requester.m()]))
+                .await,
+            vec![requester.m()]
+        );
+        assert_eq!(
+            responder.relations.peer_checks.swap(0, Ordering::Relaxed),
+            2
+        );
+
+        // Co-resident Sybils also cannot turn one machine lookup into a scan.
+        let crowded = MachineId([254; 32]);
+        for i in 0u32..256 {
+            let mut bytes = [0; 32];
+            bytes[..4].copy_from_slice(&i.to_le_bytes());
+            crate::dm_inbox::record_authenticated_machine_binding(
+                &responder.relations.bindings,
+                AgentId(bytes),
+                crowded,
+                2,
+            )
+            .await;
+        }
+        assert!(!responder.relations.authorized(crowded, responder.a()).await);
+        assert_eq!(
+            responder.relations.peer_checks.load(Ordering::Relaxed),
+            2 + MACHINE_BINDING_LIMIT
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn s4_raw_hints_are_lru_bounded_and_reads_do_not_extend_ttl() {
+        let hints = RoutingHints::default();
+        for i in 0..HINT_CAP {
+            hints.record(AgentId([i as u8; 32]), MachineId([i as u8; 32]));
+        }
+        assert_eq!(hints.machines(AgentId([0; 32])), vec![MachineId([0; 32])]);
+        hints.record(AgentId([255; 32]), MachineId([255; 32]));
+        assert_eq!(hints.0.lock().unwrap().len(), HINT_CAP);
+        assert!(hints.machines(AgentId([1; 32])).is_empty());
+        assert_eq!(hints.machines(AgentId([0; 32])), vec![MachineId([0; 32])]);
+        tokio::time::advance(Duration::from_millis(W_MS - 1)).await;
+        assert!(!hints.machines(AgentId([0; 32])).is_empty());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(hints.machines(AgentId([0; 32])).is_empty());
+        assert!(hints.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn s4_discovery_machine_index_is_only_a_candidate_source() {
+        let responder = Node::new().await;
+        let requester = Node::new().await;
+        responder.group(&[responder.a(), requester.a()]);
+        let mut discovered =
+            crate::discovered_agent_fixture(1, dm_capability::now_unix_ms() / 1000, &[], None);
+        discovered.agent_id = requester.a();
+        discovered.machine_id = requester.m();
+        crate::upsert_discovered_machine_from_agent(&responder.relations.machines, &discovered)
+            .await;
+        responder
+            .relations
+            .discovery
+            .write()
+            .await
+            .insert(requester.a(), discovered.clone());
+        assert!(
+            responder
+                .relations
+                .authorized(requester.m(), responder.a())
+                .await
+        );
+        // An obsolete reverse pointer cannot override a move in discovery.
+        discovered.machine_id = MachineId([99; 32]);
+        responder
+            .relations
+            .discovery
+            .write()
+            .await
+            .insert(requester.a(), discovered);
+        assert!(
+            !responder
+                .relations
+                .authorized(requester.m(), responder.a())
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn s4_stored_machine_index_survives_restart_and_checks_authority() {
+        let responder = Node::new().await;
+        let requester = Node::new().await;
+        responder.group(&[responder.a(), requester.a()]);
+        let now = dm_capability::now_unix_ms();
+        responder
+            .store()
+            .ingest(
+                requester.mint().unwrap().into_record(),
+                IngestSource::Gossip,
+                now,
+            )
+            .unwrap();
+        responder.store().flush(now, true).unwrap();
+        assert!(
+            responder
+                .relations
+                .authorized(requester.m(), responder.a())
+                .await
+        );
+        let restarted = PeerEvidenceStore::open(
+            responder.dir.path(),
+            Default::default(),
+            responder.policy.clone(),
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            restarted.agents_on_machine(requester.m(), MACHINE_BINDING_LIMIT),
+            vec![requester.a()]
+        );
+        responder.rosters.lock().unwrap().clear();
+        assert!(
+            !responder
+                .relations
+                .authorized(requester.m(), responder.a())
+                .await
+        );
     }
 
     #[tokio::test]
@@ -737,6 +1078,21 @@ mod tests {
             target.a(),
             record.clone(),
             now + W_MS + 1001
+        )
+        .is_err());
+        let mut wrong_digest = record.clone();
+        let mut announcement = announce_v3::deserialize_v3(&wrong_digest.announcement).unwrap();
+        announcement.cert_digest = [17; 32];
+        announcement
+            .sign_v3_1(target.identity.machine_keypair().secret_key())
+            .unwrap();
+        wrong_digest.announcement = announce_v3::serialize_v3_1(&announcement).unwrap();
+        assert!(ingest_found(
+            &cold.store(),
+            &Limits::default(),
+            target.a(),
+            wrong_digest,
+            now
         )
         .is_err());
         ingest_found(&cold.store(), &Limits::default(), target.a(), record, now).unwrap();

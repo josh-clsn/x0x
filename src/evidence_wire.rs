@@ -19,7 +19,7 @@ use tokio::{
 };
 
 mod decode;
-mod lookup;
+pub(crate) mod lookup;
 
 const MESSAGE_CAP: usize = 32 * 1024;
 // Reserve the frame, decoded vectors, and signed-part verification copies.
@@ -521,6 +521,7 @@ pub(crate) struct Context {
     own_cert: crate::announce_blob::SharedCertPair,
     capabilities: Arc<tokio::sync::watch::Sender<crate::dm::DmCapabilities>>,
     discovery: Arc<tokio::sync::RwLock<HashMap<AgentId, crate::DiscoveredAgent>>>,
+    machines: Arc<tokio::sync::RwLock<HashMap<MachineId, crate::DiscoveredMachine>>>,
     owner: crate::owner_trust::OwnerTrust,
     revoked: Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>,
 }
@@ -873,6 +874,7 @@ impl crate::Agent {
             own_cert: Arc::clone(&self.own_cert_pair),
             capabilities: Arc::clone(&self.dm_capabilities_tx),
             discovery: Arc::clone(&self.identity_discovery_cache),
+            machines: Arc::clone(&self.machine_discovery_cache),
             owner: self.owner_trust.clone(),
             revoked: Arc::clone(&self.revocation_set),
         });

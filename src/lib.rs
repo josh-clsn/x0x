@@ -14161,11 +14161,19 @@ impl Agent {
                     digest = %digest,
                 );
 
-                if evidence_ready
-                    && !discovery_cache.read().await.contains_key(&sender)
-                    && crate::dm_inbox::authenticated_machine_binding_evidence(&authenticated_machine_bindings, &sender).await.is_none()
-                {
-                    evidence.lookup(sender, Some(machine_id)).await;
+                if evidence_ready {
+                    let registry = crate::dm_inbox::authenticated_machine_binding_evidence(
+                        &authenticated_machine_bindings, &sender,
+                    ).await;
+                    let verified = {
+                        let cache = discovery_cache.read().await;
+                        raw_delivery_with_evidence(cache.get(&sender), registry, Some(evidence.as_ref()), sender, machine_id, dm_capability::now_unix_ms()).0
+                    };
+                    if !verified {
+                        // The claimed sender is only a bounded routing hint
+                        // for looking up itself on this authenticated transport.
+                        evidence.lookup(sender, Some(machine_id)).await;
+                    }
                 }
 
                 // Select one authoritative binding and its expiry for both
