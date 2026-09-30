@@ -2523,6 +2523,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn s2_raw_live_supersession_and_expiry_cannot_fall_back_to_evidence_1098() {
+        let p = Peer::new();
+        let now = crate::dm_capability::now_unix_ms();
+        let secs = now / 1000;
+        let (dir, policy, store) = setup(&p);
+        store
+            .ingest(p.record(now, now), IngestSource::Hello, now)
+            .unwrap();
+        drop(store);
+        let runtime = Arc::new(EvidenceRuntime::default());
+        runtime.start(
+            dir.path().to_owned(),
+            EvidenceConfig::default(),
+            policy,
+            Arc::default(),
+        );
+        assert!(runtime.wait(0).await);
+        let bindings = crate::dm_inbox::AuthenticatedMachineBindings::default();
+        crate::dm_inbox::record_authenticated_machine_binding(&bindings, p.a(), p.m(), secs).await;
+        let registry =
+            crate::dm_inbox::authenticated_machine_binding_evidence(&bindings, &p.a()).await;
+        let moved = MachineId([9; 32]);
+        let mut cache = crate::discovered_agent_fixture(9, secs + 1, &[], None);
+        cache.agent_id = p.a();
+        // A newer cached move (including a timestamp tie) beats the old
+        // registry. The still-usable stored old binding cannot resurrect it.
+        for (announced_at, winner) in [(secs + 1, moved), (secs, moved), (secs - 1, p.m())] {
+            cache.announced_at = announced_at;
+            for machine in [p.m(), moved] {
+                let (verified, live, _) = crate::raw_delivery_with_evidence(
+                    Some(&cache),
+                    registry,
+                    Some(&runtime),
+                    p.a(),
+                    machine,
+                    now,
+                );
+                assert_eq!((verified, live), (machine == winner, machine == winner));
+            }
+        }
+        // Expired discovery cannot fall back to either cert-less registry
+        // evidence or the valid stored record, regardless of which is newer.
+        cache.machine_id = p.m();
+        cache.cert_not_after = Some(secs - 1000);
+        for announced_at in [secs - 1, secs + 1] {
+            cache.announced_at = announced_at;
+            let (verified, live, expiry) = crate::raw_delivery_with_evidence(
+                Some(&cache),
+                registry,
+                Some(&runtime),
+                p.a(),
+                p.m(),
+                now,
+            );
+            assert_eq!((verified, live), (false, false));
+            assert_eq!(expiry, cache.cert_not_after);
+        }
+        crate::dm_inbox::record_authenticated_machine_binding_with_expiry(
+            &bindings,
+            p.a(),
+            p.m(),
+            secs + 2,
+            Some(secs - 1000),
+        )
+        .await;
+        let registry =
+            crate::dm_inbox::authenticated_machine_binding_evidence(&bindings, &p.a()).await;
+        let (verified, live, expiry) =
+            crate::raw_delivery_with_evidence(None, registry, Some(&runtime), p.a(), p.m(), now);
+        assert_eq!((verified, live), (false, false));
+        assert_eq!(expiry, Some(secs - 1000));
+        // With both live sources absent, stored authority verifies this frame
+        // without acquiring the authority to seed the reverse-routing cache.
+        assert_eq!(
+            crate::raw_delivery_with_evidence(None, None, Some(&runtime), p.a(), p.m(), now),
+            (true, false, None),
+        );
+    }
+
+    #[tokio::test]
     async fn s2_capture_pairs_verbatim_bytes_when_relationship_appears() {
         let p = Peer::new();
         let now = crate::dm_capability::now_unix_ms();

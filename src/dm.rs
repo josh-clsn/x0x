@@ -86,19 +86,22 @@ impl CapabilityRegistry {
 
     /// Require the bit for a typed product payload. Ordinary DMs are unchanged.
     pub fn require_payload(self, payload: &[u8]) -> std::result::Result<(), DmError> {
-        let required = if payload.starts_with(crate::share_grant::SHARE_GRANT_DM_PREFIX) {
-            Some((Self::SHARE_GRANT_V1, "share_grant_v1"))
-        } else if payload.starts_with(b"X0X-GROUP-PREDECESSOR-RELAY-V1\n") {
-            Some((Self::PREDECESSOR_OFFER_V1, "predecessor_offer_v1"))
-        } else {
-            None
-        };
-        if let Some((bit, capability)) = required {
+        if let Some((bit, capability)) = Self::required_for_payload(payload) {
             if !self.supports(bit) {
                 return Err(DmError::RecipientUpgradeRequired { capability });
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn required_for_payload(payload: &[u8]) -> Option<(u64, &'static str)> {
+        if payload.starts_with(crate::share_grant::SHARE_GRANT_DM_PREFIX) {
+            Some((Self::SHARE_GRANT_V1, "share_grant_v1"))
+        } else if payload.starts_with(b"X0X-GROUP-PREDECESSOR-RELAY-V1\n") {
+            Some((Self::PREDECESSOR_OFFER_V1, "predecessor_offer_v1"))
+        } else {
+            None
+        }
     }
 
     /// Unknown registry versions never imply support.

@@ -2722,14 +2722,17 @@ impl OwnerSyncService {
                     if let Some(owner_kp) = self.owner_kp() {
                         if self.should_mint_home_pointer(&home_value).await {
                             let local_machine_for_mint = self.agent.machine_id();
-                            self.mint_or_log(
-                                SyncKind::HomePointer,
-                                HOME_POINTER_KEY,
-                                home_value,
-                                owner_kp,
-                                local_machine_for_mint,
-                            )
-                            .await;
+                            // #1097: publication is a session precondition;
+                            // never exchange an empty vector after a failed mint.
+                            self.store
+                                .mint(
+                                    SyncKind::HomePointer,
+                                    HOME_POINTER_KEY,
+                                    &home_value,
+                                    owner_kp,
+                                    local_machine_for_mint,
+                                )
+                                .await?;
                         }
                     }
                 }
