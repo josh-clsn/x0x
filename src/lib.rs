@@ -1608,11 +1608,15 @@ async fn record_authenticated_machine_binding_from_message(
         );
         return false;
     }
-    dm_inbox::record_authenticated_machine_binding(
+    dm_inbox::record_authenticated_machine_binding_with_expiry(
         bindings,
         announcement.agent_id,
         announcement.machine_id,
         announcement.announced_at,
+        announcement
+            .agent_certificate
+            .as_ref()
+            .and_then(identity::AgentCertificate::not_after),
     )
     .await;
     true
@@ -3950,15 +3954,36 @@ struct RawDirectDelivery {
     digest: String,
 }
 
-/// The post-validation raw-QUIC delivery path. The listener calls this only
-/// after the revocation, pairing, and expiry gates have passed.
-/// #1088: the DELIVERY `verified` decision for a raw 0x10 frame. The
-/// discovery-cache match alone, OR the AuthenticatedMachineBindings
-/// registry naming THIS transport-authentic machine — guarded so a KNOWN
-/// expired certificate cannot be resurrected by the registry arm (the
-/// is_expired drop gate downstream then refuses the frame). An absent
-/// cache entry (`None`) keeps the pre-#130 fail-open: no expiry is known,
-/// so none is enforced, exactly as the cache-only behaviour did.
+/// Resolve raw-frame evidence by signed announcement time (#1098).
+/// Discovery wins timestamp ties, so a conflicting cached move cannot be
+/// undone by an equally old registry record. A strictly newer authenticated
+/// registry binding still wins over stale discovery (#898 C1 / #927).
+fn raw_delivery_binding(
+    cache: Option<&DiscoveredAgent>,
+    registry: Option<dm_inbox::AuthenticatedMachineBinding>,
+    machine_id: identity::MachineId,
+) -> (bool, bool, Option<u64>) {
+    if let Some(binding) = registry {
+        if cache.is_none_or(|entry| binding.announced_at > entry.announced_at) {
+            return (
+                false,
+                binding.machine_id == machine_id,
+                // A cert-less attestation cannot erase expiry already known
+                // from discovery (#1088), even if its machine binding is newer.
+                binding
+                    .cert_not_after
+                    .or_else(|| cache.and_then(|entry| entry.cert_not_after)),
+            );
+        }
+    }
+    cache
+        .map(|entry| (entry.machine_id == machine_id, false, entry.cert_not_after))
+        .unwrap_or((false, false, None))
+}
+
+/// #1088: registry evidence verifies raw delivery only while its certificate
+/// is current. Both arms use the selected binding's expiry at the downstream
+/// drop gate; None retains compatibility with peers without certificates.
 fn raw_delivery_verified(
     cache_verified: bool,
     registry_names_this_machine: bool,
@@ -8151,6 +8176,25 @@ impl Agent {
             agent,
             machine,
             announced_at,
+        )
+        .await;
+    }
+
+    /// Test seam for a retained binding whose certificate has since expired.
+    #[doc(hidden)]
+    pub async fn record_authenticated_binding_with_expiry_for_testing(
+        &self,
+        agent: identity::AgentId,
+        machine: identity::MachineId,
+        announced_at: u64,
+        cert_not_after: Option<u64>,
+    ) {
+        dm_inbox::record_authenticated_machine_binding_with_expiry(
+            &self.authenticated_machine_bindings,
+            agent,
+            machine,
+            announced_at,
+            cert_not_after,
         )
         .await;
     }
@@ -13589,38 +13633,17 @@ impl Agent {
                     digest = %digest,
                 );
 
-                // Verify AgentId→MachineId binding for DELIVERY (#1088):
-                // the identity discovery cache, OR the
-                // AuthenticatedMachineBindings registry — the registry entry
-                // is authenticated evidence of the same quality (a verified
-                // identity announcement or a fresh machine-key attestation
-                // over an agent-signed envelope; recorded on the inbox path
-                // at inbound_origin_attested). Post-restart the discovery
-                // cache is empty until the peer's next announcement (~600 s
-                // cadence), which left every raw frame delivered
-                // `verified=false` and dropped by the #1070 gates (Welcome,
-                // files, join-result, control-blob) for that whole window —
-                // the g46r2 finding-3 stalls.
-                //
-                // Expiry guard: when the cache DOES know the peer's
-                // `cert_not_after` and it is expired, the registry arm must
-                // not resurrect verification — the frame stays unverified and
-                // the is_expired drop gate below handles it. An absent cache
-                // entry keeps the pre-#130 fail-open (`None` = no expiry
-                // known), unchanged from the cache-only behaviour.
-                let (cache_verified, cert_not_after) = {
-                    let cache = discovery_cache.read().await;
-                    cache
-                        .get(&sender)
-                        .map(|entry| (entry.machine_id == machine_id, entry.cert_not_after))
-                        .unwrap_or((false, None))
-                };
-                let registry_names_this_machine = crate::dm_inbox::authenticated_machine_binding(
+                // Select one authoritative binding and its expiry for both
+                // delivery verification and the runtime expiry gate (#1098).
+                let registry = crate::dm_inbox::authenticated_machine_binding_evidence(
                     &authenticated_machine_bindings,
                     &sender,
                 )
-                .await
-                .is_some_and(|bound| bound == machine_id);
+                .await;
+                let (cache_verified, registry_names_this_machine, cert_not_after) = {
+                    let cache = discovery_cache.read().await;
+                    raw_delivery_binding(cache.get(&sender), registry, machine_id)
+                };
                 let verified = raw_delivery_verified(
                     cache_verified,
                     registry_names_this_machine,
@@ -13771,8 +13794,8 @@ impl Agent {
                 // authenticated binding lands, matching the #927 evidence
                 // rule. Since #1088 the registry arm is computed once, above,
                 // and is already part of the DELIVERY `verified` (with the
-                // expiry guard); an unverified claim — no cache match AND no
-                // registry binding naming THIS machine — still never rebinds.
+                // expiry guard and #1098 timestamp supersession); an
+                // unverified or superseded claim still never rebinds.
                 dm.mark_raw_direct_sender_connected(sender, machine_id, verified)
                     .await;
 
@@ -20622,6 +20645,101 @@ mod tests {
         // matches the machine but the downstream is_expired gate drops it;
         // this helper reports the BINDING only, as before).
         assert!(raw_delivery_verified(true, false, Some(now - 1), now));
+    }
+
+    /// #1098 acceptance: a newer cached move supersedes the old registry.
+    #[tokio::test]
+    async fn raw_delivery_newer_cache_supersedes_registry_1098() {
+        let agent = identity::AgentId([0x98; 32]);
+        let old_machine = identity::MachineId([1; 32]);
+        let new_machine = identity::MachineId([2; 32]);
+        let now = 1_800_000_000;
+        let bindings = dm_inbox::AuthenticatedMachineBindings::default();
+        dm_inbox::record_authenticated_machine_binding(&bindings, agent, old_machine, now - 10)
+            .await;
+        let registry = dm_inbox::authenticated_machine_binding_evidence(&bindings, &agent).await;
+        let mut cache = DiscoveredAgent {
+            agent_id: agent,
+            machine_id: new_machine,
+            announced_at: now,
+            ..test_discovered_agent_for_1098()
+        };
+        let (cached, retained, expiry) = raw_delivery_binding(Some(&cache), registry, old_machine);
+        assert!(
+            !raw_delivery_verified(cached, retained, expiry, now),
+            "#1098: old registry machine must not verify after a cached move"
+        );
+
+        // Equal timestamps fail closed to the cached move.
+        cache.announced_at = now - 10;
+        let (cached, retained, expiry) = raw_delivery_binding(Some(&cache), registry, old_machine);
+        assert!(!raw_delivery_verified(cached, retained, expiry, now));
+        // A newer registry supersedes an older cache in BOTH directions.
+        cache.announced_at = now - 20;
+        for (machine, expected) in [(old_machine, true), (new_machine, false)] {
+            let (cached, retained, expiry) = raw_delivery_binding(Some(&cache), registry, machine);
+            assert_eq!(
+                raw_delivery_verified(cached, retained, expiry, now),
+                expected
+            );
+        }
+        // A newer cert-less attestation must not bypass known cache expiry.
+        cache.cert_not_after = Some(now - 1000);
+        let (cached, retained, expiry) = raw_delivery_binding(Some(&cache), registry, old_machine);
+        assert!(!raw_delivery_verified(cached, retained, expiry, now));
+        assert!(identity::is_expired(expiry, now));
+        cache.cert_not_after = None;
+        // Expiry belongs to the selected binding, including after eviction.
+        dm_inbox::record_authenticated_machine_binding_with_expiry(
+            &bindings,
+            agent,
+            old_machine,
+            now,
+            Some(now - 1000),
+        )
+        .await;
+        // Attestations contain no cert: refreshing one cannot erase expiry.
+        dm_inbox::record_authenticated_machine_binding(&bindings, agent, old_machine, now + 1)
+            .await;
+        // Nor may replay of an older cert-less announcement clear it.
+        dm_inbox::record_authenticated_machine_binding_with_expiry(
+            &bindings,
+            agent,
+            new_machine,
+            now - 1,
+            None,
+        )
+        .await;
+        let registry = dm_inbox::authenticated_machine_binding_evidence(&bindings, &agent).await;
+        for discovery in [None, Some(&cache)] {
+            let (cached, retained, expiry) = raw_delivery_binding(discovery, registry, old_machine);
+            assert_eq!(expiry, Some(now - 1000));
+            assert!(identity::is_expired(expiry, now));
+            assert!(!raw_delivery_verified(cached, retained, expiry, now));
+        }
+    }
+
+    fn test_discovered_agent_for_1098() -> DiscoveredAgent {
+        DiscoveredAgent {
+            self_name: None,
+            cert_digest: None,
+            agent_id: identity::AgentId([0; 32]),
+            machine_id: identity::MachineId([0; 32]),
+            user_id: None,
+            addresses: Vec::new(),
+            announced_at: 0,
+            last_seen: 0,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: None,
+            agent_certificate: None,
+            agent_public_key: Vec::new(),
+        }
     }
 
     /// N12 (raw-path Blocked delivery): the raw 0x10 path must NOT deliver
@@ -29148,8 +29266,21 @@ fn verified_identity_origin_message(sender: &identity::AgentKeypair) -> gossip::
 async fn direct_origin_identity_ingest_populates_authenticated_binding() {
     let sender = identity::AgentKeypair::generate().expect("sender keygen");
     let machine = identity::MachineKeypair::generate().expect("machine keygen");
-    let now = 1_000;
-    let announcement = signed_identity_announcement_fixture(sender.agent_id(), &machine, now);
+    let now = Agent::unix_timestamp_secs();
+    let expiry = now + 3600;
+    let owner = identity::UserKeypair::generate().expect("owner keygen");
+    let cert = identity::AgentCertificate::issue_with_expiry(&owner, &sender, Some(expiry))
+        .expect("issue certificate");
+    let mut announcement = signed_identity_announcement_fixture(sender.agent_id(), &machine, now);
+    announcement.user_id = Some(cert.user_id().expect("certificate user"));
+    announcement.agent_certificate = Some(cert);
+    announcement.machine_signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        machine.secret_key(),
+        &bincode::serialize(&announcement.to_unsigned()).expect("serialize announcement"),
+    )
+    .expect("sign announcement")
+    .as_bytes()
+    .to_vec();
     announcement.verify().expect("valid machine announcement");
     let message = verified_identity_origin_message(&sender);
     let bindings = std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -29163,6 +29294,14 @@ async fn direct_origin_identity_ingest_populates_authenticated_binding() {
     assert_eq!(
         dm_inbox::authenticated_machine_binding_for_testing(&bindings, &sender.agent_id()).await,
         Some(machine.machine_id())
+    );
+    assert_eq!(
+        dm_inbox::authenticated_machine_binding_evidence(&bindings, &sender.agent_id())
+            .await
+            .expect("retained evidence")
+            .cert_not_after,
+        Some(expiry),
+        "verified announcement must retain its signed certificate expiry",
     );
 }
 
