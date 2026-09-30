@@ -120,19 +120,30 @@ Each signed component is judged **on its own**. The pair is never judged by its 
 | Rule | Limit |
 |---|---|
 | **Future skew** (every component, always) | `announced_at` and advert `created_at` are each ≤ now + 5 min. |
-| **Ingest freshness** (evidence arriving from the network: gossip, `Hello` or `Lookup`) | Each component must be at most **30 min** old (2 × the advert TTL of 900 s). An older component is rejected, so a stale agent advert cannot be paired with a fresh machine announcement. |
-| **Use limit** (a stored record after a restart) | Each component must be at most **30 days** old (`[evidence] max_age_days`, minimum 1). Past that, the record is treated as absent and needs a fresh `Hello` or `Lookup`. |
-| **Watermark** (persisted, per agent) | The highest advert `created_at` ever accepted for agent A, and the machine it named. A record for A is accepted, or used, only if its advert `created_at` ≥ A's watermark. A newer advert naming M_new permanently disqualifies older adverts naming M_old. |
+| **Ingest window W** (evidence arriving from the network: gossip, `Hello` or `Lookup`) | Each component must be at most **W** old. W = **15 min**, equal to today's advert TTL of 900 s. An older component is rejected, so a stale agent advert cannot be paired with a fresh machine announcement. |
+| **Stored-authority lifetime L** (using a stored record) | Each stored component must be at most **L** old. **L = 7 days** (David, 2026-09-30), via `[evidence] max_age_days` (default 7, minimum 1, maximum 7). **Any ingest-fresh `Hello` from the peer re-validates it:** the record's stored bytes are replaced with the Hello's, which restarts the clock. Past that, the record is treated as absent and needs a fresh `Hello` or `Lookup`. |
+| **Move watermark** (persisted, per agent) | `(t, M)`: the newest advert `created_at` ever accepted for agent A **that named a machine other than the one in A's stored record**, and that machine. A stored record (A, M_r, advert time t_r) is accepted, or used, only if there is no watermark with **M ≠ M_r and t > t_r**. Newer adverts naming the **same** machine (routine 600 s refreshes) never disqualify the stored record. |
 
-**Watermark storage.**
-- Watermarks are kept in the same file.
-- They outlive evicted records, with a separate cap of 4096 agents × about 80 B.
-- They are never lowered.
+**Coherent update policy (r3, Codex r2 new blocker (a)).** All of these happen in one in-memory transaction under the store lock. A file write is a single atomic replace of the whole snapshot, so the persisted record and its move watermark can never disagree.
 
-**What this bounds.**
-- A former machine M_old that kept its machine key can present A's old advert only while that advert is at most 30 min old, and only to a node that has never accepted a newer advert for A.
-- That is the same exposure as today's in-memory 900 s capability TTL.
-- After that, the ADR-0043 retired-binding revocation still removes it.
+| Event for agent A (verified, ingest-fresh) | Record | Move watermark | Material (persisted)? |
+|---|---|---|---|
+| Same machine as the stored record, arriving by **`Hello`** | stored bytes replaced with the Hello's, re-validating for a full L (David's ruling) | unchanged | **yes** (at most one `Hello` per machine per 60 s) |
+| Same machine as the stored record, arriving by gossip (routine refresh) | the live bytes in memory are updated; the stored bytes are kept unless older than L/2 | unchanged | **no**, unless the stored bytes are older than L/2, which triggers a refresh write |
+| **Different** machine M_new (a move), and both parts are available | replaced by (A, M_new) | set to `(t_new, M_new)` | **yes**, in the same snapshot |
+| Different machine M_new, and only the advert is available | the old record is **removed** | set to `(t_new, M_new)` | **yes**, in the same snapshot |
+| Revocation, relationship ended, or age exceeded | removed | unchanged | yes |
+
+**Watermark cap.**
+- Watermarks are capped at **4096**.
+- When full, a watermark is evicted only if its agent has **no** stored record, has been out of the relationship set the longest, and its `t` is older than L. That means it can no longer disqualify anything usable.
+- If no watermark qualifies, the **incoming record** is refused rather than dropping protection, and `evidence_watermark_full` is counted.
+- A watermark is never evicted while a record for its agent exists. The 512-record cap is below 4096, so this always terminates.
+
+**Replay exposure (r3; the r2 "same as today" claim is withdrawn, per Codex r2 P1-1).**
+- **The attack.** A former machine M_old that kept its machine key can present A's advert, which is at most W old and still names M_old, to a node that has never accepted a newer advert for A naming another machine. If the node stores it, M_old can then send raw frames as A for up to **L**. There's no need to replay the advert again.
+- **When it ends.** When the first fresh advert naming a different machine arrives (move watermark), on an ADR-0043 retired-binding or other revocation, or when L expires.
+- **Compared with today.** Today the in-memory capability expires 900 s after its **signed** timestamp (`src/dm_capability.rs:699`). This ADR therefore **extends** the authorization lifetime from about 15 min to **L = 7 days**, for relationship peers. David accepted this extension on 2026-09-30, with the 7-day cap and re-validation by any fresh `Hello`.
 
 **The rollback claim is corrected.**
 - Replacing `peer-evidence.bin` with an older genuine copy **does** roll back the watermark and can restore an old binding.
@@ -149,7 +160,7 @@ It returns a view only if the record exists and all of these hold, re-evaluated 
 - the record verified at load or ingest;
 - it names exactly (agent, machine);
 - every component is within the use limit;
-- the advert is at or above the watermark;
+- no move watermark disqualifies it (§3);
 - the certificate, if present, is unexpired **now**;
 - agent A is still in `relationship_set()` **now**;
 - none of the agent, machine, (agent, machine) binding or certificate user is revoked **now**.
@@ -178,15 +189,20 @@ Removing a record, or any of these conditions failing, removes its authority **i
 | Case | Path |
 |---|---|
 | **No file** (first 0.46 start, or an unreadable file) | Cold. On connect, a `Hello` arrives from any peer that sends one (§6). Otherwise `Lookup`, then gossip. |
-| **Record past the use limit, evicted, or below the watermark** | Treated as absent: `Lookup` to eligible peers, then gossip. |
+| **Record past L, evicted, or disqualified by a move watermark** | Treated as absent: `Lookup` to eligible peers, then gossip. |
 | **Contact-only peer** (not a relationship) | Excluded in this slice (E-D10): gossip only, as today. See Open Questions. |
 | **Moved peer with no eligible connected intermediary** | Its record names the old machine and verifies nothing new. Recovery waits for its `Hello` when it connects, or for gossip. |
 | **Traffic before the background load finishes** | See below. |
 
 **Traffic before the background load finishes.**
 - Raw frames and sends that would consult the store wait on a **load barrier**. The wait is bounded: at most 5 s, and at most 64 frames or 1 MiB queued.
-- When the barrier releases, they are evaluated normally. On a timeout they are evaluated as if no record existed, which fails closed exactly as today.
-- Sends return the retryable `RecipientUndiscovered` (from #1092) instead of a terminal error.
+- When the barrier releases, they are evaluated normally.
+- **Barrier timeout and queue overflow are outside the recovery guarantee (r3, Codex r2 P2-4).**
+  - A frame that times out, or doesn't fit in the queue, is evaluated immediately as "no record". It fails closed exactly as today: it is delivered `verified = false`, and the #1070 gates drop it.
+  - The sender's own retry is the only recovery path. The Welcome fetch retries, and durable DMs are retried by the sender's outbox.
+  - Each case is counted (`evidence_barrier_timeout`, `evidence_barrier_overflow`).
+  - A send in either case returns the retryable `RecipientUndiscovered` (from #1092), not a terminal error.
+- **The recovery guarantee therefore holds only when:** a usable stored record exists, **and** the load completes within 5 s, **and** the frame fits in the barrier queue. At the 512-record cap this needs `t_v` ≤ about 2.4 ms (§10).
 
 ### 6. Wire: `EvidenceV1` (r2, Codex P2-5)
 
@@ -208,13 +224,22 @@ Removing a record, or any of these conditions failing, removes its authority **i
 **Responder authorization.** The responder serves a request only if all of these hold, and otherwise answers `NotFound` without signalling why:
 - the requesting transport machine hosts an agent R that is itself one of the responder's relationship peers, with a usable record or live evidence;
 - R and X share a relationship context at the responder: the same group roster, the same owner (both enrolled to the responder's owner), or one is the grant counterparty of the other;
-- the reply is built only from the responder's own identity or a usable stored record, never from TTL caches of strangers.
+- the reply is built only from **ingest-fresh material**, never from TTL caches of strangers. That means either:
+  - the responder's own current announcement and advert, minted on demand; or
+  - the **live** (in-memory) announcement and advert bytes it holds for X, where each component is at most W old at reply time. The responder keeps the latest verified live bytes for every relationship peer in memory, updated on each routine refresh, separately from the stored bytes.
+
+  A stored record older than W is **never served**. Serving it is useless, because the requester must reject it under §3. The responder answers `NotFound` instead (r3, Codex r2 new blocker (b)).
 
 **Responder budgets.**
 - Per requesting machine: ≤ 2 open `EvidenceV1` streams, ≤ 1 `Lookup` per 2 s and ≤ **64 KiB/s** of replies.
 - Globally: ≤ **256 KiB/s** of replies and ≤ 32 evidence verifies/s, including verifies of `Hello`s received.
 - Every stream has a **5 s deadline** covering the first byte to the end of the body. Incomplete or slow streams are reset, and the reset counts against the budget.
 - Anything over budget gets `NotFound` or a reset. It is never queued.
+- **Implementation conditions (Codex r2 P2-5):**
+  - budgets are accounted **per transport machine identity across all its connections**, not per connection;
+  - `NotFound` replies are charged against the byte and rate budgets;
+  - the existing stream prefix timeout (`src/lib.rs:14750`) stays in front, so a peer that sends no first byte cannot evade the body deadline;
+  - pre-verification buffering is bounded in aggregate: ≤ 32 KiB per stream and ≤ 1 MiB in total across all `EvidenceV1` streams awaiting verification.
 
 **Requester budgets.**
 - ≤ 1 `Lookup` per target per 30 s, to ≤ 3 responders.
@@ -224,7 +249,8 @@ Removing a record, or any of these conditions failing, removes its authority **i
 **Capability bit.** This ADR allocates ADR 0093 bit 2, **`peer_evidence_v1`**, meaning "accepts `EvidenceV1`".
 - A current verified advert lacking the bit means the `Hello` is skipped.
 - Unknown state means one try per connection. A reset marks the connection "no evidence" until it drops.
-- The allocation is recorded in the ADR 0093 registry through its procedure: a registry note in `docs/adr/README.md` and the code constant. ADR 0093 itself is Accepted and is not edited.
+- The allocation follows ADR 0093's own procedure ("Allocate a bit by a reviewed ADR updating this table"). This PR adds the bit-2 row to **0093's canonical registry table**, marked as reserved by ADR 0089 and effective when 0089 is Accepted, together with the code constant in S5.
+- That table edit is the one change to an Accepted ADR that 0093's text itself authorises. No other part of 0093 is edited.
 
 ### 7. Mixed versions
 
@@ -251,10 +277,19 @@ Removing a record, or any of these conditions failing, removes its authority **i
 - A test proves the file is byte-identical after the process has received fresh evidence.
 
 **Write coalescing.**
-- The file is rewritten only on a **material change**: a record or watermark is added or removed, a binding changes machine, the certificate changes, or a record's stored components are more than 7 days older than live evidence (so they stay inside the use limit).
-- A routine re-announcement with a newer timestamp and the same content is **not** material.
+- The file is rewritten only on a **material change**, as defined by the update-policy table in §3:
+  - a record is added, replaced or removed;
+  - a move watermark is set;
+  - a certificate changes;
+  - a stored component is older than L/2 while newer live same-machine bytes exist (a refresh, so stored records stay inside L).
+- A routine same-machine re-announcement is **not** material.
 - At most one write per 60 s, and only if dirty. A dirty store is also flushed on clean shutdown.
-- **Worst case:** 1440 writes/day × 15 MiB = 21 GiB/day, reached only if a material change arrives every minute. Expected: a few writes per day. `evidence_writes` and `evidence_bytes_written` are counters, and the goal-E budget for them is set by E0 measurement.
+- **File hard cap:** ≤ **16 MiB** in total. That is records (≤ 15 MiB) plus watermarks (≤ 4096 × 80 B ≈ 320 KiB) plus framing. An insert that would exceed it is refused.
+- **Writes.**
+  - **Worst case:** 1440 writes/day × 16 MiB ≈ 22.5 GiB/day, only if a material change arrives every minute.
+  - **Refresh term:** with R records, refreshes are about R per L/2. At R = 512 and L = 7 days that's about 146/day, coalesced into ≤ 1440 writes.
+  - **Typical:** R ≈ 50 gives about 14 refreshes/day plus moves and membership changes, coalesced to a few dozen writes per day.
+  - `evidence_writes` and `evidence_bytes_written` are counters. The goal-E budget for them is set by E0 measurement.
 
 **Downgrade.** v0.45 never reads the file. A re-upgrade reuses it, and a test covers the round trip.
 
@@ -265,8 +300,8 @@ Removing a record, or any of these conditions failing, removes its authority **i
    - A frame from (A, M′) with a record for (A, M) stays unverified and never rebinds.
 2. **Replay.**
    - A stale advert cannot be paired with a fresh announcement, because ingest freshness is per component.
-   - A superseded binding cannot come back while the watermark holds.
-   - The residual is the same as today's 900 s capability TTL, plus a local-disk rollback, which is out of scope under ADR 0015.
+   - A superseded binding cannot come back once a newer advert naming another machine has been accepted, because the move watermark is persisted with it.
+   - **The residual is larger than today's, and stated in §3:** a replayed advert at most W old can yield stored authority for up to L, where today the limit is about 900 s. Also a local-disk rollback, which is out of scope under ADR 0015.
 3. **Lifetime enforcement is at the point of use.** Revocation, certificate expiry, the age limit and relationship removal take effect on the next call, because the store's authority is never copied (§4).
 4. **`Hello` carries only the sender's own evidence.** `Lookup` replies are fully re-verified.
 5. **Amplification is bounded by the responder** (§6), not by requester goodwill.
@@ -287,7 +322,7 @@ Removing a record, or any of these conditions failing, removes its authority **i
 | `Lookup` served | 64 KiB/s per requester; 256 KiB/s total | rare: only on a cache miss |
 | `Lookup` sent | 16 outstanding; 1 per target per 30 s × 3 responders | rare |
 | Evidence verifies (all inbound) | 32/s | — |
-| Disk | ≤ 15 MiB; ≤ 1 write per 60 s | a few writes per day |
+| Disk | file ≤ 16 MiB; ≤ 1 write per 60 s | a few dozen writes per day at R ≈ 50 |
 
 **Fleet restart, per node, full duplex,** with C = connections (typical 8, capped by `max_connections`) and R = relationship records:
 
@@ -296,7 +331,7 @@ Removing a record, or any of these conditions failing, removes its authority **i
 | **N = 100** | load: 4R verifies (R = 50: 200). Hellos: 2 × min(C, R) × about 23 KiB, which is about **368 KiB** at C = 8, plus 4 × min(C, R) verifies inbound = **32**. Worst case at C = 64: about 2.9 MiB, 256 verifies. Lookups: ≤ 256 KiB/s served. | receive about 100 × 7.4 KB = **740 KB** and ≥ 100 verifies, per re-announce round |
 | **N = 1000** | **the same as N = 100.** The load, Hello and Lookup terms depend on R and C, not N. | about **7.4 MB** and ≥ **1000 verifies** per round |
 
-The exchange terms are O(C), and the load term is O(R). Neither grows with N.
+The Hello term is O(C), and the load and refresh-write terms are O(R). `Lookup` is **rate-bounded** by the §6 budgets (≤ 256 KiB/s served, ≤ 16 outstanding sent); it is not shown to be O(C). None of these grows with N.
 
 ## Open Questions for David
 
@@ -306,7 +341,10 @@ The exchange terms are O(C), and the load term is O(R). Neither grows with N.
 2. **Pre-identity admission.** `EvidenceV1` is admitted from any transport-authenticated machine.
    - The alternative is to admit only enrolled machines and machines named by a stored record. That is tighter, but a moved peer or a new group member then can't send a `Hello` until gossip.
    - The bounds in §6 are what make open admission safe. Keep it open?
-3. **Ingest freshness window of 30 min.** A shorter window narrows the replay exposure in §3, but rejects evidence from peers whose adverts are late (clock skew, or advert publish delays after their own restart). 30 min matches today's TTL exposure.
+3. **Lifetimes: RULED (David, 2026-09-30).**
+   - **Stored-authority lifetime L = 7 days**, re-validated by any fresh `Hello` (§3).
+   - **Ingest window W = 15 min**, today's advert TTL. It was not ruled separately and follows from the existing TTL.
+   - **The exposure is stated in §3:** a replay accepted inside W can become stored authority for up to 7 days, unless a newer advert naming another machine arrives or a revocation lands. Today that authority lasts about 900 s.
 
 ## Consequences
 
@@ -318,9 +356,9 @@ The exchange terms are O(C), and the load term is O(R). Neither grows with N.
 
 ### Negative / Trade-offs
 
-- **New surfaces:** a new stream protocol with pre-identity admission (bounded, §6), a new persisted file (≤ 15 MiB), a load barrier (≤ 5 s) and a new ADR 0093 bit.
+- **New surfaces:** a new stream protocol with pre-identity admission (bounded, §6), a new persisted file (≤ 16 MiB), a load barrier (≤ 5 s) and a new ADR 0093 bit.
 - **Not every case recovers immediately.** No file, an expired or evicted record, contact-only peers and moved peers without an intermediary are not guaranteed (§5).
-- **Replay residual:** at most 30 min of ingest freshness, plus local-disk rollback (§3).
+- **Replay residual, larger than today:** a replayed advert at most W old can become stored authority for up to L (today about 900 s), plus local-disk rollback (§3; Open Question 3).
 - **Stored capability bits stay unknown after a restart** (D35 is separate).
 
 ### Neutral / Operational
@@ -342,8 +380,11 @@ The exchange terms are O(C), and the load term is O(R). Neither grows with N.
   - a stale advert plus a fresh announcement is rejected at ingest;
   - a future-skewed component is rejected;
   - a record past the use limit is unusable;
-  - a record below the watermark is rejected, including across a restart;
-  - the watermark survives record eviction.
+  - a record disqualified by a move watermark is rejected, including across a restart;
+  - **routine refresh then restart:** a stored record, then 3 routine same-machine refreshes, then a restart; the record is still usable (Codex r2 blocker (a));
+  - **move:** after a move, the record and watermark are replaced or removed in one snapshot; kill the process between events and restart; the persisted state is coherent;
+  - the watermark survives record eviction;
+  - **at the 4096 cap:** only eligible watermarks are evicted, and otherwise the incoming record is refused (`evidence_watermark_full`).
 - **Point of use (§4), each tested *after* load:**
   - revoking the agent, machine, binding or certificate user makes `usable()` return `None` on the next call;
   - so do certificate expiry at the next call, and removing the relationship (member removed, grant expired or revoked, device unenrolled);
@@ -357,6 +398,11 @@ The exchange terms are O(C), and the load term is O(R). Neither grows with N.
   - a `Hello` naming another machine is refused;
   - a stale component in a `Hello` is refused;
   - an **unauthorized `Lookup` gets `NotFound`**;
+  - **age mismatch:** a responder holding only a stored record older than W answers `NotFound`, and one holding fresh live bytes answers `Found`, which the cold requester accepts (Codex r2 blocker (b));
+  - budgets hold across multiple connections from one machine;
+  - `NotFound` is charged against the budget;
+  - no-first-byte streams hit the prefix timeout;
+  - the aggregate pre-verify cap holds;
   - a hostile requester is held to 64 KiB/s, 2 open streams and 1 lookup per 2 s;
   - slow and incomplete streams are reset at 5 s;
   - reconnect churn is held to 1 `Hello` per 60 s;
@@ -364,7 +410,7 @@ The exchange terms are O(C), and the load term is O(R). Neither grows with N.
   - an old-peer reset is marked once.
 - **Load barrier:**
   - a raw frame and a send arriving during load are held, then evaluated;
-  - a timeout fails closed;
+  - a timeout and a queue overflow each fail closed, are counted, and are recovered only by the sender's retry;
   - the send returns `RecipientUndiscovered`.
 
 **Integration (CI, isolated), red on origin/main and green on the fix:**
@@ -376,6 +422,7 @@ The exchange terms are O(C), and the load term is O(R). Neither grows with N.
 - **Expired record:** an expired or evicted record recovers through `Lookup`.
 - **Contact-only peer:** it waits for gossip (a pinned current limitation).
 - **Traffic during load:** sends and frames arriving during load are held by the barrier, then complete.
+- **Barrier timeout and overflow (D30):** force a slow load (> 5 s) and a burst of more than 64 frames. The excess is dropped `verified = false` and counted, and the sender's retry completes the flow once the load finishes. The gate row records this outcome separately from the guaranteed path.
 
 **D30 release-gate row, restart-cold (CI test plus a testnet row):**
 - Restart a node cold. Within the bounds above, run a DM both ways, a TreeKEM join with Welcome, a file offer and owner sync.
@@ -391,7 +438,7 @@ The exchange terms are O(C), and the load term is O(R). Neither grows with N.
 
 - **Persist the verified signed wire bytes** (never re-serialized structs), and re-verify them on load.
 - **The store is consulted at the point of use and is never copied into other caches.**
-- **Freshness is per component.** Ingest (30 min) and use (30 days) are separate limits.
+- **Freshness is per component.** Ingest (W = 15 min) and stored-authority lifetime (L = 7 days, David's ruling) are separate limits.
 - **Never mark `verified` from a record naming a different machine.**
 - **A `Hello` carries only the sender's own evidence.** A `Lookup` reply is re-verified and served only to authorized requesters.
 - **Never overwrite an unreadable evidence file.**
