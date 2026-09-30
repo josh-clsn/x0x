@@ -86,7 +86,7 @@ For security details, see [docs/security.md](https://github.com/saorsa-labs/x0x/
 
 ## Beyond Messaging
 
-- **Work orchestration (Symphony)** — replicated **TaskList CRDTs** (`/task-lists`, `/stores`; task-list deltas are not group-encrypted today, see #895), a built-in **GUI board view** (state columns, badges, approve/deny). See [docs/symphony-integration.md](https://github.com/saorsa-labs/x0x/blob/main/docs/symphony-integration.md).
+- **Work orchestration (Symphony)** — replicated **TaskList CRDTs** (`/task-lists`, `/stores`; an encrypted group's list, `x0x.group.<group_id>.symphony.<list_id>`, seals its deltas with the group key like the group's KV stores (#895), while standalone and public-group lists travel in plaintext), a built-in **GUI board view** (state columns, badges, approve/deny). See [docs/symphony-integration.md](https://github.com/saorsa-labs/x0x/blob/main/docs/symphony-integration.md).
 - **Tailnet** — connect your own computers over any network and forward a local TCP port to a loopback service on a peer machine, Tailscale-style, over the same post-quantum QUIC transport. Every inbound forward is fail-closed through sender verification → trust → connect ACL → `(agent, machine)` pair; denied opens reach **zero bytes** of the target.
 
 ---
