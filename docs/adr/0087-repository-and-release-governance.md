@@ -146,16 +146,23 @@ We will govern the repository and the release pipeline as follows.
    (`-rc.1`, `-alpha`) and build-metadata (`+build`) tags. No GitHub
    prerelease is published until a signed release channel exists (goal M,
    M2).
-8. **ADRs before code.**
-   - A change to the wire format, a network protocol, or the dependency set
-     has its ADR **Accepted before the code merges** to `main`. Here a
-     "dependency change" means a new dependency, or a pin change that alters
-     network behaviour, a persisted format or a security bound; a routine
-     lock refresh or patch bump that changes none of these is not one.
-   - Every other change that the repository's ADR rule covers (network
-     behaviour, storage formats, public APIs, security bounds, operational
-     invariants) has at least a **Proposed** ADR on `main` before the code
-     merges, as before.
+8. **ADRs before code.** Two rules apply together; the second adds to the
+   first and never replaces it.
+   - **Proposed on `main` before any merge.** A change to a network
+     behaviour, a storage format, a protocol or a security bound has a
+     **Proposed** ADR on `main` before its code merges to **any** branch,
+     integration and stacked branches included (the charter's §5 ADR
+     invariant, unchanged). The same holds for the other changes the
+     repository's ADR rule covers (architecture, crypto, public APIs,
+     operational invariants).
+   - **Accepted before `main`.** In addition, a change to the wire format, a
+     network protocol, or the dependency set has its ADR **Accepted before
+     the code merges to `main`**. Code may sit on an integration branch
+     under a Proposed ADR, but it does not reach `main` until the ADR is
+     Accepted. Here a "dependency change" means a new dependency, or a pin
+     change that alters network behaviour, a persisted format or a security
+     bound; a routine lock refresh or patch bump that changes none of these
+     is not one.
    - An ADR written after the fact to record behaviour that has already
      shipped uses the status **`Accepted (record)`**, states what it records
      and the ruling that accepted it, and is not a precedent for skipping
@@ -188,8 +195,10 @@ rather than repository governance, and is left to its own ADR.
   explicit, logged approval by David.
 - Integration and stacked branches get full CI, so mirror PRs and the
   retargeting traps they caused go away.
-- Decisions that cannot be undone once peers see them are made before the
-  code ships, and records of shipped behaviour are labelled as records.
+- No ADR-governed change reaches any branch without a Proposed ADR on
+  `main`, and decisions that cannot be undone once peers see them are
+  Accepted before the code reaches `main`. Records of shipped behaviour are
+  labelled as records.
 - Review findings on merged code reach the tracker instead of being lost.
 
 ### Negative / Trade-offs
@@ -234,10 +243,12 @@ rather than repository governance, and is left to its own ADR.
 - **Negative controls.** An intentionally failing PR cannot merge to `main`
   (ADR 0025 rule 5). A pushed `vX.Y.Z-rc.N` tag fails in the first release
   job before anything is built.
-- **ADR ordering audit at each release.** For every wire, protocol or
-  dependency change in the release, the governing ADR's acceptance date is on
-  or before the implementing PR's merge date; any exception carries the
-  `Accepted (record)` status and is listed in the release notes.
+- **ADR ordering audit at each release.** For every ADR-governed change in
+  the release, the governing ADR was Proposed on `main` before the first
+  merge of its code to any branch. For every wire, protocol or dependency
+  change, the ADR's acceptance date is also on or before the date its code
+  merged to `main`. Any exception carries the `Accepted (record)` status and
+  is listed in the release notes.
 - **Findings audit at each release.** Every review finding on a PR merged in
   the cycle links to an issue or a written dismissal.
 - **Review triggers.** Revisit this ADR if an agent tags, approves a

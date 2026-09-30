@@ -103,10 +103,13 @@ ADR 0060 as a record; ADR 0093 adds the capability-advert registry (D08).
 - Only fix ADRs are admissible: ones that record a fix to shipped or merged
   behaviour, a storage format, or deployment governance. The D29 slice of
   ADR 0089 is the one exception.
-- [ADR 0087](./0087-repository-and-release-governance.md) (Proposed) adds:
-  a wire, protocol or dependency change needs its ADR Accepted before the code
-  merges, and an ADR that records already-shipped behaviour uses the status
-  `Accepted (record)`.
+- A change to a network behaviour, a storage format, a protocol or a
+  security bound has a Proposed ADR on `main` before its code merges to any
+  branch, integration branches included.
+- [ADR 0087](./0087-repository-and-release-governance.md) (Proposed) adds to
+  that: a wire, protocol or dependency change also needs its ADR Accepted
+  before its code merges to `main`, and an ADR that records already-shipped
+  behaviour uses the status `Accepted (record)`.
 
 ## Accepted
 - [ADR 0002: Application-Level Keepalive](./0002-application-level-keepalive-for-direct-connections.md) — 15s SWIM Ping prevents QUIC idle timeout
@@ -203,7 +206,7 @@ ADR 0060 as a record; ADR 0093 adds the capability-advert registry (D08).
 
 
 - [ADR 0062: Recover Ordinary Home Persistence as One Durable Pair](./0062-home-persistence-pair-recovery.md) **[overlay: decided with ADR 0088, D16]** (proposed 2026-09-06) — #471: ordinary-pair undo intent, truthful recovery-required results and exclusive journal ownership; commit ambiguity, caller fencing and downgrade policy require human design review before implementation.
-- [ADR 0087: Repository and Release Governance](./0087-repository-and-release-governance.md) (proposed 2026-09-30) — D04/D05/D15/D36 and the ADR-before-code rule; amends ADR 0025's merge-gate enforcement. CI on every PR base; a `main` ruleset with five required checks and no bypass; admin-only `v*` tags; no bot identity, so identity-keyed gates are procedural; build/sign/create/publish and SKILL.md signing in the protected `release` environment (David as required reviewer, `v*` only); the tracked `Cargo.lock` consumed by `release.yml` and prerelease tags refused; wire, protocol and dependency changes need an Accepted ADR before merge, with `Accepted (record)` for retroactive records; review findings on merged PRs become an issue or written dismissal within 24 h
+- [ADR 0087: Repository and Release Governance](./0087-repository-and-release-governance.md) (proposed 2026-09-30) — D04/D05/D15/D36 and the ADR-before-code rule; amends ADR 0025's merge-gate enforcement. CI on every PR base; a `main` ruleset with five required checks and no bypass; admin-only `v*` tags; no bot identity, so identity-keyed gates are procedural; build/sign/create/publish and SKILL.md signing in the protected `release` environment (David as required reviewer, `v*` only); the tracked `Cargo.lock` consumed by `release.yml` and prerelease tags refused; a Proposed ADR on main before any merge of ADR-governed code, plus an Accepted ADR before wire, protocol and dependency changes merge to main, with `Accepted (record)` for retroactive records; review findings on merged PRs become an issue or written dismissal within 24 h
 
 
 ## Errata (Accepted ADRs are immutable; corrections recorded here)
