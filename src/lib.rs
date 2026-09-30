@@ -4460,13 +4460,24 @@ impl Drop for CapabilityRefreshGuard {
 /// send that raced an in-flight advert from paying the full window.
 async fn run_strict_capability_refresh(
     recipient: identity::AgentId,
+    required_application: Option<u64>,
+    require_durable_ack: bool,
     capability_store: std::sync::Arc<dm_capability::CapabilityStore>,
     shutdown_token: tokio_util::sync::CancellationToken,
     deadline: tokio::time::Instant,
     publish: impl std::future::Future<Output = error::NetworkResult<()>> + Send,
 ) {
-    if capability_binding_supports_durable_ack(capability_store.lookup_binding(&recipient).as_ref())
-    {
+    let ready = || {
+        let binding = capability_store.lookup_binding(&recipient);
+        (!require_durable_ack || capability_binding_supports_durable_ack(binding.as_ref()))
+            && required_application.is_none_or(|bit| {
+                binding.as_ref().is_some_and(|binding| {
+                    binding.machine_id.0 != [0; 32]
+                        && binding.capabilities.application_registry.supports(bit)
+                })
+            })
+    };
+    if ready() {
         return;
     }
 
@@ -4488,9 +4499,7 @@ async fn run_strict_capability_refresh(
     }
 
     loop {
-        if capability_binding_supports_durable_ack(
-            capability_store.lookup_binding(&recipient).as_ref(),
-        ) {
+        if ready() {
             return;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -6922,7 +6931,12 @@ impl Agent {
                 .require_payload_capability(to, &payload)
                 .is_err()
         {
-            self.refresh_strict_dm_capability(*to).await;
+            self.refresh_strict_dm_capability(
+                *to,
+                dm::CapabilityRegistry::required_for_payload(&payload).map(|(bit, _)| bit),
+                config.require_durable_app_ack,
+            )
+            .await;
             advert_binding = self.capability_store.lookup_binding(to);
         }
         // ADR 0093: only positive, current advert evidence of missing support
@@ -7510,11 +7524,16 @@ impl Agent {
     /// Ask one recipient to republish its signed runtime capability and give
     /// the local subscriber a bounded window to ingest it.
     ///
-    /// Used only by strict (ADR 0030) sends after a TTL-bounded cache miss: a
-    /// daemon whose advert we simply have not heard yet gets one chance to
-    /// answer before the gate refuses. Concurrent strict sends to the same
-    /// recipient share a single flight.
-    async fn refresh_strict_dm_capability(&self, recipient: identity::AgentId) {
+    /// Used when a strict send lacks durable ACK support (ADR 0030), or a
+    /// current advert lacks the payload's application bit (ADR 0093). The
+    /// recipient gets one chance to answer before the gate refuses.
+    /// Concurrent sends to the same recipient share a single flight.
+    async fn refresh_strict_dm_capability(
+        &self,
+        recipient: identity::AgentId,
+        required_application: Option<u64>,
+        require_durable_ack: bool,
+    ) {
         let Some(runtime) = self.gossip_runtime.as_ref() else {
             return;
         };
@@ -7528,6 +7547,8 @@ impl Agent {
             move |guard, completion_tx| async move {
                 run_strict_capability_refresh(
                     recipient,
+                    required_application,
+                    require_durable_ack,
                     capability_store,
                     shutdown_token,
                     deadline,
@@ -31083,3 +31104,6 @@ mod legacy_bus_interop_tests;
 
 #[cfg(test)]
 mod d08_tests;
+
+#[cfg(test)]
+mod issue1099_tests;

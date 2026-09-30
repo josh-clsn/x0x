@@ -1010,7 +1010,7 @@ pub(in crate::server) async fn import_agent_card(
                     agent_id,
                     x0x::identity::MachineId(machine_id_bytes),
                     caps,
-                    x0x::dm_capability::now_unix_ms(),
+                    card.created_at.saturating_mul(1_000),
                 );
             }
         }
@@ -2487,5 +2487,131 @@ mod owner_act_tests {
             groups: Vec::new(),
         }
         .is_durable_owner());
+    }
+}
+
+#[cfg(test)]
+mod issue1099_tests {
+    use super::*;
+    use axum::{routing::post, Router};
+    use tower::ServiceExt;
+
+    async fn offline_state() -> (Arc<AppState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = Arc::new(
+            x0x::Agent::builder()
+                .with_identity_dir(dir.path())
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .build()
+                .await
+                .unwrap(),
+        );
+        let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+            dir.path(),
+            agent,
+        )
+        .await
+        .unwrap();
+        (state, dir)
+    }
+
+    async fn import(card: x0x::groups::card::AgentCard, state: Arc<AppState>) {
+        // Real axum handler and HTTP path, invoked in process without a listener.
+        let app = Router::new()
+            .route("/agent/card/import", post(import_agent_card))
+            .with_state(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/agent/card/import")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "card": card.to_link(), "trust_level": "known"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn issue1099_route_newer_signed_card_preserves_verified_lacks_bit() {
+        let (state, _dir) = offline_state().await;
+        assert!(state.agent.network().is_none());
+        let key = x0x::identity::AgentKeypair::generate().unwrap();
+        let recipient = key.agent_id();
+        let machine = x0x::identity::MachineId([2; 32]);
+        let mut card =
+            x0x::groups::card::AgentCard::new("peer".into(), &recipient, &hex::encode(machine.0));
+        card.dm_capabilities = Some(x0x::dm::DmCapabilities::v2_durable_gossip_ready(vec![
+            2;
+            1184
+        ]));
+        card.sign(&key).unwrap();
+        let store = state.agent.capability_store();
+        let mut caps = x0x::dm::DmCapabilities::v2_durable_gossip_ready(vec![1; 1184]);
+        caps.application_registry = Default::default();
+        assert!(store.insert(recipient, machine, caps, card.created_at * 1_000 - 1));
+        import(card, Arc::clone(&state)).await;
+        assert!(matches!(
+            store.require_payload_capability(&recipient, x0x::share_grant::SHARE_GRANT_DM_PREFIX),
+            Err(x0x::dm::DmError::RecipientUpgradeRequired {
+                capability: "share_grant_v1"
+            })
+        ));
+        assert_eq!(
+            store.lookup(&recipient).unwrap().kem_public_key,
+            vec![2; 1184]
+        );
+    }
+
+    #[tokio::test]
+    async fn issue1099_route_uses_signed_card_timestamp_for_ordering_and_expiry() {
+        let (state, _dir) = offline_state().await;
+        assert!(state.agent.network().is_none());
+        let key = x0x::identity::AgentKeypair::generate().unwrap();
+        let recipient = key.agent_id();
+        let machine = x0x::identity::MachineId([2; 32]);
+        let mut card =
+            x0x::groups::card::AgentCard::new("peer".into(), &recipient, &hex::encode(machine.0));
+        card.created_at -= 600;
+        card.dm_capabilities = Some(x0x::dm::DmCapabilities::v2_durable_gossip_ready(vec![
+            2;
+            1184
+        ]));
+        card.sign(&key).unwrap();
+        let store = state.agent.capability_store();
+        let before = std::time::Instant::now();
+        import(card.clone(), Arc::clone(&state)).await;
+        assert!(store.lookup(&recipient).is_some());
+        card.created_at -= 1;
+        card.dm_capabilities.as_mut().unwrap().kem_public_key = vec![3; 1184];
+        card.sign(&key).unwrap();
+        import(card.clone(), Arc::clone(&state)).await;
+        assert_eq!(
+            store.lookup(&recipient).unwrap().kem_public_key,
+            vec![2; 1184]
+        );
+        assert!(
+            store
+                .lookup_binding_at(&recipient, before + std::time::Duration::from_secs(301))
+                .is_none(),
+            "route must derive TTL from the signed card timestamp"
+        );
+        // A stale signed card must not create capability state at all.
+        let other = x0x::identity::AgentKeypair::generate().unwrap();
+        card.agent_id = hex::encode(other.agent_id().0);
+        card.created_at -= 901;
+        card.sign(&other).unwrap();
+        import(card, state).await;
+        assert!(store.lookup(&other.agent_id()).is_none());
     }
 }
