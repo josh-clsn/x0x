@@ -449,6 +449,7 @@ pub struct EvidenceCounters {
 }
 #[derive(Clone)]
 struct CachedRecord {
+    source: IngestSource,
     wire: EvidenceRecordV1,
     view: Arc<EvidenceView>,
 }
@@ -661,6 +662,43 @@ impl PeerEvidenceStore {
             .machine_id;
         self.usable(agent, machine, now)
     }
+    /// Whether a currently usable relationship record names this machine.
+    pub(crate) fn has_machine(&self, machine: MachineId, now: u64) -> bool {
+        let agents: Vec<_> = self
+            .state
+            .lock()
+            .map(|s| s.verified.keys().copied().collect())
+            .unwrap_or_default();
+        agents
+            .into_iter()
+            .any(|agent| self.usable(agent, machine, now).is_some())
+    }
+    pub(crate) fn machine_certificate_digest(
+        &self,
+        machine: MachineId,
+        now: u64,
+    ) -> Option<[u8; 32]> {
+        let agents: Vec<_> = self.state.lock().ok()?.verified.keys().copied().collect();
+        agents.into_iter().find_map(|agent| {
+            let view = self.usable(agent, machine, now)?;
+            view.certificate.as_ref()?;
+            Some(view.announcement.cert_digest)
+        })
+    }
+    /// Exact stored certificate for a matching announcement digest, if usable.
+    pub(crate) fn certificate_for(
+        &self,
+        agent: AgentId,
+        machine: MachineId,
+        digest: [u8; 32],
+        now: u64,
+    ) -> Option<Vec<u8>> {
+        let view = self.usable(agent, machine, now)?;
+        if view.announcement.cert_digest != digest {
+            return None;
+        }
+        view.certificate.as_ref()?.to_storage_bytes().ok()
+    }
     /// Latest ingest-fresh live wire bytes, kept separately from stored bytes.
     pub fn live(&self, agent: AgentId, now: u64) -> Option<EvidenceRecordV1> {
         let record = {
@@ -688,13 +726,17 @@ impl PeerEvidenceStore {
     /// Ingest a complete verified pair. A move returns success only after the
     /// new snapshot and its parent directory have been synced, unless this
     /// instance is memory-only (where the move takes effect immediately).
-    pub fn ingest(
+    pub fn ingest(&self, record: EvidenceRecordV1, source: IngestSource, now: u64) -> Result<()> {
+        let view = Arc::new(record.verify(now, W_MS)?);
+        self.ingest_verified(record, view, source, now)
+    }
+    pub(crate) fn ingest_verified(
         &self,
         mut record: EvidenceRecordV1,
+        view: Arc<EvidenceView>,
         source: IngestSource,
         now: u64,
     ) -> Result<()> {
-        let view = Arc::new(record.verify(now, W_MS)?);
         if !allowed(&*self.policy, &view, now) {
             return Err(EvidenceError::Invalid("not a current relationship"));
         }
@@ -704,6 +746,19 @@ impl PeerEvidenceStore {
         record.stored_at_ms = now;
         let _mutation = self.lock_mutation()?;
         let mut state = self.lock()?;
+        // A gossip pairing can have been queued before a Hello completed.
+        // The same wire pair without its fetched certificate must not undo
+        // that Hello (or cause another material write).
+        if source == IngestSource::Gossip
+            && state.live.get(&a).is_some_and(|old| {
+                old.source == IngestSource::Hello
+                    && old.wire.announcement == record.announcement
+                    && old.wire.advert == record.advert
+                    && (record.certificate.is_none() || old.wire.certificate == record.certificate)
+            })
+        {
+            return Ok(());
+        }
         if disqualified(&state.file.watermarks, a, &view)
             || state
                 .pending_moves
@@ -788,7 +843,14 @@ impl PeerEvidenceStore {
             state.last_used.retain(|id, _| retained.contains(id));
         }
         if state.file.records.contains_key(&a) {
-            state.live.insert(a, CachedRecord { wire: record, view });
+            state.live.insert(
+                a,
+                CachedRecord {
+                    wire: record,
+                    view,
+                    source,
+                },
+            );
             state.last_used.insert(a, now);
         }
         drop(state);
@@ -1165,6 +1227,18 @@ impl GossipPairing {
         record: EvidenceRecordV1,
         now: u64,
     ) -> Option<Result<()>> {
+        // Hello has already verified and ingested this exact pair. Do not
+        // repeat crypto outside its wire verify budget or strip a fetched cert.
+        if store.state.lock().is_ok_and(|state| {
+            state.live.get(&agent).is_some_and(|live| {
+                live.source == IngestSource::Hello
+                    && live.wire.announcement == record.announcement
+                    && live.wire.advert == record.advert
+                    && (record.certificate.is_none() || live.wire.certificate == record.certificate)
+            })
+        }) {
+            return None;
+        }
         let mut hash = blake3::Hasher::new();
         hash.update(&record.announcement);
         hash.update(&record.advert);
@@ -1799,6 +1873,147 @@ mod tests {
         assert!(reopened.usable(p.a(), p.m(), NOW + 180_000).is_some());
         assert!(reopened.live(p.a(), NOW + 180_000).is_none());
     }
+    #[test]
+    fn s3_hello_ingest_binds_transport_and_refreshes_each_component() {
+        let p = Peer::new();
+        let policy = Arc::new(Policy::default());
+        policy.peers.lock().unwrap().insert(p.a(), GROUP);
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            PeerEvidenceStore::open(dir.path(), EvidenceConfig::default(), policy.clone(), NOW)
+                .unwrap(),
+        );
+        let capture = VerifiedWireCapture::default();
+        let limits = crate::evidence_wire::Limits::default();
+        let old = p.record(NOW, NOW);
+        store
+            .ingest(old.clone(), IngestSource::Gossip, NOW)
+            .unwrap();
+        let now = NOW + 60_000;
+        let fresh = p.record(now, now);
+        let ingest = |m, record| {
+            crate::evidence_wire::ingest_hello(Some(&store), &capture, &limits, m, record, now)
+        };
+        assert!(ingest(MachineId([42; 32]), fresh.clone()).is_err());
+        assert!(ingest(p.m(), p.record(now - W_MS - 1000, now)).is_err());
+        assert!(ingest(p.m(), p.record(now, now - W_MS - 1)).is_err());
+        assert!(ingest(p.m(), p.record(now + SKEW_MS + 1000, now)).is_err());
+        assert!(ingest(p.m(), p.record(now, now + SKEW_MS + 1)).is_err());
+        let view = ingest(p.m(), fresh.clone()).unwrap();
+        assert_eq!(view.announcement.machine_id, p.m());
+        assert_eq!(
+            store.lock().unwrap().file.records[&p.a()].announcement,
+            fresh.announcement
+        );
+        assert_eq!(
+            store.lock().unwrap().file.records[&p.a()].advert,
+            fresh.advert
+        );
+        assert!(store.lock().unwrap().file.watermarks.is_empty());
+        store.flush(now, true).unwrap();
+        let reopened =
+            PeerEvidenceStore::open(dir.path(), EvidenceConfig::default(), policy.clone(), now)
+                .unwrap();
+        assert_eq!(
+            reopened
+                .usable(p.a(), p.m(), now)
+                .unwrap()
+                .advert
+                .created_at_unix_ms,
+            now
+        );
+        policy.peers.lock().unwrap().clear();
+        assert!(store.usable(p.a(), p.m(), now).is_none());
+    }
+
+    #[test]
+    fn s3_hello_certificate_digest_and_gossip_pairing_preserve_fresh_cert() {
+        let p = Peer::new();
+        let (dir, policy, store) = setup(&p);
+        let store = Arc::new(store);
+        let capture = VerifiedWireCapture::default();
+        let limits = crate::evidence_wire::Limits::default();
+        let cert = AgentCertificate::issue(&UserKeypair::generate().unwrap(), &p.agent).unwrap();
+        let mut record = p.record(NOW, NOW);
+        record.certificate = Some(cert.to_storage_bytes().unwrap());
+        // A valid but uncommitted certificate is not this Hello's certificate.
+        assert!(crate::evidence_wire::ingest_hello(
+            Some(&store),
+            &capture,
+            &limits,
+            p.m(),
+            record.clone(),
+            NOW
+        )
+        .is_err());
+        let mut ann = announce_v3::deserialize_v3(&record.announcement).unwrap();
+        ann.cert_digest = announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert));
+        ann.sign_v3_1(p.machine.secret_key()).unwrap();
+        record.announcement = announce_v3::serialize_v3_1(&ann).unwrap();
+        crate::evidence_wire::ingest_hello(
+            Some(&store),
+            &capture,
+            &limits,
+            p.m(),
+            record.clone(),
+            NOW,
+        )
+        .unwrap();
+        let mut no_cert = record.clone();
+        no_cert.certificate = None;
+        let mut pairing = GossipPairing::default();
+        VERIFY_CALLS.set(0);
+        assert!(pairing
+            .ingest(&store, p.a(), no_cert.clone(), NOW)
+            .is_none());
+        assert_eq!(
+            VERIFY_CALLS.get(),
+            0,
+            "Hello is not re-verified by background pairing"
+        );
+        // Also exercise an already-queued gossip mutation racing the Hello.
+        store.ingest(no_cert, IngestSource::Gossip, NOW).unwrap();
+        assert_eq!(
+            store.lock().unwrap().file.records[&p.a()].certificate,
+            record.certificate
+        );
+        store.flush(NOW, true).unwrap();
+        let reopened =
+            PeerEvidenceStore::open(dir.path(), EvidenceConfig::default(), policy, NOW).unwrap();
+        assert!(reopened
+            .usable(p.a(), p.m(), NOW)
+            .unwrap()
+            .certificate
+            .is_some());
+    }
+
+    #[test]
+    fn s3_hello_stranger_is_ttl_only() {
+        let p = Peer::new();
+        let policy = Arc::new(Policy::default());
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            PeerEvidenceStore::open(dir.path(), EvidenceConfig::default(), policy, NOW).unwrap(),
+        );
+        let capture = VerifiedWireCapture::default();
+        let limits = crate::evidence_wire::Limits::default();
+        let record = p.record(NOW, NOW);
+        crate::evidence_wire::ingest_hello(
+            Some(&store),
+            &capture,
+            &limits,
+            p.m(),
+            record.clone(),
+            NOW,
+        )
+        .unwrap();
+        assert!(store.lock().unwrap().file.records.is_empty());
+        assert!(store.live(p.a(), NOW).is_none());
+        assert_eq!(capture.get(p.a(), true, NOW).unwrap(), record.announcement);
+        assert_eq!(capture.get(p.a(), false, NOW).unwrap(), record.advert);
+        assert!(capture.get(p.a(), false, NOW + W_MS + 1).is_none());
+    }
+
     #[test]
     fn use_limit_hello_revalidation_and_half_life_refresh() {
         let p = Peer::new();

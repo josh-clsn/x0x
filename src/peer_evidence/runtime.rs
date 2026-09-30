@@ -93,6 +93,7 @@ impl EvidencePolicy for RuntimePolicy {
 
 /// Bounded startup barrier shared by raw frames and sends. Views are ephemeral.
 pub struct EvidenceRuntime {
+    pub(crate) wire_limits: Arc<crate::evidence_wire::Limits>,
     store: std::sync::OnceLock<Arc<PeerEvidenceStore>>,
     ready: tokio_util::sync::CancellationToken,
     started: std::sync::atomic::AtomicBool,
@@ -108,6 +109,7 @@ pub struct EvidenceRuntime {
 impl Default for EvidenceRuntime {
     fn default() -> Self {
         Self {
+            wire_limits: Arc::new(crate::evidence_wire::Limits::default()),
             store: Default::default(),
             ready: Default::default(),
             started: Default::default(),

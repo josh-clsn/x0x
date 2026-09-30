@@ -154,9 +154,9 @@ impl StreamAccept {
             .cloned()
             .unwrap_or_else(|| match protocol {
                 // Never retain a forward handshake in the undrained default sink.
-                StreamProtocol::ForwardV1 | StreamProtocol::ForwardV2 => {
-                    tokio::sync::mpsc::channel(1).0
-                }
+                StreamProtocol::ForwardV1
+                | StreamProtocol::ForwardV2
+                | StreamProtocol::EvidenceV1 => tokio::sync::mpsc::channel(1).0,
                 _ => self.tx.clone(),
             })
     }
@@ -455,6 +455,9 @@ pub enum StreamProtocol {
     /// admits a `SyncV1` stream (and only a `SyncV1` stream) if the
     /// machine holds a verified, current, unrevoked owner enrollment.
     SyncV1 = 0x05,
+    /// ADR 0089 relationship evidence; transport-authenticated admission only.
+    /// Routed exclusively to its bounded evidence acceptor.
+    EvidenceV1 = 0x06,
 }
 
 impl StreamProtocol {
@@ -468,6 +471,7 @@ impl StreamProtocol {
             0x03 => Some(Self::ForwardV2),
             0x04 => Some(Self::WebRtcV1),
             0x05 => Some(Self::SyncV1),
+            0x06 => Some(Self::EvidenceV1),
             _ => None,
         }
     }
@@ -504,6 +508,9 @@ pub struct PeerStream {
     /// unauthorized (issue #192). The list reflects announced agents only;
     /// see `docs/connect-acl.md` "Limitations: announced agents only".
     ///
+    /// EvidenceV1 also carries an empty agent list: its acceptor verifies
+    /// the signed evidence against `peer`, never against this list.
+    ///
     /// Exception (#1040): a `SyncV1` stream admitted or opened on the
     /// owner-signed enrollment of a machine with no known agent carries an
     /// EMPTY list. Such a stream reaches only the registered owner-sync
@@ -514,6 +521,7 @@ pub struct PeerStream {
     protocol: StreamProtocol,
     send: ant_quic::HighLevelSendStream,
     recv: ant_quic::HighLevelRecvStream,
+    pub(crate) evidence_lease: Option<crate::evidence_wire::Lease>,
 }
 
 impl PeerStream {
@@ -533,6 +541,7 @@ impl PeerStream {
             protocol,
             send,
             recv,
+            evidence_lease: None,
         }
     }
 
@@ -615,8 +624,9 @@ pub(crate) async fn write_protocol_prefix(
 /// Returns the negotiated protocol, or [`NetworkError::StreamProtocolUnknown`]
 /// for a reserved/unassigned byte (the caller resets the stream).
 pub(crate) async fn read_protocol_prefix(
-    recv: &mut ant_quic::HighLevelRecvStream,
+    recv: &mut (impl tokio::io::AsyncRead + Unpin),
 ) -> NetworkResult<StreamProtocol> {
+    use tokio::io::AsyncReadExt;
     let mut buf = [0u8; 1];
     recv.read_exact(&mut buf)
         .await
@@ -665,6 +675,38 @@ mod tests {
         let _ = old_agent(&enrollment_only);
     }
 
+    #[tokio::test]
+    async fn s3_evidence_never_falls_back_to_default_channel() {
+        let registry = std::sync::Arc::new(StreamAccept::new(2));
+        assert_eq!(StreamProtocol::from_u8(6), Some(StreamProtocol::EvidenceV1));
+        assert!(registry
+            .registered_sender(StreamProtocol::EvidenceV1)
+            .is_none());
+        assert!(registry.sender_for(StreamProtocol::EvidenceV1).is_closed());
+        let acceptor = registry.register(StreamProtocol::EvidenceV1).unwrap();
+        assert!(registry
+            .registered_sender(StreamProtocol::EvidenceV1)
+            .is_some());
+        assert!(!registry
+            .sender_for(StreamProtocol::EvidenceV1)
+            .same_channel(registry.sender()));
+        drop(acceptor);
+        assert!(registry.sender_for(StreamProtocol::EvidenceV1).is_closed());
+        assert!(registry.receiver().lock().await.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn s3_no_first_byte_keeps_existing_prefix_timeout() {
+        let (_tx, mut rx) = tokio::io::duplex(1);
+        let start = tokio::time::Instant::now();
+        assert!(
+            tokio::time::timeout(PREFIX_READ_TIMEOUT, read_protocol_prefix(&mut rx))
+                .await
+                .is_err()
+        );
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(10));
+    }
+
     #[test]
     fn protocol_prefix_round_trips() {
         for p in [
@@ -672,6 +714,8 @@ mod tests {
             StreamProtocol::SocksV1,
             StreamProtocol::ForwardV2,
             StreamProtocol::WebRtcV1,
+            StreamProtocol::SyncV1,
+            StreamProtocol::EvidenceV1,
         ] {
             assert_eq!(StreamProtocol::from_u8(p.as_u8()), Some(p));
         }
@@ -683,7 +727,7 @@ mod tests {
         for byte in 0x00u8..=0xFF {
             let parsed = StreamProtocol::from_u8(byte);
             match byte {
-                0x01..=0x05 => {
+                0x01..=0x06 => {
                     assert!(parsed.is_some(), "byte {byte:#x} should parse")
                 }
                 _ => assert_eq!(parsed, None, "byte {byte:#x} must be unknown"),
