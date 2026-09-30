@@ -797,11 +797,20 @@ async fn fetch_and_apply(
         ControlBlobKind::JoinResult => {
             let result: JoinResultMessage =
                 serde_json::from_slice(&bytes).map_err(|_| "invalid join result")?;
-            let JoinResultMessage::Result { event, chain, .. } = &result else {
+            let JoinResultMessage::Result {
+                event,
+                chain,
+                intervening_events,
+                ..
+            } = &result
+            else {
                 return Err("control blob not a join result response");
             };
             if chain.len() > x0x::groups::COMMIT_LOG_CAP {
                 return Err("control blob result chain exceeds retained commit cap");
+            }
+            if intervening_events.len() > super::JOIN_RESULT_INTERVENING_EVENT_CAP {
+                return Err("control blob result carries too many intervening events");
             }
             let NamedGroupMetadataEvent::MemberAdded {
                 group_id, agent_id, ..

@@ -132,6 +132,8 @@ struct BackToBack {
     add_j2: SealedAdd,
     /// What the authority serves J2 for a fetch from the stub revision.
     j2_result: JoinResultMessage,
+    /// The same result as served by a pre-#1139 authority.
+    j2_legacy_result: JoinResultMessage,
     j1_attempt: String,
     j2_attempt: String,
 }
@@ -287,6 +289,10 @@ async fn build_back_to_back(dir: &std::path::Path) -> Result<BackToBack> {
         .write()
         .await
         .insert(group_key.clone(), next.clone());
+    // The live seal path (`add_treekem_named_group_member`) logs every
+    // sealed MemberAdded in the in-memory TreeKEM event log.
+    remember_treekem_membership_event(&authority, &add_j1.event).await;
+    remember_treekem_membership_event(&authority, &add_j2.event).await;
 
     // Exactly what the authority serves J2's FetchRequest from the stub
     // revision: stage_join_result's v2 owner attestation plus
@@ -304,11 +310,37 @@ async fn build_back_to_back(dir: &std::path::Path) -> Result<BackToBack> {
         owner,
     )
     .map_err(|e| anyhow::anyhow!(e))?;
-    let j2_result = JoinResultMessage::Result {
+    // A pre-#1139 (legacy) authority serves no intervening events.
+    let j2_legacy_result = JoinResultMessage::Result {
         event: Box::new(add_j2.event.clone()),
         chain,
         head_attestation: Some(Box::new(head_attestation)),
         roster_certificates_b64: Vec::new(),
+        intervening_events: Vec::new(),
+    };
+    // #1139: what the fixed FetchRequest arm adds from the authority's log.
+    let intervening = super::super::intervening_membership_events(
+        &authority,
+        std::slice::from_ref(&stable_group_id),
+        base.state_revision,
+        add_j2.commit.revision,
+    )
+    .await;
+    let j2_result = match j2_legacy_result.clone() {
+        JoinResultMessage::Result {
+            event,
+            chain,
+            head_attestation,
+            roster_certificates_b64,
+            ..
+        } => JoinResultMessage::Result {
+            event,
+            chain,
+            head_attestation,
+            roster_certificates_b64,
+            intervening_events: intervening,
+        },
+        other => other,
     };
 
     let owner_pin = hex::encode(owner.user_id().as_bytes());
@@ -326,6 +358,7 @@ async fn build_back_to_back(dir: &std::path::Path) -> Result<BackToBack> {
         add_j1,
         add_j2,
         j2_result,
+        j2_legacy_result,
     })
 }
 
@@ -341,15 +374,23 @@ async fn join_state(joiner: &Arc<AppState>, group_key: &str) -> &'static str {
     local_join_membership_state(joiner, &info, &local).await
 }
 
-async fn deliver_j2_result(s: &BackToBack) {
+async fn deliver_j2(s: &BackToBack, result: &JoinResultMessage) {
     super::super::handle_join_result_message_bound(
         &s.j2,
         &s.authority_id,
         true,
-        s.j2_result.clone(),
+        result.clone(),
         Some(s.j2_attempt.as_str()),
     )
     .await;
+}
+
+async fn deliver_j2_legacy_result(s: &BackToBack) {
+    deliver_j2(s, &s.j2_legacy_result).await;
+}
+
+async fn deliver_j2_result(s: &BackToBack) {
+    deliver_j2(s, &s.j2_result).await;
 }
 
 /// The page the authority's TreeKEM catch-up responder serves for J2's
@@ -374,7 +415,7 @@ fn catchup_page(s: &BackToBack) -> TreeKemCatchupResponse {
 /// ENTIRELY on a separate catch-up round trip, even though the served
 /// chain already carries r+1. Positive control: J1 (gapless) converges.
 #[tokio::test]
-async fn issue1139_join_result_alone_leaves_second_joiner_pending() -> Result<()> {
+async fn issue1139_legacy_join_result_alone_leaves_second_joiner_pending() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let s = build_back_to_back(dir.path()).await?;
 
@@ -387,6 +428,7 @@ async fn issue1139_join_result_alone_leaves_second_joiner_pending() -> Result<()
             chain: Vec::new(),
             head_attestation: None,
             roster_certificates_b64: Vec::new(),
+            intervening_events: Vec::new(),
         },
         Some(s.j1_attempt.as_str()),
     )
@@ -395,7 +437,7 @@ async fn issue1139_join_result_alone_leaves_second_joiner_pending() -> Result<()
     assert!(s.j1.treekem_groups.read().await.contains_key(&s.group_key));
 
     for _ in 0..3 {
-        deliver_j2_result(&s).await;
+        deliver_j2_legacy_result(&s).await;
     }
     assert_eq!(
         join_state(&s.j2, &s.group_key).await,
@@ -448,7 +490,7 @@ async fn issue1139_join_result_alone_leaves_second_joiner_pending() -> Result<()
 async fn issue1139_catchup_page_converges_second_joiner() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let s = build_back_to_back(dir.path()).await?;
-    deliver_j2_result(&s).await;
+    deliver_j2_legacy_result(&s).await;
     assert_eq!(
         join_state(&s.j2, &s.group_key).await,
         "pending_authority_commit"
@@ -489,24 +531,178 @@ async fn issue1139_r1_before_own_result_converges() -> Result<()> {
             .accepted,
         "r+1 applies state-only on the pre-Welcome stub"
     );
-    deliver_j2_result(&s).await;
+    deliver_j2_legacy_result(&s).await;
     assert_eq!(join_state(&s.j2, &s.group_key).await, "active");
     assert!(s.j2.treekem_groups.read().await.contains_key(&s.group_key));
     Ok(())
 }
 
-/// WHY (#1139): the self-sufficient contract — the join result already
-/// carries the owner-anchored chain [r+1], so it alone should converge J2
-/// without a second round trip whose loss (or unanswered request) strands
-/// the joiner. Fails today.
+/// WHY (#1139): the self-sufficient contract — the fixed authority's join
+/// result carries the intervening r+1 MemberAdded, which the joiner applies
+/// through the ordinary path (state-only, pre-Welcome) before its own r+2,
+/// so the result ALONE converges J2 with no catch-up round trip. Red
+/// without `apply_join_result_intervening_events`; green with it.
 #[tokio::test]
-#[ignore = "#1139: fails today — the served chain is classified but never applied on TreeKEM"]
 async fn issue1139_join_result_alone_converges_second_joiner() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let s = build_back_to_back(dir.path()).await?;
+    let JoinResultMessage::Result {
+        intervening_events, ..
+    } = &s.j2_result
+    else {
+        panic!("fixture serves a Result");
+    };
+    assert_eq!(
+        intervening_events
+            .iter()
+            .filter_map(named_group_metadata_event_commit)
+            .map(|c| c.state_hash.clone())
+            .collect::<Vec<_>>(),
+        vec![s.add_j1.commit.state_hash.clone()],
+        "the authority serves exactly the r+1 MemberAdded"
+    );
     deliver_j2_result(&s).await;
     assert_eq!(join_state(&s.j2, &s.group_key).await, "active");
     assert!(s.j2.treekem_groups.read().await.contains_key(&s.group_key));
+    assert!(
+        s.j2.treekem_catchup_throttle.read().await.is_empty(),
+        "converged without any catch-up round trip"
+    );
+    // Idempotent: the poll may re-deliver the same result.
+    deliver_j2_result(&s).await;
+    assert_eq!(join_state(&s.j2, &s.group_key).await, "active");
+    Ok(())
+}
+
+/// WHY (#1139, mixed version): the field is additive. A legacy result
+/// (no key) decodes to an empty list, and an empty list is omitted on the
+/// wire, so a fixed authority talking to a legacy peer — and vice versa —
+/// is byte-for-byte today's behaviour (the legacy path is pinned by
+/// `issue1139_legacy_join_result_alone_leaves_second_joiner_pending`).
+#[tokio::test]
+async fn issue1139_intervening_events_field_is_additive_on_the_wire() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let legacy_wire = serde_json::to_value(&s.j2_legacy_result)?;
+    assert!(
+        legacy_wire.get("intervening_events").is_none(),
+        "an empty list is omitted: a fixed authority with nothing to add sends the legacy shape"
+    );
+    let decoded: JoinResultMessage = serde_json::from_value(legacy_wire)?;
+    assert!(matches!(
+        decoded,
+        JoinResultMessage::Result { ref intervening_events, .. } if intervening_events.is_empty()
+    ));
+    let new_wire = serde_json::to_value(&s.j2_result)?;
+    assert_eq!(
+        new_wire
+            .get("intervening_events")
+            .and_then(|v| v.as_array())
+            .map(Vec::len),
+        Some(1)
+    );
+    Ok(())
+}
+
+/// WHY (#1139, authority bounds): events are served only when they cover
+/// the WHOLE gap, and only up to the cap — otherwise nothing, and the
+/// joiner keeps today's path. A partial list would only fail later links.
+#[tokio::test]
+async fn issue1139_authority_serves_only_complete_bounded_gaps() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let keys = [s.stable_group_id.clone()];
+    let r = s.add_j1.commit.revision - 1;
+    let serve = |from: u64, terminal: u64| {
+        super::super::intervening_membership_events(&s._authority, &keys, from, terminal)
+    };
+    assert_eq!(serve(r, r + 2).await.len(), 1, "complete one-link gap");
+    assert!(
+        serve(r + 1, r + 2).await.is_empty(),
+        "no gap, nothing to carry"
+    );
+    assert!(
+        serve(r + 2, r + 2).await.is_empty(),
+        "joiner at or past the terminal"
+    );
+    assert!(
+        serve(r.saturating_sub(1), r + 2).await.is_empty(),
+        "r is not a logged membership event: the gap is not covered"
+    );
+    let cap = super::super::JOIN_RESULT_INTERVENING_EVENT_CAP as u64;
+    assert!(serve(r, r + cap + 2).await.is_empty(), "over the cap");
+    // A log that lost r+1 (e.g. the authority restarted) serves nothing.
+    s._authority.treekem_event_log.write().await.clear();
+    assert!(serve(r, r + 2).await.is_empty());
+    Ok(())
+}
+
+/// WHY (#1139, joiner bounds): the joiner applies carried events only for
+/// a CURRENT bound attempt, only for the same group and only up to the
+/// cap. Anything else leaves J2 exactly where today's path leaves it.
+#[tokio::test]
+async fn issue1139_joiner_ignores_stale_foreign_or_oversized_carries() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let revision = |s: &BackToBack| {
+        let j2 = Arc::clone(&s.j2);
+        let key = s.group_key.clone();
+        async move {
+            j2.named_groups
+                .read()
+                .await
+                .get(&key)
+                .map(|i| i.state_revision)
+        }
+    };
+    let base = revision(&s).await;
+
+    // Stale attempt: rejected before any carried event is applied.
+    super::super::handle_join_result_message_bound(
+        &s.j2,
+        &s.authority_id,
+        true,
+        s.j2_result.clone(),
+        Some("attempt-dead"),
+    )
+    .await;
+    assert_eq!(revision(&s).await, base, "stale attempt applies nothing");
+
+    let with_events = |events: Vec<NamedGroupMetadataEvent>| match s.j2_result.clone() {
+        JoinResultMessage::Result {
+            event,
+            chain,
+            head_attestation,
+            roster_certificates_b64,
+            ..
+        } => JoinResultMessage::Result {
+            event,
+            chain,
+            head_attestation,
+            roster_certificates_b64,
+            intervening_events: events,
+        },
+        other => other,
+    };
+    // Over the cap: ignored wholesale.
+    let cap = super::super::JOIN_RESULT_INTERVENING_EVENT_CAP;
+    deliver_j2(&s, &with_events(vec![s.add_j1.event.clone(); cap + 1])).await;
+    assert_eq!(revision(&s).await, base, "over-cap carry applies nothing");
+    // Another group's event: ignored.
+    let mut foreign = s.add_j1.event.clone();
+    if let NamedGroupMetadataEvent::MemberAdded { group_id, .. } = &mut foreign {
+        *group_id = "ee".repeat(32);
+    }
+    deliver_j2(&s, &with_events(vec![foreign])).await;
+    assert_eq!(
+        revision(&s).await,
+        base,
+        "foreign-group carry applies nothing"
+    );
+    assert_eq!(
+        join_state(&s.j2, &s.group_key).await,
+        "pending_authority_commit"
+    );
     Ok(())
 }
 
@@ -540,7 +736,7 @@ async fn issue1139_standalone_r2_is_silent_then_r1_rescues() -> Result<()> {
             .await
             .accepted
     );
-    deliver_j2_result(&s).await;
+    deliver_j2_legacy_result(&s).await;
     assert_eq!(join_state(&s.j2, &s.group_key).await, "active");
     assert!(s.j2.treekem_groups.read().await.contains_key(&s.group_key));
     Ok(())
