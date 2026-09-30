@@ -50208,6 +50208,60 @@ pub(in crate::server) mod tests {
         Ok((state, dir))
     }
 
+    /// R17/R19: the certificate must belong to the running identity, not
+    /// overwrite discovery while its anonymous startup announce is in flight.
+    async fn networked_owner_test_state(
+        plane: &str,
+        owner_seed: &[u8; 32],
+    ) -> Result<(Arc<AppState>, tempfile::TempDir)> {
+        let dir = tempfile::tempdir()?;
+        let mut config = isolated_loopback_config(plane);
+        config.port_mapping_enabled = false;
+        let agent = Arc::new(
+            Agent::builder()
+                .with_identity_dir(dir.path())
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key(x0x::identity::AgentKeypair::generate()?)
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_user_key(x0x::identity::UserKeypair::from_seed(owner_seed)?)
+                .with_peer_cache_disabled()
+                .with_network_config(config)
+                .build()
+                .await?,
+        );
+        agent.join_network().await.context("join owner network")?;
+        agent.announce_identity(true, true).await?;
+        let state = secure_endpoint_test_state_at(dir.path(), agent).await?;
+        Ok((state, dir))
+    }
+
+    /// Observe actual V3 ingest and blob resolution, not just publish completion.
+    async fn announce_owner_cert_to(observer: &Agent, subject: &Agent) -> Result<()> {
+        let cert = subject.agent_certificate().context("owner identity cert")?;
+        let digest = x0x::announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()));
+        let marker = format!("r1132-owner-{}", rand::random::<u64>());
+        subject.set_self_name(Some(marker.clone()));
+        subject.announce_identity(true, true).await?;
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let discovered = observer.discovered_agent(subject.agent_id()).await?;
+                if discovered.as_ref().is_some_and(|entry| {
+                    entry.self_name.as_deref() == Some(marker.as_str())
+                        && entry.cert_digest == Some(digest)
+                        && entry.agent_certificate.as_ref() == Some(cert)
+                }) && observer.announce_blob_cache.get(&digest).await.is_some()
+                {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .context("owner certificate must land through announcement and blob fetch")??;
+        Ok(())
+    }
+
     /// #942 B2: a networked test state whose agent carries a DURABLE
     /// HISTORY handle — required for v2 durable-ACK DMs (the strict
     /// send mode the requester offer outbox uses). Same shape as
