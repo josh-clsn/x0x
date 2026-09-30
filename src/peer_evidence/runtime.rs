@@ -72,17 +72,16 @@ impl EvidencePolicy for RuntimePolicy {
         }
         flags
     }
-    fn revoked(&self, agent: AgentId, machine: MachineId, user: Option<UserId>) -> bool {
+    fn revoked(&self, agent: AgentId, machine: MachineId, _user: Option<UserId>) -> bool {
         let Ok(r) = self.revoked.try_read() else {
             self.unavailable.fetch_add(1, Ordering::Relaxed);
             return true;
         };
-        {
-            r.is_agent_revoked(&agent)
-                || r.is_machine_revoked(&machine)
-                || r.is_binding_revoked(&agent, &machine)
-                || user.is_some_and(|u| r.is_agent_revoked(&AgentId(*u.as_bytes())))
-        }
+        // RevocationSet has no user subject. A certificate's UserId must not
+        // be interpreted as an AgentId in the agent revocation namespace.
+        r.is_agent_revoked(&agent)
+            || r.is_machine_revoked(&machine)
+            || r.is_binding_revoked(&agent, &machine)
     }
     fn contains_agent(&self, agent: AgentId, now: u64) -> bool {
         // Without a record, only explicit agent grants and active rosters

@@ -14010,7 +14010,7 @@ impl Agent {
         let token = self.shutdown_token.clone();
         self.spawn_tracked(async move {
             let mut last_maintenance = 0;
-            let mut processed = std::collections::HashMap::new();
+            let mut processed = peer_evidence::GossipPairing::default();
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
                 tokio::select! {
@@ -14032,26 +14032,21 @@ impl Agent {
                     let Ok(ann) = announce_v3::deserialize_v3(&announcement) else { continue; };
                     let cert = certificate.as_deref().and_then(|c| identity::AgentCertificate::from_storage_bytes(c).ok());
                     if !store.related(agent, ann.machine_id, cert.as_ref(), now) { continue; }
-                    let mut hash = blake3::Hasher::new();
-                    hash.update(&announcement); hash.update(&advert);
-                    if let Some(cert) = &certificate { hash.update(cert); }
-                    let fingerprint = *hash.finalize().as_bytes();
-                    if processed.get(&agent) == Some(&fingerprint) && store.usable_agent(agent, now).is_some() { continue; }
-                    records.push((agent, fingerprint, peer_evidence::EvidenceRecordV1 { announcement, advert, certificate, relation: 0, stored_at_ms: now }));
+                    records.push((agent, peer_evidence::EvidenceRecordV1 { announcement, advert, certificate, relation: 0, stored_at_ms: now }));
                 }
                 let maintain = now.saturating_sub(last_maintenance) >= 60_000;
                 if maintain { last_maintenance = now; }
-                if let Ok(accepted) = tokio::task::spawn_blocking(move || {
-                    let mut accepted = Vec::new();
-                    for (agent, fingerprint, record) in records {
-                        if store.ingest(record, peer_evidence::IngestSource::Gossip, now).is_ok() { accepted.push((agent, fingerprint)); }
+                processed.retain_fresh(&capture, now);
+                let mut attempts = std::mem::take(&mut processed);
+                if let Ok(attempts) = tokio::task::spawn_blocking(move || {
+                    for (agent, record) in records {
+                        let _ = attempts.ingest(&store, agent, record, now);
                     }
                     if maintain { let _ = store.maintain(now); }
                     let _ = store.flush(now, false);
-                    accepted
+                    attempts
                 }).await {
-                    processed.extend(accepted);
-                    processed.retain(|agent, _| capture.get(*agent, true, now).is_some());
+                    processed = attempts;
                 }
             }
         });

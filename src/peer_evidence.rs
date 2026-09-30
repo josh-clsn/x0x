@@ -315,7 +315,8 @@ pub trait EvidencePolicy: Send + Sync {
         cert: Option<&AgentCertificate>,
         now_ms: u64,
     ) -> u8;
-    /// Includes agent, machine, binding and certificate-user revocations.
+    /// Checks agent, machine and binding revocations. The certificate user is
+    /// available to policies with a user revocation subject; RuntimePolicy has none.
     fn revoked(&self, agent: AgentId, machine: MachineId, user: Option<UserId>) -> bool;
     /// Used to protect watermarks even when their record is absent.
     fn contains_agent(&self, agent: AgentId, now_ms: u64) -> bool;
@@ -1145,6 +1146,78 @@ fn disqualified(
     })
 }
 
+/// Process-only gossip attempt cache, including refusals. It grants no authority.
+#[derive(Default)]
+pub(crate) struct GossipPairing {
+    processed: HashMap<AgentId, PairAttempt>,
+}
+struct PairAttempt {
+    fingerprint: [u8; 32],
+    unavailable_epoch: u64,
+    last_used: u64,
+}
+impl GossipPairing {
+    /// None means this exact input and policy epoch were already attempted.
+    pub(crate) fn ingest(
+        &mut self,
+        store: &PeerEvidenceStore,
+        agent: AgentId,
+        record: EvidenceRecordV1,
+        now: u64,
+    ) -> Option<Result<()>> {
+        let mut hash = blake3::Hasher::new();
+        hash.update(&record.announcement);
+        hash.update(&record.advert);
+        if let Some(cert) = &record.certificate {
+            hash.update(cert);
+        }
+        let fingerprint = *hash.finalize().as_bytes();
+        let epoch = store.policy.unavailable_epoch();
+        if let Some(previous) = self.processed.get_mut(&agent) {
+            previous.last_used = now;
+            if previous.fingerprint == fingerprint && previous.unavailable_epoch == epoch {
+                return None;
+            }
+        }
+        let result = store.ingest(record, IngestSource::Gossip, now);
+        if self.processed.len() >= RECORD_CAP && !self.processed.contains_key(&agent) {
+            // Same bounded LRU ordering as the evidence store, including ties.
+            if let Some(victim) = self
+                .processed
+                .iter()
+                .min_by_key(|(id, attempt)| (attempt.last_used, *id.as_bytes()))
+                .map(|(id, _)| *id)
+            {
+                self.processed.remove(&victim);
+            }
+        }
+        self.processed.insert(
+            agent,
+            PairAttempt {
+                fingerprint,
+                // Include unavailability observed by this attempt so a refusal
+                // does not itself force another verification on the next tick.
+                unavailable_epoch: store.policy.unavailable_epoch(),
+                last_used: now,
+            },
+        );
+        Some(result)
+    }
+
+    pub(crate) fn retain_fresh(&mut self, capture: &VerifiedWireCapture, now: u64) {
+        let Ok(entries) = capture.inner.lock() else {
+            return;
+        };
+        self.processed.retain(|agent, _| {
+            [0, 1].into_iter().all(|part| {
+                entries
+                    .get(&(*agent, part))
+                    .is_some_and(|wire| fresh(wire.timestamp, now, W_MS))
+            })
+        });
+    }
+}
+
 /// Bounded, process-only verified capture for pairing. Strangers may occupy
 /// this TTL cache, never the persistent relationship store.
 #[derive(Default)]
@@ -1239,9 +1312,18 @@ mod tests {
     struct Policy {
         peers: Mutex<HashMap<AgentId, u8>>,
         revoked: AtomicBool,
+        unavailable: AtomicBool,
+        epoch: std::sync::atomic::AtomicU64,
     }
     impl EvidencePolicy for Policy {
+        fn unavailable_epoch(&self) -> u64 {
+            self.epoch.load(Ordering::Relaxed)
+        }
         fn relation(&self, a: AgentId, _: MachineId, _: Option<&AgentCertificate>, _: u64) -> u8 {
+            if self.unavailable.load(Ordering::Relaxed) {
+                self.epoch.fetch_add(1, Ordering::Relaxed);
+                return 0;
+            }
             self.peers.lock().unwrap().get(&a).copied().unwrap_or(0)
         }
         fn revoked(&self, _: AgentId, _: MachineId, _: Option<UserId>) -> bool {
@@ -2600,6 +2682,159 @@ mod tests {
             crate::raw_delivery_with_evidence(None, None, Some(&runtime), p.a(), p.m(), now),
             (true, false, None),
         );
+    }
+
+    #[test]
+    fn s2_pairing_verifies_each_outcome_once_until_fingerprint_or_epoch_changes() {
+        for refusal in [
+            Some("agent/machine mismatch"),
+            Some("non-monotonic evidence"),
+            Some("move watermark"),
+            Some("not a current relationship"),
+            None,
+        ] {
+            let mut p = Peer::new();
+            let (_dir, policy, store) = setup(&p);
+            let mut record = p.record(NOW, NOW);
+            let mut changed = p.record(NOW + 1000, NOW + 1000);
+            match refusal {
+                Some("agent/machine mismatch") => {
+                    p.machine = MachineKeypair::generate().unwrap();
+                    record.advert = p.record(NOW, NOW).advert;
+                    changed.advert = p.record(NOW + 1000, NOW + 1000).advert;
+                }
+                Some("non-monotonic evidence") => {
+                    store
+                        .ingest(
+                            p.record(NOW + 60_000, NOW + 60_000),
+                            IngestSource::Gossip,
+                            NOW,
+                        )
+                        .unwrap();
+                }
+                Some("move watermark") => {
+                    store.lock().unwrap().file.watermarks.insert(
+                        p.a(),
+                        MoveWatermarkV1 {
+                            t: NOW + 60_000,
+                            machine: MachineKeypair::generate().unwrap().machine_id(),
+                        },
+                    );
+                }
+                Some("not a current relationship") => {
+                    policy.unavailable.store(true, Ordering::Relaxed)
+                }
+                _ => {}
+            }
+            let mut pairing = GossipPairing::default();
+            VERIFY_CALLS.set(0);
+            let outcome = pairing.ingest(&store, p.a(), record.clone(), NOW).unwrap();
+            match refusal {
+                Some(reason) => assert!(
+                    matches!(outcome, Err(EvidenceError::Invalid(actual)) if actual == reason)
+                ),
+                None => assert!(outcome.is_ok()),
+            }
+            for tick in 1..30 {
+                assert!(pairing
+                    .ingest(&store, p.a(), record.clone(), NOW + tick * 1000)
+                    .is_none());
+            }
+            assert_eq!(
+                VERIFY_CALLS.get(),
+                3,
+                "one verification of each signed part over 30 ticks: {refusal:?}"
+            );
+
+            assert!(pairing
+                .ingest(&store, p.a(), changed.clone(), NOW + 30_000)
+                .is_some());
+            for tick in 31..60 {
+                assert!(pairing
+                    .ingest(&store, p.a(), changed.clone(), NOW + tick * 1000)
+                    .is_none());
+            }
+            assert_eq!(
+                VERIFY_CALLS.get(),
+                6,
+                "changed fingerprint retries exactly once: {refusal:?}"
+            );
+
+            policy.unavailable.store(false, Ordering::Relaxed);
+            policy.epoch.fetch_add(1, Ordering::Relaxed);
+            let outcome = pairing
+                .ingest(&store, p.a(), changed.clone(), NOW + 60_000)
+                .unwrap();
+            if refusal == Some("not a current relationship") {
+                assert!(
+                    outcome.is_ok(),
+                    "policy recovery accepts the unchanged pair"
+                );
+            }
+            for tick in 61..90 {
+                assert!(pairing
+                    .ingest(&store, p.a(), changed.clone(), NOW + tick * 1000)
+                    .is_none());
+            }
+            assert_eq!(
+                VERIFY_CALLS.get(),
+                9,
+                "advanced policy epoch retries exactly once: {refusal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn s2_pairing_fingerprint_cache_is_bounded_lru_and_expires_with_capture() {
+        let p = Peer::new();
+        let (_dir, _, store) = setup(&p);
+        let mut pairing = GossipPairing::default();
+        let record = EvidenceRecordV1 {
+            announcement: vec![],
+            advert: vec![],
+            certificate: None,
+            relation: 0,
+            stored_at_ms: NOW,
+        };
+        let agent = |i: usize| {
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            AgentId(bytes)
+        };
+        for i in 0..RECORD_CAP {
+            assert!(pairing
+                .ingest(&store, agent(i), record.clone(), NOW + i as u64)
+                .unwrap()
+                .is_err());
+        }
+        // Cache hits update recency too, so agent 1 is now the LRU victim.
+        assert!(pairing
+            .ingest(&store, agent(0), record.clone(), NOW + RECORD_CAP as u64)
+            .is_none());
+        assert!(pairing
+            .ingest(
+                &store,
+                agent(RECORD_CAP),
+                record,
+                NOW + RECORD_CAP as u64 + 1
+            )
+            .is_some());
+        assert_eq!(pairing.processed.len(), RECORD_CAP);
+        assert!(pairing.processed.contains_key(&agent(0)));
+        assert!(!pairing.processed.contains_key(&agent(1)));
+
+        let capture = VerifiedWireCapture::default();
+        capture.capture(agent(0), true, &[1], NOW, NOW);
+        capture.capture(agent(0), false, &[2], NOW, NOW);
+        capture.capture(agent(2), true, &[1], NOW, NOW);
+        pairing.retain_fresh(&capture, NOW);
+        assert_eq!(
+            pairing.processed.len(),
+            1,
+            "only complete fresh pairs remain"
+        );
+        pairing.retain_fresh(&capture, NOW + W_MS + 1);
+        assert!(pairing.processed.is_empty());
     }
 
     #[tokio::test]
