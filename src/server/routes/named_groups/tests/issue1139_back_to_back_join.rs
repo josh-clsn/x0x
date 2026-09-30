@@ -920,3 +920,70 @@ fn issue1139_carry_only_for_blob_capable_bound_fetches() {
     assert!(!allowed(true, true, false), "no attempt binding");
     assert!(!allowed(false, true, true), "unverified fetch");
 }
+
+/// WHY (#1139 review r2): the authority checks revision conflicts across
+/// EVERY logged commit in the gap before selecting MemberAdded events. A
+/// competing MemberRemoved at r+1 (a different commit hash) must suppress
+/// the carry whichever order it was logged in, and a gap revision held
+/// only by a non-MemberAdded commit must too.
+#[tokio::test]
+async fn issue1139_authority_competing_commit_in_gap_suppresses_carry() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let keys = [s.stable_group_id.clone()];
+    let r1 = s.add_j1.commit.revision;
+    let (from, terminal) = (r1 - 1, r1 + 1);
+    let mut competing = s.add_j1.commit.clone();
+    competing.state_hash = "ff".repeat(32);
+    let removed = NamedGroupMetadataEvent::MemberRemoved {
+        group_id: s.stable_group_id.clone(),
+        revision: r1,
+        actor: hex::encode(s.authority_id.as_bytes()),
+        agent_id: s.add_j1.member_hex.clone(),
+        treekem_commit_b64: None,
+        treekem_epoch: None,
+        secret_epoch: None,
+        commit: Some(competing),
+    };
+    let serve =
+        || super::super::intervening_membership_events(&s._authority, &keys, from, terminal);
+    assert_eq!(serve().await.len(), 1, "control: the clean gap carries r+1");
+    let key = s.stable_group_id.clone();
+    let set_log = |events: Vec<NamedGroupMetadataEvent>| {
+        let authority = Arc::clone(&s._authority);
+        let key = key.clone();
+        async move {
+            authority
+                .treekem_event_log
+                .write()
+                .await
+                .insert(key, events.into_iter().collect());
+        }
+    };
+    set_log(vec![
+        s.add_j1.event.clone(),
+        removed.clone(),
+        s.add_j2.event.clone(),
+    ])
+    .await;
+    assert!(
+        serve().await.is_empty(),
+        "MemberAdded then competing MemberRemoved"
+    );
+    set_log(vec![
+        removed.clone(),
+        s.add_j1.event.clone(),
+        s.add_j2.event.clone(),
+    ])
+    .await;
+    assert!(
+        serve().await.is_empty(),
+        "competing MemberRemoved then MemberAdded"
+    );
+    set_log(vec![removed, s.add_j2.event.clone()]).await;
+    assert!(
+        serve().await.is_empty(),
+        "the gap revision holds only a removal"
+    );
+    Ok(())
+}

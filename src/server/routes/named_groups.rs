@@ -34571,10 +34571,10 @@ async fn intervening_membership_events(
         let Some(logged) = logs.get(key) else {
             continue;
         };
+        // Conflicts are checked across EVERY logged commit in the gap
+        // (review r2): filtering to MemberAdded first would hide a
+        // competing removal/ban at the same revision.
         for event in logged {
-            if !matches!(event, NamedGroupMetadataEvent::MemberAdded { .. }) {
-                continue;
-            }
             let Some(commit) = named_group_metadata_event_commit(event) else {
                 continue;
             };
@@ -34597,7 +34597,11 @@ async fn intervening_membership_events(
             }
         }
     }
-    if by_revision.len() as u64 != gap {
+    if by_revision.len() as u64 != gap
+        || by_revision
+            .values()
+            .any(|event| !matches!(event, NamedGroupMetadataEvent::MemberAdded { .. }))
+    {
         return Vec::new();
     }
     by_revision.into_values().collect()
