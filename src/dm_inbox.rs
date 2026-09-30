@@ -37,6 +37,31 @@ const DURABLE_ACK_MAX_CONCURRENT: usize = 32;
 /// Shared with the daemon's predecessor listener. A literal prefix alone is
 /// ordinary DM text until the suffix is a verified signed pubsub envelope.
 pub const GROUP_PREDECESSOR_RELAY_DM_PREFIX: &[u8] = b"X0X-GROUP-PREDECESSOR-RELAY-V1\n";
+
+/// The byte prefixes production registers as typed-DM routes when the DM
+/// inbox starts (`start_dm_inbox_when_gossip_ready`). The raw-QUIC dispatch
+/// consults this table for UNVERIFIED frames even BEFORE the inbox exists
+/// (N12: the raw listener starts earlier and passes an empty route list —
+/// without this, the startup window would re-open the user-DM leak).
+///
+/// `PUBLIC_GROUP_BOOTSTRAP_DM_PREFIX` is defined in the server layer; its
+/// literal is repeated here and pinned equal by a server-side test.
+pub(crate) const PRODUCTION_TYPED_DM_PREFIXES: [&[u8]; 6] = [
+    crate::exec::EXEC_DM_PREFIX,
+    GROUP_PREDECESSOR_RELAY_DM_PREFIX,
+    crate::share_grant::SHARE_GRANT_DM_PREFIX,
+    crate::history::classify::GROUP_PUBLIC_MESSAGE_DM_PREFIX,
+    crate::history::classify::KV_STORE_DELTA_DM_PREFIX,
+    b"X0X-PUBLIC-GROUP-BOOTSTRAP-V2\n",
+];
+
+/// Whether these bytes claim one of the production typed-DM protocols
+/// (prefix match only — recognition, not validation).
+pub(crate) fn recognized_production_typed_prefix(payload: &[u8]) -> bool {
+    PRODUCTION_TYPED_DM_PREFIXES
+        .iter()
+        .any(|prefix| payload.starts_with(prefix))
+}
 const PREDECESSOR_RELAY_MAX_ENVELOPE_BYTES: usize = 64 * 1024;
 
 /// Outcome of the C5 live Direct/typed ACK hedge.
@@ -104,9 +129,10 @@ const DURABLE_TYPED_COMPLETION_TIMEOUT: Duration = Duration::from_secs(20);
 const AUTHENTICATED_MACHINE_BINDING_CAPACITY: usize = 65_536;
 
 #[derive(Debug, Clone, Copy)]
-struct AuthenticatedMachineBinding {
-    machine_id: MachineId,
-    announced_at: u64,
+pub(crate) struct AuthenticatedMachineBinding {
+    pub(crate) machine_id: MachineId,
+    pub(crate) announced_at: u64,
+    pub(crate) cert_not_after: Option<u64>,
     last_used: (std::time::Instant, u64),
 }
 
@@ -119,6 +145,7 @@ struct AuthenticatedMachineBinding {
 #[derive(Debug)]
 pub struct AuthenticatedMachineBindingCache {
     entries: std::collections::HashMap<AgentId, AuthenticatedMachineBinding>,
+    by_machine: std::collections::BTreeSet<([u8; 32], [u8; 32])>,
     capacity: usize,
     recency: std::collections::BTreeSet<(std::time::Instant, u64, [u8; 32])>,
     clock: u64,
@@ -128,6 +155,7 @@ impl Default for AuthenticatedMachineBindingCache {
     fn default() -> Self {
         Self {
             entries: std::collections::HashMap::new(),
+            by_machine: Default::default(),
             recency: std::collections::BTreeSet::new(),
             capacity: AUTHENTICATED_MACHINE_BINDING_CAPACITY,
             clock: 0,
@@ -136,10 +164,20 @@ impl Default for AuthenticatedMachineBindingCache {
 }
 
 impl AuthenticatedMachineBindingCache {
+    /// Indexed routing candidates only; authority is rechecked at point of use.
+    pub(crate) fn agents_on_machine(&self, machine: MachineId, limit: usize) -> Vec<AgentId> {
+        self.by_machine
+            .range((machine.0, [0; 32])..=(machine.0, [255; 32]))
+            .take(limit)
+            .map(|(_, agent)| AgentId(*agent))
+            .collect()
+    }
+
     #[cfg(test)]
     fn with_capacity(capacity: usize) -> Self {
         Self {
             entries: std::collections::HashMap::new(),
+            by_machine: Default::default(),
             recency: std::collections::BTreeSet::new(),
             capacity: capacity.max(1),
             clock: 0,
@@ -152,14 +190,30 @@ impl AuthenticatedMachineBindingCache {
     }
 
     fn record(&mut self, agent_id: AgentId, machine_id: MachineId, announced_at: u64) {
+        // ADR-0021 attestations carry no user certificate. Preserve any known
+        // certificate expiry: a new machine attestation cannot renew a cert.
+        let cert_not_after = self.entries.get(&agent_id).and_then(|b| b.cert_not_after);
+        self.record_with_expiry(agent_id, machine_id, announced_at, cert_not_after);
+    }
+
+    fn record_with_expiry(
+        &mut self,
+        agent_id: AgentId,
+        machine_id: MachineId,
+        announced_at: u64,
+        cert_not_after: Option<u64>,
+    ) {
         let tick = self.next_tick();
         if let Some(mut existing) = self.entries.get(&agent_id).copied() {
             self.recency
                 .remove(&(existing.last_used.0, existing.last_used.1, agent_id.0));
             existing.last_used = tick;
             if announced_at >= existing.announced_at {
+                self.by_machine.remove(&(existing.machine_id.0, agent_id.0));
+                self.by_machine.insert((machine_id.0, agent_id.0));
                 existing.machine_id = machine_id;
                 existing.announced_at = announced_at;
+                existing.cert_not_after = cert_not_after;
             }
             self.entries.insert(agent_id, existing);
             self.recency.insert((tick.0, tick.1, agent_id.0));
@@ -172,6 +226,8 @@ impl AuthenticatedMachineBindingCache {
                 self.recency.remove(&oldest_key);
                 let evicted_agent = AgentId(oldest_key.2);
                 if let Some(evicted_binding) = self.entries.remove(&evicted_agent) {
+                    self.by_machine
+                        .remove(&(evicted_binding.machine_id.0, evicted_agent.0));
                     tracing::warn!(
                         agent = %hex::encode(evicted_agent.as_bytes()),
                         machine = %hex::encode(evicted_binding.machine_id.as_bytes()),
@@ -182,11 +238,13 @@ impl AuthenticatedMachineBindingCache {
             }
         }
 
+        self.by_machine.insert((machine_id.0, agent_id.0));
         self.entries.insert(
             agent_id,
             AuthenticatedMachineBinding {
                 machine_id,
                 announced_at,
+                cert_not_after,
                 last_used: tick,
             },
         );
@@ -194,6 +252,11 @@ impl AuthenticatedMachineBindingCache {
     }
 
     fn resolve(&mut self, agent_id: &AgentId) -> Option<MachineId> {
+        self.resolve_evidence(agent_id)
+            .map(|binding| binding.machine_id)
+    }
+
+    fn resolve_evidence(&mut self, agent_id: &AgentId) -> Option<AuthenticatedMachineBinding> {
         let tick = self.next_tick();
         let mut binding = self.entries.get(agent_id).copied()?;
         self.recency
@@ -201,7 +264,7 @@ impl AuthenticatedMachineBindingCache {
         binding.last_used = tick;
         self.entries.insert(*agent_id, binding);
         self.recency.insert((tick.0, tick.1, agent_id.0));
-        Some(binding.machine_id)
+        Some(binding)
     }
 }
 
@@ -223,6 +286,27 @@ pub(crate) async fn record_authenticated_machine_binding(
         .write()
         .await
         .record(agent_id, machine_id, announced_at);
+}
+
+/// Record the certificate lifetime from a verified identity announcement.
+pub(crate) async fn record_authenticated_machine_binding_with_expiry(
+    bindings: &AuthenticatedMachineBindings,
+    agent_id: AgentId,
+    machine_id: MachineId,
+    announced_at: u64,
+    cert_not_after: Option<u64>,
+) {
+    bindings
+        .write()
+        .await
+        .record_with_expiry(agent_id, machine_id, announced_at, cert_not_after);
+}
+
+pub(crate) async fn authenticated_machine_binding_evidence(
+    bindings: &AuthenticatedMachineBindings,
+    agent_id: &AgentId,
+) -> Option<AuthenticatedMachineBinding> {
+    bindings.write().await.resolve_evidence(agent_id)
 }
 
 pub(crate) async fn authenticated_machine_binding(
@@ -2316,6 +2400,14 @@ impl InboxPipeline {
         } else {
             (None, TypedRouteOutcome::NoPrefix)
         }
+    }
+
+    /// Whether these bytes are a COMPLETE match for a registered typed
+    /// route (prefix and validator): a protocol frame, not a user DM.
+    /// Non-consuming - the caller decides what to do with it (N12: an
+    /// unverified typed frame must not fall through to the generic bus).
+    pub(crate) fn typed_route_recognizes(routes: &[DmTypedPayloadRoute], payload: &[u8]) -> bool {
+        Self::matching_typed_route(routes, payload).0.is_some()
     }
 
     /// Shared prefix dispatch for verified gossip and post-validation raw direct
@@ -5041,6 +5133,15 @@ mod tests {
 
         let binding = bindings.write().await.resolve(&sender).expect("binding");
         assert_eq!(binding, machine_b);
+        assert!(bindings
+            .read()
+            .await
+            .agents_on_machine(machine_a, 16)
+            .is_empty());
+        assert_eq!(
+            bindings.read().await.agents_on_machine(machine_b, 16),
+            vec![sender]
+        );
     }
 
     #[test]
@@ -5058,6 +5159,13 @@ mod tests {
         assert!(bindings.resolve(&agent_a).is_some());
         assert!(bindings.resolve(&agent_b).is_none());
         assert!(bindings.resolve(&agent_c).is_some());
+        assert!(bindings
+            .agents_on_machine(MachineId([0x02; 32]), 16)
+            .is_empty());
+        assert_eq!(
+            bindings.agents_on_machine(MachineId([0x01; 32]), 16),
+            vec![agent_a]
+        );
     }
 
     /// A DM whose originating MACHINE is revoked (but whose agent-id is clean)

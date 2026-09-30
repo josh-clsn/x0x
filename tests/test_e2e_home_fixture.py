@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import types
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -91,6 +92,21 @@ class HomeFixtureTests(unittest.TestCase):
         self.assertIn("port_mapping_enabled = false", text)
         self.assertIn("rendezvous_enabled = false", text)
         self.assertNotIn("x0x.testnet", text)
+
+    def test_config_disables_the_startup_update_check(self):
+        # G46R2 finding 1: with 443 closed, the startup update check blocks
+        # ~30 s on api.github.com BEFORE the API binds, while
+        # start_ssh_tunnel gives up after 15 s — that failed Home on both
+        # arms of gate row 1. Every synthetic daemon config must carry the
+        # [update] table with enabled = false (synthetic daemons must
+        # never self-update anyway). Parsed with tomllib: a substring
+        # assert would be vacuous ('mdns_enabled = false' already
+        # contains 'enabled = false').
+        for bootstrap in (None, "10.2.3.4:9000"):
+            text = self.h.config_bytes(self.node(), "x0x.home.e2e." + "a" * 32, bootstrap).decode()
+            cfg = tomllib.loads(text)
+            self.assertIn("update", cfg)
+            self.assertIs(cfg["update"]["enabled"], False)
 
     def test_remote_command_preserves_hostile_arguments_and_stdin(self):
         args = ["space value", "apostrophe'quote", "dollar$()", "semi;colon", "star*"]

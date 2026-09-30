@@ -312,6 +312,7 @@ run_local_proof() {
 
     cat > /tmp/x0x-proof-alice/config.toml << 'TOML'
 instance_name = "proof-alice"
+network_id = "x0x.prod"
 data_dir = "/tmp/x0x-proof-alice"
 bind_address = "127.0.0.1:19881"
 api_address = "127.0.0.1:19891"
@@ -321,6 +322,7 @@ TOML
 
     cat > /tmp/x0x-proof-bob/config.toml << 'TOML'
 instance_name = "proof-bob"
+network_id = "x0x.prod"
 data_dir = "/tmp/x0x-proof-bob"
 bind_address = "127.0.0.1:19882"
 api_address = "127.0.0.1:19892"

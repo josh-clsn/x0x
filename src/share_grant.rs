@@ -599,6 +599,64 @@ impl ShareGrantStore {
         }
     }
 
+    /// Current relationship membership from already verified held grants.
+    pub(crate) fn evidence_related(
+        &self,
+        agent: AgentId,
+        cert: Option<&crate::identity::AgentCertificate>,
+        revoked: &RevocationSet,
+        now: u64,
+    ) -> bool {
+        let state = self.read_state();
+        state.issued.values().any(|g| {
+            g.is_active_at(now)
+                && g.agents.contains(&self.local_agent)
+                && !revoked.is_share_grant_revoked(&g.grant_id, &g.owner)
+                && match g.grantee {
+                    Grantee::Agent(a) => a == agent,
+                    Grantee::User(u) => {
+                        cert.is_some_and(|c| !c.is_expired(now) && c.user_id().ok() == Some(u))
+                    }
+                }
+        }) || state.received.values().any(|g| {
+            g.is_active_at(now)
+                && g.agents.contains(&agent)
+                && !revoked.is_share_grant_revoked(&g.grant_id, &g.owner)
+        })
+    }
+
+    /// A live grant edge, not merely two peers with unrelated grants.
+    pub(crate) fn evidence_context(
+        &self,
+        a: AgentId,
+        a_cert: Option<&crate::identity::AgentCertificate>,
+        b: AgentId,
+        b_cert: Option<&crate::identity::AgentCertificate>,
+        revoked: &RevocationSet,
+        now: u64,
+    ) -> bool {
+        let matches =
+            |grantee: &Grantee, agent, cert: Option<&crate::identity::AgentCertificate>| {
+                match grantee {
+                    Grantee::Agent(id) => *id == agent,
+                    Grantee::User(id) => {
+                        cert.is_some_and(|c| !c.is_expired(now) && c.user_id().ok() == Some(*id))
+                    }
+                }
+            };
+        let state = self.read_state();
+        state
+            .issued
+            .values()
+            .chain(state.received.values())
+            .any(|g| {
+                g.is_active_at(now)
+                    && !revoked.is_share_grant_revoked(&g.grant_id, &g.owner)
+                    && ((g.agents.contains(&a) && matches(&g.grantee, b, b_cert))
+                        || (g.agents.contains(&b) && matches(&g.grantee, a, a_cert)))
+            })
+    }
+
     /// One issued grant by id.
     #[must_use]
     pub fn issued(&self, grant_id: &[u8; 32]) -> Option<ShareGrant> {
@@ -791,6 +849,31 @@ pub async fn evaluate_grant_access(
     requester_machine: &MachineId,
     now_unix: u64,
 ) -> GrantAccess {
+    evaluate_grant_access_with_evidence(
+        store,
+        bindings,
+        discovery_cache,
+        revocation_set,
+        requester_agent,
+        requester_machine,
+        now_unix,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn evaluate_grant_access_with_evidence(
+    store: &ShareGrantStore,
+    bindings: &AuthenticatedMachineBindings,
+    discovery_cache: &RwLock<HashMap<AgentId, DiscoveredAgent>>,
+    revocation_set: &RwLock<RevocationSet>,
+    requester_agent: &AgentId,
+    requester_machine: &MachineId,
+    now_unix: u64,
+    evidence: Option<&crate::peer_evidence::EvidenceRuntime>,
+) -> GrantAccess {
+    let evaluated_at = std::time::Instant::now();
     let mut access = GrantAccess::default();
     // A failed clock read maps to 0; never evaluate validity windows
     // against it (it could reactivate a long-expired grant). Fail closed.
@@ -801,8 +884,30 @@ pub async fn evaluate_grant_access(
     if candidates.is_empty() {
         return access;
     }
+    if crate::dm_inbox::authenticated_machine_binding(bindings, requester_agent)
+        .await
+        .is_none()
+    {
+        if let Some(evidence) = evidence {
+            if evidence.wait(0).await {
+                evidence
+                    .lookup(*requester_agent, Some(*requester_machine))
+                    .await;
+            }
+        }
+    }
+    let now_unix = now_unix.saturating_add(evaluated_at.elapsed().as_secs());
     match crate::dm_inbox::authenticated_machine_binding(bindings, requester_agent).await {
         Some(bound) if bound == *requester_machine => {}
+        None if evidence
+            .and_then(|e| {
+                e.usable(
+                    *requester_agent,
+                    *requester_machine,
+                    now_unix.saturating_mul(1000),
+                )
+            })
+            .is_some() => {}
         _ => return access,
     }
     let live: Vec<ShareGrant> = {
@@ -815,7 +920,9 @@ pub async fn evaluate_grant_access(
         }
         candidates
             .into_iter()
-            .filter(|g| !revoked.is_share_grant_revoked(&g.grant_id, &g.owner))
+            .filter(|g| {
+                g.is_active_at(now_unix) && !revoked.is_share_grant_revoked(&g.grant_id, &g.owner)
+            })
             .collect()
     };
     let cert = if live.iter().any(|g| matches!(g.grantee, Grantee::User(_))) {
@@ -824,6 +931,17 @@ pub async fn evaluate_grant_access(
             .await
             .get(requester_agent)
             .and_then(|entry| entry.agent_certificate.clone())
+            .or_else(|| {
+                evidence
+                    .and_then(|e| {
+                        e.usable(
+                            *requester_agent,
+                            *requester_machine,
+                            now_unix.saturating_mul(1000),
+                        )
+                    })
+                    .and_then(|v| v.certificate.clone())
+            })
     } else {
         None
     };

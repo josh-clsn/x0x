@@ -376,7 +376,13 @@ def config_bytes(node: Node, plane: str, bootstrap: str | None) -> bytes:
             f'api_address = "127.0.0.1:{node.api_port}"\n'
             f'bootstrap_peers = {peers}\nnetwork_id = "{plane}"\n'
             'mdns_enabled = false\nport_mapping_enabled = false\n'
-            'rendezvous_enabled = false\nlog_level = "info"\n').encode()
+            'rendezvous_enabled = false\nlog_level = "info"\n'
+            # G46R2 finding 1: with 443 closed, the startup update check
+            # blocks ~30 s on api.github.com BEFORE the API binds, while
+            # start_ssh_tunnel gives up after 15 s — that failed Home on
+            # both arms of gate row 1. Synthetic daemons must never
+            # self-update anyway.
+            '[update]\nenabled = false\n').encode()
 
 
 def run_fixture(args: argparse.Namespace, remote: Remote, evidence: Evidence,

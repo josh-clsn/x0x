@@ -108,6 +108,46 @@ All notable changes to this project will be documented in this file.
   `docs/diagnostics.md`.
 ### Fixed
 
+- **Named instances must set `network_id` (release note).** A named instance
+  (`x0xd --name <n>`) whose config file sets no top-level `network_id` now
+  refuses to start: "named instance '<n>' has no network_id; set network_id =
+  \"x0x.testnet\" (or another plane) at the top level, or omit --name for the
+  prod plane". Before, it silently joined `x0x.prod`. **Action on upgrade:** add
+  `network_id` to the config of every named instance that has one (use
+  `"x0x.prod"` to keep joining prod). A named instance with no config file at
+  all (`install.sh --name`, `x0x daemon start --name`) is unaffected and still
+  joins `x0x.prod` with a warning. The unnamed default instance is unchanged.
+  **Do this BEFORE upgrading:** a deployed named instance whose config lacks
+  `network_id` will refuse to start after the upgrade. Under a supervisor
+  (systemd, launchd) the new binary is already in place and there is no
+  automatic rollback, so the service stays down; only the unsupervised
+  transactional handoff restores the previous binary when the new one fails
+  its health check. v0.45's `x0xd --check` does **not** flag this (it reports
+  "Configuration is valid"), so check by hand: the config must have a
+  `network_id = "…"` line above its first `[section]` header, e.g.
+  `awk '/^\[/{exit} /^network_id/{f=1} END{exit !f}' <config> || echo MISSING`.
+  A named instance is one started with `--name` or whose config sets
+  `instance_name`.
+- **A misplaced `network_id` no longer puts a daemon on the prod plane (N7).**
+  `network_id` or `mdns_enabled` under a config section (e.g. `[gossip]`) was
+  silently ignored, so the daemon joined `x0x.prod`; the testnet ran on prod
+  this way. `x0xd` now refuses to start, and `x0xd --check` fails, when either
+  key is anywhere but the top level (including under an unknown section).
+  Other unknown or misplaced keys stay warn-only at startup but now fail
+  `x0xd --check`, and their warnings are actually shown: they were logged
+  before the log subscriber existed and silently dropped. A named instance
+  without a top-level `network_id` is warned that it joins `x0x.prod`.
+- **KV store snapshots written by v0.45.0 load again (release blocker).** A
+  field added to `KvStore` after v0.45.0 sat between the store and the
+  trailing sequence counter in the snapshot file, so every v0.45.0 snapshot
+  under `<data_dir>/kv-stores/` failed with "unexpected end of file" and the
+  store was skipped at startup. v1 (`X0XKVS1`) snapshots are now decoded with
+  the exact v0.45.0 layout; new snapshots are written as v2 (`X0XKVS2`, with
+  the counter first). **Downgrade:** v0.45.0 does not read v2 snapshots. It
+  logs "unrecognized kv snapshot format (missing v1 magic)… refusing to start
+  with amnesia", skips that store (the manifest entry stays), and leaves the
+  file untouched; re-upgrading restores it. See
+  `docs/design/persisted-format-compat.md`.
 - **Group task-list deltas are now sealed with the group key (#895, security).**
   A group-scoped task list (`x0x.group.<gid>.symphony.<lid>`) used to publish
   its deltas and its `/state-sync` full-state serve as plaintext on a topic

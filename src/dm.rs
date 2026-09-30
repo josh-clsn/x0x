@@ -61,6 +61,59 @@ const DM_INBOX_TOPIC_PREFIX: &[u8] = b"x0x/dm/v1/inbox/";
 
 // ─── Wire format types ─────────────────────────────────────────────────────
 
+/// Versioned application compatibility registry (ADR 0093). Bits grant no authority.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityRegistry {
+    /// Registry interpretation; unknown versions fail closed.
+    pub version: u16,
+    /// Named application support bits; unknown bits are ignored.
+    pub bits: u64,
+}
+
+impl CapabilityRegistry {
+    /// Understands the ShareGrant v1 typed route.
+    pub const SHARE_GRANT_V1: u64 = 1;
+    /// Understands predecessor relays and requester offers.
+    pub const PREDECESSOR_OFFER_V1: u64 = 1 << 1;
+    /// Accepts `EvidenceV1` (stream protocol 0x06) evidence
+    /// Hello/Lookup streams (ADR 0089, canonical bit 2 in the ADR 0093
+    /// registry table in `docs/adr/README.md`).
+    pub const PEER_EVIDENCE_V1: u64 = 1 << 2;
+
+    /// The routes supported by this release's ready receiver.
+    pub const fn current() -> Self {
+        Self {
+            version: 1,
+            bits: Self::SHARE_GRANT_V1 | Self::PREDECESSOR_OFFER_V1 | Self::PEER_EVIDENCE_V1,
+        }
+    }
+
+    /// Require the bit for a typed product payload. Ordinary DMs are unchanged.
+    pub fn require_payload(self, payload: &[u8]) -> std::result::Result<(), DmError> {
+        if let Some((bit, capability)) = Self::required_for_payload(payload) {
+            if !self.supports(bit) {
+                return Err(DmError::RecipientUpgradeRequired { capability });
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn required_for_payload(payload: &[u8]) -> Option<(u64, &'static str)> {
+        if payload.starts_with(crate::share_grant::SHARE_GRANT_DM_PREFIX) {
+            Some((Self::SHARE_GRANT_V1, "share_grant_v1"))
+        } else if payload.starts_with(b"X0X-GROUP-PREDECESSOR-RELAY-V1\n") {
+            Some((Self::PREDECESSOR_OFFER_V1, "predecessor_offer_v1"))
+        } else {
+            None
+        }
+    }
+
+    /// Unknown registry versions never imply support.
+    pub fn supports(self, bit: u64) -> bool {
+        self.version == 1 && self.bits & bit == bit
+    }
+}
+
 /// Advertisement of the DM transport capabilities this agent supports.
 ///
 /// Carried on `AgentCard.dm_capabilities` (additive, optional field — cards
@@ -117,6 +170,11 @@ pub struct DmCapabilities {
     /// cannot cover it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub digest_support: bool,
+
+    /// Verified application registry from the signed announcement trailer.
+    /// Never serialized inside the frozen positional capabilities or cards.
+    #[serde(skip)]
+    pub application_registry: CapabilityRegistry,
 }
 
 /// Frozen pre-#437 wire shape of [`DmCapabilities`] — the exact five-field
@@ -179,6 +237,7 @@ impl DmCapabilities {
             // Placeholder material is never published and never
             // represents a wired v2 relay peer.
             digest_support: false,
+            application_registry: CapabilityRegistry::default(),
         }
     }
 
@@ -194,6 +253,7 @@ impl DmCapabilities {
             kem_public_key,
             // #437: this build verifies and enforces inner_digest.
             digest_support: true,
+            application_registry: CapabilityRegistry::current(),
         }
     }
 
@@ -212,6 +272,7 @@ impl DmCapabilities {
             kem_public_key,
             // #437: this build verifies and enforces inner_digest.
             digest_support: true,
+            application_registry: CapabilityRegistry::current(),
         }
     }
 
@@ -223,8 +284,8 @@ impl DmCapabilities {
         self
     }
 
-    /// Project onto the frozen pre-#437 wire shape: every field except
-    /// `digest_support`, in the original field order. The shared frozen
+    /// Project onto the frozen pre-#437 wire shape: no digest or application
+    /// registry extensions, in the original field order. The shared frozen
     /// base of the #448/#450 mixed-fleet fix — see
     /// [`DmCapabilitiesV1Wire`] for why no post-v1 field may ever enter
     /// a signed caps encoding.
@@ -682,6 +743,22 @@ pub(crate) fn millis_since(start: Instant) -> u64 {
 /// Errors surfaced by the gossip DM path. See design doc §"Error model".
 #[derive(Debug, thiserror::Error)]
 pub enum DmError {
+    /// No fresh verified advert supports this route. Retain the obligation
+    /// and retry after the recipient upgrades or advertises again.
+    #[error("recipient_upgrade_required: {capability}")]
+    RecipientUpgradeRequired {
+        /// Required named registry bit (ADR 0093).
+        capability: &'static str,
+    },
+
+    /// The recipient's agent is not yet DISCOVERED locally (no discovery
+    /// cache entry and no binding evidence — the post-restart send-first
+    /// shape of #1091). Distinct from key-material absence: retry as soon
+    /// as identity discovery repopulates (the peer's re-announce), which
+    /// the reconnect-triggered re-announce bounds to seconds.
+    #[error("recipient_undiscovered: {0} — awaiting the peer's identity announcement; retry")]
+    RecipientUndiscovered(String),
+
     /// Recipient's AgentCard / capability advert is not known locally, or
     /// their KEM public key is missing. Caller should retry after a
     /// capability-cache refresh.

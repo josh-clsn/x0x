@@ -207,8 +207,16 @@ for node in "${NODE_NAMES[@]}"; do
         mkdir -p /etc/systemd/journald.conf.d
         printf "[Journal]\nSystemMaxUse=1G\nSystemMaxFileSize=200M\n" > /etc/systemd/journald.conf.d/99-x0x-cap.conf
         systemctl restart systemd-journald 2>/dev/null || true
-        if [ -f /etc/logrotate.d/rsyslog ] && [ ! -f /etc/logrotate.d/rsyslog.x0x-bak ]; then
-            mv /etc/logrotate.d/rsyslog /etc/logrotate.d/rsyslog.x0x-bak
+        # #1071: keep backups OUTSIDE /etc/logrotate.d. logrotate reads every
+        # file there (".x0x-bak" is not a taboo extension), so a backup left
+        # inside makes two stanzas claim /var/log/syslog and logrotate drops
+        # x0x-logcap as a duplicate.
+        mkdir -p /root/x0x-logrotate-bak
+        if [ -f /etc/logrotate.d/rsyslog.x0x-bak ]; then
+            mv /etc/logrotate.d/rsyslog.x0x-bak /root/x0x-logrotate-bak/rsyslog
+        fi
+        if [ -f /etc/logrotate.d/rsyslog ]; then
+            mv /etc/logrotate.d/rsyslog /root/x0x-logrotate-bak/rsyslog
         fi
         cat > /etc/logrotate.d/x0x-logcap <<"LRCONF"
 /var/log/syslog
@@ -218,10 +226,17 @@ for node in "${NODE_NAMES[@]}"; do
 /var/log/daemon.log
 /var/log/user.log
 /var/log/debug
+/var/log/mail.info
+/var/log/mail.warn
+/var/log/mail.err
+/var/log/mail.log
+/var/log/lpr.log
+/var/log/cron.log
 {
     su root adm
     rotate 5
     maxsize 200M
+    daily
     missingok
     notifempty
     nocreate
@@ -230,11 +245,19 @@ for node in "${NODE_NAMES[@]}"; do
     sharedscripts
     postrotate
         /usr/lib/rsyslog/rsyslog-rotate 2>/dev/null || systemctl kill -s HUP rsyslog 2>/dev/null || true
-    endpostrotate
+    endscript
 }
 LRCONF
         printf "#!/bin/sh\n/usr/sbin/logrotate /etc/logrotate.conf 2>/dev/null || true\n" > /etc/cron.hourly/x0x-logrotate
         chmod 0755 /etc/cron.hourly/x0x-logrotate
+        # #1071: refuse a config logrotate cannot parse (a typo here once
+        # silently disabled the whole log budget).
+        lr_out=$(/usr/sbin/logrotate -d /etc/logrotate.conf 2>&1)
+        lr_rc=$?
+        if [ "$lr_rc" -ne 0 ] || printf "%s\n" "$lr_out" | grep -qiE "^error|duplicate log entry"; then
+            echo "logrotate config invalid after x0x-logcap install (rc=$lr_rc)" >&2
+            exit 1
+        fi
         /usr/sbin/logrotate -f /etc/logrotate.conf >/dev/null 2>&1 || true
         ' 2>/dev/null; then
             echo -e "${GREEN}done${NC}"

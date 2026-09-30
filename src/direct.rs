@@ -921,6 +921,14 @@ impl DirectMessaging {
         connected.contains_key(agent_id)
     }
 
+    /// Test seam (#1091): empty the agent↔machine resolution tables —
+    /// the post-restart cold state for send-first resolution. Transport
+    /// connections are untouched.
+    pub async fn clear_resolution_for_testing(&self) {
+        self.machine_to_agent.write().await.clear();
+        self.connected_agents.write().await.clear();
+    }
+
     /// Get the MachineId for a connected agent.
     pub async fn get_machine_id(&self, agent_id: &AgentId) -> Option<MachineId> {
         let connected = self.connected_agents.read().await;
@@ -1332,6 +1340,25 @@ impl DirectMessaging {
         self.diagnostics
             .incoming_envelopes_total
             .fetch_add(1, Ordering::Relaxed);
+        // N12: a sender the trust policy REJECTS (an explicitly blocked
+        // contact, or a machine that fails the contact's pin) is delivered
+        // to NO consumer. Every raw-prefix consumer reads this bus - SSE
+        // `/direct/events`, the WS tap and the background file/welcome/
+        // join-result/control/catch-up/bootstrap/meta listeners - and the
+        // typed-route gate already refuses exactly these two decisions;
+        // the generic fallback must not be the hole that re-admits them.
+        if matches!(
+            trust_decision,
+            Some(TrustDecision::RejectBlocked | TrustDecision::RejectMachineMismatch)
+        ) {
+            self.record_incoming_trust_rejected(sender_agent_id);
+            tracing::debug!(
+                target: "x0x::direct",
+                sender = %crate::logging::LogAgentId::from(&sender_agent_id),
+                "raw direct frame from a trust-rejected sender dropped before any consumer"
+            );
+            return 0;
+        }
         let now_ms = now_unix_ms_lossy();
         self.with_peer_diagnostics(sender_agent_id, |peer| {
             peer.last_recv_at_ms = Some(now_ms);
@@ -1795,24 +1822,30 @@ mod tests {
         assert_eq!(dm.get_machine_id(&agent_a).await, Some(m1));
 
         // Spoof: M2 prefixes A's id; the listener computed verified=false.
-        assert!(
-            !dm.mark_raw_direct_sender_connected(agent_a, m2, false)
-                .await
-        );
+        // The BINDING assertions run FIRST: with the #898 gate reverted the
+        // call both returns true and rebinds, and this test's red must come
+        // from the rebind state itself, not from the boolean.
+        let refused = dm
+            .mark_raw_direct_sender_connected(agent_a, m2, false)
+            .await;
         assert_eq!(
             dm.get_machine_id(&agent_a).await,
             Some(m1),
-            "an unverified claim must not move A's connected machine"
+            "an unverified claim must not move A's connected machine (#898 rebind)"
         );
         assert_eq!(dm.lookup_agent(&m2).await, None, "M2 must not map to A");
+        assert!(!refused, "and the unverified claim is refused");
 
         // A never-seen agent claimed unverified is not registered at all.
         let agent_b = AgentId([0xB1; 32]);
+        let refused_b = dm
+            .mark_raw_direct_sender_connected(agent_b, m2, false)
+            .await;
         assert!(
-            !dm.mark_raw_direct_sender_connected(agent_b, m2, false)
-                .await
+            !dm.is_connected(&agent_b).await,
+            "an unverified claim must not register a never-seen agent (#898 rebind)"
         );
-        assert!(!dm.is_connected(&agent_b).await);
+        assert!(!refused_b);
 
         // A verified move still updates the binding.
         assert!(dm.mark_raw_direct_sender_connected(agent_a, m2, true).await);

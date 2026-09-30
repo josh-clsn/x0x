@@ -7220,6 +7220,176 @@ async fn forking_catchup_responder_adopts_nothing_under_anchored_gap() -> Result
 
     Ok(())
 }
+/// #846 (gate-row-2 companion): the SAME forking-responder shape as
+/// `forking_catchup_responder_adopts_nothing_under_anchored_gap`, but the
+/// divergent page is a POLICY update — an ordinary stateful event the apply
+/// path has NO attested-sequence rule for, whose commit evaluates clean
+/// against the stub (links from the stub head, the stub's own roster root,
+/// security binding and meta hash; only the policy hash diverges). So the
+/// assertions here are on GROUP STATE alone, with no `cfg(test)` flag: the
+/// stub's revision, state hash and discoverability must be untouched, and
+/// the durable anchored-gap record must stay ARMED. With the catch-up gate
+/// disabled (the #846 bug), this exact page is adopted by the ordinary
+/// path — revision advances and discoverability flips — and the assertions
+/// go red.
+#[tokio::test]
+async fn forking_catchup_policy_page_leaves_group_state_untouched() -> Result<()> {
+    let stage = issue458_stage(0xBC, true).await?;
+    let (joiner_state, _jdir) = joiner_state_for(&stage).await?;
+    let owner_kp = UserKeypair::from_seed(&[0xF3u8; 32])?;
+    let (stub, b_kp, link, genuine) = two_admin_real_invite_stub(&stage).await?;
+    joiner_state
+        .named_groups
+        .write()
+        .await
+        .insert(stage.group_id.clone(), stub.clone());
+    let joiner_epoch = Some(1u64);
+    let attestation = HeadAttestation::sign_for_terminal(
+        stub.stable_group_id(),
+        &genuine,
+        &stage.joiner_hex,
+        joiner_epoch,
+        &owner_kp,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    let joiner_kp = AgentKeypair::from_bytes(&stage.joiner_key_bytes.0, &stage.joiner_key_bytes.1)?;
+    let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
+    use base64::Engine as _;
+    let terminal_event = NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: Vec::new(),
+        group_id: stage.group_id.clone(),
+        revision: stub.state_revision,
+        actor: hex::encode(stage.authority.agent.agent_id().as_bytes()),
+        agent_id: stage.joiner_hex.clone(),
+        display_name: None,
+        treekem_commit_b64: None,
+        treekem_welcome_b64: None,
+        welcome_ref: None,
+        treekem_epoch: joiner_epoch,
+        treekem_key_package_hash: None,
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
+        certificate_b64: Some(
+            base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&joiner_cert)?),
+        ),
+        owner_mandate: None,
+        commit: Some(genuine.clone()),
+    };
+    let key = join_result_key(&stage.group_id, &stage.joiner_hex);
+    joiner_state
+        .pending_adoption_chains
+        .lock()
+        .unwrap()
+        .insert(key.clone(), vec![link.clone()]);
+    joiner_state
+        .pending_head_attestations
+        .lock()
+        .unwrap()
+        .insert(key, attestation);
+    let result = apply_named_group_metadata_event(
+        &joiner_state,
+        as_treekem_join_result(&terminal_event),
+        stage.authority.agent.agent_id(),
+        true,
+        None,
+    )
+    .await;
+    assert!(!result.accepted, "TreeKEM never adopts across the gap");
+    let revision_before = {
+        let groups = joiner_state.named_groups.read().await;
+        groups
+            .get(&stage.group_id)
+            .expect("stub retained")
+            .state_revision
+    };
+    assert!(revision_before < genuine.revision, "the gap is open");
+    assert!(
+        crate::server::routes::named_groups::catchup_846_gate_armed(
+            joiner_state
+                .named_groups
+                .read()
+                .await
+                .get(&stage.group_id)
+                .expect("stub retained")
+        ),
+        "precondition: the durable anchored-gap record arms the gate"
+    );
+
+    // B (active admin in the stub) serves a DIVERGENT POLICY page: a
+    // correctly-signed commit that links from the stub head and carries the
+    // stub's own roster root, security binding and meta hash — only the
+    // policy (and its hash) diverge, flipping discoverability. The owner's
+    // attested sequence covers neither this commit nor any chain through
+    // it, so the gate must refuse the page; the commit otherwise evaluates
+    // clean, so ONLY the gate stands between this page and adoption.
+    let mut fork_policy = stub.policy.clone();
+    fork_policy.discoverability = match stub.policy.discoverability {
+        x0x::groups::GroupDiscoverability::Hidden => {
+            x0x::groups::GroupDiscoverability::ListedToContacts
+        }
+        _ => x0x::groups::GroupDiscoverability::Hidden,
+    };
+    assert_ne!(
+        x0x::groups::compute_policy_hash(&fork_policy),
+        x0x::groups::compute_policy_hash(&stub.policy),
+        "the page is divergent"
+    );
+    let fork_commit = x0x::groups::GroupStateCommit::sign(
+        stage.group_id.clone(),
+        revision_before.saturating_add(1),
+        Some(stub.state_hash.clone()),
+        x0x::groups::compute_roster_root(&stub.members_v2),
+        x0x::groups::compute_policy_hash(&fork_policy),
+        x0x::groups::compute_public_meta_hash(&stub.public_meta()),
+        stub.security_binding.clone(),
+        false,
+        crate::server::now_millis_u64(),
+        &b_kp,
+    )?;
+    let b_hex = hex::encode(b_kp.agent_id().as_bytes());
+    let policy_event = NamedGroupMetadataEvent::PolicyUpdated {
+        group_id: stage.group_id.clone(),
+        revision: revision_before.saturating_add(1),
+        actor: b_hex,
+        policy: fork_policy,
+        commit: Some(fork_commit),
+    };
+    handle_treekem_catchup_response(
+        &joiner_state,
+        &b_kp.agent_id(),
+        true,
+        TreeKemCatchupResponse {
+            message_type: "treekem_catchup_response".to_string(),
+            group_id: stage.group_id.clone(),
+            events: vec![policy_event],
+            truncated: false,
+        },
+    )
+    .await;
+    {
+        let groups = joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("stub retained");
+        assert_eq!(
+            info.state_revision, revision_before,
+            "#846: a forking responder's divergent policy page adopts NOTHING"
+        );
+        assert_eq!(
+            info.state_hash, stub.state_hash,
+            "#846: the stub's state hash is untouched by the refused page"
+        );
+        assert_eq!(
+            info.policy.discoverability, stub.policy.discoverability,
+            "#846: the divergent policy never lands"
+        );
+        assert!(
+            crate::server::routes::named_groups::catchup_846_gate_armed(info),
+            "#846: the durable anchored-gap record stays ARMED for an honest responder"
+        );
+    }
+
+    Ok(())
+}
+
 /// #846 unit: the per-page admission walk.
 #[test]
 fn catchup_page_within_attested_sequence_table() {
@@ -8681,6 +8851,233 @@ async fn non_durable_owner_seal_does_not_notify_759() -> Result<()> {
 /// drain the held delta here and fail the withheld-effect assertions.
 /// Only the Durable-gated boolean draws the line this test and its
 /// `NotReplaced` sibling both hold.
+/// N19-B follow-up (Codex r2 P2): a successful seal on a group whose
+/// TreeKEM snapshot is STALE-BUT-REPAIRABLE (metadata-only mismatch: the
+/// envelope binding still equals the named binding; only named-side
+/// metadata advanced) and which has NO live TreeKEM instance. The seal
+/// must repair the binding, restore the live instance
+/// (`rebind_restore_live_group`), and — when the marker is one the seal
+/// may clear — clear it durably; an ordinary `no_anchor` marker stays for
+/// the manual clear, which then clears DURABLY through the gated
+/// transition. Red when the seal's persist loses the #457 rebind/restore
+/// or when the manual clear is reverted to the publish-first helper.
+#[tokio::test]
+async fn n19b_treekem_seal_repairs_snapshot_and_manual_clear_is_durable() -> Result<()> {
+    let fixture = member_joined_treekem_fixture(0x6E, 0x6E).await?;
+    let state = &fixture.state;
+    let group_id = fixture.group_id.clone();
+
+    // Seed the on-disk snapshot bound at the CURRENT revision while the
+    // group is live (the same shape issue457's repair test seeds).
+    let seeded = state
+        .named_groups
+        .read()
+        .await
+        .get(&group_id)
+        .cloned()
+        .unwrap();
+    let seeded = persist_named_group_info(state, &group_id, seeded).await;
+    assert!(
+        matches!(seeded, Ok(AtomicWriteOutcome::Durable)),
+        "seed persist must be durable"
+    );
+
+    // Force the repairable mismatch: advance the named state WITHOUT
+    // rebinding the envelope (a stale on-disk envelope), then drop the
+    // live TreeKEM instance — restarted-into-the-wedge, minus the restart.
+    {
+        let mut groups = state.named_groups.write().await;
+        let info = groups.get_mut(&group_id).expect("group");
+        info.roster_revision = info.roster_revision.saturating_add(1);
+        info.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
+    }
+    let forced =
+        persist_named_groups_mutation(state, |groups| groups.get(&group_id).is_some()).await;
+    assert!(
+        matches!(forced, Ok(AtomicWriteOutcome::Durable)),
+        "forced stale persist must be durable"
+    );
+    state.treekem_groups.write().await.remove(&group_id);
+
+    // An ordinary group's marker: no owner axis, so NO seal may clear it —
+    // only the manual clear can (ADR-0066 §2).
+    {
+        let mut groups = state.named_groups.write().await;
+        let live = groups.get_mut(&group_id).expect("group");
+        let header = live.terminal_commit_header();
+        live.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: live.state_revision.saturating_sub(1),
+            state_hash: "evidenced-conflict-hash".to_string(),
+            committed_by: hex::encode(state.agent.agent_id().as_bytes()),
+            observed_at_ms: now_millis_u64(),
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: header.clone(),
+                conflicting_commit: header,
+                classification: None,
+            },
+            no_anchor: true,
+        });
+    }
+
+    // The reseal-class mutation (a rename through the real update route —
+    // the same #457 chokepoint `POST /groups/:id/state/seal`'s arms and
+    // every metadata mutator flow through; the plain reseal ROUTE itself
+    // refuses this fixture because `seal_commit_owner_certified` wants
+    // certificate state only the OwnerCertified fixtures mint — an
+    // OwnerCertified+TreeKEM seal fixture is tracked W3 test debt):
+    // succeeds, REPAIRS the binding, RESTORES the live instance.
+    let response = update_named_group(
+        State(Arc::clone(state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+        Json(UpdateGroupRequest {
+            name: Some("n19b-resealed".to_string()),
+            description: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the reseal-class mutation succeeds"
+    );
+    assert!(
+        state.treekem_groups.read().await.contains_key(&group_id),
+        "the persist's #457 transaction restored the live TreeKEM instance"
+    );
+
+    // The manual clear — the N19-B gated transition — clears DURABLY.
+    let stable_id = {
+        let groups = state.named_groups.read().await;
+        groups
+            .get(&group_id)
+            .expect("group")
+            .stable_group_id()
+            .to_string()
+    };
+    let req: ClearQuarantineRequest = serde_json::from_value(
+        serde_json::json!({ "force": true, "reason": "n19b treekem repair" }),
+    )?;
+    let response =
+        clear_group_quarantine(State(Arc::clone(state)), Path(stable_id.clone()), Json(req))
+            .await
+            .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::OK, "the manual clear succeeds: {body}");
+    assert!(
+        !state
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .expect("group")
+            .is_fork_quarantined(),
+        "the marker is gone from memory"
+    );
+    let reloaded =
+        load_named_groups_merged(&state.named_groups_path, &state.home_suite_groups_path).await?;
+    assert!(
+        !reloaded.values().any(|info| info.is_fork_quarantined()),
+        "the durable store carries the clear across a restart"
+    );
+    Ok(())
+}
+
+/// N19-B follow-up, discriminator: the manual clear runs against a
+/// CANDIDATE — while the durable write is IN FLIGHT the live map still
+/// shows the marker (no consumer can observe a clear that has not landed).
+/// Uses the save interleave hook (the #470 deterministic race point,
+/// after the candidate is encoded, before any write). RED when the manual
+/// route is reverted to the publish-first mutation helper.
+#[tokio::test]
+async fn n19b_manual_clear_candidate_is_invisible_mid_write() -> Result<()> {
+    let fixture = member_joined_treekem_fixture(0x6F, 0x6F).await?;
+    let state = &fixture.state;
+    let group_id = fixture.group_id.clone();
+    {
+        let mut groups = state.named_groups.write().await;
+        let live = groups.get_mut(&group_id).expect("group");
+        let header = live.terminal_commit_header();
+        live.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: live.state_revision.saturating_sub(1),
+            state_hash: "evidenced-conflict-hash".to_string(),
+            committed_by: hex::encode(state.agent.agent_id().as_bytes()),
+            observed_at_ms: now_millis_u64(),
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: header.clone(),
+                conflicting_commit: header,
+                classification: None,
+            },
+            no_anchor: true,
+        });
+    }
+    let stable_id = {
+        let groups = state.named_groups.read().await;
+        groups
+            .get(&group_id)
+            .expect("group")
+            .stable_group_id()
+            .to_string()
+    };
+
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    *state
+        .named_groups_save_after_snapshot_notify
+        .lock()
+        .expect("save race hook poisoned") = Some((Arc::clone(&reached), Arc::clone(&release)));
+
+    let clear_state = Arc::clone(state);
+    let clear_id = stable_id.clone();
+    let clear = tokio::spawn(async move {
+        let req: ClearQuarantineRequest = serde_json::from_value(
+            serde_json::json!({ "force": true, "reason": "n19b mid-write" }),
+        )
+        .expect("request");
+        clear_group_quarantine(State(clear_state), Path(clear_id), Json(req))
+            .await
+            .into_response()
+    });
+    reached.notified().await;
+    *state
+        .named_groups_save_after_snapshot_notify
+        .lock()
+        .expect("save race hook poisoned") = None;
+    // MID-WRITE: the candidate is encoded and the write is about to land —
+    // the live map must still show the marker (the clear is not published
+    // until the outcome is known).
+    assert!(
+        state
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .expect("group")
+            .is_fork_quarantined(),
+        "N19-B: mid-write, the live map still shows the marker — the candidate is not published until the outcome"
+    );
+    release.notify_one();
+    let response = clear.await.expect("clear task");
+    let (status, body) = response_json(response).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the clear completes durably: {body}"
+    );
+    assert!(
+        !state
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .expect("group")
+            .is_fork_quarantined(),
+        "the durable clear publishes"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn replaced_not_durable_owner_seal_withholds_the_notification_759() -> Result<()> {
     let (state, _dir, group_id, sync, task_id) =

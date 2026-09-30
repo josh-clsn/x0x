@@ -6,7 +6,12 @@
       "unit": {
         "source": "systemd/x0xd.service",
         "destination": "/etc/systemd/system/x0xd.service",
-        "dropins": []
+        "dropins": [
+          {
+            "source": "systemd/dropins/x0xd-20-x0x-1036-rustlog.conf",
+            "destination": "/etc/systemd/system/x0xd.service.d/20-x0x-1036-rustlog.conf"
+          }
+        ]
       },
       "config": {
         "source": "config/bootstrap-config.toml",
@@ -36,7 +41,10 @@
       },
       "installation": {
         "entrypoint": "install.sh",
-        "selector_args": ["--instance", "testnet"]
+        "selector_args": [
+          "--instance",
+          "testnet"
+        ]
       }
     },
     {
@@ -44,11 +52,18 @@
       "unit": {
         "source": "systemd/x0xd-443.service",
         "destination": "/etc/systemd/system/x0xd-443.service",
-        "dropins": []
+        "dropins": [
+          {
+            "source": "systemd/dropins/x0xd-443-20-x0x-1036-rustlog.conf",
+            "destination": "/etc/systemd/system/x0xd-443.service.d/20-x0x-1036-rustlog.conf"
+          }
+        ]
       },
       "config": {
         "generator": "deploy-443.sh",
-        "input_instances": ["prod"],
+        "input_instances": [
+          "prod"
+        ],
         "destination": "/etc/x0x/x0xd-443.toml"
       },
       "binary": {

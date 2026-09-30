@@ -5272,6 +5272,62 @@ where
     persist_named_groups_mutation_with_gss_guard(state, &gss_publication_guard, mutate).await
 }
 
+/// N19-B: the manual quarantine-clear transition. The mutation runs
+/// against a private CANDIDATE — the live map (every consumer: WS/SSE
+/// annotations, session gates, KV contexts, the task-ingest gate) never
+/// shows the clear while the write is in flight. Outcomes follow the
+/// #759 Watson ruling:
+/// - `Durable` → publish the cleared candidate (the route notifies).
+/// - `ReplacedNotDurable` → publish the cleared candidate TOO (memory
+///   matches the visible destination), the route still refuses and
+///   withholds every notification/effect.
+/// - `NotReplaced` / `Err` → the live map stays ARMED (fail closed).
+///
+/// Locks: roster persistence P then G, the persist_named_groups_mutation
+/// order; the candidate commit is a compare-and-commit so a writer that
+/// bypassed the pair (none exists — the #732 r8 chokepoints) fails closed.
+pub(in crate::server) async fn persist_named_groups_quarantine_clear_gated<F>(
+    state: &AppState,
+    mutate: F,
+) -> std::io::Result<AtomicWriteOutcome>
+where
+    F: FnOnce(&mut HashMap<String, x0x::groups::GroupInfo>) -> bool,
+{
+    let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+    let before = {
+        let groups = state.named_groups.read().await;
+        groups.clone()
+    };
+    let mut candidate = before.clone();
+    if !mutate(&mut candidate) {
+        return Ok(AtomicWriteOutcome::NotReplaced);
+    }
+    enforce_containment_invariant(&mut candidate, &before);
+    let outcome = {
+        let _gss_publication_guard = state.gss_publication_gate.write().await;
+        let (legacy_json, home_suite_json) =
+            encode_named_groups_store_excluding_pending_stubs(state, &candidate, None)?;
+        save_named_groups_store_checked(state, &legacy_json, &home_suite_json).await
+    };
+    if matches!(
+        outcome,
+        Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::ReplacedNotDurable)
+    ) {
+        let mut groups = state.named_groups.write().await;
+        if *groups == before {
+            *groups = candidate;
+        } else {
+            tracing::error!(
+                "N19-B: the live named-groups map diverged during a gated                  quarantine clear — keeping memory, refusing the commit"
+            );
+            return Err(std::io::Error::other(
+                "named-groups map changed during the gated quarantine clear",
+            ));
+        }
+    }
+    outcome
+}
+
 /// The roster mutation core for a caller that already owns the GSS writer.
 /// A borrowed guard is the capability: causal replay can enter here while
 /// retaining its P→G transaction without reacquiring the non-reentrant G.
@@ -14767,7 +14823,12 @@ pub(in crate::server) async fn clear_group_quarantine(
         owner_key_ok = true;
     }
     let cleared_by = if owner_key_ok { "owner-key" } else { "force" };
-    let outcome = persist_named_groups_mutation(&state, |groups| {
+    // N19-B: the clear runs against a CANDIDATE — memory never shows it
+    // while the write is in flight; NotReplaced/Err leave the map armed,
+    // and a visible-but-not-durable replacement follows the #759 Watson
+    // ruling (memory matches the destination, the route refuses and
+    // withholds every effect).
+    let outcome = persist_named_groups_quarantine_clear_gated(&state, |groups| {
         // #732 r8: one slot is enough. An alias sibling used to stay quarantined
         // after a successful clear; `enforce_containment_invariant` now copies
         // this slot's containment — ABSENCE included — to every spelling before
@@ -14778,7 +14839,10 @@ pub(in crate::server) async fn clear_group_quarantine(
         // decided about, and the invariant above spreads it. A concurrent rename
         // of the key is the only way it misses, and then it is a no-op that
         // leaves the marker in place — never a clear of the wrong group.
-        if let Some(info) = groups.get_mut(&map_key) {
+        let Some(info) = crate::server::resolve_group_entry_mut_locked(groups, &map_key) else {
+            return false;
+        };
+        {
             info.fork_quarantine = None;
             // ADR-0064 slice 4: the manual clear also re-arms the
             // evidence gate — the next authenticated conflict
@@ -32602,6 +32666,21 @@ fn encode_named_groups_store_excluding_pending_stubs(
 pub(in crate::server) async fn save_named_groups_checked_unlocked(
     state: &AppState,
 ) -> std::io::Result<AtomicWriteOutcome> {
+    let (legacy_json, home_suite_json) = {
+        let groups = state.named_groups.read().await;
+        encode_named_groups_store_excluding_pending_stubs(state, &groups, None)?
+    };
+    save_named_groups_store_checked(state, &legacy_json, &home_suite_json).await
+}
+
+/// The checked save with a caller-supplied encoded store — the gated
+/// quarantine-clear transition (N19-B) serializes its CANDIDATE here
+/// without ever publishing it to the live map first.
+async fn save_named_groups_store_checked(
+    state: &AppState,
+    legacy_json: &str,
+    home_suite_json: &str,
+) -> std::io::Result<AtomicWriteOutcome> {
     // (#470 fault cells are checked after the deterministic-interleave
     // hook below so tests can race a concurrent writer between the
     // mutation and the rollback for EVERY fault variant.)
@@ -32613,10 +32692,7 @@ pub(in crate::server) async fn save_named_groups_checked_unlocked(
     // direction is covered below — if the named write does not land, the
     // sidecar is restored to its pre-write bytes, so the ordinary save
     // never leaves (sidecar new / named old) on the non-journaled path.
-    let (legacy_json, home_suite_json) = {
-        let groups = state.named_groups.read().await;
-        encode_named_groups_store_excluding_pending_stubs(state, &groups, None)?
-    };
+    let (legacy_json, home_suite_json) = (legacy_json.to_string(), home_suite_json.to_string());
     #[cfg(test)]
     {
         let hook = state
@@ -35433,7 +35509,9 @@ enum WelcomeFetchSendError {
 
 fn classify_welcome_fetch_send_error(error: x0x::dm::DmError) -> WelcomeFetchSendError {
     match error {
-        x0x::dm::DmError::Timeout { .. } => {
+        x0x::dm::DmError::Timeout { .. } | x0x::dm::DmError::RecipientUndiscovered(_) => {
+            // #1091: an undiscovered recipient is a transient discovery gap
+            // — keep waiting/retrying, never abort the fetch.
             WelcomeFetchSendError::ReceiptUnconfirmed(error.to_string())
         }
         _ => WelcomeFetchSendError::Failed(error.to_string()),
@@ -35674,6 +35752,19 @@ where
         return Err("TreeKEM Welcome blake3 mismatch".to_string());
     }
     Ok(received)
+}
+
+/// Decode a transfer frame only after the DM layer verified its sender.
+/// Raw QUIC sender IDs are self-asserted until their AgentId/MachineId binding
+/// is verified; carrying that unchecked claim into a transfer permits spoofing.
+pub(in crate::server) fn decode_welcome_blob_message(
+    message: &x0x::direct::DirectMessage,
+) -> Option<(&AgentId, WelcomeBlobMessage)> {
+    if !message.verified {
+        return None;
+    }
+    let payload = serde_json::from_slice(&message.payload).ok()?;
+    Some((&message.sender, payload))
 }
 
 pub(in crate::server) async fn handle_welcome_blob_message(
@@ -36084,6 +36175,107 @@ pub(in crate::server) type WelcomeFetchWaiter =
 // below rather than duplicating a 150-field literal.
 pub(in crate::server) mod tests {
     use super::*;
+
+    #[test]
+    fn s2_welcome_decodes_from_reverified_cold_evidence() {
+        use x0x::peer_evidence::{
+            EvidenceConfig, EvidenceFileV1, EvidencePolicy, PeerEvidenceStore,
+        };
+        struct Related;
+        impl EvidencePolicy for Related {
+            fn relation(
+                &self,
+                _: AgentId,
+                _: x0x::identity::MachineId,
+                _: Option<&x0x::identity::AgentCertificate>,
+                _: u64,
+            ) -> u8 {
+                x0x::peer_evidence::GROUP
+            }
+            fn revoked(
+                &self,
+                _: AgentId,
+                _: x0x::identity::MachineId,
+                _: Option<x0x::identity::UserId>,
+            ) -> bool {
+                false
+            }
+            fn contains_agent(&self, _: AgentId, _: u64) -> bool {
+                true
+            }
+        }
+        let bytes = include_bytes!("../../../tests/fixtures/peer_evidence_v1.bin");
+        let file = EvidenceFileV1::decode(bytes).unwrap();
+        let (&agent, record) = file.records.iter().next().unwrap();
+        let now = record.stored_at_ms;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("peer-evidence.bin"), bytes).unwrap();
+        let store = PeerEvidenceStore::open(
+            dir.path(),
+            EvidenceConfig::default(),
+            Arc::new(Related),
+            now,
+        )
+        .unwrap();
+        let view = store.usable_agent(agent, now).unwrap();
+        let payload = serde_json::to_vec(&WelcomeBlobMessage::Complete {
+            welcome_id: "cold-welcome".into(),
+        })
+        .unwrap();
+        let mut message =
+            x0x::direct::DirectMessage::new(agent, view.announcement.machine_id, payload);
+        message.verified = store.usable(agent, message.machine_id, now).is_some();
+        assert!(decode_welcome_blob_message(&message).is_some());
+        message.verified = store
+            .usable(
+                agent,
+                message.machine_id,
+                now + 8 * x0x::peer_evidence::DAY_MS,
+            )
+            .is_some();
+        assert!(decode_welcome_blob_message(&message).is_none());
+    }
+
+    // Inert: only DirectMessage construction and JSON decoding; no agent,
+    // AppState, tasks, sockets, filesystem writes, or daemon startup.
+    #[test]
+    fn n19_welcome_blob_frames_require_verified_sender() {
+        let sender = AgentId([0x19; 32]);
+        let machine = x0x::identity::MachineId([0x20; 32]);
+        let frames = [
+            serde_json::json!({"type": "fetch_request", "group_id": "group", "welcome_id": "id"}),
+            serde_json::json!({"type": "offer", "group_id": "group", "welcome_id": "id", "byte_len": 1, "chunk_size": 1, "total_chunks": 1, "blake3_hex": "hash"}),
+            serde_json::json!({"type": "chunk", "welcome_id": "id", "sequence": 0, "data": "eA=="}),
+            serde_json::json!({"type": "chunk_ack", "welcome_id": "id", "sequence": 0}),
+            serde_json::json!({"type": "complete", "welcome_id": "id"}),
+        ];
+        for frame in frames {
+            let payload = serde_json::to_vec(&frame).expect("serialize frame");
+            let mut message = x0x::direct::DirectMessage::new(sender, machine, payload);
+            // A raw peer claiming a known sender cannot enter ANY transfer arm.
+            assert!(
+                decode_welcome_blob_message(&message).is_none(),
+                "unverified {} must not be attributed to its claimed sender",
+                frame["type"]
+            );
+            message.verified = true;
+            let (accepted_sender, accepted) = decode_welcome_blob_message(&message)
+                .expect("verified frame must still reach the consumer");
+            assert_eq!(*accepted_sender, sender);
+            assert_eq!(
+                serde_json::to_value(accepted).expect("serialize accepted"),
+                frame
+            );
+        }
+        let malformed = x0x::direct::DirectMessage::new_verified(
+            sender,
+            machine,
+            b"not json".to_vec(),
+            true,
+            None,
+        );
+        assert!(decode_welcome_blob_message(&malformed).is_none());
+    }
 
     use super::super::super::sse::SseEvent;
     use super::super::super::state::DaemonUpdateConfig;
@@ -50022,6 +50214,60 @@ pub(in crate::server) mod tests {
         agent.join_network().await.context("join network")?;
         let state = secure_endpoint_test_state_at(data_dir, agent).await?;
         Ok((state, dir))
+    }
+
+    /// R17/R19: the certificate must belong to the running identity, not
+    /// overwrite discovery while its anonymous startup announce is in flight.
+    async fn networked_owner_test_state(
+        plane: &str,
+        owner_seed: &[u8; 32],
+    ) -> Result<(Arc<AppState>, tempfile::TempDir)> {
+        let dir = tempfile::tempdir()?;
+        let mut config = isolated_loopback_config(plane);
+        config.port_mapping_enabled = false;
+        let agent = Arc::new(
+            Agent::builder()
+                .with_identity_dir(dir.path())
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key(x0x::identity::AgentKeypair::generate()?)
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_user_key(x0x::identity::UserKeypair::from_seed(owner_seed)?)
+                .with_peer_cache_disabled()
+                .with_network_config(config)
+                .build()
+                .await?,
+        );
+        agent.join_network().await.context("join owner network")?;
+        agent.announce_identity(true, true).await?;
+        let state = secure_endpoint_test_state_at(dir.path(), agent).await?;
+        Ok((state, dir))
+    }
+
+    /// Observe actual V3 ingest and blob resolution, not just publish completion.
+    async fn announce_owner_cert_to(observer: &Agent, subject: &Agent) -> Result<()> {
+        let cert = subject.agent_certificate().context("owner identity cert")?;
+        let digest = x0x::announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()));
+        let marker = format!("r1132-owner-{}", rand::random::<u64>());
+        subject.set_self_name(Some(marker.clone()));
+        subject.announce_identity(true, true).await?;
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let discovered = observer.discovered_agent(subject.agent_id()).await?;
+                if discovered.as_ref().is_some_and(|entry| {
+                    entry.self_name.as_deref() == Some(marker.as_str())
+                        && entry.cert_digest == Some(digest)
+                        && entry.agent_certificate.as_ref() == Some(cert)
+                }) && observer.announce_blob_cache.get(&digest).await.is_some()
+                {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .context("owner certificate must land through announcement and blob fetch")??;
+        Ok(())
     }
 
     /// #942 B2: a networked test state whose agent carries a DURABLE

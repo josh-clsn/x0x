@@ -2708,6 +2708,72 @@ async fn anchors_commit_binds_the_full_header_under_the_owner_key() -> Result<()
 /// revision it applies but never clears (the fence). The conflict path
 /// never clears (pinned in fork_quarantine::
 /// adr0064_owner_anchored_successor_conflicting_commit_never_clears).
+/// N19-B pin (the #759 Watson ruling on the MemberAdded owner-anchored
+/// clear): a ReplacedNotDurable apply REJECTS — so the Some→None
+/// notification never fires — while the VISIBLE candidate the replacement
+/// left carries the CLEAR (memory matches the destination). The gated-
+/// candidate r2 broke exactly this; the pin keeps any future candidate
+/// transition from re-diverging memory and disk.
+#[tokio::test]
+async fn n19b_mandate_clear_follows_the_watson_outcomes() -> Result<()> {
+    let (state, _dir, owner_kp, group_id, joiner_hex, pre_seal, cert) = receiver_stage().await?;
+    let actor_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let terminal = terminal_commit_for(&pre_seal, state.agent.identity().agent_keypair(), 2_000);
+    let mandate = mint_mandate_like_authority(
+        &pre_seal,
+        None,
+        0,
+        &joiner_hex,
+        &actor_hex,
+        "n19b-invite-secret",
+        &cert,
+        &owner_kp,
+        1_500,
+    );
+    {
+        let mut groups = state.named_groups.write().await;
+        let live = groups.get_mut(&group_id).expect("receiver group");
+        let terminal_header = live.terminal_commit_header();
+        live.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: terminal.revision.saturating_sub(1),
+            state_hash: "evidenced-conflict-hash".to_string(),
+            committed_by: actor_hex.clone(),
+            observed_at_ms: now_millis_u64(),
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: terminal_header.clone(),
+                conflicting_commit: terminal_header,
+                classification: None,
+            },
+            no_anchor: false,
+        });
+    }
+    let event = member_added_event(
+        &group_id,
+        terminal.revision,
+        &actor_hex,
+        &joiner_hex,
+        &cert,
+        terminal,
+        Some(mandate),
+    );
+    let _fault = set_save_fault(&state, SaveFault::ReplacedNotDurable);
+    let result = apply_event(&state, event).await;
+    drop(_fault);
+    assert!(
+        !result.accepted,
+        "a non-durable apply rejects — the Some→None notification never fires"
+    );
+    let visible_carries_clear = {
+        let groups = state.named_groups.read().await;
+        !groups.get(&group_id).expect("group").is_fork_quarantined()
+    };
+    assert!(
+        visible_carries_clear,
+        "N19-B (#759 Watson): the visible replacement carries the CLEAR — memory matches the destination"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn owner_anchored_apply_path_clears_quarantine() -> Result<()> {
     let (state, dir, owner_kp, group_id, joiner_hex, pre_seal, cert) = receiver_stage().await?;

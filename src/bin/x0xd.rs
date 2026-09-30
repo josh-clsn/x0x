@@ -213,7 +213,11 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let mut config = match &config_path {
+    // Whether a config file was actually loaded (explicit `--config`, or the
+    // instance's default path). A named instance with a file must declare its
+    // plane (David, 2026-09-29); one with no file keeps unset = prod.
+    let mut config_file_loaded = true;
+    let (mut config, mut config_findings) = match &config_path {
         Some(path) => load_config(path).await?,
         None => {
             let config_dir_name = match &cli_instance_name {
@@ -226,7 +230,8 @@ async fn main() -> anyhow::Result<()> {
             if default_path.exists() {
                 load_config(default_path.to_str().unwrap_or("/etc/x0x/config.toml")).await?
             } else {
-                DaemonConfig::default()
+                config_file_loaded = false;
+                (DaemonConfig::default(), Vec::new())
             }
         }
     };
@@ -236,6 +241,18 @@ async fn main() -> anyhow::Result<()> {
         config.instance_name.clone(),
         connect_acl_override.as_deref(),
     )?;
+
+    // A named instance whose config file sets no top-level `network_id` would
+    // silently join the prod plane: refuse (the operator-authored case where
+    // the testnet ran on prod). Without any config file, keep unset = prod
+    // (install.sh / `x0x daemon start --name` write none) and only warn below.
+    if let Some(name) = instance_name.as_ref() {
+        if config_file_loaded && config.network_id.is_none() {
+            anyhow::bail!(x0x::server::config::named_instance_missing_network_id(
+                name.as_str()
+            ));
+        }
+    }
 
     // Apply instance-scoped defaults for data_dir and api_address when --name
     // is active but the config didn't explicitly set instance-scoped values.
@@ -292,6 +309,20 @@ async fn main() -> anyhow::Result<()> {
     // non-blocking stdout writer thread and silently discards every later log
     // line. Named (not `_`) so it is not dropped at the end of this statement.
     let _log_guard = init_logging(&config.log_level, &config.log_format)?;
+    // N7: config findings are emitted only now, once a subscriber exists.
+    // Before this they were logged inside `load_config`, ahead of
+    // `init_logging`, and so were silently dropped.
+    if let Some(name) = instance_name.as_ref() {
+        if let Some(warning) = x0x::server::config::named_instance_plane_warning(
+            name.as_str(),
+            config.network_id.as_deref(),
+        ) {
+            config_findings.push(warning);
+        }
+    }
+    for finding in &config_findings {
+        tracing::warn!(target: "x0x::startup", "{finding}");
+    }
 
     let exec_policy = x0x::exec::load_exec_policy(exec_acl_override.as_deref(), exec_acl_load_mode)
         .await
@@ -318,6 +349,19 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if check_only {
+        // N7: `--check` fails on any config finding, so an operator sees the
+        // drift. Startup itself only warns on these (a stray key must not
+        // stop a live daemon after a self-update); misplaced plane keys were
+        // already refused in `load_config`.
+        if !config_findings.is_empty() {
+            for finding in &config_findings {
+                println!("FINDING  {finding}");
+            }
+            anyhow::bail!(
+                "configuration has {} finding(s); see FINDING lines above",
+                config_findings.len()
+            );
+        }
         println!("Configuration is valid");
         println!("{:#?}", config);
         println!("Exec ACL summary: {:#?}", exec_policy.summary());
@@ -603,32 +647,45 @@ async fn run_doctor(config: &DaemonConfig) -> Result<()> {
 }
 
 /// Load configuration from TOML file.
-async fn load_config(path: &str) -> Result<DaemonConfig> {
+///
+/// Returns the config and its non-fatal findings as warning lines, which the
+/// caller emits once logging is initialised (N7). A plane-isolation key
+/// (`network_id`, `mdns_enabled`) below the top level is fatal here.
+async fn load_config(path: &str) -> Result<(DaemonConfig, Vec<String>)> {
     let content = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("failed to read config file: {path}"))?;
-    // Issue #385: name every key the schema drops (any depth) instead of
-    // letting it vanish into a default. Warn-only (0.35.1 ruling).
-    let (config, ignored_keys) = x0x::server::config::parse_with_ignored_keys(&content)
+    // Issue #385 / N7: name every key the schema drops (any depth) instead
+    // of letting it vanish into a default. Only plane-isolation keys are
+    // fatal: an ignored `network_id` joins the prod plane. Every other
+    // dropped or misplaced key stays warn-only (0.35.1 ruling), because live
+    // prod configs carry stray keys and rejecting them would stop the
+    // daemon after a self-update.
+    let (config, findings) = x0x::server::config::analyze(&content)
         .with_context(|| format!("failed to parse config file: {path}"))?;
-    x0x::server::config::warn_ignored_keys(&ignored_keys);
-    // Warn loudly — but do not reject (0.35.1 cleanup ruling) — about a
-    // top-level key an operator placed under a sub-section, where serde
-    // silently drops it (e.g. `data_dir` under `[history]`, which owns
-    // `db_path`, not `data_dir`). Rejection could brick a drifted live config
-    // on upgrade; it is deferred to a later minor with notice.
-    if let Ok(root) = toml::from_str::<toml::Table>(&content) {
-        let findings = x0x::server::config::diagnose_section_placement(&root);
-        x0x::server::config::warn_section_misplacements(&findings);
+    if let Some(message) = findings.plane_error() {
+        anyhow::bail!("{message} (config file: {path})");
     }
     // ADR-0064 §1b: an out-of-range enforcement value changes security
     // behaviour (a 0-day grace would refuse every recorded-capable
     // authority's absent-mandate event immediately), so unlike unknown
     // keys — warn-only — this refuses startup.
+    config
+        .evidence
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid evidence configuration: {e}"))?;
     if let Err(message) = config.groups.validate() {
         anyhow::bail!("invalid [groups] configuration: {message}");
     }
-    Ok(config)
+    Ok((config, findings.warning_lines()))
+}
+
+/// Whether the stdout log layer emits ANSI colour codes.
+///
+/// #1036: colour the stdout log only for an interactive terminal, and never
+/// when `NO_COLOR` is set (<https://no-color.org/>).
+fn log_ansi_enabled(stdout_is_terminal: bool, no_color: bool) -> bool {
+    stdout_is_terminal && !no_color
 }
 
 /// Initialize structured logging.
@@ -721,6 +778,13 @@ fn init_logging(level: &str, format: &str) -> Result<WorkerGuard> {
     // that is tens of thousands of serialised syscalls competing with the very
     // tasks that must stay responsive for the API watchdog's `/health` probe.
     // `non_blocking` hands formatted lines to a dedicated writer thread instead.
+    // #1036: ANSI colour codes only when stdout is an interactive terminal.
+    // Under systemd/journald (and in log files) escape sequences are noise
+    // that inflates syslog and breaks grep.
+    let stdout_ansi = log_ansi_enabled(
+        std::io::IsTerminal::is_terminal(&std::io::stdout()),
+        std::env::var_os("NO_COLOR").is_some(),
+    );
     let (stdout_writer, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
 
     let stdout_layer: Box<dyn tracing_subscriber::Layer<_> + Send + Sync + 'static> =
@@ -728,10 +792,15 @@ fn init_logging(level: &str, format: &str) -> Result<WorkerGuard> {
             Box::new(
                 tracing_subscriber::fmt::layer()
                     .json()
+                    .with_ansi(false)
                     .with_writer(stdout_writer),
             )
         } else {
-            Box::new(tracing_subscriber::fmt::layer().with_writer(stdout_writer))
+            Box::new(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(stdout_ansi)
+                    .with_writer(stdout_writer),
+            )
         };
 
     let file_layer: Option<Box<dyn tracing_subscriber::Layer<_> + Send + Sync + 'static>> =
@@ -740,11 +809,16 @@ fn init_logging(level: &str, format: &str) -> Result<WorkerGuard> {
                 let writer = std::sync::Mutex::new(f);
                 if format == "json" {
                     Some(Box::new(
-                        tracing_subscriber::fmt::layer().json().with_writer(writer),
+                        tracing_subscriber::fmt::layer()
+                            .json()
+                            .with_ansi(false)
+                            .with_writer(writer),
                     ))
                 } else {
                     Some(Box::new(
-                        tracing_subscriber::fmt::layer().with_writer(writer),
+                        tracing_subscriber::fmt::layer()
+                            .with_ansi(false)
+                            .with_writer(writer),
                     ))
                 }
             }
@@ -780,6 +854,23 @@ fn init_logging(level: &str, format: &str) -> Result<WorkerGuard> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn logs_are_uncoloured_unless_stdout_is_a_terminal() {
+        // #1036: journald/syslog captured ANSI escapes from every WARN line.
+        assert!(
+            !super::log_ansi_enabled(false, false),
+            "non-TTY must not be coloured"
+        );
+        assert!(
+            super::log_ansi_enabled(true, false),
+            "an interactive TTY keeps colour"
+        );
+        assert!(
+            !super::log_ansi_enabled(true, true),
+            "NO_COLOR disables colour"
+        );
+    }
+
     use super::*;
     use x0x::server::InstanceName;
 

@@ -54,6 +54,7 @@ echo "  TRIALS:  $TRIALS per delay"
 mkdir -p "$WORKDIR/alice" "$WORKDIR/bob"
 cat>"$WORKDIR/alice/config.toml"<<TOML
 instance_name = "fma-alice"
+network_id = "x0x.prod"
 data_dir = "$WORKDIR/alice"
 bind_address = "127.0.0.1:29701"
 api_address = "127.0.0.1:29801"
@@ -62,6 +63,7 @@ bootstrap_peers = ["127.0.0.1:29702"]
 TOML
 cat>"$WORKDIR/bob/config.toml"<<TOML
 instance_name = "fma-bob"
+network_id = "x0x.prod"
 data_dir = "$WORKDIR/bob"
 bind_address = "127.0.0.1:29702"
 api_address = "127.0.0.1:29802"

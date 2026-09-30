@@ -1269,6 +1269,7 @@ pub(in crate::server) async fn dm_diagnostics(
         "subscriber_count": subscriber_count,
         "subscriber_capacity": subscriber_capacity,
         "capability_store_entries": state.agent.capability_store().len(),
+        "peer_evidence": state.agent.peer_evidence().diagnostics(),
         "caps_advert_prefiltered_stale": state
             .agent
             .capability_store()

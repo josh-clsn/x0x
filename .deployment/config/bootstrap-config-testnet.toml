@@ -9,6 +9,12 @@
 # $XDG_DATA_HOME/x0x-testnet, keeping the testnet root distinct from production
 # without a second, hand-maintained data_dir algorithm (design chapter §2).
 
+# Plane isolation (#206 / N7): the testnet gossip plane. Must stay at the top
+# level; a named instance (`--name testnet`) whose config sets no network_id
+# refuses to start.
+network_id = "x0x.testnet"
+mdns_enabled = false
+
 bind_address = "0.0.0.0:6483"
 api_address = "127.0.0.1:13600"
 log_level = "info"

@@ -207,6 +207,21 @@ id** — the co-located testnet needs one line in
 network_id = "x0x.testnet"
 ```
 
+**The key must be at the top level, above the first `[section]` header.**
+A `network_id` or `mdns_enabled` under any section (for example `[gossip]`)
+is not read, and the daemon would fall back to `x0x.prod`: that is how the
+testnet once ran on the prod plane. Since N7, `x0xd` refuses to start, and
+`x0xd --check` fails, when either key appears below the top level. Other
+unknown or misplaced keys are warned about at startup (and fail
+`x0xd --check`) but never stop the daemon, because live configs carry stray
+keys. **Named instances must set `network_id`.** A named instance (`--name`)
+whose config file has no top-level `network_id` refuses to start, with
+"named instance '<name>' has no network_id; …". Set
+`network_id = "x0x.testnet"` (or another plane; `"x0x.prod"` for prod) at the
+top level, or omit `--name` for the prod plane. A named instance started with
+no config file at all (what `install.sh --name` and `x0x daemon start --name`
+do) still joins `x0x.prod`, with a startup warning.
+
 The bootstrap peer cache is now strictly per-data-dir
 (`<data_dir>/peers`); the former shared-default arm (the #189 shape) is
 removed.

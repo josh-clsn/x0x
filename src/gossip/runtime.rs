@@ -1140,8 +1140,28 @@ impl GossipRuntime {
         let keepalive_membership = Arc::clone(&self.membership);
         let keepalive_network = Arc::clone(&self.network);
         let keepalive_handle = tokio::spawn(async move {
+            // x0x#1036: the same 15 s pass keeps the HyParView active view
+            // bounded by transport connectivity. saorsa-gossip admits
+            // never-connected peers from JOIN/FORWARDJOIN random walks and
+            // never prunes them, so SWIM, shuffle and presence kept sending
+            // to them ("Peer not found") indefinitely.
+            let mut stale_targets = super::stale_targets::StaleTargetTracker::default();
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+
+                let connected: std::collections::HashSet<PeerId> = keepalive_network
+                    .send_ready_peers()
+                    .await
+                    .into_iter()
+                    .map(|peer| PeerId::new(peer.0))
+                    .collect();
+                super::stale_targets::maintain_active_view(
+                    keepalive_membership.as_ref(),
+                    &mut stale_targets,
+                    &connected,
+                    Instant::now(),
+                )
+                .await;
 
                 let peers = keepalive_network.gossip_plane_peers().await;
                 for peer in peers {

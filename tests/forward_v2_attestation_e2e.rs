@@ -86,14 +86,17 @@ fn beacon_discovered_agent(
     }
 }
 
-async fn take_incoming(agent: &x0x::Agent, timeout: Duration) -> Option<x0x::streams::PeerStream> {
+async fn take_incoming(
+    acceptor: &mut x0x::streams::StreamAcceptor,
+    timeout: Duration,
+) -> Option<x0x::streams::PeerStream> {
     let deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return None;
         }
-        match tokio::time::timeout(remaining, agent.next_incoming_stream()).await {
+        match tokio::time::timeout(remaining, acceptor.next()).await {
             Ok(Some(stream)) => return Some(stream),
             Ok(None) => return None,
             Err(_) => continue,
@@ -159,7 +162,9 @@ async fn forward_v2_attestation_succeeds_on_loopback() {
 
     // Run opener (alice) and acceptor (bob) concurrently via join.
     let alice_ref = Arc::clone(&alice);
-    let bob_ref = Arc::clone(&bob);
+    let mut acceptor = bob
+        .register_stream_acceptor(StreamProtocol::ForwardV2)
+        .unwrap();
 
     let _ = tokio::join!(
         // ── Alice: open V2 stream, sign+send header, read response, ping/pong ──
@@ -197,7 +202,7 @@ async fn forward_v2_attestation_succeeds_on_loopback() {
         },
         // ── Bob: accept stream, read+verify header, send connected, echo ──
         async {
-            let mut bob_stream = take_incoming(&bob_ref, Duration::from_secs(15))
+            let mut bob_stream = take_incoming(&mut acceptor, Duration::from_secs(15))
                 .await
                 .unwrap();
             assert_eq!(bob_stream.protocol(), StreamProtocol::ForwardV2);

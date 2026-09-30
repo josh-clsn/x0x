@@ -10,6 +10,92 @@
 
 use super::*;
 
+/// Drive the real local pubsub listener through the formerly racy ordering.
+/// A unique V3.1 name defeats payload dedup even within the same clock second;
+/// waiting for that name AND digest proves ingest, not just publish completion.
+async fn anonymous_announce_lands(agent: &Agent) -> Result<()> {
+    let marker = format!("r1132-{}", rand::random::<u64>());
+    agent.set_self_name(Some(marker.clone()));
+    agent.announce_identity(false, false).await?;
+    let anonymous = x0x::announce_v3::cert_digest(&None, &None);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if agent
+                .discovered_agent(agent.agent_id())
+                .await?
+                .is_some_and(|entry| {
+                    entry.self_name.as_deref() == Some(marker.as_str())
+                        && entry.cert_digest == Some(anonymous)
+                        && entry.agent_certificate.is_none()
+                })
+            {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("anonymous V3 must invalidate the discovered certificate")??;
+    Ok(())
+}
+
+/// Mechanism control: the ordinary announcement listener, with no peer or
+/// reconnect, invalidates a hand-installed cert and makes the seal pending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn anonymous_announce_invalidates_hand_installed_cert() -> Result<()> {
+    let plane = format!("r19-writer-{}", rand::random::<u32>());
+    let dir = tempfile::tempdir()?;
+    let mut config = isolated_loopback_config(&plane);
+    config.port_mapping_enabled = false;
+    let agent = Arc::new(
+        Agent::builder()
+            .with_identity_dir(dir.path())
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key(x0x::identity::AgentKeypair::generate()?)
+            .with_agent_cert_path(dir.path().join("agent.cert"))
+            .with_user_key_path(dir.path().join("absent-user.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(config)
+            .build()
+            .await?,
+    );
+    // No join_network: make the FIRST announce land at a deterministic point.
+    // It still goes through the real signed pubsub and identity listener.
+    let state = secure_endpoint_test_state_at(dir.path(), agent).await?;
+    let owner = x0x::identity::UserKeypair::generate()?;
+    let cert =
+        x0x::identity::AgentCertificate::issue(&owner, state.agent.identity().agent_keypair())?;
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let (_, mut info) = owner_certified_group(
+        &state.agent,
+        &owner,
+        &plane,
+        &[(local_hex.clone(), &cert, true)],
+    );
+    install_discovery_cert(&state, &state.agent, &cert).await;
+    let evidence = owner_cert_seal_evidence(&state, &info).await;
+    assert!(info.owner_cert_verdict(&evidence).is_all_clean());
+
+    anonymous_announce_lands(&state.agent).await?;
+    let err = seal_commit_owner_certified(
+        &state,
+        &mut info,
+        state.agent.identity().agent_keypair(),
+        now_millis_u64(),
+    )
+    .await
+    .expect_err("an anonymous digest contradicts the hand-installed owner certificate");
+    assert!(matches!(
+        err,
+        x0x::groups::state_commit::ApplyError::OwnerCertMemberPending { members, .. }
+            if members == vec![local_hex]
+    ));
+    assert!(state.agent.peers().await?.is_empty());
+    state.agent.shutdown().await;
+    Ok(())
+}
+
 fn seat_digest(cert: &x0x::identity::AgentCertificate) -> String {
     x0x::groups::owner_cert::certificate_digest_hex(cert)
 }
@@ -52,9 +138,9 @@ fn owner_certified_group(
     (group_key, info)
 }
 
-/// Record `cert` as `subject`'s discovered certificate in `state`'s
-/// discovery cache (the seal's evidence ladder reads it for the local
-/// agent, whose harness identity certificate is self-issued).
+/// Synthetic discovery evidence for the mechanism control and the offline
+/// owner-device fixture below. Never use this to replace a live identity's
+/// certificate: its next V3 announcement can invalidate the entry (#1132).
 async fn install_discovery_cert(
     state: &AppState,
     subject: &Agent,
@@ -148,15 +234,14 @@ async fn admin_seals_after_owner_device_goes_offline() -> Result<()> {
     let run = rand::random::<u32>();
     // Distinct planes: A and C never meet on gossip, which models "A's
     // announce happened before C existed".
-    let (a, _a_dir) = networked_test_state(&format!("r19-a-{run}")).await?;
-    let (c, _c_dir) = networked_test_state(&format!("r19-c-{run}")).await?;
-    let owner = x0x::identity::UserKeypair::generate().expect("owner key");
+    let owner_seed = rand::random::<[u8; 32]>();
+    let owner = x0x::identity::UserKeypair::from_seed(&owner_seed)?;
+    let (a, _a_dir) = networked_owner_test_state(&format!("r19-a-{run}"), &owner_seed).await?;
+    let (c, _c_dir) = networked_owner_test_state(&format!("r19-c-{run}"), &owner_seed).await?;
     let a_hex = hex::encode(a.agent.agent_id().as_bytes());
     let c_hex = hex::encode(c.agent.agent_id().as_bytes());
-    let a_cert = x0x::identity::AgentCertificate::issue(&owner, a.agent.identity().agent_keypair())
-        .expect("owner device cert");
-    let c_cert = x0x::identity::AgentCertificate::issue(&owner, c.agent.identity().agent_keypair())
-        .expect("admin cert");
+    let a_cert = a.agent.agent_certificate().context("A owner cert")?.clone();
+    let c_cert = c.agent.agent_certificate().context("C owner cert")?.clone();
     // D: the next joiner (never started).
     let d_kp = x0x::identity::AgentKeypair::generate().expect("joiner key");
     let d_hex = hex::encode(d_kp.agent_id().as_bytes());
@@ -186,7 +271,7 @@ async fn admin_seals_after_owner_device_goes_offline() -> Result<()> {
         .write()
         .await
         .insert(group_key.clone(), c_info.clone());
-    install_discovery_cert(&c, &c.agent, &c_cert).await;
+    announce_owner_cert_to(&c.agent, &c.agent).await?;
     let a_digest = seat_digest(&a_cert);
     assert!(
         c.agent
@@ -212,7 +297,7 @@ async fn admin_seals_after_owner_device_goes_offline() -> Result<()> {
         matches!(
             &err,
             x0x::groups::state_commit::ApplyError::OwnerCertMemberPending { members, .. }
-                if members.iter().any(|m| m == &a_hex)
+                if members == &vec![a_hex.clone()]
         ),
         "{err}"
     );
@@ -253,12 +338,10 @@ async fn admin_seals_after_owner_device_goes_offline() -> Result<()> {
         "the bytes came through the sidecar, not C's announce cache"
     );
 
-    // C seals D's join with A offline: succeeds. C's own harness identity
-    // announce is self-issued and replaces C's discovery entry, so C's
-    // entry is set back to its owner-issued certificate (what a Home
-    // device holds) immediately before sealing. This touches only C's
-    // own evidence, never A's.
-    install_discovery_cert(&c, &c.agent, &c_cert).await;
+    // Exercise another real announcement before sealing. The local identity,
+    // roster and announce now agree; no last-moment cache reinstall is needed.
+    // First/delayed/heartbeat/reconnect writers all remain enabled (#1132).
+    announce_owner_cert_to(&c.agent, &c.agent).await?;
     let mut next = c
         .named_groups
         .read()

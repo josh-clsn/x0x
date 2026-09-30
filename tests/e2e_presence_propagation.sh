@@ -63,6 +63,7 @@ write_config() {
   peer_list=$(IFS=,; echo "${peers[*]}")
   cat >"$dir/config.toml" <<TOML
 instance_name = "presence-$i"
+network_id = "x0x.prod"
 data_dir = "$dir"
 bind_address = "127.0.0.1:$bind_port"
 api_address = "127.0.0.1:$api_port"

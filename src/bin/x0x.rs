@@ -291,18 +291,17 @@ enum Commands {
         #[command(subcommand)]
         sub: Option<TasksSub>,
     },
-    /// Check for updates and upgrade (no daemon needed).
+    /// Check releases; use authenticated POST /upgrade/apply to install.
     Upgrade {
         /// Just check for updates, don't apply.
         #[arg(long)]
         check: bool,
-        /// Accepted for REST/CLI parity naming only: this standalone
-        /// updater installs by default (no flags) straight from GitHub
-        /// and does NOT call the daemon's `POST /upgrade/apply`. The
-        /// flag is otherwise ignored.
+        /// Installation is refused; use authenticated POST /upgrade/apply.
+        /// With --check, only a read-only release check is performed.
         #[arg(long)]
         apply: bool,
-        /// Skip version comparison, download and install latest.
+        /// With --check, fetch the current manifest regardless of version.
+        /// Does not bypass the refusal to install.
         #[arg(long)]
         force: bool,
     },
@@ -3350,9 +3349,9 @@ x0x (v{VERSION})
 |
 +-- System
     +-- constitution       Display the x0x Constitution
-    +-- upgrade            Check for updates and upgrade (no daemon needed)
+    +-- upgrade            Read-only release check; use POST /upgrade/apply to install
     |   +-- --check        Just check, don't apply
-    |   +-- --force        Force reinstall latest version
+    |   +-- --force        Fetch current manifest with --check
     +-- gui                Open embedded web GUI
     +-- routes             Print all 130 REST API routes
     +-- tree               This command tree

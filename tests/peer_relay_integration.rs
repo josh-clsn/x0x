@@ -229,6 +229,7 @@ async fn sender_uses_relay_when_direct_path_fails() {
         max_envelope_bytes: MAX_ENVELOPE_BYTES,
         kem_public_key: bob_kem.public_bytes.clone(),
         digest_support: false,
+        application_registry: Default::default(),
     };
     alice.insert_capability_for_testing(bob_agent_id, bob_machine_id, bob_cap);
 
@@ -319,6 +320,7 @@ async fn enabled_policy_without_candidates_surfaces_direct_err() {
             max_envelope_bytes: MAX_ENVELOPE_BYTES,
             kem_public_key: bob_kem.public_bytes.clone(),
             digest_support: false,
+            application_registry: Default::default(),
         },
     );
     drive_past_relay_threshold(&alice, &bob_agent_id);
@@ -637,6 +639,7 @@ async fn relay_round_trip_alice_to_bob_via_charlie() {
             max_envelope_bytes: MAX_ENVELOPE_BYTES,
             kem_public_key: bob_kem.public_bytes.clone(),
             digest_support: false,
+            application_registry: Default::default(),
         },
     );
     drive_past_relay_threshold(&alice, &bob.agent_id());

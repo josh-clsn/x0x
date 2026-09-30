@@ -71,20 +71,39 @@ struct LoadedLegacyStore {
 pub(in crate::server) const KV_STORE_DELTA_DM_PREFIX: &[u8] = b"X0X-KV-DELTA-V1\n";
 pub(in crate::server) use x0x::kv::KvStoreDirectDelta;
 
+/// #1041 r2: send JSON FIRST, and fall back to bincode only when JSON
+/// encoding fails.
+///
+/// WHY JSON first: the JSON encoding shipped in 0.37-0.45, and the
+/// ordinary shapes (puts, deletes, fresh-name deltas) encode fine as
+/// JSON — only a RENAMED store's name clock (`HashMap<PeerId, u64>`,
+/// inside the LWW register) is unrepresentable. Always sending bincode
+/// would make every 0.45 peer silently drop EVERY fallback delta during
+/// a mixed rollout; JSON-first keeps them reading the 99% case and only
+/// the rename clock (which they already could not read) moves to
+/// bincode.
+///
+/// The receiver accepts both encodings (bincode first, JSON legacy), so
+/// the fallback shape reaches the upgraded peers that can apply it.
 fn encode_kv_store_delta_direct_payload(
     store_id: &str,
     peer_id: saorsa_gossip_types::PeerId,
     delta: &x0x::kv::KvStoreDelta,
-) -> serde_json::Result<Vec<u8>> {
+) -> Result<Vec<u8>, String> {
     let msg = KvStoreDirectDelta {
         store_id: store_id.to_string(),
         peer_id,
         delta: delta.clone(),
     };
-    let json = serde_json::to_vec(&msg)?;
-    let mut payload = Vec::with_capacity(KV_STORE_DELTA_DM_PREFIX.len() + json.len());
+    let bytes = serde_json::to_vec(&msg)
+        .or_else(|json_error| {
+            bincode::serialize(&msg)
+                .map_err(|bincode_error| format!("json: {json_error}; bincode: {bincode_error}"))
+        })
+        .map_err(|e| format!("no encoding fits this delta: {e}"))?;
+    let mut payload = Vec::with_capacity(KV_STORE_DELTA_DM_PREFIX.len() + bytes.len());
     payload.extend_from_slice(KV_STORE_DELTA_DM_PREFIX);
-    payload.extend_from_slice(&json);
+    payload.extend_from_slice(&bytes);
     Ok(payload)
 }
 
@@ -3015,12 +3034,63 @@ mod tests {
             x0x::history::classify::DmPayloadClass::Ephemeral
         );
 
-        let decoded: KvStoreDirectDelta =
-            serde_json::from_slice(&payload[KV_STORE_DELTA_DM_PREFIX.len()..])
-                .expect("payload JSON should decode");
+        // An ORDINARY delta (a bare version) encodes as JSON: 0.45
+        // peers read the fallback during a mixed rollout (#1041 r2).
+        let body = &payload[KV_STORE_DELTA_DM_PREFIX.len()..];
+        let first = body.first().copied();
+        assert_eq!(first, Some(b'{'), "ordinary deltas are JSON first");
+        let decoded: KvStoreDirectDelta = serde_json::from_slice(body).expect("0.45-readable JSON");
         assert_eq!(decoded.store_id, "store-1");
         assert_eq!(decoded.peer_id, peer_id);
         assert_eq!(decoded.delta.version, delta.version);
+    }
+
+    /// #1041: the rename clock (`HashMap<PeerId, u64>` inside the name
+    /// LWW register's vector clock) is the one shape JSON cannot carry —
+    /// serde_json fails with "key must be a string" (the r1 bug: the
+    /// encode failed and the fallback never delivered). The payload must
+    /// fall back to bincode, and the receiver/validator/classifier must
+    /// all accept it.
+    #[test]
+    fn kv_delta_rename_clock_falls_back_to_bincode() {
+        let peer = saorsa_gossip_types::PeerId::new([7u8; 32]);
+        let mut name = saorsa_gossip_crdt_sync::LwwRegister::new("legacy".to_string());
+        name.set("renamed".to_string(), peer);
+        let mut delta = x0x::kv::KvStoreDelta::new(1);
+        delta.name_update = Some(name);
+        // A seed put and a DELETE tombstone: the rest of the
+        // legacy-SOURCE shape (both encode fine as JSON on their own).
+        let entry = x0x::kv::KvEntry::new(
+            format!("{}/seed", "ab".repeat(16)),
+            b"payload".to_vec(),
+            "application/octet-stream".to_string(),
+        );
+        delta
+            .added
+            .insert(format!("{}/seed", "ab".repeat(16)), (entry, (peer, 1u64)));
+        delta.removed.insert(
+            format!("{}/dead", "ab".repeat(16)),
+            std::collections::HashSet::from([(peer, 1u64)]),
+        );
+
+        let payload = encode_kv_store_delta_direct_payload("x0x-app-store", peer, &delta)
+            .expect("the bincode fallback encodes the rename clock (#1041)");
+        assert!(payload.starts_with(KV_STORE_DELTA_DM_PREFIX));
+        let body = &payload[KV_STORE_DELTA_DM_PREFIX.len()..];
+        assert_ne!(
+            body.first().copied(),
+            Some(b'{'),
+            "the rename-clock delta is NOT JSON (serde_json cannot carry it)"
+        );
+        // Through the validator and the classifier, and back.
+        assert!(crate::server::valid_kv_store_delta_typed_dm(&payload));
+        assert_eq!(
+            x0x::history::classify::classify_dm_payload(&payload),
+            x0x::history::classify::DmPayloadClass::Ephemeral
+        );
+        let decoded: KvStoreDirectDelta = bincode::deserialize(body).expect("bincode round-trip");
+        assert_eq!(decoded.delta.version, delta.version);
+        assert!(decoded.delta.name_update.is_some());
     }
 
     // -- #341 Phase B: POST /groups/:id/stores ---------------------------------

@@ -90,7 +90,7 @@ use routes::{
     update_task, withdraw_group_state, AtomicWriteOutcome, ControlBlobMessage, ControlBlobState,
     JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent, PendingListenerAdmission,
     PredecessorRelayObligation, PublicGroupBootstrap, SelfPublishedReleaseManifests,
-    TreeKemCatchupRequest, TreeKemCatchupResponse, WelcomeBlobMessage, CAUSAL_ENVELOPE_MAX_BYTES,
+    TreeKemCatchupRequest, TreeKemCatchupResponse, CAUSAL_ENVELOPE_MAX_BYTES,
     CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
     CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
     CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
@@ -1258,6 +1258,42 @@ pub async fn serve_with_options(
         }));
     }
 
+    // ADR 0089: relationship sources are installed before load verification.
+    let context_state = Arc::downgrade(&state);
+    agent
+        .peer_evidence()
+        .set_group_context(Arc::new(move |a, b| {
+            let state = context_state.upgrade()?;
+            let groups = state.named_groups.try_read().ok()?;
+            let local = hex::encode(state.agent.agent_id().as_bytes());
+            let a = hex::encode(a.as_bytes());
+            let b = hex::encode(b.as_bytes());
+            Some(groups.values().any(|g| {
+                !g.withdrawn
+                    && [&local, &a, &b]
+                        .iter()
+                        .all(|id| g.members_v2.get(*id).is_some_and(|m| m.is_active()))
+            }))
+        }));
+    let evidence_state = Arc::downgrade(&state);
+    agent.start_peer_evidence(
+        config.data_dir.clone(),
+        config.evidence.clone(),
+        Arc::new(move |peer| {
+            let state = evidence_state.upgrade()?;
+            let Ok(groups) = state.named_groups.try_read() else {
+                return None;
+            };
+            let local = hex::encode(state.agent.agent_id().as_bytes());
+            let peer = hex::encode(peer.as_bytes());
+            Some(groups.values().any(|g| {
+                !g.withdrawn
+                    && g.members_v2.get(&local).is_some_and(|m| m.is_active())
+                    && g.members_v2.get(&peer).is_some_and(|m| m.is_active())
+            }))
+        }),
+    )?;
+
     // ADR-0041 Tier-1: bridge the sync service to live daemon state and
     // start the periodic + on-change pass loop (shuts down with the watch).
     if let Some(sync) = state.owner_sync.as_ref() {
@@ -1781,11 +1817,10 @@ pub async fn serve_with_options(
             let mut rx = file_state.agent.subscribe_direct();
             loop {
                 let Some(msg) = rx.recv().await else { break };
-                let Ok(file_msg) = serde_json::from_slice::<x0x::files::FileMessage>(&msg.payload)
-                else {
-                    continue; // not a file message
+                let Some((sender, file_msg)) = routes::decode_file_message(&msg) else {
+                    continue; // unverified sender or not a file message
                 };
-                handle_file_message(&file_state, &msg.sender, file_msg).await;
+                handle_file_message(&file_state, sender, file_msg).await;
             }
         }));
     }
@@ -1830,7 +1865,8 @@ pub async fn serve_with_options(
             let mut rx = welcome_state.agent.subscribe_direct();
             loop {
                 let Some(msg) = rx.recv().await else { break };
-                let Ok(welcome_msg) = serde_json::from_slice::<WelcomeBlobMessage>(&msg.payload)
+                let Some((sender, welcome_msg)) =
+                    routes::named_groups::decode_welcome_blob_message(&msg)
                 else {
                     continue;
                 };
@@ -1841,7 +1877,7 @@ pub async fn serve_with_options(
                     len = msg.payload.len(),
                     verified = msg.verified,
                 );
-                handle_welcome_blob_message(&welcome_state, &msg.sender, welcome_msg).await;
+                handle_welcome_blob_message(&welcome_state, sender, welcome_msg).await;
             }
         }));
     }
@@ -2058,7 +2094,13 @@ pub async fn serve_with_options(
                 let Some(payload) = typed.payload.strip_prefix(KV_STORE_DELTA_DM_PREFIX) else {
                     continue;
                 };
-                let Ok(delta_msg) = serde_json::from_slice::<KvStoreDirectDelta>(payload) else {
+                // #1041: the payload is BINCODE (a serde_json payload
+                // cannot carry the delta's PeerId-keyed maps). A JSON
+                // payload from an r1 sender is still accepted — the r1
+                // shape serialized only when it had no non-string keys.
+                let delta_msg = bincode::deserialize::<KvStoreDirectDelta>(payload)
+                    .or_else(|_| serde_json::from_slice::<KvStoreDirectDelta>(payload));
+                let Ok(delta_msg) = delta_msg else {
                     tracing::debug!(
                         sender = %hex::encode(typed.sender.as_bytes()),
                         "typed kv-store DM payload was not a KvStoreDirectDelta"
@@ -2818,7 +2860,12 @@ pub(crate) fn valid_public_group_bootstrap_typed_dm(payload: &[u8]) -> bool {
 pub(crate) fn valid_kv_store_delta_typed_dm(payload: &[u8]) -> bool {
     payload
         .strip_prefix(KV_STORE_DELTA_DM_PREFIX)
-        .is_some_and(|bytes| serde_json::from_slice::<KvStoreDirectDelta>(bytes).is_ok())
+        .is_some_and(|bytes| {
+            // #1041: bincode is the encoding (a JSON payload cannot carry
+            // PeerId-keyed maps); a legacy r1 JSON payload stays valid.
+            bincode::deserialize::<KvStoreDirectDelta>(bytes).is_ok()
+                || serde_json::from_slice::<KvStoreDirectDelta>(bytes).is_ok()
+        })
 }
 
 pub(crate) fn valid_predecessor_relay_typed_dm(payload: &[u8]) -> bool {
@@ -2975,6 +3022,26 @@ fn parse_machine_id_hex(hex_str: &str) -> Result<MachineId, String> {
 /// check, `stores`' TreeKEM protector and the manual clear route all resolve
 /// here. A quarantine-relevant lookup that spells this rule out again is a
 /// defect the `adr0066_lookup_guard` fixture is there to catch.
+/// #732 both-spellings resolution for a MUTABLE roster entry (the mut
+/// sibling of [`resolve_group_entry_locked`]): the exact map key first,
+/// else the entry whose STABLE id matches. Quarantine-clear closures use
+/// this so a clear requested under either spelling reaches the record the
+/// map actually holds (N19-B).
+pub(in crate::server) fn resolve_group_entry_mut_locked<'a>(
+    groups: &'a mut HashMap<String, x0x::groups::GroupInfo>,
+    group_id: &str,
+) -> Option<&'a mut x0x::groups::GroupInfo> {
+    let key: String = if groups.contains_key(group_id) {
+        group_id.to_string()
+    } else {
+        groups
+            .iter()
+            .find(|(_, info)| info.stable_group_id() == group_id)
+            .map(|(k, _)| k.clone())?
+    };
+    groups.get_mut(&key)
+}
+
 pub(in crate::server) fn resolve_group_entry_locked<'a>(
     groups: &'a HashMap<String, x0x::groups::GroupInfo>,
     group_id: &str,
