@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.46.0] - 2026-10-01
+
 ### Added
 
 - **Share-grant outbox P3 fixes (#1004).** Entries that expired while the
