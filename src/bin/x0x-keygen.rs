@@ -101,6 +101,14 @@ enum Commands {
         /// Output directory for manifest and signature files.
         #[arg(long)]
         output_dir: PathBuf,
+        /// Base URL for asset download links (row 7b rehearsal tooling).
+        /// DEFAULT UNCHANGED: without this flag the URLs are exactly the
+        /// GitHub release form the release workflow has always produced;
+        /// with it, archive/signature/SKILL URLs point under the given
+        /// base (e.g. http://127.0.0.1:8443). Tooling only — the daemon
+        /// and release workflow are untouched.
+        #[arg(long)]
+        base_url: Option<String>,
     },
 }
 
@@ -183,8 +191,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             skill_path,
             key,
             output_dir,
+            base_url,
         } => {
-            generate_manifest(&version, &assets_dir, &skill_path, &key, &output_dir)?;
+            generate_manifest(
+                &version,
+                &assets_dir,
+                &skill_path,
+                &key,
+                &output_dir,
+                base_url,
+            )?;
         }
         Commands::EmbedRust { key } => {
             let pk_bytes = std::fs::read(&key)?;
@@ -261,16 +277,48 @@ const PLATFORM_ARCHIVES: &[(&str, &str, &str)] = &[
     ("x86_64-pc-windows-msvc", "x0x-windows-x64", "zip"),
 ];
 
+/// The release asset origin the workflow has always used. Kept as a
+/// const so the flagless output stays byte-identical to it.
+const RELEASE_ASSET_BASE: &str = "https://github.com/saorsa-labs/x0x/releases/download";
+
+/// Normalize a `--base-url` value: reject empty input and non-http(s)
+/// schemes, and strip trailing slashes so `http://h:1/` and `http://h:1`
+/// produce identical URLs.
+fn normalize_base_url(base: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+    let Some(base) = base else {
+        return Ok(RELEASE_ASSET_BASE.to_string());
+    };
+    if !(base.starts_with("http://") || base.starts_with("https://")) {
+        return Err(
+            format!("--base-url must start with http:// or https:// (got {base:?})").into(),
+        );
+    }
+    let trimmed = base.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err("--base-url must not be only slashes".into());
+    }
+    Ok(trimmed.to_string())
+}
+
+/// The (archive, signature) URL pair for one asset name under `base`.
+fn asset_urls(base: &str, version: &str, name: &str) -> (String, String) {
+    (
+        format!("{base}/v{version}/{name}"),
+        format!("{base}/v{version}/{name}.sig"),
+    )
+}
+
 fn generate_manifest(
     version: &str,
     assets_dir: &Path,
     skill_path: &Path,
     key_path: &Path,
     output_dir: &Path,
+    base_url: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let sk_bytes = std::fs::read(key_path)?;
     let secret_key = MlDsaSecretKey::from_bytes(MlDsaVariant::MlDsa65, &sk_bytes)?;
-    let repo_url = "https://github.com/saorsa-labs/x0x/releases/download";
+    let repo_url = normalize_base_url(base_url.as_deref())?;
 
     let mut assets = Vec::new();
     for (target, prefix, ext) in PLATFORM_ARCHIVES {
@@ -294,8 +342,8 @@ fn generate_manifest(
             .into());
         }
 
-        let archive_url = format!("{repo_url}/v{version}/{archive_name}");
-        let signature_url = format!("{repo_url}/v{version}/{sig_name}");
+        let (archive_url, signature_url) = asset_urls(&repo_url, version, &archive_name);
+        let _ = &sig_name;
 
         assets.push(PlatformAsset {
             target: target.to_string(),
