@@ -1,6 +1,7 @@
 # ADR 0106: Join Results Carry the Intervening Membership Events
 
-- **Status:** Proposed
+- **Status:** Accepted
+- **Accepted:** 2026-10-01 by David Irvine (as written; relayed by Root, who verified the r2 diff at c06dbd3). The status change was applied by Claude (x0x-32) at his instruction.
 - **Date:** 2026-09-30
 - **Decision owners:** David Irvine
 - **Reviewers:** Root (cross-model review: Codex or OMP)
