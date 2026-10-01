@@ -70,6 +70,9 @@ const NAMED_GROUP_METADATA_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 const TREEKEM_PENDING_EVENTS_PER_GROUP_CAP: usize = 64;
 
 const TREEKEM_EVENT_LOG_PER_GROUP_CAP: usize = 128;
+/// #1139: the most intervening membership events a join result carries.
+/// A larger gap falls back to TreeKEM catch-up (today's path).
+pub(in crate::server) const JOIN_RESULT_INTERVENING_EVENT_CAP: usize = 8;
 
 // TreeKEM MemberAdded events carry signed state commits plus commit/welcome
 // references and are ~35-40 KiB each on the wire. Two events in one catch-up
@@ -1196,6 +1199,18 @@ pub(in crate::server) enum JoinResultMessage {
         /// the key.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         roster_certificates_b64: Vec<String>,
+        /// #1139: the authority's own logged membership events whose
+        /// commits lie strictly between the fetcher's `from_revision` and
+        /// `event`'s commit — present only when they cover that whole gap
+        /// (at most [`JOIN_RESULT_INTERVENING_EVENT_CAP`]). The joiner
+        /// applies each through the ordinary metadata apply path before
+        /// `event`, so a TreeKEM joiner whose invite predates another seal
+        /// converges without a catch-up round trip. Carries no new trust:
+        /// every event is verified exactly as if it had arrived by gossip.
+        /// Empty and omitted by legacy authorities; legacy joiners ignore
+        /// the key.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        intervening_events: Vec<NamedGroupMetadataEvent>,
     },
     /// #477 W1: the authority's typed, attempt-bound refusal. Served ONLY
     /// to fetches that carried `accepts_refusal: true` AND a matching
@@ -34524,6 +34539,220 @@ pub(in crate::server) async fn join_result_payload_with_roster_certificates(
     Ok(bare)
 }
 
+/// #1139: the logged `MemberAdded` events strictly between `from_revision`
+/// and `terminal_revision`, ordered by commit revision. Returns them only
+/// when they cover EVERY revision in that gap exactly once and number at
+/// most [`JOIN_RESULT_INTERVENING_EVENT_CAP`]; otherwise empty, and the
+/// joiner keeps today's behaviour (anchored-gap classification and
+/// TreeKEM catch-up). A gap that holds any other commit (a rename, a
+/// removal) is never covered, so it is never partially sent.
+async fn intervening_membership_events(
+    state: &AppState,
+    group_keys: &[String],
+    from_revision: u64,
+    terminal_revision: u64,
+) -> Vec<NamedGroupMetadataEvent> {
+    let Some(gap) = terminal_revision
+        .checked_sub(from_revision)
+        .and_then(|span| span.checked_sub(1))
+    else {
+        return Vec::new();
+    };
+    if gap == 0 || gap > JOIN_RESULT_INTERVENING_EVENT_CAP as u64 {
+        return Vec::new();
+    }
+    let mut by_revision: BTreeMap<u64, NamedGroupMetadataEvent> = BTreeMap::new();
+    let logs = state.treekem_event_log.read().await;
+    let mut seen_keys = HashSet::new();
+    for key in group_keys {
+        if !seen_keys.insert(key.as_str()) {
+            continue;
+        }
+        let Some(logged) = logs.get(key) else {
+            continue;
+        };
+        // Conflicts are checked across EVERY logged commit in the gap
+        // (review r2): filtering to MemberAdded first would hide a
+        // competing removal/ban at the same revision.
+        for event in logged {
+            let Some(commit) = named_group_metadata_event_commit(event) else {
+                continue;
+            };
+            if commit.revision <= from_revision || commit.revision >= terminal_revision {
+                continue;
+            }
+            match by_revision.get(&commit.revision) {
+                None => {
+                    by_revision.insert(commit.revision, event.clone());
+                }
+                Some(existing) => {
+                    // Two different logged commits at one revision: not a
+                    // single linear history — send nothing.
+                    let same = named_group_metadata_event_commit(existing)
+                        .is_some_and(|c| c.state_hash == commit.state_hash);
+                    if !same {
+                        return Vec::new();
+                    }
+                }
+            }
+        }
+    }
+    if by_revision.len() as u64 != gap
+        || by_revision
+            .values()
+            .any(|event| !matches!(event, NamedGroupMetadataEvent::MemberAdded { .. }))
+    {
+        return Vec::new();
+    }
+    by_revision.into_values().collect()
+}
+
+/// #1139 (review r1 P2-3): the carry rides only a result the joiner can
+/// pull as a control blob — the same predicate the FetchRequest arm uses
+/// for the blob path. A legacy joiner (no `accepts_control_blob_ref`)
+/// never receives it, so the carry can never push an otherwise-inline
+/// result past the DM budget and suppress its delivery.
+fn join_result_carry_allowed(
+    verified: bool,
+    accepts_control_blob_ref: bool,
+    has_attempt_id: bool,
+) -> bool {
+    verified && accepts_control_blob_ref && has_attempt_id
+}
+
+/// #1139 (review r1 P2-2): validate the WHOLE carried list before any
+/// mutation. Every entry must be a `MemberAdded` for `group_id` with a
+/// commit; revisions are unique and contiguous, the last is exactly
+/// `terminal_revision - 1`, and the first is at or below
+/// `local_revision + 1` (so the list reaches the joiner's stub). Returns
+/// the events in revision order, or `None` to reject the list wholesale.
+fn preflight_join_result_intervening_events(
+    group_id: &str,
+    local_revision: u64,
+    terminal_revision: u64,
+    events: Vec<NamedGroupMetadataEvent>,
+) -> Option<Vec<(u64, NamedGroupMetadataEvent)>> {
+    if events.is_empty() || events.len() > JOIN_RESULT_INTERVENING_EVENT_CAP {
+        return None;
+    }
+    let mut ordered = Vec::with_capacity(events.len());
+    for event in events {
+        let NamedGroupMetadataEvent::MemberAdded {
+            group_id: event_group,
+            commit: Some(commit),
+            ..
+        } = &event
+        else {
+            return None;
+        };
+        if event_group != group_id {
+            return None;
+        }
+        let revision = commit.revision;
+        ordered.push((revision, event));
+    }
+    ordered.sort_by_key(|(revision, _)| *revision);
+    let contiguous = ordered
+        .iter()
+        .zip(ordered.iter().skip(1))
+        .all(|((a, _), (b, _))| a.checked_add(1) == Some(*b));
+    let first = ordered.first().map(|(r, _)| *r)?;
+    let last = ordered.last().map(|(r, _)| *r)?;
+    if !contiguous
+        || last.checked_add(1) != Some(terminal_revision)
+        || first > local_revision.saturating_add(1)
+    {
+        return None;
+    }
+    Some(ordered)
+}
+
+/// #1139: apply the authority-served intervening `MemberAdded` events, in
+/// commit-revision order, before the join result's own event. Carried
+/// events are applied ONLY for a bound attempt, and each goes through the
+/// bound apply, which re-checks the attempt's currency UNDER the group's
+/// membership lock (review r1 P2-1), so a result that went stale between
+/// the handler's pre-check and an apply mutates nothing more. The list is
+/// preflighted as a whole first (review r1 P2-2). No new acceptance rule:
+/// each event is verified exactly as the ordinary metadata apply verifies
+/// gossip, and the TreeKEM adoption exclusion is untouched. Events already
+/// covered by the local revision are skipped. A later refusal by the
+/// ordinary apply stops the walk and KEEPS the prefix already accepted —
+/// each accepted link is a valid, verified commit in its own right.
+async fn apply_join_result_intervening_events(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    verified: bool,
+    group_id: &str,
+    terminal_revision: Option<u64>,
+    bound_join_attempt: Option<&str>,
+    events: Vec<NamedGroupMetadataEvent>,
+) {
+    if events.is_empty() {
+        return;
+    }
+    let (Some(bound), Some(terminal_revision), true) =
+        (bound_join_attempt, terminal_revision, verified)
+    else {
+        tracing::debug!(
+            target: "treekem.trace",
+            stage = "join_result_intervening_rejected",
+            group_id = %group_id,
+            reason = "unbound_or_unverified",
+        );
+        return;
+    };
+    let local_revision = {
+        let groups = state.named_groups.read().await;
+        let info = groups.get(group_id).or_else(|| {
+            groups
+                .values()
+                .find(|info| info.stable_group_id() == group_id)
+        });
+        match info {
+            Some(info) => info.state_revision,
+            None => return,
+        }
+    };
+    let Some(ordered) = preflight_join_result_intervening_events(
+        group_id,
+        local_revision,
+        terminal_revision,
+        events,
+    ) else {
+        tracing::warn!(
+            group_id = %LogHexId::group(group_id),
+            "#1139: join-result intervening events rejected by preflight (not a complete MemberAdded gap for this group)"
+        );
+        return;
+    };
+    for (revision, event) in ordered {
+        if revision <= local_revision {
+            continue;
+        }
+        let accepted = Box::pin(apply_named_group_metadata_event_with_binding(
+            state,
+            event,
+            *sender,
+            true,
+            None,
+            Some(bound),
+        ))
+        .await
+        .accepted;
+        tracing::debug!(
+            target: "treekem.trace",
+            stage = "join_result_intervening_event",
+            group_id = %group_id,
+            revision,
+            accepted,
+        );
+        if !accepted {
+            return;
+        }
+    }
+}
+
 pub(in crate::server) async fn handle_join_result_message(
     state: &Arc<AppState>,
     sender: &AgentId,
@@ -34699,11 +34928,40 @@ async fn handle_join_result_message_bound(
                 }
                 None => Vec::new(),
             };
+            let carry_allowed =
+                join_result_carry_allowed(verified, accepts_control_blob_ref, attempt_id.is_some());
+            let intervening_events =
+                match (from_revision, named_group_metadata_event_commit(&event)) {
+                    (Some(from_revision), Some(terminal)) if carry_allowed => {
+                        let keys: Vec<String> = {
+                            let groups = state.named_groups.read().await;
+                            let mut keys = vec![group_id.clone()];
+                            if let Some(info) = groups.get(&group_id).or_else(|| {
+                                groups
+                                    .values()
+                                    .find(|info| info.stable_group_id() == group_id)
+                            }) {
+                                keys.push(info.stable_group_id().to_string());
+                                keys.push(info.mls_group_id.clone());
+                            }
+                            keys
+                        };
+                        intervening_membership_events(
+                            state,
+                            &keys,
+                            from_revision,
+                            terminal.revision,
+                        )
+                        .await
+                    }
+                    _ => Vec::new(),
+                };
             let response = JoinResultMessage::Result {
                 event: Box::new(event),
                 chain,
                 head_attestation: head_attestation.map(Box::new),
                 roster_certificates_b64: Vec::new(),
+                intervening_events,
             };
             let payload = match join_result_payload_with_roster_certificates(
                 state,
@@ -34818,6 +35076,7 @@ async fn handle_join_result_message_bound(
             chain,
             head_attestation,
             roster_certificates_b64,
+            intervening_events,
         } => {
             let event = *event;
             tracing::debug!(
@@ -34914,6 +35173,21 @@ async fn handle_join_result_message_bound(
                     return;
                 }
             }
+            // #1139: the intervening membership events first, through the
+            // ordinary apply path, so `event` then chains gaplessly. BOXED:
+            // the apply future is enormous and must not be inlined into
+            // this handler's async frame (a deterministic stack overflow).
+            let terminal_revision = named_group_metadata_event_commit(&event).map(|c| c.revision);
+            Box::pin(apply_join_result_intervening_events(
+                state,
+                sender,
+                verified,
+                &group_id,
+                terminal_revision,
+                bound_join_attempt,
+                intervening_events,
+            ))
+            .await;
             // #458 r3/r5: expose the carried chain AND head attestation
             // to the joiner's adoption path for exactly this apply.
             {
@@ -36318,6 +36592,7 @@ pub(in crate::server) mod tests {
     mod home_control_payload_size;
     mod hs_f2_membership_cluster;
     mod hs_r3_invite_auth;
+    mod issue1139_back_to_back_join;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;
@@ -38453,6 +38728,7 @@ pub(in crate::server) mod tests {
                     chain: Vec::new(),
                     head_attestation: attestation.map(Box::new),
                     roster_certificates_b64: Vec::new(),
+                    intervening_events: Vec::new(),
                 },
             )
             .await;
@@ -48501,6 +48777,7 @@ pub(in crate::server) mod tests {
             chain: Vec::new(),
             head_attestation: None,
             roster_certificates_b64: Vec::new(),
+            intervening_events: Vec::new(),
         };
         let result_payload = serde_json::to_vec(&result);
         assert!(result_payload.is_ok(), "join-result response serializes");
