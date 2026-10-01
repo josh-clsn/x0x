@@ -987,3 +987,324 @@ async fn issue1139_authority_competing_commit_in_gap_suppresses_carry() -> Resul
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// D39(A) regression: a device whose join failed or timed out AFTER a
+// state-only intermediate apply (the ADR 0106 carry, or the same commit
+// arriving by gossip first) keeps a `not_member` row. A fresh invite must
+// still start a NEW join attempt and converge. Red on eb4c6b7 (PR #1147).
+// ---------------------------------------------------------------------------
+
+/// J2's result with its OWN MemberAdded made unappliable (the commit's
+/// state hash is altered, so the signature no longer verifies), optionally
+/// still carrying the intervening r+1 events.
+fn result_with_failing_own_event(s: &BackToBack, carry: bool) -> JoinResultMessage {
+    let mut own = s.add_j2.event.clone();
+    if let NamedGroupMetadataEvent::MemberAdded {
+        commit: Some(commit),
+        ..
+    } = &mut own
+    {
+        commit.state_hash = "00".repeat(32);
+    }
+    match s.j2_result.clone() {
+        JoinResultMessage::Result {
+            chain,
+            head_attestation,
+            roster_certificates_b64,
+            intervening_events,
+            ..
+        } => JoinResultMessage::Result {
+            event: Box::new(own),
+            chain,
+            head_attestation,
+            roster_certificates_b64,
+            intervening_events: if carry {
+                intervening_events
+            } else {
+                Vec::new()
+            },
+        },
+        other => other,
+    }
+}
+
+/// Drive J2 through: own seat refused after (optionally) the carry
+/// applied → attempt finalized as timed out → the documented remedy, a
+/// fresh invite (ADR 0106: "request a fresh invite"). Returns whether the
+/// fresh-invite join registered a NEW attempt, plus diagnostics.
+async fn d39_a_fresh_invite_after_failed_own_seat(carry: bool) -> Result<(bool, String)> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    let base = j2_revision(&s).await;
+    deliver_j2(&s, &result_with_failing_own_event(&s, carry)).await;
+    let after_result = j2_revision(&s).await;
+    if carry {
+        assert!(
+            after_result > base,
+            "probe precondition: the carried r+1 applied (base {base:?}, now {after_result:?})"
+        );
+    } else {
+        assert_eq!(after_result, base, "control precondition: nothing applied");
+    }
+    assert_eq!(
+        join_state(&s.j2, &s.group_key).await,
+        "pending_authority_commit",
+        "precondition: J2's own seat did not land"
+    );
+    // The attempt times out (the poll's own finalizer path).
+    super::super::finalize_join_attempt(
+        &s.j2,
+        &s.group_key,
+        &s.stable_group_id,
+        &j2_hex,
+        &s.j2_attempt,
+        super::super::JoinAttemptOutcome::TimedOut,
+        super::super::JoinFinalizeGuard::Unlocked,
+    )
+    .await;
+    let row_after_timeout = s.j2.named_groups.read().await.contains_key(&s.group_key);
+    // The documented remedy: a FRESH invite, addressed to J2.
+    let (_invite, link) = mint_invite_transaction(
+        &s._authority,
+        &s.group_key,
+        3_600,
+        Some(s.j2.agent.agent_id()),
+        x0x::groups::InviteOrigin::Explicit,
+        true,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("mint fresh invite: {e:?}"))?;
+    let owner_pin = hex::encode(
+        s._authority
+            .agent
+            .identity()
+            .user_keypair()
+            .expect("owned")
+            .user_id()
+            .as_bytes(),
+    );
+    let response = join_group_via_invite(
+        State(Arc::clone(&s.j2)),
+        Json(JoinGroupRequest {
+            invite: link,
+            display_name: None,
+            mode: Some("home".to_string()),
+            expected_owner_user_id: Some(owner_pin),
+        }),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    let key = join_result_key(&s.stable_group_id, &j2_hex);
+    let new_attempt =
+        s.j2.pending_join_attempts
+            .lock()
+            .expect("attempt registry")
+            .get(&key)
+            .map(|a| a.attempt_id.clone())
+            .filter(|id| *id != s.j2_attempt);
+    Ok((
+        new_attempt.is_some(),
+        format!(
+            "carry={carry} row_after_timeout={row_after_timeout} fresh_join_status={status} body={}",
+            String::from_utf8_lossy(&body)
+        ),
+    ))
+}
+
+/// D39(A): after the ADR 0106 carry applied and J2's own seat then failed
+/// and timed out, a fresh invite starts a NEW join attempt (the #1146
+/// family). On eb4c6b7 the join route answered `ok:true,
+/// join_state:"not_member"` and started nothing.
+#[tokio::test]
+async fn d39_a_fresh_invite_rejoins_after_carry_then_failed_own_seat() -> Result<()> {
+    let (rejoined, diag) = d39_a_fresh_invite_after_failed_own_seat(true).await?;
+    assert!(
+        rejoined,
+        "D39(A): a fresh invite must start a new join attempt: {diag}"
+    );
+    Ok(())
+}
+
+/// D39(A) control: the same failure WITHOUT a carry — the stub is still
+/// pending at timeout, so the finalizer removes it and a fresh invite
+/// rejoins (green before and after the fix).
+#[tokio::test]
+async fn d39_a_control_fresh_invite_rejoins_without_carry() -> Result<()> {
+    let (rejoined, diag) = d39_a_fresh_invite_after_failed_own_seat(false).await?;
+    assert!(
+        rejoined,
+        "control: a fresh invite must rejoin without a carry: {diag}"
+    );
+    Ok(())
+}
+
+// D39(A) user paths from the stuck state (carry applied → own seat failed →
+// timed out → row `not_member`): `x0x group leave` is still refused for a
+// non-member (the #446 guard is unchanged), and after it — or after a
+// daemon restart — the fresh invite starts a new attempt and converges.
+
+/// Put J2 into the reproduced hazard-(A) state (row `not_member`, attempt
+/// finalized as timed out).
+async fn d39_a_stuck(s: &BackToBack) -> Result<()> {
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    deliver_j2(s, &result_with_failing_own_event(s, true)).await;
+    super::super::finalize_join_attempt(
+        &s.j2,
+        &s.group_key,
+        &s.stable_group_id,
+        &j2_hex,
+        &s.j2_attempt,
+        super::super::JoinAttemptOutcome::TimedOut,
+        super::super::JoinFinalizeGuard::Unlocked,
+    )
+    .await;
+    assert_eq!(
+        join_state(&s.j2, &s.group_key).await,
+        "not_member",
+        "stuck precondition"
+    );
+    Ok(())
+}
+
+/// The fresh-invite remedy on `joiner`, then the authority's staged result
+/// re-served for the NEW attempt. Returns (new attempt started, final
+/// state, diagnostics).
+async fn d39_a_fresh_join_and_converge(
+    s: &BackToBack,
+    joiner: &Arc<AppState>,
+) -> Result<(bool, &'static str, String)> {
+    let j2_hex = hex::encode(joiner.agent.agent_id().as_bytes());
+    let (_invite, link) = mint_invite_transaction(
+        &s._authority,
+        &s.group_key,
+        3_600,
+        Some(joiner.agent.agent_id()),
+        x0x::groups::InviteOrigin::Explicit,
+        true,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("mint fresh invite: {e:?}"))?;
+    let owner_pin = hex::encode(
+        s._authority
+            .agent
+            .identity()
+            .user_keypair()
+            .expect("owned")
+            .user_id()
+            .as_bytes(),
+    );
+    let response = join_group_via_invite(
+        State(Arc::clone(joiner)),
+        Json(JoinGroupRequest {
+            invite: link,
+            display_name: None,
+            mode: Some("home".to_string()),
+            expected_owner_user_id: Some(owner_pin),
+        }),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    let key = join_result_key(&s.stable_group_id, &j2_hex);
+    let new_attempt = joiner
+        .pending_join_attempts
+        .lock()
+        .expect("attempt registry")
+        .get(&key)
+        .map(|a| a.attempt_id.clone())
+        .filter(|id| *id != s.j2_attempt);
+    let final_state = match new_attempt.as_deref() {
+        Some(attempt) => {
+            super::super::handle_join_result_message_bound(
+                joiner,
+                &s.authority_id,
+                true,
+                s.j2_result.clone(),
+                Some(attempt),
+            )
+            .await;
+            join_state(joiner, &s.group_key).await
+        }
+        None => join_state(joiner, &s.group_key).await,
+    };
+    Ok((
+        new_attempt.is_some(),
+        final_state,
+        format!(
+            "fresh_join_status={status} body={}",
+            String::from_utf8_lossy(&body)
+        ),
+    ))
+}
+
+/// `x0x group leave <id>` (`DELETE /groups/:id`) stays refused for the
+/// non-member row (#446 guard intact); the fresh invite still recovers.
+#[tokio::test]
+async fn d39_a_leave_refused_then_fresh_invite_converges() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    d39_a_stuck(&s).await?;
+    let response = leave_group(
+        State(Arc::clone(&s.j2)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(s.group_key.clone()),
+    )
+    .await
+    .into_response();
+    let leave_status = response.status();
+    let leave_body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    let row_after_leave = s.j2.named_groups.read().await.contains_key(&s.group_key);
+    assert_eq!(
+        leave_status,
+        StatusCode::FORBIDDEN,
+        "#446: leave stays refused for a non-member row"
+    );
+    let (started, final_state, diag) = d39_a_fresh_join_and_converge(&s, &s.j2).await?;
+    assert!(
+        started && final_state == "active",
+        "D39(A): after `x0x group leave` the fresh invite must recover: leave={leave_status} {} \
+         row_after_leave={row_after_leave} new_attempt={started} final={final_state} {diag}",
+        String::from_utf8_lossy(&leave_body)
+    );
+    Ok(())
+}
+
+/// After a daemon restart (same data dir and agent key) the durable
+/// `not_member` row reloads; the fresh invite still recovers.
+#[tokio::test]
+async fn d39_a_restart_then_fresh_invite_converges() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    d39_a_stuck(&s).await?;
+    let key_bytes = s.j2.agent.identity().agent_keypair().to_bytes();
+    s.j2.agent.shutdown().await;
+    let restarted = joiner_state(
+        dir.path(),
+        "j2",
+        x0x::identity::AgentKeypair::from_bytes(&key_bytes.0, &key_bytes.1)?,
+    )
+    .await?;
+    let row_after_restart = restarted
+        .named_groups
+        .read()
+        .await
+        .contains_key(&s.group_key);
+    let state_after_restart = if row_after_restart {
+        join_state(&restarted, &s.group_key).await
+    } else {
+        "no_row"
+    };
+    let (started, final_state, diag) = d39_a_fresh_join_and_converge(&s, &restarted).await?;
+    assert!(
+        started && final_state == "active",
+        "D39(A): after a restart the fresh invite must recover: row_after_restart={row_after_restart} \
+         state_after_restart={state_after_restart} new_attempt={started} final={final_state} {diag}"
+    );
+    restarted.agent.shutdown().await;
+    Ok(())
+}
