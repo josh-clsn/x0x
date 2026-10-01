@@ -17694,6 +17694,40 @@ pub(in crate::server) const JOIN_HOME_PLACEMENTS_MAX: usize =
     x0x::groups::invite::MAX_INVITE_ROSTER_ENTRIES;
 
 /// POST /groups/join — join a group via invite link.
+/// D39(A) (review r1): what a local `not_member` row is, from the joiner's
+/// point of view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotMemberJoinRow {
+    /// The remnant of THIS device's own join that never seated: the join
+    /// route's lineage marker is present with no `seated_at_revision`, and
+    /// the roster holds no entry at all for the joiner (not Pending, not
+    /// Removed, not Banned). Only this shape may be cleared for a retry.
+    UnseatedJoinRemnant,
+    /// Fork-quarantined (marker or lineage fork evidence): containment is
+    /// kept and the retry is refused.
+    Quarantined,
+    /// Anything else (a removal, a ban, a group never joined by invite):
+    /// left exactly as it is.
+    Other,
+}
+
+fn classify_not_member_join_row(
+    info: &x0x::groups::GroupInfo,
+    joiner_hex: &str,
+) -> NotMemberJoinRow {
+    let lineage = info.invite_lineage.as_ref();
+    if info.is_fork_quarantined() || lineage.is_some_and(|l| l.fork_evidence.is_some()) {
+        return NotMemberJoinRow::Quarantined;
+    }
+    let never_seated = lineage.is_some_and(|l| l.seated_at_revision.is_none());
+    let no_roster_entry = !info.members_v2.contains_key(joiner_hex);
+    if never_seated && no_roster_entry && !info.withdrawn {
+        NotMemberJoinRow::UnseatedJoinRemnant
+    } else {
+        NotMemberJoinRow::Other
+    }
+}
+
 /// D39(A): clear a local row the joining daemon is NOT a member of, so a
 /// fresh invite starts a NEW join attempt instead of returning an
 /// idempotent `already_joined: false, join_state: "not_member"` with no
@@ -17705,9 +17739,10 @@ pub(in crate::server) const JOIN_HOME_PLACEMENTS_MAX: usize =
 /// durable record is rewritten when the member's own seat persists. A
 /// leftover TreeKEM group for the key is dropped too — a non-member must
 /// not hold it, and it would falsely satisfy the join poll's
-/// `treekem_groups.contains_key` confirmation. Active rows are never
-/// touched (re-checked under the write lock), so the #446 leave guard and
-/// every seated member's state are unaffected.
+/// `treekem_groups.contains_key` confirmation. Only an
+/// [`NotMemberJoinRow::UnseatedJoinRemnant`] is cleared (re-checked under the
+/// write lock): seated, removed, banned and quarantined rows are never
+/// touched, and the #446 leave guard is unaffected.
 async fn clear_stale_not_member_join_row(state: &AppState, group_id_hex: &str, joiner_hex: &str) {
     let cleared: Vec<String> = {
         let mut groups = state.named_groups.write().await;
@@ -17715,7 +17750,8 @@ async fn clear_stale_not_member_join_row(state: &AppState, group_id_hex: &str, j
             .iter()
             .filter(|(key, info)| {
                 (key.as_str() == group_id_hex || info.mls_group_id == group_id_hex)
-                    && !info.has_active_member(joiner_hex)
+                    && classify_not_member_join_row(info, joiner_hex)
+                        == NotMemberJoinRow::UnseatedJoinRemnant
             })
             .map(|(key, _)| key.clone())
             .collect();
@@ -18034,10 +18070,10 @@ pub(in crate::server) async fn join_group_via_invite(
     if let Some(resp) = join_pending_invite_check(state.as_ref(), &invite, &req.invite).await {
         return resp;
     }
-    // D39(A): a local row this daemon is NOT a member of (a join that
-    // failed or timed out after a state-only intermediate apply had already
-    // persisted the row) must not swallow a fresh invite as an idempotent
-    // success. It is cleared below and the join proceeds as a NEW attempt.
+    // D39(A): the provably-unseated remnant of this device's OWN failed
+    // join (see `classify_not_member_join_row`) must not swallow a fresh
+    // invite as an idempotent success. It is cleared below and the join
+    // proceeds as a NEW attempt.
     let mut stale_not_member_row = false;
     {
         let groups = state.named_groups.read().await;
@@ -18079,7 +18115,20 @@ pub(in crate::server) async fn join_group_via_invite(
                 let joiner_hex = hex::encode(agent_id.as_bytes());
                 let membership_state =
                     local_join_membership_state(state.as_ref(), &info, &joiner_hex).await;
-                if membership_state == "not_member" {
+                let not_member_row = (membership_state == "not_member")
+                    .then(|| classify_not_member_join_row(&info, &joiner_hex));
+                if not_member_row == Some(NotMemberJoinRow::Quarantined) {
+                    // Review r1 P1-2: a fork-quarantined row keeps its
+                    // containment; a retry never clears it.
+                    return api_error_with_reason(
+                        StatusCode::CONFLICT,
+                        "this device's earlier join of the group is fork-quarantined, so a new \
+                         invite cannot replace it; an operator clears the marker with \
+                         POST /groups/:id/quarantine/clear, then retries the invite",
+                        "fork_quarantined",
+                    );
+                }
+                if not_member_row == Some(NotMemberJoinRow::UnseatedJoinRemnant) {
                     stale_not_member_row = true;
                 } else {
                     let still_pending = membership_state == "pending_authority_commit";
