@@ -184,5 +184,22 @@ class CustodyTests(unittest.TestCase):
             self.assertEqual(entry["sha256"], C.digest(archive))
 
 
+    def test_aggregate_accepts_gnu_binary_mode_marker_and_rejects_wrong_name(self) -> None:
+        artifacts = self.root / "artifacts"; artifacts.mkdir()
+        for platform in C.PLATFORM_TARGETS:
+            directory = artifacts / f"release-{platform}"; directory.mkdir()
+            self.archive(directory, platform)
+        windows = next(artifacts.glob("release-*/*.zip"))
+        checksum = windows.with_name(f"{windows.name}.sha256")
+        # Git Bash sha256sum on windows-latest writes '<hash> *<name>' (binary mode).
+        checksum.write_text(f"{C.digest(windows)} *{windows.name}\n", encoding="utf-8")
+        C.aggregate(self.custody, artifacts, self.root / "aggregate.json")
+        checksum.write_text(f"{C.digest(windows)} *other.zip\n", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "archive checksum mismatch"):
+            C.aggregate(self.custody, artifacts, self.root / "aggregate2.json")
+        checksum.write_text(f"{'0' * 64} *{windows.name}\n", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "archive checksum mismatch"):
+            C.aggregate(self.custody, artifacts, self.root / "aggregate3.json")
+
 if __name__ == "__main__":
     unittest.main()
