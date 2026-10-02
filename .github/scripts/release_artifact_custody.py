@@ -210,7 +210,10 @@ def aggregate(custody: Path, artifacts: Path, output: Path) -> None:
         if not checksum.is_file():
             fail(f"archive checksum is missing: {archive.name}")
         fields = checksum.read_text(encoding="utf-8").split()
-        if len(fields) != 2 or fields[0] != digest(archive) or Path(fields[1]).name != archive.name:
+        # GNU sha256sum marks binary mode with '*' before the name, and it is the
+        # default in Git Bash on windows-latest: '<hash> *x0x-windows-x64.zip'.
+        name = fields[1][1:] if len(fields) == 2 and fields[1].startswith("*") else (fields[1] if len(fields) == 2 else "")
+        if len(fields) != 2 or fields[0] != digest(archive) or Path(name).name != archive.name:
             fail(f"archive checksum mismatch: {archive.name}")
         provenance = verify_archive(archive, lock_manifest)
         platform = str(provenance["platform"])
