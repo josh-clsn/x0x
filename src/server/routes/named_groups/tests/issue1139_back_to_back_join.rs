@@ -27,11 +27,18 @@ async fn seal_home_add(
     owner: &x0x::identity::UserKeypair,
     member_kp: &x0x::identity::AgentKeypair,
     prepared: crate::mls::treekem::PreparedMember,
+    identity_cert: Option<&x0x::identity::AgentCertificate>,
 ) -> Result<SealedAdd> {
     let authority_hex = hex::encode(state.agent.agent_id().as_bytes());
     let member = member_kp.agent_id();
     let member_hex = hex::encode(member.as_bytes());
-    let cert = x0x::identity::AgentCertificate::issue(owner, member_kp)?;
+    // The device's OWN identity certificate when known (production seals the
+    // joiner's own certificate, so a later re-join presents the same digest);
+    // otherwise a fresh owner-issued one.
+    let cert = match identity_cert {
+        Some(cert) => cert.clone(),
+        None => x0x::identity::AgentCertificate::issue(owner, member_kp)?,
+    };
     let kp_b64 = BASE64.encode(prepared.key_package_bytes());
     let now_ms = now_millis_u64();
     let group = state
@@ -263,6 +270,7 @@ async fn build_back_to_back(dir: &std::path::Path) -> Result<BackToBack> {
         owner,
         &x0x::identity::AgentKeypair::from_bytes(&j1_bytes.0, &j1_bytes.1)?,
         j1_prepared,
+        j1.agent.identity().agent_certificate(),
     )
     .await?;
     let add_j2 = seal_home_add(
@@ -273,6 +281,7 @@ async fn build_back_to_back(dir: &std::path::Path) -> Result<BackToBack> {
         owner,
         &x0x::identity::AgentKeypair::from_bytes(&j2_bytes.0, &j2_bytes.1)?,
         j2_prepared,
+        j2.agent.identity().agent_certificate(),
     )
     .await?;
     assert_eq!(add_j1.commit.revision, base.state_revision + 1);
@@ -989,71 +998,65 @@ async fn issue1139_authority_competing_commit_in_gap_suppresses_carry() -> Resul
 }
 
 // ---------------------------------------------------------------------------
-// D39(A) regression: a device whose join failed or timed out AFTER a
-// state-only intermediate apply (the ADR 0106 carry, or the same commit
-// arriving by gossip first) keeps a durable `not_member` row. A fresh
-// invite must still start a NEW join attempt and converge, but only for
-// the provably-unseated remnant of the device's own join: a banned or
-// fork-quarantined row is never cleared (review r1). Red on eb4c6b7
-// (PR #1147).
+// D39(A) regression (#1148, ruling D43): a Home device whose join timed out
+// AFTER a state-only intermediate apply (the ADR 0106 carry) keeps a durable
+// `not_member` row. The owner removes it (`x0x group remove-member`) and
+// re-invites it; the device must converge `active` WITH its TreeKEM group.
+// Each join is a FAITHFUL round trip: the device's NEW MemberJoined goes
+// through the owner device's real apply, and whatever it stages is served
+// back as its FetchRequest arm would (the staged Welcome is inlined — the
+// in-process stand-in for the control-blob pull). Red without #1148
+// (probe PR #1151), green with it (probe PR #1152).
 // ---------------------------------------------------------------------------
-
-/// Put J2 into the D39(A) state: optionally the ADR 0106 carry applies the
-/// intervening r+1 state-only through its real (bound) path, J2's own
-/// result never lands, and the attempt is finalized as timed out.
-async fn d39_a_stuck(s: &BackToBack, carry: bool) -> Result<&'static str> {
-    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
-    let base = j2_revision(s).await;
-    if carry {
-        super::super::apply_join_result_intervening_events(
-            &s.j2,
-            &s.authority_id,
-            true,
-            &s.stable_group_id,
-            Some(s.add_j2.commit.revision),
-            Some(s.j2_attempt.as_str()),
-            vec![s.add_j1.event.clone()],
-        )
-        .await;
-        assert!(
-            j2_revision(s).await > base,
-            "precondition: the carried r+1 applied state-only"
-        );
+async fn wa_state(joiner: &Arc<AppState>, group_key: &str) -> &'static str {
+    let info = joiner.named_groups.read().await.get(group_key).cloned();
+    match info {
+        Some(info) => {
+            let local = hex::encode(joiner.agent.agent_id().as_bytes());
+            local_join_membership_state(joiner, &info, &local).await
+        }
+        None => "no_row",
     }
-    super::super::finalize_join_attempt(
-        &s.j2,
-        &s.group_key,
-        &s.stable_group_id,
-        &j2_hex,
-        &s.j2_attempt,
-        super::super::JoinAttemptOutcome::TimedOut,
-        super::super::JoinFinalizeGuard::Unlocked,
-    )
-    .await;
-    Ok(
-        if s.j2.named_groups.read().await.contains_key(&s.group_key) {
-            join_state(&s.j2, &s.group_key).await
-        } else {
-            "no_row"
-        },
-    )
 }
 
-struct FreshJoin {
+struct WaJoin {
     status: StatusCode,
     body: String,
     new_attempt: bool,
+    authority_accepted: bool,
+    staged: bool,
     final_state: &'static str,
-    treekem_installed: bool,
+    treekem: bool,
 }
 
-/// The fresh-invite remedy on `joiner`, then the authority's staged result
-/// re-served for the NEW attempt (if one started).
-async fn d39_a_fresh_join_and_converge(
-    s: &BackToBack,
-    joiner: &Arc<AppState>,
-) -> Result<FreshJoin> {
+impl std::fmt::Display for WaJoin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "status={} new_attempt={} authority_accepted_member_joined={} staged={} final={} treekem={} body={}",
+            self.status, self.new_attempt, self.authority_accepted, self.staged,
+            self.final_state, self.treekem, self.body
+        )
+    }
+}
+
+/// Mint a fresh invite for J2 (`x0x` home seat / mint), join through the
+/// real route, then the faithful authority round trip.
+async fn wa_fresh_invite_round_trip(s: &BackToBack) -> Result<WaJoin> {
+    wa_fresh_invite_round_trip_on(s, &s.j2).await
+}
+
+async fn wa_fresh_invite_round_trip_on(s: &BackToBack, joiner: &Arc<AppState>) -> Result<WaJoin> {
     let j2_hex = hex::encode(joiner.agent.agent_id().as_bytes());
+    let before: Option<String> = {
+        let key = join_result_key(&s.stable_group_id, &j2_hex);
+        joiner
+            .pending_join_attempts
+            .lock()
+            .expect("attempt registry")
+            .get(&key)
+            .map(|a| a.attempt_id.clone())
+    };
     let (_invite, link) = mint_invite_transaction(
         &s._authority,
         &s.group_key,
@@ -1085,106 +1088,303 @@ async fn d39_a_fresh_join_and_converge(
     .await
     .into_response();
     let status = response.status();
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    let body =
+        String::from_utf8_lossy(&axum::body::to_bytes(response.into_body(), usize::MAX).await?)
+            .to_string();
     let key = join_result_key(&s.stable_group_id, &j2_hex);
-    let new_attempt = joiner
+    let attempt = joiner
         .pending_join_attempts
         .lock()
         .expect("attempt registry")
         .get(&key)
-        .map(|a| a.attempt_id.clone())
-        .filter(|id| *id != s.j2_attempt);
-    if let Some(attempt) = new_attempt.as_deref() {
-        super::super::handle_join_result_message_bound(
-            joiner,
-            &s.authority_id,
-            true,
-            s.j2_result.clone(),
-            Some(attempt),
-        )
-        .await;
-    }
-    let final_state = if joiner.named_groups.read().await.contains_key(&s.group_key) {
-        join_state(joiner, &s.group_key).await
-    } else {
-        "no_row"
-    };
-    Ok(FreshJoin {
+        .filter(|a| Some(&a.attempt_id) != before.as_ref())
+        .map(|a| {
+            (
+                a.attempt_id.clone(),
+                a.stored_resend.as_ref().map(|r| r.event.clone()),
+            )
+        });
+    let mut out = WaJoin {
         status,
-        body: String::from_utf8_lossy(&body).to_string(),
-        new_attempt: new_attempt.is_some(),
-        final_state,
-        treekem_installed: joiner
-            .treekem_groups
+        body,
+        new_attempt: attempt.is_some(),
+        authority_accepted: false,
+        staged: false,
+        final_state: "unknown",
+        treekem: false,
+    };
+    if let Some((attempt_id, Some(member_joined))) = attempt {
+        s._authority.pending_join_results.write().await.clear();
+        out.authority_accepted = apply_named_group_metadata_event(
+            &s._authority,
+            member_joined,
+            joiner.agent.agent_id(),
+            true,
+            None,
+        )
+        .await
+        .accepted;
+        let staged = s
+            ._authority
+            .pending_join_results
             .read()
             .await
-            .contains_key(&s.group_key),
-    })
+            .get(&key)
+            .map(|p| (p.event.clone(), p.head_attestation.clone()));
+        out.staged = staged.is_some();
+        if !out.authority_accepted {
+            let counters = super::group_counters_for_test(&s._authority, &s.stable_group_id).await;
+            out.body = format!("{} authority_counters={counters:?}", out.body);
+        }
+        if let Some((mut event, head_attestation)) = staged {
+            // In-process transport stand-in: the owner device sends the
+            // Welcome by reference (control-blob pull over the network);
+            // inline the staged bytes exactly as the R19 tests do.
+            if let NamedGroupMetadataEvent::MemberAdded {
+                treekem_welcome_b64,
+                welcome_ref,
+                ..
+            } = &mut event
+            {
+                if let Some(reference) = welcome_ref.take() {
+                    let welcomes = s._authority.pending_welcomes.read().await;
+                    if let Some(welcome) = welcomes.get(&reference.welcome_id) {
+                        *treekem_welcome_b64 = Some(BASE64.encode(&welcome.bytes));
+                    } else {
+                        *welcome_ref = Some(reference);
+                    }
+                }
+            }
+            let from = joiner
+                .named_groups
+                .read()
+                .await
+                .get(&s.group_key)
+                .map(|i| i.state_revision)
+                .unwrap_or_default();
+            let terminal = named_group_metadata_event_commit(&event).map(|c| c.revision);
+            let info = s
+                ._authority
+                .named_groups
+                .read()
+                .await
+                .get(&s.group_key)
+                .cloned()
+                .expect("authority group");
+            let (chain, intervening_events) = match terminal {
+                Some(terminal) => (
+                    intervening_chain_from(&info, from, terminal),
+                    super::super::intervening_membership_events(
+                        &s._authority,
+                        std::slice::from_ref(&s.stable_group_id),
+                        from,
+                        terminal,
+                    )
+                    .await,
+                ),
+                None => (Vec::new(), Vec::new()),
+            };
+            super::super::handle_join_result_message_bound(
+                joiner,
+                &s.authority_id,
+                true,
+                JoinResultMessage::Result {
+                    event: Box::new(event),
+                    chain,
+                    head_attestation: head_attestation.map(Box::new),
+                    roster_certificates_b64: Vec::new(),
+                    intervening_events,
+                },
+                Some(attempt_id.as_str()),
+            )
+            .await;
+        }
+    }
+    out.final_state = wa_state(joiner, &s.group_key).await;
+    out.treekem = joiner
+        .treekem_groups
+        .read()
+        .await
+        .contains_key(&s.group_key);
+    Ok(out)
 }
 
-fn assert_recovered(label: &str, f: &FreshJoin) {
-    assert!(
-        f.new_attempt && f.final_state == "active" && f.treekem_installed,
-        "D39(A) {label}: the fresh invite must start a new attempt and converge with the \
-         TreeKEM group installed: status={} new_attempt={} final={} treekem={} body={}",
-        f.status,
-        f.new_attempt,
-        f.final_state,
-        f.treekem_installed,
-        f.body
-    );
-}
-
-/// D39(A): the carry applied, J2's own seat never landed, the attempt
-/// timed out (row `not_member`); a fresh invite starts a NEW attempt and
-/// J2 converges with its TreeKEM group. On eb4c6b7 the join route answered
-/// `ok:true, join_state:"not_member"` and started nothing (#1146 family).
-#[tokio::test]
-async fn d39_a_fresh_invite_rejoins_after_carry_then_timeout() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let s = build_back_to_back(dir.path()).await?;
+/// Stuck state A: the carry applied r+1 state-only, J2's own seat never
+/// landed, the attempt timed out → durable `not_member` row.
+async fn wa_stuck_not_member(s: &BackToBack) -> Result<()> {
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    super::super::apply_join_result_intervening_events(
+        &s.j2,
+        &s.authority_id,
+        true,
+        &s.stable_group_id,
+        Some(s.add_j2.commit.revision),
+        Some(s.j2_attempt.as_str()),
+        vec![s.add_j1.event.clone()],
+    )
+    .await;
+    super::super::finalize_join_attempt(
+        &s.j2,
+        &s.group_key,
+        &s.stable_group_id,
+        &j2_hex,
+        &s.j2_attempt,
+        super::super::JoinAttemptOutcome::TimedOut,
+        super::super::JoinFinalizeGuard::Unlocked,
+    )
+    .await;
     assert_eq!(
-        d39_a_stuck(&s, true).await?,
+        wa_state(&s.j2, &s.group_key).await,
         "not_member",
         "stuck precondition"
-    );
-    assert_recovered(
-        "after carry + timeout",
-        &d39_a_fresh_join_and_converge(&s, &s.j2).await?,
     );
     Ok(())
 }
 
-/// D39(A) control: the same timeout WITHOUT a carry — the stub is still
-/// pending, the finalizer removes it, and a fresh invite rejoins (green
-/// before and after the fix).
+/// Stuck state B: the timed-out join (no carry) then the documented fresh
+/// invite → keyless `active` (the authority rejects the re-join, #1150).
+async fn wa_stuck_keyless(s: &BackToBack) -> Result<WaJoin> {
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    super::super::finalize_join_attempt(
+        &s.j2,
+        &s.group_key,
+        &s.stable_group_id,
+        &j2_hex,
+        &s.j2_attempt,
+        super::super::JoinAttemptOutcome::TimedOut,
+        super::super::JoinFinalizeGuard::Unlocked,
+    )
+    .await;
+    wa_fresh_invite_round_trip(s).await
+}
+
+/// The owner removes J2 (`x0x group remove-member <group> <agent>` =
+/// `DELETE /groups/:id/members/:agent_id`); optionally the resulting
+/// MemberRemoved reaches J2. Returns J2's local state afterwards.
+async fn wa_owner_removes_j2(s: &BackToBack, deliver: bool) -> Result<&'static str> {
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    s._authority
+        .named_group_test_recorders
+        .publish_bytes
+        .lock()
+        .expect("publish hook")
+        .clear();
+    let response = remove_named_group_member(
+        State(Arc::clone(&s._authority)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path((s.group_key.clone(), j2_hex.clone())),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let body =
+        String::from_utf8_lossy(&axum::body::to_bytes(response.into_body(), usize::MAX).await?)
+            .to_string();
+    anyhow::ensure!(status.is_success(), "owner remove-member: {status} {body}");
+    if deliver {
+        let removed = s
+            ._authority
+            .named_group_test_recorders
+            .publish_bytes
+            .lock()
+            .expect("publish hook")
+            .iter()
+            .filter_map(|(_t, b)| serde_json::from_slice::<NamedGroupMetadataEvent>(b).ok())
+            .find(|e| matches!(e, NamedGroupMetadataEvent::MemberRemoved { agent_id, .. } if *agent_id == j2_hex));
+        if let Some(event) = removed {
+            apply_named_group_metadata_event(&s.j2, event, s.authority_id, true, None).await;
+        }
+    }
+    Ok(wa_state(&s.j2, &s.group_key).await)
+}
+
+fn wa_assert_recovered(ctx: &str, r: &WaJoin) {
+    assert!(
+        r.new_attempt && r.final_state == "active" && r.treekem,
+        "owner remove-member + fresh invite did NOT recover with keys [{ctx}]: {r}"
+    );
+}
+
+/// Characterization of #1150 (known limitation in v0.46.0, NOT fixed here):
+/// after a timed-out join left the device keyless `active`, a fresh invite
+/// ALONE does not give it keys — the owner device rejects the re-join
+/// MemberJoined (the device is already an Active member) and stages no
+/// Welcome. Flip when #1150 is fixed.
 #[tokio::test]
-async fn d39_a_control_fresh_invite_rejoins_without_carry() -> Result<()> {
+async fn d39_1150_fresh_invite_alone_leaves_keyless_device_keyless() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let s = build_back_to_back(dir.path()).await?;
-    assert_eq!(
-        d39_a_stuck(&s, false).await?,
-        "no_row",
-        "control precondition"
+    let r = wa_stuck_keyless(&s).await?;
+    assert!(
+        r.new_attempt
+            && !r.authority_accepted
+            && !r.staged
+            && r.final_state == "active"
+            && !r.treekem,
+        "#1150: expected keyless active with the re-join rejected: {r}"
     );
-    assert_recovered(
-        "control (no carry)",
-        &d39_a_fresh_join_and_converge(&s, &s.j2).await?,
-    );
+    Ok(())
+}
+
+/// The device's join timed out with no state-only apply (no carry): the
+/// finalizer removes the pending stub, so no row remains.
+async fn d39_timed_out_without_carry(s: &BackToBack) -> &'static str {
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    super::super::finalize_join_attempt(
+        &s.j2,
+        &s.group_key,
+        &s.stable_group_id,
+        &j2_hex,
+        &s.j2_attempt,
+        super::super::JoinAttemptOutcome::TimedOut,
+        super::super::JoinFinalizeGuard::Unlocked,
+    )
+    .await;
+    wa_state(&s.j2, &s.group_key).await
+}
+
+async fn d39_not_member_remove_reinvite(deliver_removal: bool) -> Result<(String, WaJoin)> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    wa_stuck_not_member(&s).await?;
+    let after_removal = wa_owner_removes_j2(&s, deliver_removal).await?;
+    let r = wa_fresh_invite_round_trip(&s).await?;
+    Ok((
+        format!(
+            "from=not_member removal_delivered={deliver_removal} j2_after_removal={after_removal}"
+        ),
+        r,
+    ))
+}
+
+/// D39(A): stuck `not_member` → the owner removes the device (the removal
+/// reaches it) → fresh invite → `active` WITH keys. Red on eb4c6b7: the
+/// leftover row answered the invite `ok:true, join_state:"not_member"` and
+/// started no attempt.
+#[tokio::test]
+async fn d39_a_not_member_owner_removes_delivered_then_fresh_invite_recovers_keys() -> Result<()> {
+    let (ctx, r) = d39_not_member_remove_reinvite(true).await?;
+    wa_assert_recovered(&ctx, &r);
+    Ok(())
+}
+
+/// D39(A): the same with the device OFFLINE for the removal (its leftover
+/// row stays `not_member`) — the fresh invite still recovers it with keys.
+#[tokio::test]
+async fn d39_a_not_member_owner_removes_undelivered_then_fresh_invite_recovers_keys() -> Result<()>
+{
+    let (ctx, r) = d39_not_member_remove_reinvite(false).await?;
+    wa_assert_recovered(&ctx, &r);
     Ok(())
 }
 
 /// `x0x group leave <id>` (`DELETE /groups/:id`) stays refused for the
-/// non-member row (#446 guard unchanged); the fresh invite still recovers.
+/// non-member row: the #446 guard is unchanged.
 #[tokio::test]
-async fn d39_a_leave_refused_then_fresh_invite_converges() -> Result<()> {
+async fn d39_a_leave_stays_refused_for_a_not_member_row() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let s = build_back_to_back(dir.path()).await?;
-    assert_eq!(
-        d39_a_stuck(&s, true).await?,
-        "not_member",
-        "stuck precondition"
-    );
+    wa_stuck_not_member(&s).await?;
     let response = leave_group(
         State(Arc::clone(&s.j2)),
         axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
@@ -1195,59 +1395,23 @@ async fn d39_a_leave_refused_then_fresh_invite_converges() -> Result<()> {
     assert_eq!(
         response.status(),
         StatusCode::FORBIDDEN,
-        "#446: leave stays refused for a non-member row"
+        "#446: leave stays refused"
     );
-    assert_recovered(
-        "after leave",
-        &d39_a_fresh_join_and_converge(&s, &s.j2).await?,
+    assert_eq!(
+        wa_state(&s.j2, &s.group_key).await,
+        "not_member",
+        "the row is kept"
     );
     Ok(())
 }
 
-/// After a daemon restart (same data dir and agent key) the durable
-/// `not_member` row reloads with its lineage; the fresh invite still
-/// recovers.
-#[tokio::test]
-async fn d39_a_restart_then_fresh_invite_converges() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let s = build_back_to_back(dir.path()).await?;
-    assert_eq!(
-        d39_a_stuck(&s, true).await?,
-        "not_member",
-        "stuck precondition"
-    );
-    let key_bytes = s.j2.agent.identity().agent_keypair().to_bytes();
-    s.j2.agent.shutdown().await;
-    let restarted = joiner_state(
-        dir.path(),
-        "j2",
-        x0x::identity::AgentKeypair::from_bytes(&key_bytes.0, &key_bytes.1)?,
-    )
-    .await?;
-    assert_eq!(
-        join_state(&restarted, &s.group_key).await,
-        "not_member",
-        "the durable remnant reloads"
-    );
-    assert_recovered(
-        "after restart",
-        &d39_a_fresh_join_and_converge(&s, &restarted).await?,
-    );
-    restarted.agent.shutdown().await;
-    Ok(())
-}
-
-/// Review r1 P1-1: a BANNED device's row is never cleared — an old,
-/// unexpired invite must not restore it (no new attempt, the ban stays).
+/// Review r1 P1-1: a BANNED device's row is never cleared — a fresh invite
+/// must not restore it (no new attempt, the ban stays).
 #[tokio::test]
 async fn d39_a_banned_row_is_not_cleared_and_does_not_rejoin() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let s = build_back_to_back(dir.path()).await?;
-    assert_eq!(
-        d39_a_stuck(&s, true).await?,
-        "not_member",
-        "stuck precondition"
-    );
+    wa_stuck_not_member(&s).await?;
     let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
     s.j2.named_groups
         .write()
@@ -1255,15 +1419,19 @@ async fn d39_a_banned_row_is_not_cleared_and_does_not_rejoin() -> Result<()> {
         .get_mut(&s.group_key)
         .expect("row")
         .ban_member(&j2_hex, None);
-    let f = d39_a_fresh_join_and_converge(&s, &s.j2).await?;
+    let r = wa_fresh_invite_round_trip(&s).await?;
     assert!(
-        !f.new_attempt,
-        "a banned row must not start a join attempt: {}",
-        f.body
+        !r.new_attempt,
+        "a banned row must not start a join attempt: {r}"
     );
     let groups = s.j2.named_groups.read().await;
-    let row = groups.get(&s.group_key).expect("the banned row is kept");
-    assert!(row.is_banned(&j2_hex), "the ban survives the retry");
+    assert!(
+        groups
+            .get(&s.group_key)
+            .expect("the banned row is kept")
+            .is_banned(&j2_hex),
+        "the ban survives the retry"
+    );
     Ok(())
 }
 
@@ -1273,11 +1441,7 @@ async fn d39_a_banned_row_is_not_cleared_and_does_not_rejoin() -> Result<()> {
 async fn d39_a_quarantined_row_is_refused_and_keeps_evidence() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let s = build_back_to_back(dir.path()).await?;
-    assert_eq!(
-        d39_a_stuck(&s, true).await?,
-        "not_member",
-        "stuck precondition"
-    );
+    wa_stuck_not_member(&s).await?;
     let evidence = x0x::groups::ForkEvidence {
         revision: 1,
         state_hash: "ab".repeat(32),
@@ -1291,15 +1455,102 @@ async fn d39_a_quarantined_row_is_refused_and_keeps_evidence() -> Result<()> {
         .and_then(|row| row.invite_lineage.as_mut())
         .expect("lineage")
         .fork_evidence = Some(evidence.clone());
-    let f = d39_a_fresh_join_and_converge(&s, &s.j2).await?;
-    assert_eq!(f.status, StatusCode::CONFLICT, "body={}", f.body);
-    assert!(f.body.contains("fork_quarantined"), "body={}", f.body);
-    assert!(!f.new_attempt);
+    let r = wa_fresh_invite_round_trip(&s).await?;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{r}");
+    assert!(r.body.contains("fork_quarantined"), "{r}");
+    assert!(!r.new_attempt, "{r}");
     let groups = s.j2.named_groups.read().await;
     let lineage = groups
         .get(&s.group_key)
         .and_then(|row| row.invite_lineage.as_ref())
         .expect("the quarantined row and its lineage are kept");
     assert_eq!(lineage.fork_evidence.as_ref(), Some(&evidence));
+    Ok(())
+}
+
+/// Codex r2 scenario (#1149): the owner device ADMITTED J2 (its seat is
+/// sealed), mints an invite whose base already holds J2's ACTIVE seat, then
+/// BANS J2; J2 observes neither and joins with that invite.
+async fn d39_r2_join_with_pre_ban_seated_invite(
+    s: &BackToBack,
+    carry: bool,
+) -> Result<&'static str> {
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    if carry {
+        wa_stuck_not_member(s).await?;
+    } else {
+        assert_eq!(d39_timed_out_without_carry(s).await, "no_row");
+    }
+    let (_invite, link) = mint_invite_transaction(
+        &s._authority,
+        &s.group_key,
+        3_600,
+        Some(s.j2.agent.agent_id()),
+        x0x::groups::InviteOrigin::Explicit,
+        true,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("mint invite: {e:?}"))?;
+    s._authority
+        .named_groups
+        .write()
+        .await
+        .get_mut(&s.group_key)
+        .expect("authority group")
+        .ban_member(&j2_hex, None);
+    let owner_pin = hex::encode(
+        s._authority
+            .agent
+            .identity()
+            .user_keypair()
+            .expect("owned")
+            .user_id()
+            .as_bytes(),
+    );
+    let response = join_group_via_invite(
+        State(Arc::clone(&s.j2)),
+        Json(JoinGroupRequest {
+            invite: link,
+            display_name: None,
+            mode: Some("home".to_string()),
+            expected_owner_user_id: Some(owner_pin),
+        }),
+    )
+    .await
+    .into_response();
+    assert!(
+        response.status().is_success(),
+        "join route: {}",
+        response.status()
+    );
+    Ok(wa_state(&s.j2, &s.group_key).await)
+}
+
+/// Characterization (Codex r2, PRE-EXISTING since eb4c6b7, tracked as
+/// #1149): a device with NO local row that joins with a stale invite whose
+/// base seats it reports local `active` from the snapshot alone, although
+/// the owner device banned it since. Flip when #1149 is fixed.
+#[tokio::test]
+async fn d39_r2_preexisting_seated_invite_without_row_reports_active() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    assert_eq!(
+        d39_r2_join_with_pre_ban_seated_invite(&s, false).await?,
+        "active"
+    );
+    Ok(())
+}
+
+/// Characterization (Codex r2, #1149): the #1148 recovery routes the stuck
+/// remnant onto exactly that pre-existing path — same input, same `active`.
+/// Flip together with the test above when #1149 is fixed.
+#[tokio::test]
+async fn d39_r2_recovered_remnant_takes_the_same_seated_invite_path() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    assert_eq!(
+        d39_r2_join_with_pre_ban_seated_invite(&s, true).await?,
+        "active"
+    );
     Ok(())
 }
