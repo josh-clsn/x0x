@@ -120,7 +120,7 @@ pub(in crate::server) fn daemon_shutdown_hook(
     let notify = shutdown_notify.clone();
     let tx = shutdown_tx.clone();
     Arc::new(move || {
-        let _ = notify.send(true);
+        let _ = notify.send_replace(true);
         let _ = tx.try_send(());
     })
 }

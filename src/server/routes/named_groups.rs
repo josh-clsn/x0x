@@ -13026,6 +13026,27 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             if self_leave_auth && secret_epoch.is_some() {
                 return ApplyMetadataResult::REJECTED;
             }
+            // Returning-member re-key, device side: the authority's real
+            // removal of THIS device reaches it by gossip while it is
+            // re-joining, before its join result. Taken as a departure it
+            // would wipe the row, pins and attempt the result is about to
+            // land on. While this device has a current join attempt for the
+            // group and holds no tree, its own admin removal is left to the
+            // carried chain link instead; with no current attempt (a genuine
+            // kick) it departs exactly as before, and D39 recovery covers a
+            // kick that lands mid-attempt.
+            if agent_id == local_agent_hex
+                && !self_leave_auth
+                && rejoin_in_flight_without_tree(state, &resolved_group_key, &info, &agent_id).await
+            {
+                tracing::debug!(
+                    target: "treekem.trace",
+                    stage = "apply_metadata_event_reject",
+                    reason = "own_removal_during_rejoin",
+                    group_id = %resolved_group_key,
+                );
+                return ApplyMetadataResult::REJECTED;
+            }
             let action_kind = if self_leave_auth {
                 x0x::groups::ActionKind::MemberSelf
             } else {
@@ -14838,6 +14859,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 let expected1 = guard.epoch().saturating_add(1);
                 let expected2 = expected1.saturating_add(1);
 
+                let rekey_prior_role = next
+                    .members_v2
+                    .get(&member_agent_id)
+                    .map(|member| member.role);
                 // Commit 1: a REAL removal of the member, sealed at epoch +1
                 // with the plain epoch binding — exactly the state every
                 // other member's ordinary `MemberRemoved` arm computes, so
@@ -14938,6 +14963,32 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         }
                     };
                 let revision2 = next.roster_revision;
+
+                // Commit 3 (only for a returning admin): the real removal
+                // dropped the seat and the add re-seats as Member, which is
+                // all a receiver's add arm can grant. Restore the role the
+                // member held at the seal, capped at Admin (Owner is never
+                // assigned), as an ordinary signed role update by the same
+                // inviter — exactly what every receiver's role arm computes.
+                let restored_role = (rekey_prior_role
+                    .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin)))
+                .then_some(x0x::groups::GroupRole::Admin);
+                let mut role_commit = None;
+                if let Some(role) = restored_role {
+                    next.roster_revision = next.roster_revision.saturating_add(1);
+                    next.set_member_role(&member_agent_id, role);
+                    match seal_commit_owner_certified(state, &mut next, signing_kp, now_ms).await {
+                        Ok(c) => role_commit = Some((next.roster_revision, role, c)),
+                        Err(e) => {
+                            tracing::warn!(
+                                group_id = %LogHexId::group(&resolved_group_key),
+                                member = %LogHexId::agent(&member_agent_id),
+                                "MemberJoined re-key: failed to seal role restore commit: {e}"
+                            );
+                            return ApplyMetadataResult::REJECTED;
+                        }
+                    }
+                }
 
                 // Now mutate the live TreeKEM tree back-to-back: remove the
                 // stale leaf (epoch +1) then add the fresh KeyPackage
@@ -15138,6 +15189,30 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     &added_event,
                     std::slice::from_ref(&member_agent_id),
                 );
+                if let Some((revision3, role, commit3)) = role_commit {
+                    let role_event = NamedGroupMetadataEvent::MemberRoleUpdated {
+                        group_id: event_group_id.clone(),
+                        revision: revision3,
+                        actor: inviter_agent_id.clone(),
+                        agent_id: member_agent_id.clone(),
+                        role,
+                        commit: Some(commit3),
+                    };
+                    publish_named_group_metadata_event(state, &metadata_topic, &role_event).await;
+                    spawn_named_group_event_delivery_to_active_members(
+                        state,
+                        &next,
+                        &role_event,
+                        &[],
+                    );
+                    spawn_group_control_event_redelivery(
+                        state,
+                        &metadata_topic,
+                        &next,
+                        &role_event,
+                        &[],
+                    );
+                }
                 tracing::info!(
                     group_id = %LogHexId::group(&resolved_group_key),
                     member = %LogHexId::agent(&member_agent_id),
@@ -39812,6 +39887,27 @@ pub(in crate::server) async fn dispatch_join_result_message(
             Err(_) => {}
         }
     });
+}
+
+/// Whether this device is mid-rejoin for the group with no TreeKEM tree:
+/// a join attempt for it is registered and current, and no tree is held
+/// under the row's key or its stable id.
+async fn rejoin_in_flight_without_tree(
+    state: &AppState,
+    group_key: &str,
+    info: &x0x::groups::GroupInfo,
+    local_hex: &str,
+) -> bool {
+    let attempt = state
+        .pending_join_attempts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains_key(&join_result_key(info.stable_group_id(), local_hex));
+    if !attempt {
+        return false;
+    }
+    let trees = state.treekem_groups.read().await;
+    !trees.contains_key(group_key) && !trees.contains_key(info.stable_group_id())
 }
 
 /// Returning-member re-key, device side (#1150 on this fork). The authority
