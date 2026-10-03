@@ -50,16 +50,16 @@ use routes::{
     daemon_shutdown_hook, delete_contact, delete_discovery_subscription, delete_kv_value,
     delete_machine, direct_connections, direct_message_send_config, direct_send, discover_groups,
     discover_groups_nearby, discovered_agent, discovered_agents, discovered_machine,
-    discovered_machines, dm_diagnostics, enroll_device, ensure_named_group_listeners,
-    evaluate_trust, exec_cancel, exec_diagnostics, exec_run, exec_sessions, file_accept_handler,
-    file_reject_handler, file_send_handler, file_transfer_status_handler, file_transfers_handler,
-    find_agent, forward_add, forward_list, forward_remove, get_a2a_agent_card, get_agent_card,
-    get_constitution, get_constitution_json, get_group_card, get_group_join_status,
-    get_group_public_messages, get_group_state, get_group_state_commits, get_kv_value,
-    get_mls_group, get_named_group, get_named_group_members, get_profile, get_sync_devices,
-    gossip_diagnostics, group_membership_lock, groups_diagnostics, handle_control_blob_message,
-    handle_file_message, handle_join_result_message, handle_treekem_catchup_request,
-    handle_treekem_catchup_response, handle_welcome_blob_message, health, history_diagnostics,
+    discovered_machines, dispatch_welcome_blob_message, dm_diagnostics, enroll_device,
+    ensure_named_group_listeners, evaluate_trust, exec_cancel, exec_diagnostics, exec_run,
+    exec_sessions, file_accept_handler, file_reject_handler, file_send_handler,
+    file_transfer_status_handler, file_transfers_handler, find_agent, forward_add, forward_list,
+    forward_remove, get_a2a_agent_card, get_agent_card, get_constitution, get_constitution_json,
+    get_group_card, get_group_join_status, get_group_public_messages, get_group_state,
+    get_group_state_commits, get_kv_value, get_mls_group, get_named_group, get_named_group_members,
+    get_profile, get_sync_devices, gossip_diagnostics, group_membership_lock, groups_diagnostics,
+    handle_control_blob_message, handle_file_message, handle_join_result_message,
+    handle_treekem_catchup_request, handle_treekem_catchup_response, health, history_diagnostics,
     history_list, history_message, history_purge, history_scopes, history_search, history_stats,
     identity_revocations, identity_revoke, import_agent_card, import_group_card,
     ingest_public_message, introduction, join_group_via_invite, join_kv_store, leave_group,
@@ -1912,7 +1912,7 @@ pub async fn serve_with_options(
                     len = msg.payload.len(),
                     verified = msg.verified,
                 );
-                handle_welcome_blob_message(&welcome_state, sender, welcome_msg).await;
+                dispatch_welcome_blob_message(&welcome_state, sender, welcome_msg).await;
             }
         }));
     }

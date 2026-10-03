@@ -1259,9 +1259,14 @@ pub(super) struct NamedGroupTestRecorders {
     pub(super) publish_bytes: StdMutex<Vec<(String, Vec<u8>)>>,
     pub(super) direct_deliveries: StdMutex<Vec<(String, String, &'static str, &'static str)>>,
     /// ADR 0107: every join result the `FetchRequest` arm decided to serve,
-    /// as `(recipient, group, exact payload)`, recorded before the transport
-    /// send. In-process sends fail, so this is the only witness of a serve.
+    /// as `(recipient, group, exact payload)`, recorded at the serve
+    /// DECISION (before any egress task runs). Tests read the payload here.
     pub(super) join_result_serves: StdMutex<Vec<(String, String, Vec<u8>)>>,
+    /// ADR 0107 (review r2): every join-artifact EGRESS handoff, as
+    /// `(recipient, group, kind)`, recorded immediately before the bytes
+    /// are handed to the transport (`join_result`, `join_result_reference`,
+    /// `join_result_chunk`, `welcome_frame`).
+    pub(super) join_artifact_egress: StdMutex<Vec<(String, String, &'static str)>>,
 }
 
 #[cfg(test)]

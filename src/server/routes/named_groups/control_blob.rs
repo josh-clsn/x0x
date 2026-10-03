@@ -368,6 +368,26 @@ impl ControlBlobState {
         self.with_registry(|registry| registry.staged.len())
     }
 
+    /// ADR 0107 (review r2): test inspection — the staged JoinResult
+    /// references addressed to `recipient`.
+    #[cfg(test)]
+    pub(in crate::server) fn staged_join_result_refs_for_test(
+        &self,
+        recipient: &str,
+    ) -> Vec<ControlBlobRef> {
+        self.with_registry(|registry| {
+            registry
+                .staged
+                .keys()
+                .filter(|reference| {
+                    reference.kind == ControlBlobKind::JoinResult
+                        && reference.recipient == recipient
+                })
+                .cloned()
+                .collect()
+        })
+    }
+
     pub(super) fn cancel_attempt(&self, group_id: &str, recipient: &str, attempt_id: &str) {
         // Removes ROUTING only. The cancelled task's lease keeps its
         // declared bytes accounted until the task itself ends, so a
@@ -647,8 +667,20 @@ pub(in crate::server) async fn handle_control_blob_message(
             };
             let agent = Arc::clone(&state.agent);
             let recipient = *sender;
+            #[cfg(test)]
+            let witness_state = Arc::clone(state);
             tokio::spawn(async move {
                 let _permit = permit;
+                #[cfg(test)]
+                if reference.kind == ControlBlobKind::JoinResult {
+                    super::join_egress_test_point(
+                        &witness_state,
+                        &reference.recipient,
+                        &reference.group_id,
+                        "join_result_chunk",
+                    )
+                    .await;
+                }
                 let message = ControlBlobMessage::Chunk {
                     reference,
                     sequence,

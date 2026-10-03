@@ -35446,6 +35446,8 @@ async fn join_artifact_serving_refusal(
 /// copy, so a previously copied cache entry cannot outlive the member's
 /// eligibility.
 async fn purge_member_join_artifacts(state: &AppState, group_id: &str, member_hex: &str) {
+    #[cfg(test)]
+    join_egress_test_barrier::park(member_hex, "purge").await;
     let aliases: HashSet<String> = {
         let roster = state.named_groups.read().await;
         let mut aliases = HashSet::from([group_id.to_string()]);
@@ -35515,6 +35517,94 @@ async fn purge_join_artifacts_if_ineligible(state: &AppState, group_id: &str, me
         .is_some_and(JoinArtifactRefusal::is_definitive)
     {
         purge_member_join_artifacts(state, group_id, member_hex).await;
+    }
+}
+
+/// ADR 0107 (review r2): test-only, per-(recipient, point) barriers at the
+/// join-artifact egress boundary, so a test can hold an egress after its
+/// eligibility check and land a membership change before the bytes leave.
+/// Unarmed points pass straight through.
+#[cfg(test)]
+pub(in crate::server) mod join_egress_test_barrier {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    pub(in crate::server) struct Gate {
+        reached: AtomicBool,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl Gate {
+        pub(in crate::server) fn reached(&self) -> bool {
+            self.reached.load(Ordering::SeqCst)
+        }
+
+        /// Release every current and future waiter of this gate.
+        pub(in crate::server) fn release(&self) {
+            self.release.close();
+        }
+    }
+
+    type GateKey = (String, &'static str);
+
+    static GATES: LazyLock<Mutex<HashMap<GateKey, Arc<Gate>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Arm `point` for `recipient`; the returned guard disarms (and releases)
+    /// it on drop.
+    pub(in crate::server) fn arm(recipient: &str, point: &'static str) -> Armed {
+        let gate = Arc::new(Gate {
+            reached: AtomicBool::new(false),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        if let Ok(mut gates) = GATES.lock() {
+            gates.insert((recipient.to_string(), point), Arc::clone(&gate));
+        }
+        Armed {
+            key: (recipient.to_string(), point),
+            gate,
+        }
+    }
+
+    pub(in crate::server) struct Armed {
+        key: GateKey,
+        pub(in crate::server) gate: Arc<Gate>,
+    }
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            self.gate.release();
+            if let Ok(mut gates) = GATES.lock() {
+                gates.remove(&self.key);
+            }
+        }
+    }
+
+    pub(in crate::server) async fn park(recipient: &str, point: &'static str) {
+        let gate = GATES
+            .lock()
+            .ok()
+            .and_then(|gates| gates.get(&(recipient.to_string(), point)).cloned());
+        if let Some(gate) = gate {
+            gate.reached.store(true, Ordering::SeqCst);
+            let _ = gate.release.acquire().await;
+        }
+    }
+}
+
+/// ADR 0107 (review r2): the test-only egress witness, at the point where
+/// a join artifact's bytes are handed to the transport (after any barrier).
+#[cfg(test)]
+async fn join_egress_test_point(
+    state: &AppState,
+    recipient: &str,
+    group: &str,
+    kind: &'static str,
+) {
+    join_egress_test_barrier::park(recipient, kind).await;
+    if let Ok(mut egress) = state.named_group_test_recorders.join_artifact_egress.lock() {
+        egress.push((recipient.to_string(), group.to_string(), kind));
     }
 }
 
@@ -35817,6 +35907,16 @@ async fn handle_join_result_message_bound(
                 let guard_state = Arc::clone(state);
                 tokio::spawn(async move {
                     let _staging_permit = permit;
+                    #[cfg(test)]
+                    join_egress_test_barrier::park(&member_for_log, "join_result_stage").await;
+                    #[cfg(test)]
+                    join_egress_test_point(
+                        &guard_state,
+                        &member_for_log,
+                        &group_id_for_task,
+                        "join_result_reference",
+                    )
+                    .await;
                     let outcome = control_blob::send_reference(
                         &control_blobs,
                         &agent,
@@ -35838,6 +35938,8 @@ async fn handle_join_result_message_bound(
                 });
                 return;
             }
+            #[cfg(test)]
+            join_egress_test_point(state, &member_agent_id, &group_id, "join_result").await;
             if let Err(e) = state
                 .agent
                 .send_direct_with_config(sender, payload, direct_message_send_config())
@@ -36834,6 +36936,16 @@ pub(in crate::server) fn decode_welcome_blob_message(
     Some((&message.sender, payload))
 }
 
+/// The Welcome DM listener's dispatch for one verified frame (the single
+/// listener loop in `server::run` awaits this).
+pub(in crate::server) async fn dispatch_welcome_blob_message(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    msg: WelcomeBlobMessage,
+) {
+    handle_welcome_blob_message(state, sender, msg).await;
+}
+
 pub(in crate::server) async fn handle_welcome_blob_message(
     state: &Arc<AppState>,
     sender: &AgentId,
@@ -36913,6 +37025,38 @@ async fn handle_welcome_fetch_request(
     group_id: String,
     welcome_id: String,
 ) {
+    let send_state = Arc::clone(state);
+    let send_recipient = *sender;
+    handle_welcome_fetch_request_via(
+        state,
+        sender,
+        group_id,
+        welcome_id,
+        move |msg: WelcomeBlobMessage| {
+            let state = Arc::clone(&send_state);
+            async move {
+                send_welcome_blob_message(&state, &send_recipient, &msg)
+                    .await
+                    .map(|_| ())
+            }
+        },
+    )
+    .await;
+}
+
+/// [`handle_welcome_fetch_request`] with an injectable frame transport
+/// (production: [`send_welcome_blob_message`]; tests carry the frames to an
+/// in-process joiner's real receive path).
+async fn handle_welcome_fetch_request_via<S, F>(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    group_id: String,
+    welcome_id: String,
+    transport: S,
+) where
+    S: FnMut(WelcomeBlobMessage) -> F + Send + 'static,
+    F: std::future::Future<Output = std::result::Result<(), String>> + Send + 'static,
+{
     let sender_hex = hex::encode(sender.as_bytes());
     // ADR 0107: the eligibility check, the staged-Welcome selection and the
     // stream registration are linearized with membership mutations under the
@@ -36979,7 +37123,8 @@ async fn handle_welcome_fetch_request(
     let recipient = *sender;
     let stream_id = welcome_id.clone();
     replace_welcome_stream(state, &welcome_id, async move {
-        stream_welcome_blob(&stream_state, &recipient, &stream_id, pending).await;
+        stream_welcome_blob_guarded(&stream_state, &recipient, &stream_id, pending, transport)
+            .await;
     })
     .await;
 }
@@ -37002,20 +37147,28 @@ where
     streams.insert(welcome_id.to_string(), tokio::spawn(stream));
 }
 
-async fn stream_welcome_blob(
+/// ADR 0107: stream one staged Welcome through `transport`, guarding every
+/// frame. The transport future is built per frame but only polled after the
+/// frame's eligibility check passes, so no frame leaves an ineligible
+/// recipient's stream.
+async fn stream_welcome_blob_guarded<S, F>(
     state: &Arc<AppState>,
     recipient: &AgentId,
     welcome_id: &str,
     pending: PendingWelcome,
-) {
-    let send_state = Arc::clone(state);
-    let send_recipient = *recipient;
-    let send_group = pending.group_id.clone();
+    mut transport: S,
+) where
+    S: FnMut(WelcomeBlobMessage) -> F + Send + 'static,
+    F: std::future::Future<Output = std::result::Result<(), String>> + Send + 'static,
+{
+    let check_state = Arc::clone(state);
+    let check_group = pending.group_id.clone();
     let recipient_hex = hex::encode(recipient.as_bytes());
     stream_welcome_blob_via(state, recipient, welcome_id, pending, move |msg| {
-        let state = Arc::clone(&send_state);
-        let group_id = send_group.clone();
+        let state = Arc::clone(&check_state);
+        let group_id = check_group.clone();
         let recipient_hex = recipient_hex.clone();
+        let send = transport(msg);
         async move {
             // ADR 0107: the stream holds a COPY of the staged Welcome, so it
             // re-checks eligibility before every frame. A certificate that
@@ -37029,9 +37182,9 @@ async fn stream_welcome_blob(
                     refusal.reason()
                 ));
             }
-            send_welcome_blob_message(&state, &send_recipient, &msg)
-                .await
-                .map(|_| ())
+            #[cfg(test)]
+            join_egress_test_point(&state, &recipient_hex, &group_id, "welcome_frame").await;
+            send.await
         }
     })
     .await;

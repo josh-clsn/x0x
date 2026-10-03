@@ -263,9 +263,96 @@ pub(super) async fn serve_welcome(
         .is_some_and(|streams| streams.contains_key(welcome_id))
 }
 
-/// In-process stand-in for the Welcome blob pull: inline the staged bytes
-/// the authority's Welcome path just agreed to stream.
-async fn with_inline_welcome(authority: &AppState, result: JoinResultMessage) -> JoinResultMessage {
+/// Pull a staged Welcome through the REAL transfer callbacks: the joiner's
+/// production receive path (`fetch_treekem_welcome_via`) sends its
+/// FetchRequest to the authority's production fetch handler, whose guarded
+/// stream carries every Offer, Chunk and Complete frame to the joiner's real
+/// handlers (and each ChunkAck back) in process.
+async fn pull_welcome_through_guarded_stream(
+    authority: &Arc<AppState>,
+    joiner: &Arc<AppState>,
+    stable: &str,
+    welcome_ref: &super::super::WelcomeRef,
+) -> anyhow::Result<Vec<u8>> {
+    let owner = Arc::clone(authority);
+    let receiver = Arc::clone(joiner);
+    let owner_id = authority.agent.agent_id();
+    let joiner_id = joiner.agent.agent_id();
+    let pull =
+        super::super::fetch_treekem_welcome_via(joiner, stable, welcome_ref, move |_, request| {
+            let owner = Arc::clone(&owner);
+            let receiver = Arc::clone(&receiver);
+            async move {
+                let WelcomeBlobMessage::FetchRequest {
+                    group_id,
+                    welcome_id,
+                } = request
+                else {
+                    return Ok(());
+                };
+                let transport = {
+                    let owner = Arc::clone(&owner);
+                    move |msg: WelcomeBlobMessage| {
+                        let owner = Arc::clone(&owner);
+                        let receiver = Arc::clone(&receiver);
+                        async move {
+                            match msg {
+                                WelcomeBlobMessage::Chunk {
+                                    welcome_id,
+                                    sequence,
+                                    data,
+                                } => {
+                                    super::super::handle_welcome_blob_chunk(
+                                        &receiver,
+                                        &owner_id,
+                                        welcome_id.clone(),
+                                        sequence,
+                                        data,
+                                    )
+                                    .await;
+                                    super::super::handle_welcome_blob_message(
+                                        &owner,
+                                        &joiner_id,
+                                        WelcomeBlobMessage::ChunkAck {
+                                            welcome_id,
+                                            sequence,
+                                        },
+                                    )
+                                    .await;
+                                }
+                                other => {
+                                    super::super::handle_welcome_blob_message(
+                                        &receiver, &owner_id, other,
+                                    )
+                                    .await;
+                                }
+                            }
+                            Ok(())
+                        }
+                    }
+                };
+                super::super::handle_welcome_fetch_request_via(
+                    &owner, &joiner_id, group_id, welcome_id, transport,
+                )
+                .await;
+                Ok(())
+            }
+        });
+    tokio::time::timeout(Duration::from_secs(30), pull)
+        .await
+        .map_err(|_| anyhow::anyhow!("the guarded Welcome transfer never completed"))?
+        .map_err(|e| anyhow::anyhow!("Welcome pull failed: {e}"))
+}
+
+/// Replace the served result's Welcome reference with the bytes the joiner
+/// pulled through the real guarded transfer (the join-result apply path's
+/// own pull uses the direct-message transport, which fails in process).
+async fn with_pulled_welcome(
+    authority: &Arc<AppState>,
+    joiner: &Arc<AppState>,
+    stable: &str,
+    result: JoinResultMessage,
+) -> JoinResultMessage {
     match result {
         JoinResultMessage::Result {
             mut event,
@@ -281,16 +368,16 @@ async fn with_inline_welcome(authority: &AppState, result: JoinResultMessage) ->
             } = event.as_mut()
             {
                 if let Some(reference) = welcome_ref.take() {
-                    let bytes = authority
-                        .pending_welcomes
-                        .read()
-                        .await
-                        .get(&reference.welcome_id)
-                        .map(|w| w.bytes.clone());
-                    match bytes {
-                        Some(bytes) => *treekem_welcome_b64 = Some(BASE64.encode(bytes)),
-                        None => *welcome_ref = Some(reference),
-                    }
+                    let bytes =
+                        pull_welcome_through_guarded_stream(authority, joiner, stable, &reference)
+                            .await
+                            .expect("the guarded Welcome transfer delivers the original Welcome");
+                    assert_eq!(
+                        super::super::welcome_id_for_bytes(&bytes),
+                        reference.welcome_id,
+                        "the exact staged Welcome arrived"
+                    );
+                    *treekem_welcome_b64 = Some(BASE64.encode(bytes));
                 }
             }
             JoinResultMessage::Result {
@@ -606,7 +693,7 @@ async fn s8a_1150_carry_remnant_rearms_and_installs_the_original_welcome() -> an
         serve_welcome(&s.authority, &s.j2, &s.stable, &welcome_id).await,
         "the authority streams the original Welcome"
     );
-    let served = with_inline_welcome(&s.authority, served).await;
+    let served = with_pulled_welcome(&s.authority, &s.j2, &s.stable, served).await;
     deliver(&s.j2, &s.authority_id, served, &new_attempt).await;
     assert_eq!(local_state(&s.j2, &s.group_key).await, "active");
     assert!(
@@ -694,7 +781,7 @@ async fn s8a_1150_rearm_recovers_after_joiner_restart_without_stored_secrets() -
     .expect("the original result is served");
     let welcome_id = welcome_id_of(&s.j2_add).expect("welcome ref");
     assert!(serve_welcome(&s.authority, &restarted, &s.stable, &welcome_id).await);
-    let served = with_inline_welcome(&s.authority, served).await;
+    let served = with_pulled_welcome(&s.authority, &restarted, &s.stable, served).await;
     deliver(&restarted, &s.authority_id, served, &new_attempt).await;
     assert_eq!(local_state(&restarted, &s.group_key).await, "active");
     assert!(
@@ -763,7 +850,7 @@ async fn s8a_1150_rearm_rejects_stale_attempts_and_sends_no_volley() -> anyhow::
     .expect("served");
     let welcome_id = welcome_id_of(&s.j2_add).expect("welcome ref");
     assert!(serve_welcome(&s.authority, &s.j2, &s.stable, &welcome_id).await);
-    let served = with_inline_welcome(&s.authority, served).await;
+    let served = with_pulled_welcome(&s.authority, &s.j2, &s.stable, served).await;
     // The OLD (finalized) attempt is stale: nothing applies.
     deliver(&s.j2, &s.authority_id, served.clone(), &s.j2_attempt).await;
     assert!(!keyed(&s.j2, &s.group_key).await, "stale attempt applied");
@@ -808,7 +895,7 @@ async fn s8a_1150_disabling_rearm_reproduces_the_keyless_failure() -> anyhow::Re
         .expect("the eligible device is still served its original result");
     let welcome_id = welcome_id_of(&s.j2_add).expect("welcome ref");
     assert!(serve_welcome(&s.authority, &s.j2, &s.stable, &welcome_id).await);
-    let served = with_inline_welcome(&s.authority, served).await;
+    let served = with_pulled_welcome(&s.authority, &s.j2, &s.stable, served).await;
     deliver(&s.j2, &s.authority_id, served, &new_attempt).await;
     assert_eq!(local_state(&s.j2, &s.group_key).await, "active");
     assert!(
@@ -861,7 +948,7 @@ async fn s8a_1150_rearm_restores_the_original_seat_and_post_seal_commits_need_ca
     .expect("the original result is served");
     let welcome_id = welcome_id_of(&s.j2_add).expect("welcome ref");
     assert!(serve_welcome(&s.authority, &s.j2, &s.stable, &welcome_id).await);
-    let served = with_inline_welcome(&s.authority, served).await;
+    let served = with_pulled_welcome(&s.authority, &s.j2, &s.stable, served).await;
     deliver(&s.j2, &s.authority_id, served, &new_attempt).await;
     assert_eq!(local_state(&s.j2, &s.group_key).await, "active");
     assert!(keyed(&s.j2, &s.group_key).await);
@@ -919,7 +1006,7 @@ async fn owner_remove_and_reinvite_restores_keys(s: &Fixture, ctx: &str) -> anyh
         serve_welcome(&s.authority, &s.j2, &s.stable, &welcome_id).await,
         "[{ctx}] the re-admission Welcome is streamed"
     );
-    let served = with_inline_welcome(&s.authority, served).await;
+    let served = with_pulled_welcome(&s.authority, &s.j2, &s.stable, served).await;
     deliver(&s.j2, &s.authority_id, served, &attempt).await;
     anyhow::ensure!(
         local_state(&s.j2, &s.group_key).await == "active" && keyed(&s.j2, &s.group_key).await,
@@ -1209,6 +1296,34 @@ async fn announce_valid_cert(authority: &AppState, cert: x0x::identity::AgentCer
         );
 }
 
+/// Put the authority's ORIGINAL staged result and Welcome back (a definitive
+/// refusal purges both), and prove they are present.
+async fn restore_staged_artifacts(
+    authority: &AppState,
+    stable: &str,
+    member_hex: &str,
+    result: &super::super::PendingJoinResult,
+    welcome_id: &str,
+    welcome: &super::super::PendingWelcome,
+) {
+    authority
+        .pending_join_results
+        .write()
+        .await
+        .insert(join_result_key(stable, member_hex), result.clone());
+    authority
+        .pending_welcomes
+        .write()
+        .await
+        .insert(welcome_id.to_string(), welcome.clone());
+    assert!(staged(authority, stable, member_hex).await.is_some());
+    assert!(authority
+        .pending_welcomes
+        .read()
+        .await
+        .contains_key(welcome_id));
+}
+
 /// WHY (ADR 0107 serving guard): both serving paths serve a requester only
 /// while it is Active, not banned and certificate-valid on the CURRENT
 /// committed roster. The roster is mutated directly here (no route, so no
@@ -1285,15 +1400,41 @@ async fn s8a_serving_guard_refuses_ineligible_requesters_on_both_paths() -> anyh
             .await
             .remove(&s.j2.agent.agent_id());
     };
+    // Each guard is exercised on its OWN intact caches: a definitive refusal
+    // on the result path purges the Welcome too, so the caches are restored
+    // (and asserted present) before each path — the Welcome refusal is the
+    // Welcome guard's, never a missing cache entry.
     let served = |ctx: String| {
         let s = &s;
         let welcome_id = welcome_id.clone();
+        let result = result.clone();
+        let welcome = welcome.clone();
+        let j2_hex = j2_hex.clone();
         async move {
-            let result = serve_result(&s.authority, &s.j2, &s.stable, &s.j2_attempt, Some(s.base))
-                .await
-                .is_some();
-            let welcome = serve_welcome(&s.authority, &s.j2, &s.stable, &welcome_id).await;
-            (ctx, result, welcome)
+            restore_staged_artifacts(
+                &s.authority,
+                &s.stable,
+                &j2_hex,
+                &result,
+                &welcome_id,
+                &welcome,
+            )
+            .await;
+            let result_served =
+                serve_result(&s.authority, &s.j2, &s.stable, &s.j2_attempt, Some(s.base))
+                    .await
+                    .is_some();
+            restore_staged_artifacts(
+                &s.authority,
+                &s.stable,
+                &j2_hex,
+                &result,
+                &welcome_id,
+                &welcome,
+            )
+            .await;
+            let welcome_served = serve_welcome(&s.authority, &s.j2, &s.stable, &welcome_id).await;
+            (ctx, result_served, welcome_served)
         }
     };
 
@@ -1554,7 +1695,7 @@ async fn s8a_serving_non_regression_treekem_first_joins_and_adr0106_carry() -> a
         );
         let welcome_id = welcome_id_of(add).expect("welcome ref");
         assert!(serve_welcome(&s.authority, joiner, &s.stable, &welcome_id).await);
-        let served = with_inline_welcome(&s.authority, served).await;
+        let served = with_pulled_welcome(&s.authority, joiner, &s.stable, served).await;
         deliver(joiner, &s.authority_id, served, attempt).await;
         assert_eq!(local_state(joiner, &s.group_key).await, "active");
         assert!(keyed(joiner, &s.group_key).await);
@@ -1562,82 +1703,705 @@ async fn s8a_serving_non_regression_treekem_first_joins_and_adr0106_carry() -> a
     Ok(())
 }
 
+struct GssFixture {
+    dir: std::path::PathBuf,
+    authority: Arc<AppState>,
+    group_key: String,
+    stable: String,
+    joiner: Arc<AppState>,
+    attempt: String,
+}
+
+/// A GSS-plane group (MlsEncrypted, not Hidden) on an owned authority, with
+/// one device joined through the REAL route and sealed through the
+/// authority's REAL `MemberJoined` apply (its join result staged, its
+/// secure share published).
+async fn build_gss(dir: &std::path::Path, owner_certified: bool) -> anyhow::Result<GssFixture> {
+    let authority = super::super::super::home::tests::owned_state(dir, OWNER_SEED).await?;
+    let owner_id = x0x::identity::UserKeypair::from_seed(&OWNER_SEED)?.user_id();
+    let policy = x0x::groups::GroupPolicy {
+        discoverability: x0x::groups::GroupDiscoverability::ListedToContacts,
+        admission: if owner_certified {
+            x0x::groups::GroupAdmission::OwnerCertified(owner_id)
+        } else {
+            x0x::groups::GroupAdmission::InviteOnly
+        },
+        confidentiality: x0x::groups::GroupConfidentiality::MlsEncrypted,
+        read_access: x0x::groups::GroupReadAccess::MembersOnly,
+        write_access: x0x::groups::GroupWriteAccess::MembersOnly,
+    };
+    let created = create_named_group(
+        State(Arc::clone(&authority)),
+        Json(CreateGroupRequest {
+            name: "gss".to_string(),
+            description: String::new(),
+            display_name: None,
+            preset: None,
+            policy: Some(policy),
+        }),
+    )
+    .await
+    .into_response();
+    let status = created.status();
+    let body: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(created.into_body(), usize::MAX).await?)?;
+    anyhow::ensure!(status == StatusCode::CREATED, "create: {status} {body}");
+    let group_key = body["group_id"].as_str().unwrap_or_default().to_string();
+    let stable = {
+        let groups = authority.named_groups.read().await;
+        let info = groups
+            .get(&group_key)
+            .ok_or_else(|| anyhow::anyhow!("created group"))?;
+        anyhow::ensure!(info.secure_plane == x0x::mls::SecureGroupPlane::Gss);
+        info.stable_group_id().to_string()
+    };
+    let joiner = device(dir, "g", x0x::identity::AgentKeypair::generate()?).await?;
+    let link = mint_for(&authority, &group_key, &joiner).await?;
+    let (status, body) = join(
+        &joiner,
+        link,
+        owner_certified.then(|| owner_pin_of(&authority)),
+    )
+    .await?;
+    anyhow::ensure!(status == StatusCode::OK, "[oc={owner_certified}] {body}");
+    let Some((attempt, Some(joined))) = attempt_of(&joiner, &stable) else {
+        anyhow::bail!("stored MemberJoined");
+    };
+    anyhow::ensure!(
+        apply_named_group_metadata_event(&authority, joined, joiner.agent.agent_id(), true, None)
+            .await
+            .accepted,
+        "[oc={owner_certified}] the authority seals the GSS add"
+    );
+    anyhow::ensure!(
+        staged(&authority, &stable, &hex_of(&joiner))
+            .await
+            .is_some(),
+        "GSS result staged"
+    );
+    Ok(GssFixture {
+        dir: dir.to_path_buf(),
+        authority,
+        group_key,
+        stable,
+        joiner,
+        attempt,
+    })
+}
+
+/// The `SecureShareDelivered` the authority published for `recipient`.
+fn published_secure_share(
+    authority: &AppState,
+    recipient: &str,
+) -> Option<NamedGroupMetadataEvent> {
+    authority
+        .named_group_test_recorders
+        .publish_bytes
+        .lock()
+        .expect("publish witness")
+        .iter()
+        .filter_map(|(_, bytes)| serde_json::from_slice::<NamedGroupMetadataEvent>(bytes).ok())
+        .find(|event| {
+            matches!(
+                event,
+                NamedGroupMetadataEvent::SecureShareDelivered { recipient: to, .. } if to == recipient
+            )
+        })
+}
+
 /// WHY (ADR 0107 serving non-regression, GSS): GSS-plane first joins are
 /// served too — an OwnerCertified group whose joiner is certified inline with
-/// no announce, and an ordinary invite-only group that needs no certificate.
+/// no announce, and an ordinary invite-only group that needs no certificate —
+/// and the joiner ends with USABLE key material: the served result seats it
+/// and the authority's sealed secure share installs the group's current
+/// secret.
 #[tokio::test]
 async fn s8a_serving_non_regression_gss_first_joins() -> anyhow::Result<()> {
     for owner_certified in [true, false] {
         let dir = tempfile::tempdir()?;
-        let authority =
-            super::super::super::home::tests::owned_state(dir.path(), OWNER_SEED).await?;
-        let owner = owner_pin_of(&authority);
-        let owner_id = x0x::identity::UserKeypair::from_seed(&OWNER_SEED)?.user_id();
-        let policy = x0x::groups::GroupPolicy {
-            discoverability: x0x::groups::GroupDiscoverability::ListedToContacts,
-            admission: if owner_certified {
-                x0x::groups::GroupAdmission::OwnerCertified(owner_id)
-            } else {
-                x0x::groups::GroupAdmission::InviteOnly
-            },
-            confidentiality: x0x::groups::GroupConfidentiality::MlsEncrypted,
-            read_access: x0x::groups::GroupReadAccess::MembersOnly,
-            write_access: x0x::groups::GroupWriteAccess::MembersOnly,
-        };
-        let created = create_named_group(
-            State(Arc::clone(&authority)),
-            Json(CreateGroupRequest {
-                name: "gss".to_string(),
-                description: String::new(),
-                display_name: None,
-                preset: None,
-                policy: Some(policy),
-            }),
-        )
-        .await
-        .into_response();
-        let status = created.status();
-        let body: serde_json::Value =
-            serde_json::from_slice(&axum::body::to_bytes(created.into_body(), usize::MAX).await?)?;
-        assert_eq!(status, StatusCode::CREATED, "{body}");
-        let group_key = body["group_id"].as_str().unwrap_or_default().to_string();
-        let stable = {
-            let groups = authority.named_groups.read().await;
-            let info = groups.get(&group_key).expect("created group");
-            assert_eq!(info.secure_plane, x0x::mls::SecureGroupPlane::Gss);
-            info.stable_group_id().to_string()
-        };
-        let joiner = device(dir.path(), "g", x0x::identity::AgentKeypair::generate()?).await?;
-        let link = mint_for(&authority, &group_key, &joiner).await?;
-        let (status, body) = join(&joiner, link, owner_certified.then(|| owner.clone())).await?;
-        assert_eq!(status, StatusCode::OK, "[oc={owner_certified}] {body}");
-        let (attempt, Some(joined)) = attempt_of(&joiner, &stable).expect("attempt") else {
-            panic!("stored MemberJoined");
-        };
-        assert!(
-            apply_named_group_metadata_event(
-                &authority,
-                joined,
-                joiner.agent.agent_id(),
-                true,
-                None
-            )
-            .await
-            .accepted,
-            "[oc={owner_certified}] the authority seals the GSS add"
-        );
-        let from = remnant_revision(&joiner, &group_key).await;
-        let served = serve_result(&authority, &joiner, &stable, &attempt, from)
+        let g = build_gss(dir.path(), owner_certified).await?;
+        let authority_id = g.authority.agent.agent_id();
+        let from = remnant_revision(&g.joiner, &g.group_key).await;
+        let served = serve_result(&g.authority, &g.joiner, &g.stable, &g.attempt, from)
             .await
             .unwrap_or_else(|| {
                 panic!("[oc={owner_certified}] an eligible GSS first join is served")
             });
-        deliver(&joiner, &authority.agent.agent_id(), served, &attempt).await;
+        deliver(&g.joiner, &authority_id, served, &g.attempt).await;
         assert_eq!(
-            local_state(&joiner, &group_key).await,
+            local_state(&g.joiner, &g.group_key).await,
             "active",
             "[oc={owner_certified}] the served result seats the joiner"
         );
+        let share = published_secure_share(&g.authority, &hex_of(&g.joiner))
+            .unwrap_or_else(|| panic!("[oc={owner_certified}] the authority sealed a share"));
+        assert!(
+            apply_named_group_metadata_event(&g.joiner, share, authority_id, true, None)
+                .await
+                .accepted,
+            "[oc={owner_certified}] the joiner opens the sealed share"
+        );
+        let (authority_secret, authority_epoch) = {
+            let groups = g.authority.named_groups.read().await;
+            let info = groups.get(&g.group_key).expect("authority group");
+            (info.shared_secret.clone(), info.secret_epoch)
+        };
+        let (joiner_secret, joiner_epoch) = {
+            let groups = g.joiner.named_groups.read().await;
+            let info = groups.get(&g.group_key).expect("joiner group");
+            (info.shared_secret.clone(), info.secret_epoch)
+        };
+        assert!(authority_secret.is_some());
+        assert_eq!(
+            (joiner_secret, joiner_epoch),
+            (authority_secret, authority_epoch),
+            "[oc={owner_certified}] the joiner holds the group's current secret"
+        );
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Review r2 (Codex, PR #1190): every remaining egress of a join artifact —
+// control-blob staging and chunks, the inline result send, Welcome frames —
+// is linearized with membership mutations; purge runs inside the mutation's
+// critical section on every path (API, apply, replay); and the Welcome
+// listener never blocks on a group lock.
+// ---------------------------------------------------------------------------
+
+type BlobRef = super::super::control_blob::ControlBlobRef;
+
+fn egress_count(state: &AppState, recipient: &str, kind: &str) -> usize {
+    state
+        .named_group_test_recorders
+        .join_artifact_egress
+        .lock()
+        .expect("egress witness")
+        .iter()
+        .filter(|(to, _, k)| to == recipient && *k == kind)
+        .count()
+}
+
+fn clear_egress(state: &AppState) {
+    state
+        .named_group_test_recorders
+        .join_artifact_egress
+        .lock()
+        .expect("egress witness")
+        .clear();
+}
+
+/// Wait (bounded) for `kind` egress to `recipient`; false when none happens.
+async fn egress_happens(state: &AppState, recipient: &str, kind: &str, within: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + within;
+    while tokio::time::Instant::now() < deadline {
+        if egress_count(state, recipient, kind) > 0 {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    egress_count(state, recipient, kind) > 0
+}
+
+async fn wait_reached(gate: &super::super::join_egress_test_barrier::Gate, what: &str) {
+    let reached = tokio::time::timeout(Duration::from_secs(10), async {
+        while !gate.reached() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(reached.is_ok(), "{what}: the barrier was never reached");
+}
+
+/// The eligible J2's oversized join result, staged as a control blob by the
+/// production FetchRequest arm.
+async fn staged_join_result_blob(s: &Fixture) -> anyhow::Result<BlobRef> {
+    anyhow::ensure!(
+        serve_result(&s.authority, &s.j2, &s.stable, &s.j2_attempt, Some(s.base))
+            .await
+            .is_some(),
+        "the eligible device is served"
+    );
+    let j2_hex = hex_of(&s.j2);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(reference) = s
+                .authority
+                .control_blobs
+                .staged_join_result_refs_for_test(&j2_hex)
+                .into_iter()
+                .next()
+            {
+                return reference;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("the oversized result was never staged"))
+}
+
+async fn fetch_chunk(s: &Fixture, reference: &BlobRef) {
+    super::super::control_blob::handle_control_blob_message(
+        &s.authority,
+        &s.j2.agent.agent_id(),
+        true,
+        super::super::control_blob::ControlBlobMessage::Fetch {
+            reference: reference.clone(),
+            sequence: 0,
+        },
+    )
+    .await;
+}
+
+async fn ban_via_route(authority: &Arc<AppState>, group_key: &str, member_hex: &str) -> StatusCode {
+    ban_group_member(
+        State(Arc::clone(authority)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path((group_key.to_string(), member_hex.to_string())),
+    )
+    .await
+    .into_response()
+    .status()
+}
+
+/// WHY (review r2 P1-1): a staged JoinResult control blob is a copy of the
+/// result. Chunk egress must pass the same current-roster guard as the
+/// FetchRequest arm: a recipient banned, or whose roster certificate has
+/// expired, since the blob was staged gets no chunk.
+#[tokio::test]
+async fn s8a_r2_join_result_chunks_refuse_ineligible_recipients() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    let j2_hex = hex_of(&s.j2);
+    let reference = staged_join_result_blob(&s).await?;
+    clear_egress(&s.authority);
+    fetch_chunk(&s, &reference).await;
+    assert!(
+        egress_happens(
+            &s.authority,
+            &j2_hex,
+            "join_result_chunk",
+            Duration::from_secs(5)
+        )
+        .await,
+        "control: an eligible recipient pulls its chunk"
+    );
+    let roster = s
+        .authority
+        .named_groups
+        .read()
+        .await
+        .get(&s.group_key)
+        .cloned()
+        .expect("authority group");
+    let owner_kp = x0x::identity::UserKeypair::from_seed(&OWNER_SEED)?;
+    let mut leaks = Vec::new();
+    for case in ["banned", "certificate_expired"] {
+        s.authority
+            .named_groups
+            .write()
+            .await
+            .insert(s.group_key.clone(), roster.clone());
+        {
+            let mut groups = s.authority.named_groups.write().await;
+            let info = groups.get_mut(&s.group_key).expect("authority group");
+            if case == "banned" {
+                info.ban_member(&j2_hex, None);
+            } else if let Some(seat) = info.members_v2.get_mut(&j2_hex) {
+                let past = x0x::groups::owner_cert::restore_clock_now() - 30 * 86_400;
+                seat.certificate = Some(x0x::identity::AgentCertificate::issue_with_expiry(
+                    &owner_kp,
+                    &keypair(&s.j2_kp)?,
+                    Some(past),
+                )?);
+            }
+        }
+        // The roster changed directly (no route, no purge): only the chunk
+        // guard stands between the copied blob and the recipient.
+        assert!(!s
+            .authority
+            .control_blobs
+            .staged_join_result_refs_for_test(&j2_hex)
+            .is_empty());
+        clear_egress(&s.authority);
+        fetch_chunk(&s, &reference).await;
+        if egress_happens(
+            &s.authority,
+            &j2_hex,
+            "join_result_chunk",
+            Duration::from_secs(1),
+        )
+        .await
+        {
+            leaks.push(case);
+        }
+    }
+    assert!(
+        leaks.is_empty(),
+        "a staged join-result blob was chunked to an ineligible recipient: {leaks:?}"
+    );
+    Ok(())
+}
+
+/// WHY (review r2 P1-1): an owner ban drops the member's staged JoinResult
+/// control blobs too, not only the result and Welcome caches.
+#[tokio::test]
+async fn s8a_r2_owner_ban_purges_staged_join_result_blobs() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    let j2_hex = hex_of(&s.j2);
+    staged_join_result_blob(&s).await?;
+    assert!(ban_via_route(&s.authority, &s.group_key, &j2_hex)
+        .await
+        .is_success());
+    assert!(
+        s.authority
+            .control_blobs
+            .staged_join_result_refs_for_test(&j2_hex)
+            .is_empty(),
+        "the banned member's staged join-result blob is purged"
+    );
+    Ok(())
+}
+
+/// WHY (review r2 P1-1): the bounded staging of an oversized result runs
+/// after the FetchRequest arm's check. A ban that commits while the staging
+/// is pending must stop it: no blob is (re)created and no reference leaves.
+#[tokio::test]
+async fn s8a_r2_delayed_join_result_staging_cannot_recreate_purged_blobs() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    let j2_hex = hex_of(&s.j2);
+    let armed = super::super::join_egress_test_barrier::arm(&j2_hex, "join_result_stage");
+    clear_egress(&s.authority);
+    assert!(
+        serve_result(&s.authority, &s.j2, &s.stable, &s.j2_attempt, Some(s.base))
+            .await
+            .is_some(),
+        "the eligible device's fetch is accepted"
+    );
+    wait_reached(&armed.gate, "staging").await;
+    assert!(ban_via_route(&s.authority, &s.group_key, &j2_hex)
+        .await
+        .is_success());
+    drop(armed);
+    let referenced = egress_happens(
+        &s.authority,
+        &j2_hex,
+        "join_result_reference",
+        Duration::from_secs(2),
+    )
+    .await;
+    let staged = s
+        .authority
+        .control_blobs
+        .staged_join_result_refs_for_test(&j2_hex);
+    assert!(
+        !referenced && staged.is_empty(),
+        "a staging that resumed after the ban recreated the blob (referenced={referenced}, staged={})",
+        staged.len()
+    );
+    Ok(())
+}
+
+/// WHY (review r2 P1-1/P1-2): a chunk send that passed its check when the
+/// ban committed must not deliver: the ban cancels the outstanding send.
+#[tokio::test]
+async fn s8a_r2_ban_racing_join_result_chunk_egress_sends_nothing() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    let j2_hex = hex_of(&s.j2);
+    let reference = staged_join_result_blob(&s).await?;
+    let armed = super::super::join_egress_test_barrier::arm(&j2_hex, "join_result_chunk");
+    clear_egress(&s.authority);
+    fetch_chunk(&s, &reference).await;
+    wait_reached(&armed.gate, "chunk egress").await;
+    assert!(ban_via_route(&s.authority, &s.group_key, &j2_hex)
+        .await
+        .is_success());
+    drop(armed);
+    assert!(
+        !egress_happens(
+            &s.authority,
+            &j2_hex,
+            "join_result_chunk",
+            Duration::from_secs(2)
+        )
+        .await,
+        "a chunk left after the ban committed"
+    );
+    Ok(())
+}
+
+/// WHY (review r2 P1-2): the inline join-result send happens after the
+/// arm's eligibility check. A ban that commits in between must cancel it.
+#[tokio::test]
+async fn s8a_r2_ban_racing_inline_join_result_egress_sends_nothing() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    let g_hex = hex_of(&g.joiner);
+    let from = remnant_revision(&g.joiner, &g.group_key).await;
+    let armed = super::super::join_egress_test_barrier::arm(&g_hex, "join_result");
+    clear_egress(&g.authority);
+    let serve = {
+        let authority = Arc::clone(&g.authority);
+        let joiner = Arc::clone(&g.joiner);
+        let stable = g.stable.clone();
+        let attempt = g.attempt.clone();
+        tokio::spawn(
+            async move { serve_result(&authority, &joiner, &stable, &attempt, from).await },
+        )
+    };
+    wait_reached(&armed.gate, "inline result egress").await;
+    assert!(ban_via_route(&g.authority, &g.group_key, &g_hex)
+        .await
+        .is_success());
+    drop(armed);
+    let _ = tokio::time::timeout(Duration::from_secs(10), serve).await;
+    assert!(
+        !egress_happens(&g.authority, &g_hex, "join_result", Duration::from_secs(1)).await,
+        "the join result left after the ban committed"
+    );
+    Ok(())
+}
+
+/// WHY (review r2 P1-2): a Welcome frame that passed its check must not leave
+/// once a ban commits — before r2 the ban's purge ran only after the
+/// mutation released its lock, so the frame could leave in between.
+#[tokio::test]
+async fn s8a_r2_ban_racing_welcome_frame_egress_sends_nothing() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    let j2_hex = hex_of(&s.j2);
+    let welcome_id = welcome_id_of(&s.j2_add).expect("welcome ref");
+    let frame = super::super::join_egress_test_barrier::arm(&j2_hex, "welcome_frame");
+    let purge = super::super::join_egress_test_barrier::arm(&j2_hex, "purge");
+    clear_egress(&s.authority);
+    assert!(serve_welcome(&s.authority, &s.j2, &s.stable, &welcome_id).await);
+    wait_reached(&frame.gate, "Welcome frame egress").await;
+    let ban = {
+        let authority = Arc::clone(&s.authority);
+        let group_key = s.group_key.clone();
+        let j2_hex = j2_hex.clone();
+        tokio::spawn(async move { ban_via_route(&authority, &group_key, &j2_hex).await })
+    };
+    // The ban has committed once it reaches its purge (or finished).
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !(ban.is_finished() || purge.gate.reached()) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    drop(frame);
+    let leaked = egress_happens(
+        &s.authority,
+        &j2_hex,
+        "welcome_frame",
+        Duration::from_millis(500),
+    )
+    .await;
+    drop(purge);
+    assert!(ban.await?.is_success());
+    assert!(!leaked, "a Welcome frame left after the ban committed");
+    Ok(())
+}
+
+/// WHY (review r2 P2-3): the removal's purge must belong to the removal's
+/// critical section. A purge that runs after the lock is released can erase
+/// the artifacts of a LEGITIMATE re-admission that committed in between.
+#[tokio::test]
+async fn s8a_r2_removal_purge_cannot_erase_a_concurrent_readmission() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    let j2_hex = hex_of(&s.j2);
+    // J2's first attempt ends; it then holds a fresh invite and its signed
+    // MemberJoined, ready to be re-admitted after the removal.
+    super::super::finalize_join_attempt(
+        &s.j2,
+        &s.group_key,
+        &s.stable,
+        &j2_hex,
+        &s.j2_attempt,
+        super::super::JoinAttemptOutcome::TimedOut,
+        super::super::JoinFinalizeGuard::Unlocked,
+    )
+    .await;
+    let link = mint_for(&s.authority, &s.group_key, &s.j2).await?;
+    let (status, body) = join(&s.j2, link, Some(owner_pin_of(&s.authority))).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let Some((_, Some(rejoin))) = attempt_of(&s.j2, &s.stable) else {
+        panic!("J2 stored its re-join MemberJoined");
+    };
+
+    let purge = super::super::join_egress_test_barrier::arm(&j2_hex, "purge");
+    let removal = {
+        let authority = Arc::clone(&s.authority);
+        let group_key = s.group_key.clone();
+        let j2_hex = j2_hex.clone();
+        tokio::spawn(async move {
+            remove_named_group_member(
+                State(authority),
+                axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                    durable: true,
+                }),
+                Path((group_key, j2_hex)),
+            )
+            .await
+            .into_response()
+            .status()
+        })
+    };
+    wait_reached(&purge.gate, "removal purge").await;
+    let readmission = {
+        let authority = Arc::clone(&s.authority);
+        let sender = s.j2.agent.agent_id();
+        tokio::spawn(async move {
+            apply_named_group_metadata_event(&authority, rejoin, sender, true, None)
+                .await
+                .accepted
+        })
+    };
+    // Give the re-admission every chance to commit while the purge waits
+    // (it cannot while the removal still holds the group lock).
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        while !readmission.is_finished() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    drop(purge);
+    assert!(removal.await?.is_success());
+    assert!(readmission.await?, "the re-admission is accepted");
+    let removed_at = s.base + 3;
+    let restaged = staged(&s.authority, &s.stable, &j2_hex)
+        .await
+        .map(|p| revision_of(&p.event));
+    assert!(
+        restaged.is_some_and(|revision| revision > Some(removed_at)),
+        "the re-admission's staged result survived the removal's purge: {restaged:?}"
+    );
+    Ok(())
+}
+
+/// WHY (review r2 P2-3): a removal applied through the REPLAY entry point
+/// (`apply_named_group_metadata_event_inner`, used by the TreeKEM pending
+/// replay) purges the removed member's staged artifacts too.
+#[tokio::test]
+async fn s8a_r2_replayed_member_removal_purges_staged_artifacts() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    let g_hex = hex_of(&g.joiner);
+    // A second daemon over the SAME identity and roster authors the removal
+    // (the authority's own signed MemberRemoved, as it arrives on replay).
+    let author = super::super::super::home::tests::owned_state(&g.dir, OWNER_SEED).await?;
+    let removed = remove_named_group_member(
+        State(Arc::clone(&author)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path((g.group_key.clone(), g_hex.clone())),
+    )
+    .await
+    .into_response();
+    assert!(
+        removed.status().is_success(),
+        "author: {}",
+        removed.status()
+    );
+    let removal = author
+        .named_group_test_recorders
+        .publish_bytes
+        .lock()
+        .expect("publish witness")
+        .iter()
+        .filter_map(|(_, bytes)| serde_json::from_slice::<NamedGroupMetadataEvent>(bytes).ok())
+        .find(|e| {
+            matches!(e, NamedGroupMetadataEvent::MemberRemoved { agent_id, .. } if *agent_id == g_hex)
+        })
+        .expect("the author published the removal");
+    assert!(staged(&g.authority, &g.stable, &g_hex).await.is_some());
+    let applied = super::super::apply_named_group_metadata_event_inner(
+        &g.authority,
+        removal,
+        g.authority.agent.agent_id(),
+        true,
+        false,
+        None,
+    )
+    .await;
+    assert!(applied.accepted, "the replayed removal applies");
+    assert!(
+        staged(&g.authority, &g.stable, &g_hex).await.is_none(),
+        "a replayed removal must purge the member's staged join result"
+    );
+    Ok(())
+}
+
+/// WHY (review r2 P2-4): the single Welcome listener must keep receiving
+/// while a FetchRequest waits on a group lock — otherwise the Offer, Chunk
+/// and Complete frames a lock holder may itself be waiting for queue behind
+/// it (a dependency cycle).
+#[tokio::test]
+async fn s8a_r2_welcome_listener_progresses_while_a_group_lock_is_held() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    let welcome_id = welcome_id_of(&s.j2_add).expect("welcome ref");
+    let lock = super::super::group_membership_lock_for_known_group(&s.authority, &s.stable)
+        .await
+        .expect("known group");
+    let held = lock.lock().await;
+    let dispatched = tokio::time::timeout(
+        Duration::from_secs(2),
+        super::super::dispatch_welcome_blob_message(
+            &s.authority,
+            &s.j2.agent.agent_id(),
+            WelcomeBlobMessage::FetchRequest {
+                group_id: s.stable.clone(),
+                welcome_id: welcome_id.clone(),
+            },
+        ),
+    )
+    .await;
+    assert!(
+        dispatched.is_ok(),
+        "the listener blocked on a FetchRequest waiting for the group lock"
+    );
+    // Receive-side frames still flow (an unsolicited Offer is ignored).
+    let offer = tokio::time::timeout(
+        Duration::from_secs(2),
+        super::super::dispatch_welcome_blob_message(
+            &s.authority,
+            &s.j2.agent.agent_id(),
+            WelcomeBlobMessage::Offer {
+                group_id: s.stable.clone(),
+                welcome_id: "ab".repeat(32),
+                byte_len: 1,
+                chunk_size: x0x::files::DEFAULT_CHUNK_SIZE,
+                total_chunks: 1,
+                blake3_hex: "ab".repeat(32),
+            },
+        ),
+    )
+    .await;
+    assert!(
+        offer.is_ok(),
+        "a receive-side frame queued behind the fetch"
+    );
+    drop(held);
+    // The fetch completes once the lock is free.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if s.authority
+                .pending_welcome_streams
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|streams| streams.contains_key(&welcome_id))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
     Ok(())
 }
