@@ -1,7 +1,7 @@
 # x0x design direction and rulings digest
 
 - **Status:** maintained digest, not an ADR. It records the design rulings
-  David Irvine made from 2026-09-28 to 2026-10-03 (decisions D01–D52 and the
+  David Irvine made from 2026-09-28 to 2026-10-03 (decisions D01–D55 and the
   efficiency decisions E-D1–E-D17).
 - **Updated:** 2026-10-03.
 - **Relationship to ADRs:** ADRs remain the decision records, and only David
@@ -114,7 +114,7 @@ wave that fixes each is in section 7.
 | I12 | **Resource bounds.** A daemon never fills its host's disk, spends a user's uplink as infrastructure, or grows queues without bound, and every bound is visible. |
 | I13 | **Plane isolation.** A test or named daemon never joins production by accident. |
 
-## 5. Decisions D01–D52
+## 5. Decisions D01–D55
 
 Status key: **implemented** = in effect on `main` (code, configuration or an
 Accepted ADR); **ruled** = decided by David, work outstanding or ongoing;
@@ -179,6 +179,9 @@ and D29 (an ADR 0089 slice pulled into v0.46).
 | D50 | Sign row 8's v0.46.0 known limitations as written: 15 items, including 7b and 7c. | Implemented; signed 2026-10-03 |
 | D51 | Run the signed-update canary on two production hosts while holding two others; re-enable the held hosts only after health passes, otherwise keep the hold and manually roll back the canary pair. | Passed (2026-10-03); all six production hosts (12 daemons) upgraded and healthy |
 | D52 | Publish v0.46.0 as Latest (tag `v0.46.0`, commit `cea64f2`) and promote crates.io and ClawHub. | Implemented; published 2026-10-03 |
+| D53 | v0.46.1 includes #1103 (fork-clear seal arms), #1150(a) (joiner re-arm, under D55), #1144 (exact-basename extraction and magic check), #1086 (update check after API bind), release-note lines for #1120, #336 and #1103, and #857 (gossip fan-out). #857 waits for saorsa-gossip PR #106 and a saorsa-gossip release; its crates.io publish needs David's approval at the time. | Ruled (2026-10-03) |
+| D54 | ADR 0088 uses S5 fetch-by-hash from any holder for missed group events, with catch-up control blobs under S5, instead of a persisted authority catch-up log; S5 is the single certificate-carry rule and #1143 becomes a rule change. Record ADR 0062 as Accepted (option 1, #617 shipped) and ADR 0063 as Rejected. In-process red tests do not satisfy D16's harness-first rule. Add to I8's may-block-forever list: groups with a signed owner delete, removed members' catch-up on epochs after removal, ordinary group forks without an owner anchor until manual admin action (ADR 0066), and evidence fetches while all holders are offline. | Ruled (2026-10-03); ADR 0088 pending |
+| D55 | Allow #1150(a) alone to ship in v0.46.1 with its committed red test; its W3-H harness case follows later. Every other liveness fix still requires harness reproduction first (D16, D54). | Ruled (2026-10-03); exception for #1150(a) only |
 | COMMS | Use plain controlled language (about 80% toward ASD-STE100), fixed decision templates and one release contact; record and share each ruling, check live GitHub before requesting approval, keep the release dashboard current and include diagrams in briefs. Trial explainer videos after promotion. | Ruled; adopted 2026-10-02 |
 
 ## 6. Efficiency decisions E-D1–E-D17 (Track E)
