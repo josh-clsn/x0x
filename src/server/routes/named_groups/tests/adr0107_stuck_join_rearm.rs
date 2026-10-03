@@ -4456,11 +4456,12 @@ async fn s8a_r6_duplicate_fetches_never_overlap_inline_egress() -> anyhow::Resul
             },
         )
         .await;
-        // Let the handler finish (and release its G7 ticket).
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Witness, not a sleep: the handler has finished and released its
+        // G7 ticket, so the NEXT duplicate is admitted by G7 and only the
+        // egress admission can stop it.
+        g7_tickets_released(&g.authority).await;
     }
     wait_reached(&armed.gate, "inline result").await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
     let parked = armed.gate.parked();
     drop(armed);
     assert_eq!(
@@ -4513,4 +4514,19 @@ async fn s8a_r6_terminal_share_invalidations_outrank_withholding() -> anyhow::Re
         "a withholding refusal masked a terminal share invalidation: {masked:?}"
     );
     Ok(())
+}
+
+/// Wait (bounded) until every G7 join-result fetch handler has released its
+/// admission ticket.
+async fn g7_tickets_released(state: &AppState) {
+    let released = tokio::time::timeout(Duration::from_secs(10), async {
+        while state.join_result_fetch_admission.in_flight() > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        released.is_ok(),
+        "a G7 fetch handler never released its ticket"
+    );
 }
