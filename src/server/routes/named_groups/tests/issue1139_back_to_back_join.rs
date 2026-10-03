@@ -2933,6 +2933,9 @@ async fn a_seat_between_the_check_and_the_drop_keeps_the_group() -> Result<()> {
             &state,
             &key,
             super::super::AbandonedRekeyPin::MustBeGone,
+            // The persistence-lock re-check alone (the second line of defence
+            // for a caller that already holds the membership lock).
+            super::super::DepartLock::HeldByCaller,
             "test",
         )
         .await
@@ -3037,6 +3040,7 @@ async fn a_diverged_live_alias_blocks_the_departure() -> Result<()> {
         &s.j2,
         &s.group_key,
         super::super::AbandonedRekeyPin::MustBeGone,
+        super::super::DepartLock::Take,
         "test",
     )
     .await;
@@ -3044,5 +3048,227 @@ async fn a_diverged_live_alias_blocks_the_departure() -> Result<()> {
     let groups = s.j2.named_groups.read().await;
     assert!(groups.contains_key(&s.group_key) && groups.contains_key(&sibling));
     assert!(s.j2.treekem_groups.read().await.contains_key(&sibling));
+    Ok(())
+}
+
+/// Round 7 N1: a real welcome seat in flight (parked just before it takes
+/// the roster persistence lock, holding the membership lock as every seat
+/// does) cannot lose its group to a concurrent departure: the departure
+/// waits for the membership lock, then finds the device seated.
+#[tokio::test]
+async fn an_in_flight_seat_survives_a_concurrent_departure() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let (terminal, carried) = wa_abandoned_row(&s).await?;
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let go = Arc::new(tokio::sync::Notify::new());
+    *super::super::SEAT_TEST_PAUSE.lock().expect("pause") = Some((
+        s.stable_group_id.clone(),
+        Arc::clone(&reached),
+        Arc::clone(&go),
+    ));
+    let seat = wa_deliver_held(&s, None, terminal, carried);
+    let racer = async {
+        reached.notified().await;
+        let depart = super::super::depart_abandoned_rekey_row(
+            &s.j2,
+            &s.group_key,
+            super::super::AbandonedRekeyPin::MustBeGone,
+            super::super::DepartLock::Take,
+            "test",
+        );
+        let release = async {
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            go.notify_one();
+        };
+        tokio::join!(depart, release).0
+    };
+    let (seated, departed) = tokio::join!(seat, racer);
+    *super::super::SEAT_TEST_PAUSE.lock().expect("pause") = None;
+    seated?;
+    assert!(!departed, "the departure must find the device seated");
+    assert_eq!(wa_state(&s.j2, &s.group_key).await, "active");
+    assert!(s.j2.treekem_groups.read().await.contains_key(&s.group_key));
+    let snapshot = super::super::treekem_snapshot_path_for_drop(&s.j2, &s.stable_group_id)
+        .context("snapshot path")?;
+    assert!(
+        tokio::fs::try_exists(&snapshot).await?,
+        "the snapshot survives"
+    );
+    assert!(wa_decrypts_post_rekey(&s, &s.j2).await?);
+    Ok(())
+}
+
+/// Round 7 N1, the Refused wrapper: its departure holds the membership lock
+/// from the pre-check to the end of the wipe, so a fresh invite (which runs
+/// under that lock) cannot record its new pin in the middle and lose it to
+/// the wipe.
+#[tokio::test]
+async fn the_refused_departure_holds_the_membership_lock_to_the_end() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let (attempt, _terminal, carried) = wa_held_rekey(&s).await?;
+    wa_chain_step(&s, carried.first().context("removal")?).await?;
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    let pin_key = join_result_key(&s.stable_group_id, &j2_hex);
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let go = Arc::new(tokio::sync::Notify::new());
+    *super::super::DEPART_TEST_PAUSE.lock().expect("pause") = Some((
+        s.stable_group_id.clone(),
+        Arc::clone(&reached),
+        Arc::clone(&go),
+    ));
+    let refuse = super::super::finalize_join_attempt(
+        &s.j2,
+        &s.group_key,
+        &s.stable_group_id,
+        &j2_hex,
+        &attempt,
+        super::super::JoinAttemptOutcome::Refused,
+        super::super::JoinFinalizeGuard::Unlocked,
+    );
+    let fresh_invite = async {
+        reached.notified().await;
+        let lock = super::super::group_membership_lock(&s.j2, &s.group_key).await;
+        assert!(
+            lock.try_lock().is_err(),
+            "the departure holds the membership lock across its window"
+        );
+        go.notify_one();
+        // The fresh invite runs under the lock, after the departure.
+        let _guard = lock.lock().await;
+        super::super::record_expected_join_result_inviter(
+            &s.j2,
+            pin_key.clone(),
+            hex::encode(s.authority_id.as_bytes()),
+        );
+    };
+    tokio::join!(refuse, fresh_invite);
+    *super::super::DEPART_TEST_PAUSE.lock().expect("pause") = None;
+    assert_eq!(
+        wa_state(&s.j2, &s.group_key).await,
+        "no_row",
+        "the refused row departed"
+    );
+    assert!(
+        super::super::live_expected_join_result_inviter(&s.j2, &pin_key).is_some(),
+        "the fresh invite's pin survives"
+    );
+    Ok(())
+}
+
+/// Round 7: the periodic sweep bounds the linger. A timed-out chain-step
+/// row is kept while its pin is within the TTL, and departs on the first
+/// tick after the pin has passed it.
+#[tokio::test]
+async fn the_periodic_sweep_departs_a_row_once_its_pin_expires() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let (attempt, _terminal, carried) = wa_held_rekey(&s).await?;
+    wa_chain_step(&s, carried.first().context("removal")?).await?;
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    super::super::finalize_join_attempt(
+        &s.j2,
+        &s.group_key,
+        &s.stable_group_id,
+        &j2_hex,
+        &attempt,
+        super::super::JoinAttemptOutcome::TimedOut,
+        super::super::JoinFinalizeGuard::Unlocked,
+    )
+    .await;
+    assert_eq!(
+        super::super::sweep_abandoned_rekey_rows(&s.j2, "tick").await,
+        0
+    );
+    assert_eq!(wa_state(&s.j2, &s.group_key).await, "not_member");
+
+    // The clock passes the pin's TTL.
+    {
+        let key = join_result_key(&s.stable_group_id, &j2_hex);
+        let mut pins = s.j2.expected_join_result_inviters.lock().expect("pins");
+        let pin = pins.get_mut(&key).expect("timed-out pin");
+        pin.created_at = std::time::Instant::now()
+            .checked_sub(EXPECTED_JOIN_RESULT_INVITER_TTL + Duration::from_secs(1))
+            .expect("monotonic clock far enough from boot");
+    }
+    assert_eq!(
+        super::super::sweep_abandoned_rekey_rows(&s.j2, "tick").await,
+        1
+    );
+    assert_eq!(wa_state(&s.j2, &s.group_key).await, "no_row");
+    Ok(())
+}
+
+/// Round 7: a poisoned pin map fails closed (it reads as a live pin), so no
+/// row departs on the strength of a map that cannot be read.
+#[tokio::test]
+async fn a_poisoned_pin_map_departs_nothing() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    wa_abandoned_row(&s).await?;
+    let pins = &s.j2.expected_join_result_inviters;
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = pins.lock().expect("pins");
+        panic!("poison the pin map");
+    }));
+    assert!(poisoned.is_err() && pins.is_poisoned());
+    let departed = super::super::depart_abandoned_rekey_row(
+        &s.j2,
+        &s.group_key,
+        super::super::AbandonedRekeyPin::MayBeTimedOut,
+        super::super::DepartLock::Take,
+        "test",
+    )
+    .await;
+    assert!(!departed);
+    assert!(s.j2.named_groups.read().await.contains_key(&s.group_key));
+    Ok(())
+}
+
+/// Round 7 test gap: every alias row qualifies (the device Removed on each),
+/// but a tree exists under one alias key; the "no tree under any alias"
+/// clause alone blocks the departure.
+#[tokio::test]
+async fn a_tree_under_any_alias_blocks_the_departure() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    wa_abandoned_row(&s).await?;
+    // A second alias row for the same group, equally listing the device as
+    // Removed, so every row qualifies; the tree sits under that alias key.
+    let alias = format!("{}-alias", s.group_key);
+    {
+        let alias = alias.clone();
+        let key = s.group_key.clone();
+        let outcome = persist_named_groups_mutation(&s.j2, |groups| {
+            let Some(row) = groups.get(&key).cloned() else {
+                return false;
+            };
+            groups.insert(alias, row);
+            true
+        })
+        .await;
+        anyhow::ensure!(matches!(outcome, Ok(AtomicWriteOutcome::Durable)));
+    }
+    let group_id_bytes = hex::decode(&s.group_key)?;
+    let seed = agent_treekem_seed(s.j2.agent.as_ref(), &group_id_bytes);
+    let tree = x0x::mls::TreeKemMlsGroup::create(group_id_bytes, s.j2.agent.agent_id(), &seed)?;
+    s.j2.treekem_groups
+        .write()
+        .await
+        .insert(alias.clone(), Arc::new(Mutex::new(tree)));
+    let departed = super::super::depart_abandoned_rekey_row(
+        &s.j2,
+        &s.group_key,
+        super::super::AbandonedRekeyPin::MustBeGone,
+        super::super::DepartLock::Take,
+        "test",
+    )
+    .await;
+    assert!(!departed);
+    assert!(s.j2.named_groups.read().await.contains_key(&s.group_key));
+    assert!(s.j2.treekem_groups.read().await.contains_key(&alias));
     Ok(())
 }
