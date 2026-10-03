@@ -1999,22 +1999,25 @@ async fn secure_share_delivery_verdict(
         return SecureShareDeliveryVerdict::Purge("group_unknown");
     };
     let _membership_guard = lock.lock().await;
-    if let Err(refusal) = join_artifact_serving_check(state, group_id, recipient_hex).await {
-        return if refusal.is_definitive() || refusal == JoinArtifactRefusal::UnknownGroup {
-            SecureShareDeliveryVerdict::Purge(refusal.reason())
-        } else {
-            SecureShareDeliveryVerdict::Withhold(refusal.reason())
-        };
-    }
+    // r6 (P4): terminal facts first. An obsolete share (the epoch moved on,
+    // or its secret is gone) is purged before any eligibility question;
+    // the serving guard then reports every definitive refusal (withdrawn,
+    // banned, revoked, not Active, certificate invalid) before any
+    // withholding one (quarantine, pending evidence, a non-Clean verdict).
     let current = {
         let roster = state.named_groups.read().await;
         crate::server::resolve_group_entry_locked(&roster, group_id)
             .is_some_and(|(_, info)| secure_share_epoch_current(info, secret_epoch))
     };
-    if current {
-        SecureShareDeliveryVerdict::Deliver
-    } else {
-        SecureShareDeliveryVerdict::Purge("secret_epoch_moved")
+    if !current {
+        return SecureShareDeliveryVerdict::Purge("secret_epoch_moved");
+    }
+    match join_artifact_serving_check(state, group_id, recipient_hex).await {
+        Ok(_) => SecureShareDeliveryVerdict::Deliver,
+        Err(refusal) if refusal.is_definitive() || refusal == JoinArtifactRefusal::UnknownGroup => {
+            SecureShareDeliveryVerdict::Purge(refusal.reason())
+        }
+        Err(refusal) => SecureShareDeliveryVerdict::Withhold(refusal.reason()),
     }
 }
 
@@ -35710,11 +35713,11 @@ fn join_artifact_serving_refusal_for(
     revoked: bool,
     now_unix: u64,
 ) -> Option<JoinArtifactRefusal> {
+    // r6 (P4): every DEFINITIVE refusal is decided before any withholding
+    // one, so a withholding state (quarantine, pending evidence) never
+    // masks a terminal fact and keeps an obsolete artifact pending.
     if info.withdrawn {
         return Some(JoinArtifactRefusal::GroupWithdrawn);
-    }
-    if info.is_fork_quarantined() {
-        return Some(JoinArtifactRefusal::GroupQuarantined);
     }
     if info.is_banned(member_hex) {
         return Some(JoinArtifactRefusal::Banned);
@@ -35729,13 +35732,21 @@ fn join_artifact_serving_refusal_for(
     else {
         return Some(JoinArtifactRefusal::NotActive);
     };
-    let owner = info.policy.admission.owner_certified_user_id()?;
-    match seat.certificate.as_ref() {
-        Some(cert) => x0x::groups::owner_cert::verify_cert_against_owner(
+    let owner = info.policy.admission.owner_certified_user_id();
+    if let (Some(owner), Some(cert)) = (owner, seat.certificate.as_ref()) {
+        if let Err(failure) = x0x::groups::owner_cert::verify_cert_against_owner(
             owner, member_hex, cert, false, now_unix,
-        )
-        .err()
-        .map(JoinArtifactRefusal::CertificateInvalid),
+        ) {
+            return Some(JoinArtifactRefusal::CertificateInvalid(failure));
+        }
+    }
+    // Withholding refusals only after every definitive one.
+    if info.is_fork_quarantined() {
+        return Some(JoinArtifactRefusal::GroupQuarantined);
+    }
+    owner?;
+    match seat.certificate.as_ref() {
+        Some(_) => None,
         None if seat.certificate_digest.is_some() => {
             Some(JoinArtifactRefusal::CertificateDigestPending)
         }
