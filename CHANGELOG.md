@@ -4,7 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.46.1] - 2026-10-03
+
 ### Fixed
+
+- **Fork-quarantine clears are durable before they are published (#1103).**
+  The explicit seal's eviction and all-clean arms, the owner-mandate
+  MemberAdded arm and gap adoption now clear a fork quarantine through the
+  same candidate-gated write as the manual clear (#1073). While the write is
+  in flight, and on NotReplaced or Err, the group stays quarantined. On
+  ReplacedNotDurable the clear is already published (as in #759) and the
+  route returns 503. The lookup resolves both group-id spellings.
+
+- **The startup update check no longer delays the REST API (#1086).** The
+  check runs in the background after the API binds, so an unreachable
+  GitHub no longer holds `/health` for about 30 s. Release builds have no
+  configurable update source.
 
 - **Self-update extraction matches the exact binary basename (#1144).**
   Archive extraction for the `x0xd`/`x0x` self-update now accepts only a
