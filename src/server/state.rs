@@ -972,6 +972,10 @@ pub(super) struct AppState {
     /// tasks: one in-flight task per chunk, a per-group share and a global
     /// cap. A fetch is validated (staged copy, existing sequence) first.
     pub(super) join_result_chunk_admission: crate::server::routes::named_groups::FairAdmission,
+    /// ADR 0107 (r6 P3): fair, coalescing admission for inline join-result
+    /// egress tasks: one in flight per `(group, recipient)` (the ticket
+    /// lives in the task), a per-group share and a global cap.
+    pub(super) join_result_egress_admission: crate::server::routes::named_groups::FairAdmission,
     /// Bounded, process-local exact-byte transfers for oversized named-group
     /// direct events and join results. No control payload is persisted.
     pub(super) control_blobs: crate::server::routes::ControlBlobState,

@@ -36780,6 +36780,13 @@ async fn join_egress_test_point(
     }
 }
 
+/// ADR 0107 (r6, P3): a group's share of the inline join-result egress
+/// tasks.
+pub(in crate::server) const JOIN_RESULT_EGRESS_PER_GROUP_CAP: usize = 8;
+
+/// ADR 0107 (r6, P3): bound on concurrent inline join-result egress tasks.
+pub(in crate::server) const JOIN_RESULT_EGRESS_CAP: usize = 64;
+
 /// ADR 0107 (r5, G8): a group's share of the join-result chunk tasks.
 pub(in crate::server) const JOIN_RESULT_CHUNK_PER_GROUP_CAP: usize = 4;
 
@@ -37256,6 +37263,34 @@ async fn handle_join_result_message_bound(
             // requester is still eligible and the staged result unchanged; a
             // removal or ban cancels it before committing. The receipt wait
             // runs outside the lock.
+            // r6 (P3): one in-flight inline egress per (group, recipient),
+            // with a per-group share of the global cap. The ticket lives in
+            // the egress task (released at completion, deadline or abort),
+            // so duplicate fetches never start overlapping egress; the
+            // in-flight one serves the same staged result, and the joiner
+            // retries.
+            let stable_group = {
+                let roster = state.named_groups.read().await;
+                crate::server::resolve_group_entry_locked(&roster, &group_id).map_or_else(
+                    || group_id.clone(),
+                    |(_, info)| info.stable_group_id().to_string(),
+                )
+            };
+            let egress_ticket = match state.join_result_egress_admission.try_admit(
+                &join_result_key(&stable_group, &member_agent_id),
+                &stable_group,
+            ) {
+                Ok(ticket) => ticket,
+                Err(refusal) => {
+                    tracing::debug!(
+                        group_id = %LogHexId::group(&group_id),
+                        member = %LogHexId::agent(&member_agent_id),
+                        ?refusal,
+                        "inline join-result egress already in flight or at capacity; the joiner retries"
+                    );
+                    return;
+                }
+            };
             let task_state = Arc::clone(state);
             let recipient = *sender;
             let group_for_task = group_id.clone();
@@ -37268,6 +37303,7 @@ async fn handle_join_result_message_bound(
                 "join_result",
                 artifact_deadline,
                 async move {
+                    let _egress_ticket = egress_ticket;
                     if !join_result_still_servable(
                         &task_state,
                         &group_for_task,
@@ -39904,6 +39940,10 @@ pub(in crate::server) mod tests {
             join_result_chunk_admission: crate::server::routes::named_groups::FairAdmission::new(
                 crate::server::routes::named_groups::JOIN_RESULT_CHUNK_PER_GROUP_CAP,
                 crate::server::routes::named_groups::JOIN_RESULT_CHUNK_TASK_CAP,
+            ),
+            join_result_egress_admission: crate::server::routes::named_groups::FairAdmission::new(
+                crate::server::routes::named_groups::JOIN_RESULT_EGRESS_PER_GROUP_CAP,
+                crate::server::routes::named_groups::JOIN_RESULT_EGRESS_CAP,
             ),
             control_blobs: ControlBlobState::default(),
             treekem_pending_events: RwLock::new(HashMap::new()),

@@ -1121,6 +1121,10 @@ pub async fn serve_with_options(
             crate::server::routes::named_groups::JOIN_RESULT_CHUNK_PER_GROUP_CAP,
             crate::server::routes::named_groups::JOIN_RESULT_CHUNK_TASK_CAP,
         ),
+        join_result_egress_admission: crate::server::routes::named_groups::FairAdmission::new(
+            crate::server::routes::named_groups::JOIN_RESULT_EGRESS_PER_GROUP_CAP,
+            crate::server::routes::named_groups::JOIN_RESULT_EGRESS_CAP,
+        ),
         control_blobs: ControlBlobState::default(),
         treekem_pending_events: RwLock::new(HashMap::new()),
         parked_role_updates: StdMutex::new(HashMap::new()),
