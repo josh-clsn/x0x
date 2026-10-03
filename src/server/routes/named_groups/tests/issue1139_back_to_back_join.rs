@@ -2105,21 +2105,22 @@ async fn gossip_removal_before_the_result_does_not_strand_the_rejoining_device()
     assert_eq!(r.final_state, "active", "{r}");
     let (attempt_id, terminal, carried) = r.held.clone().context("held result")?;
     let removal = carried.first().cloned().context("the re-key removal")?;
-    for verified in [false, true] {
-        let gossip = apply_named_group_metadata_event(
-            &s.j2,
-            removal.clone(),
-            s.authority_id,
-            verified,
-            None,
-        )
-        .await;
-        assert!(
-            !gossip.accepted && !gossip.should_exit,
-            "gossip removal must not depart"
-        );
-        assert_eq!(wa_state(&s.j2, &s.group_key).await, "active");
-    }
+    let head_before = wa_head(&s.j2, &s).await.0;
+    let gossip =
+        apply_named_group_metadata_event(&s.j2, removal.clone(), s.authority_id, false, None).await;
+    assert!(
+        gossip.accepted && !gossip.should_exit,
+        "the pinned inviter's removal applies as a chain step, not a departure"
+    );
+    assert_eq!(wa_head(&s.j2, &s).await.0, head_before + 1);
+    let replay =
+        apply_named_group_metadata_event(&s.j2, removal.clone(), s.authority_id, true, None).await;
+    assert!(!replay.should_exit, "a replayed copy never departs");
+    assert_eq!(
+        wa_state(&s.j2, &s.group_key).await,
+        "pending_authority_commit",
+        "the row is kept, mid-rejoin"
+    );
     let from = wa_head(&s.j2, &s).await.0;
     let terminal_revision = named_group_metadata_event_commit(&terminal)
         .map(|c| c.revision)
@@ -2349,5 +2350,231 @@ async fn the_rekey_link_refuses_non_admin_tree_holding_and_stale_attempts() -> R
         before,
         "the genuine link still applies (positive control)"
     );
+    Ok(())
+}
+
+/// Held fresh-invite round trip on a keyless J2 whose earlier attempt timed
+/// out: J2 is mid-rejoin with a live pin; returns the held result.
+async fn wa_held_rekey(
+    s: &BackToBack,
+) -> Result<(
+    String,
+    NamedGroupMetadataEvent,
+    Vec<NamedGroupMetadataEvent>,
+)> {
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    super::super::finalize_join_attempt(
+        &s.j2,
+        &s.group_key,
+        &s.stable_group_id,
+        &j2_hex,
+        &s.j2_attempt,
+        super::super::JoinAttemptOutcome::TimedOut,
+        super::super::JoinFinalizeGuard::Unlocked,
+    )
+    .await;
+    let r = wa_fresh_invite_round_trip_with(s, &s.j2, false).await?;
+    anyhow::ensure!(r.final_state == "active", "{r}");
+    r.held.clone().context("held result")
+}
+
+async fn wa_deliver_held(
+    s: &BackToBack,
+    bound: Option<&str>,
+    terminal: NamedGroupMetadataEvent,
+    carried: Vec<NamedGroupMetadataEvent>,
+) -> Result<()> {
+    let from = wa_head(&s.j2, s).await.0;
+    let terminal_revision = named_group_metadata_event_commit(&terminal)
+        .map(|c| c.revision)
+        .context("terminal commit")?;
+    let info = s
+        ._authority
+        .named_groups
+        .read()
+        .await
+        .get(&s.group_key)
+        .cloned()
+        .context("authority group")?;
+    super::super::handle_join_result_message_bound(
+        &s.j2,
+        &s.authority_id,
+        true,
+        JoinResultMessage::Result {
+            event: Box::new(terminal),
+            chain: intervening_chain_from(&info, from, terminal_revision),
+            head_attestation: None,
+            roster_certificates_b64: Vec::new(),
+            intervening_events: carried,
+            signed_by: None,
+        },
+        bound,
+    )
+    .await;
+    Ok(())
+}
+
+/// M1: only the inviter this device's pin names gets the chain-step
+/// treatment. A removal of the mid-rejoin device by any OTHER admin is a
+/// genuine kick and departs exactly as before.
+#[tokio::test]
+async fn a_kick_by_an_admin_other_than_the_pinned_inviter_departs() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let (_attempt, _terminal, carried) = wa_held_rekey(&s).await?;
+    let removal = carried.first().cloned().context("removal")?;
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    // The device's pin names a different inviter than the removal's actor.
+    super::super::record_expected_join_result_inviter(
+        &s.j2,
+        join_result_key(&s.stable_group_id, &j2_hex),
+        hex::encode(s.j1.agent.agent_id().as_bytes()),
+    );
+    let applied =
+        apply_named_group_metadata_event(&s.j2, removal, s.authority_id, true, None).await;
+    assert!(applied.accepted && applied.should_exit, "the kick departs");
+    assert_eq!(wa_state(&s.j2, &s.group_key).await, "no_row");
+    Ok(())
+}
+
+/// M2: a restart mid-rejoin loses the in-memory attempt and pin; the pin
+/// is read back from disk, so the gossip removal that lands first is still
+/// a chain step, and the (now unbound) result seats the device with keys.
+#[tokio::test]
+async fn a_restart_mid_rejoin_still_takes_the_rekey_removal_as_a_chain_step() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let (_attempt, terminal, carried) = wa_held_rekey(&s).await?;
+    let removal = carried.first().cloned().context("removal")?;
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    let key = join_result_key(&s.stable_group_id, &j2_hex);
+
+    // The restart: every in-memory join attempt and pin is gone; startup
+    // reads the persisted state back.
+    s.j2.pending_join_attempts.lock().expect("attempts").clear();
+    s.j2.expected_join_result_inviters
+        .lock()
+        .expect("pins")
+        .clear();
+    super::super::load_join_result_staging(&s.j2).await;
+    assert!(
+        super::super::live_expected_join_result_inviter(&s.j2, &key).is_some(),
+        "the pin survives the restart"
+    );
+
+    let gossip =
+        apply_named_group_metadata_event(&s.j2, removal, s.authority_id, false, None).await;
+    assert!(
+        gossip.accepted && !gossip.should_exit,
+        "chain step, not departure"
+    );
+    assert_eq!(
+        wa_state(&s.j2, &s.group_key).await,
+        "pending_authority_commit",
+        "the row is kept, mid-rejoin"
+    );
+
+    wa_deliver_held(&s, None, terminal, carried).await?;
+    assert_eq!(wa_state(&s.j2, &s.group_key).await, "active");
+    assert!(s.j2.treekem_groups.read().await.contains_key(&s.group_key));
+    assert!(wa_decrypts_post_rekey(&s, &s.j2).await?);
+    Ok(())
+}
+
+/// L2: the role restore (r+3) reaches the device before it is seated (its
+/// result arrives after the redelivery window). It is held and replayed
+/// when the device's add lands, so the device still ends Admin at the
+/// authority's head.
+#[tokio::test]
+async fn a_role_restore_that_arrives_before_the_seat_is_held_and_applied() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    let promoted = update_member_role(
+        State(Arc::clone(&s._authority)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path((s.group_key.clone(), j2_hex.clone())),
+        Json(UpdateMemberRoleRequest {
+            role: "admin".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    anyhow::ensure!(promoted.status().is_success());
+    wa_clear_published(&s);
+    let (attempt, terminal, carried) = wa_held_rekey(&s).await?;
+    let role_event = wa_published(&s)
+        .into_iter()
+        .map(|(_, e)| e)
+        .find(|e| matches!(e, NamedGroupMetadataEvent::MemberRoleUpdated { .. }))
+        .context("the re-key publishes the role restore")?;
+
+    let early =
+        apply_named_group_metadata_event(&s.j2, role_event, s.authority_id, true, None).await;
+    assert!(!early.accepted, "held, not applied, before the seat");
+
+    wa_deliver_held(&s, Some(attempt.as_str()), terminal, carried).await?;
+    assert!(s.j2.treekem_groups.read().await.contains_key(&s.group_key));
+    assert_eq!(
+        wa_role(&s.j2, &s, &j2_hex).await,
+        Some(x0x::groups::GroupRole::Admin)
+    );
+    assert_eq!(wa_head(&s.j2, &s).await, wa_head(&s._authority, &s).await);
+    Ok(())
+}
+
+/// L3: a returning Guest or Moderator gets its exact role back, not Member
+/// (for a Guest that would be an escalation).
+#[tokio::test]
+async fn a_returning_guest_or_moderator_gets_its_exact_role_back() -> Result<()> {
+    for role in [
+        x0x::groups::GroupRole::Guest,
+        x0x::groups::GroupRole::Moderator,
+    ] {
+        let dir = tempfile::tempdir()?;
+        let s = build_back_to_back(dir.path()).await?;
+        let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+        // A legacy seat holding a reserved role: sealed directly by the
+        // authority, as an older release could have.
+        {
+            let mut info = s
+                ._authority
+                .named_groups
+                .read()
+                .await
+                .get(&s.group_key)
+                .cloned()
+                .context("authority row")?;
+            info.roster_revision = info.roster_revision.saturating_add(1);
+            info.set_member_role(&j2_hex, role);
+            seal_commit_owner_certified(
+                &s._authority,
+                &mut info,
+                s._authority.agent.identity().agent_keypair(),
+                now_millis_u64(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("seal legacy role: {e:?}"))?;
+            anyhow::ensure!(store_named_group_info(&s._authority, &s.group_key, info).await);
+        }
+        wa_clear_published(&s);
+        let r = wa_stuck_keyless(&s).await?;
+        anyhow::ensure!(r.treekem, "{r}");
+        assert_eq!(
+            wa_role(&s._authority, &s, &j2_hex).await,
+            Some(role),
+            "authority"
+        );
+        let role_event = wa_published(&s)
+            .into_iter()
+            .map(|(_, e)| e)
+            .find(|e| matches!(e, NamedGroupMetadataEvent::MemberRoleUpdated { .. }))
+            .context("role restore published")?;
+        let applied =
+            apply_named_group_metadata_event(&s.j2, role_event, s.authority_id, true, None).await;
+        assert!(applied.accepted);
+        assert_eq!(wa_role(&s.j2, &s, &j2_hex).await, Some(role), "device");
+        assert_eq!(wa_head(&s.j2, &s).await, wa_head(&s._authority, &s).await);
+    }
     Ok(())
 }
