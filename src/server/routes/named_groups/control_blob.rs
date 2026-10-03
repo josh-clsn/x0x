@@ -1271,6 +1271,86 @@ mod tests {
         }
     }
 
+    /// ADR 0107 (r6 boundary): the seam's non-blocking staged-copy lookup
+    /// agrees with the locked (pruning) one on every TTL and deadline case,
+    /// and reports contention instead of blocking.
+    #[test]
+    fn try_staged_origin_matches_the_locked_lookup() {
+        let store = ControlBlobState::default();
+        let bytes = |fill: u8| vec![fill; x0x::dm::MAX_PAYLOAD_BYTES + 64];
+        let join_ref = |data: &[u8]| ControlBlobRef {
+            kind: ControlBlobKind::JoinResult,
+            join_attempt_id: Some("attempt".to_string()),
+            ..reference(data)
+        };
+        let now = Instant::now();
+        let far = StagedOrigin {
+            staged_at: now,
+            deadline: now + Duration::from_secs(60),
+        };
+        // Bound and current.
+        let live = join_ref(&bytes(1));
+        store
+            .stage_with_origin(live.clone(), bytes(1), Some(far))
+            .expect("stage live copy");
+        // Bound to an original whose deadline is about to pass.
+        let near = join_ref(&bytes(2));
+        store
+            .stage_with_origin(
+                near.clone(),
+                bytes(2),
+                Some(StagedOrigin {
+                    staged_at: now,
+                    deadline: Instant::now() + Duration::from_millis(30),
+                }),
+            )
+            .expect("stage near-deadline copy");
+        // The copy's own TTL has elapsed (its original is still current).
+        let stale = join_ref(&bytes(3));
+        store
+            .stage_with_origin(stale.clone(), bytes(3), Some(far))
+            .expect("stage stale copy");
+        store.with_registry(|registry| {
+            if let Some(entry) = registry.staged.get_mut(&stale) {
+                entry.created_at = Instant::now()
+                    .checked_sub(PENDING_JOIN_RESULT_TTL + Duration::from_secs(1))
+                    .expect("monotonic clock far enough from boot");
+            }
+        });
+        // Unbound (no original).
+        let unbound = join_ref(&bytes(4));
+        store
+            .stage(unbound.clone(), bytes(4))
+            .expect("stage unbound copy");
+        std::thread::sleep(Duration::from_millis(60));
+        let deadline_of = |origin: Option<StagedOrigin>| origin.map(|o| (o.staged_at, o.deadline));
+        for (case, reference, present) in [
+            ("live", &live, true),
+            ("past the original's deadline", &near, false),
+            ("past the copy's own TTL", &stale, false),
+            ("unbound", &unbound, false),
+        ] {
+            // Non-blocking first: the locked lookup prunes.
+            let seam = store
+                .try_staged_origin(reference)
+                .expect("uncontended registry");
+            let locked = store.staged_origin(reference);
+            assert_eq!(seam.is_some(), present, "[{case}] seam lookup");
+            assert_eq!(
+                deadline_of(seam),
+                deadline_of(locked),
+                "[{case}] the seam and locked lookups disagree"
+            );
+        }
+        let held = store.hold_registry_for_test(Duration::from_millis(500));
+        held.recv_timeout(Duration::from_secs(5))
+            .expect("the holder took the lock");
+        assert!(
+            store.try_staged_origin(&live).is_err(),
+            "contention is reported, not waited out"
+        );
+    }
+
     /// The Home oversize fixture fails unless it parses this exact line, and the
     /// line must never carry routing identities or payload bytes.
     #[test]

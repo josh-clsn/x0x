@@ -4530,3 +4530,123 @@ async fn g7_tickets_released(state: &AppState) {
         "a G7 fetch handler never released its ticket"
     );
 }
+
+/// WHY (r6 boundary): certificate expiry carries a 300 s clock-skew
+/// tolerance (`now > not_after + 300` is expired). At the seam's clock, an
+/// announced certificate just inside the tolerance still admits, and just
+/// outside it refuses.
+#[tokio::test]
+async fn s8a_r6_seam_verdict_honours_the_expiry_tolerance_boundary() -> anyhow::Result<()> {
+    let mut wrong = Vec::new();
+    // (skew past the pre-phase, expected to admit)
+    for (case, skew, admit) in [
+        ("inside", 120 + 300 - 10, true),
+        ("outside", 120 + 300 + 10, false),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let s = build(dir.path()).await?;
+        let j2_hex = hex_of(&s.j2);
+        let owner_kp = x0x::identity::UserKeypair::from_seed(&OWNER_SEED)?;
+        let owner_id = owner_kp.user_id();
+        let announced = x0x::identity::AgentCertificate::issue_with_expiry(
+            &owner_kp,
+            &keypair(&s.j2_kp)?,
+            Some(x0x::groups::owner_cert::restore_clock_now() + 120),
+        )?;
+        let digest = x0x::announce_v3::cert_digest(&Some(owner_id), &Some(announced.clone()));
+        insert_discovery_entry(
+            &s.authority,
+            s.j2.agent.agent_id(),
+            Some(owner_id),
+            Some(announced),
+            Some(digest),
+        )
+        .await;
+        s.authority
+            .named_group_test_recorders
+            .seam_clock_skew_secs
+            .store(skew, std::sync::atomic::Ordering::SeqCst);
+        let welcome_id = welcome_id_of(&s.j2_add).expect("welcome ref");
+        clear_egress(&s.authority);
+        assert!(serve_welcome(&s.authority, &s.j2, &s.stable, &welcome_id).await);
+        assert!(
+            transport_seen(&s.authority, &j2_hex, "welcome_frame").await,
+            "[{case}] the Welcome chunk reached the transport"
+        );
+        let admitted = egress_happens(
+            &s.authority,
+            &j2_hex,
+            "welcome_frame",
+            Duration::from_secs(1),
+        )
+        .await;
+        if admitted != admit {
+            wrong.push((case, admitted));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "the seam misjudged the 300 s expiry tolerance boundary: {wrong:?}"
+    );
+    Ok(())
+}
+
+/// WHY (r6 boundary): once an in-flight inline egress is cancelled (here:
+/// quiesced, as a removal or ban would), its egress ticket is released and
+/// the recipient's next fetch is admitted again.
+#[tokio::test]
+async fn s8a_r6_a_fetch_after_a_cancelled_egress_is_admitted() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    let g_hex = hex_of(&g.joiner);
+    let from = remnant_revision(&g.joiner, &g.group_key).await;
+    let fetch = || JoinResultMessage::FetchRequest {
+        group_id: g.stable.clone(),
+        member_agent_id: g_hex.clone(),
+        from_revision: from,
+        base_state_hash: None,
+        accepts_refusal: true,
+        accepts_control_blob_ref: true,
+        attempt_id: Some(g.attempt.clone()),
+    };
+    let armed = super::super::join_egress_test_barrier::arm(&g_hex, "join_result");
+    super::super::dispatch_join_result_message(
+        &g.authority,
+        &g.joiner.agent.agent_id(),
+        true,
+        fetch(),
+    )
+    .await;
+    wait_reached(&armed.gate, "inline result").await;
+    g7_tickets_released(&g.authority).await;
+    assert_eq!(g.authority.join_result_egress_admission.in_flight(), 1);
+    // Cancel the in-flight egress (aborted and awaited).
+    super::super::quiesce_member_join_egress(&g.authority, &g.stable, &g_hex).await;
+    assert_eq!(armed.gate.parked(), 0, "the egress was cancelled");
+    assert_eq!(
+        g.authority.join_result_egress_admission.in_flight(),
+        0,
+        "the cancelled egress released its egress ticket"
+    );
+    // The next fetch is admitted and starts a new egress.
+    super::super::dispatch_join_result_message(
+        &g.authority,
+        &g.joiner.agent.agent_id(),
+        true,
+        fetch(),
+    )
+    .await;
+    let readmitted = tokio::time::timeout(Duration::from_secs(10), async {
+        while armed.gate.parked() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .is_ok();
+    drop(armed);
+    assert!(
+        readmitted,
+        "a fetch after a cancelled egress was not admitted"
+    );
+    Ok(())
+}
