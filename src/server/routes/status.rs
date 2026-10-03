@@ -292,7 +292,7 @@ pub(in crate::server) async fn shutdown_handler(
         );
     }
     tracing::info!("Shutdown requested via API");
-    let _ = state.shutdown_notify.send(true);
+    let _ = state.shutdown_notify.send_replace(true);
     let _ = state.shutdown_tx.send(()).await;
     (
         StatusCode::OK,

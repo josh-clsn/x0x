@@ -124,7 +124,7 @@ async fn finish_startup_error(
         forward_service.shutdown();
     }
     agent.begin_shutdown();
-    let _ = shutdown_notify.send(true);
+    let _ = shutdown_notify.send_replace(true);
     let handles = std::mem::take(background_tasks);
     for handle in &handles {
         handle.abort();
@@ -2855,7 +2855,7 @@ pub async fn serve_with_options(
 
         // Tell every `shutdown_notify`-watching loop (and the axum graceful
         // shutdown future) to stop.
-        let _ = state.shutdown_notify.send(true);
+        let _ = state.shutdown_notify.send_replace(true);
 
         // Drain the axum server result and propagate any failure. If the select
         // already observed it ending, `server` was consumed there and its result
@@ -5096,7 +5096,7 @@ mod member_certificate_bridge_tests {
 
         // Clean shutdown: the worker exits when the daemon's shutdown
         // watch fires.
-        let _ = state.shutdown_notify.send(true);
+        let _ = state.shutdown_notify.send_replace(true);
         tokio::time::timeout(std::time::Duration::from_secs(10), worker)
             .await
             .expect("bridge worker exits on shutdown")
@@ -5256,7 +5256,7 @@ mod member_certificate_bridge_tests {
 
         // Clean shutdown: the supervisor (still alive after the respawn)
         // exits on the daemon's shutdown watch.
-        let _ = state.shutdown_notify.send(true);
+        let _ = state.shutdown_notify.send_replace(true);
         tokio::time::timeout(std::time::Duration::from_secs(10), supervisor)
             .await
             .expect("supervisor exits on shutdown")

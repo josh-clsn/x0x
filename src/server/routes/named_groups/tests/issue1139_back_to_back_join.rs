@@ -1043,6 +1043,13 @@ struct WaJoin {
     staged: bool,
     final_state: &'static str,
     treekem: bool,
+    /// Set instead of delivering when the round trip is asked to hold the
+    /// result back: (bound attempt id, terminal event, carried links).
+    held: Option<(
+        String,
+        NamedGroupMetadataEvent,
+        Vec<NamedGroupMetadataEvent>,
+    )>,
 }
 
 impl std::fmt::Display for WaJoin {
@@ -1063,6 +1070,14 @@ async fn wa_fresh_invite_round_trip(s: &BackToBack) -> Result<WaJoin> {
 }
 
 async fn wa_fresh_invite_round_trip_on(s: &BackToBack, joiner: &Arc<AppState>) -> Result<WaJoin> {
+    wa_fresh_invite_round_trip_with(s, joiner, true).await
+}
+
+async fn wa_fresh_invite_round_trip_with(
+    s: &BackToBack,
+    joiner: &Arc<AppState>,
+    deliver: bool,
+) -> Result<WaJoin> {
     let j2_hex = hex::encode(joiner.agent.agent_id().as_bytes());
     let before: Option<String> = {
         let key = join_result_key(&s.stable_group_id, &j2_hex);
@@ -1128,6 +1143,7 @@ async fn wa_fresh_invite_round_trip_on(s: &BackToBack, joiner: &Arc<AppState>) -
         staged: false,
         final_state: "unknown",
         treekem: false,
+        held: None,
     };
     if let Some((attempt_id, Some(member_joined))) = attempt {
         s._authority.pending_join_results.write().await.clear();
@@ -1205,6 +1221,11 @@ async fn wa_fresh_invite_round_trip_on(s: &BackToBack, joiner: &Arc<AppState>) -
                 ),
                 None => (Vec::new(), Vec::new()),
             };
+            if !deliver {
+                out.held = Some((attempt_id.clone(), event, intervening_events));
+                out.final_state = wa_state(joiner, &s.group_key).await;
+                return Ok(out);
+            }
             super::super::handle_join_result_message_bound(
                 joiner,
                 &s.authority_id,
@@ -1876,5 +1897,249 @@ async fn local_only_drop_refuses_a_fork_quarantined_row() -> Result<()> {
         .and_then(|row| row.invite_lineage.as_ref())
         .expect("the quarantined row is kept");
     assert_eq!(lineage.fork_evidence.as_ref(), Some(&evidence));
+    Ok(())
+}
+
+async fn wa_tree_epoch(state: &Arc<AppState>, s: &BackToBack) -> Option<u64> {
+    let trees = state.treekem_groups.read().await;
+    let tree = trees
+        .get(&s.group_key)
+        .or_else(|| trees.get(&s.stable_group_id))
+        .cloned()?;
+    drop(trees);
+    let epoch = tree.lock().await.epoch();
+    Some(epoch)
+}
+
+async fn wa_head(state: &Arc<AppState>, s: &BackToBack) -> (u64, String) {
+    let groups = state.named_groups.read().await;
+    let row = groups.get(&s.group_key).expect("row");
+    (row.state_revision, row.state_hash.clone())
+}
+
+/// A returning-member re-key seen by a THIRD member. The authority re-keys
+/// keyless J2 (a real removal, then the ordinary add); J1, already seated
+/// with keys, applies both events through its ordinary metadata arms and
+/// must end on the authority's exact revision, state hash and epoch — and
+/// read traffic sealed after the re-key by both the authority and J2.
+#[tokio::test]
+async fn a_third_member_follows_the_returning_member_rekey() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    super::super::handle_join_result_message_bound(
+        &s.j1,
+        &s.authority_id,
+        true,
+        JoinResultMessage::Result {
+            event: Box::new(s.add_j1.event.clone()),
+            chain: Vec::new(),
+            head_attestation: None,
+            roster_certificates_b64: Vec::new(),
+            intervening_events: Vec::new(),
+            signed_by: None,
+        },
+        Some(s.j1_attempt.as_str()),
+    )
+    .await;
+    anyhow::ensure!(
+        s.j1.treekem_groups.read().await.contains_key(&s.group_key),
+        "precondition: J1 is seated with keys"
+    );
+    let j1_add =
+        apply_named_group_metadata_event(&s.j1, s.add_j2.event.clone(), s.authority_id, true, None)
+            .await;
+    anyhow::ensure!(j1_add.accepted, "precondition: J1 holds J2's original seat");
+    anyhow::ensure!(wa_head(&s.j1, &s).await == wa_head(&s._authority, &s).await);
+    s._authority
+        .named_group_test_recorders
+        .publish_bytes
+        .lock()
+        .expect("publish hook")
+        .clear();
+
+    let r = wa_stuck_keyless(&s).await?;
+    anyhow::ensure!(r.treekem, "precondition: J2 re-keyed with keys: {r}");
+
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    let published: Vec<NamedGroupMetadataEvent> = s
+        ._authority
+        .named_group_test_recorders
+        .publish_bytes
+        .lock()
+        .expect("publish hook")
+        .iter()
+        .filter_map(|(_t, b)| serde_json::from_slice::<NamedGroupMetadataEvent>(b).ok())
+        .filter(|e| match e {
+            NamedGroupMetadataEvent::MemberRemoved { agent_id, .. }
+            | NamedGroupMetadataEvent::MemberAdded { agent_id, .. } => *agent_id == j2_hex,
+            _ => false,
+        })
+        .collect();
+    let mut pair: Vec<_> = published
+        .into_iter()
+        .filter_map(|e| named_group_metadata_event_commit(&e).map(|c| (c.revision, e.clone())))
+        .collect();
+    pair.sort_by_key(|(revision, _)| *revision);
+    pair.dedup_by_key(|(revision, _)| *revision);
+    anyhow::ensure!(
+        pair.len() == 2
+            && matches!(pair[0].1, NamedGroupMetadataEvent::MemberRemoved { .. })
+            && matches!(pair[1].1, NamedGroupMetadataEvent::MemberAdded { .. }),
+        "the authority publishes the re-key as remove then add"
+    );
+    for (revision, event) in pair {
+        let applied =
+            apply_named_group_metadata_event(&s.j1, event, s.authority_id, true, None).await;
+        assert!(
+            applied.accepted,
+            "J1 must apply the re-key link at r{revision}"
+        );
+    }
+
+    let authority = wa_head(&s._authority, &s).await;
+    assert_eq!(
+        wa_head(&s.j1, &s).await,
+        authority,
+        "J1 converges on the authority's head"
+    );
+    assert_eq!(
+        wa_head(&s.j2, &s).await,
+        authority,
+        "J2 converges on the authority's head"
+    );
+    let epoch = wa_tree_epoch(&s._authority, &s).await;
+    assert!(epoch.is_some());
+    assert_eq!(
+        wa_tree_epoch(&s.j1, &s).await,
+        epoch,
+        "J1's tree follows the re-key"
+    );
+    assert_eq!(
+        wa_tree_epoch(&s.j2, &s).await,
+        epoch,
+        "J2's tree follows the re-key"
+    );
+
+    let tree = |state: &Arc<AppState>| {
+        let state = Arc::clone(state);
+        let keys = [s.group_key.clone(), s.stable_group_id.clone()];
+        async move {
+            let trees = state.treekem_groups.read().await;
+            keys.iter()
+                .find_map(|k| trees.get(k).cloned())
+                .expect("tree")
+        }
+    };
+    let (authority_tree, j1_tree, j2_tree) = (
+        tree(&s._authority).await,
+        tree(&s.j1).await,
+        tree(&s.j2).await,
+    );
+    for (sender, label) in [(&authority_tree, "authority"), (&j2_tree, "J2")] {
+        let plaintext = format!("from {label} after the re-key").into_bytes();
+        let ciphertext = sender.lock().await.encrypt_message(&plaintext)?;
+        let opened = j1_tree.lock().await.decrypt_message(&ciphertext)?;
+        assert_eq!(opened, plaintext, "J1 must read {label} after the re-key");
+    }
+    Ok(())
+}
+
+/// The device-side re-key link, applied with the REAL authority-signed
+/// removal, refuses every shape but the one it exists for, and leaves the
+/// device's head untouched when it refuses:
+/// - a removal not followed by this device's own add;
+/// - a removal of a different device (the link re-labelled);
+/// - a self-leave (actor == the removed device);
+/// - a removal that is not the last link.
+///
+/// The genuine pair, applied last, still converges (positive control).
+#[tokio::test]
+async fn the_rekey_link_refuses_every_other_carry_shape() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    super::super::finalize_join_attempt(
+        &s.j2,
+        &s.group_key,
+        &s.stable_group_id,
+        &j2_hex,
+        &s.j2_attempt,
+        super::super::JoinAttemptOutcome::TimedOut,
+        super::super::JoinFinalizeGuard::Unlocked,
+    )
+    .await;
+    let r = wa_fresh_invite_round_trip_with(&s, &s.j2, false).await?;
+    let (attempt_id, terminal, carried) = r.held.clone().context("held result")?;
+    let terminal_revision = named_group_metadata_event_commit(&terminal).map(|c| c.revision);
+    let [removal] = carried.as_slice() else {
+        anyhow::bail!("the carry is exactly the re-key removal: {carried:?}");
+    };
+    let before = wa_head(&s.j2, &s).await;
+    let attempt = |events: Vec<NamedGroupMetadataEvent>, terminal_self_add: bool| {
+        let s = &s;
+        let attempt_id = attempt_id.clone();
+        async move {
+            super::super::apply_join_result_intervening_events_for(
+                &s.j2,
+                &s.authority_id,
+                true,
+                &s.stable_group_id,
+                terminal_revision,
+                Some(attempt_id.as_str()),
+                events,
+                terminal_self_add,
+            )
+            .await;
+            wa_head(&s.j2, s).await
+        }
+    };
+    let relabel = |actor: Option<&str>, member: Option<&str>| {
+        let mut event = removal.clone();
+        if let NamedGroupMetadataEvent::MemberRemoved {
+            actor: a,
+            agent_id: m,
+            ..
+        } = &mut event
+        {
+            if let Some(actor) = actor {
+                *a = actor.to_string();
+            }
+            if let Some(member) = member {
+                *m = member.to_string();
+            }
+        }
+        event
+    };
+    let other = hex::encode(s.j1.agent.agent_id().as_bytes());
+    assert_eq!(
+        attempt(vec![removal.clone()], false).await,
+        before,
+        "no own add"
+    );
+    assert_eq!(
+        attempt(vec![relabel(None, Some(&other))], true).await,
+        before,
+        "a different device"
+    );
+    assert_eq!(
+        attempt(vec![relabel(Some(&j2_hex), None)], true).await,
+        before,
+        "a self-leave"
+    );
+    let mut earlier = removal.clone();
+    if let NamedGroupMetadataEvent::MemberRemoved {
+        commit: Some(commit),
+        ..
+    } = &mut earlier
+    {
+        commit.revision = commit.revision.saturating_sub(1);
+    }
+    assert_eq!(
+        attempt(vec![earlier, removal.clone()], true).await,
+        before,
+        "not the last link"
+    );
+    let after = attempt(vec![removal.clone()], true).await;
+    assert_ne!(after, before, "the genuine link advances the device");
     Ok(())
 }
