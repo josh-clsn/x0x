@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Self-update extraction matches the exact binary basename (#1144).**
+  Archive extraction for the `x0xd`/`x0x` self-update now accepts only a
+  regular file whose final path component is exactly the binary name,
+  refuses archives holding more than one such entry, and requires the
+  extracted file to carry the platform's native executable magic (ELF,
+  Mach-O including 64-bit fat binaries, or MZ). A macOS AppleDouble sidecar
+  (`._x0xd`), a same-named symlink, hard link or directory entry can no
+  longer be staged as the replacement binary.
+
 ## [v0.46.0] - 2026-10-01
 
 ### Added
