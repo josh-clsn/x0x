@@ -295,7 +295,7 @@ no gossip, binds nothing, and takes no instance lock.
 
 ## Update Flow (for x0xd)
 
-1. **Startup**: Check GitHub for new release, broadcast manifest to gossip if found
+1. **Startup (background, post-bind)**: after the API listener is bound — and as a non-blocking background task, so an unreachable GitHub never delays API readiness (#1086) — check GitHub for a new release and apply it if found (the startup manifest broadcast is a separate task, run by `broadcast_current_manifest`)
 2. **Gossip listener**: Receive manifests on `x0x/releases` topic, verify signature, rebroadcast, apply if newer
 3. **GitHub poller**: Periodic fallback poll, broadcast discovered manifests to gossip
 
