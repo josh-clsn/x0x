@@ -599,6 +599,22 @@ const ROUTE_CLASSIFICATION: &[(&str, RouteClass)] = &[
     ("DELETE /groups/:id", RouteClass::ControlPlane),
     ("GET /groups/:id/members", RouteClass::ControlPlane),
     ("POST /groups/:id/members", RouteClass::ControlPlane),
+    // Relay-delivered membership (the fork's engine-A lane): the same signed
+    // metadata events and join results the DM and gossip lanes carry, applied
+    // through the one metadata apply path that already owns the marker's
+    // membership rules. Control plane, like the routes that mint them.
+    (
+        "POST /groups/:id/apply-metadata-event",
+        RouteClass::ControlPlane,
+    ),
+    (
+        "GET /groups/:id/join-result/:member",
+        RouteClass::ControlPlane,
+    ),
+    (
+        "POST /groups/:id/join-result/:member",
+        RouteClass::ControlPlane,
+    ),
     (
         "DELETE /groups/:id/members/:agent_id",
         RouteClass::ControlPlane,

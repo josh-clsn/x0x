@@ -932,6 +932,11 @@ impl HeadAttestation {
 pub(in crate::server) struct ExpectedJoinResultInviter {
     inviter_agent_id: String,
     created_at: Instant,
+    /// Set when the attempt that armed the pin was finalized `TimedOut`. The
+    /// pin still authorizes a late result from this inviter (#390), but the
+    /// join no longer counts as pending: the typed membership state reports
+    /// `not_member` exactly as upstream's D39 recovery expects.
+    timed_out: bool,
 }
 
 /// Wall-clock for the same sidecar-restart reason as [`PendingJoinResult`].
@@ -16693,7 +16698,9 @@ pub(in crate::server) async fn local_join_membership_state(
         return "active";
     }
     let stable = info.stable_group_id().to_string();
-    if expected_join_result_inviter(state, &join_result_key(&stable, local_agent_hex)).is_some() {
+    if live_expected_join_result_inviter(state, &join_result_key(&stable, local_agent_hex))
+        .is_some()
+    {
         return "pending_authority_commit";
     }
     match info.members_v2.get(local_agent_hex) {
@@ -20129,44 +20136,52 @@ pub(in crate::server) async fn join_group_via_invite(
         // `mls_group_id` under a different key) keep the unconditional
         // no-op: falling through would re-insert the group under a second
         // key.
-        let converged = if invite_is_treekem && keyed_by_invite_group_id {
-            let treekem_groups = state.treekem_groups.read().await;
-            treekem_groups.contains_key(&group_id_hex)
-                || treekem_groups.contains_key(info.stable_group_id())
+        // D39 runs first, whatever the convergence: a quarantined row keeps
+        // its containment and a banned or otherwise non-member row never
+        // re-runs a join from a replayed invite. Only a live join of ours
+        // (pending, or seated without TreeKEM state) takes the convergence
+        // gate below.
+        let joiner_hex = hex::encode(agent_id.as_bytes());
+        let membership_state =
+            local_join_membership_state(state.as_ref(), &info, &joiner_hex).await;
+        let not_member_row = (membership_state == "not_member")
+            .then(|| classify_not_member_join_row(&info, &joiner_hex));
+        if not_member_row == Some(NotMemberJoinRow::Quarantined) {
+            // Review r1 P1-2: a fork-quarantined row keeps its
+            // containment; a retry never clears it.
+            return api_error_with_reason(
+                StatusCode::CONFLICT,
+                "this device's earlier join of the group is fork-quarantined, so a new \
+                 invite cannot replace it; an operator clears the marker with \
+                 POST /groups/:id/quarantine/clear, then retries the invite",
+                "fork_quarantined",
+            );
+        }
+        if not_member_row == Some(NotMemberJoinRow::UnseatedJoinRemnant) {
+            stale_not_member_row = true;
         } else {
-            // Non-TreeKEM joins complete locally at join time, so any
-            // present record is a real membership.
-            true
-        };
-        if converged {
-            // #447/#458: a converged record is still not necessarily a
-            // COMMITTED one — if our own roster seat never landed (the
-            // authority never committed our MemberAdded, or the commit was
-            // lost under churn) the response says
-            // `join_state: "pending_authority_commit"` and the signed
-            // MemberJoined volley is re-fired + re-polled instead of
-            // short-circuiting as a bare idempotent success. The one-time
-            // invite secret was never consumed by a rejection, so replaying
-            // it is safe.
-            let joiner_hex = hex::encode(agent_id.as_bytes());
-            let membership_state =
-                local_join_membership_state(state.as_ref(), &info, &joiner_hex).await;
-            let not_member_row = (membership_state == "not_member")
-                .then(|| classify_not_member_join_row(&info, &joiner_hex));
-            if not_member_row == Some(NotMemberJoinRow::Quarantined) {
-                // Review r1 P1-2: a fork-quarantined row keeps its
-                // containment; a retry never clears it.
-                return api_error_with_reason(
-                    StatusCode::CONFLICT,
-                    "this device's earlier join of the group is fork-quarantined, so a new \
-                     invite cannot replace it; an operator clears the marker with \
-                     POST /groups/:id/quarantine/clear, then retries the invite",
-                    "fork_quarantined",
-                );
-            }
-            if not_member_row == Some(NotMemberJoinRow::UnseatedJoinRemnant) {
-                stale_not_member_row = true;
+            let converged = if not_member_row.is_some() {
+                true
+            } else if invite_is_treekem && keyed_by_invite_group_id {
+                let treekem_groups = state.treekem_groups.read().await;
+                treekem_groups.contains_key(&group_id_hex)
+                    || treekem_groups.contains_key(info.stable_group_id())
             } else {
+                // Non-TreeKEM joins complete locally at join time, so any
+                // present record is a real membership.
+                true
+            };
+            if converged {
+                // #447/#458: a converged record is still not necessarily a
+                // COMMITTED one — if our own roster seat never landed (the
+                // authority never committed our MemberAdded, or the commit was
+                // lost under churn) the response says
+                // `join_state: "pending_authority_commit"` and the signed
+                // MemberJoined volley is re-fired + re-polled instead of
+                // short-circuiting as a bare idempotent success. The one-time
+                // invite secret was never consumed by a rejection, so replaying
+                // it is safe.
+
                 let still_pending = membership_state == "pending_authority_commit";
                 if still_pending {
                     let refire_state = Arc::clone(&state);
@@ -20232,12 +20247,12 @@ pub(in crate::server) async fn join_group_via_invite(
                         "chat_topic": info.general_chat_topic(),
                     })),
                 );
+            } else {
+                tracing::info!(
+                    group_id = %LogHexId::group(&group_id_hex),
+                    "replayed join for an unconverged TreeKEM stub: re-running join to re-arm the join-result gate and re-announce MemberJoined"
+                );
             }
-        } else {
-            tracing::info!(
-                group_id = %LogHexId::group(&group_id_hex),
-                "replayed join for an unconverged TreeKEM stub: re-running join to re-arm the join-result gate and re-announce MemberJoined"
-            );
         }
     }
     if let Some(remnant) = rearm_remnant {
@@ -35914,11 +35929,16 @@ const PENDING_WELCOME_TTL: Duration = PENDING_JOIN_RESULT_TTL;
 /// evicting queued DMs and outliving the poll window. Retry cadence belongs
 /// to `poll_join_result_until_membership_confirmed`, which re-delivers the
 /// event and re-enters this fetch on its own backoff.
-const WELCOME_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+const WELCOME_FETCH_UNDER_GUARD_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Upstream's in-window re-send schedule for the Welcome pull. Under the
-/// bound above only the first two sends fit; the outer join-result poll owns
-/// every later retry.
+// The TreeKEM join-result poll closes at 120s. All fetch retries and the
+// final receive wait must finish inside that window. Upstream's bound, still
+// used by the control-blob pull, which holds no membership guard.
+const WELCOME_FETCH_TIMEOUT: Duration = Duration::from_secs(115);
+
+/// Upstream's in-window re-send schedule for the Welcome pull. Under
+/// `WELCOME_FETCH_UNDER_GUARD_TIMEOUT` only the first two sends fit; the outer
+/// join-result poll owns every later retry.
 const WELCOME_FETCH_RETRY_DELAYS: [Duration; 4] = [
     Duration::ZERO,
     Duration::from_secs(5),
@@ -36082,6 +36102,7 @@ fn record_expected_join_result_inviter(state: &AppState, key: String, inviter_ag
         ExpectedJoinResultInviter {
             inviter_agent_id,
             created_at: Instant::now(),
+            timed_out: false,
         },
     );
 }
@@ -36097,6 +36118,25 @@ fn expected_join_result_inviter(state: &AppState, key: &str) -> Option<String> {
     expected
         .get(key)
         .map(|pending| pending.inviter_agent_id.clone())
+}
+
+/// The pin only while its attempt is still live: a `TimedOut` pin keeps
+/// authorizing a late result but no longer makes the join read as pending.
+fn live_expected_join_result_inviter(state: &AppState, key: &str) -> Option<String> {
+    expected_join_result_inviter(state, key)?;
+    let expected = state.expected_join_result_inviters.lock().ok()?;
+    expected
+        .get(key)
+        .filter(|pending| !pending.timed_out)
+        .map(|pending| pending.inviter_agent_id.clone())
+}
+
+fn mark_expected_join_result_inviter_timed_out(state: &AppState, key: &str) {
+    if let Ok(mut expected) = state.expected_join_result_inviters.lock() {
+        if let Some(pending) = expected.get_mut(key) {
+            pending.timed_out = true;
+        }
+    }
 }
 
 fn clear_expected_join_result_inviter(state: &AppState, key: &str) {
@@ -37510,7 +37550,9 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
     // clearing it here orphaned late deliveries as
     // `missing_expected_inviter`. `Seated`/`Refused` are terminal for the
     // pin as well and clear it. The pin's own TTL bounds the leak.
-    if outcome != JoinAttemptOutcome::TimedOut {
+    if outcome == JoinAttemptOutcome::TimedOut {
+        mark_expected_join_result_inviter_timed_out(state, &expected_key);
+    } else {
         clear_expected_join_result_inviter(state, &expected_key);
     }
     // #477 (r7 item 3): abort every owned poll/task EXCEPT the finalizer's
@@ -40902,7 +40944,7 @@ where
         welcome_ref,
         send,
         &WELCOME_FETCH_RETRY_DELAYS,
-        WELCOME_FETCH_TIMEOUT,
+        WELCOME_FETCH_UNDER_GUARD_TIMEOUT,
     )
     .await
 }

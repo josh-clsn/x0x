@@ -1322,26 +1322,20 @@ fn wa_assert_recovered(ctx: &str, r: &WaJoin) {
     );
 }
 
-/// Characterization of #1150 (known limitation in v0.46.0): after a
-/// timed-out join left the device keyless `active`, a fresh invite ALONE
-/// does not give it keys — the owner device rejects the re-join
-/// MemberJoined (the device is already an Active member) and stages no
-/// Welcome. ADR 0107 S8 (a) does NOT flip this test: its round trip clears
-/// the authority's staged results, so it pins the cache-loss limitation.
-/// The cache-preserving recovery is
-/// `adr0107_stuck_join_rearm::s8a_1150_carry_remnant_rearms_and_installs_the_original_welcome`.
+/// #1150, flipped for this fork: after a timed-out join left the device
+/// keyless `active`, a fresh invite alone is enough on the authority side —
+/// the returning-member re-key accepts the re-join MemberJoined (a fresh
+/// KeyPackage from an Active member), commits remove + add, and stages the
+/// join result with its Welcome. This harness does not deliver that
+/// result back to the device, so the device itself is still keyless here.
 #[tokio::test]
-async fn d39_1150_fresh_invite_alone_leaves_keyless_device_keyless() -> Result<()> {
+async fn d39_1150_fresh_invite_alone_rekeys_the_keyless_device() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let s = build_back_to_back(dir.path()).await?;
     let r = wa_stuck_keyless(&s).await?;
     assert!(
-        r.new_attempt
-            && !r.authority_accepted
-            && !r.staged
-            && r.final_state == "active"
-            && !r.treekem,
-        "#1150: expected keyless active with the re-join rejected: {r}"
+        r.new_attempt && r.authority_accepted && r.staged && r.final_state == "active",
+        "#1150: the authority must re-key the keyless device on a fresh invite: {r}"
     );
     Ok(())
 }
@@ -1398,10 +1392,13 @@ async fn d39_a_not_member_owner_removes_undelivered_then_fresh_invite_recovers_k
     Ok(())
 }
 
-/// `x0x group leave <id>` (`DELETE /groups/:id`) stays refused for the
-/// non-member row: the #446 guard is unchanged.
+/// `x0x group leave <id>` (`DELETE /groups/:id`) for the non-member row.
+/// This fork admits it for the DURABLE owner only, as the #376 local-only
+/// drop (TreeKEM state of a group the node no longer belongs to is wiped,
+/// nothing is published, no roster changes); a session bearer is still
+/// refused (`local_only_drop_refuses_a_session_bearer`).
 #[tokio::test]
-async fn d39_a_leave_stays_refused_for_a_not_member_row() -> Result<()> {
+async fn d39_a_leave_is_a_local_only_drop_for_a_not_member_row() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let s = build_back_to_back(dir.path()).await?;
     wa_stuck_not_member(&s).await?;
@@ -1414,13 +1411,13 @@ async fn d39_a_leave_stays_refused_for_a_not_member_row() -> Result<()> {
     .into_response();
     assert_eq!(
         response.status(),
-        StatusCode::FORBIDDEN,
-        "#446: leave stays refused"
+        StatusCode::OK,
+        "#376: the durable owner may drop a not-member row locally"
     );
     assert_eq!(
         wa_state(&s.j2, &s.group_key).await,
-        "not_member",
-        "the row is kept"
+        "no_row",
+        "the local-only drop removes the row"
     );
     Ok(())
 }
