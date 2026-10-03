@@ -36506,14 +36506,92 @@ async fn join_egress_test_point(
     }
 }
 
-/// The join-result listener's entry point (r5, G7).
+/// ADR 0107 (r5, G7): a group's share of the join-result fetch handlers.
+pub(in crate::server) const JOIN_RESULT_FETCH_PER_GROUP_CAP: usize = 4;
+
+/// ADR 0107 (r5, G7): bound on concurrent join-result fetch handlers.
+pub(in crate::server) const JOIN_RESULT_FETCH_HANDLER_CAP: usize = 32;
+
+/// ADR 0107 (r5, G7): bound on one join-result fetch handler (the
+/// owner-certificate retry, the lock wait and the selection). Its egress
+/// runs in registered tasks under the artifact's deadline.
+const JOIN_RESULT_FETCH_HANDLER_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The join-result listener's entry point (ADR 0107 r5, G7). A
+/// `FetchRequest` can wait on its group's membership lock (and runs the
+/// owner-certificate retry), so it never runs on the shared listener: it is
+/// provisionally validated (the sender is the member asked for, the group is
+/// known), admitted by [`FairAdmission`] (one in-flight handler per
+/// `(group, member)`, a per-group share, a global cap), and handled off the
+/// listener under a timeout. Every other message is handled inline as
+/// before.
 pub(in crate::server) async fn dispatch_join_result_message(
     state: &Arc<AppState>,
     sender: &AgentId,
     verified: bool,
     msg: JoinResultMessage,
 ) {
-    handle_join_result_message(state, sender, verified, msg).await;
+    let JoinResultMessage::FetchRequest {
+        group_id,
+        member_agent_id,
+        ..
+    } = &msg
+    else {
+        handle_join_result_message(state, sender, verified, msg).await;
+        return;
+    };
+    let sender_hex = hex::encode(sender.as_bytes());
+    if sender_hex != *member_agent_id {
+        tracing::warn!(group_id = %LogHexId::group(group_id), sender = %LogHexId::agent(&sender_hex), member = %LogHexId::agent(member_agent_id), "ignoring unauthorized join-result fetch");
+        return;
+    }
+    let stable_group = {
+        let roster = state.named_groups.read().await;
+        crate::server::resolve_group_entry_locked(&roster, group_id)
+            .map(|(_, info)| info.stable_group_id().to_string())
+    };
+    let Some(stable_group) = stable_group else {
+        tracing::debug!(group_id = %LogHexId::group(group_id), "join-result fetch for an unknown group; dropped");
+        return;
+    };
+    let ticket = match state.join_result_fetch_admission.try_admit(
+        &join_result_key(&stable_group, member_agent_id),
+        &stable_group,
+    ) {
+        Ok(ticket) => ticket,
+        Err(refusal) => {
+            tracing::debug!(
+                group_id = %LogHexId::group(group_id),
+                member = %LogHexId::agent(member_agent_id),
+                ?refusal,
+                "join-result fetch not admitted; the joiner retries"
+            );
+            return;
+        }
+    };
+    let task_state = Arc::clone(state);
+    let requester = *sender;
+    let worker = tokio::spawn(async move {
+        tokio::time::timeout(
+            JOIN_RESULT_FETCH_HANDLER_TIMEOUT,
+            handle_join_result_message(&task_state, &requester, verified, msg),
+        )
+        .await
+        .is_err()
+    });
+    // Supervisor: holds the admission ticket until the handler ends and
+    // reports a handler that panicked or timed out.
+    tokio::spawn(async move {
+        let _ticket = ticket;
+        match worker.await {
+            Ok(false) => {}
+            Ok(true) => tracing::warn!("join-result fetch handler timed out; the joiner retries"),
+            Err(e) if e.is_panic() => {
+                tracing::error!("join-result fetch handler panicked: {e}");
+            }
+            Err(_) => {}
+        }
+    });
 }
 
 pub(in crate::server) async fn handle_join_result_message(
@@ -39536,6 +39614,10 @@ pub(in crate::server) mod tests {
             welcome_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
                 crate::server::routes::named_groups::WELCOME_FETCH_PER_GROUP_CAP,
                 crate::server::routes::named_groups::WELCOME_FETCH_HANDLER_CAP,
+            ),
+            join_result_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
+                crate::server::routes::named_groups::JOIN_RESULT_FETCH_PER_GROUP_CAP,
+                crate::server::routes::named_groups::JOIN_RESULT_FETCH_HANDLER_CAP,
             ),
             control_blobs: ControlBlobState::default(),
             treekem_pending_events: RwLock::new(HashMap::new()),
