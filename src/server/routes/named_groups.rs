@@ -12356,7 +12356,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                             Err(_) => return ApplyMetadataResult::REJECTED,
                         }
                     } else if let Some(welcome_ref) = welcome_ref {
-                        match fetch_treekem_welcome_with_retries(state, &group_id, &welcome_ref).await {
+                        match fetch_treekem_welcome_with_retries(state, &group_id, &welcome_ref)
+                            .await
+                        {
                             Ok(bytes) => bytes,
                             Err(e) => {
                                 tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), welcome_id = %welcome_ref.welcome_id, "failed to fetch TreeKEM Welcome blob (bounded attempt; the join-result poll re-drives): {e}");
@@ -13456,7 +13458,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                             Err(_) => return ApplyMetadataResult::REJECTED,
                         }
                     } else if let Some(welcome_ref) = welcome_ref {
-                        match fetch_treekem_welcome_with_retries(state, &group_id, &welcome_ref).await {
+                        match fetch_treekem_welcome_with_retries(state, &group_id, &welcome_ref)
+                            .await
+                        {
                             Ok(bytes) => bytes,
                             Err(e) => {
                                 tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), welcome_id = %welcome_ref.welcome_id, "failed to fetch TreeKEM Welcome blob (bounded attempt; the join-result poll re-drives): {e}");
@@ -14285,16 +14289,16 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 )
                 .await
                 {
-                        Ok(cert) => cert,
-                        Err(failure) => {
-                            tracing::info!(
-                                group_id = %LogHexId::group(&resolved_group_key),
-                                member = %LogHexId::agent(&member_agent_id),
-                                "MemberJoined re-key: refusing OwnerCertified re-key ({failure})"
-                            );
-                            return ApplyMetadataResult::REJECTED;
-                        }
-                    };
+                    Ok(cert) => cert,
+                    Err(failure) => {
+                        tracing::info!(
+                            group_id = %LogHexId::group(&resolved_group_key),
+                            member = %LogHexId::agent(&member_agent_id),
+                            "MemberJoined re-key: refusing OwnerCertified re-key ({failure})"
+                        );
+                        return ApplyMetadataResult::REJECTED;
+                    }
+                };
                 let group = {
                     let map = state.treekem_groups.read().await;
                     map.get(&resolved_group_key).cloned()
@@ -38859,10 +38863,9 @@ async fn handle_welcome_fetch_request(
         // A concurrent restage can replace this content id between the read
         // above and this write. Only tear down the stream for an entry that is
         // still expired while holding the same lock as staging.
-        if welcomes
-            .get(&welcome_id)
-            .is_some_and(|current| !staging_entry_fresh(current.created_at_ms, PENDING_WELCOME_TTL, now_millis_u64()))
-        {
+        if welcomes.get(&welcome_id).is_some_and(|current| {
+            !staging_entry_fresh(current.created_at_ms, PENDING_WELCOME_TTL, now_millis_u64())
+        }) {
             welcomes.remove(&welcome_id);
             let mut streams = state.pending_welcome_streams.lock().await;
             if let Some(stream) = streams
@@ -44625,7 +44628,9 @@ pub(in crate::server) mod tests {
             payload,
         });
 
-        state.named_group_test_recorders.publish_attempts
+        state
+            .named_group_test_recorders
+            .publish_attempts
             .lock()
             .expect("publish-attempt recorder poisoned")
             .clear();
@@ -44647,7 +44652,9 @@ pub(in crate::server) mod tests {
         .await;
 
         assert!(
-            state.named_group_test_recorders.publish_attempts
+            state
+                .named_group_test_recorders
+                .publish_attempts
                 .lock()
                 .expect("publish-attempt recorder poisoned")
                 .iter()
@@ -52209,7 +52216,8 @@ pub(in crate::server) mod tests {
                 group_id: group_id.clone(),
                 joiner_agent: hex::encode(joiner_id.as_bytes()),
                 bytes,
-                created_at_ms: now_millis_u64().saturating_sub(PENDING_WELCOME_TTL.as_millis() as u64 + 1_000),
+                created_at_ms: now_millis_u64()
+                    .saturating_sub(PENDING_WELCOME_TTL.as_millis() as u64 + 1_000),
             },
         );
         let active = Arc::new(AtomicBool::new(false));
@@ -52446,7 +52454,8 @@ pub(in crate::server) mod tests {
                 group_id: group_id.clone(),
                 joiner_agent: joiner_id.clone(),
                 bytes: bytes.clone(),
-                created_at_ms: now_millis_u64().saturating_sub(PENDING_WELCOME_TTL.as_millis() as u64 + 1_000),
+                created_at_ms: now_millis_u64()
+                    .saturating_sub(PENDING_WELCOME_TTL.as_millis() as u64 + 1_000),
             },
         );
         let active = Arc::new(AtomicBool::new(false));
@@ -54530,8 +54539,14 @@ pub(in crate::server) mod tests {
 
     /// Recipients recorded for a `MemberRemoved` direct delivery of `group_id`
     /// on the given path ("direct" or "delayed").
-    fn member_removed_delivery_recipients(state: &AppState, group_id: &str, path: &str) -> Vec<String> {
-        state.named_group_test_recorders.direct_deliveries
+    fn member_removed_delivery_recipients(
+        state: &AppState,
+        group_id: &str,
+        path: &str,
+    ) -> Vec<String> {
+        state
+            .named_group_test_recorders
+            .direct_deliveries
             .lock()
             .expect("delivery recorder poisoned")
             .iter()
@@ -54550,7 +54565,9 @@ pub(in crate::server) mod tests {
     #[tokio::test]
     async fn self_leave_wipes_treekem_event_log() -> Result<()> {
         let f = departure_fixture(0x66, x0x::mls::SecureGroupPlane::TreeKem, true).await?;
-        f.state.named_group_test_recorders.direct_deliveries
+        f.state
+            .named_group_test_recorders
+            .direct_deliveries
             .lock()
             .expect("delivery recorder poisoned")
             .clear();
@@ -54572,7 +54589,8 @@ pub(in crate::server) mod tests {
         assert_departure_wiped_treekem_state(&f.state, &f.aliases(), "treekem self-leave").await;
         for path in ["direct", "delayed"] {
             assert!(
-                member_removed_delivery_recipients(&f.state, &f.stable_group_id, path).contains(&f.peer_hex),
+                member_removed_delivery_recipients(&f.state, &f.stable_group_id, path)
+                    .contains(&f.peer_hex),
                 "the leave event must still be direct-delivered ({path}) to the remaining member"
             );
         }
@@ -57118,7 +57136,9 @@ pub(in crate::server) mod tests {
             .lock()
             .expect("expected-inviter map poisoned")
             .clear();
-        joiner.named_group_test_recorders.publish_attempts
+        joiner
+            .named_group_test_recorders
+            .publish_attempts
             .lock()
             .expect("publish-attempt recorder poisoned")
             .clear();
@@ -57151,7 +57171,9 @@ pub(in crate::server) mod tests {
             "retry re-arms the expected-inviter gate lost to the restart"
         );
         assert!(
-            !joiner.named_group_test_recorders.publish_attempts
+            !joiner
+                .named_group_test_recorders
+                .publish_attempts
                 .lock()
                 .expect("publish-attempt recorder poisoned")
                 .is_empty(),
@@ -57187,7 +57209,9 @@ pub(in crate::server) mod tests {
             );
             info.recompute_state_hash();
         }
-        joiner.named_group_test_recorders.publish_attempts
+        joiner
+            .named_group_test_recorders
+            .publish_attempts
             .lock()
             .expect("publish-attempt recorder poisoned")
             .clear();
@@ -57209,7 +57233,9 @@ pub(in crate::server) mod tests {
             "converged replay stays the idempotent no-op, body: {body}"
         );
         assert!(
-            joiner.named_group_test_recorders.publish_attempts
+            joiner
+                .named_group_test_recorders
+                .publish_attempts
                 .lock()
                 .expect("publish-attempt recorder poisoned")
                 .is_empty(),
