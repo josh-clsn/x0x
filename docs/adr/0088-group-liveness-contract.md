@@ -6,7 +6,7 @@
 - **Reviewers:** Codex (cross-model review of the text), Root
 - **Supersedes:** ADR 0038, ADR 0060, ADR 0069; in part ADR 0064 Decision §3 and ADR 0066 §2. Each supersession takes effect only when the slice ADR named in the supersession table is Accepted.
 - **Superseded by:** none
-- **Related:** charter invariant I8; rulings D16, D34, D37–D42; ADR 0106 (slice S1); ADR 0016, 0007, 0059, 0062, 0085, 0087, 0089, 0093; #1139, #1143, #1023, #811, #818, #871, #824, #1113, #1146, #1149, #1150, #646. Serves vision **R3** (all my machines connected) and the "shared places" core.
+- **Related:** charter invariant I8; rulings D16, D34, D37–D42, D54, D55; ADR 0106 (slice S1); ADR 0016, 0007, 0059, 0062, 0085, 0087, 0089, 0093; #1139, #1143, #1023, #811, #818, #871, #824, #1113, #1146, #1149, #1150, #646. Serves vision **R3** (all my machines connected) and the "shared places" core.
 
 **Naming.** This ADR is **group liveness (0088)**: membership, admission, catch-up and repair inside named groups and Home. ADR 0104 (prov.) is the separate transport liveness ADR, which supersedes ADR 0002. Reviews and briefs should name 0088 as "group liveness".
 
@@ -78,12 +78,16 @@ Definitions:
 
 **L4. No safety is traded.** These rules stay fail-closed: signature, sender authority, prev-hash linkage, owner mandate, fork evidence, revocation and the TreeKEM adoption exclusion. A slice meets L1 by carrying or fetching verified evidence. A slice that adds or relaxes an acceptance rule states that explicitly, with its own security argument (as ADR 0106 states it adds none).
 
-### §2 May block forever (draft; open question G2)
+### §2 May block forever (D54)
 
 1. Re-admission of a revoked or banned identity.
 2. An OwnerCertified joiner whose certificate fails against the group's owner: invalid, wrong owner, revoked or expired.
-3. No active admin is ever online (admission, eviction). For catch-up and repair: no holder of the needed bytes is ever online.
+3. No active admin is ever online (admission, eviction).
 4. Decryption of epochs the member was never admitted to.
+5. A group its owner deleted. After a signed delete, nothing for that group completes.
+6. A removed member's catch-up on epochs after its removal.
+7. An ordinary group forked with no owner anchor. It stays quarantined until an admin acts by hand (ADR 0066).
+8. Evidence whose holders are all offline. A fetch waits until one holder is online.
 
 Everything else completes under L1.
 
@@ -98,7 +102,7 @@ Supersessions and amendments take effect when the named slice is Accepted. Until
 | 0069 Home waits for owner sync | Superseded | S7 | Auto-provisioning stops |
 | 0064 Decision §3 | Superseded in part | S3 | A quarantined node gets a self-recovery re-seat path (#871) |
 | 0066 §2 | Superseded in part | S3 | An active admin's signed terminal snapshot lets a stale or forked node recover itself, never anyone else (D41) |
-| 0062 Home persistence pair | Decided here, with S7 | S7 | Status ruling: open question G5 |
+| 0062 Home persistence pair | Decided (D54) | — | Accepted (record) of its option 1, which #617 shipped and D42 keeps |
 | 0016 §6 | Amended | S4 | The deterministic committer rule extends to revocation evictions (D40) |
 | 0007 consent | Amended | S2 | The owner certificate is disclosed to Home members only (D38) |
 | 0059 InviteV4, 0064 §1a | Amended | S6 | Inviter pinning and the mandate preimage allow any-admin redemption |
@@ -107,7 +111,7 @@ Supersessions and amendments take effect when the named slice is Accepted. Until
 
 Each slice is its own ADR. Each one:
 - names the L-rule and the holes it closes;
-- has a failing reproduction before its fix (open question G4);
+- has its failure reproduced in the W3-H harness before its fix (D16, D54). The only exception is S8 (a), the joiner re-arm for #1150: it ships in v0.46.1 with its committed in-process red test, and its W3-H case follows (D55);
 - puts any wire change behind an ADR 0093 capability bit;
 - versions any persisted state per ADR 0085;
 - is Accepted by David before its code merges (ADR 0087 rule 8).
@@ -118,22 +122,25 @@ Each slice is its own ADR. Each one:
 | S2 Home-scoped owner certificate plus verdict rule | #1143, then #1023's structural part | D38 | wire, probably the ADR 0089 EvidenceV1 carrier; size it first |
 | S3 Ownerless attestation, self-recovery only | #818 part 2, #871 | D34(1), D41 | wire plus a 0093 bit; a quarantine "retired" state |
 | S4 Revocation eviction, designated first | #1113 | D34(2), D40 | protocol rule; a persisted obligation; the bound value is proposed in S4 |
-| S5 Evidence size K plus fetch-by-hash | #811 family, the certificate-carry family, the #646 primitive; catch-up as control blobs | D34(3) | wire plus a 0093 bit; a holder store |
+| S5 Evidence size K plus fetch-by-hash from any holder; the single carry rule | #811 family, the certificate-carry family, the #646 primitive; catch-up as control blobs | D34(3), D54 | wire plus a 0093 bit; a holder store. No persisted authority catch-up log (D54) |
 | S6 Any-admin invite redemption | offline-inviter gap | D16 | wire plus a bit |
 | S7 Home as an explicit owner group, adopted in place | #824 residual, #1023 structure | D16, D42 | no new closed-enum Tier-1 kind; a mixed-version check |
-| S8 Stuck join rows: joiner re-arm, then authority re-Welcome | #1150, #1149, #1146 residual | D39 findings | (a) none; (b) a protocol rule reusing S4's committer |
+| S8 Stuck join rows: (a) joiner re-arm, then (b) authority re-Welcome | #1150, #1149, #1146 residual | D39 findings, D55 for (a) | (a) none; ships in v0.46.1 (D55); (b) a protocol rule reusing S4's committer |
 
 **Acceptance order:** this contract, then S2 and S8, then S4 and S3, then S5, then S6, then S7. Slice code that touches `named_groups.rs` lands on one lane at a time.
 
-## Open questions for David
+## Rulings and open questions
 
-These are not decided by this draft. The proposals come from the 2026-10-03 backlog plan (§G).
+David ruled G2–G6 on 2026-10-03 (D54, D55):
 
-- **G2, the §2 list.** Is §2 complete and correct as drafted?
-- **G3, catch-up storage.** S5 fetch-by-hash from any holder (proposed), or a persisted authority catch-up log that replaces ADR 0106's in-memory log (a storage-format change under ADR 0085)? Catch-up as control blobs is proposed under S5.
-- **G4, harness first.** Do committed in-process red tests count as "harness first" for S2 and S8, ported to the W3-H harness later (proposed)? The other option is that every slice waits for W3-H.
-- **G5, ADR 0062.** Accepted (record) of its option 1, which #617 shipped and D42 keeps (proposed)? Or Rejected or Deprecated? "Withdrawn" is not a governance status.
-- **G6, stop per-case certificate-carry patches** (design health check). Proposed: no new carry patch outside S2 and S5; S2 is a rule change, and S5 is the single carry rule.
+- **G2, the §2 list:** the draft plus items 5–8 (D54).
+- **G3, catch-up storage:** fetch-by-hash from any holder (S5), not a persisted authority catch-up log. Catch-up as control blobs belongs under S5 (D54).
+- **G4, harness first:** in-process red tests do NOT count. D16 stands: the W3-H harness reproduces each failure first (D54). The one exception is S8 (a) for #1150 (D55).
+- **G5, ADR 0062:** Accepted (record) of option 1, which #617 shipped (D54).
+- **G6, per-case certificate-carry patches:** stopped. S2 (#1143) is a rule change, and S5 is the single carry rule (D54). No new carry patch lands outside them.
+
+Still open for David:
+
 - **G7, typed terminal blocks (L3).** Should L3 bind every slice, including the 120 s join poll that gives up before the 10-minute #946 refusal is staged? Or should it stay a goal?
 
 ## Consequences
