@@ -99,8 +99,9 @@ Supersessions and amendments take effect when the named slice is Accepted. Until
 
 | ADR | Effect | Through slice | What changes |
 |---|---|---|---|
-| 0038 Home: seal-time owner-certificate re-check | Superseded in part | S2 | The owner certificate is checked at admission, not re-checked at every seal |
+| 0038 Home: the seal-time owner-certificate verdict | Amended (interim) | S2 | A Home-scoped owner certificate and a new verdict rule. The check still runs at seal; an anonymous public announce no longer invalidates the Home-scoped certificate |
 | 0038 Home: evict at next seal | Superseded in part | S4 | Revocation is by bounded eviction |
+| 0038 Home: seal-time re-checks | Superseded in part | S7, only once S4 is in effect | The certificate is checked at admission only, and seals stop re-checking. This retirement waits until S4's revocation enforcement is Accepted and shipped, because the re-check is today's revocation path |
 | 0038 Home: the auto-provisioned personal space | Superseded in part | S7 | Home is an explicit owner group, with the existing Home adopted in place |
 | 0038 as a whole | Superseded | S2, S4 and S7 | Only once all three are Accepted. Until then, every 0038 provision not yet replaced stays in force |
 | 0060 Home is elected | Superseded | S7 | Election stops; the existing canonical Home is adopted in place (D42) |
@@ -126,12 +127,12 @@ Each later slice is its own ADR. Each one:
 | Slice | Closes | Rulings | Wire or storage |
 |---|---|---|---|
 | S1 = ADR 0106 (Accepted) | #1139, small gaps | D16 hole (a) | additive field |
-| S2 Home-scoped owner certificate plus verdict rule: disclosed to Home members only; public announces stay anonymous; an anonymous public announce never invalidates the Home-scoped certificate | #1143, then #1023's structural part | D38 | wire, probably the ADR 0089 EvidenceV1 carrier; size it first |
+| S2 Home-scoped owner certificate plus verdict rule (interim: still checked at seal; the seal-time re-checks retire later, in S7): disclosed to Home members only; public announces stay anonymous; an anonymous public announce never invalidates the Home-scoped certificate | #1143, then #1023's structural part | D38 | wire, probably the ADR 0089 EvidenceV1 carrier; size it first |
 | S3 Ownerless attestation, self-recovery only: automatic stale-base catch-up; unanchored-fork re-seat only under an admin's manual authorisation (§2 item 7) | #818 part 2, #871 | D34(1), D41 | wire plus a 0093 bit; a quarantine "retired" state |
 | S4 Revocation eviction, designated first: the lowest online active-admin ID first, any other online admin after the bound | #1113 | D34(2), D40 | protocol rule; a persisted obligation; the bound value is proposed in S4 |
 | S5 Evidence size K plus fetch-by-hash from any holder; the single carry rule | #811 family, the certificate-carry family, the #646 primitive; catch-up as control blobs | D34(3), D54 | wire plus a 0093 bit; a holder store. No persisted authority catch-up log (D54) |
 | S6 Any-admin invite redemption | offline-inviter gap | D16 | wire plus a bit |
-| S7 Home as an explicit owner group, adopted in place | #824 residual, #1023 structure | D16, D42 | no new closed-enum Tier-1 kind; a mixed-version check |
+| S7 Home as an explicit owner group, adopted in place; the admission-only check replaces the seal-time re-checks once S4 is in effect | #824 residual, #1023 structure | D16, D42 | no new closed-enum Tier-1 kind; a mixed-version check |
 | S8 Stuck join rows: (a) joiner re-arm, then (b) authority re-Welcome | #1150, #1149, #1146 residual | D39 findings, D55 for (a) | (a) none; ships in v0.46.1 (D55); (b) a protocol rule reusing S4's committer |
 
 **Acceptance order:** this contract, then S2 and S8, then S4 and S3, then S5, then S6, then S7. Slice code that touches `named_groups.rs` lands on one lane at a time.
