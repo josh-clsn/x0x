@@ -12146,6 +12146,12 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 drop(mls_groups);
             }
             if removed_self {
+                // ADR 0107 (r5, G5): this node no longer serves the group's
+                // join artifacts — retire them before the group leaves the
+                // roster.
+                let artifact_aliases =
+                    join_artifact_group_aliases(state, &resolved_group_key).await;
+                retire_local_group_join_artifacts(state, &artifact_aliases).await;
                 state
                     .group_card_cache
                     .write()
@@ -20851,6 +20857,11 @@ async fn drop_local_named_group_state(
     stable_group_id: Option<&str>,
     reason: &str,
 ) -> bool {
+    // ADR 0107 (r5, G5): retire the group's join-artifact serving state
+    // (quiesce, awaited, then purge) before the group leaves the roster.
+    let mut artifact_aliases = join_artifact_group_aliases(state, id).await;
+    artifact_aliases.extend(stable_group_id.map(str::to_string));
+    retire_local_group_join_artifacts(state, &artifact_aliases).await;
     let cache_aliases = treekem_cache_group_aliases(state, id).await;
     let stable_group_id = stable_group_id.filter(|stable| *stable != id);
     // #457 r8 items 8.3/8.8 — DELETE ORDERING (reworked from r7):
@@ -21133,6 +21144,10 @@ async fn leave_treekem_group(
         }
     };
 
+    // ADR 0107 (r5, G5): retire the group's join-artifact serving state
+    // before the group leaves the roster.
+    let artifact_aliases = join_artifact_group_aliases(&state, &id).await;
+    retire_local_group_join_artifacts(&state, &artifact_aliases).await;
     let cache_aliases = treekem_cache_group_aliases(&state, &id).await;
     if !matches!(
         persist_named_groups_mutation(&state, |groups| {
@@ -22450,6 +22465,10 @@ pub(in crate::server) async fn leave_group(
     spawn_named_group_event_delivery_to_active_members(&state, &delivery_roster, &event, &[]);
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
+    // ADR 0107 (r5, G5): retire the group's join-artifact serving state
+    // before the group leaves the roster.
+    let artifact_aliases = join_artifact_group_aliases(&state, &id).await;
+    retire_local_group_join_artifacts(&state, &artifact_aliases).await;
     let cache_aliases = treekem_cache_group_aliases(&state, &id).await;
     let _ = prune_treekem_cache_groups(&state, &cache_aliases, "leave_group").await;
     if !matches!(
@@ -35856,6 +35875,12 @@ async fn quiesce_member_join_egress(state: &AppState, group_id: &str, member_hex
 /// commit, so nothing is still running when the commit lands.
 async fn quiesce_group_join_egress(state: &AppState, group_id: &str) {
     let aliases = join_artifact_group_aliases(state, group_id).await;
+    quiesce_join_egress_for_aliases(state, &aliases).await;
+}
+
+/// [`quiesce_group_join_egress`] for an alias set captured by the caller
+/// (a local drop captures it before the group leaves the roster).
+async fn quiesce_join_egress_for_aliases(state: &AppState, aliases: &HashSet<String>) {
     let tasks: Vec<tokio::task::JoinHandle<()>> = {
         let mut registry = state
             .join_artifact_egress
@@ -35886,6 +35911,53 @@ async fn quiesce_group_join_egress(state: &AppState, group_id: &str) {
         .map(|(id, _)| id.clone())
         .collect();
     stop_welcome_streams(state, &welcome_ids).await;
+}
+
+/// ADR 0107 (r5, G5): a local drop or leave retires the group's
+/// join-artifact serving state: it quiesces every egress (awaited), then
+/// purges the staged originals, Welcomes (with their ACK slots), staged
+/// copies and idle staging guards under every spelling in `aliases`.
+/// Callers capture `aliases` (see [`join_artifact_group_aliases`]) before
+/// the group leaves the roster.
+async fn retire_local_group_join_artifacts(state: &AppState, aliases: &HashSet<String>) {
+    quiesce_join_egress_for_aliases(state, aliases).await;
+    state
+        .pending_join_results
+        .write()
+        .await
+        .retain(|key, pending| {
+            !join_result_key_matches_any_group_alias(key, aliases)
+                && !group_id_matches_any_alias(
+                    named_group_metadata_event_group_id(&pending.event),
+                    aliases,
+                )
+        });
+    let purged_welcomes: Vec<String> = {
+        let mut welcomes = state.pending_welcomes.write().await;
+        let ids: Vec<String> = welcomes
+            .iter()
+            .filter(|(_, pending)| aliases.contains(&pending.group_id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &ids {
+            welcomes.remove(id);
+        }
+        ids
+    };
+    if !purged_welcomes.is_empty() {
+        let mut acks = state.pending_welcome_acks.write().await;
+        for id in &purged_welcomes {
+            acks.remove(id);
+        }
+    }
+    state.control_blobs.prune_groups(aliases);
+    state
+        .join_result_staging_guards
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .retain(|(group, _), semaphore| {
+            !(aliases.contains(group) && semaphore.available_permits() == 1)
+        });
 }
 
 /// ADR 0107 (review r2): the staged result `staged_at` is still the one to
