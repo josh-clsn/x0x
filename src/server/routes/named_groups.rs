@@ -11804,7 +11804,11 @@ fn ensure_listeners_after_local_admission<'a>(
     accepted: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
     Box::pin(async move {
-        if !accepted {
+        // Once shutdown is requested the drain has already taken the listener
+        // registries; a listener spawned now would be registered nowhere the
+        // drain can reach and would keep `AppState` (and the exclusive history
+        // handle) alive past the instance lock (#661).
+        if !accepted || *state.shutdown_notify.borrow() {
             return;
         }
         let resolved = {
