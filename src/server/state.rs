@@ -1310,6 +1310,9 @@ pub(super) struct NamedGroupTestRecorders {
     /// ADR 0107 / D60 (r5, G11): every class-K share delivery scheduled, as
     /// `(group, recipient, exact payload)`.
     pub(super) secure_share_scheduled: StdMutex<Vec<(String, String, Vec<u8>)>>,
+    /// ADR 0107 (r6): seconds added to the stream seam's clock, to land a
+    /// certificate expiry between the pre-phase and the seam.
+    pub(super) seam_clock_skew_secs: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(test)]

@@ -4336,3 +4336,66 @@ async fn s8a_r5_g13_real_deadline_cuts_a_stalled_exchange() -> anyhow::Result<()
     pair.bob.agent.shutdown().await;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Round 6 (Codex review of a8acd0d).
+// ---------------------------------------------------------------------------
+
+/// WHY (r6 P1): the seam must take the roster verdict at the SEAM's clock,
+/// not the pre-phase snapshot's. J2's resolved announced certificate (a
+/// rotation, so the embedded one is stale) expires between the pre-phase
+/// and the seam while the embedded certificate stays valid: the snapshot
+/// still says Clean, the seam must refuse.
+#[tokio::test]
+async fn s8a_r6_verdict_expiry_between_pre_phase_and_seam_is_refused() -> anyhow::Result<()> {
+    use x0x::groups::owner_cert::MemberCertStatus;
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    let j2_hex = hex_of(&s.j2);
+    let owner_kp = x0x::identity::UserKeypair::from_seed(&OWNER_SEED)?;
+    let owner_id = owner_kp.user_id();
+    let announced = x0x::identity::AgentCertificate::issue_with_expiry(
+        &owner_kp,
+        &keypair(&s.j2_kp)?,
+        Some(x0x::groups::owner_cert::restore_clock_now() + 120),
+    )?;
+    let digest = x0x::announce_v3::cert_digest(&Some(owner_id), &Some(announced.clone()));
+    insert_discovery_entry(
+        &s.authority,
+        s.j2.agent.agent_id(),
+        Some(owner_id),
+        Some(announced),
+        Some(digest),
+    )
+    .await;
+    assert_eq!(
+        roster_verdict(&s.authority, &s.group_key, &j2_hex).await,
+        Some(MemberCertStatus::Clean),
+        "control: the resolved announced certificate is Clean now"
+    );
+    // The seam runs an hour later than the pre-phase: past the announced
+    // certificate's expiry and its 300 s clock-skew tolerance, while the
+    // embedded one is still valid.
+    s.authority
+        .named_group_test_recorders
+        .seam_clock_skew_secs
+        .store(3600, std::sync::atomic::Ordering::SeqCst);
+    let welcome_id = welcome_id_of(&s.j2_add).expect("welcome ref");
+    clear_egress(&s.authority);
+    assert!(serve_welcome(&s.authority, &s.j2, &s.stable, &welcome_id).await);
+    assert!(
+        transport_seen(&s.authority, &j2_hex, "welcome_frame").await,
+        "the Welcome chunk reached the transport"
+    );
+    assert!(
+        !egress_happens(
+            &s.authority,
+            &j2_hex,
+            "welcome_frame",
+            Duration::from_secs(1)
+        )
+        .await,
+        "the seam admitted bytes on a verdict that expired after the pre-phase"
+    );
+    Ok(())
+}

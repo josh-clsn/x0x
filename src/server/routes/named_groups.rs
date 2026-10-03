@@ -35867,7 +35867,7 @@ fn join_artifact_seam_refusal(
         Ok(set) => set.is_agent_revoked(&member),
         Err(_) => return Some(JoinArtifactRefusal::SeamContended),
     };
-    let now_unix = x0x::groups::owner_cert::restore_clock_now();
+    let now_unix = join_artifact_seam_now(state);
     let probe = {
         let Ok(roster) = state.named_groups.try_read() else {
             return Some(JoinArtifactRefusal::SeamContended);
@@ -35885,6 +35885,23 @@ fn join_artifact_seam_refusal(
         return Some(JoinArtifactRefusal::SeamContended);
     };
     join_artifact_verdict_refusal(probe, evidence, member_hex)
+}
+
+/// The wall clock the stream seam evaluates certificates with (unix
+/// seconds). Test builds can skew it per `AppState` to land a certificate
+/// expiry deterministically between the pre-phase and the seam.
+fn join_artifact_seam_now(state: &AppState) -> u64 {
+    let now = x0x::groups::owner_cert::restore_clock_now();
+    #[cfg(test)]
+    let now = now.saturating_add(
+        state
+            .named_group_test_recorders
+            .seam_clock_skew_secs
+            .load(std::sync::atomic::Ordering::SeqCst),
+    );
+    #[cfg(not(test))]
+    let _ = state;
+    now
 }
 
 /// Every spelling (map key, stable id, MLS id) this node holds the group
