@@ -799,28 +799,57 @@ pub(in crate::server) async fn handle_control_blob_message(
                 // membership lock, inside a registered egress task (a
                 // removal or ban cancels it before committing). The lock is
                 // taken in the task, never on this listener.
-                let Ok(permit) = Arc::clone(&state.control_blobs.0.chunk_slots).try_acquire_owned()
-                else {
-                    tracing::warn!("control blob chunk send slots exhausted");
+                // r5 (G8): validate before taking any capacity — the copy
+                // is staged and bound to an original, and the sequence
+                // exists — then fair admission: one in-flight task per
+                // chunk (duplicates coalesce) and a per-group share of the
+                // global cap. The authoritative checks run in the task.
+                let Some(origin) = state.control_blobs.staged_origin(&reference) else {
+                    tracing::debug!(
+                        group_id = %LogHexId::group(&reference.group_id),
+                        "join-result chunk fetch for no staged copy; dropped"
+                    );
                     return;
+                };
+                if u64::from(sequence) >= reference.byte_len.div_ceil(CHUNK_BYTES as u64) {
+                    tracing::debug!(
+                        group_id = %LogHexId::group(&reference.group_id),
+                        sequence,
+                        "join-result chunk fetch past the copy's last chunk; dropped"
+                    );
+                    return;
+                }
+                let admission_key =
+                    format!("{}:{}:{sequence}", reference.digest, reference.recipient);
+                let ticket = match state
+                    .join_result_chunk_admission
+                    .try_admit(&admission_key, &reference.group_id)
+                {
+                    Ok(ticket) => ticket,
+                    Err(refusal) => {
+                        tracing::debug!(
+                            group_id = %LogHexId::group(&reference.group_id),
+                            sequence,
+                            ?refusal,
+                            "join-result chunk fetch not admitted; the joiner retries"
+                        );
+                        return;
+                    }
                 };
                 let task_state = Arc::clone(state);
                 let recipient = *sender;
                 let group_id = reference.group_id.clone();
                 let member_hex = reference.recipient.clone();
                 // r5: the task, like the copy, dies at the original's
-                // deadline (an unknown copy refuses at once).
-                let deadline = state
-                    .control_blobs
-                    .staged_origin(&reference)
-                    .map_or_else(Instant::now, |origin| origin.deadline);
+                // deadline.
+                let deadline = origin.deadline;
                 super::spawn_join_artifact_egress(
                     state,
                     &group_id,
                     &member_hex,
                     deadline,
                     async move {
-                        let _permit = permit;
+                        let _ticket = ticket;
                         let Some(chunk) =
                             super::join_result_chunk_if_servable(&task_state, &reference, sequence)
                                 .await

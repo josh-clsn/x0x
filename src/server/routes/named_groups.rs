@@ -36506,6 +36506,12 @@ async fn join_egress_test_point(
     }
 }
 
+/// ADR 0107 (r5, G8): a group's share of the join-result chunk tasks.
+pub(in crate::server) const JOIN_RESULT_CHUNK_PER_GROUP_CAP: usize = 4;
+
+/// ADR 0107 (r5, G8): bound on concurrent join-result chunk tasks.
+pub(in crate::server) const JOIN_RESULT_CHUNK_TASK_CAP: usize = 16;
+
 /// ADR 0107 (r5, G7): a group's share of the join-result fetch handlers.
 pub(in crate::server) const JOIN_RESULT_FETCH_PER_GROUP_CAP: usize = 4;
 
@@ -39618,6 +39624,10 @@ pub(in crate::server) mod tests {
             join_result_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
                 crate::server::routes::named_groups::JOIN_RESULT_FETCH_PER_GROUP_CAP,
                 crate::server::routes::named_groups::JOIN_RESULT_FETCH_HANDLER_CAP,
+            ),
+            join_result_chunk_admission: crate::server::routes::named_groups::FairAdmission::new(
+                crate::server::routes::named_groups::JOIN_RESULT_CHUNK_PER_GROUP_CAP,
+                crate::server::routes::named_groups::JOIN_RESULT_CHUNK_TASK_CAP,
             ),
             control_blobs: ControlBlobState::default(),
             treekem_pending_events: RwLock::new(HashMap::new()),
