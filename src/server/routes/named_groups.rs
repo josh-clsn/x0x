@@ -36506,6 +36506,16 @@ async fn join_egress_test_point(
     }
 }
 
+/// The join-result listener's entry point (r5, G7).
+pub(in crate::server) async fn dispatch_join_result_message(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    verified: bool,
+    msg: JoinResultMessage,
+) {
+    handle_join_result_message(state, sender, verified, msg).await;
+}
+
 pub(in crate::server) async fn handle_join_result_message(
     state: &Arc<AppState>,
     sender: &AgentId,

@@ -3580,3 +3580,81 @@ async fn s8a_r5_g5_local_drop_quiesces_and_purges_the_groups_join_artifacts() ->
     );
     Ok(())
 }
+
+fn serves_to(state: &AppState, recipient: &str) -> usize {
+    state
+        .named_group_test_recorders
+        .join_result_serves
+        .lock()
+        .expect("serve witness")
+        .iter()
+        .filter(|(to, _, _)| to == recipient)
+        .count()
+}
+
+/// WHY (note r3 G7): the join-result listener is shared by every group. A
+/// `FetchRequest` (selection, owner-certificate retry) must never hold the
+/// listener while it waits for one group's lock, and a flood of duplicate
+/// fetches for one recipient coalesces into ONE in-flight handler.
+#[tokio::test]
+async fn s8a_r5_g7_join_result_listener_never_waits_on_a_group_lock() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    let j2_hex = hex_of(&s.j2);
+    let fetch = || JoinResultMessage::FetchRequest {
+        group_id: s.stable.clone(),
+        member_agent_id: j2_hex.clone(),
+        from_revision: Some(s.base),
+        base_state_hash: None,
+        accepts_refusal: true,
+        accepts_control_blob_ref: true,
+        attempt_id: Some(s.j2_attempt.clone()),
+    };
+    s.authority
+        .named_group_test_recorders
+        .join_result_serves
+        .lock()
+        .expect("serve witness")
+        .clear();
+    let lock = super::super::group_membership_lock_for_known_group(&s.authority, &s.stable)
+        .await
+        .expect("known group");
+    let held = lock.lock().await;
+    let mut blocked = 0usize;
+    for _ in 0..12 {
+        let dispatched = tokio::time::timeout(
+            Duration::from_millis(500),
+            super::super::dispatch_join_result_message(
+                &s.authority,
+                &s.j2.agent.agent_id(),
+                true,
+                fetch(),
+            ),
+        )
+        .await;
+        if dispatched.is_err() {
+            blocked += 1;
+            break;
+        }
+    }
+    drop(held);
+    assert_eq!(
+        blocked, 0,
+        "the join-result listener blocked on a FetchRequest waiting for the group lock"
+    );
+    // The fetches coalesce: exactly one serve once the lock is free.
+    let served = tokio::time::timeout(Duration::from_secs(10), async {
+        while serves_to(&s.authority, &j2_hex) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(served.is_ok(), "the parked fetch was never served");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        serves_to(&s.authority, &j2_hex),
+        1,
+        "duplicate fetches for one recipient were not coalesced"
+    );
+    Ok(())
+}
