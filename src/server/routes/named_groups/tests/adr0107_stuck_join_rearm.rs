@@ -4399,3 +4399,32 @@ async fn s8a_r6_verdict_expiry_between_pre_phase_and_seam_is_refused() -> anyhow
     );
     Ok(())
 }
+
+/// WHY (r6 P2): the synchronous stream seam must never block. With the
+/// staging registry's lock held elsewhere, the seam's staged-copy check
+/// refuses at once (a retryable withhold) instead of blocking the executor
+/// until the lock frees — a block no timeout or abort can interrupt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s8a_r6_seam_staged_copy_check_never_blocks() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    let reference = staged_join_result_blob(&s).await?;
+    assert!(
+        super::super::join_result_blob_staged_now(&s.authority, &reference),
+        "control: the staged copy passes when uncontended"
+    );
+    let held = s
+        .authority
+        .control_blobs
+        .hold_registry_for_test(Duration::from_secs(2));
+    held.recv_timeout(Duration::from_secs(5))
+        .map_err(|_| anyhow::anyhow!("the holder never took the lock"))?;
+    let started = std::time::Instant::now();
+    let admitted = super::super::join_result_blob_staged_now(&s.authority, &reference);
+    let waited = started.elapsed();
+    assert!(
+        waited < Duration::from_millis(500) && !admitted,
+        "the seam blocked on the staging registry ({waited:?}, admitted: {admitted})"
+    );
+    Ok(())
+}

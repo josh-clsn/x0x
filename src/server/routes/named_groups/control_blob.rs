@@ -262,6 +262,24 @@ impl ControlBlobState {
         self.with_registry(|registry| registry.staged.get(reference).and_then(|entry| entry.bound))
     }
 
+    /// ADR 0107 (r6, test only): hold the staging registry's lock on
+    /// another thread for `hold`; the receiver fires once it is held.
+    #[cfg(test)]
+    pub(super) fn hold_registry_for_test(&self, hold: Duration) -> std::sync::mpsc::Receiver<()> {
+        let store = self.clone();
+        let (held, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _guard = store
+                .0
+                .registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _ = held.send(());
+            std::thread::sleep(hold);
+        });
+        rx
+    }
+
     pub(super) fn staged_chunk(
         &self,
         reference: &ControlBlobRef,
