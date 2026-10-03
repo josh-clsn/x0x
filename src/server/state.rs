@@ -952,6 +952,16 @@ pub(super) struct AppState {
     /// One cancellable owner-side stream per staged Welcome.
     /// `None` closes admission during shutdown under the same lock as replacement.
     pub(super) pending_welcome_streams: Mutex<Option<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    /// ADR 0107 (review r2): every in-flight join-artifact egress task
+    /// (join-result send, control-blob staging and chunk sends), keyed by
+    /// `(group id, recipient hex)`. Registered under the group's membership
+    /// lock before it runs; a removal or ban aborts and awaits them inside
+    /// its critical section, before it commits.
+    pub(super) join_artifact_egress: StdMutex<JoinArtifactEgressRegistry>,
+    /// ADR 0107 (review r2): bounded slots for Welcome `FetchRequest`
+    /// handling, which runs off the single Welcome listener loop (it can
+    /// wait on a group membership lock).
+    pub(super) welcome_fetch_slots: Arc<tokio::sync::Semaphore>,
     /// Bounded, process-local exact-byte transfers for oversized named-group
     /// direct events and join results. No control payload is persisted.
     pub(super) control_blobs: crate::server::routes::ControlBlobState,
@@ -1251,6 +1261,11 @@ pub(super) struct AppState {
     #[cfg(test)]
     pub(super) named_group_test_recorders: NamedGroupTestRecorders,
 }
+
+/// ADR 0107 (review r2): in-flight join-artifact egress tasks keyed by
+/// `(group id, recipient hex)` (see `AppState::join_artifact_egress`).
+pub(super) type JoinArtifactEgressRegistry =
+    HashMap<(String, String), Vec<tokio::task::JoinHandle<()>>>;
 
 #[cfg(test)]
 #[derive(Default)]

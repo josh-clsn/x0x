@@ -10629,9 +10629,6 @@ async fn apply_named_group_metadata_event_with_binding(
     if applied.accepted {
         if let Some((gid, member)) = departing_member.as_ref() {
             clear_cert_evidence_stamps_for(state, gid, Some(member)).await;
-            // ADR 0107: a removal or ban authored elsewhere drops the
-            // member's join artifacts this node staged as its sealer.
-            purge_join_artifacts_if_ineligible(state, gid, member).await;
         }
         if let Some(gid) = member_landing_group {
             replay_parked_role_updates(state, &gid).await;
@@ -12167,10 +12164,16 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     return ApplyMetadataResult::REJECTED;
                 }
             }
-            if !matches!(
-                persist_named_group_info(state, &resolved_group_key, next.clone()).await,
-                Ok(AtomicWriteOutcome::Durable)
-            ) {
+            // ADR 0107 (review r2): inside this apply's critical section
+            // (the group membership lock), on every path — gossip, direct,
+            // causal and TreeKEM replay — stop the removed member's in-flight
+            // join-artifact egress BEFORE the removal commits, then drop what
+            // stays staged AFTER it.
+            quiesce_member_join_egress(state, &resolved_group_key, &agent_id).await;
+            let persisted =
+                persist_named_group_info(state, &resolved_group_key, next.clone()).await;
+            purge_join_artifacts_if_ineligible(state, &resolved_group_key, &agent_id).await;
+            if !matches!(persisted, Ok(AtomicWriteOutcome::Durable)) {
                 return ApplyMetadataResult::REJECTED;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
@@ -12496,10 +12499,19 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     );
                 }
             }
-            if !matches!(
-                persist_named_group_info(state, &resolved_group_key, next.clone()).await,
-                Ok(AtomicWriteOutcome::Durable)
-            ) {
+            // ADR 0107 (review r2): inside this apply's critical section, on
+            // every path (gossip, direct, causal and TreeKEM replay), stop
+            // the banned member's in-flight join-artifact egress BEFORE the
+            // ban commits, then drop what stays staged AFTER it.
+            if !banned_self {
+                quiesce_member_join_egress(state, &resolved_group_key, &agent_id).await;
+            }
+            let persisted =
+                persist_named_group_info(state, &resolved_group_key, next.clone()).await;
+            if !banned_self {
+                purge_join_artifacts_if_ineligible(state, &resolved_group_key, &agent_id).await;
+            }
+            if !matches!(persisted, Ok(AtomicWriteOutcome::Durable)) {
                 return banned_reject("persist_not_durable", &resolved_group_key);
             }
             // #531 I4b: the ONLY point at which the ban is durably applied.
@@ -19834,28 +19846,6 @@ pub(in crate::server) async fn remove_named_group_member(
         crate::server::rider_auth::ActorContext,
     >,
     Path((id, agent_id_hex)): Path<(String, String)>,
-) -> axum::response::Response {
-    let response = remove_named_group_member_inner(
-        State(Arc::clone(&state)),
-        axum::extract::Extension(actor),
-        Path((id.clone(), agent_id_hex.clone())),
-    )
-    .await
-    .into_response();
-    // ADR 0107: a committed removal drops the member's staged join result
-    // and Welcomes and cancels any unsent Welcome transfer. The roster
-    // decides: a refused or failed removal leaves an eligible member's
-    // artifacts in place.
-    purge_join_artifacts_if_ineligible(&state, &id, &agent_id_hex).await;
-    response
-}
-
-async fn remove_named_group_member_inner(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Extension(actor): axum::extract::Extension<
-        crate::server::rider_auth::ActorContext,
-    >,
-    Path((id, agent_id_hex)): Path<(String, String)>,
 ) -> impl IntoResponse {
     if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
         return resp;
@@ -20012,10 +20002,13 @@ async fn remove_named_group_member_inner(
         let delivery_roster = next.clone();
         drop(named_groups);
 
-        if !matches!(
-            persist_named_group_info(&state, &id, next).await,
-            Ok(AtomicWriteOutcome::Durable)
-        ) {
+        // ADR 0107 (review r2): inside this removal's critical section,
+        // stop every in-flight egress of the member's join artifacts BEFORE
+        // the removal commits, then drop what stays staged AFTER it.
+        quiesce_member_join_egress(&state, &id, &agent_id_hex).await;
+        let persisted = persist_named_group_info(&state, &id, next).await;
+        purge_join_artifacts_if_ineligible(&state, &id, &agent_id_hex).await;
+        if !matches!(persisted, Ok(AtomicWriteOutcome::Durable)) {
             return api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "named-group state is not directory-durable",
@@ -21252,9 +21245,14 @@ async fn remove_treekem_named_group_member(
             })),
         );
     }
-    if let Err(e) =
-        persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await
-    {
+    // ADR 0107 (review r2): inside this removal's critical section, stop
+    // every in-flight egress of the member's join artifacts BEFORE the
+    // removal commits, then drop what stays staged AFTER it.
+    quiesce_member_join_egress(&state, &id, &agent_id_hex).await;
+    let persisted =
+        persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await;
+    purge_join_artifacts_if_ineligible(&state, &id, &agent_id_hex).await;
+    if let Err(e) = persisted {
         tracing::error!(group_id = %LogHexId::group(&id), "failed to persist TreeKEM snapshot after removal: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -21830,9 +21828,16 @@ async fn owner_certified_seal_with_eviction(
                 let metadata_topic = next.metadata_topic.clone();
                 let delivery_roster = next.clone();
                 drop(groups);
-                if let Err(e) =
-                    persist_treekem_and_named_groups_atomic_with_info(state, id, next, &guard).await
-                {
+                // ADR 0107 (review r2): an eviction is a removal — stop the
+                // evicted member's join-artifact egress before it commits
+                // and drop what stays staged after it, in this critical
+                // section.
+                quiesce_member_join_egress(state, id, &evict_hex).await;
+                let persisted =
+                    persist_treekem_and_named_groups_atomic_with_info(state, id, next, &guard)
+                        .await;
+                purge_join_artifacts_if_ineligible(state, id, &evict_hex).await;
+                if let Err(e) = persisted {
                     tracing::error!(group_id = %id, "failed to persist TreeKEM snapshot after eviction: {e}");
                     return Some(Err(api_error(
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -21945,10 +21950,13 @@ async fn owner_certified_seal_with_eviction(
             let metadata_topic = next.metadata_topic.clone();
             let delivery_roster = next.clone();
             drop(groups);
-            if !matches!(
-                persist_named_group_info(state, id, next).await,
-                Ok(AtomicWriteOutcome::Durable)
-            ) {
+            // ADR 0107 (review r2): an eviction is a removal — stop the
+            // evicted member's join-artifact egress before it commits and
+            // drop what stays staged after it, in this critical section.
+            quiesce_member_join_egress(state, id, &evict_hex).await;
+            let persisted = persist_named_group_info(state, id, next).await;
+            purge_join_artifacts_if_ineligible(state, id, &evict_hex).await;
+            if !matches!(persisted, Ok(AtomicWriteOutcome::Durable)) {
                 return Some(Err(api_error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "named-group state is not directory-durable",
@@ -24189,26 +24197,6 @@ pub(in crate::server) async fn ban_group_member(
         crate::server::rider_auth::ActorContext,
     >,
     Path((id, agent_id_hex)): Path<(String, String)>,
-) -> axum::response::Response {
-    let response = ban_group_member_inner(
-        State(Arc::clone(&state)),
-        axum::extract::Extension(actor),
-        Path((id.clone(), agent_id_hex.clone())),
-    )
-    .await
-    .into_response();
-    // ADR 0107: a committed ban drops the member's staged join result and
-    // Welcomes and cancels any unsent Welcome transfer.
-    purge_join_artifacts_if_ineligible(&state, &id, &agent_id_hex).await;
-    response
-}
-
-async fn ban_group_member_inner(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Extension(actor): axum::extract::Extension<
-        crate::server::rider_auth::ActorContext,
-    >,
-    Path((id, agent_id_hex)): Path<(String, String)>,
 ) -> impl IntoResponse {
     if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
         return resp;
@@ -24281,10 +24269,13 @@ async fn ban_group_member_inner(
     // Roster snapshot for the #344 redelivery below: the persist consumes
     // `next`, and the resend schedule must not read live group state.
     let delivery_roster = next.clone();
-    if !matches!(
-        persist_named_group_info(&state, &id, next).await,
-        Ok(AtomicWriteOutcome::Durable)
-    ) {
+    // ADR 0107 (review r2): inside this ban's critical section, stop every
+    // in-flight egress of the member's join artifacts BEFORE the ban
+    // commits, then drop what stays staged AFTER it.
+    quiesce_member_join_egress(&state, &id, &agent_id_hex).await;
+    let persisted = persist_named_group_info(&state, &id, next).await;
+    purge_join_artifacts_if_ineligible(&state, &id, &agent_id_hex).await;
+    if !matches!(persisted, Ok(AtomicWriteOutcome::Durable)) {
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "named-group state is not directory-durable",
@@ -24490,9 +24481,14 @@ async fn ban_treekem_group_member(
             ),
         );
     }
-    if let Err(e) =
-        persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await
-    {
+    // ADR 0107 (review r2): inside this ban's critical section, stop every
+    // in-flight egress of the member's join artifacts BEFORE the ban
+    // commits, then drop what stays staged AFTER it.
+    quiesce_member_join_egress(&state, &id, &agent_id_hex).await;
+    let persisted =
+        persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await;
+    purge_join_artifacts_if_ineligible(&state, &id, &agent_id_hex).await;
+    if let Err(e) = persisted {
         tracing::error!(group_id = %LogHexId::group(&id), "failed to persist TreeKEM snapshot after ban: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -35332,8 +35328,11 @@ enum JoinArtifactRefusal {
     /// OwnerCertified: the roster seat commits to a certificate digest but
     /// holds no bytes (`MemberCertStatus::DigestPending`).
     CertificateDigestPending,
-    /// OwnerCertified: the roster seat holds no certificate evidence at all
-    /// (the roster verdict's missing-evidence `InGrace` shape).
+    /// OwnerCertified: the roster seat holds no certificate evidence at all.
+    /// This is ONE of the roster verdict's `InGrace` shapes (missing
+    /// evidence); `InGrace` also covers stale evidence during a rotation,
+    /// which this guard does not re-derive (its handling of a verifying
+    /// embedded certificate is the subject of a separate ADR 0107 note).
     CertificateMissing,
     /// OwnerCertified: the roster-embedded certificate fails
     /// `verify_cert_against_owner` against the current clock.
@@ -35357,8 +35356,8 @@ impl JoinArtifactRefusal {
 
     /// A definitive refusal invalidates the member's staged artifacts: the
     /// seat or the certificate is gone, not merely awaiting evidence or an
-    /// operator. Pending evidence (digest-only or missing bytes), quarantine
-    /// and an unknown spelling only withhold.
+    /// operator. Pending evidence (digest-only, or no certificate on the
+    /// seat), quarantine and an unknown spelling only withhold.
     fn is_definitive(self) -> bool {
         matches!(
             self,
@@ -35441,23 +35440,27 @@ async fn join_artifact_serving_refusal(
     }
 }
 
-/// ADR 0107: drop `member_hex`'s staged join result and Welcomes for this
-/// group (every spelling) and cancel any Welcome transfer still streaming a
-/// copy, so a previously copied cache entry cannot outlive the member's
-/// eligibility.
+/// Every spelling (map key, stable id, MLS id) this node holds the group
+/// under, plus the spelling asked for.
+async fn join_artifact_group_aliases(state: &AppState, group_id: &str) -> HashSet<String> {
+    let roster = state.named_groups.read().await;
+    let mut aliases = HashSet::from([group_id.to_string()]);
+    if let Some((key, info)) = crate::server::resolve_group_entry_locked(&roster, group_id) {
+        aliases.insert(key.to_string());
+        aliases.insert(info.stable_group_id().to_string());
+        aliases.insert(info.mls_group_id.clone());
+    }
+    aliases
+}
+
+/// ADR 0107: drop `member_hex`'s staged join result, Welcomes and staged
+/// join-result control blobs for this group (every spelling), and cancel any
+/// Welcome transfer still streaming a copy, so no copied cache entry outlives
+/// the member's eligibility.
 async fn purge_member_join_artifacts(state: &AppState, group_id: &str, member_hex: &str) {
     #[cfg(test)]
     join_egress_test_barrier::park(member_hex, "purge").await;
-    let aliases: HashSet<String> = {
-        let roster = state.named_groups.read().await;
-        let mut aliases = HashSet::from([group_id.to_string()]);
-        if let Some((key, info)) = crate::server::resolve_group_entry_locked(&roster, group_id) {
-            aliases.insert(key.to_string());
-            aliases.insert(info.stable_group_id().to_string());
-            aliases.insert(info.mls_group_id.clone());
-        }
-        aliases
-    };
+    let aliases = join_artifact_group_aliases(state, group_id).await;
     let mut dropped_results = 0usize;
     {
         let mut results = state.pending_join_results.write().await;
@@ -35470,6 +35473,7 @@ async fn purge_member_join_artifacts(state: &AppState, group_id: &str, member_he
             }
         }
     }
+    let dropped_blobs = state.control_blobs.purge_join_results(&aliases, member_hex);
     let welcome_ids: Vec<String> = {
         let mut welcomes = state.pending_welcomes.write().await;
         let ids: Vec<String> = welcomes
@@ -35484,7 +35488,23 @@ async fn purge_member_join_artifacts(state: &AppState, group_id: &str, member_he
         }
         ids
     };
-    for welcome_id in &welcome_ids {
+    stop_welcome_streams(state, &welcome_ids).await;
+    if dropped_results > 0 || dropped_blobs > 0 || !welcome_ids.is_empty() {
+        tracing::info!(
+            group_id = %LogHexId::group(group_id),
+            member = %LogHexId::agent(member_hex),
+            dropped_results,
+            dropped_blobs,
+            dropped_welcomes = welcome_ids.len(),
+            "ADR 0107: dropped an ineligible member's staged join artifacts"
+        );
+    }
+}
+
+/// Abort the owner-side streams of these Welcomes and wait until each has
+/// stopped (none may send another frame once this returns).
+async fn stop_welcome_streams(state: &AppState, welcome_ids: &[String]) {
+    for welcome_id in welcome_ids {
         let stream = state
             .pending_welcome_streams
             .lock()
@@ -35497,26 +35517,220 @@ async fn purge_member_join_artifacts(state: &AppState, group_id: &str, member_he
         }
         state.pending_welcome_acks.write().await.remove(welcome_id);
     }
-    if dropped_results > 0 || !welcome_ids.is_empty() {
-        tracing::info!(
-            group_id = %LogHexId::group(group_id),
-            member = %LogHexId::agent(member_hex),
-            dropped_results,
-            dropped_welcomes = welcome_ids.len(),
-            "ADR 0107: dropped an ineligible member's staged join artifacts"
-        );
-    }
 }
 
 /// ADR 0107: after a membership mutation (removal, ban, a departure event),
 /// drop the member's staged join artifacts when the current roster no longer
-/// makes it eligible. A still-eligible member keeps them.
+/// makes it eligible. A still-eligible member keeps them. Mutation sites call
+/// this INSIDE their critical section, after the commit.
 async fn purge_join_artifacts_if_ineligible(state: &AppState, group_id: &str, member_hex: &str) {
     if join_artifact_serving_refusal(state, group_id, member_hex)
         .await
         .is_some_and(JoinArtifactRefusal::is_definitive)
     {
         purge_member_join_artifacts(state, group_id, member_hex).await;
+    }
+}
+
+/// ADR 0107 (review r2): bound on concurrent Welcome `FetchRequest`
+/// handlers dispatched off the Welcome listener.
+pub(in crate::server) const WELCOME_FETCH_HANDLER_CAP: usize = 16;
+
+/// ADR 0107 (review r2): spawn a join-artifact egress task registered under
+/// `(group_id, recipient)`. Its body runs only AFTER registration, so a
+/// removal or ban that quiesces this recipient can never miss it. Every body
+/// re-checks eligibility under the group's membership lock before it hands
+/// bytes to the transport; receipt waits run outside that lock.
+fn spawn_join_artifact_egress<F>(state: &AppState, group_id: &str, recipient: &str, body: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (registered, ready) = oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        if ready.await.is_ok() {
+            body.await;
+        }
+    });
+    {
+        let mut registry = state
+            .join_artifact_egress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.retain(|_, tasks| {
+            tasks.retain(|task| !task.is_finished());
+            !tasks.is_empty()
+        });
+        registry
+            .entry((group_id.to_string(), recipient.to_string()))
+            .or_default()
+            .push(handle);
+    }
+    let _ = registered.send(());
+}
+
+/// ADR 0107 (review r2): stop every in-flight egress of `member_hex`'s join
+/// artifacts for this group — registered result sends, staging and chunk
+/// sends, and the streams of its staged Welcomes — and wait until each has
+/// stopped. Removal and ban call this inside their critical section BEFORE
+/// they commit: every egress either finished before the mutation or never
+/// sends, and no new one can start while the membership lock is held.
+async fn quiesce_member_join_egress(state: &AppState, group_id: &str, member_hex: &str) {
+    let aliases = join_artifact_group_aliases(state, group_id).await;
+    let tasks: Vec<tokio::task::JoinHandle<()>> = {
+        let mut registry = state
+            .join_artifact_egress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        aliases
+            .iter()
+            .filter_map(|alias| registry.remove(&(alias.clone(), member_hex.to_string())))
+            .flatten()
+            .collect()
+    };
+    for task in &tasks {
+        task.abort();
+    }
+    for task in tasks {
+        let _ = task.await;
+    }
+    let welcome_ids: Vec<String> = state
+        .pending_welcomes
+        .read()
+        .await
+        .iter()
+        .filter(|(_, pending)| {
+            pending.joiner_agent == member_hex && aliases.contains(&pending.group_id)
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    stop_welcome_streams(state, &welcome_ids).await;
+}
+
+/// ADR 0107 (review r2): the staged result `staged_at` is still the one to
+/// serve and `member_hex` is still eligible. The caller holds the group's
+/// membership lock.
+async fn join_result_servable_locked(
+    state: &AppState,
+    group_id: &str,
+    member_hex: &str,
+    staged_at: Instant,
+) -> bool {
+    if join_artifact_serving_refusal(state, group_id, member_hex)
+        .await
+        .is_some()
+    {
+        return false;
+    }
+    state
+        .pending_join_results
+        .read()
+        .await
+        .get(&join_result_key(group_id, member_hex))
+        .is_some_and(|pending| {
+            pending.created_at == staged_at
+                && pending.created_at.elapsed() < PENDING_JOIN_RESULT_TTL
+        })
+}
+
+/// ADR 0107 (review r2): [`join_result_servable_locked`] under the group's
+/// membership lock — the last check before a result's bytes are handed to
+/// the transport.
+async fn join_result_still_servable(
+    state: &AppState,
+    group_id: &str,
+    member_hex: &str,
+    staged_at: Instant,
+) -> bool {
+    let Some(lock) = group_membership_lock_for_known_group(state, group_id).await else {
+        return false;
+    };
+    let _membership_guard = lock.lock().await;
+    join_result_servable_locked(state, group_id, member_hex, staged_at).await
+}
+
+/// ADR 0107 (review r2): stage an oversized result as a control blob only
+/// while it is still servable, atomically under the group's membership lock,
+/// so a staging retry can never recreate a blob a removal or ban purged.
+async fn stage_join_result_blob_if_servable(
+    state: &AppState,
+    group_id: &str,
+    recipient: &AgentId,
+    staged_at: Instant,
+    attempt_id: Option<&str>,
+    payload: &[u8],
+) -> std::result::Result<control_blob::ControlBlobRef, &'static str> {
+    let member_hex = hex::encode(recipient.as_bytes());
+    let Some(lock) = group_membership_lock_for_known_group(state, group_id).await else {
+        return Err("join-result group is unknown");
+    };
+    let _membership_guard = lock.lock().await;
+    if !join_result_servable_locked(state, group_id, &member_hex, staged_at).await {
+        return Err("join-result recipient is no longer eligible");
+    }
+    control_blob::stage_reference(
+        &state.control_blobs,
+        &state.agent,
+        recipient,
+        control_blob::ControlBlobKind::JoinResult,
+        group_id,
+        attempt_id,
+        payload.to_vec(),
+    )
+}
+
+/// ADR 0107 (review r2): one chunk of a staged join-result blob, read only
+/// while its recipient is eligible, under the group's membership lock.
+async fn join_result_chunk_if_servable(
+    state: &AppState,
+    group_id: &str,
+    member_hex: &str,
+    chunk: impl FnOnce() -> Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    let lock = group_membership_lock_for_known_group(state, group_id).await?;
+    let _membership_guard = lock.lock().await;
+    if join_artifact_serving_refusal(state, group_id, member_hex)
+        .await
+        .is_some()
+    {
+        return None;
+    }
+    chunk()
+}
+
+/// ADR 0107 (review r2): the staged Welcome `welcome_id` (staged at
+/// `staged_at`) may still be streamed to `recipient_hex`. Checked under the
+/// group's membership lock before EVERY frame is handed to the transport.
+async fn welcome_frame_servable(
+    state: &AppState,
+    group_id: &str,
+    recipient_hex: &str,
+    welcome_id: &str,
+    staged_at: Instant,
+) -> std::result::Result<(), String> {
+    let Some(lock) = group_membership_lock_for_known_group(state, group_id).await else {
+        return Err("Welcome group is unknown".to_string());
+    };
+    let _membership_guard = lock.lock().await;
+    if let Some(refusal) = join_artifact_serving_refusal(state, group_id, recipient_hex).await {
+        return Err(format!(
+            "Welcome recipient is no longer eligible ({})",
+            refusal.reason()
+        ));
+    }
+    let staged = state
+        .pending_welcomes
+        .read()
+        .await
+        .get(welcome_id)
+        .is_some_and(|pending| {
+            pending.created_at == staged_at
+                && pending.created_at.elapsed() < PENDING_WELCOME_TTL
+                && pending.joiner_agent == recipient_hex
+        });
+    if staged {
+        Ok(())
+    } else {
+        Err("the staged Welcome was withdrawn".to_string())
     }
 }
 
@@ -35672,7 +35886,7 @@ async fn handle_join_result_message_bound(
                 Some(arc) => Some(arc.lock().await),
                 None => None,
             };
-            let (event, head_attestation, pending_count) = {
+            let (event, head_attestation, staged_at, pending_count) = {
                 let mut results = state.pending_join_results.write().await;
                 results.retain(|_, pending| pending.created_at.elapsed() < PENDING_JOIN_RESULT_TTL);
                 (
@@ -35680,6 +35894,7 @@ async fn handle_join_result_message_bound(
                     results
                         .get(&key)
                         .and_then(|pending| pending.head_attestation.clone()),
+                    results.get(&key).map(|pending| pending.created_at),
                     results.len(),
                 )
             };
@@ -35730,12 +35945,16 @@ async fn handle_join_result_message_bound(
                 tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch before result was staged");
                 return;
             };
+            let Some(staged_at) = staged_at else {
+                return;
+            };
             // ADR 0107: the staged result is served only while the requester
             // is eligible on the CURRENT committed roster — checked inside
-            // the same membership critical section as the selection, so a
-            // concurrent removal, ban or seal either precedes this check or
-            // follows the serve (and then purges what was staged). A
-            // definitive refusal invalidates the staged artifacts too.
+            // the same membership critical section as the selection. The
+            // egress itself is a registered task that re-checks under this
+            // lock right before the transport handoff; a removal or ban
+            // cancels it before committing. A definitive refusal invalidates
+            // the staged artifacts too.
             if let Some(refusal) =
                 join_artifact_serving_refusal(state, &group_id, &member_agent_id).await
             {
@@ -35897,74 +36116,140 @@ async fn handle_join_result_message_bound(
                     );
                     return;
                 };
-                let control_blobs = state.control_blobs.clone();
-                let agent = Arc::clone(&state.agent);
+                let task_state = Arc::clone(state);
                 let group_id_for_task = group_id.clone();
                 let attempt = attempt_id.clone();
                 let member_for_log = member_agent_id.clone();
                 let recipient = *sender;
                 let guard_key = (group_id.clone(), *sender);
-                let guard_state = Arc::clone(state);
-                tokio::spawn(async move {
+                // ADR 0107 (review r2): staging is egress of a copy of the
+                // result. Each (re)staging attempt re-checks eligibility and
+                // stages atomically under the group's membership lock, inside
+                // a registered task a removal or ban cancels before it
+                // commits, so a delayed retry can never recreate a purged
+                // blob. The reference itself carries no artifact bytes.
+                spawn_join_artifact_egress(state, &group_id, &member_agent_id, async move {
                     let _staging_permit = permit;
-                    #[cfg(test)]
-                    join_egress_test_barrier::park(&member_for_log, "join_result_stage").await;
-                    #[cfg(test)]
-                    join_egress_test_point(
-                        &guard_state,
-                        &member_for_log,
-                        &group_id_for_task,
-                        "join_result_reference",
-                    )
-                    .await;
-                    let outcome = control_blob::send_reference(
-                        &control_blobs,
-                        &agent,
-                        &recipient,
-                        control_blob::ControlBlobKind::JoinResult,
-                        &group_id_for_task,
-                        attempt.as_deref(),
-                        payload,
-                    )
-                    .await;
+                    let mut retries = 0;
+                    let staged = loop {
+                        #[cfg(test)]
+                        join_egress_test_barrier::park(&member_for_log, "join_result_stage").await;
+                        match stage_join_result_blob_if_servable(
+                            &task_state,
+                            &group_id_for_task,
+                            &recipient,
+                            staged_at,
+                            attempt.as_deref(),
+                            &payload,
+                        )
+                        .await
+                        {
+                            Ok(reference) => break Ok(reference),
+                            Err(control_blob::STAGING_BUDGET_EXHAUSTED)
+                                if retries < control_blob::STAGING_BUDGET_RETRIES =>
+                            {
+                                tracing::warn!(
+                                    group_id = %LogHexId::group(&group_id_for_task),
+                                    member = %LogHexId::agent(&member_for_log),
+                                    retries,
+                                    "control blob staging budget exhausted; retrying (#876)"
+                                );
+                                retries += 1;
+                                tokio::time::sleep(control_blob::STAGING_BUDGET_RETRY_DELAY).await;
+                            }
+                            Err(reason) => break Err(reason.to_string()),
+                        }
+                    };
+                    let outcome = match staged {
+                        Ok(reference) => {
+                            #[cfg(test)]
+                            join_egress_test_point(
+                                &task_state,
+                                &member_for_log,
+                                &group_id_for_task,
+                                "join_result_reference",
+                            )
+                            .await;
+                            control_blob::send_reference_message(
+                                &task_state.agent,
+                                &recipient,
+                                reference,
+                            )
+                            .await
+                        }
+                        Err(reason) => Err(reason),
+                    };
                     // #878 r5 (review): drop OUR permit BEFORE pruning,
                     // so the released semaphore is observably idle — the
                     // prune condition (available == 1) actually holds.
                     drop(_staging_permit);
-                    release_join_result_staging_guard(&guard_state, &guard_key);
+                    release_join_result_staging_guard(&task_state, &guard_key);
                     if let Err(e) = outcome {
                         tracing::warn!(group_id = %LogHexId::group(&group_id_for_task), member = %LogHexId::agent(&member_for_log), "failed to send join-result reference: {e}");
                     }
                 });
                 return;
             }
-            #[cfg(test)]
-            join_egress_test_point(state, &member_agent_id, &group_id, "join_result").await;
-            if let Err(e) = state
-                .agent
-                .send_direct_with_config(sender, payload, direct_message_send_config())
+            // ADR 0107 (review r2): the inline send is a registered egress
+            // task. Immediately before handing the bytes to the transport it
+            // re-checks, under the group's membership lock, that the
+            // requester is still eligible and the staged result unchanged; a
+            // removal or ban cancels it before committing. The receipt wait
+            // runs outside the lock.
+            let task_state = Arc::clone(state);
+            let recipient = *sender;
+            let group_for_task = group_id.clone();
+            let member_for_task = member_agent_id.clone();
+            spawn_join_artifact_egress(state, &group_id, &member_agent_id, async move {
+                if !join_result_still_servable(
+                    &task_state,
+                    &group_for_task,
+                    &member_for_task,
+                    staged_at,
+                )
                 .await
-            {
-                tracing::warn!(group_id = %LogHexId::group(&group_id), member = %LogHexId::agent(&member_agent_id), "failed to send join-result response: {e}");
-                tracing::debug!(
-                    target: "treekem.trace",
-                    stage = "join_result_send_err",
-                    group_id = %group_id,
-                    member = %member_agent_id,
-                    payload_len,
-                    payload_hash = %payload_hash,
-                    error = %e,
-                );
-            } else {
-                tracing::debug!(
-                    target: "treekem.trace",
-                    stage = "join_result_send_ok",
-                    group_id = %group_id,
-                    member = %member_agent_id,
-                    payload_len,
-                    payload_hash = %payload_hash,
-                );
-            }
+                {
+                    tracing::debug!(
+                        group_id = %LogHexId::group(&group_for_task),
+                        member = %LogHexId::agent(&member_for_task),
+                        "ADR 0107: join result withheld at egress; the requester is no longer eligible"
+                    );
+                    return;
+                }
+                #[cfg(test)]
+                join_egress_test_point(
+                    &task_state,
+                    &member_for_task,
+                    &group_for_task,
+                    "join_result",
+                )
+                .await;
+                if let Err(e) = task_state
+                    .agent
+                    .send_direct_with_config(&recipient, payload, direct_message_send_config())
+                    .await
+                {
+                    tracing::warn!(group_id = %LogHexId::group(&group_for_task), member = %LogHexId::agent(&member_for_task), "failed to send join-result response: {e}");
+                    tracing::debug!(
+                        target: "treekem.trace",
+                        stage = "join_result_send_err",
+                        group_id = %group_for_task,
+                        member = %member_for_task,
+                        payload_len,
+                        payload_hash = %payload_hash,
+                        error = %e,
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "treekem.trace",
+                        stage = "join_result_send_ok",
+                        group_id = %group_for_task,
+                        member = %member_for_task,
+                        payload_len,
+                        payload_hash = %payload_hash,
+                    );
+                }
+            });
         }
         JoinResultMessage::Result {
             event,
@@ -36938,12 +37223,49 @@ pub(in crate::server) fn decode_welcome_blob_message(
 
 /// The Welcome DM listener's dispatch for one verified frame (the single
 /// listener loop in `server::run` awaits this).
+///
+/// ADR 0107 (review r2): a `FetchRequest` is served off the listener, in a
+/// bounded, supervised task, because serving waits on the group's
+/// membership lock. A lock holder may itself be waiting for Offer, Chunk or
+/// Complete frames on this same listener, so handling the fetch inline could
+/// stall every group's frames (a dependency cycle). Receive-side frames stay
+/// inline and never take a membership lock. With every slot busy, the fetch
+/// is dropped; the joiner's bounded retry schedule asks again.
 pub(in crate::server) async fn dispatch_welcome_blob_message(
     state: &Arc<AppState>,
     sender: &AgentId,
     msg: WelcomeBlobMessage,
 ) {
-    handle_welcome_blob_message(state, sender, msg).await;
+    match msg {
+        WelcomeBlobMessage::FetchRequest {
+            group_id,
+            welcome_id,
+        } => {
+            let Ok(permit) = Arc::clone(&state.welcome_fetch_slots).try_acquire_owned() else {
+                tracing::warn!(
+                    welcome_id = %LogHexId::new("welcome", &welcome_id),
+                    "Welcome fetch handler slots exhausted; dropping the request (the joiner retries)"
+                );
+                return;
+            };
+            let task_state = Arc::clone(state);
+            let requester = *sender;
+            let worker = tokio::spawn(async move {
+                handle_welcome_fetch_request(&task_state, &requester, group_id, welcome_id).await;
+            });
+            // Supervisor: holds the slot until the handler ends and reports
+            // a handler that panicked instead of losing it silently.
+            tokio::spawn(async move {
+                let _permit = permit;
+                if let Err(e) = worker.await {
+                    if e.is_panic() {
+                        tracing::error!("Welcome fetch handler panicked: {e}");
+                    }
+                }
+            });
+        }
+        other => handle_welcome_blob_message(state, sender, other).await,
+    }
 }
 
 pub(in crate::server) async fn handle_welcome_blob_message(
@@ -37062,7 +37384,9 @@ async fn handle_welcome_fetch_request_via<S, F>(
     // stream registration are linearized with membership mutations under the
     // group's (lookup-gated) membership lock. A removal or ban either lands
     // first and is refused below, or lands after the stream registered and
-    // its purge cancels that stream.
+    // stops that stream before it commits; every frame also re-checks under
+    // the lock. This handler runs off the Welcome listener
+    // (`dispatch_welcome_blob_message`), so waiting here never stalls it.
     let membership_arc = group_membership_lock_for_known_group(state, &group_id).await;
     let _membership_guard = match &membership_arc {
         Some(arc) => Some(arc.lock().await),
@@ -37163,25 +37487,25 @@ async fn stream_welcome_blob_guarded<S, F>(
 {
     let check_state = Arc::clone(state);
     let check_group = pending.group_id.clone();
+    let staged_at = pending.created_at;
+    let check_welcome = welcome_id.to_string();
     let recipient_hex = hex::encode(recipient.as_bytes());
     stream_welcome_blob_via(state, recipient, welcome_id, pending, move |msg| {
         let state = Arc::clone(&check_state);
         let group_id = check_group.clone();
+        let welcome_id = check_welcome.clone();
         let recipient_hex = recipient_hex.clone();
         let send = transport(msg);
         async move {
-            // ADR 0107: the stream holds a COPY of the staged Welcome, so it
-            // re-checks eligibility before every frame. A certificate that
-            // is revoked or expires mid-transfer stops the stream at its
-            // next frame; removal and ban also cancel it outright.
-            if let Some(refusal) =
-                join_artifact_serving_refusal(&state, &group_id, &recipient_hex).await
-            {
-                return Err(format!(
-                    "Welcome recipient is no longer eligible ({})",
-                    refusal.reason()
-                ));
-            }
+            // ADR 0107: the stream holds a COPY of the staged Welcome, so
+            // before EVERY frame it re-checks, under the group's membership
+            // lock, that the recipient is still eligible and the staged
+            // Welcome still stands (a purge withdraws it). A certificate
+            // revoked or expiring mid-transfer stops the stream at its next
+            // frame; a removal or ban cancels the stream before it commits.
+            // The frame's receipt wait runs outside the lock.
+            welcome_frame_servable(&state, &group_id, &recipient_hex, &welcome_id, staged_at)
+                .await?;
             #[cfg(test)]
             join_egress_test_point(&state, &recipient_hex, &group_id, "welcome_frame").await;
             send.await
@@ -38339,6 +38663,10 @@ pub(in crate::server) mod tests {
             pending_welcome_waiters: RwLock::new(HashMap::new()),
             pending_welcome_acks: RwLock::new(HashMap::new()),
             pending_welcome_streams: Mutex::new(Some(HashMap::new())),
+            join_artifact_egress: StdMutex::new(HashMap::new()),
+            welcome_fetch_slots: Arc::new(tokio::sync::Semaphore::new(
+                crate::server::routes::named_groups::WELCOME_FETCH_HANDLER_CAP,
+            )),
             control_blobs: ControlBlobState::default(),
             treekem_pending_events: RwLock::new(HashMap::new()),
             parked_role_updates: StdMutex::new(HashMap::new()),

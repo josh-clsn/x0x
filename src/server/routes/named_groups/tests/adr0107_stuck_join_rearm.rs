@@ -1330,7 +1330,8 @@ async fn restore_staged_artifacts(
 /// purge runs): the guard alone must refuse. OwnerCertified serving uses the
 /// ROSTER-EMBEDDED certificate with the current revocation set and clock — a
 /// valid certificate in the announce/discovery cache never rescues an
-/// expired or foreign one — and DigestPending/InGrace fail closed. The
+/// expired or foreign one — and DigestPending and the missing-evidence InGrace
+/// shape fail closed (InGrace also covers stale evidence mid-rotation). The
 /// control (an eligible, inline-certified first join with no announce) is
 /// served on both paths.
 #[tokio::test]

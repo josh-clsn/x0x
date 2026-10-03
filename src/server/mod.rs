@@ -1108,6 +1108,10 @@ pub async fn serve_with_options(
         pending_welcome_waiters: RwLock::new(HashMap::new()),
         pending_welcome_acks: RwLock::new(HashMap::new()),
         pending_welcome_streams: Mutex::new(Some(HashMap::new())),
+        join_artifact_egress: StdMutex::new(HashMap::new()),
+        welcome_fetch_slots: Arc::new(tokio::sync::Semaphore::new(
+            crate::server::routes::named_groups::WELCOME_FETCH_HANDLER_CAP,
+        )),
         control_blobs: ControlBlobState::default(),
         treekem_pending_events: RwLock::new(HashMap::new()),
         parked_role_updates: StdMutex::new(HashMap::new()),

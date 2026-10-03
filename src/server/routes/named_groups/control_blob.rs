@@ -388,6 +388,25 @@ impl ControlBlobState {
         })
     }
 
+    /// ADR 0107: drop every staged JoinResult blob addressed to `recipient`
+    /// for any spelling of the group (a removed, banned or otherwise
+    /// ineligible member). Returns how many were dropped.
+    pub(super) fn purge_join_results(
+        &self,
+        group_aliases: &HashSet<String>,
+        recipient: &str,
+    ) -> usize {
+        self.with_registry(|registry| {
+            let before = registry.staged.len();
+            registry.staged.retain(|reference, _| {
+                !(reference.kind == ControlBlobKind::JoinResult
+                    && reference.recipient == recipient
+                    && group_aliases.contains(&reference.group_id))
+            });
+            before - registry.staged.len()
+        })
+    }
+
     pub(super) fn cancel_attempt(&self, group_id: &str, recipient: &str, attempt_id: &str) {
         // Removes ROUTING only. The cancelled task's lease keeps its
         // declared bytes accounted until the task itself ends, so a
@@ -496,6 +515,58 @@ pub(super) async fn send_reference(
     join_attempt_id: Option<&str>,
     bytes: Vec<u8>,
 ) -> std::result::Result<(), String> {
+    // #876 (issue item 2): a budget-exhausted refusal is TRANSIENT once
+    // recipients release their completed pulls — retry it briefly before
+    // giving up, instead of dropping the event on the floor. Any other
+    // refusal (invalid blob, digest conflict) returns immediately.
+    let mut attempt = 0;
+    let reference = loop {
+        match stage_reference(
+            store,
+            agent,
+            recipient,
+            kind,
+            group_id,
+            join_attempt_id,
+            bytes.clone(),
+        ) {
+            Ok(reference) => break reference,
+            Err(STAGING_BUDGET_EXHAUSTED) if attempt < STAGING_BUDGET_RETRIES => {
+                tracing::warn!(
+                    kind = ?kind,
+                    group_id = %group_id,
+                    recipient = %LogHexId::agent(&hex::encode(recipient.as_bytes())),
+                    attempt,
+                    "control blob staging budget exhausted; retrying (#876)"
+                );
+                attempt += 1;
+                tokio::time::sleep(STAGING_BUDGET_RETRY_DELAY).await;
+            }
+            Err(other) => return Err(other.to_string()),
+        }
+    };
+    send_reference_message(agent, recipient, reference).await
+}
+
+/// The refusal [`ControlBlobState::stage`] returns while the staging budget
+/// is exhausted (transient: recipients release completed pulls).
+pub(super) const STAGING_BUDGET_EXHAUSTED: &str = "control blob staging budget exhausted";
+/// #876: bounded retries of a budget-exhausted staging.
+pub(super) const STAGING_BUDGET_RETRIES: usize = 6;
+pub(super) const STAGING_BUDGET_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Stage the exact original JSON once and return its bounded reference
+/// (no retry, no send). ADR 0107 (review r2): join-result staging calls
+/// this under the group's membership lock, after the eligibility check.
+pub(super) fn stage_reference(
+    store: &ControlBlobState,
+    agent: &Agent,
+    recipient: &AgentId,
+    kind: ControlBlobKind,
+    group_id: &str,
+    join_attempt_id: Option<&str>,
+    bytes: Vec<u8>,
+) -> std::result::Result<ControlBlobRef, &'static str> {
     let reference = ControlBlobRef {
         kind,
         group_id: group_id.to_string(),
@@ -505,28 +576,17 @@ pub(super) async fn send_reference(
         byte_len: bytes.len() as u64,
         join_attempt_id: join_attempt_id.map(str::to_string),
     };
-    // #876 (issue item 2): a budget-exhausted refusal is TRANSIENT once
-    // recipients release their completed pulls — retry it briefly before
-    // giving up, instead of dropping the event on the floor. Any other
-    // refusal (invalid blob, digest conflict) returns immediately.
-    const BUDGET_RETRIES: usize = 6;
-    const BUDGET_RETRY_DELAY: Duration = Duration::from_secs(2);
-    for attempt in 0..=BUDGET_RETRIES {
-        match store.stage(reference.clone(), bytes.clone()) {
-            Ok(()) => break,
-            Err("control blob staging budget exhausted") if attempt < BUDGET_RETRIES => {
-                tracing::warn!(
-                    kind = ?reference.kind,
-                    group_id = %reference.group_id,
-                    recipient = %LogHexId::agent(&reference.recipient),
-                    attempt,
-                    "control blob staging budget exhausted; retrying (#876)"
-                );
-                tokio::time::sleep(BUDGET_RETRY_DELAY).await;
-            }
-            Err(other) => return Err(other.to_string()),
-        }
-    }
+    store.stage(reference.clone(), bytes)?;
+    Ok(reference)
+}
+
+/// Send a staged blob's bounded reference (metadata only; the bytes are
+/// pulled chunk by chunk).
+pub(super) async fn send_reference_message(
+    agent: &Agent,
+    recipient: &AgentId,
+    reference: ControlBlobRef,
+) -> std::result::Result<(), String> {
     send_message(
         agent,
         recipient,
@@ -657,6 +717,60 @@ pub(in crate::server) async fn handle_control_blob_message(
             if !incoming_fetch_header_valid(&reference, &sender_hex, &local_hex, verified) {
                 return;
             }
+            if reference.kind == ControlBlobKind::JoinResult {
+                // ADR 0107 (review r2): a staged join result is a COPY of a
+                // join artifact, so each chunk is a serve. The chunk is read
+                // only while the recipient is eligible, under the group's
+                // membership lock, inside a registered egress task (a
+                // removal or ban cancels it before committing). The lock is
+                // taken in the task, never on this listener.
+                let Ok(permit) = Arc::clone(&state.control_blobs.0.chunk_slots).try_acquire_owned()
+                else {
+                    tracing::warn!("control blob chunk send slots exhausted");
+                    return;
+                };
+                let task_state = Arc::clone(state);
+                let recipient = *sender;
+                let group_id = reference.group_id.clone();
+                let member_hex = reference.recipient.clone();
+                super::spawn_join_artifact_egress(state, &group_id, &member_hex, async move {
+                    let _permit = permit;
+                    let store = task_state.control_blobs.clone();
+                    let Some(chunk) = super::join_result_chunk_if_servable(
+                        &task_state,
+                        &reference.group_id,
+                        &reference.recipient,
+                        || store.staged_chunk(&reference, sequence),
+                    )
+                    .await
+                    else {
+                        tracing::debug!(
+                            group_id = %LogHexId::group(&reference.group_id),
+                            recipient = %LogHexId::agent(&reference.recipient),
+                            "ADR 0107: join-result chunk withheld; the recipient is not eligible or the blob was purged"
+                        );
+                        return;
+                    };
+                    #[cfg(test)]
+                    super::join_egress_test_point(
+                        &task_state,
+                        &reference.recipient,
+                        &reference.group_id,
+                        "join_result_chunk",
+                    )
+                    .await;
+                    let message = ControlBlobMessage::Chunk {
+                        reference,
+                        sequence,
+                        data_b64: BASE64.encode(chunk),
+                    };
+                    if let Err(reason) = send_message(&task_state.agent, &recipient, &message).await
+                    {
+                        tracing::warn!(reason, "control blob chunk send failed");
+                    }
+                });
+                return;
+            }
             let Some(chunk) = state.control_blobs.staged_chunk(&reference, sequence) else {
                 return;
             };
@@ -667,20 +781,8 @@ pub(in crate::server) async fn handle_control_blob_message(
             };
             let agent = Arc::clone(&state.agent);
             let recipient = *sender;
-            #[cfg(test)]
-            let witness_state = Arc::clone(state);
             tokio::spawn(async move {
                 let _permit = permit;
-                #[cfg(test)]
-                if reference.kind == ControlBlobKind::JoinResult {
-                    super::join_egress_test_point(
-                        &witness_state,
-                        &reference.recipient,
-                        &reference.group_id,
-                        "join_result_chunk",
-                    )
-                    .await;
-                }
                 let message = ControlBlobMessage::Chunk {
                     reference,
                     sequence,
