@@ -3060,3 +3060,324 @@ async fn s8a_r4_finished_egress_tasks_leave_the_registry() -> anyhow::Result<()>
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Round 5 (lifecycle note r3, `docs/design/join-artifact-serving-lifecycle.md`):
+// the class-R transport admits every physical exchange (G3), checks the
+// resolved machine (G2), is bounded by per-exchange and per-task deadlines,
+// and records DM metrics (G14).
+// ---------------------------------------------------------------------------
+
+fn transports_for(state: &AppState, recipient: &str) -> Vec<(&'static str, &'static str)> {
+    state
+        .named_group_test_recorders
+        .join_artifact_transports
+        .lock()
+        .expect("transport witness")
+        .iter()
+        .filter(|(to, _, _)| to == recipient)
+        .map(|(_, kind, transport)| (*kind, *transport))
+        .collect()
+}
+
+async fn transport_seen(state: &AppState, recipient: &str, kind: &str) -> bool {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !transports_for(state, recipient)
+            .iter()
+            .any(|(k, _)| *k == kind)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// Make the authority resolve `recipient` to its REAL machine through the
+/// announce/discovery cache, as it would for an announced peer.
+async fn pin_recipient_machine(authority: &AppState, recipient: &AppState) {
+    let agent_id = recipient.agent.agent_id();
+    authority
+        .agent
+        .identity_discovery_cache()
+        .write()
+        .await
+        .insert(
+            agent_id,
+            x0x::DiscoveredAgent {
+                agent_id,
+                machine_id: recipient.agent.machine_id(),
+                user_id: None,
+                self_name: None,
+                addresses: Vec::new(),
+                announced_at: 0,
+                last_seen: 0,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                cert_not_after: None,
+                agent_certificate: None,
+                agent_public_key: Vec::new(),
+                cert_digest: None,
+            },
+        );
+}
+
+/// Self-revoke `owner`'s MACHINE (not its agent) in the authority's
+/// revocation set.
+async fn revoke_machine(authority: &AppState, owner: &AppState) -> anyhow::Result<()> {
+    let machine = owner.agent.identity().machine_keypair();
+    let record = x0x::revocation::RevocationRecord::sign(
+        x0x::revocation::RevokedSubject::Machine(owner.agent.machine_id()),
+        machine.public_key(),
+        machine.secret_key(),
+        x0x::groups::owner_cert::restore_clock_now(),
+        Some("adr0107 r5 machine revocation".to_string()),
+    )?;
+    authority
+        .agent
+        .revocation_set()
+        .write()
+        .await
+        .verify_and_insert(record, None)?;
+    Ok(())
+}
+
+async fn age_staged_result(state: &AppState, key: &str, remaining: Duration) {
+    if let Some(p) = state.pending_join_results.write().await.get_mut(key) {
+        p.created_at = Instant::now()
+            .checked_sub(super::super::PENDING_JOIN_RESULT_TTL - remaining)
+            .expect("monotonic clock far enough from boot");
+    }
+}
+
+/// WHY (note r3 G3): pinned ant-quic's ACK-v2 send retries internally and
+/// x0x's X0X-0053 path reissues on `Replaced`, so a write can happen with no
+/// admission at all. Every class-R kind must take the single-exchange
+/// transport, where each physical write is admitted at the stream seam.
+#[tokio::test]
+async fn s8a_r5_g3_recovery_responses_take_one_admitted_exchange() -> anyhow::Result<()> {
+    let mut observed = Vec::new();
+    {
+        let dir = tempfile::tempdir()?;
+        let g = build_gss(dir.path(), false).await?;
+        let g_hex = hex_of(&g.joiner);
+        let from = remnant_revision(&g.joiner, &g.group_key).await;
+        let _ = serve_result(&g.authority, &g.joiner, &g.stable, &g.attempt, from).await;
+        assert!(transport_seen(&g.authority, &g_hex, "join_result").await);
+        observed.extend(transports_for(&g.authority, &g_hex));
+    }
+    {
+        let dir = tempfile::tempdir()?;
+        let s = build(dir.path()).await?;
+        let j2_hex = hex_of(&s.j2);
+        let welcome_id = welcome_id_of(&s.j2_add).expect("welcome ref");
+        assert!(serve_welcome(&s.authority, &s.j2, &s.stable, &welcome_id).await);
+        assert!(transport_seen(&s.authority, &j2_hex, "welcome_frame").await);
+        let reference = staged_join_result_blob(&s).await?;
+        fetch_chunk(&s, &reference).await;
+        assert!(transport_seen(&s.authority, &j2_hex, "join_result_chunk").await);
+        observed.extend(transports_for(&s.authority, &j2_hex));
+    }
+    let unadmitted: Vec<_> = observed
+        .iter()
+        .filter(|(_, transport)| *transport != "pinned_single_exchange")
+        .collect();
+    assert!(
+        unadmitted.is_empty(),
+        "class-R exchanges took a transport with unadmitted resends: {unadmitted:?}"
+    );
+    Ok(())
+}
+
+/// WHY (note r3 G2): the guard checks the recipient AGENT; the transport
+/// resolves a MACHINE. A machine revoked after the egress task's checks but
+/// before the write must get nothing, on the same admission as the agent.
+#[tokio::test]
+async fn s8a_r5_g2_machine_revocation_before_admission_sends_nothing() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    let g_hex = hex_of(&g.joiner);
+    pin_recipient_machine(&g.authority, &g.joiner).await;
+    let from = remnant_revision(&g.joiner, &g.group_key).await;
+    // Control: the pinned, unrevoked machine is served.
+    clear_egress(&g.authority);
+    let _ = serve_result(&g.authority, &g.joiner, &g.stable, &g.attempt, from).await;
+    assert!(
+        egress_happens(&g.authority, &g_hex, "join_result", Duration::from_secs(5)).await,
+        "control: the eligible recipient on an unrevoked machine is served"
+    );
+    // The machine is revoked between the task's checks and the write.
+    let armed = super::super::join_egress_test_barrier::arm(&g_hex, "join_result");
+    clear_egress(&g.authority);
+    let _ = serve_result(&g.authority, &g.joiner, &g.stable, &g.attempt, from).await;
+    wait_reached(&armed.gate, "inline result").await;
+    revoke_machine(&g.authority, &g.joiner).await?;
+    drop(armed);
+    assert!(
+        !egress_happens(&g.authority, &g_hex, "join_result", Duration::from_secs(1)).await,
+        "bytes were handed to the transport for a revoked machine"
+    );
+    Ok(())
+}
+
+/// WHY (note r3, section 2.7 item 6): without the ACK-v2 exchange there is
+/// no whole-exchange timeout. A stalled exchange (here: parked inside the
+/// exchange) must be cut by the artifact's deadline, and its egress task
+/// must end, on the inline, Welcome and chunk paths.
+#[tokio::test]
+async fn s8a_r5_deadline_cuts_stalled_exchanges() -> anyhow::Result<()> {
+    let mut outlived = Vec::new();
+    let all_finished = |state: &AppState, key: &(String, String)| {
+        state
+            .join_artifact_egress
+            .lock()
+            .expect("egress registry")
+            .get(key)
+            .is_none_or(|tasks| tasks.iter().all(tokio::task::JoinHandle::is_finished))
+    };
+    // Inline result.
+    {
+        let dir = tempfile::tempdir()?;
+        let g = build_gss(dir.path(), false).await?;
+        let g_hex = hex_of(&g.joiner);
+        let from = remnant_revision(&g.joiner, &g.group_key).await;
+        age_staged_result(
+            &g.authority,
+            &join_result_key(&g.stable, &g_hex),
+            Duration::from_millis(1500),
+        )
+        .await;
+        let armed = super::super::join_egress_test_barrier::arm(&g_hex, "join_result");
+        let _ = serve_result(&g.authority, &g.joiner, &g.stable, &g.attempt, from).await;
+        wait_reached(&armed.gate, "inline result").await;
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        if !all_finished(&g.authority, &(g.stable.clone(), g_hex.clone())) {
+            outlived.push("inline join result");
+        }
+        drop(armed);
+    }
+    // Result chunk (the copy shares the original's deadline).
+    {
+        let dir = tempfile::tempdir()?;
+        let s = build(dir.path()).await?;
+        let j2_hex = hex_of(&s.j2);
+        age_staged_result(
+            &s.authority,
+            &join_result_key(&s.stable, &j2_hex),
+            Duration::from_millis(2500),
+        )
+        .await;
+        let reference = staged_join_result_blob(&s).await?;
+        let armed = super::super::join_egress_test_barrier::arm(&j2_hex, "join_result_chunk");
+        fetch_chunk(&s, &reference).await;
+        wait_reached(&armed.gate, "result chunk").await;
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+        if !all_finished(&s.authority, &(s.stable.clone(), j2_hex.clone())) {
+            outlived.push("join-result chunk");
+        }
+        drop(armed);
+    }
+    // Welcome stream.
+    {
+        let dir = tempfile::tempdir()?;
+        let s = build(dir.path()).await?;
+        let j2_hex = hex_of(&s.j2);
+        let welcome_id = welcome_id_of(&s.j2_add).expect("welcome ref");
+        if let Some(w) = s
+            .authority
+            .pending_welcomes
+            .write()
+            .await
+            .get_mut(&welcome_id)
+        {
+            w.created_at = Instant::now()
+                .checked_sub(super::super::PENDING_WELCOME_TTL - Duration::from_millis(1500))
+                .expect("monotonic clock far enough from boot");
+        }
+        let armed = super::super::join_egress_test_barrier::arm(&j2_hex, "welcome_frame");
+        assert!(serve_welcome(&s.authority, &s.j2, &s.stable, &welcome_id).await);
+        wait_reached(&armed.gate, "Welcome frame").await;
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        let stream_live = s
+            .authority
+            .pending_welcome_streams
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|streams| streams.get(&welcome_id).map(|h| !h.is_finished()))
+            .unwrap_or(false);
+        if stream_live {
+            outlived.push("Welcome stream");
+        }
+        drop(armed);
+    }
+    assert!(
+        outlived.is_empty(),
+        "a stalled exchange outlived its artifact's deadline: {outlived:?}"
+    );
+    Ok(())
+}
+
+/// WHY (note r3 G14): the class-R transport is a logical DM send and must
+/// show up in the DM metrics like every other send.
+#[tokio::test]
+async fn s8a_r5_g14_recovery_response_sends_record_dm_metrics() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    let g_hex = hex_of(&g.joiner);
+    // Let the fixture's own background deliveries (the +8 s delayed sends)
+    // finish, so the delta below is this serve's alone.
+    let settle_started = tokio::time::Instant::now();
+    let mut last = g
+        .authority
+        .agent
+        .direct_messaging()
+        .diagnostics_snapshot()
+        .stats
+        .outgoing_send_total;
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let now = g
+            .authority
+            .agent
+            .direct_messaging()
+            .diagnostics_snapshot()
+            .stats
+            .outgoing_send_total;
+        if now == last && settle_started.elapsed() >= Duration::from_secs(9) {
+            break;
+        }
+        assert!(
+            settle_started.elapsed() < Duration::from_secs(30),
+            "DM metrics never settled"
+        );
+        last = now;
+    }
+    let before = g.authority.agent.direct_messaging().diagnostics_snapshot();
+    let from = remnant_revision(&g.joiner, &g.group_key).await;
+    let _ = serve_result(&g.authority, &g.joiner, &g.stable, &g.attempt, from).await;
+    assert!(transport_seen(&g.authority, &g_hex, "join_result").await);
+    let recorded = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let now = g.authority.agent.direct_messaging().diagnostics_snapshot();
+            if now.stats.outgoing_send_total > before.stats.outgoing_send_total
+                && now.stats.outgoing_send_failed + now.stats.outgoing_send_succeeded
+                    > before.stats.outgoing_send_failed + before.stats.outgoing_send_succeeded
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        recorded.is_ok(),
+        "the class-R send was not recorded in the DM metrics"
+    );
+    Ok(())
+}

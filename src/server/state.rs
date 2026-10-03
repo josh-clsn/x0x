@@ -1287,6 +1287,10 @@ pub(super) struct NamedGroupTestRecorders {
     /// path that can reach the gossip inbox can leave the bytes with a
     /// detached stranded-publish retry.
     pub(super) join_artifact_delivery_paths: StdMutex<Vec<(String, &'static str, bool)>>,
+    /// ADR 0107 (r5, G3): the transport discipline every class-R exchange
+    /// was handed to, as `(recipient, kind, transport)`. Only
+    /// `pinned_single_exchange` admits every physical write.
+    pub(super) join_artifact_transports: StdMutex<Vec<(String, &'static str, &'static str)>>,
 }
 
 #[cfg(test)]

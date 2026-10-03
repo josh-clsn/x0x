@@ -35885,6 +35885,17 @@ pub(super) async fn send_join_artifact(
         let recipient_hex = hex::encode(recipient.as_bytes());
         join_egress_test_barrier::park(&recipient_hex, kind).await;
         record_join_artifact_delivery_path(state, &recipient_hex, kind, false);
+        if let Ok(mut transports) = state
+            .named_group_test_recorders
+            .join_artifact_transports
+            .lock()
+        {
+            transports.push((
+                recipient_hex.clone(),
+                kind,
+                "raw_ack_v2_with_internal_resends",
+            ));
+        }
         if state.agent.network().is_none() {
             // In-process stand-in for the raw-QUIC transport: the admission
             // runs where the transport runs it, and the egress witness
