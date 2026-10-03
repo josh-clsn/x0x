@@ -14336,9 +14336,13 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 let expected1 = guard.epoch().saturating_add(1);
                 let expected2 = expected1.saturating_add(1);
 
-                // Commit 1: roster with the stale KP removed, sealed at
-                // epoch +1. Removes carry the plain epoch binding.
+                // Commit 1: a REAL removal of the member, sealed at epoch +1
+                // with the plain epoch binding — exactly the state every
+                // other member's ordinary `MemberRemoved` arm computes, so
+                // the whole group follows the remove + add pair through the
+                // normal apply path.
                 next.roster_revision = next.roster_revision.saturating_add(1);
+                next.remove_member(&member_agent_id, Some(inviter_agent_id.clone()));
                 next.secret_epoch = expected1;
                 next.security_binding = Some(format!("treekem:epoch={expected1}"));
                 // ADR-0038: an owner-axis group refuses a PLAIN seal, so both
@@ -14358,10 +14362,42 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     };
                 let revision1 = next.roster_revision;
 
-                // Commit 2: roster with the fresh KP, sealed at epoch +2 with
-                // the recovery binding (same discipline as the fresh-add path).
-                next.set_member_treekem_key_package(&member_agent_id, new_kp_b64.clone());
+                // Commit 2: the member re-seated with the fresh KP, sealed at
+                // epoch +2 with the recovery binding — the fresh-add path's
+                // seat write, which is what every receiver's `MemberAdded`
+                // arm reproduces (role Member, added by the inviter).
                 next.roster_revision = next.roster_revision.saturating_add(1);
+                next.add_member_with_kem(
+                    member_agent_id.clone(),
+                    x0x::groups::GroupRole::Member,
+                    Some(inviter_agent_id.clone()),
+                    display_name.clone(),
+                    None,
+                );
+                if let Some(ref dn) = display_name {
+                    next.set_display_name(&member_agent_id, dn.clone());
+                }
+                next.set_member_treekem_key_package(&member_agent_id, new_kp_b64.clone());
+                if let Some(kem_b64) = verified_joiner_kem_b64.clone() {
+                    next.set_member_kem_public_key(&member_agent_id, kem_b64);
+                }
+                hydrate_digest_only_seats_at_seat_time(
+                    state,
+                    &resolved_group_key,
+                    &mut next,
+                    std::slice::from_ref(&member_agent_id),
+                )
+                .await;
+                if let Some(cert) = rekey_owner_certified_admission.clone() {
+                    if next.set_member_certificate(&member_agent_id, cert).is_err() {
+                        tracing::warn!(
+                            group_id = %LogHexId::group(&resolved_group_key),
+                            member = %LogHexId::agent(&member_agent_id),
+                            "MemberJoined re-key: certificate digest contradicts the re-seated roster digest"
+                        );
+                        return ApplyMetadataResult::REJECTED;
+                    }
+                }
                 next.secret_epoch = expected2;
                 let Some(binding) = treekem_recovery_security_binding(expected2, &rekey_recovery)
                 else {
@@ -15275,6 +15311,87 @@ fn listener_shutdown_flagged(shutdown_rx: &mut tokio::sync::watch::Receiver<bool
     *shutdown_rx.borrow_and_update()
 }
 
+/// Where a group listener's messages come from: the gossip subscription in
+/// production, any channel in a test.
+trait GroupListenerSource {
+    fn next_message(
+        &mut self,
+    ) -> impl std::future::Future<Output = Option<x0x::gossip::PubSubMessage>> + Send + '_;
+}
+
+impl GroupListenerSource for x0x::gossip::Subscription {
+    fn next_message(
+        &mut self,
+    ) -> impl std::future::Future<Output = Option<x0x::gossip::PubSubMessage>> + Send + '_ {
+        self.recv()
+    }
+}
+
+/// The metadata listener's receive loop, apart from its registration so
+/// the shutdown contract is testable with any message source. Returns
+/// whether it stopped because an apply reported a membership exit.
+async fn run_group_metadata_listener(
+    state: &Arc<AppState>,
+    group_id: &str,
+    source: &mut impl GroupListenerSource,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    let mut membership_exit = false;
+    loop {
+        // The shutdown may have been flagged before this receiver
+        // existed, in which case `changed()` never fires for it.
+        if listener_shutdown_flagged(shutdown_rx) {
+            break;
+        }
+        tokio::select! {
+            _ = shutdown_rx.changed() => break,
+            maybe_msg = source.next_message() => {
+                let Some(msg) = maybe_msg else { break; };
+                let Some(sender) = msg.sender else { continue; };
+                // #946 r2: group-scoped certificate fetch traffic rides
+                // this topic BEFORE any metadata event (it is not an
+                // event); route it to the real handler branches and
+                // continue the listener loop.
+                if let Some(rest) = msg.payload.strip_prefix(GROUP_CERT_FETCH_DOMAIN) {
+                    handle_group_cert_fetch_request(
+                        state,
+                        rest,
+                        Some(&sender),
+                        msg.verified,
+                        group_id,
+                    )
+                    .await;
+                    continue;
+                }
+                if let Some(rest) = msg.payload.strip_prefix(GROUP_CERT_FETCH_RESPONSE_DOMAIN) {
+                    handle_group_cert_fetch_response(
+                        state,
+                        rest,
+                        msg.verified,
+                        group_id,
+                    )
+                    .await;
+                    continue;
+                }
+                let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else { continue; };
+                let apply_result = apply_named_group_metadata_event(
+                    state,
+                    event,
+                    sender,
+                    msg.verified,
+                    msg.raw_envelope.as_deref(),
+                )
+                .await;
+                if apply_result.should_exit {
+                    membership_exit = true;
+                    break;
+                }
+            }
+        }
+    }
+    membership_exit
+}
+
 async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &str) {
     // Shutdown already requested: the drain has taken (or is taking) the
     // registries, so a listener registered now would outlive the instance.
@@ -15322,59 +15439,13 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
         // Track a membership-driven exit so the tail can re-evaluate its own
         // eligibility (#376, FIX A). A shutdown or a closed subscription does
         // not qualify — only an apply that returned `should_exit`.
-        let mut membership_exit = false;
-        loop {
-            // The shutdown may have been flagged before this receiver
-            // existed, in which case `changed()` never fires for it.
-            if listener_shutdown_flagged(&mut shutdown_rx) {
-                break;
-            }
-            tokio::select! {
-                _ = shutdown_rx.changed() => break,
-                maybe_msg = sub.recv() => {
-                    let Some(msg) = maybe_msg else { break; };
-                    let Some(sender) = msg.sender else { continue; };
-                    // #946 r2: group-scoped certificate fetch traffic rides
-                    // this topic BEFORE any metadata event (it is not an
-                    // event); route it to the real handler branches and
-                    // continue the listener loop.
-                    if let Some(rest) = msg.payload.strip_prefix(GROUP_CERT_FETCH_DOMAIN) {
-                        handle_group_cert_fetch_request(
-                            &state_for_task,
-                            rest,
-                            Some(&sender),
-                            msg.verified,
-                            &task_group_id,
-                        )
-                        .await;
-                        continue;
-                    }
-                    if let Some(rest) = msg.payload.strip_prefix(GROUP_CERT_FETCH_RESPONSE_DOMAIN) {
-                        handle_group_cert_fetch_response(
-                            &state_for_task,
-                            rest,
-                            msg.verified,
-                            &task_group_id,
-                        )
-                        .await;
-                        continue;
-                    }
-                    let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else { continue; };
-                    let apply_result = apply_named_group_metadata_event(
-                        &state_for_task,
-                        event,
-                        sender,
-                        msg.verified,
-                        msg.raw_envelope.as_deref(),
-                    )
-                    .await;
-                    if apply_result.should_exit {
-                        membership_exit = true;
-                        break;
-                    }
-                }
-            }
-        }
+        let membership_exit = run_group_metadata_listener(
+            &state_for_task,
+            &task_group_id,
+            &mut sub,
+            &mut shutdown_rx,
+        )
+        .await;
         remove_listener_if_token(&state_for_task, &task_group_id, registration_token).await;
         // FIX A (#376): the wrapper-site re-ensure ran while THIS handle was
         // still registered, so for a `should_exit` on our own task it no-op'd on
@@ -35366,6 +35437,35 @@ pub(in crate::server) struct ApplyMetadataEventRequest {
     sender_agent_id: String,
 }
 
+/// Which events the engine-A local-apply endpoint refuses, and why. The
+/// endpoint takes the sender from its caller and clears the transport gate,
+/// so it admits only events whose authority does not rest on that sender
+/// claim: an event carrying a signed state commit (its arm verifies the
+/// signature, the chain link and the state hash against the local roster)
+/// and the self-signed ORIGINAL `MemberJoined` (the arm checks the joiner's
+/// ML-DSA signature, its derived id and the single-use invite secret).
+/// Everything else authorizes on the sender alone and is refused:
+/// the recovery-courier `MemberJoined`, a `SecureShareDelivered` (actor ==
+/// sender, Admin), a `GroupCardPublished`, and any event whose commit is
+/// absent.
+fn engine_a_apply_refusal(event: &NamedGroupMetadataEvent) -> Option<&'static str> {
+    match event {
+        NamedGroupMetadataEvent::MemberJoined {
+            recovery_authority_signature_b64: Some(_),
+            ..
+        } => Some("recovery_courier_needs_verified_sender"),
+        NamedGroupMetadataEvent::MemberJoined { .. } => None,
+        NamedGroupMetadataEvent::SecureShareDelivered { .. } => {
+            Some("secure_share_needs_verified_sender")
+        }
+        NamedGroupMetadataEvent::GroupCardPublished { .. } => {
+            Some("group_card_needs_verified_sender")
+        }
+        other if named_group_metadata_event_commit(other).is_some() => None,
+        _ => Some("unsigned_event_needs_verified_sender"),
+    }
+}
+
 /// POST /groups/:id/apply-metadata-event: apply a metadata event into local
 /// group state without gossip. With gossip disabled or unreliable (a mobile
 /// owner's mesh), `agent.publish` only fans out to remote peers, so a
@@ -35409,21 +35509,12 @@ pub(in crate::server) async fn apply_group_metadata_event(
             );
         }
     };
-    // The recovery-courier MemberJoined (an authority attestation present)
-    // trusts the delivering sender's own active membership, which this
-    // endpoint cannot vouch for: the caller only asserts `sender_agent_id`.
-    // That shape stays on the transport-verified paths (#377).
-    if matches!(
-        event,
-        NamedGroupMetadataEvent::MemberJoined {
-            recovery_authority_signature_b64: Some(_),
-            ..
-        }
-    ) {
+    if let Some(reason) = engine_a_apply_refusal(&event) {
         return api_error_with_reason(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "a recovery-courier MemberJoined needs a transport-verified sender",
-            "recovery_courier_needs_verified_sender",
+            "the local-apply endpoint admits only commit-signed events and the \
+             self-signed original MemberJoined",
+            reason,
         );
     }
     tracing::debug!(
@@ -37639,6 +37730,7 @@ async fn apply_rekey_self_removal_link_checked(
     let NamedGroupMetadataEvent::MemberRemoved {
         revision,
         actor,
+        agent_id: removed_agent,
         treekem_epoch: Some(epoch),
         commit: Some(commit),
         ..
@@ -37701,10 +37793,11 @@ async fn apply_rekey_self_removal_link_checked(
         None,
         x0x::groups::ActionKind::AdminOrHigher,
         |next| {
-            // Mirrors the authority's re-key seal: the removal commit keeps
-            // the member's roster seat (only its stale leaf leaves the tree)
-            // and advances the roster revision and the epoch binding.
+            // Exactly the ordinary `MemberRemoved` arm's state change; only
+            // the departure teardown is skipped, since the add that follows
+            // re-seats this device on the same row.
             next.roster_revision = adopt_roster_revision(next.roster_revision, *revision);
+            next.remove_member(removed_agent, Some(actor.clone()));
             next.secret_epoch = *epoch;
             next.security_binding = Some(format!("treekem:epoch={epoch}"));
         },

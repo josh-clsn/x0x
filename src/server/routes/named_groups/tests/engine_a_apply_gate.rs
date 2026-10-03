@@ -1,8 +1,10 @@
 //! The engine-A local-apply endpoint (`POST /groups/:id/apply-metadata-event`)
 //! applies with the transport gate cleared for a caller-asserted sender, so it
-//! must never admit a shape that trusts that sender: the recovery-courier
-//! `MemberJoined` is refused, while the original self-delivered join the
-//! relay lane exists for still applies.
+//! must never admit a shape that trusts that sender. It admits commit-signed
+//! events and the self-signed original `MemberJoined` (what fetch>it relays:
+//! the bridged join and the group log's commit-only `MemberAdded`), and
+//! refuses the recovery courier, `SecureShareDelivered`, `GroupCardPublished`
+//! and any commit-less event.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -153,5 +155,73 @@ async fn engine_a_apply_refuses_the_recovery_courier_and_admits_the_original_joi
         .expect("group")
         .has_active_member(&joiner_hex));
     let _ = group;
+    Ok(())
+}
+
+#[tokio::test]
+async fn engine_a_apply_refuses_events_that_authorize_on_the_sender_alone() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let admin = hex::encode(state.agent.agent_id().as_bytes());
+    let group_id = "ab".repeat(32);
+    let share = NamedGroupMetadataEvent::SecureShareDelivered {
+        group_id: group_id.clone(),
+        recipient: admin.clone(),
+        secret_epoch: 2,
+        kem_ciphertext_b64: String::new(),
+        aead_nonce_b64: String::new(),
+        aead_ciphertext_b64: String::new(),
+        actor: admin.clone(),
+    };
+    let card = NamedGroupMetadataEvent::GroupCardPublished {
+        group_id: group_id.clone(),
+        card: x0x::groups::GroupCard {
+            group_id: group_id.clone(),
+            name: "spoof".into(),
+            description: String::new(),
+            avatar_url: None,
+            banner_url: None,
+            tags: Vec::new(),
+            policy_summary: x0x::groups::GroupPolicySummary {
+                discoverability: x0x::groups::GroupDiscoverability::PublicDirectory,
+                admission: x0x::groups::GroupAdmission::RequestAccess,
+                confidentiality: x0x::groups::GroupConfidentiality::MlsEncrypted,
+                read_access: x0x::groups::GroupReadAccess::MembersOnly,
+                write_access: x0x::groups::GroupWriteAccess::MembersOnly,
+            },
+            owner_agent_id: admin.clone(),
+            admin_count: 1,
+            member_count: 1,
+            created_at: 0,
+            updated_at: 0,
+            request_access_enabled: true,
+            metadata_topic: None,
+            revision: 1,
+            state_hash: String::new(),
+            prev_state_hash: None,
+            issued_at: 1,
+            expires_at: 2,
+            authority_agent_id: String::new(),
+            authority_public_key: String::new(),
+            withdrawn: false,
+            signature: String::new(),
+        },
+    };
+    let unsigned_rename = NamedGroupMetadataEvent::GroupMetadataUpdated {
+        group_id: group_id.clone(),
+        revision: 1,
+        actor: admin.clone(),
+        name: Some("spoof".into()),
+        description: None,
+        commit: None,
+    };
+    for (event, reason) in [
+        (share, "secure_share_needs_verified_sender"),
+        (card, "group_card_needs_verified_sender"),
+        (unsigned_rename, "unsigned_event_needs_verified_sender"),
+    ] {
+        let (status, body) = post_apply(&state, &group_id, &event, &admin).await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body.contains(reason), "{body}");
+    }
     Ok(())
 }
