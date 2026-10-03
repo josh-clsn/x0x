@@ -298,6 +298,19 @@ Each gap below was fixed red-then-green: the test commit is red on its parent, t
 | G1, G12 | Accepted (section 5) | — | — |
 | G10 | Accept, conditional on evidence | — | Needs e2e Home and mixed-version runs. Class K is now raw-only too: an unreachable recipient retries until the horizon. |
 
+### Round 6 (Codex review of `a8acd0d`: changes required, narrow)
+
+The review found the call-site audit clean: every class-R and class-K write converges on the single-exchange seam, and no gossip or general-DM path is left. It also confirmed that agent/machine revocation and pairing are checked at the seam, and that G4/G5 quiesce, the G6/G8 caps, G9 cleanup, the deadline calculation and panics are correct. On mixed versions, v0.46.0 already accepts `[0x10][sender][payload]` and `SecureShareDelivered` through its direct metadata listener, so there is no decoder break and no new ADR.
+
+| Item | Status | Red, then fix | Evidence |
+|---|---|---|---|
+| P1: the seam took the verdict at the pre-phase snapshot's clock | Fixed: `OwnerCertEvidence::at_time`; the seam re-takes the snapshot's verdict at its own clock (the same clock as the embedded-certificate check), for class R and class K | `01eab83`, `c0c4a5c` | `s8a_r6_verdict_expiry_between_pre_phase_and_seam_is_refused` (a test-only skew of the seam's clock; the announced certificate expires past its 300 s tolerance while the embedded one stays valid) |
+| P2: the chunk seam took the staging registry's blocking lock and pruned | Fixed: `ControlBlobState::try_staged_origin` (`try_lock`, no pruning, explicit TTL and deadline checks); contention is a retryable withhold | `8eeeec0`, `21d7fa3` | `s8a_r6_seam_staged_copy_check_never_blocks` |
+| P3: inline egress outlived its G7 handler ticket, so duplicate fetches overlapped | Fixed: `join_result_egress_admission` (one per (stable group, recipient), 8 per group, 64 global); the ticket lives in the egress task | `388a42f`, `a2d7d68` | `s8a_r6_duplicate_fetches_never_overlap_inline_egress` (6 duplicate fetches against a stalled egress leave 1 in flight) |
+| P4: withholding masked terminal share invalidations | Fixed: the serving guard decides every definitive refusal before quarantine or pending evidence (class R and K); the share verdict checks the epoch first | `96d103c`, `d12a42e` | `s8a_r6_terminal_share_invalidations_outrank_withholding` (quarantine plus agent revocation, and quarantine plus a moved epoch: both purged) |
+
+Still outstanding for merge: the G10 evidence (e2e Home joins, survivor rekeys, mixed-version delivery on raw-only), from Root's ephemeral-testnet gate.
+
 Remaining notes:
 - **Retry classification.** Certificate expiry is classified as definitive and purges, consistent with the existing serving guard. A later certificate renewal does not re-send a purged share; the next rotation does.
 - **Joiner side.** A `Result` arm handled on the joiner's listener still waits inline for the joiner's own group lock. That is outside these gaps.
