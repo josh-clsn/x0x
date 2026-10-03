@@ -5303,8 +5303,9 @@ where
 /// order. The candidate commit compares and writes only touched keys (#470),
 /// preserving unrelated changes from writers that bypass P (owner-cert
 /// verdict stamping and stale join-row cleanup). A changed target fails
-/// closed and requires durability confirmation; a rebind transaction re-saves
-/// memory before discarding its rejected candidate's journals.
+/// closed, re-saves memory, and requires durability confirmation; a rebind
+/// transaction discards its rejected candidate's journals only after a durable
+/// memory re-save.
 pub(in crate::server) async fn persist_named_groups_quarantine_clear_gated<F>(
     state: &AppState,
     mutate: F,
@@ -5388,16 +5389,22 @@ where
             tracing::error!(
                 "N19-B: a touched named-group record diverged during a gated quarantine clear — keeping memory, refusing the commit"
             );
-            if let Some(group_id) = rebind_group_id {
-                // P and G remain held. Only a durable memory re-save makes
-                // it safe to discard the candidate's replay journals.
-                if matches!(
-                    save_named_groups_checked_unlocked(state).await,
-                    Ok(AtomicWriteOutcome::Durable)
-                ) {
+            // P and G remain held. Re-save memory for every target conflict;
+            // only a durable re-save makes candidate journals safe to discard.
+            if matches!(
+                save_named_groups_checked_unlocked(state).await,
+                Ok(AtomicWriteOutcome::Durable)
+            ) {
+                if let Some(group_id) = rebind_group_id {
                     discard_rebind_journal(state, group_id).await;
                 }
             }
+            // A durable corrective save clears the flag internally. Keep the
+            // rejected transaction fail-closed until the next persist confirms
+            // memory before accepting another mutation.
+            state
+                .named_groups_requires_durability_confirmation
+                .store(true, Ordering::Release);
             return Err(std::io::Error::other(
                 "named-group record changed during the gated quarantine clear",
             ));
@@ -33072,8 +33079,9 @@ async fn save_named_groups_store_checked(
             state
                 .named_groups_requires_durability_confirmation
                 .store(false, Ordering::Release);
-            // #477 (r9 item 1): the on-disk view now matches the live map
-            // — every in-flight install marker is obsolete.
+            // #477 (r9 item 1): the supplied store view is now durable
+            // (a gated clear may still have to publish its private candidate),
+            // so every in-flight install marker is obsolete.
             clear_join_install_pending_markers(&state.named_groups_path).await;
         }
         Ok(AtomicWriteOutcome::ReplacedNotDurable) => state
