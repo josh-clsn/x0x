@@ -21,8 +21,7 @@ async fn staged_self_leave(
     let local = state.agent.agent_id();
     let local_hex = hex::encode(local.as_bytes());
     let local_seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
-    let mut group =
-        x0x::mls::TreeKemMlsGroup::create(group_id_bytes.clone(), local, &local_seed)?;
+    let mut group = x0x::mls::TreeKemMlsGroup::create(group_id_bytes.clone(), local, &local_seed)?;
 
     let leaver = AgentId([0x6b; 32]);
     let leaver_hex = hex::encode(leaver.as_bytes());
@@ -89,7 +88,9 @@ async fn self_leave_advances_the_epoch_and_rotates_the_leaver_out() -> Result<()
     let (leaver_hex, leaver_kp, group) = staged_self_leave(&state, group_id, local).await?;
     let epoch_before = group.lock().await.epoch();
 
-    state.named_group_test_recorders.publish_attempts
+    state
+        .named_group_test_recorders
+        .publish_attempts
         .lock()
         .expect("publish-attempt recorder poisoned")
         .clear();
@@ -115,7 +116,9 @@ async fn self_leave_advances_the_epoch_and_rotates_the_leaver_out() -> Result<()
     );
     drop(groups);
     assert!(
-        state.named_group_test_recorders.publish_attempts
+        state
+            .named_group_test_recorders
+            .publish_attempts
             .lock()
             .expect("publish-attempt recorder poisoned")
             .iter()
@@ -234,8 +237,7 @@ async fn a_member_who_is_not_the_designated_committer_does_not_rekey() -> Result
     // The group's admin/creator is someone else, so this node is a plain
     // member and must stay out of the way.
     let other_admin = AgentId([0x01; 32]);
-    let (_leaver_hex, leaver_kp, group) =
-        staged_self_leave(&state, group_id, other_admin).await?;
+    let (_leaver_hex, leaver_kp, group) = staged_self_leave(&state, group_id, other_admin).await?;
     let epoch_before = group.lock().await.epoch();
 
     let rotated = reconcile_treekem_self_leave_rekeys(&state, group_id, "test").await;
