@@ -1,9 +1,9 @@
 # x0x design direction and rulings digest
 
 - **Status:** maintained digest, not an ADR. It records the design rulings
-  David Irvine made from 2026-09-28 to 2026-09-30 (decisions D01–D36 and the
+  David Irvine made from 2026-09-28 to 2026-10-03 (decisions D01–D52 and the
   efficiency decisions E-D1–E-D17).
-- **Updated:** 2026-09-30.
+- **Updated:** 2026-10-03.
 - **Relationship to ADRs:** ADRs remain the decision records, and only David
   marks an ADR Accepted. Where a ruling here changes what an Accepted ADR
   means in practice, the status overlay at the top of the
@@ -114,7 +114,7 @@ wave that fixes each is in section 7.
 | I12 | **Resource bounds.** A daemon never fills its host's disk, spends a user's uplink as infrastructure, or grows queues without bound, and every bound is visible. |
 | I13 | **Plane isolation.** A test or named daemon never joins production by accident. |
 
-## 5. Decisions D01–D36
+## 5. Decisions D01–D52
 
 Status key: **implemented** = in effect on `main` (code, configuration or an
 Accepted ADR); **ruled** = decided by David, work outstanding or ongoing;
@@ -127,23 +127,23 @@ and D29 (an ADR 0089 slice pulled into v0.46).
 
 | Id | Ruling (one line) | Status |
 |---|---|---|
-| D01 | v0.46 failing to read v0.45 KV snapshots (C1) is a release blocker; the fail-closed downgrade of `X0XKVS2` is accepted (files kept, unreadable on 0.45). #1046 lands on `main` with a storage ADR and a gate row that loads a real v0.45.0 `data_dir`. | Implemented: #1046, [ADR 0085](../adr/0085-persisted-binary-formats-are-versioned.md); gate row outstanding |
-| D02 | The v0.46.0 gate is relative to a v0.45.0 baseline, with exactly three Home gating rows, a Home stopping rule and a drop rule for should-land fixes. | Ruled; gate in progress |
-| D03 | Canary: a draft-bytes deploy before publish, a 0.46→0.46.x self-upgrade rehearsal on a real systemd host, and no GitHub prerelease publishing. | Ruled; gate rows 7a/7b outstanding |
-| D04 | Released bytes equal the CI-tested graph: `Cargo.lock` is tracked, `release.yml` consumes it, and prerelease tags are refused. | Implemented; recorded by ADR 0087 (Proposed) |
-| D05 | Release-key protection: release build, sign, create and publish jobs, and ad-hoc SKILL.md signing, run in a protected `release` environment with David as required reviewer, limited to `v*` tags. | Implemented; recorded by ADR 0087 (Proposed) |
+| D01 | v0.46 failing to read v0.45 KV snapshots (C1) is a release blocker; the fail-closed downgrade of `X0XKVS2` is accepted (files kept, unreadable on 0.45). #1046 lands on `main` with a storage ADR and a gate row that loads a real v0.45.0 `data_dir`. | Implemented: #1046, [ADR 0085](../adr/0085-persisted-binary-formats-are-versioned.md); W2 gate complete |
+| D02 | The v0.46.0 gate is relative to a v0.45.0 baseline, with exactly three Home gating rows, a Home stopping rule and a drop rule for should-land fixes. | Ruled; W2 gate complete (2026-10-03) |
+| D03 | Canary: a draft-bytes deploy before publish, a 0.46→0.46.x self-upgrade rehearsal on a real systemd host, and no GitHub prerelease publishing. | Ruled; W2 complete (2026-10-03) |
+| D04 | Released bytes equal the CI-tested graph: `Cargo.lock` is tracked, `release.yml` consumes it, and prerelease tags are refused. | Implemented; recorded by ADR 0087 (Accepted) |
+| D05 | Release-key protection: release build, sign, create and publish jobs, and ad-hoc SKILL.md signing, run in a protected `release` environment with David as required reviewer, limited to `v*` tags. | Implemented; recorded by ADR 0087 (Accepted) |
 | D06 | #1044 (owner-sync admission on verified enrollment) is kept and recorded retroactively, amending ADR 0041; the SyncV1-acceptor machine-revocation re-check is must-land. | Implemented: [ADR 0084](../adr/0084-enrolled-owner-sync-admission.md) |
 | D07 | The v0.46 should-land fix set is approved under the drop rule. The review-only model lanes may also author small fixes, each reviewed by another model family. Persisted consent moves to W3. | Ruled |
 | D08 | The grant capability bit ships **in v0.46**, with an ADR and W2 implementation. David ruled this over the recommendation to defer it to W3. | Implemented: #1064, [ADR 0093](../adr/0093-capability-advert-registry.md) |
-| D09 | The v0.46 known limitations and the 0.46→0.45 downgrade procedure are signed; `/calls` is labelled experimental. | Ruled; release notes outstanding |
+| D09 | The v0.46 known limitations and the 0.46→0.45 downgrade procedure are signed; `/calls` is labelled experimental. | Implemented; signed release notes published (2026-10-03) |
 | D10 | Three criteria changes are **ratified as-is (David, 2026-09-29)**: #903 (predecessor loss is a mixed-version limitation), #952 folded into #504, and #1021's private-KV precondition barrier. The ruling carries no control-run condition; the charter's recommendation had proposed one for #1021. | Ruled |
 | D11 | ADR 0069 (Home waits for owner sync) is accepted as a record of shipped behaviour, to be superseded by ADR 0088. | Implemented: [ADR 0069](../adr/0069-home-wait-for-sync-before-auto-provisioning.md) |
 | D12 | #613 stays separate from #807 and keeps its measurement row. | Ruled |
 | D13 | #646 (invites stop past 20 Active+Banned members) is a product limit, not parked; fixed in W4. | Ruled |
 | D14 | Testnet evidence runs on **dedicated testnet hosts**, sealed from production. David chose dedicated hosts over the open "dedicated hosts or 4 vCPU" option. | Ruled |
-| D15 | CI runs on PRs to every base; `main` has a ruleset with required checks and no bypass; `v*` tags are admin-only. **No bot identity:** David declined the recommended separate agent identity, so agents act as the admin account. | Implemented; recorded by ADR 0087 (Proposed) |
+| D15 | CI runs on PRs to every base; `main` has a ruleset with required checks and no bypass; `v*` tags are admin-only. **No bot identity:** David declined the recommended separate agent identity, so agents act as the admin account. | Implemented; recorded by ADR 0087 (Accepted) |
 | D16 | Group liveness contract, **ruled in full (David, 2026-09-29)**: a promoted admin carrying the evidence may admit while the owner device is offline, and any active admin may redeem invites; stale ordinary-group joiners catch up; Home becomes an explicit owner group, with the owner certificate checked at admission; the simulation harness must reproduce each failure first. D34 closes the three holes this left (who attests catch-up, eviction on revocation, certificate size). | Pending ADR 0088 (prov.), W3 |
-| D17 | Trust gates decide only from in-band evidence plus persisted state, through one `Authority::decide`. | Pending ADR 0089 (prov.), W3 |
+| D17 | Trust gates decide only from in-band evidence plus persisted state, through one `Authority::decide`. | ADR 0089 Accepted; unified authority pending W3 |
 | D18 | One group crypto (TreeKEM only) and one acknowledged-delivery primitive (`Outbox<T>`), enforced in CI: no new bespoke queues in fix PRs. | Pending ADRs 0090, 0091 (prov.), W3 |
 | D19 | Scope, **revised by David on 2026-09-29** (it supersedes the 09-28 "network-and-trust layer" wording): x0x is the glue between people, their machines and their agents and does not provide agents. Core: shared places, sharing whole agent teams, and efficiency (goal E). Headline requirement: any agent that sees x0x knows how to use it. R8 media calling and the loro notes merge path are lower priority, not in scope now. | Pending ADR 0095 (prov.), after promotion |
 | D20 | R12, "x0x is maintained by its own agents", is agreed; its ADR is accepted after promotion. The charter plans ADR 0097 (prov.) to supersede ADR 0045 alongside it. | Pending ADR 0096 (prov.), after promotion |
@@ -155,14 +155,31 @@ and D29 (an ADR 0089 slice pulled into v0.46).
 | D26 | The Leaf egress default (ADR 0078, Proposed) is decided after v0.46 as one bundle together with unicast capability responses, a gated DM bus and envelope collapse (ADR 0101, prov.), in the E-D6 order. Revocation topics are exempt first, and the shed estimate is re-measured first. | Ruled (decision deferred to W4) |
 | D27 | Cuts after v0.46, as removal-only PRs: roaming (retire ADR 0037/0043), `/mls/groups`, the peer relay (reject ADR 0051) at ADR 0071's exit, the KV DM fallback once `Outbox<T>` exists, dead code. Withdraw ADR 0063. Decline grantee fetch; the number 0076 stays unused. | Ruled; ADR 0102 (prov.) retires roaming |
 | D28 | ADR hygiene: ADR 0083 implementation is held after slice 1 until a cross-model review is recorded; new slices of ADR 0070, 0077 and 0079 are held until their reviews are recorded; the other "Reviewers pending" ADRs get a README note. | Implemented in the ADR README overlay |
-| D29 | An ADR 0089 slice is pulled into v0.46, overriding the moratorium for this slice only: persist verified agent→machine bindings and KEM keys for relationship peers (enrolled devices, grant parties, group members); an on-connect evidence exchange; a pull lookup ("who hosts agent X; send me its signed announce"); ADR 0021's no-persistent-cache rule amended for relationship peers only. Amended (David, 2026-09-30): stored authority is capped at 7 days and re-validated by a fresh Hello. | ADR 0089 Accepted (2026-09-30, #1095); implementation S1 in progress |
+| D29 | An ADR 0089 slice is pulled into v0.46, overriding the moratorium for this slice only: persist verified agent→machine bindings and KEM keys for relationship peers (enrolled devices, grant parties, group members); an on-connect evidence exchange; a pull lookup ("who hosts agent X; send me its signed announce"); ADR 0021's no-persistent-cache rule amended for relationship peers only. Amended (David, 2026-09-30): stored authority is capped at 7 days and re-validated by a fresh Hello. | ADR 0089 Accepted (2026-09-30, #1095); S1–S5 merged and shipped in v0.46.0 |
 | D30 | v0.46 gains a restart-cold gate row backed by a CI test (DM, TreeKEM join/Welcome, file offer and owner sync after a cold restart), plus row 4b: a restarted rc sender to a 0.45 receiver within 5 minutes. | Ruled |
-| D31 | PR #1092 (reconnect re-announce) is fixed, then merged as a stopgap until the D29 slice supersedes it: no debug print, per-node bytes and verifies stated including churn, a minimum peer absence before re-announcing, and a cross-model review. Amended (David, 2026-09-30): the absence threshold is 20 s, not about 5 minutes, because real restarts (15–30 s) never reached 5 minutes; the global 30 s rate limit stays. | Ruled; PR open |
+| D31 | PR #1092 (reconnect re-announce) is fixed, then merged as a stopgap until the D29 slice supersedes it: no debug print, per-node bytes and verifies stated including churn, a minimum peer absence before re-announcing, and a cross-model review. Amended (David, 2026-09-30): the absence threshold is 20 s, not about 5 minutes, because real restarts (15–30 s) never reached 5 minutes; the global 30 s rate limit stays. | Superseded by ADR 0089 evidence slices |
 | D32 | Fix the paper drift now, docs only: this digest, the ADR README status overlay, ADR 0087, #966, the missing planned issues, tracker hygiene, and W3, M-safety and W4 milestones. | In progress |
-| D33 | ADR 0089's scope is a pull lookup plus persisted evidence for relationship peers, on top of D17. | Pending ADR 0089 (prov.) |
+| D33 | ADR 0089's scope is a pull lookup plus persisted evidence for relationship peers, on top of D17. | Implemented: ADR 0089 Accepted; S1–S5 merged |
 | D34 | The three D16 holes: (1) in ownerless groups, an active admin's signed terminal snapshot attests stale-base catch-up (a mandate layer above ADR 0016, which gives #871 a re-seat path); (2) any online admin that receives a revocation evicts and rekeys within a bound, and group membership joins I7's live-session rule; (3) up to K certificates travel inline and the rest by hash, fetched from any holder (ADR 0088 owns fetch-by-hash). | Pending ADR 0088 (prov.) |
 | D35 | Sharing and mixed versions: a 90-day maximum ShareGrant lifetime with renewal (ADR 0098); after a restart, obligation-carrying typed sends to peers of unknown capability are held for up to one advert period; a minimum supported version and support window for embedders is published, owned by M1's census. | Ruled; lifetime pending ADR 0098 (prov.) |
-| D36 | Planning: W4 is re-sequenced so A5 (scratch store plus Data capability) and a team record come right after M3; named-group fanout joins E-D17's protected delivery classes before any shed default; every review finding on a merged PR becomes an issue or a written dismissal within 24 hours. | Ruled; the review rule is recorded by ADR 0087 (Proposed) |
+| D36 | Planning: W4 is re-sequenced so A5 (scratch store plus Data capability) and a team record come right after M3; named-group fanout joins E-D17's protected delivery classes before any shed default; every review finding on a merged PR becomes an issue or a written dismissal within 24 hours. | Ruled; the review rule is recorded by ADR 0087 (Accepted) |
+| D37 | ADR 0088 is a short I8 contract (the may-block-forever list, completion with any one admin or holder online, supersessions and numbered slices); each mechanism has a separate ADR, reproduced in the harness and Accepted separately. Drafting starts at W3-0 after promotion. | Ruled (2026-10-01); ADR 0106 Accepted and shipped in v0.46.0; remaining slices pending |
+| D38 | Home ownership implies consent to disclose the owner's user certificate **to Home members only**; public announces stay anonymous without explicit consent. The fix must stop an anonymous public announce contradicting the Home-scoped certificate; size it before promising a date. | Pending ADR 0088 slice, v0.46.x (2026-10-01) |
+| D39 | Before promotion, test (A) retained membership state after a refused or timed-out join and (B) a repeated seal after 300 s; any reproduction needs a blocker-or-limitation ruling. A reproduced; B did not. The initial fix and then known-limitation rulings for A were superseded by D43; joiner re-arm and authority re-Welcome remain v0.46.x work. | Implemented: CI-only hazard probes; final recovery ruling D43 (2026-10-02) |
+| D40 | Revocation eviction is designated-first: the lowest online active-admin agent ID evicts and rekeys; another admin acts only after the bound expires. The slice amends ADR 0016's committer rule and proposes the bound for acceptance. | Pending ADR 0088 slice (2026-10-01) |
+| D41 | An active admin's signed terminal snapshot lets a stale joiner or forked node adopt state and clear **its own** marker only; it cannot mark another member forked, evict anyone or clear another member's marker. | Pending ADR 0088 slice (2026-10-01) |
+| D42 | Adopt the canonical Home in place as the explicit owner group, preserving its group, roster and data; stop auto-provisioning and election. Duplicates stay until their user retires them; test that 0.45/0.46 peers see no new closed-enum Tier-1 kind. | Pending ADR 0088 slice (2026-10-01) |
+| D43 | Restore #1148 to v0.46.0: a stuck non-member recovers through owner removal and a fresh invite; an active device without keys needs removal while online, restart and a fresh invite. Rewrite the tests to this recovery, re-gate Home and re-tag. | Implemented in v0.46.0 (2026-10-02); supersedes the D39(A) drop ruling |
+| D44 | Run the two missing mixed-version checks before row 8: ShareGrant to a 0.45 recipient and a 0.45 joiner against a 0.46 authority. Accept the other measured row-4 results, including the fail-closed old-to-new DM result. | Ruled (2026-10-02); W2 complete |
+| D45 | Merge #1155 to keep `Cargo.lock` LF on checkout, then move the v0.46.0 tag to that merge after the Windows source-custody failure; approve the replacement release run. | Implemented (2026-10-02) |
+| D46 | Merge #1157 so custody verification accepts GNU sha256sum's binary-mode `*` marker, then move the v0.46.0 tag to that merge and approve the replacement release run. | Implemented (2026-10-02) |
+| D47 | A designated release operator may approve build, sign and draft-creation environments for David-authorized `v*` tags checked against their commit; each approval is rechecked and recorded. Publishing, tag changes, draft downloads and production changes still need David's specific approval. | Ruled; standing instruction (2026-10-03) |
+| D48 | Authorize downloading verified v0.46.0 draft Linux bytes (`cea64f2`) for row 7a's sealed testnet arm and six-fixture batch after signature, checksum and provenance checks; production deployment still needs separate approval. | Ruled (2026-10-03); W2 complete |
+| D49 | Authorize row 7a's production pair to run the draft daemon with retained backups, hash and configuration checks, rolling restarts 15 s apart and a 30-minute watch; rollback restores the backup. Keep the draft unpublished and do not use self-update for this step. | Ruled (2026-10-03); W2 complete |
+| D50 | Sign row 8's v0.46.0 known limitations as written: 15 items, including 7b and 7c. | Implemented; signed 2026-10-03 |
+| D51 | Run the signed-update canary on two production hosts while holding two others; re-enable the held hosts only after health passes, otherwise keep the hold and manually roll back the canary pair. | Passed (2026-10-03); all six production hosts (12 daemons) upgraded and healthy |
+| D52 | Publish v0.46.0 as Latest (tag `v0.46.0`, commit `cea64f2`) and promote crates.io and ClawHub. | Implemented; published 2026-10-03 |
+| COMMS | Use plain controlled language (about 80% toward ASD-STE100), fixed decision templates and one release contact; record and share each ruling, check live GitHub before requesting approval, keep the release dashboard current and include diagrams in briefs. Trial explainer videos after promotion. | Ruled; adopted 2026-10-02 |
 
 ## 6. Efficiency decisions E-D1–E-D17 (Track E)
 
@@ -207,11 +224,11 @@ repeated, sealed-mesh and stated with their evidence level.
 
 Calendar figures are estimates.
 
-| Wave | What it is | State (2026-09-30) |
+| Wave | What it is | State (2026-10-03) |
 |---|---|---|
 | **W0: ops now** | Stop the bleeding (the log flood), seal the testnet, lock scope, answer field reports. | Started 2026-09-28 |
 | **W1: land #802** | The final-acceptance candidate lands on `main` as one integration merge, with no tag. | Done (merge `952ed18`, 2026-09-28) |
-| **W2: v0.46.0 gate** | Fixes only, released against the signed relative gate (D02, D03, D30). Must-land: C1 (#1046, ADR 0085), the #1044 panic follow-up, the tracked lock and prerelease refusal, the self-upgrade rehearsal, the release environment, and any regression the gate finds. Should-land fixes merge by the cutoff or drop to a signed known limitation. Efficiency is measured only. | In progress |
+| **W2: v0.46.0 gate** | Fixes only, released against the signed relative gate (D02, D03, D30). Must-land: C1 (#1046, ADR 0085), the #1044 panic follow-up, the tracked lock and prerelease refusal, the self-upgrade rehearsal, the release environment, and any regression the gate finds. Should-land fixes merge by the cutoff or drop to a signed known limitation. Efficiency is measured only. | Complete; v0.46.0 published 2026-10-03 (tag `v0.46.0`, commit `cea64f2`) |
 | **v0.47 (early W3)** | Efficiency quick wins with no wire change, counters and tier-0/1 gates; the budgets ADR and ADR 0101 drafted; the SKILL.md split. | After promotion |
 | **W3: group consolidation (Track G)** | ADR 0088 liveness contract; a deterministic multi-node simulation harness that reproduces #1023, #811, #818 and #969 before they are fixed; `Outbox<T>` (ADR 0090); one seal-and-publish service; in-band evidence and `Authority::decide` (ADR 0089); a `GroupAccess` extractor; one roster-commit path; one group crypto (ADR 0091); a digest beacon for KV and task lists (ADR 0092). Efficiency rides these chokepoints. | 10–14 weeks after promotion |
 | **Track M-safety (parallel with W3)** | M1 health truth (a `/health` verdict, census, `x0x doctor --json`); M2 safe apply (supervised readiness and self-rollback, one binary writer per host, StagedRollout wired or deleted; ADR 0094). Exit: a crash-looping release on a supervised host is restored by the new binary with no SSH, and reported. | M-safe about 4–6 weeks after promotion |
@@ -253,10 +270,10 @@ deliberately bad canary is rolled back and recalled automatically.
 
 ## 9. Process rules
 
-- **Moratorium until v0.46.0 is promoted.** Only fix ADRs are admissible:
+- **Moratorium through v0.46.0 promotion (completed 2026-10-03).** Only fix ADRs were admissible:
   ones that record a fix to shipped or merged behaviour, a storage format, or
-  deployment governance. The D29 slice of ADR 0089 is the one exception.
-- **ADRs before code** (ADR 0087, Proposed). Two rules apply together. A
+  deployment governance. The D29 slice of ADR 0089 was the one exception.
+- **ADRs before code** (ADR 0087, Accepted). Two rules apply together. A
   change to a network behaviour, a storage format, a protocol or a security
   bound has a Proposed ADR on `main` before its code merges to any branch,
   integration branches included. In addition, a wire, protocol or dependency
