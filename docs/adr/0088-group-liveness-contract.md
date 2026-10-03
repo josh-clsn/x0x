@@ -4,7 +4,7 @@
 - **Date:** 2026-10-03
 - **Decision owners:** David Irvine
 - **Reviewers:** Codex (cross-model review of the text), Root
-- **Supersedes:** ADR 0038, ADR 0060, ADR 0069; in part ADR 0064 Decision §3 and ADR 0066 §2. Each supersession takes effect only when the slice ADR named in the supersession table is Accepted.
+- **Supersedes:** ADR 0038 (in stages; as a whole only once S2, S4 and S7 are all Accepted), ADR 0060, ADR 0069; in part ADR 0064 Decision §3 and ADR 0066 §2. Each supersession takes effect only when the slice ADR named in the supersession table is Accepted.
 - **Superseded by:** none
 - **Related:** charter invariant I8; rulings D16, D34, D37–D42, D54, D55; ADR 0106 (slice S1); ADR 0016, 0007, 0059, 0062, 0085, 0087, 0089, 0093; #1139, #1143, #1023, #811, #818, #871, #824, #1113, #1146, #1149, #1150, #646. Serves vision **R3** (all my machines connected) and the "shared places" core.
 
@@ -74,7 +74,9 @@ Definitions:
 
 **L2. Only the list may block forever.** An operation may wait without bound only for a reason on the §2 list. Any other indefinite wait, pending state or quarantine with no exit is a defect against this ADR.
 
-**L3. Blocks explain themselves.** A block on the §2 list ends in a typed, terminal outcome that the waiting side sees, not in a silent pending state. ADR 0066 §5 already says a refusal must explain itself; the #946 `certificate_evidence_unavailable` refusal is the existing example.
+**L3. Blocks explain themselves.** Whether L3 binds every slice, or stays a goal, is pending G7. As drafted, a block on the §2 list is never a silent pending state, and it takes one of two forms:
+- **Definitive** entries (§2 items 1, 2, 4, 5 and 6) end the request with a typed, terminal refusal that the waiting side sees. ADR 0066 §5 already says a refusal must explain itself; the #946 `certificate_evidence_unavailable` refusal is the existing example.
+- **Waiting** entries (§2 items 3, 7 and 8) are not terminal. The operation stays retryable and resumes when an admin or a holder is online, or an admin acts. Its state is typed and visible, and it names what it waits for.
 
 **L4. No safety is traded.** These rules stay fail-closed: signature, sender authority, prev-hash linkage, owner mandate, fork evidence, revocation and the TreeKEM adoption exclusion. A slice meets L1 by carrying or fetching verified evidence. A slice that adds or relaxes an acceptance rule states that explicitly, with its own security argument (as ADR 0106 states it adds none).
 
@@ -97,31 +99,36 @@ Supersessions and amendments take effect when the named slice is Accepted. Until
 
 | ADR | Effect | Through slice | What changes |
 |---|---|---|---|
-| 0038 Home | Superseded | S2, S4, S7 | The owner certificate is checked at admission (S2); revocation is by eviction (S4); Home is an explicit owner group (S7) |
+| 0038 Home: seal-time owner-certificate re-check | Superseded in part | S2 | The owner certificate is checked at admission, not re-checked at every seal |
+| 0038 Home: evict at next seal | Superseded in part | S4 | Revocation is by bounded eviction |
+| 0038 Home: the auto-provisioned personal space | Superseded in part | S7 | Home is an explicit owner group, with the existing Home adopted in place |
+| 0038 as a whole | Superseded | S2, S4 and S7 | Only once all three are Accepted. Until then, every 0038 provision not yet replaced stays in force |
 | 0060 Home is elected | Superseded | S7 | Election stops; the existing canonical Home is adopted in place (D42) |
 | 0069 Home waits for owner sync | Superseded | S7 | Auto-provisioning stops |
-| 0064 Decision §3 | Superseded in part | S3 | A quarantined node gets a self-recovery re-seat path (#871) |
-| 0066 §2 | Superseded in part | S3 | An active admin's signed terminal snapshot lets a stale or forked node recover itself, never anyone else (D41) |
-| 0062 Home persistence pair | Decided (D54) | — | Accepted (record) of its option 1, which #617 shipped and D42 keeps |
-| 0016 §6 | Amended | S4 | The deterministic committer rule extends to revocation evictions (D40) |
-| 0007 consent | Amended | S2 | The owner certificate is disclosed to Home members only (D38) |
+| 0064 Decision §3 | Superseded in part | S3 | A node quarantined on a stale base catches up and clears its own marker under an admin's signed terminal snapshot. A forked node gets a re-seat path (#871) only with an admin's explicit manual authorisation |
+| 0066 §2 | Superseded in part | S3 | Self-recovery only (D41): the snapshot lets a node recover itself, never anyone else. Automatic stale-base catch-up is separate from unanchored-fork recovery, which stays a manual admin act (§2 item 7) |
+| 0062 Home persistence pair | Decided (D54) | none | Accepted (record) of its option 1, which #617 shipped and D42 keeps. No slice dependency; its status line changes in a separate PR |
+| 0016 §6 | Amended | S4 | The deterministic committer rule extends to revocation evictions (D40): the lowest online active-admin agent ID evicts and rekeys first. Any other online admin acts only if nothing lands within the bound. S4 proposes the bound's value |
+| 0007 consent | Amended | S2 | D38: owning a Home implies consent only to disclosure of the owner certificate to that Home's members, delivered directly and checked at seal. Public identity announces stay anonymous unless the owner consents explicitly, as today. An anonymous public announce must not invalidate the Home-scoped certificate |
 | 0059 InviteV4, 0064 §1a | Amended | S6 | Inviter pinning and the mandate preimage allow any-admin redemption |
 
 ### §4 Slices
 
-Each slice is its own ADR. Each one:
+S1 (ADR 0106) is the historical Accepted slice, with its own gate. It was reproduced in process, and its carry is gated by the existing in-message opt-in `accepts_control_blob_ref`, not by an ADR 0093 bit. The requirements below bind S2–S8.
+
+Each later slice is its own ADR. Each one:
 - names the L-rule and the holes it closes;
 - has its failure reproduced in the W3-H harness before its fix (D16, D54). The only exception is S8 (a), the joiner re-arm for #1150: it ships in v0.46.1 with its committed in-process red test, and its W3-H case follows (D55);
-- puts any wire change behind an ADR 0093 capability bit;
+- puts any new wire change behind an ADR 0093 capability bit;
 - versions any persisted state per ADR 0085;
 - is Accepted by David before its code merges (ADR 0087 rule 8).
 
 | Slice | Closes | Rulings | Wire or storage |
 |---|---|---|---|
 | S1 = ADR 0106 (Accepted) | #1139, small gaps | D16 hole (a) | additive field |
-| S2 Home-scoped owner certificate plus verdict rule | #1143, then #1023's structural part | D38 | wire, probably the ADR 0089 EvidenceV1 carrier; size it first |
-| S3 Ownerless attestation, self-recovery only | #818 part 2, #871 | D34(1), D41 | wire plus a 0093 bit; a quarantine "retired" state |
-| S4 Revocation eviction, designated first | #1113 | D34(2), D40 | protocol rule; a persisted obligation; the bound value is proposed in S4 |
+| S2 Home-scoped owner certificate plus verdict rule: disclosed to Home members only; public announces stay anonymous; an anonymous public announce never invalidates the Home-scoped certificate | #1143, then #1023's structural part | D38 | wire, probably the ADR 0089 EvidenceV1 carrier; size it first |
+| S3 Ownerless attestation, self-recovery only: automatic stale-base catch-up; unanchored-fork re-seat only under an admin's manual authorisation (§2 item 7) | #818 part 2, #871 | D34(1), D41 | wire plus a 0093 bit; a quarantine "retired" state |
+| S4 Revocation eviction, designated first: the lowest online active-admin ID first, any other online admin after the bound | #1113 | D34(2), D40 | protocol rule; a persisted obligation; the bound value is proposed in S4 |
 | S5 Evidence size K plus fetch-by-hash from any holder; the single carry rule | #811 family, the certificate-carry family, the #646 primitive; catch-up as control blobs | D34(3), D54 | wire plus a 0093 bit; a holder store. No persisted authority catch-up log (D54) |
 | S6 Any-admin invite redemption | offline-inviter gap | D16 | wire plus a bit |
 | S7 Home as an explicit owner group, adopted in place | #824 residual, #1023 structure | D16, D42 | no new closed-enum Tier-1 kind; a mixed-version check |
