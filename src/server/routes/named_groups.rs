@@ -35346,6 +35346,9 @@ enum JoinArtifactRefusal {
     /// `MemberCertStatus::Failed` although its embedded certificate
     /// verifies (e.g. the announced certificate fails against the owner).
     CertificateVerdictFailed(x0x::groups::owner_cert::OwnerCertFailure),
+    /// A lock the synchronous stream-seam check needs was contended (r5,
+    /// lifecycle note section 2.7). Retryable: it withholds, never purges.
+    SeamContended,
 }
 
 impl JoinArtifactRefusal {
@@ -35362,6 +35365,7 @@ impl JoinArtifactRefusal {
             Self::CertificateInvalid(_) => "certificate_invalid",
             Self::CertificateInGrace => "certificate_in_grace",
             Self::CertificateVerdictFailed(_) => "certificate_verdict_failed",
+            Self::SeamContended => "seam_contended",
         }
     }
 
@@ -35447,7 +35451,20 @@ async fn join_artifact_serving_refusal(
     group_id: &str,
     member_hex: &str,
 ) -> Option<JoinArtifactRefusal> {
-    use x0x::groups::owner_cert::MemberCertStatus;
+    join_artifact_serving_check(state, group_id, member_hex)
+        .await
+        .err()
+}
+
+/// [`join_artifact_serving_refusal`], also returning the owner-certificate
+/// evidence an OwnerCertified verdict was taken over (`Ok(None)` for other
+/// groups), so the stream-seam check can re-take the verdict over the same
+/// snapshot without awaiting (r5, lifecycle note section 2.7).
+async fn join_artifact_serving_check(
+    state: &AppState,
+    group_id: &str,
+    member_hex: &str,
+) -> std::result::Result<Option<x0x::groups::owner_cert::OwnerCertEvidence>, JoinArtifactRefusal> {
     let revoked = match parse_agent_id_hex(member_hex) {
         Ok(member) => state
             .agent
@@ -35455,30 +35472,57 @@ async fn join_artifact_serving_refusal(
             .read()
             .await
             .is_agent_revoked(&member),
-        Err(_) => return Some(JoinArtifactRefusal::NotActive),
+        Err(_) => return Err(JoinArtifactRefusal::NotActive),
     };
     let now_unix = x0x::groups::owner_cert::restore_clock_now();
     // The recipient's seat alone, for the verdict below (the per-member
     // ladder does not depend on other seats).
-    let mut probe = {
+    let probe = {
         let roster = state.named_groups.read().await;
         let Some((_, info)) = crate::server::resolve_group_entry_locked(&roster, group_id) else {
-            return Some(JoinArtifactRefusal::UnknownGroup);
+            return Err(JoinArtifactRefusal::UnknownGroup);
         };
-        if let Some(refusal) =
-            join_artifact_serving_refusal_for(info, member_hex, revoked, now_unix)
-        {
-            return Some(refusal);
+        match join_artifact_record_probe(info, member_hex, revoked, now_unix) {
+            Ok(Some(probe)) => probe,
+            Ok(None) => return Ok(None),
+            Err(refusal) => return Err(refusal),
         }
-        // Non-OwnerCertified groups need no certificate: eligible.
-        info.policy.admission.owner_certified_user_id()?;
-        let mut probe = info.clone();
-        probe.members_v2.retain(|agent, _| agent == member_hex);
-        probe
     };
     let evidence = owner_cert_evidence_for(state, &[member_hex]).await;
+    join_artifact_verdict_refusal(probe, &evidence, member_hex).map_or(Ok(Some(evidence)), Err)
+}
+
+/// The record-local guard, plus (OwnerCertified groups only) the
+/// recipient's seat alone for the verdict. `Ok(None)`: eligible, no
+/// certificate verdict needed.
+fn join_artifact_record_probe(
+    info: &x0x::groups::GroupInfo,
+    member_hex: &str,
+    revoked: bool,
+    now_unix: u64,
+) -> std::result::Result<Option<x0x::groups::GroupInfo>, JoinArtifactRefusal> {
+    if let Some(refusal) = join_artifact_serving_refusal_for(info, member_hex, revoked, now_unix) {
+        return Err(refusal);
+    }
+    // Non-OwnerCertified groups need no certificate: eligible.
+    if info.policy.admission.owner_certified_user_id().is_none() {
+        return Ok(None);
+    }
+    let mut probe = info.clone();
+    probe.members_v2.retain(|agent, _| agent == member_hex);
+    Ok(Some(probe))
+}
+
+/// ADR 0107 line 64: an OwnerCertified recipient needs a Clean roster
+/// verdict; `DigestPending`, `InGrace` and `Failed` fail closed.
+fn join_artifact_verdict_refusal(
+    mut probe: x0x::groups::GroupInfo,
+    evidence: &x0x::groups::owner_cert::OwnerCertEvidence,
+    member_hex: &str,
+) -> Option<JoinArtifactRefusal> {
+    use x0x::groups::owner_cert::MemberCertStatus;
     match probe
-        .owner_cert_verdict(&evidence)
+        .owner_cert_verdict(evidence)
         .per_member
         .remove(member_hex)
     {
@@ -35492,6 +35536,44 @@ async fn join_artifact_serving_refusal(
         }
         None => Some(JoinArtifactRefusal::NotActive),
     }
+}
+
+/// ADR 0107 (r5, lifecycle note section 2.7, G2/G3): the serving guard at
+/// the stream seam, synchronously. Every lock is taken with `try_read`, and
+/// contention returns [`JoinArtifactRefusal::SeamContended`] (withhold,
+/// never purge). It re-reads the current revocation set, roster and clock,
+/// and re-takes an OwnerCertified verdict over the pre-phase `evidence`.
+fn join_artifact_seam_refusal(
+    state: &AppState,
+    group_id: &str,
+    member_hex: &str,
+    evidence: Option<&x0x::groups::owner_cert::OwnerCertEvidence>,
+) -> Option<JoinArtifactRefusal> {
+    let Ok(member) = parse_agent_id_hex(member_hex) else {
+        return Some(JoinArtifactRefusal::NotActive);
+    };
+    let revoked = match state.agent.revocation_set().try_read() {
+        Ok(set) => set.is_agent_revoked(&member),
+        Err(_) => return Some(JoinArtifactRefusal::SeamContended),
+    };
+    let now_unix = x0x::groups::owner_cert::restore_clock_now();
+    let probe = {
+        let Ok(roster) = state.named_groups.try_read() else {
+            return Some(JoinArtifactRefusal::SeamContended);
+        };
+        let Some((_, info)) = crate::server::resolve_group_entry_locked(&roster, group_id) else {
+            return Some(JoinArtifactRefusal::UnknownGroup);
+        };
+        match join_artifact_record_probe(info, member_hex, revoked, now_unix) {
+            Ok(Some(probe)) => probe,
+            Ok(None) => return None,
+            Err(refusal) => return Some(refusal),
+        }
+    };
+    let Some(evidence) = evidence else {
+        return Some(JoinArtifactRefusal::SeamContended);
+    };
+    join_artifact_verdict_refusal(probe, evidence, member_hex)
 }
 
 /// Every spelling (map key, stable id, MLS id) this node holds the group
@@ -35595,14 +35677,22 @@ pub(in crate::server) const WELCOME_FETCH_HANDLER_CAP: usize = 16;
 /// removal or ban that quiesces this recipient can never miss it. Every body
 /// re-checks eligibility under the group's membership lock before it hands
 /// bytes to the transport; receipt waits run outside that lock.
-fn spawn_join_artifact_egress<F>(state: &AppState, group_id: &str, recipient: &str, body: F)
-where
+fn spawn_join_artifact_egress<F>(
+    state: &AppState,
+    group_id: &str,
+    recipient: &str,
+    deadline: Instant,
+    body: F,
+) where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     let (registered, ready) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
         if ready.await.is_ok() {
-            body.await;
+            // r5 (lifecycle note section 2.7 item 6): no egress task
+            // outlives its artifact's deadline. A timeout drops the body
+            // (an unfinished stream resets) and never purges.
+            let _ = tokio::time::timeout_at(deadline.into(), body).await;
         }
     });
     {
@@ -35774,24 +35864,79 @@ pub(super) async fn join_result_chunk_if_servable(
     state.control_blobs.staged_chunk(reference, sequence)
 }
 
-/// ADR 0107 (review r4 P1): a transport admission check, evaluated under the
-/// group's membership lock immediately before the bytes are handed to the
-/// network.
-fn join_artifact_admission<F, Fut>(check: F) -> x0x::dm::TransportAdmission
-where
-    F: Fn() -> Fut + Send + Sync + 'static,
-    Fut: std::future::Future<Output = bool> + Send + 'static,
-{
-    Arc::new(move || Box::pin(check()))
+/// ADR 0107 (r5): the staged result `staged_at` is still the one to serve
+/// and unexpired, read synchronously at the stream seam (contention
+/// refuses).
+fn join_result_staged_now(
+    state: &AppState,
+    group_id: &str,
+    member_hex: &str,
+    staged_at: Instant,
+) -> bool {
+    state.pending_join_results.try_read().is_ok_and(|results| {
+        results
+            .get(&join_result_key(group_id, member_hex))
+            .is_some_and(|pending| {
+                pending.created_at == staged_at
+                    && pending.created_at.elapsed() < PENDING_JOIN_RESULT_TTL
+            })
+    })
 }
 
-/// ADR 0107 (review r4 P1): the transport admission of an inline join result.
+/// ADR 0107 (r5): the staged join-result copy `reference` is still bound
+/// to its unexpired original, read synchronously at the stream seam.
+fn join_result_blob_staged_now(state: &AppState, reference: &control_blob::ControlBlobRef) -> bool {
+    state
+        .control_blobs
+        .staged_origin(reference)
+        .is_some_and(|origin| {
+            join_result_staged_now(
+                state,
+                reference.group_id(),
+                reference.recipient(),
+                origin.staged_at,
+            )
+        })
+}
+
+/// ADR 0107 (r5): the staged Welcome `welcome_id` (staged at `staged_at`)
+/// still stands, unexpired, for `recipient_hex`, read synchronously at the
+/// stream seam.
+fn welcome_staged_now(
+    state: &AppState,
+    welcome_id: &str,
+    recipient_hex: &str,
+    staged_at: Instant,
+) -> bool {
+    state.pending_welcomes.try_read().is_ok_and(|welcomes| {
+        welcomes.get(welcome_id).is_some_and(|pending| {
+            pending.created_at == staged_at
+                && pending.created_at.elapsed() < PENDING_WELCOME_TTL
+                && pending.joiner_agent == recipient_hex
+        })
+    })
+}
+
+/// ADR 0107 (r5, lifecycle note section 2.7): wrap an async pre-phase as a
+/// recovery-response admission. The pre-phase runs once per physical
+/// exchange and returns the seam check bound to its snapshot.
+fn join_artifact_admission<F, Fut>(pre_phase: F) -> x0x::dm::ArtifactAdmission
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Option<x0x::dm::SeamAdmission>> + Send + 'static,
+{
+    Arc::new(move || Box::pin(pre_phase()))
+}
+
+/// ADR 0107 (r5): the admission of an inline join result. Pre-phase: under
+/// the group's membership lock, the serving guard (keeping its evidence)
+/// and the staged original. Seam: the same, synchronously.
 fn join_result_admission(
     state: &Arc<AppState>,
     group_id: &str,
     member_hex: &str,
     staged_at: Instant,
-) -> x0x::dm::TransportAdmission {
+) -> x0x::dm::ArtifactAdmission {
     let state = Arc::clone(state);
     let group_id = group_id.to_string();
     let member_hex = member_hex.to_string();
@@ -35799,41 +35944,78 @@ fn join_result_admission(
         let state = Arc::clone(&state);
         let group_id = group_id.clone();
         let member_hex = member_hex.clone();
-        async move { join_result_still_servable(&state, &group_id, &member_hex, staged_at).await }
+        async move {
+            let lock = group_membership_lock_for_known_group(&state, &group_id).await?;
+            let evidence = {
+                let _membership_guard = lock.lock().await;
+                let evidence = join_artifact_serving_check(&state, &group_id, &member_hex)
+                    .await
+                    .ok()?;
+                if !join_result_servable_locked(&state, &group_id, &member_hex, staged_at).await {
+                    return None;
+                }
+                evidence
+            };
+            let seam: x0x::dm::SeamAdmission = Box::new(move || {
+                join_artifact_seam_refusal(&state, &group_id, &member_hex, evidence.as_ref())
+                    .is_none()
+                    && join_result_staged_now(&state, &group_id, &member_hex, staged_at)
+            });
+            Some(seam)
+        }
     })
 }
 
-/// ADR 0107 (review r4 P1): the transport admission of one join-result chunk.
+/// ADR 0107 (r5): the admission of one join-result chunk (the copy bound to
+/// its original).
 pub(super) fn join_result_chunk_admission(
     state: &Arc<AppState>,
     reference: &control_blob::ControlBlobRef,
-    _sequence: u32,
-) -> x0x::dm::TransportAdmission {
+) -> x0x::dm::ArtifactAdmission {
     let state = Arc::clone(state);
     let reference = reference.clone();
     join_artifact_admission(move || {
         let state = Arc::clone(&state);
         let reference = reference.clone();
         async move {
-            let Some(lock) =
-                group_membership_lock_for_known_group(&state, reference.group_id()).await
-            else {
-                return false;
+            let lock = group_membership_lock_for_known_group(&state, reference.group_id()).await?;
+            let evidence = {
+                let _membership_guard = lock.lock().await;
+                let evidence = join_artifact_serving_check(
+                    &state,
+                    reference.group_id(),
+                    reference.recipient(),
+                )
+                .await
+                .ok()?;
+                if !join_result_blob_servable_locked(&state, &reference).await {
+                    return None;
+                }
+                evidence
             };
-            let _membership_guard = lock.lock().await;
-            join_result_blob_servable_locked(&state, &reference).await
+            let seam: x0x::dm::SeamAdmission = Box::new(move || {
+                join_artifact_seam_refusal(
+                    &state,
+                    reference.group_id(),
+                    reference.recipient(),
+                    evidence.as_ref(),
+                )
+                .is_none()
+                    && join_result_blob_staged_now(&state, &reference)
+            });
+            Some(seam)
         }
     })
 }
 
-/// ADR 0107 (review r4 P1): the transport admission of one Welcome chunk:
-/// the staged Welcome still stands, unexpired, for this recipient, and the
-/// recipient is eligible (checked under the group's membership lock).
+/// ADR 0107 (r5): the admission of one Welcome chunk: the staged Welcome
+/// still stands, unexpired, for this recipient, and the recipient is
+/// eligible.
 fn welcome_chunk_admission(
     state: &Arc<AppState>,
     welcome_id: &str,
     recipient_hex: &str,
-) -> x0x::dm::TransportAdmission {
+) -> x0x::dm::ArtifactAdmission {
     let state = Arc::clone(state);
     let welcome_id = welcome_id.to_string();
     let recipient_hex = recipient_hex.to_string();
@@ -35842,86 +36024,111 @@ fn welcome_chunk_admission(
         let welcome_id = welcome_id.clone();
         let recipient_hex = recipient_hex.clone();
         async move {
-            let staged = state
+            let (group_id, staged_at) = state
                 .pending_welcomes
                 .read()
                 .await
                 .get(&welcome_id)
-                .map(|pending| (pending.group_id.clone(), pending.created_at));
-            let Some((group_id, staged_at)) = staged else {
-                return false;
+                .map(|pending| (pending.group_id.clone(), pending.created_at))?;
+            let lock = group_membership_lock_for_known_group(&state, &group_id).await?;
+            let evidence = {
+                let _membership_guard = lock.lock().await;
+                let evidence = join_artifact_serving_check(&state, &group_id, &recipient_hex)
+                    .await
+                    .ok()?;
+                let staged = state
+                    .pending_welcomes
+                    .read()
+                    .await
+                    .get(&welcome_id)
+                    .is_some_and(|pending| {
+                        pending.created_at == staged_at
+                            && pending.created_at.elapsed() < PENDING_WELCOME_TTL
+                            && pending.joiner_agent == recipient_hex
+                    });
+                if !staged {
+                    return None;
+                }
+                evidence
             };
-            welcome_frame_servable(&state, &group_id, &recipient_hex, &welcome_id, staged_at)
-                .await
-                .is_ok()
+            let seam: x0x::dm::SeamAdmission = Box::new(move || {
+                join_artifact_seam_refusal(&state, &group_id, &recipient_hex, evidence.as_ref())
+                    .is_none()
+                    && welcome_staged_now(&state, &welcome_id, &recipient_hex, staged_at)
+            });
+            Some(seam)
         }
     })
 }
 
-/// ADR 0107 (review r4): the raw-QUIC receive-ACK bound for a join
-/// artifact (the bound the DM and file-transfer paths use).
-const JOIN_ARTIFACT_RAW_RECEIVE_ACK_TIMEOUT: Duration = Duration::from_secs(8);
+/// ADR 0107 (r5, lifecycle note section 2.7 item 6): the bound on one
+/// class-R exchange (resolution, any redial, the pre-phase, stream
+/// allocation and writing), further capped by the artifact's deadline.
+const JOIN_ARTIFACT_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// ADR 0107 (review r4 P1): hand one join-artifact frame (an inline join
-/// result, a Welcome chunk or a join-result chunk) to the transport.
+/// ADR 0107 (r5, lifecycle note section 2.7): hand one recovery-response
+/// frame (an inline join result, a Welcome chunk or a join-result chunk) to
+/// the transport in ONE admitted physical exchange.
 ///
-/// The ONLY delivery path is x0x's own raw-QUIC direct send: never the
-/// gossip inbox, whose stranded-publish retry (saorsa-gossip-pubsub 0.5.86)
-/// runs detached and could carry the bytes after a revocation or withdrawal.
-/// A failed send never falls back; the joiner's fetch retries. `admission`
-/// runs inside the transport after connection resolution, immediately
-/// before the bytes are handed to the network, so an invalidation that lands
-/// before that point sends nothing.
+/// The only path is x0x's pinned single-exchange raw-QUIC send
+/// ([`Agent::send_direct_pinned_admitted`]): never the gossip inbox (whose
+/// stranded-publish retry runs detached), never an ACK-v2 exchange (whose
+/// internal retry and the X0X-0053 reissue write again without admission),
+/// never a retry. A failure never falls back; the joiner's fetch retries and
+/// every resend is admitted afresh. The exchange runs under
+/// `min(now + JOIN_ARTIFACT_EXCHANGE_TIMEOUT, deadline)`: on timeout the
+/// future is dropped, so an unfinished stream resets. The deadline only
+/// cancels; it never purges.
 pub(super) async fn send_join_artifact(
     state: &AppState,
     recipient: &AgentId,
     payload: &[u8],
     group_id: &str,
     kind: &'static str,
-    admission: x0x::dm::TransportAdmission,
+    admission: x0x::dm::ArtifactAdmission,
+    deadline: Instant,
 ) -> std::result::Result<(), String> {
+    let exchange_deadline =
+        std::cmp::min(Instant::now() + JOIN_ARTIFACT_EXCHANGE_TIMEOUT, deadline);
     #[cfg(test)]
-    {
-        let recipient_hex = hex::encode(recipient.as_bytes());
-        join_egress_test_barrier::park(&recipient_hex, kind).await;
-        record_join_artifact_delivery_path(state, &recipient_hex, kind, false);
-        if let Ok(mut transports) = state
-            .named_group_test_recorders
-            .join_artifact_transports
-            .lock()
+    let recipient_hex = hex::encode(recipient.as_bytes());
+    let exchange = async {
+        #[cfg(test)]
         {
-            transports.push((
-                recipient_hex.clone(),
-                kind,
-                "raw_ack_v2_with_internal_resends",
-            ));
+            join_egress_test_barrier::park(&recipient_hex, kind).await;
+            record_join_artifact_delivery_path(state, &recipient_hex, kind, false);
+            if let Ok(mut transports) = state
+                .named_group_test_recorders
+                .join_artifact_transports
+                .lock()
+            {
+                transports.push((recipient_hex.clone(), kind, "pinned_single_exchange"));
+            }
         }
-        if state.agent.network().is_none() {
-            // In-process stand-in for the raw-QUIC transport: the admission
-            // runs where the transport runs it, and the egress witness
-            // records only bytes that would have been handed over.
-            if !admission().await {
-                return Err("transport admission refused".to_string());
-            }
-            if let Ok(mut egress) = state.named_group_test_recorders.join_artifact_egress.lock() {
-                egress.push((recipient_hex, group_id.to_string(), kind));
-            }
-            return Err("no network in process".to_string());
+        state
+            .agent
+            .send_direct_pinned_admitted(recipient, payload, &admission)
+            .await
+    };
+    let outcome = match tokio::time::timeout_at(exchange_deadline.into(), exchange).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!("{kind} exchange deadline elapsed")),
+    };
+    // Test builds: the in-process stand-in reports an admitted exchange
+    // through its marker error; record the egress witness for it.
+    #[cfg(test)]
+    if outcome
+        .as_ref()
+        .is_err_and(|reason| reason.contains(x0x::dm::PINNED_STANDIN_ADMITTED))
+    {
+        if let Ok(mut egress) = state.named_group_test_recorders.join_artifact_egress.lock() {
+            egress.push((recipient_hex, group_id.to_string(), kind));
         }
     }
     #[cfg(not(test))]
     let _ = (group_id, kind);
-    state
-        .agent
-        .send_direct_raw_admitted(
-            recipient,
-            payload,
-            Some(JOIN_ARTIFACT_RAW_RECEIVE_ACK_TIMEOUT),
-            &admission,
-        )
-        .await
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    outcome
 }
 
 /// ADR 0107 (review r2): the staged Welcome `welcome_id` (staged at
@@ -36373,66 +36580,75 @@ async fn handle_join_result_message_bound(
                 // a registered task a removal or ban cancels before it
                 // commits, so a delayed retry can never recreate a purged
                 // blob. The reference itself carries no artifact bytes.
-                spawn_join_artifact_egress(state, &group_id, &member_agent_id, async move {
-                    let _staging_permit = permit;
-                    let mut retries = 0;
-                    let staged = loop {
-                        #[cfg(test)]
-                        join_egress_test_barrier::park(&member_for_log, "join_result_stage").await;
-                        match stage_join_result_blob_if_servable(
-                            &task_state,
-                            &group_id_for_task,
-                            &recipient,
-                            staged_at,
-                            attempt.as_deref(),
-                            &payload,
-                        )
-                        .await
-                        {
-                            Ok(reference) => break Ok(reference),
-                            Err(control_blob::STAGING_BUDGET_EXHAUSTED)
-                                if retries < control_blob::STAGING_BUDGET_RETRIES =>
-                            {
-                                tracing::warn!(
-                                    group_id = %LogHexId::group(&group_id_for_task),
-                                    member = %LogHexId::agent(&member_for_log),
-                                    retries,
-                                    "control blob staging budget exhausted; retrying (#876)"
-                                );
-                                retries += 1;
-                                tokio::time::sleep(control_blob::STAGING_BUDGET_RETRY_DELAY).await;
-                            }
-                            Err(reason) => break Err(reason.to_string()),
-                        }
-                    };
-                    let outcome = match staged {
-                        Ok(reference) => {
+                let artifact_deadline = staged_at + PENDING_JOIN_RESULT_TTL;
+                spawn_join_artifact_egress(
+                    state,
+                    &group_id,
+                    &member_agent_id,
+                    artifact_deadline,
+                    async move {
+                        let _staging_permit = permit;
+                        let mut retries = 0;
+                        let staged = loop {
                             #[cfg(test)]
-                            join_egress_test_point(
+                            join_egress_test_barrier::park(&member_for_log, "join_result_stage")
+                                .await;
+                            match stage_join_result_blob_if_servable(
                                 &task_state,
-                                &member_for_log,
                                 &group_id_for_task,
-                                "join_result_reference",
-                            )
-                            .await;
-                            control_blob::send_reference_message(
-                                &task_state.agent,
                                 &recipient,
-                                reference,
+                                staged_at,
+                                attempt.as_deref(),
+                                &payload,
                             )
                             .await
+                            {
+                                Ok(reference) => break Ok(reference),
+                                Err(control_blob::STAGING_BUDGET_EXHAUSTED)
+                                    if retries < control_blob::STAGING_BUDGET_RETRIES =>
+                                {
+                                    tracing::warn!(
+                                        group_id = %LogHexId::group(&group_id_for_task),
+                                        member = %LogHexId::agent(&member_for_log),
+                                        retries,
+                                        "control blob staging budget exhausted; retrying (#876)"
+                                    );
+                                    retries += 1;
+                                    tokio::time::sleep(control_blob::STAGING_BUDGET_RETRY_DELAY)
+                                        .await;
+                                }
+                                Err(reason) => break Err(reason.to_string()),
+                            }
+                        };
+                        let outcome = match staged {
+                            Ok(reference) => {
+                                #[cfg(test)]
+                                join_egress_test_point(
+                                    &task_state,
+                                    &member_for_log,
+                                    &group_id_for_task,
+                                    "join_result_reference",
+                                )
+                                .await;
+                                control_blob::send_reference_message(
+                                    &task_state.agent,
+                                    &recipient,
+                                    reference,
+                                )
+                                .await
+                            }
+                            Err(reason) => Err(reason),
+                        };
+                        // #878 r5 (review): drop OUR permit BEFORE pruning,
+                        // so the released semaphore is observably idle — the
+                        // prune condition (available == 1) actually holds.
+                        drop(_staging_permit);
+                        release_join_result_staging_guard(&task_state, &guard_key);
+                        if let Err(e) = outcome {
+                            tracing::warn!(group_id = %LogHexId::group(&group_id_for_task), member = %LogHexId::agent(&member_for_log), "failed to send join-result reference: {e}");
                         }
-                        Err(reason) => Err(reason),
-                    };
-                    // #878 r5 (review): drop OUR permit BEFORE pruning,
-                    // so the released semaphore is observably idle — the
-                    // prune condition (available == 1) actually holds.
-                    drop(_staging_permit);
-                    release_join_result_staging_guard(&task_state, &guard_key);
-                    if let Err(e) = outcome {
-                        tracing::warn!(group_id = %LogHexId::group(&group_id_for_task), member = %LogHexId::agent(&member_for_log), "failed to send join-result reference: {e}");
-                    }
-                });
+                    },
+                );
                 return;
             }
             // ADR 0107 (review r2): the inline send is a registered egress
@@ -36445,59 +36661,67 @@ async fn handle_join_result_message_bound(
             let recipient = *sender;
             let group_for_task = group_id.clone();
             let member_for_task = member_agent_id.clone();
-            spawn_join_artifact_egress(state, &group_id, &member_agent_id, async move {
-                if !join_result_still_servable(
-                    &task_state,
-                    &group_for_task,
-                    &member_for_task,
-                    staged_at,
-                )
-                .await
-                {
-                    tracing::debug!(
-                        group_id = %LogHexId::group(&group_for_task),
-                        member = %LogHexId::agent(&member_for_task),
-                        "ADR 0107: join result withheld at egress; the requester is no longer eligible"
+            let artifact_deadline = staged_at + PENDING_JOIN_RESULT_TTL;
+            spawn_join_artifact_egress(
+                state,
+                &group_id,
+                &member_agent_id,
+                artifact_deadline,
+                async move {
+                    if !join_result_still_servable(
+                        &task_state,
+                        &group_for_task,
+                        &member_for_task,
+                        staged_at,
+                    )
+                    .await
+                    {
+                        tracing::debug!(
+                            group_id = %LogHexId::group(&group_for_task),
+                            member = %LogHexId::agent(&member_for_task),
+                            "ADR 0107: join result withheld at egress; the requester is no longer eligible"
+                        );
+                        return;
+                    }
+                    let admission = join_result_admission(
+                        &task_state,
+                        &group_for_task,
+                        &member_for_task,
+                        staged_at,
                     );
-                    return;
-                }
-                let admission = join_result_admission(
-                    &task_state,
-                    &group_for_task,
-                    &member_for_task,
-                    staged_at,
-                );
-                if let Err(e) = send_join_artifact(
-                    &task_state,
-                    &recipient,
-                    &payload,
-                    &group_for_task,
-                    "join_result",
-                    admission,
-                )
-                .await
-                {
-                    tracing::warn!(group_id = %LogHexId::group(&group_for_task), member = %LogHexId::agent(&member_for_task), "failed to send join-result response: {e}");
-                    tracing::debug!(
-                        target: "treekem.trace",
-                        stage = "join_result_send_err",
-                        group_id = %group_for_task,
-                        member = %member_for_task,
-                        payload_len,
-                        payload_hash = %payload_hash,
-                        error = %e,
-                    );
-                } else {
-                    tracing::debug!(
-                        target: "treekem.trace",
-                        stage = "join_result_send_ok",
-                        group_id = %group_for_task,
-                        member = %member_for_task,
-                        payload_len,
-                        payload_hash = %payload_hash,
-                    );
-                }
-            });
+                    if let Err(e) = send_join_artifact(
+                        &task_state,
+                        &recipient,
+                        &payload,
+                        &group_for_task,
+                        "join_result",
+                        admission,
+                        artifact_deadline,
+                    )
+                    .await
+                    {
+                        tracing::warn!(group_id = %LogHexId::group(&group_for_task), member = %LogHexId::agent(&member_for_task), "failed to send join-result response: {e}");
+                        tracing::debug!(
+                            target: "treekem.trace",
+                            stage = "join_result_send_err",
+                            group_id = %group_for_task,
+                            member = %member_for_task,
+                            payload_len,
+                            payload_hash = %payload_hash,
+                            error = %e,
+                        );
+                    } else {
+                        tracing::debug!(
+                            target: "treekem.trace",
+                            stage = "join_result_send_ok",
+                            group_id = %group_for_task,
+                            member = %member_for_task,
+                            payload_len,
+                            payload_hash = %payload_hash,
+                        );
+                    }
+                },
+            );
         }
         JoinResultMessage::Result {
             event,
@@ -37614,6 +37838,15 @@ async fn handle_welcome_fetch_request(
                     // keep their delivery config.
                     WelcomeBlobMessage::Chunk { welcome_id, .. } => {
                         let payload = welcome_blob_payload(&msg)?;
+                        let Some(deadline) = state
+                            .pending_welcomes
+                            .read()
+                            .await
+                            .get(welcome_id)
+                            .map(|pending| pending.created_at + PENDING_WELCOME_TTL)
+                        else {
+                            return Err("the staged Welcome was withdrawn".to_string());
+                        };
                         let admission = welcome_chunk_admission(
                             &state,
                             welcome_id,
@@ -37626,6 +37859,7 @@ async fn handle_welcome_fetch_request(
                             &group_id,
                             "welcome_frame",
                             admission,
+                            deadline,
                         )
                         .await
                     }
@@ -37719,9 +37953,16 @@ async fn handle_welcome_fetch_request_via<S, F>(
     let stream_state = Arc::clone(state);
     let recipient = *sender;
     let stream_id = welcome_id.clone();
+    // r5 (lifecycle note section 2.7 item 6): the stream never outlives the
+    // staged Welcome's deadline; a timeout drops it (an unfinished stream
+    // resets) and never purges.
+    let stream_deadline = pending.created_at + PENDING_WELCOME_TTL;
     replace_welcome_stream(state, &welcome_id, async move {
-        stream_welcome_blob_guarded(&stream_state, &recipient, &stream_id, pending, transport)
-            .await;
+        let _ = tokio::time::timeout_at(
+            stream_deadline.into(),
+            stream_welcome_blob_guarded(&stream_state, &recipient, &stream_id, pending, transport),
+        )
+        .await;
     })
     .await;
 }

@@ -808,47 +808,59 @@ pub(in crate::server) async fn handle_control_blob_message(
                 let recipient = *sender;
                 let group_id = reference.group_id.clone();
                 let member_hex = reference.recipient.clone();
-                super::spawn_join_artifact_egress(state, &group_id, &member_hex, async move {
-                    let _permit = permit;
-                    let Some(chunk) =
-                        super::join_result_chunk_if_servable(&task_state, &reference, sequence)
-                            .await
-                    else {
-                        tracing::debug!(
-                            group_id = %LogHexId::group(&reference.group_id),
-                            recipient = %LogHexId::agent(&reference.recipient),
-                            "ADR 0107: join-result chunk withheld; the recipient is not eligible, or the blob or its original expired or was purged"
-                        );
-                        return;
-                    };
-                    let admission =
-                        super::join_result_chunk_admission(&task_state, &reference, sequence);
-                    let group = reference.group_id.clone();
-                    let message = ControlBlobMessage::Chunk {
-                        reference,
-                        sequence,
-                        data_b64: BASE64.encode(chunk),
-                    };
-                    let payload = match encode_message(&message) {
-                        Ok(payload) => payload,
-                        Err(reason) => {
-                            tracing::warn!(reason, "control blob chunk encode failed");
+                // r5: the task, like the copy, dies at the original's
+                // deadline (an unknown copy refuses at once).
+                let deadline = state
+                    .control_blobs
+                    .staged_origin(&reference)
+                    .map_or_else(Instant::now, |origin| origin.deadline);
+                super::spawn_join_artifact_egress(
+                    state,
+                    &group_id,
+                    &member_hex,
+                    deadline,
+                    async move {
+                        let _permit = permit;
+                        let Some(chunk) =
+                            super::join_result_chunk_if_servable(&task_state, &reference, sequence)
+                                .await
+                        else {
+                            tracing::debug!(
+                                group_id = %LogHexId::group(&reference.group_id),
+                                recipient = %LogHexId::agent(&reference.recipient),
+                                "ADR 0107: join-result chunk withheld; the recipient is not eligible, or the blob or its original expired or was purged"
+                            );
                             return;
+                        };
+                        let admission = super::join_result_chunk_admission(&task_state, &reference);
+                        let group = reference.group_id.clone();
+                        let message = ControlBlobMessage::Chunk {
+                            reference,
+                            sequence,
+                            data_b64: BASE64.encode(chunk),
+                        };
+                        let payload = match encode_message(&message) {
+                            Ok(payload) => payload,
+                            Err(reason) => {
+                                tracing::warn!(reason, "control blob chunk encode failed");
+                                return;
+                            }
+                        };
+                        if let Err(reason) = super::send_join_artifact(
+                            &task_state,
+                            &recipient,
+                            &payload,
+                            &group,
+                            "join_result_chunk",
+                            admission,
+                            deadline,
+                        )
+                        .await
+                        {
+                            tracing::warn!(reason, "control blob chunk send failed");
                         }
-                    };
-                    if let Err(reason) = super::send_join_artifact(
-                        &task_state,
-                        &recipient,
-                        &payload,
-                        &group,
-                        "join_result_chunk",
-                        admission,
-                    )
-                    .await
-                    {
-                        tracing::warn!(reason, "control blob chunk send failed");
-                    }
-                });
+                    },
+                );
                 return;
             }
             let Some(chunk) = state.control_blobs.staged_chunk(&reference, sequence) else {
