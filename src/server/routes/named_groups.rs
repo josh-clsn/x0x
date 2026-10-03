@@ -10851,6 +10851,9 @@ fn acquire_join_result_staging_permit(
         .join_result_staging_guards
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // ADR 0107 (review r2): a staging task a removal or ban aborted never
+    // ran `release_join_result_staging_guard`; drop every idle entry here.
+    guards.retain(|_, semaphore| semaphore.available_permits() == 0);
     let semaphore = guards
         .entry((group_id.to_string(), *recipient))
         .or_insert_with(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)))
@@ -35326,17 +35329,23 @@ enum JoinArtifactRefusal {
     /// The recipient's agent key is in the ADR-0018 revocation set.
     Revoked,
     /// OwnerCertified: the roster seat commits to a certificate digest but
-    /// holds no bytes (`MemberCertStatus::DigestPending`).
+    /// holds no bytes, or the recipient's roster verdict is
+    /// `MemberCertStatus::DigestPending`.
     CertificateDigestPending,
-    /// OwnerCertified: the roster seat holds no certificate evidence at all.
-    /// This is ONE of the roster verdict's `InGrace` shapes (missing
-    /// evidence); `InGrace` also covers stale evidence during a rotation,
-    /// which this guard does not re-derive (its handling of a verifying
-    /// embedded certificate is the subject of a separate ADR 0107 note).
+    /// OwnerCertified: the roster seat holds neither certificate bytes nor
+    /// a digest.
     CertificateMissing,
     /// OwnerCertified: the roster-embedded certificate fails
     /// `verify_cert_against_owner` against the current clock.
     CertificateInvalid(x0x::groups::owner_cert::OwnerCertFailure),
+    /// OwnerCertified: the recipient's current roster verdict is
+    /// `MemberCertStatus::InGrace` — evidence missing or in flight,
+    /// including a stale embedded certificate during a rotation.
+    CertificateInGrace,
+    /// OwnerCertified: the recipient's current roster verdict is
+    /// `MemberCertStatus::Failed` although its embedded certificate
+    /// verifies (e.g. the announced certificate fails against the owner).
+    CertificateVerdictFailed(x0x::groups::owner_cert::OwnerCertFailure),
 }
 
 impl JoinArtifactRefusal {
@@ -35351,13 +35360,17 @@ impl JoinArtifactRefusal {
             Self::CertificateDigestPending => "certificate_digest_pending",
             Self::CertificateMissing => "certificate_missing",
             Self::CertificateInvalid(_) => "certificate_invalid",
+            Self::CertificateInGrace => "certificate_in_grace",
+            Self::CertificateVerdictFailed(_) => "certificate_verdict_failed",
         }
     }
 
     /// A definitive refusal invalidates the member's staged artifacts: the
-    /// seat or the certificate is gone, not merely awaiting evidence or an
-    /// operator. Pending evidence (digest-only, or no certificate on the
-    /// seat), quarantine and an unknown spelling only withhold.
+    /// seat or the embedded certificate is gone, not merely awaiting
+    /// evidence or an operator. A non-Clean roster verdict whose embedded
+    /// certificate still verifies (DigestPending, InGrace, or Failed on the
+    /// current evidence), missing certificate bytes, quarantine and an
+    /// unknown spelling only withhold: the next seal decides eviction.
     fn is_definitive(self) -> bool {
         matches!(
             self,
@@ -35370,12 +35383,13 @@ impl JoinArtifactRefusal {
     }
 }
 
-/// ADR 0107: the pure serving guard over one roster record. `None` means
-/// `member_hex` may receive its staged artifacts now. OwnerCertified groups
-/// verify the certificate EMBEDDED in the committed roster seat (the one
-/// `MemberJoined` bound into the `MemberAdded` commit) — never the
-/// announce/discovery cache, which a #842 inline-certificate first join may
-/// not have reached. Other groups skip the certificate check only.
+/// ADR 0107: the record-local half of the serving guard. `None` means the
+/// seat passes; OwnerCertified groups then also require a Clean roster
+/// verdict ([`join_artifact_serving_refusal`]). OwnerCertified groups verify
+/// the certificate EMBEDDED in the committed roster seat (the one
+/// `MemberJoined` bound into the `MemberAdded` commit) — never a certificate
+/// from the announce/discovery cache, which a #842 inline-certificate first
+/// join may not have reached. Other groups skip the certificate checks only.
 fn join_artifact_serving_refusal_for(
     info: &x0x::groups::GroupInfo,
     member_hex: &str,
@@ -35418,11 +35432,22 @@ fn join_artifact_serving_refusal_for(
 /// ADR 0107: the serving guard against the CURRENT local state. Callers on
 /// a serving path hold the group's membership lock, so the check and the
 /// artifact selection are linearized with every membership mutation.
+///
+/// OwnerCertified groups (ADR 0107 line 64) need BOTH a roster-embedded
+/// certificate that verifies against the owner, the current revocation set
+/// and the current clock, AND a Clean roster verdict for the recipient:
+/// `DigestPending`, `InGrace` and `Failed` verdicts fail closed. The verdict
+/// is the seal paths' own ladder (`GroupInfo::owner_cert_verdict`) over the
+/// current evidence. Announce/discovery evidence can therefore only WITHHOLD
+/// (e.g. a stale embedded certificate during a rotation); it is never the
+/// certificate a serve relies on. An #842 inline-certificate first join with
+/// no announce has a Clean verdict and is served.
 async fn join_artifact_serving_refusal(
     state: &AppState,
     group_id: &str,
     member_hex: &str,
 ) -> Option<JoinArtifactRefusal> {
+    use x0x::groups::owner_cert::MemberCertStatus;
     let revoked = match parse_agent_id_hex(member_hex) {
         Ok(member) => state
             .agent
@@ -35433,10 +35458,39 @@ async fn join_artifact_serving_refusal(
         Err(_) => return Some(JoinArtifactRefusal::NotActive),
     };
     let now_unix = x0x::groups::owner_cert::restore_clock_now();
-    let roster = state.named_groups.read().await;
-    match crate::server::resolve_group_entry_locked(&roster, group_id) {
-        Some((_, info)) => join_artifact_serving_refusal_for(info, member_hex, revoked, now_unix),
-        None => Some(JoinArtifactRefusal::UnknownGroup),
+    // The recipient's seat alone, for the verdict below (the per-member
+    // ladder does not depend on other seats).
+    let mut probe = {
+        let roster = state.named_groups.read().await;
+        let Some((_, info)) = crate::server::resolve_group_entry_locked(&roster, group_id) else {
+            return Some(JoinArtifactRefusal::UnknownGroup);
+        };
+        if let Some(refusal) =
+            join_artifact_serving_refusal_for(info, member_hex, revoked, now_unix)
+        {
+            return Some(refusal);
+        }
+        // Non-OwnerCertified groups need no certificate: eligible.
+        info.policy.admission.owner_certified_user_id()?;
+        let mut probe = info.clone();
+        probe.members_v2.retain(|agent, _| agent == member_hex);
+        probe
+    };
+    let evidence = owner_cert_evidence_for(state, &[member_hex]).await;
+    match probe
+        .owner_cert_verdict(&evidence)
+        .per_member
+        .remove(member_hex)
+    {
+        Some(MemberCertStatus::Clean) => None,
+        Some(MemberCertStatus::DigestPending) => {
+            Some(JoinArtifactRefusal::CertificateDigestPending)
+        }
+        Some(MemberCertStatus::InGrace { .. }) => Some(JoinArtifactRefusal::CertificateInGrace),
+        Some(MemberCertStatus::Failed { reason }) => {
+            Some(JoinArtifactRefusal::CertificateVerdictFailed(reason))
+        }
+        None => Some(JoinArtifactRefusal::NotActive),
     }
 }
 
