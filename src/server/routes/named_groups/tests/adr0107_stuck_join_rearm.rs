@@ -4469,3 +4469,48 @@ async fn s8a_r6_duplicate_fetches_never_overlap_inline_egress() -> anyhow::Resul
     );
     Ok(())
 }
+
+/// WHY (r6 P4, D60): a withholding refusal (quarantine) must not mask a
+/// terminal one. Quarantine together with agent revocation, or together
+/// with a moved secret epoch, purges the pending share — it is not
+/// withheld until the horizon.
+#[tokio::test]
+async fn s8a_r6_terminal_share_invalidations_outrank_withholding() -> anyhow::Result<()> {
+    let mut masked = Vec::new();
+    for case in ["quarantine_and_agent_revoked", "quarantine_and_epoch_moved"] {
+        let dir = tempfile::tempdir()?;
+        let g = build_gss(dir.path(), true).await?;
+        let g_hex = hex_of(&g.joiner);
+        let armed = super::super::join_egress_test_barrier::arm(&g_hex, "secure_share");
+        clear_share_witnesses(&g.authority);
+        deliver_current_share(&g).await?;
+        wait_reached(&armed.gate, "secure share").await;
+        invalidate_share_recipient(&g, ShareInvalidation::Quarantined).await?;
+        if case == "quarantine_and_agent_revoked" {
+            invalidate_share_recipient(&g, ShareInvalidation::AgentRevoked).await?;
+        } else if let Some(info) = g.authority.named_groups.write().await.get_mut(&g.group_key) {
+            info.secret_epoch += 1;
+        }
+        clear_share_witnesses(&g.authority);
+        drop(armed);
+        let key = (g.stable.clone(), g_hex.clone());
+        let purged = tokio::time::timeout(Duration::from_secs(12), async {
+            while live_egress_tasks(&g.authority, &key) > 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .is_ok();
+        if !purged {
+            masked.push(case);
+        }
+        if share_writes(&g.authority, &g_hex) > 0 {
+            masked.push("a share was written");
+        }
+    }
+    assert!(
+        masked.is_empty(),
+        "a withholding refusal masked a terminal share invalidation: {masked:?}"
+    );
+    Ok(())
+}
