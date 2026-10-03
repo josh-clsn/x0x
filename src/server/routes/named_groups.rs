@@ -20753,15 +20753,22 @@ async fn wipe_local_group_crypto_material(
         });
     }
     if !welcome_ids.is_empty() {
-        let mut streams = state.pending_welcome_streams.lock().await;
-        if let Some(streams) = streams.as_mut() {
-            for welcome_id in &welcome_ids {
-                if let Some(stream) = streams.remove(welcome_id) {
-                    stream.abort();
-                }
-            }
+        // r5 (G4): abort, then AWAIT, every stream (outside the map lock).
+        let aborted: Vec<tokio::task::JoinHandle<()>> = {
+            let mut streams = state.pending_welcome_streams.lock().await;
+            streams.as_mut().map_or_else(Vec::new, |streams| {
+                welcome_ids
+                    .iter()
+                    .filter_map(|welcome_id| streams.remove(welcome_id))
+                    .collect()
+            })
+        };
+        for stream in &aborted {
+            stream.abort();
         }
-        drop(streams);
+        for stream in aborted {
+            let _ = stream.await;
+        }
         let mut waiters = state.pending_welcome_waiters.write().await;
         let mut acks = state.pending_welcome_acks.write().await;
         for welcome_id in welcome_ids {
@@ -20807,6 +20814,9 @@ async fn retain_withdrawn_group_tombstone(
     let stable_group_id = info.stable_group_id().to_string();
     info.withdrawn = true;
     clear_group_info_key_material(&mut info);
+    // ADR 0107 (r5, G4): quiesce every in-flight join-artifact egress of
+    // the group, awaited, before the terminal commit.
+    quiesce_group_join_egress(state, group_id).await;
     #[cfg(test)]
     record_join_artifact_lifecycle(state, format!("tombstone_persist:{stable_group_id}"));
     let mut aliases = HashSet::new();
@@ -35834,6 +35844,45 @@ async fn quiesce_member_join_egress(state: &AppState, group_id: &str, member_hex
         .filter(|(_, pending)| {
             pending.joiner_agent == member_hex && aliases.contains(&pending.group_id)
         })
+        .map(|(id, _)| id.clone())
+        .collect();
+    stop_welcome_streams(state, &welcome_ids).await;
+}
+
+/// ADR 0107 (r5, G4): stop EVERY in-flight join-artifact egress of the
+/// group — every registered task for every recipient, under every spelling,
+/// and every Welcome stream of the group — and await each one. Terminal
+/// mutations (withdrawal, deletion, local drop) call this BEFORE they
+/// commit, so nothing is still running when the commit lands.
+async fn quiesce_group_join_egress(state: &AppState, group_id: &str) {
+    let aliases = join_artifact_group_aliases(state, group_id).await;
+    let tasks: Vec<tokio::task::JoinHandle<()>> = {
+        let mut registry = state
+            .join_artifact_egress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let keys: Vec<(String, String)> = registry
+            .keys()
+            .filter(|(group, _)| aliases.contains(group))
+            .cloned()
+            .collect();
+        keys.iter()
+            .filter_map(|key| registry.remove(key))
+            .flatten()
+            .collect()
+    };
+    for task in &tasks {
+        task.abort();
+    }
+    for task in tasks {
+        let _ = task.await;
+    }
+    let welcome_ids: Vec<String> = state
+        .pending_welcomes
+        .read()
+        .await
+        .iter()
+        .filter(|(_, pending)| aliases.contains(&pending.group_id))
         .map(|(id, _)| id.clone())
         .collect();
     stop_welcome_streams(state, &welcome_ids).await;
