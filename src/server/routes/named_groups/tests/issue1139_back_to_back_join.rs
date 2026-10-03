@@ -2014,3 +2014,340 @@ async fn the_rekey_link_refuses_every_other_carry_shape() -> Result<()> {
     assert_ne!(after, before, "the genuine link advances the device");
     Ok(())
 }
+
+/// Seat J1 with keys and give it J2's original seat, so J1 is a converged
+/// third member at the authority's head.
+async fn wa_seat_j1_with_keys(s: &BackToBack) -> Result<()> {
+    super::super::handle_join_result_message_bound(
+        &s.j1,
+        &s.authority_id,
+        true,
+        JoinResultMessage::Result {
+            event: Box::new(s.add_j1.event.clone()),
+            chain: Vec::new(),
+            head_attestation: None,
+            roster_certificates_b64: Vec::new(),
+            intervening_events: Vec::new(),
+            signed_by: None,
+        },
+        Some(s.j1_attempt.as_str()),
+    )
+    .await;
+    let seated =
+        apply_named_group_metadata_event(&s.j1, s.add_j2.event.clone(), s.authority_id, true, None)
+            .await;
+    anyhow::ensure!(seated.accepted, "J1 holds J2's original seat");
+    anyhow::ensure!(wa_head(&s.j1, s).await == wa_head(&s._authority, s).await);
+    Ok(())
+}
+
+/// The authority's published commit-bearing events since the recorder was
+/// last cleared, by revision.
+fn wa_published(s: &BackToBack) -> Vec<(u64, NamedGroupMetadataEvent)> {
+    let mut events: Vec<_> = s
+        ._authority
+        .named_group_test_recorders
+        .publish_bytes
+        .lock()
+        .expect("publish hook")
+        .iter()
+        .filter_map(|(_t, b)| serde_json::from_slice::<NamedGroupMetadataEvent>(b).ok())
+        .filter_map(|e| named_group_metadata_event_commit(&e).map(|c| (c.revision, e.clone())))
+        .collect();
+    events.sort_by_key(|(revision, _)| *revision);
+    events.dedup_by_key(|(revision, _)| *revision);
+    events
+}
+
+fn wa_clear_published(s: &BackToBack) {
+    s._authority
+        .named_group_test_recorders
+        .publish_bytes
+        .lock()
+        .expect("publish hook")
+        .clear();
+}
+
+async fn wa_role(
+    state: &Arc<AppState>,
+    s: &BackToBack,
+    member: &str,
+) -> Option<x0x::groups::GroupRole> {
+    state
+        .named_groups
+        .read()
+        .await
+        .get(&s.group_key)
+        .and_then(|row| row.members_v2.get(member).map(|m| m.role))
+}
+
+/// The race the device meets in production: the authority's real removal of
+/// the device arrives by gossip BEFORE the device's join result. While the
+/// device is mid-rejoin without a tree it must not take that as its own
+/// departure; the carried result then lands and the device ends active with
+/// keys that read post-re-key traffic.
+#[tokio::test]
+async fn gossip_removal_before_the_result_does_not_strand_the_rejoining_device() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    super::super::finalize_join_attempt(
+        &s.j2,
+        &s.group_key,
+        &s.stable_group_id,
+        &j2_hex,
+        &s.j2_attempt,
+        super::super::JoinAttemptOutcome::TimedOut,
+        super::super::JoinFinalizeGuard::Unlocked,
+    )
+    .await;
+    let r = wa_fresh_invite_round_trip_with(&s, &s.j2, false).await?;
+    assert_eq!(r.final_state, "active", "{r}");
+    let (attempt_id, terminal, carried) = r.held.clone().context("held result")?;
+    let removal = carried.first().cloned().context("the re-key removal")?;
+    for verified in [false, true] {
+        let gossip = apply_named_group_metadata_event(
+            &s.j2,
+            removal.clone(),
+            s.authority_id,
+            verified,
+            None,
+        )
+        .await;
+        assert!(
+            !gossip.accepted && !gossip.should_exit,
+            "gossip removal must not depart"
+        );
+        assert_eq!(wa_state(&s.j2, &s.group_key).await, "active");
+    }
+    let from = wa_head(&s.j2, &s).await.0;
+    let terminal_revision = named_group_metadata_event_commit(&terminal)
+        .map(|c| c.revision)
+        .context("terminal commit")?;
+    let info = s
+        ._authority
+        .named_groups
+        .read()
+        .await
+        .get(&s.group_key)
+        .cloned()
+        .context("authority group")?;
+    super::super::handle_join_result_message_bound(
+        &s.j2,
+        &s.authority_id,
+        true,
+        JoinResultMessage::Result {
+            event: Box::new(terminal),
+            chain: intervening_chain_from(&info, from, terminal_revision),
+            head_attestation: None,
+            roster_certificates_b64: Vec::new(),
+            intervening_events: carried,
+            signed_by: None,
+        },
+        Some(attempt_id.as_str()),
+    )
+    .await;
+    assert_eq!(wa_state(&s.j2, &s.group_key).await, "active");
+    assert!(s.j2.treekem_groups.read().await.contains_key(&s.group_key));
+    assert!(wa_decrypts_post_rekey(&s, &s.j2).await?);
+    Ok(())
+}
+
+/// A genuine kick of a device that is NOT mid-rejoin (no current attempt)
+/// still departs exactly as before: the row is wiped.
+#[tokio::test]
+async fn a_genuine_kick_with_no_current_attempt_still_departs() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let first = wa_stuck_keyless(&s).await?;
+    anyhow::ensure!(
+        first.treekem,
+        "precondition: J2 re-keyed with keys: {first}"
+    );
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    anyhow::ensure!(!s
+        .j2
+        .pending_join_attempts
+        .lock()
+        .expect("attempts")
+        .contains_key(&join_result_key(&s.stable_group_id, &j2_hex)));
+    assert_eq!(wa_owner_removes_j2(&s, true).await?, "no_row");
+    Ok(())
+}
+
+/// A returning ADMIN is re-seated as Member by the add and restored to
+/// Admin by the re-key's signed role update; the authority, the device and
+/// a third member all agree. A returning Member stays Member and no role
+/// update is published.
+#[tokio::test]
+async fn a_returning_admin_is_restored_on_every_member() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    wa_seat_j1_with_keys(&s).await?;
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    wa_clear_published(&s);
+    let promoted = update_member_role(
+        State(Arc::clone(&s._authority)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path((s.group_key.clone(), j2_hex.clone())),
+        Json(UpdateMemberRoleRequest {
+            role: "admin".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    anyhow::ensure!(
+        promoted.status().is_success(),
+        "promote J2: {}",
+        promoted.status()
+    );
+    let promotion = wa_published(&s);
+    for (revision, event) in promotion {
+        // J2 is still a keyless stub here; its role reaches it with the
+        // re-key below. J1 is the converged third member.
+        for (state, name) in [(&s.j1, "J1")] {
+            let head = wa_head(state, &s).await.0;
+            let applied =
+                apply_named_group_metadata_event(state, event.clone(), s.authority_id, true, None)
+                    .await;
+            anyhow::ensure!(
+                applied.accepted,
+                "{name} at r{head} applies the promotion r{revision}: {}",
+                super::super::named_group_metadata_event_kind(&event)
+            );
+        }
+    }
+    anyhow::ensure!(
+        wa_role(&s._authority, &s, &j2_hex).await == Some(x0x::groups::GroupRole::Admin),
+        "precondition: J2 is an admin"
+    );
+
+    wa_clear_published(&s);
+    let r = wa_stuck_keyless(&s).await?;
+    anyhow::ensure!(r.treekem, "J2 re-keyed with keys: {r}");
+    let published = wa_published(&s);
+    assert!(
+        published
+            .iter()
+            .any(|(_, e)| matches!(e, NamedGroupMetadataEvent::MemberRoleUpdated { .. })),
+        "the re-key restores the role with a signed update"
+    );
+    for (revision, event) in published {
+        let j1 = apply_named_group_metadata_event(&s.j1, event.clone(), s.authority_id, true, None)
+            .await;
+        assert!(j1.accepted, "J1 applies r{revision}");
+        if matches!(event, NamedGroupMetadataEvent::MemberRoleUpdated { .. }) {
+            let j2 =
+                apply_named_group_metadata_event(&s.j2, event, s.authority_id, true, None).await;
+            assert!(j2.accepted, "J2 applies its role restore");
+        }
+    }
+    let head = wa_head(&s._authority, &s).await;
+    assert_eq!(wa_head(&s.j1, &s).await, head);
+    assert_eq!(wa_head(&s.j2, &s).await, head);
+    for state in [&s._authority, &s.j1, &s.j2] {
+        assert_eq!(
+            wa_role(state, &s, &j2_hex).await,
+            Some(x0x::groups::GroupRole::Admin)
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_returning_member_stays_member() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    wa_clear_published(&s);
+    let r = wa_stuck_keyless(&s).await?;
+    anyhow::ensure!(r.treekem, "{r}");
+    assert!(!wa_published(&s)
+        .iter()
+        .any(|(_, e)| matches!(e, NamedGroupMetadataEvent::MemberRoleUpdated { .. })));
+    for state in [&s._authority, &s.j2] {
+        assert_eq!(
+            wa_role(state, &s, &j2_hex).await,
+            Some(x0x::groups::GroupRole::Member)
+        );
+    }
+    Ok(())
+}
+
+/// The device-side link's remaining refusals, each with the REAL signed
+/// removal and each leaving the device's head untouched: a sender that is
+/// not an admin, a device that already holds a tree, and a stale attempt.
+#[tokio::test]
+async fn the_rekey_link_refuses_non_admin_tree_holding_and_stale_attempts() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    super::super::finalize_join_attempt(
+        &s.j2,
+        &s.group_key,
+        &s.stable_group_id,
+        &j2_hex,
+        &s.j2_attempt,
+        super::super::JoinAttemptOutcome::TimedOut,
+        super::super::JoinFinalizeGuard::Unlocked,
+    )
+    .await;
+    let r = wa_fresh_invite_round_trip_with(&s, &s.j2, false).await?;
+    let (attempt_id, terminal, carried) = r.held.clone().context("held result")?;
+    let terminal_revision = named_group_metadata_event_commit(&terminal).map(|c| c.revision);
+    let before = wa_head(&s.j2, &s).await;
+    let link = |sender: AgentId, events: Vec<NamedGroupMetadataEvent>, attempt: String| {
+        let s = &s;
+        async move {
+            super::super::apply_join_result_intervening_events_for(
+                &s.j2,
+                &sender,
+                true,
+                &s.stable_group_id,
+                terminal_revision,
+                Some(attempt.as_str()),
+                events,
+                true,
+            )
+            .await;
+            wa_head(&s.j2, s).await
+        }
+    };
+
+    let j1_id = s.j1.agent.agent_id();
+    let mut by_member = carried.clone();
+    if let Some(NamedGroupMetadataEvent::MemberRemoved { actor, .. }) = by_member.first_mut() {
+        *actor = hex::encode(j1_id.as_bytes());
+    }
+    assert_eq!(
+        link(j1_id, by_member, attempt_id.clone()).await,
+        before,
+        "non-admin sender"
+    );
+
+    assert_eq!(
+        link(s.authority_id, carried.clone(), "stale-attempt".to_string()).await,
+        before,
+        "stale attempt"
+    );
+
+    let group_id_bytes = hex::decode(&s.group_key)?;
+    let seed = agent_treekem_seed(s.j2.agent.as_ref(), &group_id_bytes);
+    let tree = x0x::mls::TreeKemMlsGroup::create(group_id_bytes, s.j2.agent.agent_id(), &seed)?;
+    s.j2.treekem_groups
+        .write()
+        .await
+        .insert(s.group_key.clone(), Arc::new(Mutex::new(tree)));
+    assert_eq!(
+        link(s.authority_id, carried.clone(), attempt_id.clone()).await,
+        before,
+        "device already holds a tree"
+    );
+    s.j2.treekem_groups.write().await.remove(&s.group_key);
+    assert_ne!(
+        link(s.authority_id, carried, attempt_id).await,
+        before,
+        "the genuine link still applies (positive control)"
+    );
+    Ok(())
+}
