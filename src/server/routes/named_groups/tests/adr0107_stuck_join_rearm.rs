@@ -3658,3 +3658,129 @@ async fn s8a_r5_g7_join_result_listener_never_waits_on_a_group_lock() -> anyhow:
     );
     Ok(())
 }
+
+/// WHY (note r3 G8): chunk fetches for one group whose lock is held —
+/// duplicates and out-of-range sequences — must not take the shared chunk
+/// slots another group's legitimate chunk fetch needs. Fetches are
+/// validated (the copy is staged, the sequence exists) before they take a
+/// slot, coalesce per chunk, and each group gets only its share.
+#[tokio::test]
+async fn s8a_r5_g8_chunk_fetch_admission_is_validated_and_fair() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    // Group B's member: a fresh agent with no other staged copies.
+    let b_member = x0x::identity::AgentKeypair::generate()?.agent_id();
+    let j1_hex = hex::encode(b_member.as_bytes());
+    // Group A: J2's real staged copy.
+    let reference_a = staged_join_result_blob(&s).await?;
+    // Group B (same authority): its member is Active and has a staged
+    // original and a bound copy of it.
+    let group_b = "c5".repeat(32);
+    {
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "b".to_string(),
+            String::new(),
+            s.authority_id,
+            group_b.clone(),
+            x0x::groups::GroupPolicy::default(),
+        );
+        info.add_member(
+            j1_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(hex::encode(s.authority_id.as_bytes())),
+            None,
+        );
+        s.authority
+            .named_groups
+            .write()
+            .await
+            .insert(group_b.clone(), info);
+    }
+    let staged_at = Instant::now();
+    s.authority.pending_join_results.write().await.insert(
+        join_result_key(&group_b, &j1_hex),
+        super::super::PendingJoinResult {
+            event: s.j1_add.clone(),
+            head_attestation: None,
+            created_at: staged_at,
+        },
+    );
+    let reference_b = super::super::control_blob::stage_reference(
+        &s.authority.control_blobs,
+        &s.authority.agent,
+        &b_member,
+        super::super::control_blob::ControlBlobKind::JoinResult,
+        &group_b,
+        Some("adr0107-r5-g8-attempt"),
+        vec![0x5b; x0x::dm::MAX_PAYLOAD_BYTES + 4096],
+        Some(super::super::control_blob::StagedOrigin {
+            staged_at,
+            deadline: staged_at + super::super::PENDING_JOIN_RESULT_TTL,
+        }),
+    )
+    .map_err(|e| anyhow::anyhow!("stage group B copy: {e}"))?;
+    // Control: with no flood, group B's chunk is served.
+    clear_egress(&s.authority);
+    super::super::control_blob::handle_control_blob_message(
+        &s.authority,
+        &b_member,
+        true,
+        super::super::control_blob::ControlBlobMessage::Fetch {
+            reference: reference_b.clone(),
+            sequence: 0,
+        },
+    )
+    .await;
+    assert!(
+        egress_happens(
+            &s.authority,
+            &j1_hex,
+            "join_result_chunk",
+            Duration::from_secs(5)
+        )
+        .await,
+        "control: group B's chunk is served without a flood"
+    );
+    clear_egress(&s.authority);
+    let lock = super::super::group_membership_lock_for_known_group(&s.authority, &s.stable)
+        .await
+        .expect("known group");
+    let held = lock.lock().await;
+    // The flood for group A: in-range duplicates and out-of-range sequences.
+    for sequence in 0..24u32 {
+        super::super::control_blob::handle_control_blob_message(
+            &s.authority,
+            &s.j2.agent.agent_id(),
+            true,
+            super::super::control_blob::ControlBlobMessage::Fetch {
+                reference: reference_a.clone(),
+                sequence: sequence % 12,
+            },
+        )
+        .await;
+    }
+    // Group B's legitimate fetch.
+    super::super::control_blob::handle_control_blob_message(
+        &s.authority,
+        &b_member,
+        true,
+        super::super::control_blob::ControlBlobMessage::Fetch {
+            reference: reference_b,
+            sequence: 0,
+        },
+    )
+    .await;
+    let served = egress_happens(
+        &s.authority,
+        &j1_hex,
+        "join_result_chunk",
+        Duration::from_secs(5),
+    )
+    .await;
+    drop(held);
+    assert!(
+        served,
+        "another group's legitimate chunk fetch was starved by one locked group's flood"
+    );
+    Ok(())
+}
