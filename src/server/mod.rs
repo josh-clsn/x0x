@@ -1575,6 +1575,33 @@ pub async fn serve_with_options(
     // and the #661 `drop(state)` below is then the last reference even on a
     // daemon restarted mid-join.
     let respawned = respawn_unconverged_join_polls(Arc::clone(&state), &mut bg_tasks).await;
+    // A re-key chain-step row whose pin passes its TTL while the daemon keeps
+    // running departs on this tick (the startup pass inside the respawn
+    // covers the restart case).
+    {
+        let sweep_state = Arc::clone(&state);
+        let mut shutdown_rx = state.shutdown_notify.subscribe();
+        bg_tasks.push(tokio::spawn(async move {
+            let mut tick =
+                tokio::time::interval(routes::named_groups::ABANDONED_REKEY_SWEEP_INTERVAL);
+            tick.tick().await;
+            loop {
+                if *shutdown_rx.borrow_and_update() {
+                    break;
+                }
+                tokio::select! {
+                    _ = shutdown_rx.changed() => break,
+                    _ = tick.tick() => {
+                        routes::named_groups::sweep_abandoned_rekey_rows(
+                            &sweep_state,
+                            "rekey_abandoned_periodic",
+                        )
+                        .await;
+                    }
+                }
+            }
+        }));
+    }
     if !respawned.is_empty() {
         tracing::info!(
             groups = ?respawned,
