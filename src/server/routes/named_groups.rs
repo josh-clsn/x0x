@@ -5219,8 +5219,9 @@ pub(in crate::server) async fn refresh_group_rosters_for_gossip(state: &AppState
 /// changed and is retained through serialization, atomic replacement, and
 /// failure restoration. This prevents a concurrent cross-group save from
 /// durably capturing an uncommitted candidate. A pre-rename failure restores
-/// the exact full-map snapshot; a post-rename durability failure keeps memory
-/// aligned with the visible replacement while withholding success.
+/// touched keys only if their live records still match the mutation (#470),
+/// preserving concurrent raw-map writes. A post-rename durability failure
+/// keeps the mutation in memory while withholding success.
 pub(in crate::server) async fn persist_named_groups_mutation<F>(
     state: &AppState,
     mutate: F,
@@ -5287,7 +5288,7 @@ where
     persist_named_groups_mutation_with_gss_guard(state, &gss_publication_guard, mutate).await
 }
 
-/// N19-B: the manual quarantine-clear transition. The mutation runs
+/// N19-B / #1103: every quarantine-clear transition. The mutation runs
 /// against a private CANDIDATE — the live map (every consumer: WS/SSE
 /// annotations, session gates, KV contexts, the task-ingest gate) never
 /// shows the clear while the write is in flight. Outcomes follow the
@@ -5299,8 +5300,12 @@ where
 /// - `NotReplaced` / `Err` → the live map stays ARMED (fail closed).
 ///
 /// Locks: roster persistence P then G, the persist_named_groups_mutation
-/// order; the candidate commit is a compare-and-commit so a writer that
-/// bypassed the pair (none exists — the #732 r8 chokepoints) fails closed.
+/// order. The candidate commit compares and writes only touched keys (#470),
+/// preserving unrelated changes from writers that bypass P (owner-cert
+/// verdict stamping and stale join-row cleanup). A changed target fails
+/// closed, re-saves memory, and requires durability confirmation; a rebind
+/// transaction discards its rejected candidate's journals only after a durable
+/// memory re-save.
 pub(in crate::server) async fn persist_named_groups_quarantine_clear_gated<F>(
     state: &AppState,
     mutate: F,
@@ -5309,6 +5314,27 @@ where
     F: FnOnce(&mut HashMap<String, x0x::groups::GroupInfo>) -> bool,
 {
     let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+    let gss_publication_guard = state.gss_publication_gate.write().await;
+    persist_named_groups_quarantine_clear_gated_unlocked(
+        state,
+        &gss_publication_guard,
+        None,
+        mutate,
+    )
+    .await
+}
+
+/// Caller holds P and G. Record replacements retain the existing TreeKEM
+/// rebind journal and pending-stub semantics, but stage all writes privately.
+async fn persist_named_groups_quarantine_clear_gated_unlocked<F>(
+    state: &AppState,
+    _gss_publication_guard: &tokio::sync::RwLockWriteGuard<'_, ()>,
+    rebind_group_id: Option<&str>,
+    mutate: F,
+) -> std::io::Result<AtomicWriteOutcome>
+where
+    F: FnOnce(&mut HashMap<String, x0x::groups::GroupInfo>) -> bool,
+{
     let before = {
         let groups = state.named_groups.read().await;
         groups.clone()
@@ -5318,26 +5344,110 @@ where
         return Ok(AtomicWriteOutcome::NotReplaced);
     }
     enforce_containment_invariant(&mut candidate, &before);
-    let outcome = {
-        let _gss_publication_guard = state.gss_publication_gate.write().await;
-        let (legacy_json, home_suite_json) =
-            encode_named_groups_store_excluding_pending_stubs(state, &candidate, None)?;
-        save_named_groups_store_checked(state, &legacy_json, &home_suite_json).await
+    let (legacy_json, home_suite_json) =
+        encode_named_groups_store_excluding_pending_stubs(state, &candidate, rebind_group_id)?;
+    let prejournaled = if let Some(group_id) = rebind_group_id {
+        match prepare_rebind_journal_for_groups(state, group_id, &candidate).await {
+            RebindOutcome::Failed(error) => {
+                return Err(std::io::Error::other(format!(
+                    "TreeKEM rebind preparation failed: {error}"
+                )));
+            }
+            outcome => outcome,
+        }
+    } else {
+        RebindOutcome::NotApplicable
     };
+    let outcome = save_named_groups_store_checked(state, &legacy_json, &home_suite_json).await;
+    if matches!(&outcome, Ok(AtomicWriteOutcome::NotReplaced) | Err(_)) {
+        if let Some(group_id) = rebind_group_id {
+            discard_rebind_journal(state, group_id).await;
+        }
+    }
     if matches!(
         outcome,
         Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::ReplacedNotDurable)
     ) {
         let mut groups = state.named_groups.write().await;
-        if *groups == before {
-            *groups = candidate;
-        } else {
+        let mut touched: Vec<&String> = before
+            .keys()
+            .chain(candidate.keys())
+            .filter(|key| before.get(*key) != candidate.get(*key))
+            .collect();
+        touched.sort_unstable();
+        touched.dedup();
+        // Validate every touched key before committing any of them, including
+        // additions/removals and all local-only fields in GroupInfo equality.
+        if touched
+            .iter()
+            .any(|key| groups.get(*key) != before.get(*key))
+        {
+            drop(groups);
+            state
+                .named_groups_requires_durability_confirmation
+                .store(true, Ordering::Release);
             tracing::error!(
-                "N19-B: the live named-groups map diverged during a gated                  quarantine clear — keeping memory, refusing the commit"
+                "N19-B: a touched named-group record diverged during a gated quarantine clear — keeping memory, refusing the commit"
             );
+            // P and G remain held. Re-save memory for every target conflict;
+            // only a durable re-save makes candidate journals safe to discard.
+            if matches!(
+                save_named_groups_checked_unlocked(state).await,
+                Ok(AtomicWriteOutcome::Durable)
+            ) {
+                if let Some(group_id) = rebind_group_id {
+                    discard_rebind_journal(state, group_id).await;
+                }
+            }
+            // A durable corrective save clears the flag internally. Keep the
+            // rejected transaction fail-closed until the next persist confirms
+            // memory before accepting another mutation.
+            state
+                .named_groups_requires_durability_confirmation
+                .store(true, Ordering::Release);
             return Err(std::io::Error::other(
-                "named-groups map changed during the gated quarantine clear",
+                "named-group record changed during the gated quarantine clear",
             ));
+        }
+        for key in touched {
+            match candidate.get(key) {
+                Some(record) => {
+                    groups.insert(key.clone(), record.clone());
+                }
+                None => {
+                    groups.remove(key);
+                }
+            }
+        }
+    }
+    if matches!(
+        &outcome,
+        Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::ReplacedNotDurable)
+    ) {
+        if let Some(group_id) = rebind_group_id {
+            state
+                .pending_join_stubs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(group_id);
+            if matches!(outcome, Ok(AtomicWriteOutcome::Durable))
+                && matches!(prejournaled, RebindOutcome::Rebound)
+            {
+                // Named state is already durable: retain journals on error,
+                // as in the ordinary record transaction, for startup replay.
+                apply_rebind_journal_snapshot(state, group_id)
+                    .await
+                    .map_err(|error| {
+                        tracing::error!(
+                            group_id = %LogHexId::group(group_id),
+                            error = %error,
+                            "#457 r5c: journaled rebind apply failed AFTER the durable named save — journals LEFT IN PLACE for startup replay (never discard a journal whose named half is durable)"
+                        );
+                        std::io::Error::other(format!(
+                            "TreeKEM snapshot rebind apply failed (journals retained for startup replay): {error}"
+                        ))
+                    })?;
+            }
         }
     }
     outcome
@@ -5371,11 +5481,12 @@ where
         if !mutate(&mut groups) {
             return Ok(AtomicWriteOutcome::NotReplaced);
         }
-        // #732 r8: ONE of the FOUR containment chokepoints. The others are
+        // #732 r8 / #1103: ONE of the FIVE containment chokepoints. The others are
         // `persist_named_group_info`'s transaction, the TreeKEM atomic
         // writer's durable candidate, and the scoped entry in
-        // `store_named_group_info` — none of which pass through here.
-        // Together the four cover every map write that can carry
+        // `store_named_group_info`, plus the gated quarantine-clear candidate
+        // — none of which pass through here.
+        // Together the five cover every map write that can carry
         // containment, and the `before` clone the compare-and-restore already
         // needs IS the pre-mutation snapshot the invariant wants — so
         // enforcing INV here costs nothing and removes every per-site alias
@@ -5938,6 +6049,29 @@ async fn persist_named_group_info_inner(
             outcome => return outcome,
         }
     }
+    // #1103: both the all-clean SEAL and MemberAdded's mandate/gap-adoption
+    // arms replace a record whose fork marker was cleared on a clone. Route
+    // every such replacement through the same candidate gate as manual clear.
+    let quarantine_clear_key = {
+        let groups = state.named_groups.read().await;
+        crate::server::resolve_group_entry_locked(&groups, group_id)
+            // A replacement can arrive under its MLS spelling while the
+            // record is stored under its stable id. Resolve that id too.
+            .or_else(|| crate::server::resolve_group_entry_locked(&groups, info.stable_group_id()))
+            .filter(|(_, current)| {
+                current.fork_quarantine.is_some() && info.fork_quarantine.is_none()
+            })
+            .map(|(key, _)| key.to_string())
+    };
+    if let Some(key) = quarantine_clear_key {
+        return persist_named_groups_quarantine_clear_gated_unlocked(
+            state,
+            &_gss_publication_guard,
+            Some(&key),
+            |groups| store_named_group_info_locked(groups, &key, info),
+        )
+        .await;
+    }
     // #458 r4 item 1: the pending-stub exclusion and the map mutation are
     // one atomic step under this lock — a stub is never visible to a
     // serializer without its marker, and a confirmed group never keeps a
@@ -5987,12 +6121,11 @@ async fn persist_named_group_info_inner(
         // #732 r8: the SECOND containment chokepoint. This transaction does
         // NOT pass through `persist_named_groups_mutation_unlocked`, so the
         // invariant is enforced HERE, against the same pre-mutation snapshot
-        // the pre-durable rollback below restores. The owner-anchored clear
-        // arms that persist a cleared record through this function —
-        // adoption, the mandate-carrying apply, both explicit-seal arms —
-        // thereby reach EVERY alias spelling, and a clear survives reload
-        // because the journal and save below serialize the post-invariant
-        // map.
+        // the pre-durable rollback below restores. Quarantine-clear record
+        // replacements (adoption, mandate-carrying apply and all-clean seal)
+        // use the gated candidate transaction above; the eviction-arm seal
+        // clear uses the gated mutation wrapper. Each enforces the same alias
+        // invariant before serializing its candidate.
         enforce_containment_invariant(&mut groups, &snapshot);
         snapshot
     };
@@ -6110,10 +6243,28 @@ const REBIND_MUTEX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_
 /// `NotApplicable` = group not on the TreeKEM plane / no snapshot and no
 /// live group; `Failed` = nothing durable changed (caller rolls back).
 async fn prepare_rebind_journal_locked(state: &AppState, group_id: &str) -> RebindOutcome {
+    let groups = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(group_id) else {
+            return RebindOutcome::NotApplicable;
+        };
+        if info.withdrawn || info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem {
+            return RebindOutcome::NotApplicable;
+        }
+        groups.clone()
+    };
+    prepare_rebind_journal_for_groups(state, group_id, &groups).await
+}
+
+async fn prepare_rebind_journal_for_groups(
+    state: &AppState,
+    group_id: &str,
+    groups: &HashMap<String, x0x::groups::GroupInfo>,
+) -> RebindOutcome {
     // Contention is RETRIED briefly (the mutex is also taken by short
     // epoch READS, which promise no follow-up persistence); still
     // contended is a FAILURE — never a silent success.
-    let envelope = match rebind_envelope_for(state, group_id).await {
+    let envelope = match rebind_envelope_for(state, group_id, groups.get(group_id)).await {
         Ok(Some(envelope)) => envelope,
         Ok(None) => return RebindOutcome::NotApplicable,
         Err(e) => return RebindOutcome::Failed(e),
@@ -6122,11 +6273,9 @@ async fn prepare_rebind_journal_locked(state: &AppState, group_id: &str) -> Rebi
         // #451 seam: the two-file split encode, stub-excluded — THIS
         // group's post-mutation entry is the confirmed state being
         // persisted, so it survives the filter.
-        let (legacy_json, home_suite_json) = {
-            let groups = state.named_groups.read().await;
-            encode_named_groups_store_excluding_pending_stubs(state, &groups, Some(group_id))
-                .map_err(|e| anyhow::anyhow!("named groups encode for journal: {e}"))?
-        };
+        let (legacy_json, home_suite_json) =
+            encode_named_groups_store_excluding_pending_stubs(state, groups, Some(group_id))
+                .map_err(|e| anyhow::anyhow!("named groups encode for journal: {e}"))?;
         // The LEGACY journal carries the legacy half (its postcard shape
         // is the downgrade-safe replay carrier — old binaries decode and
         // replay exactly this); the separate `.hsjournal` carries the
@@ -6142,7 +6291,6 @@ async fn prepare_rebind_journal_locked(state: &AppState, group_id: &str) -> Rebi
         // written, so a legacy journal on disk always has its sidecar
         // journal already durable.
         let tx = {
-            let groups = state.named_groups.read().await;
             groups
                 .get(group_id)
                 .map(|record| HomeSuiteJournalTx {
@@ -6262,11 +6410,8 @@ async fn discard_rebind_journal(state: &AppState, group_id: &str) {
 async fn rebind_envelope_for(
     state: &AppState,
     group_id: &str,
+    info: Option<&x0x::groups::GroupInfo>,
 ) -> std::result::Result<Option<Vec<u8>>, anyhow::Error> {
-    let info = {
-        let groups = state.named_groups.read().await;
-        groups.get(group_id).cloned()
-    };
     let Some(info) = info else {
         return Ok(None);
     };
@@ -6295,7 +6440,7 @@ async fn rebind_envelope_for(
                 "TreeKEM group mutex contended after retries"
             ));
         };
-        let envelope = encode_treekem_snapshot_envelope(&info, &guard)?;
+        let envelope = encode_treekem_snapshot_envelope(info, &guard)?;
         return Ok(Some(envelope));
     }
     // Arm 2: repair from disk — only a metadata-only divergence qualifies.
@@ -11400,6 +11545,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     }
                 }
             };
+            let mut mandate_cleared_quarantine = false;
             // ADR-0064 slice 2 + 3: owner-mandate enforcement on the
             // owner axis (both the gapless apply and the across-gap
             // adoption land here with `next` holding the seated roster).
@@ -11497,16 +11643,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                                 }) {
                                     next.fork_quarantine = None;
                                     next.reset_fork_evidence_after_quarantine_clear();
-                                    state
-                                        .groups_diagnostics
-                                        .record_fork_quarantine_owner_anchored_clear(
-                                            &resolved_group_key,
-                                        );
-                                    tracing::info!(
-                                        group_id = %LogHexId::group(&resolved_group_key),
-                                        revision = commit.revision,
-                                        "ADR-0064: mandate-carrying MemberAdded cleared the fork quarantine (owner-anchored commit)"
-                                    );
+                                    mandate_cleared_quarantine = true;
                                 }
                                 // #759 item 1: this clear (and the tier-1
                                 // adoption's) does NOT resume task ingest
@@ -11819,6 +11956,16 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 Ok(AtomicWriteOutcome::Durable)
             ) {
                 return ApplyMetadataResult::REJECTED;
+            }
+            if mandate_cleared_quarantine {
+                state
+                    .groups_diagnostics
+                    .record_fork_quarantine_owner_anchored_clear(&resolved_group_key);
+                tracing::info!(
+                    group_id = %LogHexId::group(&resolved_group_key),
+                    revision = commit.revision,
+                    "ADR-0064: mandate-carrying MemberAdded cleared the fork quarantine (owner-anchored commit)"
+                );
             }
             // #759 item 1: a Some→None fork-quarantine transition here is
             // an owner-anchored clear (the mandate-valid arm above, or the
@@ -21191,8 +21338,8 @@ async fn owner_certified_seal_with_eviction(
                     // failed/non-durable persist could not roll it back),
                     // and the outcome is surfaced exactly like the
                     // all-clean arm instead of swallowed with `.ok()`:
-                    // non-durable → 503 with memory and disk still
-                    // quarantined.
+                    // non-durable → 503; ReplacedNotDurable keeps the
+                    // cleared candidate visible but withholds success.
                     let owner_user_key = state.agent.identity().user_keypair();
                     let clear_key = id.to_string();
                     // #759 item 1: the durable-clear notification for this
@@ -21205,32 +21352,41 @@ async fn owner_certified_seal_with_eviction(
                     // guard: the drain takes `TaskList` write then
                     // `named_groups` read, which this guard forbids.
                     let mut fork_marker_cleared = false;
-                    let persist_outcome = persist_named_groups_mutation(state, |groups| {
-                        // ADR0066-LOOKUP-WAIVER: `clear_key` mirrors the id `seal_group_state` resolved the record with;
-                        // a miss leaves the marker set on disk AND in memory, so it fails closed.
-                        if let Some(info) = groups.get_mut(&clear_key) {
-                            info.owner_cert_reverify_required = false;
-                            let had_marker = info.fork_quarantine.is_some();
-                            // ADR-0064 slice 4 (slice-1 review non-blocking
-                            // (1)): the EVICTION arm of the explicit seal
-                            // route clears the fork marker under the SAME
-                            // fence as the all-clean arm — the local
-                            // install holds the owner USER key (#469 A1b
-                            // fence) and the sealed revision (bumped by
-                            // the eviction seals) is strictly greater
-                            // than the evidenced one.
-                            info.clear_fork_quarantine_on_explicit_owner_seal(owner_user_key);
-                            fork_marker_cleared = had_marker && info.fork_quarantine.is_none();
-                        }
-                        true
-                    })
-                    .await;
+                    let persist_outcome =
+                        persist_named_groups_quarantine_clear_gated(state, |groups| {
+                            // ADR0066-LOOKUP-WAIVER: `clear_key` mirrors the id `seal_group_state` resolved the record with;
+                            // a miss leaves the marker set on disk AND in memory, so it fails closed.
+                            if let Some(info) = groups.get_mut(&clear_key) {
+                                info.owner_cert_reverify_required = false;
+                                let had_marker = info.fork_quarantine.is_some();
+                                // ADR-0064 slice 4 (slice-1 review non-blocking
+                                // (1)): the EVICTION arm of the explicit seal
+                                // route clears the fork marker under the SAME
+                                // fence as the all-clean arm — the local
+                                // install holds the owner USER key (#469 A1b
+                                // fence) and the sealed revision (bumped by
+                                // the eviction seals) is strictly greater
+                                // than the evidenced one.
+                                info.clear_fork_quarantine_on_explicit_owner_seal(owner_user_key);
+                                fork_marker_cleared = had_marker && info.fork_quarantine.is_none();
+                            }
+                            true
+                        })
+                        .await;
                     if !matches!(persist_outcome, Ok(AtomicWriteOutcome::Durable)) {
-                        tracing::warn!(
-                            group_id = %id,
-                            ?persist_outcome,
-                            "ADR-0064/ADR-0038: eviction-arm reverify-flag/fork-marker clear was not directory-durable — marker kept, refusing"
-                        );
+                        if matches!(persist_outcome, Ok(AtomicWriteOutcome::ReplacedNotDurable)) {
+                            tracing::warn!(
+                                group_id = %id,
+                                ?persist_outcome,
+                                "ADR-0064/ADR-0038: eviction-arm reverify-flag/fork-marker clear was replaced but not directory-durable — cleared candidate visible, refusing"
+                            );
+                        } else {
+                            tracing::warn!(
+                                group_id = %id,
+                                ?persist_outcome,
+                                "ADR-0064/ADR-0038: eviction-arm reverify-flag/fork-marker clear failed — marker kept, refusing"
+                            );
+                        }
                         return Some(Err(api_error(
                             StatusCode::SERVICE_UNAVAILABLE,
                             "named-group state is not directory-durable",
@@ -32928,8 +33084,9 @@ async fn save_named_groups_store_checked(
             state
                 .named_groups_requires_durability_confirmation
                 .store(false, Ordering::Release);
-            // #477 (r9 item 1): the on-disk view now matches the live map
-            // — every in-flight install marker is obsolete.
+            // #477 (r9 item 1): the supplied store view is now durable
+            // (a gated clear may still have to publish its private candidate),
+            // so every in-flight install marker is obsolete.
             clear_join_install_pending_markers(&state.named_groups_path).await;
         }
         Ok(AtomicWriteOutcome::ReplacedNotDurable) => state
