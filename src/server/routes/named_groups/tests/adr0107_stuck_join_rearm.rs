@@ -2879,7 +2879,6 @@ async fn s8a_r4_copied_join_result_blob_expires_with_the_original() -> anyhow::R
 /// fair. Duplicate and bogus FetchRequests aimed at ONE group whose lock is
 /// held must not use up the slots another group's legitimate fetch needs.
 #[tokio::test]
-#[ignore = "WIP #1150 r4: Welcome fetch admission (validate, coalesce, per-group fairness) is not implemented yet; see docs/design/join-artifact-serving-lifecycle.md (gaps)"]
 async fn s8a_r4_welcome_fetch_admission_is_fair_across_groups() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let s = build(dir.path()).await?;
@@ -2948,24 +2947,13 @@ async fn s8a_r4_welcome_fetch_admission_is_fair_across_groups() -> anyhow::Resul
         },
     )
     .await;
-    let admitted = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if s.authority
-                .pending_welcome_streams
-                .lock()
-                .await
-                .as_ref()
-                .is_some_and(|streams| streams.contains_key(&other_welcome))
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
+    // The other group's fetch streams its Welcome (r5 G9: a finished
+    // stream leaves the stream map, so observe the transport witness).
+    let j1_hex = hex_of(&s.j1);
+    let admitted = transport_seen(&s.authority, &j1_hex, "welcome_frame").await;
     drop(held);
     assert!(
-        admitted.is_ok(),
+        admitted,
         "another group's legitimate Welcome fetch was starved by one locked group's flood"
     );
     Ok(())
