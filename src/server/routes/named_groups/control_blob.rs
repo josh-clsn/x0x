@@ -847,6 +847,7 @@ pub(in crate::server) async fn handle_control_blob_message(
                     state,
                     &group_id,
                     &member_hex,
+                    "join_result_chunk",
                     deadline,
                     async move {
                         let _ticket = ticket;

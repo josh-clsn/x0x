@@ -1916,8 +1916,8 @@ fn build_secure_share_event(
 /// design exists to close.
 #[allow(clippy::too_many_arguments)]
 async fn publish_secure_share(
-    state: &AppState,
-    metadata_topic: &str,
+    state: &Arc<AppState>,
+    _metadata_topic: &str,
     group_id: &str,
     recipient_hex: &str,
     recipient_kem_public_b64: &str,
@@ -1949,13 +1949,253 @@ async fn publish_secure_share(
             return false;
         }
     };
-    publish_named_group_metadata_event(state, metadata_topic, &event).await;
-    spawn_named_group_event_delivery(state, recipient_hex, &event);
-    spawn_named_group_event_delivery_after(
+    spawn_secure_share_delivery(state, &event)
+}
+
+/// ADR 0107 / D60 (r5, G11): how long a class-K share delivery may stay
+/// pending (withheld) before it is dropped.
+const SECURE_SHARE_DELIVERY_HORIZON: Duration = PENDING_JOIN_RESULT_TTL;
+
+/// ADR 0107 / D60 (r5, G11): admitted sends per share (the first and the
+/// [`GROUP_BACKGROUND_PUBLISH_DELAY`] resend), each admitted afresh.
+const SECURE_SHARE_SENDS: usize = 2;
+
+/// ADR 0107 / D60 (r5, G11): how soon a withheld share delivery re-checks.
+const SECURE_SHARE_WITHHELD_RETRY: Duration = Duration::from_secs(15);
+
+/// ADR 0107 / D60 (r5, G11): the retry backoff after a share write that
+/// failed in transport (no gossip fallback, so an unreachable recipient is
+/// retried, admitted afresh each time, until the horizon).
+const SECURE_SHARE_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(120);
+
+/// ADR 0107 / D60 (r5, G11): what a class-K share delivery may do now.
+enum SecureShareDeliveryVerdict {
+    Deliver,
+    /// The condition can still clear (quarantine, a non-Clean verdict, a
+    /// missing certificate, contention): keep the share pending.
+    Withhold(&'static str),
+    /// It cannot (removed, banned, agent revoked, certificate invalid,
+    /// group withdrawn or gone, or the epoch moved on): drop the share.
+    Purge(&'static str),
+}
+
+/// ADR 0107 / D60: the share's epoch is the group's CURRENT secret epoch
+/// and this node still holds that secret.
+fn secure_share_epoch_current(info: &x0x::groups::GroupInfo, secret_epoch: u64) -> bool {
+    info.secret_epoch == secret_epoch && info.shared_secret.is_some()
+}
+
+/// ADR 0107 / D60 (r5, G11): the epoch-bound share admission verdict,
+/// under the group's membership lock: the recipient's CURRENT eligibility
+/// (the serving guard: withdrawn, quarantine, ban, agent revocation, Active
+/// seat, certificate and roster verdict) and the CURRENT secret epoch.
+async fn secure_share_delivery_verdict(
+    state: &AppState,
+    group_id: &str,
+    recipient_hex: &str,
+    secret_epoch: u64,
+) -> SecureShareDeliveryVerdict {
+    let Some(lock) = group_membership_lock_for_known_group(state, group_id).await else {
+        return SecureShareDeliveryVerdict::Purge("group_unknown");
+    };
+    let _membership_guard = lock.lock().await;
+    if let Err(refusal) = join_artifact_serving_check(state, group_id, recipient_hex).await {
+        return if refusal.is_definitive() || refusal == JoinArtifactRefusal::UnknownGroup {
+            SecureShareDeliveryVerdict::Purge(refusal.reason())
+        } else {
+            SecureShareDeliveryVerdict::Withhold(refusal.reason())
+        };
+    }
+    let current = {
+        let roster = state.named_groups.read().await;
+        crate::server::resolve_group_entry_locked(&roster, group_id)
+            .is_some_and(|(_, info)| secure_share_epoch_current(info, secret_epoch))
+    };
+    if current {
+        SecureShareDeliveryVerdict::Deliver
+    } else {
+        SecureShareDeliveryVerdict::Purge("secret_epoch_moved")
+    }
+}
+
+/// ADR 0107 / D60 (r5, G11): the epoch-bound admission of one class-K
+/// share write. Pre-phase: under the group's membership lock, the serving
+/// guard (keeping its evidence) and the current epoch. Seam: the same,
+/// synchronously. Unlike the join-result admission it needs no staged
+/// original: survivor and approval shares have none.
+fn secure_share_admission(
+    state: &Arc<AppState>,
+    group_id: &str,
+    recipient_hex: &str,
+    secret_epoch: u64,
+) -> x0x::dm::ArtifactAdmission {
+    let state = Arc::clone(state);
+    let group_id = group_id.to_string();
+    let recipient_hex = recipient_hex.to_string();
+    join_artifact_admission(move || {
+        let state = Arc::clone(&state);
+        let group_id = group_id.clone();
+        let recipient_hex = recipient_hex.clone();
+        async move {
+            let lock = group_membership_lock_for_known_group(&state, &group_id).await?;
+            let evidence = {
+                let _membership_guard = lock.lock().await;
+                let evidence = join_artifact_serving_check(&state, &group_id, &recipient_hex)
+                    .await
+                    .ok()?;
+                let current = {
+                    let roster = state.named_groups.read().await;
+                    crate::server::resolve_group_entry_locked(&roster, &group_id)
+                        .is_some_and(|(_, info)| secure_share_epoch_current(info, secret_epoch))
+                };
+                if !current {
+                    return None;
+                }
+                evidence
+            };
+            let seam: x0x::dm::SeamAdmission = Box::new(move || {
+                join_artifact_seam_refusal(&state, &group_id, &recipient_hex, evidence.as_ref())
+                    .is_none()
+                    && state.named_groups.try_read().is_ok_and(|roster| {
+                        crate::server::resolve_group_entry_locked(&roster, &group_id)
+                            .is_some_and(|(_, info)| secure_share_epoch_current(info, secret_epoch))
+                    })
+            });
+            Some(seam)
+        }
+    })
+}
+
+/// ADR 0107 / D60 (r5, G11): deliver one class-K share
+/// (`SecureShareDelivered`) in a registered egress task. There is no gossip
+/// publish: a published share leaves x0x's control (detached stranded
+/// retry, other peers' caches). Each of the [`SECURE_SHARE_SENDS`] writes
+/// goes through the single-admission transport after a fresh
+/// [`secure_share_delivery_verdict`]: a withheld share stays pending and
+/// re-checks every [`SECURE_SHARE_WITHHELD_RETRY`] until
+/// [`SECURE_SHARE_DELIVERY_HORIZON`]; a purge ends the delivery. A removal,
+/// ban or terminal mutation quiesces it with the recipient's other egress.
+/// Returns whether a delivery was scheduled.
+fn spawn_secure_share_delivery(state: &Arc<AppState>, event: &NamedGroupMetadataEvent) -> bool {
+    let NamedGroupMetadataEvent::SecureShareDelivered {
+        group_id,
+        recipient,
+        secret_epoch,
+        ..
+    } = event
+    else {
+        return false;
+    };
+    let Ok(recipient_id) = parse_agent_id_hex(recipient) else {
+        tracing::warn!(recipient = %LogHexId::agent(recipient), "secure share for an invalid recipient id");
+        return false;
+    };
+    let payload = match serde_json::to_vec(event) {
+        Ok(payload) if payload.len() <= x0x::dm::MAX_PAYLOAD_BYTES => payload,
+        Ok(_) => {
+            tracing::warn!(group_id = %LogHexId::group(group_id), "secure share exceeds the direct-message limit");
+            return false;
+        }
+        Err(e) => {
+            tracing::warn!("failed to serialize a secure share: {e}");
+            return false;
+        }
+    };
+    #[cfg(test)]
+    if let Ok(mut scheduled) = state
+        .named_group_test_recorders
+        .secure_share_scheduled
+        .lock()
+    {
+        scheduled.push((group_id.clone(), recipient.clone(), payload.clone()));
+    }
+    let task_state = Arc::clone(state);
+    let group = group_id.clone();
+    let recipient_hex = recipient.clone();
+    let epoch = *secret_epoch;
+    let deadline = Instant::now() + SECURE_SHARE_DELIVERY_HORIZON;
+    spawn_join_artifact_egress(
         state,
-        recipient_hex,
-        &event,
-        GROUP_BACKGROUND_PUBLISH_DELAY,
+        group_id,
+        recipient,
+        "secure_share",
+        deadline,
+        async move {
+            let mut sent = 0usize;
+            let mut backoff = GROUP_BACKGROUND_PUBLISH_DELAY;
+            while sent < SECURE_SHARE_SENDS {
+                match secure_share_delivery_verdict(&task_state, &group, &recipient_hex, epoch)
+                    .await
+                {
+                    SecureShareDeliveryVerdict::Deliver => {}
+                    SecureShareDeliveryVerdict::Withhold(reason) => {
+                        tracing::debug!(group_id = %LogHexId::group(&group), recipient = %LogHexId::agent(&recipient_hex), reason, "D60: secure share withheld; re-checking later");
+                        tokio::time::sleep(SECURE_SHARE_WITHHELD_RETRY).await;
+                        continue;
+                    }
+                    SecureShareDeliveryVerdict::Purge(reason) => {
+                        tracing::debug!(group_id = %LogHexId::group(&group), recipient = %LogHexId::agent(&recipient_hex), reason, "D60: secure share purged");
+                        return;
+                    }
+                }
+                let admission = secure_share_admission(&task_state, &group, &recipient_hex, epoch);
+                let outcome = send_join_artifact(
+                    &task_state,
+                    &recipient_id,
+                    &payload,
+                    &group,
+                    "secure_share",
+                    admission,
+                    deadline,
+                )
+                .await;
+                let written = match &outcome {
+                    Ok(()) => true,
+                    // The in-process stand-in reports an admitted exchange with
+                    // its marker error (test builds only).
+                    #[cfg(test)]
+                    Err(reason) if reason.contains(x0x::dm::PINNED_STANDIN_ADMITTED) => true,
+                    Err(_) => false,
+                };
+                if written {
+                    sent += 1;
+                    backoff = GROUP_BACKGROUND_PUBLISH_DELAY;
+                    if sent < SECURE_SHARE_SENDS {
+                        tokio::time::sleep(GROUP_BACKGROUND_PUBLISH_DELAY).await;
+                    }
+                    continue;
+                }
+                match outcome {
+                    Err(reason) if reason.contains(x0x::dm::PINNED_ADMISSION_REFUSED) => {
+                        // An invalidation landed between the verdict and the
+                        // write. Classify it now: a purge ends the delivery;
+                        // anything else (including a seam-only refusal such as a
+                        // revoked machine binding) withholds it.
+                        if let SecureShareDeliveryVerdict::Purge(reason) =
+                            secure_share_delivery_verdict(
+                                &task_state,
+                                &group,
+                                &recipient_hex,
+                                epoch,
+                            )
+                            .await
+                        {
+                            tracing::debug!(group_id = %LogHexId::group(&group), recipient = %LogHexId::agent(&recipient_hex), reason, "D60: secure share purged");
+                            return;
+                        }
+                        tokio::time::sleep(SECURE_SHARE_WITHHELD_RETRY).await;
+                    }
+                    Err(reason) => {
+                        // A transport failure: retry with backoff (each retry is
+                        // admitted afresh) until the horizon.
+                        tracing::debug!(group_id = %LogHexId::group(&group), recipient = %LogHexId::agent(&recipient_hex), "secure share write failed; retrying: {reason}");
+                        tokio::time::sleep(backoff).await;
+                        backoff = std::cmp::min(backoff * 2, SECURE_SHARE_RETRY_BACKOFF_MAX);
+                    }
+                    Ok(()) => {}
+                }
+            }
+        },
     );
     true
 }
@@ -20146,15 +20386,10 @@ pub(in crate::server) async fn remove_named_group_member(
     ); // F1 §5a step 5: publish the buffered survivor envelopes only after the
        // removal is live and persisted. Each is broadcast on the metadata topic
        // plus direct + delayed delivery, mirroring publish_secure_share's shape.
-    for (recipient_hex, ev) in &buffered_survivor_envelopes {
-        publish_named_group_metadata_event(&state, &metadata_topic, ev).await;
-        spawn_named_group_event_delivery(&state, recipient_hex, ev);
-        spawn_named_group_event_delivery_after(
-            &state,
-            recipient_hex,
-            ev,
-            GROUP_BACKGROUND_PUBLISH_DELAY,
-        );
+       // D60 (r5, G11): each survivor share is a class-K delivery with a
+       // fresh epoch-bound admission per write; never a gossip publish.
+    for (_recipient_hex, ev) in &buffered_survivor_envelopes {
+        spawn_secure_share_delivery(&state, ev);
     }
     maybe_publish_group_card_after_state_change(&state, &id).await;
     (
@@ -22059,15 +22294,10 @@ async fn owner_certified_seal_with_eviction(
                 std::slice::from_ref(&evict_hex),
             );
         }
-        for (recipient_hex, ev) in &buffered_envelopes {
-            publish_named_group_metadata_event(state, &metadata_topic, ev).await;
-            spawn_named_group_event_delivery(state, recipient_hex, ev);
-            spawn_named_group_event_delivery_after(
-                state,
-                recipient_hex,
-                ev,
-                GROUP_BACKGROUND_PUBLISH_DELAY,
-            );
+        // D60 (r5, G11): each survivor share is a class-K delivery with a
+        // fresh epoch-bound admission per write; never a gossip publish.
+        for (_recipient_hex, ev) in &buffered_envelopes {
+            spawn_secure_share_delivery(state, ev);
         }
         evicted_total.push(evict_hex.clone());
         last_commit = Some(commit);
@@ -35770,6 +36000,7 @@ fn spawn_join_artifact_egress<F>(
     state: &Arc<AppState>,
     group_id: &str,
     recipient: &str,
+    kind: &'static str,
     deadline: Instant,
     body: F,
 ) where
@@ -35786,6 +36017,7 @@ fn spawn_join_artifact_egress<F>(
             let _cleanup = JoinArtifactEgressCleanup {
                 state: cleanup_state,
                 key: registry_key,
+                kind,
                 task: tokio::task::try_id(),
             };
             // r5 (lifecycle note section 2.7 item 6): no egress task
@@ -35816,15 +36048,24 @@ fn spawn_join_artifact_egress<F>(
 struct JoinArtifactEgressCleanup {
     state: Arc<AppState>,
     key: (String, String),
+    /// What the task egresses (`join_result`, `join_result_stage`,
+    /// `join_result_chunk`, `secure_share`), for diagnostics.
+    kind: &'static str,
     task: Option<tokio::task::Id>,
 }
 
 impl Drop for JoinArtifactEgressCleanup {
     fn drop(&mut self) {
+        tracing::trace!(
+            group_id = %LogHexId::group(&self.key.0),
+            recipient = %LogHexId::agent(&self.key.1),
+            kind = self.kind,
+            "join-artifact egress task ended"
+        );
         #[cfg(test)]
         record_join_artifact_lifecycle(
             &self.state,
-            format!("egress_ended:{}:{}", self.key.0, self.key.1),
+            format!("egress_ended:{}:{}:{}", self.key.0, self.key.1, self.kind),
         );
         let mut registry = self
             .state
@@ -36910,6 +37151,7 @@ async fn handle_join_result_message_bound(
                     state,
                     &group_id,
                     &member_agent_id,
+                    "join_result_stage",
                     artifact_deadline,
                     async move {
                         let staging_slot = staging_slot;
@@ -36990,6 +37232,7 @@ async fn handle_join_result_message_bound(
                 state,
                 &group_id,
                 &member_agent_id,
+                "join_result",
                 artifact_deadline,
                 async move {
                     if !join_result_still_servable(
@@ -47423,6 +47666,12 @@ pub(in crate::server) mod tests {
             .lock()
             .expect("publish-attempt recorder poisoned")
             .clear();
+        state
+            .named_group_test_recorders
+            .secure_share_scheduled
+            .lock()
+            .expect("secure-share recorder poisoned")
+            .clear();
 
         let (status, body) = response_json(
             remove_named_group_member(
@@ -47460,17 +47709,17 @@ pub(in crate::server) mod tests {
         // Core 4c observation: the published recipient set. The recorder now
         // carries `SecureShareDelivered.recipient` alongside topic+group, so
         // the assertion is on the recipient set, not a publish count.
+        // D60 (#1150 r5, G11): survivor envelopes are class-K deliveries
+        // (admitted per write), never gossip publishes.
+        let _ = &metadata_topic;
         let published_recipients: Vec<String> = state
             .named_group_test_recorders
-            .publish_attempts
+            .secure_share_scheduled
             .lock()
-            .expect("publish-attempt recorder poisoned")
+            .expect("secure-share recorder poisoned")
             .iter()
-            .filter_map(|(topic, gid, recipient)| {
-                (topic == &metadata_topic && gid == &stable_group_id)
-                    .then(|| recipient.clone())
-                    .flatten()
-            })
+            .filter(|(gid, _, _)| gid == &stable_group_id)
+            .map(|(_, recipient, _)| recipient.clone())
             .collect();
 
         assert!(
@@ -56488,16 +56737,18 @@ pub(in crate::server) mod tests {
         }
 
         async fn secure_share_publishes_to_joiner(&self) -> bool {
+            // D60 (#1150 r5, G11): a share is a class-K delivery to its
+            // recipient (admitted per write), never a gossip publish.
             let joiner_hex = self.joiner_hex();
-            let attempts = self
+            let scheduled = self
                 .state
                 .named_group_test_recorders
-                .publish_attempts
+                .secure_share_scheduled
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            attempts.iter().any(|(_topic, _group, recipient)| {
-                recipient.as_deref() == Some(joiner_hex.as_str())
-            })
+            scheduled
+                .iter()
+                .any(|(_group, recipient, _payload)| *recipient == joiner_hex)
         }
     }
 

@@ -1809,19 +1809,16 @@ fn published_secure_share(
     authority: &AppState,
     recipient: &str,
 ) -> Option<NamedGroupMetadataEvent> {
+    // D60 (r5, G11): a share is a class-K delivery to its recipient, never a
+    // gossip publish; read the scheduled delivery's exact payload.
     authority
         .named_group_test_recorders
-        .publish_bytes
+        .secure_share_scheduled
         .lock()
-        .expect("publish witness")
+        .expect("secure-share witness")
         .iter()
-        .filter_map(|(_, bytes)| serde_json::from_slice::<NamedGroupMetadataEvent>(bytes).ok())
-        .find(|event| {
-            matches!(
-                event,
-                NamedGroupMetadataEvent::SecureShareDelivered { recipient: to, .. } if to == recipient
-            )
-        })
+        .filter(|(_, to, _)| to == recipient)
+        .find_map(|(_, _, bytes)| serde_json::from_slice::<NamedGroupMetadataEvent>(bytes).ok())
 }
 
 /// WHY (ADR 0107 serving non-regression, GSS): GSS-plane first joins are
@@ -3010,7 +3007,9 @@ async fn s8a_r4_finished_egress_tasks_leave_the_registry() -> anyhow::Result<()>
             .is_some()
     );
     let key = (g.stable.clone(), g_hex.clone());
-    let finished = tokio::time::timeout(Duration::from_secs(10), async {
+    // The GSS fixture's class-K share deliveries (two writes, 8 s apart)
+    // share this key.
+    let finished = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let done = g
                 .authority
@@ -3234,7 +3233,12 @@ async fn s8a_r5_deadline_cuts_stalled_exchanges() -> anyhow::Result<()> {
         let _ = serve_result(&g.authority, &g.joiner, &g.stable, &g.attempt, from).await;
         wait_reached(&armed.gate, "inline result").await;
         tokio::time::sleep(Duration::from_millis(2500)).await;
-        if !all_finished(&g.authority, &(g.stable.clone(), g_hex.clone())) {
+        // The GSS fixture's class-K share deliveries share this registry
+        // key; check the inline-result task itself.
+        if !lifecycle_of(&g.authority)
+            .iter()
+            .any(|e| *e == format!("egress_ended:{}:{}:join_result", g.stable, g_hex))
+        {
             outlived.push("inline join result");
         }
         drop(armed);
@@ -3487,7 +3491,7 @@ async fn s8a_r5_g4_withdrawal_quiesces_all_group_egress_before_its_commit() -> a
         .expect("the withdrawal committed its tombstone");
     let chunk_ended = events
         .iter()
-        .position(|e| *e == format!("egress_ended:{}:{}", s.stable, j2_hex));
+        .position(|e| *e == format!("egress_ended:{}:{}:join_result_chunk", s.stable, j2_hex));
     let stream_ended = events
         .iter()
         .position(|e| *e == format!("welcome_stream_ended:{welcome_id}"));
@@ -3542,7 +3546,7 @@ async fn s8a_r5_g5_local_drop_quiesces_and_purges_the_groups_join_artifacts() ->
     let mut left = Vec::new();
     if !lifecycle_of(&s.authority)
         .iter()
-        .any(|e| *e == format!("egress_ended:{}:{}", s.stable, j2_hex))
+        .any(|e| *e == format!("egress_ended:{}:{}:join_result_chunk", s.stable, j2_hex))
     {
         left.push("a registered chunk egress kept running");
     }

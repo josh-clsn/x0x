@@ -7778,16 +7778,34 @@ impl Agent {
                 dm::PINNED_ADMISSION_REFUSED.to_string(),
             ));
         };
-        let seam = self.pinned_admission_seam(*to, target.machine_id, seam);
-        network
+        // A refusal AT THE SEAM is reported as an admission refusal (a
+        // retryable withhold for the caller), not as a transport failure.
+        let refused_at_seam = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seam = {
+            let refused_at_seam = std::sync::Arc::clone(&refused_at_seam);
+            let checks = self.pinned_admission_seam(*to, target.machine_id, seam);
+            move || {
+                let admitted = checks();
+                if !admitted {
+                    refused_at_seam.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                admitted
+            }
+        };
+        let sent = network
             .send_direct_pinned(
                 &target.ant_peer_id,
                 &self.identity.agent_id().0,
                 payload,
                 seam,
             )
-            .await
-            .map_err(Self::map_raw_quic_dm_error)?;
+            .await;
+        if refused_at_seam.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(dm::DmError::NoConnectivity(
+                dm::PINNED_ADMISSION_REFUSED.to_string(),
+            ));
+        }
+        sent.map_err(Self::map_raw_quic_dm_error)?;
         tracing::debug!(
             target: "dm.trace",
             stage = "pinned_exchange_written",
