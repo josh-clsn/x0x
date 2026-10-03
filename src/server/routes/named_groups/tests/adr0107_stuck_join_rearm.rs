@@ -2983,7 +2983,6 @@ async fn s8a_r4_welcome_fetch_admission_is_fair_across_groups() -> anyhow::Resul
 /// its per-recipient staging guard itself (RAII), not only on a later
 /// acquire.
 #[tokio::test]
-#[ignore = "WIP #1150 r4: RAII staging-guard release is not implemented yet; see docs/design/join-artifact-serving-lifecycle.md (gaps)"]
 async fn s8a_r4_aborted_staging_releases_its_staging_guard() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let s = build(dir.path()).await?;
@@ -3020,7 +3019,6 @@ async fn s8a_r4_aborted_staging_releases_its_staging_guard() -> anyhow::Result<(
 /// WHY (review r2 registry hygiene): a finished egress task leaves the
 /// egress registry when it completes, not only when a later egress spawns.
 #[tokio::test]
-#[ignore = "WIP #1150 r4: egress-registry prune on completion is not implemented yet; see docs/design/join-artifact-serving-lifecycle.md (gaps)"]
 async fn s8a_r4_finished_egress_tasks_leave_the_registry() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let g = build_gss(dir.path(), false).await?;
@@ -3378,6 +3376,87 @@ async fn s8a_r5_g14_recovery_response_sends_record_dm_metrics() -> anyhow::Resul
     assert!(
         recorded.is_ok(),
         "the class-R send was not recorded in the DM metrics"
+    );
+    Ok(())
+}
+
+/// WHY (note r3 G9): a Welcome stream that ends on its own (here: its
+/// chunk send fails in process) leaves `pending_welcome_streams` itself,
+/// not only when a later fetch, stop or wipe replaces it.
+#[tokio::test]
+async fn s8a_r5_g9_finished_welcome_stream_leaves_its_handle() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    let welcome_id = welcome_id_of(&s.j2_add).expect("welcome ref");
+    assert!(serve_welcome(&s.authority, &s.j2, &s.stable, &welcome_id).await);
+    let gone = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let present = s
+                .authority
+                .pending_welcome_streams
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|streams| streams.contains_key(&welcome_id));
+            if !present {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        gone.is_ok(),
+        "a finished Welcome stream left its handle behind"
+    );
+    Ok(())
+}
+
+/// WHY (note r3 G9): a Welcome stream that panics releases its ACK slot and
+/// its stream handle, generation-safely, and the panic is reported.
+#[tokio::test]
+async fn s8a_r5_g9_panicking_welcome_stream_releases_its_bookkeeping() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    let welcome_id = welcome_id_of(&s.j2_add).expect("welcome ref");
+    super::super::handle_welcome_fetch_request_via(
+        &s.authority,
+        &s.j2.agent.agent_id(),
+        s.stable.clone(),
+        welcome_id.clone(),
+        |msg: WelcomeBlobMessage| async move {
+            if matches!(msg, WelcomeBlobMessage::Chunk { .. }) {
+                panic!("injected Welcome transport panic");
+            }
+            Ok(())
+        },
+    )
+    .await;
+    let released = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let stream = s
+                .authority
+                .pending_welcome_streams
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|streams| streams.contains_key(&welcome_id));
+            let ack = s
+                .authority
+                .pending_welcome_acks
+                .read()
+                .await
+                .contains_key(&welcome_id);
+            if !stream && !ack {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        released.is_ok(),
+        "a panicking Welcome stream left its ACK slot or stream handle behind"
     );
     Ok(())
 }
