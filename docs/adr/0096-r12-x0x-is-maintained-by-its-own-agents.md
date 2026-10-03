@@ -7,7 +7,7 @@
 - **Decision owners:** David Irvine (ruling D20; only David marks this ADR
   Accepted)
 - **Author:** Claude (Opus)
-- **Reviewers:** TBD (a Codex cross-model review follows)
+- **Reviewers:** Codex (cross-model r1)
 - **Supersedes:** none
 - **Superseded by:** none
 - **Extends:** [ADR 0072](./0072-scope-freeze-deferred-and-legacy-maintenance.md)
@@ -29,7 +29,7 @@
 
 - ADR 0072's requirement list (R1–R11) has no requirement for goal M. So a
   new goal M feature has no requirement to name under ADR 0072 rule 5. Only
-  fixes to shipped behaviour are admissible today.
+  correctness and security fixes to shipped behaviour are admissible today.
 - Today, keeping x0x healthy and current needs humans. Every enabled node
   applies a signed release when it first sees it (ADR 0045). There is no
   owner update policy, no rings across an owner's machines and no recall.
@@ -79,9 +79,10 @@ checks, upgrade, hold, rollback, recall and problem reports.
 
 ### 2. ADR 0072 extended
 
-- ADR 0072's requirement table gains R12. Rule 5 accepts R1–R12, and goal E
-  per ADR 0095.
-- ADR 0072 rule 6 (lifting a freeze) is unchanged.
+- ADR 0072's requirement table gains R12. Rule 5 accepts R1–R12.
+- Nothing else in ADR 0072 changes. Rule 5's exception for correctness and
+  security fixes to shipped behaviour, and rule 6 (lifting a freeze), stay
+  as written.
 
 ### 3. Who decides what
 
@@ -91,10 +92,14 @@ checks, upgrade, hold, rollback, recall and problem reports.
 - **The owner's agents** act within that policy. They read health, apply,
   hold, roll back, report problems, and help other agents install or
   upgrade.
-- **The release-key holders** sign releases and recalls. An agent never
-  signs a release. ADR 0087 and D05 govern release custody.
-- **The daemon** enforces safety with no agent present: it verifies before
-  apply, gates rings and rolls back a failed boot by itself (M2).
+- **Release signing does not move.** Deployed maintenance agents gain no
+  release-signing authority. Protected release-workflow operations stay
+  under David's authorization (ADR 0087, D05, D47). Future signing custody
+  is left to the decision that ADR 0087 requires before M4.
+- **The daemon** keeps apply safety with no agent present (M2, ADR 0094):
+  it verifies before apply, probes the new binary before the swap, checks
+  health at boot and rolls back a failed boot by itself. Ring and canary
+  enforcement belong to M4 and ADR 0097, not to M2.
 
 ### 4. The agent surface
 
@@ -103,8 +108,8 @@ checks, upgrade, hold, rollback, recall and problem reports.
 - x0x provides this surface. It does not ship an AI agent.
 - Maintenance data goes to the owner's own devices. Reports to the
   maintainers are opt-in and redacted.
-- Maintenance traffic follows the efficiency rules (E-D15). A new
-  every-node topic needs an ADR that names goal E and states its byte cost.
+- Maintenance work applies the E-D15 efficiency checklist, like every PR
+  and ADR.
 
 ### 5. What R12 gates
 
@@ -125,12 +130,16 @@ These items need R12, and each needs an ADR that names it:
 ### 6. What R12 does not gate
 
 - **M1 health truth** (a `/health` verdict, a census, `x0x doctor --json`)
-  and **M2 safe apply** (supervised readiness and self-rollback, one binary
-  writer per host, StagedRollout wired or deleted) fix shipped behaviour
-  (D21).
-- They proceed now under ADR 0072 rule 5's fix exception, through
-  ADR 0094 (prov.), which supersedes ADR 0061 §6. They may cite R12 as the
-  goal they support. They do not wait for this ADR.
+  and **M2 safe apply** fix shipped behaviour (D21).
+- M2 stays within ADR 0094's safety scope: a pre-swap exec probe, a boot
+  health check, self-rollback, a channel field, StagedRollout wired up or
+  deleted, and a CLI companion rollback. It adds no owner policy, rings or
+  canary.
+- M1 and M2 proceed now through ADR 0094 (prov.), which supersedes
+  ADR 0061 §6, as correctness and security fixes under ADR 0072 rule 5.
+  They may cite R12 as the goal they support. They do not wait for this
+  ADR. The fix exception does not waive a freeze, an implementation hold
+  (D28) or ADR 0087's ADR-before-code ordering.
 
 ### 7. Order
 
@@ -143,14 +152,14 @@ at a time.
 ### Positive
 
 - New goal M work has a requirement to name, so its ADRs are checkable.
-- The split between owner, agents, release key and daemon is fixed before
-  M3–M6 are designed.
+- The split between the owner, agents, release signing and the daemon is
+  fixed before M3–M6 are designed.
 - Upgrade safety (M1, M2) does not wait for this ADR.
 
 ### Negative / Trade-offs
 
 - An owner gets more state to hold: a policy record, rings and canary
-  attestations. Each costs bytes and needs a budget under goal E.
+  attestations. Each costs bytes, and the E-D15 checklist applies.
 - An agent can hold or roll back the owner's nodes within policy. A
   compromised agent can therefore delay upgrades on that owner's machines.
   The policy bounds the harm, and only the human changes the policy.
@@ -159,8 +168,10 @@ at a time.
 ### Neutral / Operational
 
 - R12 covers deployed nodes. The repository's own release process stays
-  under ADR 0087. D47 lets a designated operator approve some release
-  steps, and publishing still needs David.
+  under ADR 0087. Under D47 a designated release operator, which may be an
+  agent, may approve the build, sign and draft-creation environments for
+  `v*` tags that David has authorized. Publishing, tag changes, draft
+  downloads and production changes still need David's specific approval.
 - The goal M exit test (digest §7) is the measure of R12.
 
 ## Validation
@@ -172,8 +183,9 @@ at a time.
   PR is not blocked on this ADR.
 - **Review check:** each new maintenance action ships with its route, typed
   error, event and test.
-- **Review check:** no change lets an agent sign a release, or change the
-  owner's update policy without the human.
+- **Review check:** no change gives a deployed maintenance agent
+  release-signing authority, or lets it change the owner's update policy
+  without the human.
 - **Revisit** when ADR 0097 is decided, when M4's signing custody is
   decided, or when a field incident needs human SSH to recover a node.
 
@@ -183,8 +195,8 @@ at a time.
    cover agents that maintain the x0x code and releases (triage, fix PRs,
    release operations)?
 2. **Reference helper.** Should x0x ship a default-off reference maintenance
-   helper under ADR 0095's placement rule, or only the surface (this
-   draft)?
+   helper, or only the surface (this draft)? This depends on the placement
+   rule, which is open in ADR 0095 (question 6).
 3. **Default policy.** For an owner who sets no policy: keep today's apply
    on first sight, or hold until ring evidence exists? This draft leaves it
    to ADR 0097. Do you want to set the direction now?
