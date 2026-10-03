@@ -2,7 +2,8 @@
 
 <!-- File name: docs/adr/0094-m2-safe-apply.md -->
 
-- **Status:** Proposed
+- **Status:** Accepted
+- **Accepted:** 2026-10-03 by David Irvine (D58, as written: the Proposed text merged via #1186, commit cfb0975; his instruction to Claude directly). The Open questions remain open for later rulings. The status change was applied by Claude at his instruction.
 - **Date:** 2026-10-03
 - **Decision owners:** David Irvine
 - **Author:** Codex (GPT-6)
