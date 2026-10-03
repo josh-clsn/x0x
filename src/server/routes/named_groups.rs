@@ -7,10 +7,12 @@
 //! server decomposition. The router registrations stay in the parent module.
 
 mod control_blob;
+mod fair_admission;
 mod seat_cert_fetch;
 pub(in crate::server) use control_blob::{
     handle_control_blob_message, ControlBlobMessage, ControlBlobState,
 };
+pub(in crate::server) use fair_admission::FairAdmission;
 pub(in crate::server) use seat_cert_fetch::{
     cert_evidence_deadline_elapsed, clear_cert_evidence_stamps, clear_cert_evidence_stamps_for,
     handle_group_cert_fetch_request, handle_group_cert_fetch_response, publish_group_cert_fetch,
@@ -35751,6 +35753,14 @@ async fn purge_join_artifacts_if_ineligible(state: &AppState, group_id: &str, me
 /// handlers dispatched off the Welcome listener.
 pub(in crate::server) const WELCOME_FETCH_HANDLER_CAP: usize = 16;
 
+/// ADR 0107 (r5, G6): a group's share of [`WELCOME_FETCH_HANDLER_CAP`].
+pub(in crate::server) const WELCOME_FETCH_PER_GROUP_CAP: usize = 2;
+
+/// ADR 0107 (r5, G6): bound on one Welcome fetch handler (lock wait,
+/// checks and stream registration). The stream itself runs under the
+/// staged Welcome's deadline.
+const WELCOME_FETCH_HANDLER_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// ADR 0107 (review r2): spawn a join-artifact egress task registered under
 /// `(group_id, recipient)`. Its body runs only AFTER registration, so a
 /// removal or ban that quiesces this recipient can never miss it. Every body
@@ -37933,26 +37943,67 @@ pub(in crate::server) async fn dispatch_welcome_blob_message(
             group_id,
             welcome_id,
         } => {
-            let Ok(permit) = Arc::clone(&state.welcome_fetch_slots).try_acquire_owned() else {
-                tracing::warn!(
+            // ADR 0107 (r5, G6): provisional validation without any group
+            // lock — a Welcome staged for this group and this sender — then
+            // fair, coalescing admission. The handler re-checks everything
+            // authoritatively under the group's membership lock.
+            let sender_hex = hex::encode(sender.as_bytes());
+            let staged_group = state
+                .pending_welcomes
+                .read()
+                .await
+                .get(&welcome_id)
+                .filter(|pending| {
+                    pending.group_id == group_id && pending.joiner_agent == sender_hex
+                })
+                .map(|pending| pending.group_id.clone());
+            let Some(staged_group) = staged_group else {
+                tracing::debug!(
                     welcome_id = %LogHexId::new("welcome", &welcome_id),
-                    "Welcome fetch handler slots exhausted; dropping the request (the joiner retries)"
+                    sender = %LogHexId::agent(&sender_hex),
+                    "Welcome fetch matches no Welcome staged for this sender; dropped"
                 );
                 return;
             };
+            let ticket = match state
+                .welcome_fetch_admission
+                .try_admit(&welcome_id, &staged_group)
+            {
+                Ok(ticket) => ticket,
+                Err(refusal) => {
+                    tracing::debug!(
+                        welcome_id = %LogHexId::new("welcome", &welcome_id),
+                        ?refusal,
+                        "Welcome fetch not admitted; the joiner retries"
+                    );
+                    return;
+                }
+            };
             let task_state = Arc::clone(state);
             let requester = *sender;
+            let log_id = welcome_id.clone();
             let worker = tokio::spawn(async move {
-                handle_welcome_fetch_request(&task_state, &requester, group_id, welcome_id).await;
+                tokio::time::timeout(
+                    WELCOME_FETCH_HANDLER_TIMEOUT,
+                    handle_welcome_fetch_request(&task_state, &requester, group_id, welcome_id),
+                )
+                .await
+                .is_err()
             });
-            // Supervisor: holds the slot until the handler ends and reports
-            // a handler that panicked instead of losing it silently.
+            // Supervisor: holds the admission ticket until the handler ends
+            // and reports a handler that panicked or timed out.
             tokio::spawn(async move {
-                let _permit = permit;
-                if let Err(e) = worker.await {
-                    if e.is_panic() {
+                let _ticket = ticket;
+                match worker.await {
+                    Ok(false) => {}
+                    Ok(true) => tracing::warn!(
+                        welcome_id = %LogHexId::new("welcome", &log_id),
+                        "Welcome fetch handler timed out; the joiner retries"
+                    ),
+                    Err(e) if e.is_panic() => {
                         tracing::error!("Welcome fetch handler panicked: {e}");
                     }
+                    Err(_) => {}
                 }
             });
         }
@@ -39472,9 +39523,10 @@ pub(in crate::server) mod tests {
             pending_welcome_acks: RwLock::new(HashMap::new()),
             pending_welcome_streams: Mutex::new(Some(HashMap::new())),
             join_artifact_egress: StdMutex::new(HashMap::new()),
-            welcome_fetch_slots: Arc::new(tokio::sync::Semaphore::new(
+            welcome_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
+                crate::server::routes::named_groups::WELCOME_FETCH_PER_GROUP_CAP,
                 crate::server::routes::named_groups::WELCOME_FETCH_HANDLER_CAP,
-            )),
+            ),
             control_blobs: ControlBlobState::default(),
             treekem_pending_events: RwLock::new(HashMap::new()),
             parked_role_updates: StdMutex::new(HashMap::new()),

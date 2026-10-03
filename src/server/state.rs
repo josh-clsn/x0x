@@ -958,10 +958,11 @@ pub(super) struct AppState {
     /// lock before it runs; a removal or ban aborts and awaits them inside
     /// its critical section, before it commits.
     pub(super) join_artifact_egress: StdMutex<JoinArtifactEgressRegistry>,
-    /// ADR 0107 (review r2): bounded slots for Welcome `FetchRequest`
-    /// handling, which runs off the single Welcome listener loop (it can
-    /// wait on a group membership lock).
-    pub(super) welcome_fetch_slots: Arc<tokio::sync::Semaphore>,
+    /// ADR 0107 (review r2; r5 G6): fair, coalescing admission for Welcome
+    /// `FetchRequest` handlers, which run off the single Welcome listener
+    /// loop (they can wait on a group membership lock): one in-flight
+    /// handler per Welcome, a per-group share and a global cap.
+    pub(super) welcome_fetch_admission: crate::server::routes::named_groups::FairAdmission,
     /// Bounded, process-local exact-byte transfers for oversized named-group
     /// direct events and join results. No control payload is persisted.
     pub(super) control_blobs: crate::server::routes::ControlBlobState,
