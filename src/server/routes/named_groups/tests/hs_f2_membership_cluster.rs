@@ -3294,7 +3294,9 @@ async fn integration_real_home_provision_rename_restart_join_e2e() -> Result<()>
     // observed CI timeout. Whether cross-test discovery actually contributed
     // there is unestablished, and a transport or gossip defect is not excluded.
     let network_id = format!(
-        "hs-f2-real-home-provision-restart-join-{}-{}",
+        // Short prefix on purpose: pid + nanos already run to ~27 bytes and
+        // `validate_plane_id` caps the whole id at MAX_PLANE_ID_LEN (64).
+        "hs-f2-home-provision-restart-join-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
