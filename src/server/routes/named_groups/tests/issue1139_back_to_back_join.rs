@@ -2578,3 +2578,267 @@ async fn a_returning_guest_or_moderator_gets_its_exact_role_back() -> Result<()>
     }
     Ok(())
 }
+
+/// Apply the held re-key's removal to J2 as gossip: the chain step.
+async fn wa_chain_step(s: &BackToBack, removal: &NamedGroupMetadataEvent) -> Result<()> {
+    let applied =
+        apply_named_group_metadata_event(&s.j2, removal.clone(), s.authority_id, false, None).await;
+    anyhow::ensure!(applied.accepted && !applied.should_exit, "chain step");
+    anyhow::ensure!(wa_state(&s.j2, &s.group_key).await == "pending_authority_commit");
+    Ok(())
+}
+
+/// Round 5 M1: the pinned inviter removes the device and never re-adds it
+/// (a kick the device cannot tell from a re-key's first half). When the
+/// attempt times out the row departs for real, and a later fresh invite
+/// starts a real attempt that seats the device with keys.
+#[tokio::test]
+async fn a_pinned_kick_without_a_readd_departs_at_timeout() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let (attempt, _terminal, carried) = wa_held_rekey(&s).await?;
+    wa_chain_step(&s, carried.first().context("removal")?).await?;
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    super::super::finalize_join_attempt(
+        &s.j2,
+        &s.group_key,
+        &s.stable_group_id,
+        &j2_hex,
+        &attempt,
+        super::super::JoinAttemptOutcome::TimedOut,
+        super::super::JoinFinalizeGuard::Unlocked,
+    )
+    .await;
+    assert_eq!(wa_state(&s.j2, &s.group_key).await, "no_row");
+
+    let r = wa_fresh_invite_round_trip(&s).await?;
+    assert!(
+        r.new_attempt && r.final_state == "active" && r.treekem,
+        "a fresh invite starts a real attempt: {r}"
+    );
+    Ok(())
+}
+
+/// Round 5 M1 across a restart: the pin expired while the daemon was down,
+/// so startup finishes the departure instead of polling the remover, and a
+/// fresh invite then works.
+#[tokio::test]
+async fn an_expired_pin_at_startup_departs_the_abandoned_row() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let (_attempt, _terminal, carried) = wa_held_rekey(&s).await?;
+    wa_chain_step(&s, carried.first().context("removal")?).await?;
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    let key = join_result_key(&s.stable_group_id, &j2_hex);
+
+    // Down for longer than the pin's lifetime.
+    let stale = now_millis_u64().saturating_sub(
+        u64::try_from(EXPECTED_JOIN_RESULT_INVITER_TTL.as_millis()).unwrap_or(u64::MAX) + 1_000,
+    );
+    let pins = serde_json::json!({ key.clone(): {
+        "inviter_agent_id": hex::encode(s.authority_id.as_bytes()),
+        "recorded_at_ms": stale,
+        "timed_out": false,
+    }});
+    tokio::fs::write(
+        super::super::join_result_pins::pins_path(&s.j2),
+        serde_json::to_vec(&pins)?,
+    )
+    .await?;
+    s.j2.pending_join_attempts.lock().expect("attempts").clear();
+    s.j2.expected_join_result_inviters
+        .lock()
+        .expect("pins")
+        .clear();
+    super::super::load_join_result_staging(&s.j2).await;
+    let mut tasks = Vec::new();
+    let respawned = respawn_unconverged_join_polls(Arc::clone(&s.j2), &mut tasks).await;
+    for task in &tasks {
+        task.abort();
+    }
+    assert!(
+        respawned.is_empty(),
+        "nothing polls the remover: {respawned:?}"
+    );
+    assert_eq!(wa_state(&s.j2, &s.group_key).await, "no_row");
+
+    let r = wa_fresh_invite_round_trip(&s).await?;
+    assert!(
+        r.new_attempt && r.final_state == "active" && r.treekem,
+        "{r}"
+    );
+    Ok(())
+}
+
+/// Round 5 L1: a pinned-inviter removal without its TreeKEM payload is
+/// refused by the chain step, exactly as the ordinary arm refuses it.
+#[tokio::test]
+async fn a_payload_less_pinned_removal_is_refused() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let (_attempt, _terminal, carried) = wa_held_rekey(&s).await?;
+    let mut removal = carried.first().cloned().context("removal")?;
+    if let NamedGroupMetadataEvent::MemberRemoved {
+        treekem_commit_b64,
+        treekem_epoch,
+        ..
+    } = &mut removal
+    {
+        *treekem_commit_b64 = None;
+        *treekem_epoch = None;
+    }
+    let before = wa_head(&s.j2, &s).await;
+    let applied =
+        apply_named_group_metadata_event(&s.j2, removal, s.authority_id, false, None).await;
+    assert!(!applied.accepted && !applied.should_exit);
+    assert_eq!(wa_head(&s.j2, &s).await, before);
+    assert_eq!(wa_state(&s.j2, &s.group_key).await, "active");
+    Ok(())
+}
+
+/// Round 5 L2/L3: what the pins file loads as. A truncated or malformed
+/// file loads as no pins (no panic); an entry stamped further in the future
+/// than the skew allowance is dropped; a sane entry loads.
+#[tokio::test]
+async fn the_pins_file_loads_defensively() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let path = super::super::join_result_pins::pins_path(&s.j2);
+    let inviter = hex::encode(s.authority_id.as_bytes());
+    let load = || async {
+        s.j2.expected_join_result_inviters
+            .lock()
+            .expect("pins")
+            .clear();
+        super::super::load_join_result_staging(&s.j2).await;
+        s.j2.expected_join_result_inviters
+            .lock()
+            .expect("pins")
+            .len()
+    };
+    tokio::fs::write(&path, b"{\"k\": {\"inviter_agent_id\": \"aa").await?;
+    assert_eq!(load().await, 0, "truncated");
+    tokio::fs::write(&path, b"not json at all").await?;
+    assert_eq!(load().await, 0, "malformed");
+    let future = now_millis_u64() + 10 * 60 * 1_000;
+    tokio::fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({
+            "future": { "inviter_agent_id": inviter, "recorded_at_ms": future },
+            "sane": { "inviter_agent_id": inviter, "recorded_at_ms": now_millis_u64() },
+        }))?,
+    )
+    .await?;
+    assert_eq!(
+        load().await,
+        1,
+        "the future stamp is dropped, the sane one loads"
+    );
+    assert!(super::super::live_expected_join_result_inviter(&s.j2, "sane").is_some());
+    Ok(())
+}
+
+/// Round 5 L3: re-arming the pin for the same pending join keeps its
+/// original stamp and time-out state; a different inviter is a new pin.
+#[tokio::test]
+async fn a_refire_keeps_the_pins_original_age() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let inviter = hex::encode(s.authority_id.as_bytes());
+    let key = "rearm-key".to_string();
+    super::super::record_expected_join_result_inviter(&s.j2, key.clone(), inviter.clone());
+    {
+        let mut pins = s.j2.expected_join_result_inviters.lock().expect("pins");
+        let pin = pins.get_mut(&key).expect("pin");
+        pin.recorded_at_ms = 1_234;
+        pin.timed_out = true;
+    }
+    super::super::rearm_expected_join_result_inviter(&s.j2, key.clone(), inviter.clone());
+    {
+        let pins = s.j2.expected_join_result_inviters.lock().expect("pins");
+        let pin = pins.get(&key).expect("pin");
+        assert_eq!(pin.recorded_at_ms, 1_234, "same join: original stamp kept");
+        assert!(pin.timed_out, "same join: time-out state kept");
+    }
+    let other = hex::encode(s.j1.agent.agent_id().as_bytes());
+    super::super::rearm_expected_join_result_inviter(&s.j2, key.clone(), other.clone());
+    let pins = s.j2.expected_join_result_inviters.lock().expect("pins");
+    let pin = pins.get(&key).expect("pin");
+    assert_eq!(pin.inviter_agent_id, other);
+    assert!(
+        !pin.timed_out && pin.recorded_at_ms != 1_234,
+        "a new inviter is a new pin"
+    );
+    Ok(())
+}
+
+/// Round 5 info + remaining gap: a role restore parked before the seat
+/// keeps its original `parked_at` when another member lands; a restart
+/// then loses it (parking is in memory), the device seats from an unbound
+/// result with no live attempt, and the restore that a later redelivery or
+/// catch-up brings applies on the seated device.
+#[tokio::test]
+async fn a_parked_role_restore_survives_replays_and_converges_after_a_restart() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    let promoted = update_member_role(
+        State(Arc::clone(&s._authority)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path((s.group_key.clone(), j2_hex.clone())),
+        Json(UpdateMemberRoleRequest {
+            role: "admin".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    anyhow::ensure!(promoted.status().is_success());
+    wa_clear_published(&s);
+    let (_attempt, terminal, carried) = wa_held_rekey(&s).await?;
+    let role_event = wa_published(&s)
+        .into_iter()
+        .map(|(_, e)| e)
+        .find(|e| matches!(e, NamedGroupMetadataEvent::MemberRoleUpdated { .. }))
+        .context("role restore")?;
+    wa_chain_step(&s, carried.first().context("removal")?).await?;
+    let early =
+        apply_named_group_metadata_event(&s.j2, role_event.clone(), s.authority_id, true, None)
+            .await;
+    assert!(!early.accepted, "parked before the seat");
+    let parked_at = |s: &BackToBack| {
+        s.j2.parked_role_updates
+            .lock()
+            .expect("parked")
+            .get(&s.group_key)
+            .and_then(|list| list.first().map(|entry| entry.parked_at))
+    };
+    let first = parked_at(&s).context("parked")?;
+    // Another member landing drains and re-checks the lot.
+    super::super::replay_parked_role_updates(&s.j2, &s.group_key).await;
+    assert_eq!(parked_at(&s), Some(first), "the original parked_at is kept");
+
+    // The restart: attempts, in-memory pins and parked updates are gone.
+    s.j2.pending_join_attempts.lock().expect("attempts").clear();
+    s.j2.expected_join_result_inviters
+        .lock()
+        .expect("pins")
+        .clear();
+    s.j2.parked_role_updates.lock().expect("parked").clear();
+    super::super::load_join_result_staging(&s.j2).await;
+
+    wa_deliver_held(&s, None, terminal, carried).await?;
+    assert!(s.j2.treekem_groups.read().await.contains_key(&s.group_key));
+    assert_eq!(
+        wa_role(&s.j2, &s, &j2_hex).await,
+        Some(x0x::groups::GroupRole::Member)
+    );
+    let redelivered =
+        apply_named_group_metadata_event(&s.j2, role_event, s.authority_id, true, None).await;
+    assert!(redelivered.accepted);
+    assert_eq!(
+        wa_role(&s.j2, &s, &j2_hex).await,
+        Some(x0x::groups::GroupRole::Admin)
+    );
+    assert_eq!(wa_head(&s.j2, &s).await, wa_head(&s._authority, &s).await);
+    Ok(())
+}

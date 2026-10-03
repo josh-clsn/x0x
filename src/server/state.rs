@@ -1106,6 +1106,9 @@ pub(super) struct AppState {
     /// Serializes snapshot-and-write of the join-result staging sidecar
     /// (same P→Q lock order as the ADR-0028 persistence locks).
     pub(super) join_result_staging_persistence_lock: Mutex<()>,
+    /// Serializes snapshot-and-write of the joiner's expected-inviter pins
+    /// (`join_result_inviter_pins.json`), so the last write is the newest.
+    pub(super) join_result_pins_persistence_lock: Mutex<()>,
     /// Serializes snapshot-and-write of the causal approval queue sidecar so
     /// an older snapshot cannot rename over a newer conflict tombstone.
     pub(super) causal_approval_queue_persistence_lock: Mutex<()>,
