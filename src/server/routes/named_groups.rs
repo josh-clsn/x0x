@@ -8,6 +8,7 @@
 
 mod control_blob;
 mod fair_admission;
+mod join_result_pins;
 mod seat_cert_fetch;
 pub(in crate::server) use control_blob::{
     handle_control_blob_message, ControlBlobMessage, ControlBlobState,
@@ -932,6 +933,8 @@ impl HeadAttestation {
 pub(in crate::server) struct ExpectedJoinResultInviter {
     inviter_agent_id: String,
     created_at: Instant,
+    /// Wall-clock twin of `created_at`, so the pin's age survives a restart.
+    recorded_at_ms: u64,
     /// Set when the attempt that armed the pin was finalized `TimedOut`. The
     /// pin still authorizes a late result from this inviter (#390), but the
     /// join no longer counts as pending: the typed membership state reports
@@ -13026,26 +13029,58 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             if self_leave_auth && secret_epoch.is_some() {
                 return ApplyMetadataResult::REJECTED;
             }
-            // Returning-member re-key, device side: the authority's real
-            // removal of THIS device reaches it by gossip while it is
-            // re-joining, before its join result. Taken as a departure it
-            // would wipe the row, pins and attempt the result is about to
-            // land on. While this device has a current join attempt for the
-            // group and holds no tree, its own admin removal is left to the
-            // carried chain link instead; with no current attempt (a genuine
-            // kick) it departs exactly as before, and D39 recovery covers a
-            // kick that lands mid-attempt.
+            // Returning-member re-key, device side: the re-keying inviter's
+            // real removal of THIS device reaches it (by gossip, redelivery
+            // or catch-up) while it re-joins, typically before its join
+            // result. As a departure it would wipe the row, pins and attempt
+            // the add at r+2 is about to land on. So when the removal is by
+            // the very inviter this device's pin names, on a TreeKEM row with
+            // no tree, it is applied as the chain step it is: the ordinary
+            // removal's state change without the departure teardown. A
+            // removal by any other admin is a genuine kick and departs as
+            // before. The pin is persisted, so this holds across a restart.
             if agent_id == local_agent_hex
                 && !self_leave_auth
-                && rejoin_in_flight_without_tree(state, &resolved_group_key, &info, &agent_id).await
+                && awaiting_rekey_by(state, &resolved_group_key, &info, &agent_id, &actor).await
             {
+                let current = info.clone();
+                let Ok(next) = apply_stateful_event_with_evidence(
+                    state,
+                    &resolved_group_key,
+                    &current,
+                    &commit,
+                    None,
+                    roster_lock_already_held,
+                    held_gss_guard,
+                    x0x::groups::ActionKind::AdminOrHigher,
+                    |next| {
+                        next.roster_revision =
+                            adopt_roster_revision(next.roster_revision, revision);
+                        next.remove_member(&agent_id, Some(actor.clone()));
+                        if let Some(epoch) = treekem_epoch {
+                            next.secret_epoch = epoch;
+                            next.security_binding = Some(format!("treekem:epoch={epoch}"));
+                        }
+                    },
+                )
+                .await
+                else {
+                    return ApplyMetadataResult::REJECTED;
+                };
+                if !matches!(
+                    persist_named_group_info(state, &resolved_group_key, next).await,
+                    Ok(AtomicWriteOutcome::Durable)
+                ) {
+                    return ApplyMetadataResult::REJECTED;
+                }
+                remember_treekem_membership_event(state, &event_for_log).await;
                 tracing::debug!(
                     target: "treekem.trace",
-                    stage = "apply_metadata_event_reject",
-                    reason = "own_removal_during_rejoin",
+                    stage = "rekey_own_removal_applied_as_link",
                     group_id = %resolved_group_key,
                 );
-                return ApplyMetadataResult::REJECTED;
+                *replay_group_id = Some(resolved_group_key.clone());
+                return ApplyMetadataResult::ACCEPTED_CONTINUE;
             }
             let action_kind = if self_leave_auth {
                 x0x::groups::ActionKind::MemberSelf
@@ -13403,6 +13438,25 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             let actor_authorized = actor == sender_hex
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
             if !actor_authorized {
+                return ApplyMetadataResult::REJECTED;
+            }
+            // The re-key's role restore (r+3) for THIS device, arriving
+            // before the device is seated (its add at r+2 is still on the
+            // way): hold it like any role update for a member that has not
+            // landed yet, and replay it when the add lands.
+            let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+            if agent_id == local_hex
+                && commit.revision > info.state_revision.saturating_add(1)
+                && awaiting_rekey_by(state, &resolved_group_key, &info, &agent_id, &actor).await
+            {
+                park_role_update_for_late_member(
+                    state,
+                    &resolved_group_key,
+                    event_for_log.clone(),
+                    sender,
+                    &agent_id,
+                    allow_queue,
+                );
                 return ApplyMetadataResult::REJECTED;
             }
             let Some(target) = info.members_v2.get(&agent_id).cloned() else {
@@ -14964,15 +15018,19 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     };
                 let revision2 = next.roster_revision;
 
-                // Commit 3 (only for a returning admin): the real removal
-                // dropped the seat and the add re-seats as Member, which is
-                // all a receiver's add arm can grant. Restore the role the
-                // member held at the seal, capped at Admin (Owner is never
-                // assigned), as an ordinary signed role update by the same
-                // inviter — exactly what every receiver's role arm computes.
-                let restored_role = (rekey_prior_role
-                    .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin)))
-                .then_some(x0x::groups::GroupRole::Admin);
+                // Commit 3 (for any member that was not a plain Member): the
+                // real removal dropped the seat and the add re-seats as
+                // Member, which is all a receiver's add arm can grant. Restore
+                // the exact role held at the seal (Admin, Moderator, Guest; a
+                // legacy Owner is capped at Admin, Owner is never assigned) as
+                // an ordinary signed role update by the same inviter, exactly
+                // what every receiver's role arm computes. A Guest must not
+                // come back as Member: that would be an escalation.
+                let restored_role = match rekey_prior_role {
+                    Some(x0x::groups::GroupRole::Owner) => Some(x0x::groups::GroupRole::Admin),
+                    Some(x0x::groups::GroupRole::Member) | None => None,
+                    Some(role) => Some(role),
+                };
                 let mut role_commit = None;
                 if let Some(role) = restored_role {
                     next.roster_revision = next.roster_revision.saturating_add(1);
@@ -22534,6 +22592,7 @@ async fn wipe_local_group_crypto_material(
     }
     if let Ok(mut expected) = state.expected_join_result_inviters.lock() {
         expected.retain(|key, _| !join_result_key_matches_any_group_alias(key, &aliases));
+        join_result_pins::persist(state, &expected);
     }
 
     let _ = prune_treekem_cache_groups(state, &aliases, reason).await;
@@ -35859,6 +35918,8 @@ async fn persist_join_result_staging(state: &AppState) {
 /// spawn, and the departure/ban wipe re-saves post-wipe, so a banned group's
 /// staging never survives a restart (#384 invariant).
 pub(in crate::server) async fn load_join_result_staging(state: &AppState) {
+    // The joiner-side pins live beside the staging sidecar and load with it.
+    join_result_pins::load(state);
     let path = state.join_result_staging_path.clone();
     let raw = match tokio::fs::read(&path).await {
         Ok(raw) => raw,
@@ -36286,9 +36347,11 @@ fn record_expected_join_result_inviter(state: &AppState, key: String, inviter_ag
         ExpectedJoinResultInviter {
             inviter_agent_id,
             created_at: Instant::now(),
+            recorded_at_ms: now_millis_u64(),
             timed_out: false,
         },
     );
+    join_result_pins::persist(state, &expected);
 }
 
 fn expected_join_result_inviter(state: &AppState, key: &str) -> Option<String> {
@@ -36320,12 +36383,15 @@ fn mark_expected_join_result_inviter_timed_out(state: &AppState, key: &str) {
         if let Some(pending) = expected.get_mut(key) {
             pending.timed_out = true;
         }
+        join_result_pins::persist(state, &expected);
     }
 }
 
 fn clear_expected_join_result_inviter(state: &AppState, key: &str) {
     if let Ok(mut expected) = state.expected_join_result_inviters.lock() {
-        expected.remove(key);
+        if expected.remove(key).is_some() {
+            join_result_pins::persist(state, &expected);
+        }
     }
 }
 
@@ -39889,21 +39955,26 @@ pub(in crate::server) async fn dispatch_join_result_message(
     });
 }
 
-/// Whether this device is mid-rejoin for the group with no TreeKEM tree:
-/// a join attempt for it is registered and current, and no tree is held
-/// under the row's key or its stable id.
-async fn rejoin_in_flight_without_tree(
+/// Whether this device is waiting for a returning-member re-key by `actor`:
+/// the row is TreeKEM and holds no tree, and the device's live (persisted)
+/// expected-inviter pin for the group names `actor`. Such a device takes
+/// `actor`'s removal of it as a chain step and holds `actor`'s role update
+/// for it until it is seated.
+async fn awaiting_rekey_by(
     state: &AppState,
     group_key: &str,
     info: &x0x::groups::GroupInfo,
     local_hex: &str,
+    actor: &str,
 ) -> bool {
-    let attempt = state
-        .pending_join_attempts
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .contains_key(&join_result_key(info.stable_group_id(), local_hex));
-    if !attempt {
+    if info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem {
+        return false;
+    }
+    let pinned = live_expected_join_result_inviter(
+        state,
+        &join_result_key(info.stable_group_id(), local_hex),
+    );
+    if !pinned.is_some_and(|inviter| inviter.eq_ignore_ascii_case(actor)) {
         return false;
     }
     let trees = state.treekem_groups.read().await;
@@ -42524,6 +42595,7 @@ pub(in crate::server) mod tests {
     mod pr291_restart_marker_matrix;
     mod r17_cert_hydrate;
     mod r19_cert_carry;
+    mod rekey_plane_gate;
     mod requester_offer;
     mod sec377_dm_verified_gate;
     mod self_leave_rekey;
