@@ -2717,12 +2717,46 @@ async fn wa_chain_step(s: &BackToBack, removal: &NamedGroupMetadataEvent) -> Res
     Ok(())
 }
 
-/// Round 5 M1: the pinned inviter removes the device and never re-adds it
-/// (a kick the device cannot tell from a re-key's first half). When the
-/// attempt times out the row departs for real, and a later fresh invite
-/// starts a real attempt that seats the device with keys.
+/// Round 6 F3 (#390 kept): the pinned inviter's removal was applied as a
+/// chain step and the attempt then timed out. The timed-out pin still
+/// authorizes a late result, so the row is NOT departed at the timeout, and
+/// a result that lands afterwards (before the pin expires) still seats the
+/// device with keys.
 #[tokio::test]
-async fn a_pinned_kick_without_a_readd_departs_at_timeout() -> Result<()> {
+async fn a_late_result_after_the_timeout_still_seats_the_chain_step_row() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let (attempt, terminal, carried) = wa_held_rekey(&s).await?;
+    wa_chain_step(&s, carried.first().context("removal")?).await?;
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    super::super::finalize_join_attempt(
+        &s.j2,
+        &s.group_key,
+        &s.stable_group_id,
+        &j2_hex,
+        &attempt,
+        super::super::JoinAttemptOutcome::TimedOut,
+        super::super::JoinFinalizeGuard::Unlocked,
+    )
+    .await;
+    assert_eq!(
+        wa_state(&s.j2, &s.group_key).await,
+        "not_member",
+        "kept, not departed"
+    );
+
+    wa_deliver_held(&s, None, terminal, carried).await?;
+    assert_eq!(wa_state(&s.j2, &s.group_key).await, "active");
+    assert!(s.j2.treekem_groups.read().await.contains_key(&s.group_key));
+    assert!(wa_decrypts_post_rekey(&s, &s.j2).await?);
+    Ok(())
+}
+
+/// The same timed-out row, but no late result: a fresh invite supersedes
+/// the old attempt, finishes the departure and starts a real attempt that
+/// seats the device with keys.
+#[tokio::test]
+async fn a_fresh_invite_after_the_timeout_replaces_the_chain_step_row() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let s = build_back_to_back(dir.path()).await?;
     let (attempt, _terminal, carried) = wa_held_rekey(&s).await?;
@@ -2738,13 +2772,33 @@ async fn a_pinned_kick_without_a_readd_departs_at_timeout() -> Result<()> {
         super::super::JoinFinalizeGuard::Unlocked,
     )
     .await;
-    assert_eq!(wa_state(&s.j2, &s.group_key).await, "no_row");
-
     let r = wa_fresh_invite_round_trip(&s).await?;
     assert!(
         r.new_attempt && r.final_state == "active" && r.treekem,
         "a fresh invite starts a real attempt: {r}"
     );
+    Ok(())
+}
+
+/// A refused attempt clears the pin: the chain-step row departs.
+#[tokio::test]
+async fn a_refused_attempt_departs_the_chain_step_row() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let (attempt, _terminal, carried) = wa_held_rekey(&s).await?;
+    wa_chain_step(&s, carried.first().context("removal")?).await?;
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    super::super::finalize_join_attempt(
+        &s.j2,
+        &s.group_key,
+        &s.stable_group_id,
+        &j2_hex,
+        &attempt,
+        super::super::JoinAttemptOutcome::Refused,
+        super::super::JoinFinalizeGuard::Unlocked,
+    )
+    .await;
+    assert_eq!(wa_state(&s.j2, &s.group_key).await, "no_row");
     Ok(())
 }
 
@@ -2969,5 +3023,155 @@ async fn a_parked_role_restore_survives_replays_and_converges_after_a_restart() 
         Some(x0x::groups::GroupRole::Admin)
     );
     assert_eq!(wa_head(&s.j2, &s).await, wa_head(&s._authority, &s).await);
+    Ok(())
+}
+
+/// A chain-step row whose pin is gone: the state the depart path acts on.
+async fn wa_abandoned_row(
+    s: &BackToBack,
+) -> Result<(NamedGroupMetadataEvent, Vec<NamedGroupMetadataEvent>)> {
+    let (_attempt, terminal, carried) = wa_held_rekey(s).await?;
+    wa_chain_step(s, carried.first().context("removal")?).await?;
+    s.j2.pending_join_attempts.lock().expect("attempts").clear();
+    s.j2.expected_join_result_inviters
+        .lock()
+        .expect("pins")
+        .clear();
+    Ok((terminal, carried))
+}
+
+/// Round 6 F1: a seat that commits between depart's unlocked pre-check and
+/// its drop wins. The drop re-checks under the roster persistence lock,
+/// finds the device seated, and drops and wipes nothing.
+#[tokio::test]
+async fn a_seat_between_the_check_and_the_drop_keeps_the_group() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let (terminal, carried) = wa_abandoned_row(&s).await?;
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let go = Arc::new(tokio::sync::Notify::new());
+    *super::super::DEPART_TEST_PAUSE.lock().expect("pause") = Some((
+        s.stable_group_id.clone(),
+        Arc::clone(&reached),
+        Arc::clone(&go),
+    ));
+    let state = Arc::clone(&s.j2);
+    let key = s.group_key.clone();
+    let depart = tokio::spawn(async move {
+        super::super::depart_abandoned_rekey_row(
+            &state,
+            &key,
+            super::super::AbandonedRekeyPin::MustBeGone,
+            "test",
+        )
+        .await
+    });
+    reached.notified().await;
+    // The seat lands inside the window.
+    wa_deliver_held(&s, None, terminal, carried).await?;
+    anyhow::ensure!(
+        s.j2.treekem_groups.read().await.contains_key(&s.group_key),
+        "precondition: the seat landed in the window"
+    );
+    go.notify_one();
+    let departed = depart.await?;
+    *super::super::DEPART_TEST_PAUSE.lock().expect("pause") = None;
+    assert!(!departed, "the in-lock re-check must abort the drop");
+    assert_eq!(wa_state(&s.j2, &s.group_key).await, "active");
+    assert!(s.j2.treekem_groups.read().await.contains_key(&s.group_key));
+    assert!(wa_decrypts_post_rekey(&s, &s.j2).await?);
+    Ok(())
+}
+
+async fn wa_withdrawn(s: &BackToBack) -> bool {
+    s.j2.named_groups
+        .read()
+        .await
+        .get(&s.group_key)
+        .is_some_and(|info| info.withdrawn)
+}
+
+async fn wa_mark_withdrawn(s: &BackToBack) -> Result<()> {
+    let key = s.group_key.clone();
+    let outcome = persist_named_groups_mutation(&s.j2, |groups| {
+        groups.get_mut(&key).is_some_and(|info| {
+            info.withdrawn = true;
+            true
+        })
+    })
+    .await;
+    anyhow::ensure!(matches!(outcome, Ok(AtomicWriteOutcome::Durable)));
+    Ok(())
+}
+
+/// Round 6 F2: a withdrawn tombstone that grew out of a chain-step row is
+/// never dropped by the startup sweep, and a replayed invite for that group
+/// still gets 409 with the tombstone intact.
+#[tokio::test]
+async fn a_withdrawn_tombstone_survives_the_sweep_and_refuses_a_replayed_invite() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    wa_abandoned_row(&s).await?;
+    wa_mark_withdrawn(&s).await?;
+    let mut tasks = Vec::new();
+    respawn_unconverged_join_polls(Arc::clone(&s.j2), &mut tasks).await;
+    for task in &tasks {
+        task.abort();
+    }
+    assert!(wa_withdrawn(&s).await, "the sweep keeps the tombstone");
+
+    let r = wa_fresh_invite_round_trip(&s).await?;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{r}");
+    assert!(
+        wa_withdrawn(&s).await,
+        "the replayed invite keeps the tombstone"
+    );
+    Ok(())
+}
+
+/// Round 6 F4: a stale sibling alias row says Removed while the live alias
+/// row is Active with a tree under its own key. Every alias must qualify,
+/// so depart does nothing.
+#[tokio::test]
+async fn a_diverged_live_alias_blocks_the_departure() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    wa_abandoned_row(&s).await?;
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    let sibling = format!("{}-sibling", s.group_key);
+    {
+        let sibling = sibling.clone();
+        let key = s.group_key.clone();
+        let j2_hex = j2_hex.clone();
+        let outcome = persist_named_groups_mutation(&s.j2, |groups| {
+            let Some(mut live) = groups.get(&key).cloned() else {
+                return false;
+            };
+            live.add_member(j2_hex, x0x::groups::GroupRole::Member, None, None);
+            groups.insert(sibling, live);
+            true
+        })
+        .await;
+        anyhow::ensure!(matches!(outcome, Ok(AtomicWriteOutcome::Durable)));
+    }
+    let group_id_bytes = hex::decode(&s.group_key)?;
+    let seed = agent_treekem_seed(s.j2.agent.as_ref(), &group_id_bytes);
+    let tree = x0x::mls::TreeKemMlsGroup::create(group_id_bytes, s.j2.agent.agent_id(), &seed)?;
+    s.j2.treekem_groups
+        .write()
+        .await
+        .insert(sibling.clone(), Arc::new(Mutex::new(tree)));
+
+    let departed = super::super::depart_abandoned_rekey_row(
+        &s.j2,
+        &s.group_key,
+        super::super::AbandonedRekeyPin::MustBeGone,
+        "test",
+    )
+    .await;
+    assert!(!departed);
+    let groups = s.j2.named_groups.read().await;
+    assert!(groups.contains_key(&s.group_key) && groups.contains_key(&sibling));
+    assert!(s.j2.treekem_groups.read().await.contains_key(&sibling));
     Ok(())
 }
