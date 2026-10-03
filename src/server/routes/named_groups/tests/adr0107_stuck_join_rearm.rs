@@ -3784,3 +3784,319 @@ async fn s8a_r5_g8_chunk_fetch_admission_is_validated_and_fair() -> anyhow::Resu
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Round 5, G11 (D60): every delivery and resend of a class-K GSS share needs
+// the recipient's CURRENT eligibility and the CURRENT secret epoch. A share
+// is withheld (still pending) while the condition can clear, and purged
+// when it cannot.
+// ---------------------------------------------------------------------------
+
+/// Every write of a `SecureShareDelivered` to `recipient` any path made: a
+/// metadata-topic gossip publish, a direct-delivery schedule, or an admitted
+/// class-K exchange.
+fn share_writes(state: &AppState, recipient: &str) -> usize {
+    let recorders = &state.named_group_test_recorders;
+    let published = recorders
+        .publish_bytes
+        .lock()
+        .expect("publish witness")
+        .iter()
+        .filter(|(_, bytes)| {
+            matches!(
+                serde_json::from_slice::<NamedGroupMetadataEvent>(bytes),
+                Ok(NamedGroupMetadataEvent::SecureShareDelivered { recipient: to, .. }) if to == recipient
+            )
+        })
+        .count();
+    let scheduled = recorders
+        .direct_deliveries
+        .lock()
+        .expect("direct-delivery witness")
+        .iter()
+        .filter(|(to, _, kind, _)| to == recipient && *kind == "secure_share_delivered")
+        .count();
+    published + scheduled + egress_count(state, recipient, "secure_share")
+}
+
+fn clear_share_witnesses(state: &AppState) {
+    let recorders = &state.named_group_test_recorders;
+    recorders
+        .publish_bytes
+        .lock()
+        .expect("publish witness")
+        .clear();
+    recorders
+        .direct_deliveries
+        .lock()
+        .expect("direct-delivery witness")
+        .clear();
+    clear_egress(state);
+}
+
+fn live_egress_tasks(state: &AppState, key: &(String, String)) -> usize {
+    state
+        .join_artifact_egress
+        .lock()
+        .expect("egress registry")
+        .get(key)
+        .map_or(0, |tasks| tasks.iter().filter(|t| !t.is_finished()).count())
+}
+
+/// Re-deliver the group's CURRENT share to the GSS joiner through the
+/// production producer.
+async fn deliver_current_share(g: &GssFixture) -> anyhow::Result<()> {
+    let (topic, secret, epoch) = {
+        let groups = g.authority.named_groups.read().await;
+        let info = groups.get(&g.group_key).expect("authority group");
+        let secret: [u8; 32] = info
+            .shared_secret
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("the authority holds the secret"))?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("32-byte secret"))?;
+        (info.metadata_topic.clone(), secret, info.secret_epoch)
+    };
+    let _ = super::super::publish_secure_share(
+        &g.authority,
+        &topic,
+        &g.stable,
+        &hex_of(&g.joiner),
+        &BASE64.encode(&g.joiner.agent_kem_keypair.public_bytes),
+        &hex_of(&g.authority),
+        &secret,
+        epoch,
+    )
+    .await;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShareInvalidation {
+    AgentRevoked,
+    MachineRevoked,
+    CertificateExpired,
+    VerdictInGrace,
+    Quarantined,
+}
+
+impl ShareInvalidation {
+    /// Can the condition still clear (withhold) or not (purge)?
+    fn can_clear(self) -> bool {
+        matches!(
+            self,
+            Self::MachineRevoked | Self::VerdictInGrace | Self::Quarantined
+        )
+    }
+}
+
+async fn invalidate_share_recipient(g: &GssFixture, case: ShareInvalidation) -> anyhow::Result<()> {
+    let g_hex = hex_of(&g.joiner);
+    match case {
+        ShareInvalidation::AgentRevoked => {
+            let kp = g.joiner.agent.identity().agent_keypair().to_bytes();
+            revoke_agent(&g.authority, &kp).await?;
+        }
+        ShareInvalidation::MachineRevoked => revoke_machine(&g.authority, &g.joiner).await?,
+        ShareInvalidation::CertificateExpired => {
+            let owner_kp = x0x::identity::UserKeypair::from_seed(&OWNER_SEED)?;
+            let past = x0x::groups::owner_cert::restore_clock_now() - 30 * 86_400;
+            let expired = x0x::identity::AgentCertificate::issue_with_expiry(
+                &owner_kp,
+                g.joiner.agent.identity().agent_keypair(),
+                Some(past),
+            )?;
+            if let Some(seat) = g
+                .authority
+                .named_groups
+                .write()
+                .await
+                .get_mut(&g.group_key)
+                .and_then(|info| info.members_v2.get_mut(&g_hex))
+            {
+                seat.certificate = Some(expired);
+            }
+        }
+        ShareInvalidation::VerdictInGrace => {
+            // The joiner announced a ROTATED certificate whose bytes are
+            // still in flight: the embedded one is stale (InGrace).
+            let owner_kp = x0x::identity::UserKeypair::from_seed(&OWNER_SEED)?;
+            let rotated = x0x::identity::AgentCertificate::issue_with_expiry(
+                &owner_kp,
+                g.joiner.agent.identity().agent_keypair(),
+                Some(x0x::groups::owner_cert::restore_clock_now() + 365 * 86_400),
+            )?;
+            let owner_id = owner_kp.user_id();
+            let digest = x0x::announce_v3::cert_digest(&Some(owner_id), &Some(rotated));
+            insert_discovery_entry(
+                &g.authority,
+                g.joiner.agent.agent_id(),
+                Some(owner_id),
+                None,
+                Some(digest),
+            )
+            .await;
+        }
+        ShareInvalidation::Quarantined => {
+            if let Some(info) = g.authority.named_groups.write().await.get_mut(&g.group_key) {
+                info.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+                    revision: 7,
+                    state_hash: info.state_hash.clone(),
+                    committed_by: "9e".repeat(32),
+                    observed_at_ms: 1_726_000_000_000,
+                    snapshot: x0x::groups::ForkSnapshot {
+                        terminal_commit: info.terminal_commit_header(),
+                        conflicting_commit: info.terminal_commit_header(),
+                        classification: None,
+                    },
+                    no_anchor: true,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A class-K share delivery with `case` landing between the producer and
+/// the write: nothing is written, and the share is withheld (still
+/// pending) when the condition can clear, purged when it cannot.
+async fn share_delivery_case(case: ShareInvalidation) -> anyhow::Result<Option<String>> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), true).await?;
+    let g_hex = hex_of(&g.joiner);
+    if case == ShareInvalidation::MachineRevoked {
+        pin_recipient_machine(&g.authority, &g.joiner).await;
+    }
+    let armed = super::super::join_egress_test_barrier::arm(&g_hex, "secure_share");
+    clear_share_witnesses(&g.authority);
+    deliver_current_share(&g).await?;
+    // The share's producer has run; the invalidation lands before its write.
+    let reached = tokio::time::timeout(Duration::from_secs(5), async {
+        while !armed.gate.reached() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .is_ok();
+    invalidate_share_recipient(&g, case).await?;
+    if reached {
+        clear_share_witnesses(&g.authority);
+    }
+    drop(armed);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let writes = share_writes(&g.authority, &g_hex);
+    if writes > 0 {
+        return Ok(Some(format!(
+            "{case:?}: {writes} share write(s) after the invalidation"
+        )));
+    }
+    let key = (g.stable.clone(), g_hex.clone());
+    if case.can_clear() {
+        if live_egress_tasks(&g.authority, &key) == 0 {
+            return Ok(Some(format!(
+                "{case:?}: the share was purged, not withheld"
+            )));
+        }
+    } else {
+        // The fixture's own +8 s resend task re-checks too.
+        let purged = tokio::time::timeout(Duration::from_secs(12), async {
+            while live_egress_tasks(&g.authority, &key) > 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .is_ok();
+        if !purged {
+            return Ok(Some(format!(
+                "{case:?}: the share was withheld, not purged"
+            )));
+        }
+        if share_writes(&g.authority, &g_hex) > 0 {
+            return Ok(Some(format!("{case:?}: a resend wrote the share")));
+        }
+    }
+    Ok(None)
+}
+
+/// WHY (D60, G11): agent revocation before a share's write.
+#[tokio::test]
+async fn s8a_r5_g11_agent_revocation_withholds_nothing_and_purges_the_share() -> anyhow::Result<()>
+{
+    let failure = share_delivery_case(ShareInvalidation::AgentRevoked).await?;
+    assert!(failure.is_none(), "{failure:?}");
+    Ok(())
+}
+
+/// WHY (D60, G11): machine revocation before a share's write.
+#[tokio::test]
+async fn s8a_r5_g11_machine_revocation_withholds_the_share() -> anyhow::Result<()> {
+    let failure = share_delivery_case(ShareInvalidation::MachineRevoked).await?;
+    assert!(failure.is_none(), "{failure:?}");
+    Ok(())
+}
+
+/// WHY (D60, G11): certificate expiry before a share's write.
+#[tokio::test]
+async fn s8a_r5_g11_certificate_expiry_purges_the_share() -> anyhow::Result<()> {
+    let failure = share_delivery_case(ShareInvalidation::CertificateExpired).await?;
+    assert!(failure.is_none(), "{failure:?}");
+    Ok(())
+}
+
+/// WHY (D60, G11): a verdict change (InGrace) before a share's write.
+#[tokio::test]
+async fn s8a_r5_g11_verdict_change_withholds_the_share() -> anyhow::Result<()> {
+    let failure = share_delivery_case(ShareInvalidation::VerdictInGrace).await?;
+    assert!(failure.is_none(), "{failure:?}");
+    Ok(())
+}
+
+/// WHY (D60, G11): fork quarantine before a share's write.
+#[tokio::test]
+async fn s8a_r5_g11_quarantine_withholds_the_share() -> anyhow::Result<()> {
+    let failure = share_delivery_case(ShareInvalidation::Quarantined).await?;
+    assert!(failure.is_none(), "{failure:?}");
+    Ok(())
+}
+
+/// WHY (D60, G11): a share's RESEND (the +8 s second delivery) is admitted
+/// afresh: it is never scheduled outside admission, and an invalidation
+/// after the first write stops it.
+#[tokio::test]
+async fn s8a_r5_g11_share_resend_is_admitted_afresh() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), true).await?;
+    let g_hex = hex_of(&g.joiner);
+    clear_share_witnesses(&g.authority);
+    deliver_current_share(&g).await?;
+    let unadmitted_resends = g
+        .authority
+        .named_group_test_recorders
+        .direct_deliveries
+        .lock()
+        .expect("direct-delivery witness")
+        .iter()
+        .filter(|(to, _, kind, label)| {
+            *to == g_hex && *kind == "secure_share_delivered" && *label == "delayed"
+        })
+        .count();
+    assert_eq!(
+        unadmitted_resends, 0,
+        "a share resend was scheduled outside per-send admission"
+    );
+    // The first write happened; the recipient is revoked before the resend.
+    assert!(
+        egress_happens(&g.authority, &g_hex, "secure_share", Duration::from_secs(5)).await,
+        "the first share write"
+    );
+    let kp = g.joiner.agent.identity().agent_keypair().to_bytes();
+    revoke_agent(&g.authority, &kp).await?;
+    clear_share_witnesses(&g.authority);
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(
+        share_writes(&g.authority, &g_hex),
+        0,
+        "the resend wrote the share after the recipient was revoked"
+    );
+    Ok(())
+}
