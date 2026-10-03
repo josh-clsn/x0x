@@ -2054,8 +2054,7 @@ fn secure_share_admission(
                 evidence
             };
             let seam: x0x::dm::SeamAdmission = Box::new(move || {
-                join_artifact_seam_refusal(&state, &group_id, &recipient_hex, evidence.as_ref())
-                    .is_none()
+                join_artifact_seam_refusal(&state, &group_id, &recipient_hex, evidence).is_none()
                     && state.named_groups.try_read().is_ok_and(|roster| {
                         crate::server::resolve_group_entry_locked(&roster, &group_id)
                             .is_some_and(|(_, info)| secure_share_epoch_current(info, secret_epoch))
@@ -35858,7 +35857,7 @@ fn join_artifact_seam_refusal(
     state: &AppState,
     group_id: &str,
     member_hex: &str,
-    evidence: Option<&x0x::groups::owner_cert::OwnerCertEvidence>,
+    evidence: Option<x0x::groups::owner_cert::OwnerCertEvidence>,
 ) -> Option<JoinArtifactRefusal> {
     let Ok(member) = parse_agent_id_hex(member_hex) else {
         return Some(JoinArtifactRefusal::NotActive);
@@ -35884,7 +35883,9 @@ fn join_artifact_seam_refusal(
     let Some(evidence) = evidence else {
         return Some(JoinArtifactRefusal::SeamContended);
     };
-    join_artifact_verdict_refusal(probe, evidence, member_hex)
+    // r6 (P1): the snapshot's certificates at the SEAM's clock, so an
+    // announced certificate that expired since the pre-phase fails here.
+    join_artifact_verdict_refusal(probe, &evidence.at_time(now_unix), member_hex)
 }
 
 /// The wall clock the stream seam evaluates certificates with (unix
@@ -36435,8 +36436,7 @@ fn join_result_admission(
                 evidence
             };
             let seam: x0x::dm::SeamAdmission = Box::new(move || {
-                join_artifact_seam_refusal(&state, &group_id, &member_hex, evidence.as_ref())
-                    .is_none()
+                join_artifact_seam_refusal(&state, &group_id, &member_hex, evidence).is_none()
                     && join_result_staged_now(&state, &group_id, &member_hex, staged_at)
             });
             Some(seam)
@@ -36476,7 +36476,7 @@ pub(super) fn join_result_chunk_admission(
                     &state,
                     reference.group_id(),
                     reference.recipient(),
-                    evidence.as_ref(),
+                    evidence,
                 )
                 .is_none()
                     && join_result_blob_staged_now(&state, &reference)
@@ -36530,8 +36530,7 @@ fn welcome_chunk_admission(
                 evidence
             };
             let seam: x0x::dm::SeamAdmission = Box::new(move || {
-                join_artifact_seam_refusal(&state, &group_id, &recipient_hex, evidence.as_ref())
-                    .is_none()
+                join_artifact_seam_refusal(&state, &group_id, &recipient_hex, evidence).is_none()
                     && welcome_staged_now(&state, &welcome_id, &recipient_hex, staged_at)
             });
             Some(seam)
