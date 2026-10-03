@@ -7247,6 +7247,7 @@ impl Agent {
                     &payload,
                     config.raw_quic_receive_ack_timeout,
                     prefer_newest_grace,
+                    None,
                 )
                 .await
             {
@@ -7329,6 +7330,7 @@ impl Agent {
                         &payload,
                         config.raw_quic_receive_ack_timeout,
                         prefer_newest_grace,
+                        None,
                     )
                     .await
                     .map(dm_send::raw_quic_receipt_for_path)
@@ -7691,12 +7693,55 @@ impl Agent {
         }
     }
 
+    /// x0x #1150 (ADR 0107): send `payload` to `to` over the raw-QUIC direct
+    /// path ONLY. It never uses the gossip inbox, whose stranded-publish retry
+    /// runs detached and could carry the bytes after the caller gave up.
+    /// `admission` is evaluated after connection resolution, any repair or
+    /// redial, and every pairing check, immediately before the bytes are
+    /// handed to the network; a refusal writes nothing. With
+    /// `receive_ack_timeout` the send also waits for the remote receive
+    /// pipeline's ACK (after the write, so outside the admission). A failure
+    /// never falls back to another path: the caller's protocol retries.
+    pub(crate) async fn send_direct_raw_admitted(
+        &self,
+        to: &identity::AgentId,
+        payload: &[u8],
+        receive_ack_timeout: Option<std::time::Duration>,
+        admission: &dm::TransportAdmission,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        // ADR-0043 signing gate: the same egress refusal the general path
+        // applies before any envelope or transport work.
+        if !self.signing_gate_allows(&self.identity.agent_id()).await {
+            self.direct_messaging.record_outgoing_failed(*to);
+            return Err(dm::DmError::EnvelopeConstruction(
+                "signing refused: this machine is not the agent's custodian (ADR-0043 signing gate)"
+                    .to_string(),
+            ));
+        }
+        if *to == self.identity.agent_id() {
+            return Err(dm::DmError::NoConnectivity(
+                "an admitted raw-QUIC send is never self-addressed".to_string(),
+            ));
+        }
+        self.send_direct_raw_quic(
+            to,
+            payload,
+            receive_ack_timeout,
+            std::time::Duration::from_millis(dm::DEFAULT_PREFER_NEWEST_GRACE_MS),
+            Some(admission),
+        )
+        .await
+        .map(dm_send::raw_quic_receipt_for_path)
+        .map_err(Self::map_raw_quic_dm_error)
+    }
+
     async fn send_direct_raw_quic(
         &self,
         agent_id: &identity::AgentId,
         payload: &[u8],
         receive_ack_timeout: Option<std::time::Duration>,
         prefer_newest_grace: std::time::Duration,
+        admission: Option<&dm::TransportAdmission>,
     ) -> error::NetworkResult<dm::DmPath> {
         let send_start = std::time::Instant::now();
         let agent_prefix = network::hex_prefix(&agent_id.0, 4);
@@ -7968,6 +8013,27 @@ impl Agent {
             bytes,
             digest = %digest,
         );
+
+        // x0x #1150 (ADR 0107): the caller's admission runs HERE — after
+        // machine resolution, any repair or redial, and the final pairing
+        // check, immediately before the bytes are handed to the network.
+        // A refusal writes nothing.
+        if let Some(admission) = admission {
+            if !admission().await {
+                tracing::info!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                    machine_prefix = %crate::logging::LogHexId::new("machine", &machine_prefix),
+                    outcome = "refused_at_transport_admission",
+                    bytes,
+                    "raw-QUIC send refused by its transport admission check"
+                );
+                return Err(error::NetworkError::ConnectionFailed(
+                    "transport admission refused".to_string(),
+                ));
+            }
+        }
 
         // Send via network layer. Prefer receive-pipeline ACK when configured:
         // success then means the remote ant-quic reader drained the direct

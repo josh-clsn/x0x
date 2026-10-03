@@ -35721,6 +35721,8 @@ async fn stage_join_result_blob_if_servable(
     if !join_result_servable_locked(state, group_id, &member_hex, staged_at).await {
         return Err("join-result recipient is no longer eligible");
     }
+    // ADR 0107 (review r4 P2): the copy is bound to the ORIGINAL staged
+    // result and dies with its deadline; every chunk re-checks both.
     control_blob::stage_reference(
         &state.control_blobs,
         &state.agent,
@@ -35729,26 +35731,186 @@ async fn stage_join_result_blob_if_servable(
         group_id,
         attempt_id,
         payload.to_vec(),
+        Some(control_blob::StagedOrigin {
+            staged_at,
+            deadline: staged_at + PENDING_JOIN_RESULT_TTL,
+        }),
     )
 }
 
-/// ADR 0107 (review r2): one chunk of a staged join-result blob, read only
-/// while its recipient is eligible, under the group's membership lock.
-async fn join_result_chunk_if_servable(
+/// ADR 0107 (review r4 P2): the staged join-result copy `reference` may still
+/// be served: it is bound to an original staged result that is still the one
+/// to serve and unexpired, and its recipient is eligible on the current
+/// roster. The caller holds the group's membership lock.
+async fn join_result_blob_servable_locked(
     state: &AppState,
-    group_id: &str,
-    member_hex: &str,
-    chunk: impl FnOnce() -> Option<Vec<u8>>,
+    reference: &control_blob::ControlBlobRef,
+) -> bool {
+    let Some(origin) = state.control_blobs.staged_origin(reference) else {
+        return false;
+    };
+    join_result_servable_locked(
+        state,
+        reference.group_id(),
+        reference.recipient(),
+        origin.staged_at,
+    )
+    .await
+}
+
+/// ADR 0107 (review r4 P2): one chunk of a staged join-result copy, read
+/// under the group's membership lock only while
+/// [`join_result_blob_servable_locked`] holds.
+pub(super) async fn join_result_chunk_if_servable(
+    state: &AppState,
+    reference: &control_blob::ControlBlobRef,
+    sequence: u32,
 ) -> Option<Vec<u8>> {
-    let lock = group_membership_lock_for_known_group(state, group_id).await?;
+    let lock = group_membership_lock_for_known_group(state, reference.group_id()).await?;
     let _membership_guard = lock.lock().await;
-    if join_artifact_serving_refusal(state, group_id, member_hex)
-        .await
-        .is_some()
-    {
+    if !join_result_blob_servable_locked(state, reference).await {
         return None;
     }
-    chunk()
+    state.control_blobs.staged_chunk(reference, sequence)
+}
+
+/// ADR 0107 (review r4 P1): a transport admission check, evaluated under the
+/// group's membership lock immediately before the bytes are handed to the
+/// network.
+fn join_artifact_admission<F, Fut>(check: F) -> x0x::dm::TransportAdmission
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = bool> + Send + 'static,
+{
+    Arc::new(move || Box::pin(check()))
+}
+
+/// ADR 0107 (review r4 P1): the transport admission of an inline join result.
+fn join_result_admission(
+    state: &Arc<AppState>,
+    group_id: &str,
+    member_hex: &str,
+    staged_at: Instant,
+) -> x0x::dm::TransportAdmission {
+    let state = Arc::clone(state);
+    let group_id = group_id.to_string();
+    let member_hex = member_hex.to_string();
+    join_artifact_admission(move || {
+        let state = Arc::clone(&state);
+        let group_id = group_id.clone();
+        let member_hex = member_hex.clone();
+        async move { join_result_still_servable(&state, &group_id, &member_hex, staged_at).await }
+    })
+}
+
+/// ADR 0107 (review r4 P1): the transport admission of one join-result chunk.
+pub(super) fn join_result_chunk_admission(
+    state: &Arc<AppState>,
+    reference: &control_blob::ControlBlobRef,
+    _sequence: u32,
+) -> x0x::dm::TransportAdmission {
+    let state = Arc::clone(state);
+    let reference = reference.clone();
+    join_artifact_admission(move || {
+        let state = Arc::clone(&state);
+        let reference = reference.clone();
+        async move {
+            let Some(lock) =
+                group_membership_lock_for_known_group(&state, reference.group_id()).await
+            else {
+                return false;
+            };
+            let _membership_guard = lock.lock().await;
+            join_result_blob_servable_locked(&state, &reference).await
+        }
+    })
+}
+
+/// ADR 0107 (review r4 P1): the transport admission of one Welcome chunk:
+/// the staged Welcome still stands, unexpired, for this recipient, and the
+/// recipient is eligible (checked under the group's membership lock).
+fn welcome_chunk_admission(
+    state: &Arc<AppState>,
+    welcome_id: &str,
+    recipient_hex: &str,
+) -> x0x::dm::TransportAdmission {
+    let state = Arc::clone(state);
+    let welcome_id = welcome_id.to_string();
+    let recipient_hex = recipient_hex.to_string();
+    join_artifact_admission(move || {
+        let state = Arc::clone(&state);
+        let welcome_id = welcome_id.clone();
+        let recipient_hex = recipient_hex.clone();
+        async move {
+            let staged = state
+                .pending_welcomes
+                .read()
+                .await
+                .get(&welcome_id)
+                .map(|pending| (pending.group_id.clone(), pending.created_at));
+            let Some((group_id, staged_at)) = staged else {
+                return false;
+            };
+            welcome_frame_servable(&state, &group_id, &recipient_hex, &welcome_id, staged_at)
+                .await
+                .is_ok()
+        }
+    })
+}
+
+/// ADR 0107 (review r4): the raw-QUIC receive-ACK bound for a join
+/// artifact (the bound the DM and file-transfer paths use).
+const JOIN_ARTIFACT_RAW_RECEIVE_ACK_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// ADR 0107 (review r4 P1): hand one join-artifact frame (an inline join
+/// result, a Welcome chunk or a join-result chunk) to the transport.
+///
+/// The ONLY delivery path is x0x's own raw-QUIC direct send: never the
+/// gossip inbox, whose stranded-publish retry (saorsa-gossip-pubsub 0.5.86)
+/// runs detached and could carry the bytes after a revocation or withdrawal.
+/// A failed send never falls back; the joiner's fetch retries. `admission`
+/// runs inside the transport after connection resolution, immediately
+/// before the bytes are handed to the network, so an invalidation that lands
+/// before that point sends nothing.
+pub(super) async fn send_join_artifact(
+    state: &AppState,
+    recipient: &AgentId,
+    payload: &[u8],
+    group_id: &str,
+    kind: &'static str,
+    admission: x0x::dm::TransportAdmission,
+) -> std::result::Result<(), String> {
+    #[cfg(test)]
+    {
+        let recipient_hex = hex::encode(recipient.as_bytes());
+        join_egress_test_barrier::park(&recipient_hex, kind).await;
+        record_join_artifact_delivery_path(state, &recipient_hex, kind, false);
+        if state.agent.network().is_none() {
+            // In-process stand-in for the raw-QUIC transport: the admission
+            // runs where the transport runs it, and the egress witness
+            // records only bytes that would have been handed over.
+            if !admission().await {
+                return Err("transport admission refused".to_string());
+            }
+            if let Ok(mut egress) = state.named_group_test_recorders.join_artifact_egress.lock() {
+                egress.push((recipient_hex, group_id.to_string(), kind));
+            }
+            return Err("no network in process".to_string());
+        }
+    }
+    #[cfg(not(test))]
+    let _ = (group_id, kind);
+    state
+        .agent
+        .send_direct_raw_admitted(
+            recipient,
+            payload,
+            Some(JOIN_ARTIFACT_RAW_RECEIVE_ACK_TIMEOUT),
+            &admission,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// ADR 0107 (review r2): the staged Welcome `welcome_id` (staged at
@@ -35859,17 +36021,6 @@ pub(in crate::server) mod join_egress_test_barrier {
             let _ = gate.release.acquire().await;
         }
     }
-}
-
-/// Whether a direct-message send with `config` can end on the gossip inbox
-/// (mirrors `Agent::send_direct_with_config` routing: only a preferred
-/// raw-QUIC send that stops on a raw error never publishes to gossip).
-#[cfg(test)]
-fn dm_config_can_reach_gossip(config: &x0x::dm::DmSendConfig) -> bool {
-    config.require_gossip
-        || config.require_durable_app_ack
-        || !config.prefer_raw_quic_if_connected
-        || !config.stop_fallback_on_raw_error
 }
 
 /// ADR 0107 (review r2 P1-2): test-only witness of the delivery path a
@@ -36299,25 +36450,21 @@ async fn handle_join_result_message_bound(
                     );
                     return;
                 }
-                #[cfg(test)]
-                join_egress_test_point(
+                let admission = join_result_admission(
                     &task_state,
+                    &group_for_task,
                     &member_for_task,
+                    staged_at,
+                );
+                if let Err(e) = send_join_artifact(
+                    &task_state,
+                    &recipient,
+                    &payload,
                     &group_for_task,
                     "join_result",
+                    admission,
                 )
-                .await;
-                #[cfg(test)]
-                record_join_artifact_delivery_path(
-                    &task_state,
-                    &member_for_task,
-                    "join_result",
-                    dm_config_can_reach_gossip(&direct_message_send_config()),
-                );
-                if let Err(e) = task_state
-                    .agent
-                    .send_direct_with_config(&recipient, payload, direct_message_send_config())
-                    .await
+                .await
                 {
                     tracing::warn!(group_id = %LogHexId::group(&group_for_task), member = %LogHexId::agent(&member_for_task), "failed to send join-result response: {e}");
                     tracing::debug!(
@@ -37439,6 +37586,7 @@ async fn handle_welcome_fetch_request(
 ) {
     let send_state = Arc::clone(state);
     let send_recipient = *sender;
+    let send_group = group_id.clone();
     handle_welcome_fetch_request_via(
         state,
         sender,
@@ -37446,17 +37594,34 @@ async fn handle_welcome_fetch_request(
         welcome_id,
         move |msg: WelcomeBlobMessage| {
             let state = Arc::clone(&send_state);
+            let group_id = send_group.clone();
             async move {
-                #[cfg(test)]
-                record_join_artifact_delivery_path(
-                    &state,
-                    &hex::encode(send_recipient.as_bytes()),
-                    "welcome_frame",
-                    dm_config_can_reach_gossip(&welcome_blob_send_config(&msg)),
-                );
-                send_welcome_blob_message(&state, &send_recipient, &msg)
-                    .await
-                    .map(|_| ())
+                match &msg {
+                    // ADR 0107 (review r4 P1): a chunk carries the Welcome's
+                    // bytes, so it takes the owned, admitted raw-QUIC path
+                    // only. Offer and Complete carry no artifact bytes and
+                    // keep their delivery config.
+                    WelcomeBlobMessage::Chunk { welcome_id, .. } => {
+                        let payload = welcome_blob_payload(&msg)?;
+                        let admission = welcome_chunk_admission(
+                            &state,
+                            welcome_id,
+                            &hex::encode(send_recipient.as_bytes()),
+                        );
+                        send_join_artifact(
+                            &state,
+                            &send_recipient,
+                            &payload,
+                            &group_id,
+                            "welcome_frame",
+                            admission,
+                        )
+                        .await
+                    }
+                    _ => send_welcome_blob_message(&state, &send_recipient, &msg)
+                        .await
+                        .map(|_| ()),
+                }
             }
         },
     )
@@ -37603,8 +37768,6 @@ async fn stream_welcome_blob_guarded<S, F>(
             // The frame's receipt wait runs outside the lock.
             welcome_frame_servable(&state, &group_id, &recipient_hex, &welcome_id, staged_at)
                 .await?;
-            #[cfg(test)]
-            join_egress_test_point(&state, &recipient_hex, &group_id, "welcome_frame").await;
             send.await
         }
     })

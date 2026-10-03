@@ -1110,6 +1110,14 @@ impl Default for DmSendConfig {
 /// X0X-0041: default prefer-newest-connection grace window.
 pub const DEFAULT_PREFER_NEWEST_GRACE_MS: u64 = 250;
 
+/// x0x #1150 (ADR 0107): a caller's admission check, which the raw-QUIC
+/// transport evaluates immediately before handing the bytes to the network
+/// (after connection resolution and every pairing check). `false` refuses
+/// the send and nothing is written.
+pub(crate) type TransportAdmission = std::sync::Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> + Send + Sync,
+>;
+
 /// Backoff schedule between send attempts.
 #[derive(Debug, Clone, Copy)]
 pub enum BackoffPolicy {

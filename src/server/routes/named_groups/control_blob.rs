@@ -41,6 +41,18 @@ pub(in crate::server) struct ControlBlobRef {
     join_attempt_id: Option<String>,
 }
 
+impl ControlBlobRef {
+    /// The group this staged copy belongs to.
+    pub(super) fn group_id(&self) -> &str {
+        &self.group_id
+    }
+
+    /// The hex agent id this staged copy is addressed to.
+    pub(super) fn recipient(&self) -> &str {
+        &self.recipient
+    }
+}
+
 /// Distinct `type` names prevent older Welcome/file listeners from treating
 /// a control chunk as their own. Legacy small event/result JSON is unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +82,20 @@ pub(in crate::server) enum ControlBlobMessage {
 struct StagedBlob {
     bytes: Arc<Vec<u8>>,
     created_at: Instant,
+    /// ADR 0107 (review r2 P2-4): a join-result copy is bound to its
+    /// ORIGINAL artifact: it expires no later than the original's deadline,
+    /// and a re-stage never extends that bound.
+    bound: Option<StagedOrigin>,
+}
+
+/// ADR 0107 (review r2 P2-4): the original staged artifact a blob copies.
+#[derive(Clone, Copy)]
+pub(super) struct StagedOrigin {
+    /// The original artifact's own staging instant (its identity: a purge or
+    /// re-seal replaces it).
+    pub(super) staged_at: Instant,
+    /// The original artifact's deadline.
+    pub(super) deadline: Instant,
 }
 
 struct IncomingBlob {
@@ -103,8 +129,11 @@ struct Registry {
 
 impl Registry {
     fn prune_expired(&mut self) {
-        self.staged
-            .retain(|_, entry| entry.created_at.elapsed() < PENDING_JOIN_RESULT_TTL);
+        let now = Instant::now();
+        self.staged.retain(|_, entry| {
+            entry.created_at.elapsed() < PENDING_JOIN_RESULT_TTL
+                && entry.bound.is_none_or(|bound| now < bound.deadline)
+        });
         // Expiry removes routing only; the owning lease keeps the declared
         // bytes accounted until its task actually ends.
         self.incoming
@@ -150,11 +179,29 @@ impl ControlBlobState {
         f(&mut guard)
     }
 
+    /// An unbound stage (test fixtures); production copies of join
+    /// artifacts always stage through [`Self::stage_with_origin`].
+    #[cfg(test)]
     pub(super) fn stage(
         &self,
         reference: ControlBlobRef,
         bytes: Vec<u8>,
     ) -> Result<(), &'static str> {
+        self.stage_with_origin(reference, bytes, None)
+    }
+
+    /// [`Self::stage`] for a copy of an original artifact: the entry expires
+    /// with the original (`origin.deadline`), and re-staging the identical
+    /// copy never moves that bound later.
+    pub(super) fn stage_with_origin(
+        &self,
+        reference: ControlBlobRef,
+        bytes: Vec<u8>,
+        origin: Option<StagedOrigin>,
+    ) -> Result<(), &'static str> {
+        if origin.is_some_and(|origin| Instant::now() >= origin.deadline) {
+            return Err("the original artifact has expired");
+        }
         if bytes.len() as u64 != reference.byte_len
             || reference.byte_len <= x0x::dm::MAX_PAYLOAD_BYTES as u64
             || reference.byte_len > MAX_BLOB_BYTES
@@ -168,6 +215,13 @@ impl ControlBlobState {
                     return Err("conflicting control blob digest");
                 }
                 existing.created_at = Instant::now();
+                existing.bound = match (existing.bound, origin) {
+                    (Some(old), Some(new)) => Some(StagedOrigin {
+                        staged_at: new.staged_at,
+                        deadline: old.deadline.min(new.deadline),
+                    }),
+                    (old, new) => new.or(old),
+                };
                 return Ok(());
             }
             let peer_count = registry
@@ -195,13 +249,24 @@ impl ControlBlobState {
                 StagedBlob {
                     bytes: Arc::new(bytes),
                     created_at: Instant::now(),
+                    bound: origin,
                 },
             );
             Ok(())
         })
     }
 
-    fn staged_chunk(&self, reference: &ControlBlobRef, sequence: u32) -> Option<Vec<u8>> {
+    /// ADR 0107 (review r2 P2-4): the original artifact a staged copy is
+    /// bound to, while the copy is still staged.
+    pub(super) fn staged_origin(&self, reference: &ControlBlobRef) -> Option<StagedOrigin> {
+        self.with_registry(|registry| registry.staged.get(reference).and_then(|entry| entry.bound))
+    }
+
+    pub(super) fn staged_chunk(
+        &self,
+        reference: &ControlBlobRef,
+        sequence: u32,
+    ) -> Option<Vec<u8>> {
         self.with_registry(|registry| {
             let bytes = &registry.staged.get(reference)?.bytes;
             let start = (sequence as usize).checked_mul(CHUNK_BYTES)?;
@@ -479,15 +544,22 @@ fn control_config(message: &ControlBlobMessage) -> x0x::dm::DmSendConfig {
     }
 }
 
+/// One control-blob frame's wire bytes, refusing a frame over the
+/// direct-message limit.
+pub(super) fn encode_message(message: &ControlBlobMessage) -> std::result::Result<Vec<u8>, String> {
+    let bytes = serde_json::to_vec(message).map_err(|e| e.to_string())?;
+    if bytes.len() > x0x::dm::MAX_PAYLOAD_BYTES {
+        return Err("control blob frame exceeds direct-message limit".to_string());
+    }
+    Ok(bytes)
+}
+
 async fn send_message(
     agent: &Agent,
     recipient: &AgentId,
     message: &ControlBlobMessage,
 ) -> std::result::Result<(), String> {
-    let bytes = serde_json::to_vec(message).map_err(|e| e.to_string())?;
-    if bytes.len() > x0x::dm::MAX_PAYLOAD_BYTES {
-        return Err("control blob frame exceeds direct-message limit".to_string());
-    }
+    let bytes = encode_message(message)?;
     agent
         .send_direct_with_config(recipient, bytes, control_config(message))
         .await
@@ -529,6 +601,7 @@ pub(super) async fn send_reference(
             group_id,
             join_attempt_id,
             bytes.clone(),
+            None,
         ) {
             Ok(reference) => break reference,
             Err(STAGING_BUDGET_EXHAUSTED) if attempt < STAGING_BUDGET_RETRIES => {
@@ -558,6 +631,7 @@ pub(super) const STAGING_BUDGET_RETRY_DELAY: Duration = Duration::from_secs(2);
 /// Stage the exact original JSON once and return its bounded reference
 /// (no retry, no send). ADR 0107 (review r2): join-result staging calls
 /// this under the group's membership lock, after the eligibility check.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn stage_reference(
     store: &ControlBlobState,
     agent: &Agent,
@@ -566,6 +640,7 @@ pub(super) fn stage_reference(
     group_id: &str,
     join_attempt_id: Option<&str>,
     bytes: Vec<u8>,
+    origin: Option<StagedOrigin>,
 ) -> std::result::Result<ControlBlobRef, &'static str> {
     let reference = ControlBlobRef {
         kind,
@@ -576,7 +651,7 @@ pub(super) fn stage_reference(
         byte_len: bytes.len() as u64,
         join_attempt_id: join_attempt_id.map(str::to_string),
     };
-    store.stage(reference.clone(), bytes)?;
+    store.stage_with_origin(reference.clone(), bytes, origin)?;
     Ok(reference)
 }
 
@@ -735,45 +810,41 @@ pub(in crate::server) async fn handle_control_blob_message(
                 let member_hex = reference.recipient.clone();
                 super::spawn_join_artifact_egress(state, &group_id, &member_hex, async move {
                     let _permit = permit;
-                    let store = task_state.control_blobs.clone();
-                    let Some(chunk) = super::join_result_chunk_if_servable(
-                        &task_state,
-                        &reference.group_id,
-                        &reference.recipient,
-                        || store.staged_chunk(&reference, sequence),
-                    )
-                    .await
+                    let Some(chunk) =
+                        super::join_result_chunk_if_servable(&task_state, &reference, sequence)
+                            .await
                     else {
                         tracing::debug!(
                             group_id = %LogHexId::group(&reference.group_id),
                             recipient = %LogHexId::agent(&reference.recipient),
-                            "ADR 0107: join-result chunk withheld; the recipient is not eligible or the blob was purged"
+                            "ADR 0107: join-result chunk withheld; the recipient is not eligible, or the blob or its original expired or was purged"
                         );
                         return;
                     };
-                    #[cfg(test)]
-                    super::join_egress_test_point(
-                        &task_state,
-                        &reference.recipient,
-                        &reference.group_id,
-                        "join_result_chunk",
-                    )
-                    .await;
-                    #[cfg(test)]
-                    let witness_recipient = reference.recipient.clone();
+                    let admission =
+                        super::join_result_chunk_admission(&task_state, &reference, sequence);
+                    let group = reference.group_id.clone();
                     let message = ControlBlobMessage::Chunk {
                         reference,
                         sequence,
                         data_b64: BASE64.encode(chunk),
                     };
-                    #[cfg(test)]
-                    super::record_join_artifact_delivery_path(
+                    let payload = match encode_message(&message) {
+                        Ok(payload) => payload,
+                        Err(reason) => {
+                            tracing::warn!(reason, "control blob chunk encode failed");
+                            return;
+                        }
+                    };
+                    if let Err(reason) = super::send_join_artifact(
                         &task_state,
-                        &witness_recipient,
+                        &recipient,
+                        &payload,
+                        &group,
                         "join_result_chunk",
-                        super::dm_config_can_reach_gossip(&control_config(&message)),
-                    );
-                    if let Err(reason) = send_message(&task_state.agent, &recipient, &message).await
+                        admission,
+                    )
+                    .await
                     {
                         tracing::warn!(reason, "control blob chunk send failed");
                     }
