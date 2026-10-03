@@ -36365,17 +36365,18 @@ fn join_result_staged_now(
 /// ADR 0107 (r5): the staged join-result copy `reference` is still bound
 /// to its unexpired original, read synchronously at the stream seam.
 fn join_result_blob_staged_now(state: &AppState, reference: &control_blob::ControlBlobRef) -> bool {
-    state
-        .control_blobs
-        .staged_origin(reference)
-        .is_some_and(|origin| {
-            join_result_staged_now(
-                state,
-                reference.group_id(),
-                reference.recipient(),
-                origin.staged_at,
-            )
-        })
+    // r6 (P2): never block at the seam; contention refuses (withhold).
+    let Ok(origin) = state.control_blobs.try_staged_origin(reference) else {
+        return false;
+    };
+    origin.is_some_and(|origin| {
+        join_result_staged_now(
+            state,
+            reference.group_id(),
+            reference.recipient(),
+            origin.staged_at,
+        )
+    })
 }
 
 /// ADR 0107 (r5): the staged Welcome `welcome_id` (staged at `staged_at`)

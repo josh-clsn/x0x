@@ -262,6 +262,29 @@ impl ControlBlobState {
         self.with_registry(|registry| registry.staged.get(reference).and_then(|entry| entry.bound))
     }
 
+    /// ADR 0107 (r6, P2): [`Self::staged_origin`] for the synchronous stream
+    /// seam: it never blocks and never prunes. `Err(())` when the registry
+    /// is contended (the caller withholds and retries); `Ok(None)` when the
+    /// copy is absent, unbound or past its original's deadline or its own
+    /// TTL.
+    pub(super) fn try_staged_origin(
+        &self,
+        reference: &ControlBlobRef,
+    ) -> Result<Option<StagedOrigin>, ()> {
+        let registry = match self.0.registry.try_lock() {
+            Ok(registry) => registry,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Err(()),
+        };
+        let now = Instant::now();
+        Ok(registry
+            .staged
+            .get(reference)
+            .filter(|entry| entry.created_at.elapsed() < PENDING_JOIN_RESULT_TTL)
+            .and_then(|entry| entry.bound)
+            .filter(|origin| now < origin.deadline))
+    }
+
     /// ADR 0107 (r6, test only): hold the staging registry's lock on
     /// another thread for `hold`; the receiver fires once it is held.
     #[cfg(test)]
