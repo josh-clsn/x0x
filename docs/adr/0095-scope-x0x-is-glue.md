@@ -2,7 +2,8 @@
 
 <!-- File name: docs/adr/0095-scope-x0x-is-glue.md -->
 
-- **Status:** Proposed
+- **Status:** Accepted
+- **Accepted:** 2026-10-03 by David Irvine (D58, as written: the Proposed text merged via #1185, commit 80d448e; his instruction to Claude directly). The Open questions remain open for later rulings. The status change was applied by Claude at his instruction.
 - **Date:** 2026-10-03
 - **Decision owners:** David Irvine (ruling D19, revised 2026-09-29; only
   David marks this ADR Accepted)
