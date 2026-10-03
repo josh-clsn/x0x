@@ -164,18 +164,25 @@ async fn keyed(joiner: &AppState, group_key: &str) -> bool {
     joiner.treekem_groups.read().await.contains_key(group_key)
 }
 
-fn outcome_of(joiner: &AppState, group_key: &str) -> Option<&'static str> {
-    joiner
+/// The typed failed re-arm on the join-status surface: `timed_out`, with
+/// the cause named.
+fn assert_rearm_timed_out(joiner: &AppState, group_key: &str, ctx: &str) {
+    let outcome = joiner
         .last_join_outcomes
         .lock()
         .expect("outcomes")
         .get(group_key)
-        .map(|o| o.outcome)
+        .map(|o| (o.outcome, o.reason));
+    assert_eq!(
+        outcome,
+        Some(("timed_out", Some(super::super::JOIN_REARM_TIMEOUT_REASON))),
+        "[{ctx}] a failed re-arm ends with the typed timed_out outcome and its cause"
+    );
 }
 
 /// The authority's PRODUCTION `FetchRequest` arm for `joiner`; returns the
 /// join result it decided to serve, if any.
-async fn serve_result(
+pub(super) async fn serve_result(
     authority: &Arc<AppState>,
     joiner: &AppState,
     stable: &str,
@@ -218,7 +225,7 @@ async fn serve_result(
 
 /// The authority's PRODUCTION Welcome serve path for `joiner`; true when it
 /// started a stream for the staged Welcome.
-async fn serve_welcome(
+pub(super) async fn serve_welcome(
     authority: &Arc<AppState>,
     joiner: &AppState,
     stable: &str,
@@ -774,6 +781,153 @@ async fn s8a_1150_rearm_rejects_stale_attempts_and_sends_no_volley() -> anyhow::
     Ok(())
 }
 
+/// WHY (ADR 0107 Validation, "disabling re-arm reproduces the keyless
+/// failure"): with the re-arm switched off, the same fixture takes the
+/// pre-S8 (a) path — the remnant is cleared, the base-seat shortcut reports
+/// the snapshot seat, and the authority's ORIGINAL add is stale at the base
+/// revision, so its Welcome is never consumed and the device stays keyless
+/// (#1150).
+#[tokio::test]
+async fn s8a_1150_disabling_rearm_reproduces_the_keyless_failure() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    stuck_with_carry(&s).await?;
+    let _disabled = super::super::disable_rearm_for_test(&s.group_key);
+    let (status, body, new_attempt) = redeem_fresh_invite(&s, &s.j2, &s.authority).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        join_state_of(&body),
+        "active",
+        "without re-arm the base-seat shortcut reports the snapshot seat: {body}"
+    );
+    let new_attempt = new_attempt.expect("the ordinary path registered an attempt");
+    let from = remnant_revision(&s.j2, &s.group_key).await;
+    assert_eq!(from, Some(s.base + 2), "the row jumped to the invite base");
+    let served = serve_result(&s.authority, &s.j2, &s.stable, &new_attempt, from)
+        .await
+        .expect("the eligible device is still served its original result");
+    let welcome_id = welcome_id_of(&s.j2_add).expect("welcome ref");
+    assert!(serve_welcome(&s.authority, &s.j2, &s.stable, &welcome_id).await);
+    let served = with_inline_welcome(&s.authority, served).await;
+    deliver(&s.j2, &s.authority_id, served, &new_attempt).await;
+    assert_eq!(local_state(&s.j2, &s.group_key).await, "active");
+    assert!(
+        !keyed(&s.j2, &s.group_key).await,
+        "#1150: the original add is stale at the base revision; the device stays keyless"
+    );
+    Ok(())
+}
+
+/// WHY (ADR 0107 bounds): re-arm restores the ORIGINAL seat only. A commit
+/// the authority sealed after J2's add (a third device at r+3) is not part of
+/// the recovered result: J2 ends keyed at r+2 and still needs ordinary
+/// catch-up (#818) to reach the authority's head.
+#[tokio::test]
+async fn s8a_1150_rearm_restores_the_original_seat_and_post_seal_commits_need_catch_up(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    stuck_with_carry(&s).await?;
+    let j3 = device(&s.dir, "j3", x0x::identity::AgentKeypair::generate()?).await?;
+    let link = mint_for(&s.authority, &s.group_key, &j3).await?;
+    let (status, body) = join(&j3, link, Some(owner_pin_of(&s.authority))).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, Some(j3_joined)) = attempt_of(&j3, &s.stable).expect("J3 attempt") else {
+        panic!("J3 stored its MemberJoined");
+    };
+    assert!(
+        apply_named_group_metadata_event(&s.authority, j3_joined, j3.agent.agent_id(), true, None)
+            .await
+            .accepted,
+        "the authority seals a post-seal commit"
+    );
+    assert_eq!(
+        remnant_revision(&s.authority, &s.group_key).await,
+        Some(s.base + 3)
+    );
+
+    let (status, body, new_attempt) = redeem_fresh_invite(&s, &s.j2, &s.authority).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(join_state_of(&body), "pending_authority_commit", "{body}");
+    let new_attempt = new_attempt.expect("re-arm attempt");
+    let served = serve_result(
+        &s.authority,
+        &s.j2,
+        &s.stable,
+        &new_attempt,
+        Some(s.base + 1),
+    )
+    .await
+    .expect("the original result is served");
+    let welcome_id = welcome_id_of(&s.j2_add).expect("welcome ref");
+    assert!(serve_welcome(&s.authority, &s.j2, &s.stable, &welcome_id).await);
+    let served = with_inline_welcome(&s.authority, served).await;
+    deliver(&s.j2, &s.authority_id, served, &new_attempt).await;
+    assert_eq!(local_state(&s.j2, &s.group_key).await, "active");
+    assert!(keyed(&s.j2, &s.group_key).await);
+    assert_eq!(
+        remnant_revision(&s.j2, &s.group_key).await,
+        Some(s.base + 2),
+        "restoring the Welcome alone does not reach the authority's r+3 head"
+    );
+    Ok(())
+}
+
+/// The operator exit after a failed re-arm (ADR 0107): owner remove-member,
+/// then a fresh invite (whose base no longer seats the device) clears the
+/// remnant and admits the device again through the ordinary join — served by
+/// the guarded paths, ending keyed-active.
+async fn owner_remove_and_reinvite_restores_keys(s: &Fixture, ctx: &str) -> anyhow::Result<()> {
+    let removed = remove_named_group_member(
+        State(Arc::clone(&s.authority)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path((s.group_key.clone(), hex_of(&s.j2))),
+    )
+    .await
+    .into_response();
+    anyhow::ensure!(
+        removed.status().is_success(),
+        "[{ctx}] owner remove-member: {}",
+        removed.status()
+    );
+    let (status, body, attempt) = redeem_fresh_invite(s, &s.j2, &s.authority).await?;
+    anyhow::ensure!(
+        status == StatusCode::OK && join_state_of(&body) == "pending_authority_commit",
+        "[{ctx}] re-invite: {status} {body}"
+    );
+    let attempt = attempt.ok_or_else(|| anyhow::anyhow!("[{ctx}] no new attempt"))?;
+    let Some((_, Some(joined))) = attempt_of(&s.j2, &s.stable) else {
+        anyhow::bail!("[{ctx}] the ordinary join stored its MemberJoined");
+    };
+    anyhow::ensure!(
+        apply_named_group_metadata_event(&s.authority, joined, s.j2.agent.agent_id(), true, None)
+            .await
+            .accepted,
+        "[{ctx}] the authority re-admits the removed device"
+    );
+    let staged_add = staged(&s.authority, &s.stable, &hex_of(&s.j2))
+        .await
+        .ok_or_else(|| anyhow::anyhow!("[{ctx}] re-admission staged"))?
+        .event;
+    let from = remnant_revision(&s.j2, &s.group_key).await;
+    let served = serve_result(&s.authority, &s.j2, &s.stable, &attempt, from)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("[{ctx}] the re-admitted device is served"))?;
+    let welcome_id =
+        welcome_id_of(&staged_add).ok_or_else(|| anyhow::anyhow!("[{ctx}] welcome ref"))?;
+    anyhow::ensure!(
+        serve_welcome(&s.authority, &s.j2, &s.stable, &welcome_id).await,
+        "[{ctx}] the re-admission Welcome is streamed"
+    );
+    let served = with_inline_welcome(&s.authority, served).await;
+    deliver(&s.j2, &s.authority_id, served, &attempt).await;
+    anyhow::ensure!(
+        local_state(&s.j2, &s.group_key).await == "active" && keyed(&s.j2, &s.group_key).await,
+        "[{ctx}] owner remove-member + re-invite restores membership WITH keys"
+    );
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy)]
 enum LostStaging {
     ResultExpired,
@@ -838,14 +992,27 @@ async fn s8a_1150_lost_staging_never_claims_recovery() -> anyhow::Result<()> {
         );
         let new_attempt = new_attempt.expect("re-arm registered an attempt");
         let served = serve_result(&serving, &s.j2, &s.stable, &new_attempt, Some(s.base + 1)).await;
-        let welcome = serve_welcome(&serving, &s.j2, &s.stable, &welcome_id).await;
         match case {
-            LostStaging::ResultExpired | LostStaging::AuthorityRestarted => {
+            // Without the result the device never learns the Welcome
+            // reference, so it has nothing to pull.
+            LostStaging::ResultExpired => {
                 assert!(served.is_none(), "[{case:?}] no result to serve");
             }
-            LostStaging::WelcomeExpired => {}
+            LostStaging::WelcomeExpired => {
+                assert!(served.is_some(), "[{case:?}] the result is still staged");
+                assert!(
+                    !serve_welcome(&serving, &s.j2, &s.stable, &welcome_id).await,
+                    "[{case:?}] no Welcome to stream"
+                );
+            }
+            LostStaging::AuthorityRestarted => {
+                assert!(served.is_none(), "[{case:?}] no result to serve");
+                assert!(
+                    !serve_welcome(&serving, &s.j2, &s.stable, &welcome_id).await,
+                    "[{case:?}] no Welcome to stream"
+                );
+            }
         }
-        assert!(!welcome, "[{case:?}] no Welcome to stream");
         assert!(!keyed(&s.j2, &s.group_key).await, "[{case:?}] keyed");
         assert_ne!(local_state(&s.j2, &s.group_key).await, "active");
         super::super::finalize_join_attempt(
@@ -858,12 +1025,18 @@ async fn s8a_1150_lost_staging_never_claims_recovery() -> anyhow::Result<()> {
             super::super::JoinFinalizeGuard::Unlocked,
         )
         .await;
-        assert_eq!(outcome_of(&s.j2, &s.group_key), Some("timed_out"));
+        assert_rearm_timed_out(&s.j2, &s.group_key, &format!("{case:?}"));
         assert_eq!(
             local_state(&s.j2, &s.group_key).await,
             "not_member",
             "[{case:?}] a failed re-arm leaves the remnant for owner remove-member + re-invite"
         );
+        // The eligible-device exit works from that state (an authority that
+        // restarted reloads no TreeKEM group in this fixture, so its exit is
+        // the same route and is not repeated here).
+        if !matches!(case, LostStaging::AuthorityRestarted) {
+            owner_remove_and_reinvite_restores_keys(&s, &format!("{case:?}")).await?;
+        }
     }
     Ok(())
 }
@@ -981,7 +1154,7 @@ async fn s8a_1149_carry_remnant_never_gains_keys_after_post_seal_ineligibility(
             super::super::JoinFinalizeGuard::Unlocked,
         )
         .await;
-        assert_eq!(outcome_of(&s.j2, &s.group_key), Some("timed_out"));
+        assert_rearm_timed_out(&s.j2, &s.group_key, &format!("{case:?}"));
         assert_eq!(local_state(&s.j2, &s.group_key).await, "not_member");
         assert!(
             !keyed(&s.j2, &s.group_key).await,

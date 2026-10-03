@@ -10629,6 +10629,9 @@ async fn apply_named_group_metadata_event_with_binding(
     if applied.accepted {
         if let Some((gid, member)) = departing_member.as_ref() {
             clear_cert_evidence_stamps_for(state, gid, Some(member)).await;
+            // ADR 0107: a removal or ban authored elsewhere drops the
+            // member's join artifacts this node staged as its sealer.
+            purge_join_artifacts_if_ineligible(state, gid, member).await;
         }
         if let Some(gid) = member_landing_group {
             replay_parked_role_updates(state, &gid).await;
@@ -17827,6 +17830,42 @@ fn take_member_joined_sign_failure_for_test(group_id: &str, member_agent_id: &st
         .unwrap_or(false)
 }
 
+/// ADR 0107 Validation ("disabling re-arm reproduces the keyless failure"):
+/// test-only switch, per group, that routes a base-seated carry remnant back
+/// onto the pre-S8 (a) clear + base-seat path.
+#[cfg(test)]
+static JOIN_TEST_DISABLE_REARM: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+#[cfg(test)]
+struct JoinRearmDisabledGuard(String);
+
+#[cfg(test)]
+impl Drop for JoinRearmDisabledGuard {
+    fn drop(&mut self) {
+        if let Ok(mut groups) = JOIN_TEST_DISABLE_REARM.lock() {
+            groups.remove(&self.0);
+        }
+    }
+}
+
+#[cfg(test)]
+fn disable_rearm_for_test(group_id: &str) -> JoinRearmDisabledGuard {
+    if let Ok(mut groups) = JOIN_TEST_DISABLE_REARM.lock() {
+        groups.insert(group_id.to_string());
+    }
+    JoinRearmDisabledGuard(group_id.to_string())
+}
+
+#[cfg(test)]
+fn rearm_disabled_for_test(group_id: &str) -> bool {
+    JOIN_TEST_DISABLE_REARM
+        .lock()
+        .map(|groups| groups.contains(group_id))
+        .unwrap_or(false)
+}
+
 /// r3 (Codex 10): join-time bound on the invite-carried Home metadata's
 /// `primary_agent`. The field names an agent id — 64 hex chars (the
 /// 32-byte `AgentId` encoding); anything longer can never resolve and is
@@ -17930,6 +17969,143 @@ async fn clear_stale_not_member_join_row(state: &AppState, group_id_hex: &str, j
         cleared = cleared.len(),
         "D39: cleared a not_member local row so a fresh invite starts a new join attempt"
     );
+}
+
+/// ADR 0107 (0088 S8 (a)): re-arm this device's sealed-but-unconfirmed
+/// join.
+///
+/// Called by the join route with the membership guard held, for an
+/// [`NotMemberJoinRow::UnseatedJoinRemnant`] (a durable carry row with no
+/// own seat) when the VERIFIED invite base seats this device: the
+/// authority sealed the add, but its join result and Welcome never landed.
+/// Neither #1148's clear nor the base-seat shortcut runs. The row keeps its
+/// pre-seat revision and verified chain prefix; a leftover TreeKEM group
+/// for the key is dropped so it cannot satisfy the poll's key-presence
+/// confirmation. A NEW bound attempt then re-fetches the authority's
+/// still-staged ORIGINAL result (own `MemberAdded` + Welcome) through the
+/// ordinary bound apply, with every signature, authority, chain,
+/// owner-certificate, revocation and fork check unchanged. The TreeKEM
+/// identity is re-derived from the agent secret (`agent_treekem_seed`), so
+/// nothing new is stored.
+///
+/// The attempt is fetch-only: it stores and sends no `MemberJoined` volley.
+/// The authority's step 7 would only reject one as an Active replay, and a
+/// re-arm never asks for a new admission. The expected-inviter pin is this
+/// invite's inviter, so only the device that sealed the original add can
+/// complete it. The attempt ends through the ordinary poll: confirmed once
+/// the Welcome installs (TreeKEM) or the roster seats the device, otherwise
+/// the typed `timed_out` outcome, which leaves the remnant for the owner
+/// remove-member + re-invite exit.
+#[allow(clippy::too_many_arguments)]
+async fn rearm_sealed_unconfirmed_join(
+    state: &Arc<AppState>,
+    membership_guard: tokio::sync::MutexGuard<'_, ()>,
+    group_id_hex: &str,
+    remnant: x0x::groups::GroupInfo,
+    invite: &x0x::groups::invite::SignedInvite,
+    invite_link: &str,
+    inviter: AgentId,
+    await_treekem: bool,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let joiner_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let stable = remnant.stable_group_id().to_string();
+    let expected_key = join_result_key(&stable, &joiner_hex);
+    // The remnant's map key, exactly as the route found it (key match
+    // first, else the record whose MLS id is the invite's group id).
+    let remnant_key = {
+        let roster = state.named_groups.read().await;
+        if roster.contains_key(group_id_hex) {
+            group_id_hex.to_string()
+        } else {
+            roster
+                .iter()
+                .find(|(_, info)| info.mls_group_id == group_id_hex)
+                .map_or_else(|| group_id_hex.to_string(), |(key, _)| key.clone())
+        }
+    };
+    // A leftover TreeKEM group must not confirm the poll: confirmation
+    // requires installing the recovered Welcome in THIS attempt.
+    state.treekem_groups.write().await.remove(&remnant_key);
+    let attempt_id = hex::encode(rand::random::<[u8; 32]>());
+    {
+        // The same membership → persistence critical section as a fresh
+        // install, so join-status never observes a torn re-arm.
+        let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+        record_expected_join_result_inviter(
+            state.as_ref(),
+            expected_key.clone(),
+            invite.inviter.clone(),
+        );
+        state
+            .last_join_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&remnant_key);
+        state
+            .pending_join_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                expected_key,
+                PendingJoinAttempt {
+                    attempt_id: attempt_id.clone(),
+                    local_group_key: remnant_key.clone(),
+                    invite_fingerprint: join_invite_fingerprint(invite_link),
+                    invite_group_id: stable.clone(),
+                    inviter_public_key_b64: invite.inviter_public_key_b64.clone(),
+                    stored_resend: None,
+                    polls: Vec::new(),
+                    tasks: Vec::new(),
+                    listener_token: None,
+                },
+            );
+    }
+    ensure_named_group_listeners(Arc::clone(state), &remnant_key).await;
+    {
+        let poll_state = Arc::clone(state);
+        let poll_group = remnant_key.clone();
+        let poll_event_group = stable.clone();
+        let poll_member = joiner_hex.clone();
+        let poll_attempt = attempt_id.clone();
+        spawn_attempt_task_under_guard(
+            state,
+            &stable,
+            &joiner_hex,
+            &attempt_id,
+            AttemptTaskKind::Poll,
+            Some(&membership_guard),
+            async move {
+                poll_join_result_until_membership_confirmed(
+                    poll_state,
+                    poll_group,
+                    poll_event_group,
+                    inviter,
+                    poll_member,
+                    await_treekem,
+                    None,
+                    poll_attempt,
+                )
+                .await;
+            },
+        );
+    }
+    drop(membership_guard);
+    tracing::info!(
+        group_id = %LogHexId::group(&remnant_key),
+        revision = remnant.state_revision,
+        "ADR 0107: re-armed a sealed-but-unconfirmed join; re-fetching the authority's original join result"
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "already_joined": false,
+            "join_state": "pending_authority_commit",
+            "group_id": group_id_hex,
+            "group_name": invite.group_name,
+            "chat_topic": remnant.general_chat_topic(),
+        })),
+    )
 }
 
 pub(in crate::server) async fn join_group_via_invite(
@@ -18220,8 +18396,9 @@ pub(in crate::server) async fn join_group_via_invite(
     // D39(A): the provably-unseated remnant of this device's OWN failed
     // join (see `classify_not_member_join_row`) must not swallow a fresh
     // invite as an idempotent success. It is cleared below and the join
-    // proceeds as a NEW attempt.
+    // proceeds as a NEW attempt — unless ADR 0107 re-arms it instead.
     let mut stale_not_member_row = false;
+    let mut rearm_remnant: Option<x0x::groups::GroupInfo> = None;
     {
         let groups = state.named_groups.read().await;
         if has_withdrawn_group_record(&groups, &group_id_hex)
@@ -18276,7 +18453,24 @@ pub(in crate::server) async fn join_group_via_invite(
                     );
                 }
                 if not_member_row == Some(NotMemberJoinRow::UnseatedJoinRemnant) {
-                    stale_not_member_row = true;
+                    // ADR 0107 (0088 S8 (a)): the VERIFIED invite base is
+                    // the discriminator. A base that seats this device
+                    // proves the authority sealed its add, so the remnant
+                    // is re-armed (neither the #1148 clear nor the
+                    // base-seat shortcut runs). Otherwise #1148's clear
+                    // stands.
+                    let base_seats_device = view
+                        .base_roster
+                        .get(&joiner_hex)
+                        .is_some_and(|seat| seat.state == x0x::groups::GroupMemberState::Active);
+                    #[cfg(test)]
+                    let base_seats_device =
+                        base_seats_device && !rearm_disabled_for_test(&group_id_hex);
+                    if base_seats_device {
+                        rearm_remnant = Some(info);
+                    } else {
+                        stale_not_member_row = true;
+                    }
                 } else {
                     let still_pending = membership_state == "pending_authority_commit";
                     if still_pending {
@@ -18295,36 +18489,44 @@ pub(in crate::server) async fn join_group_via_invite(
                         // can never transmit unowned. A post-restart pending
                         // has no registry entry (empty attempt id): its legacy
                         // repair wrapper spawns detached (C8's deadline owner).
-                        let owning_attempt_id = {
+                        let (owning_attempt_id, fetch_only) = {
                             let attempts = state
                                 .pending_join_attempts
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
                             attempts
                                 .get(&join_result_key(&refire_stable, &joiner_hex))
-                                .map(|entry| entry.attempt_id.clone())
+                                .map(|entry| {
+                                    (entry.attempt_id.clone(), entry.stored_resend.is_none())
+                                })
                                 .unwrap_or_default()
                         };
                         drop(groups);
-                        spawn_attempt_task_under_guard(
-                            state.as_ref(),
-                            invite_stable_group_id,
-                            &joiner_hex,
-                            &owning_attempt_id,
-                            AttemptTaskKind::Task,
-                            Some(&membership_guard),
-                            async move {
-                                refire_pending_join_volley(
-                                    &refire_state,
-                                    &refire_group_id,
-                                    refire_stable,
-                                    &refire_inviter,
-                                    refire_secret,
-                                    refire_treekem,
-                                )
-                                .await;
-                            },
-                        );
+                        // ADR 0107: a REGISTERED attempt without a stored
+                        // volley is a fetch-only S8 (a) re-arm. It keeps
+                        // polling for the original result and never sends
+                        // a `MemberJoined` (no new admission is asked for).
+                        if !fetch_only {
+                            spawn_attempt_task_under_guard(
+                                state.as_ref(),
+                                invite_stable_group_id,
+                                &joiner_hex,
+                                &owning_attempt_id,
+                                AttemptTaskKind::Task,
+                                Some(&membership_guard),
+                                async move {
+                                    refire_pending_join_volley(
+                                        &refire_state,
+                                        &refire_group_id,
+                                        refire_stable,
+                                        &refire_inviter,
+                                        refire_secret,
+                                        refire_treekem,
+                                    )
+                                    .await;
+                                },
+                            );
+                        }
                         drop(membership_guard);
                     }
                     let confirmed = membership_state == "active";
@@ -18347,6 +18549,21 @@ pub(in crate::server) async fn join_group_via_invite(
                 }
             }
         }
+    }
+    if let Some(remnant) = rearm_remnant {
+        // Still under the membership guard taken above: the re-arm installs
+        // its attempt and poll before any apply or finalizer can interleave.
+        return rearm_sealed_unconfirmed_join(
+            &state,
+            membership_guard,
+            &group_id_hex,
+            remnant,
+            &invite,
+            &req.invite,
+            inviter_agent,
+            invite_is_treekem,
+        )
+        .await;
     }
     if stale_not_member_row {
         // Still under the membership guard taken above, so no concurrent
@@ -19612,6 +19829,28 @@ async fn add_treekem_named_group_member(
 
 /// DELETE /groups/:id/members/:agent_id — remove a member from the named-group roster.
 pub(in crate::server) async fn remove_named_group_member(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
+    Path((id, agent_id_hex)): Path<(String, String)>,
+) -> axum::response::Response {
+    let response = remove_named_group_member_inner(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(actor),
+        Path((id.clone(), agent_id_hex.clone())),
+    )
+    .await
+    .into_response();
+    // ADR 0107: a committed removal drops the member's staged join result
+    // and Welcomes and cancels any unsent Welcome transfer. The roster
+    // decides: a refused or failed removal leaves an eligible member's
+    // artifacts in place.
+    purge_join_artifacts_if_ineligible(&state, &id, &agent_id_hex).await;
+    response
+}
+
+async fn remove_named_group_member_inner(
     State(state): State<Arc<AppState>>,
     axum::extract::Extension(actor): axum::extract::Extension<
         crate::server::rider_auth::ActorContext,
@@ -23945,6 +24184,26 @@ pub(in crate::server) async fn update_member_role(
 
 /// POST /groups/:id/ban/:agent_id — ban a member (admin+).
 pub(in crate::server) async fn ban_group_member(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
+    Path((id, agent_id_hex)): Path<(String, String)>,
+) -> axum::response::Response {
+    let response = ban_group_member_inner(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(actor),
+        Path((id.clone(), agent_id_hex.clone())),
+    )
+    .await
+    .into_response();
+    // ADR 0107: a committed ban drops the member's staged join result and
+    // Welcomes and cancels any unsent Welcome transfer.
+    purge_join_artifacts_if_ineligible(&state, &id, &agent_id_hex).await;
+    response
+}
+
+async fn ban_group_member_inner(
     State(state): State<Arc<AppState>>,
     axum::extract::Extension(actor): axum::extract::Extension<
         crate::server::rider_auth::ActorContext,
@@ -34120,6 +34379,13 @@ pub(in crate::server) enum JoinAttemptOutcome {
     TimedOut,
 }
 
+/// ADR 0107: the `timed_out` reason a failed S8 (a) re-arm records on the
+/// join-status surface — the authority's original join result or Welcome
+/// could not be fetched (staging expired or lost, inviter mismatch, or the
+/// device is no longer eligible). The exit for an eligible device is owner
+/// remove-member + re-invite.
+pub(in crate::server) const JOIN_REARM_TIMEOUT_REASON: &str = "rearm_original_result_unavailable";
+
 /// #477 C5 — the SEAT finalizer at the `MemberAdded` apply site (the
 /// caller holds the group's membership guard): whatever attempt is pending
 /// for `(event_group_id, member)` is finalized as `Seated` — its polls and
@@ -34287,6 +34553,9 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
             return JoinFinalizeDisposition::NotApplicable;
         }
     }
+    // ADR 0107: whether the finalized attempt was a fetch-only S8 (a) re-arm
+    // (a registered attempt with no stored volley).
+    let mut fetch_only = false;
     let (mut polls, mut tasks, listener_token) = {
         let mut attempts = state
             .pending_join_attempts
@@ -34299,6 +34568,7 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
             let Some(mut entry) = attempts.remove(&expected_key) else {
                 return JoinFinalizeDisposition::NotApplicable;
             };
+            fetch_only = entry.stored_resend.is_none();
             (
                 std::mem::take(&mut entry.polls),
                 std::mem::take(&mut entry.tasks),
@@ -34376,6 +34646,16 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(local_group_key);
         }
+        // ADR 0107: a re-arm (fetch-only, over the durable carry remnant)
+        // that times out names its cause on the existing status surface:
+        // the authority's original result or Welcome could not be fetched.
+        // The remnant stays for the owner remove-member + re-invite exit.
+        let reason = match (outcome, reason) {
+            (JoinAttemptOutcome::TimedOut, None) if fetch_only && !stub_is_pending => {
+                Some(JOIN_REARM_TIMEOUT_REASON)
+            }
+            (_, reason) => reason,
+        };
         state
             .last_join_outcomes
             .lock()
@@ -35033,6 +35313,211 @@ async fn apply_join_result_intervening_events(
     }
 }
 
+/// ADR 0107 (0088 S8 (a)): why the authority must not serve a recipient its
+/// staged join artifacts (join result or Welcome) right now. Historical
+/// invite or seal evidence never counts: only the CURRENT committed roster,
+/// the current revocation set and the current clock do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinArtifactRefusal {
+    /// This node holds no record for the group under either spelling.
+    UnknownGroup,
+    GroupWithdrawn,
+    /// Fork-quarantined: containment holds until an admin acts.
+    GroupQuarantined,
+    Banned,
+    /// No Active seat on the current committed roster (removed or absent).
+    NotActive,
+    /// The recipient's agent key is in the ADR-0018 revocation set.
+    Revoked,
+    /// OwnerCertified: the roster seat commits to a certificate digest but
+    /// holds no bytes (`MemberCertStatus::DigestPending`).
+    CertificateDigestPending,
+    /// OwnerCertified: the roster seat holds no certificate evidence at all
+    /// (the roster verdict's missing-evidence `InGrace` shape).
+    CertificateMissing,
+    /// OwnerCertified: the roster-embedded certificate fails
+    /// `verify_cert_against_owner` against the current clock.
+    CertificateInvalid(x0x::groups::owner_cert::OwnerCertFailure),
+}
+
+impl JoinArtifactRefusal {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::UnknownGroup => "group_unknown",
+            Self::GroupWithdrawn => "group_withdrawn",
+            Self::GroupQuarantined => "group_quarantined",
+            Self::Banned => "member_banned",
+            Self::NotActive => "member_not_active",
+            Self::Revoked => "member_revoked",
+            Self::CertificateDigestPending => "certificate_digest_pending",
+            Self::CertificateMissing => "certificate_missing",
+            Self::CertificateInvalid(_) => "certificate_invalid",
+        }
+    }
+
+    /// A definitive refusal invalidates the member's staged artifacts: the
+    /// seat or the certificate is gone, not merely awaiting evidence or an
+    /// operator. Pending evidence (digest-only or missing bytes), quarantine
+    /// and an unknown spelling only withhold.
+    fn is_definitive(self) -> bool {
+        matches!(
+            self,
+            Self::GroupWithdrawn
+                | Self::Banned
+                | Self::NotActive
+                | Self::Revoked
+                | Self::CertificateInvalid(_)
+        )
+    }
+}
+
+/// ADR 0107: the pure serving guard over one roster record. `None` means
+/// `member_hex` may receive its staged artifacts now. OwnerCertified groups
+/// verify the certificate EMBEDDED in the committed roster seat (the one
+/// `MemberJoined` bound into the `MemberAdded` commit) — never the
+/// announce/discovery cache, which a #842 inline-certificate first join may
+/// not have reached. Other groups skip the certificate check only.
+fn join_artifact_serving_refusal_for(
+    info: &x0x::groups::GroupInfo,
+    member_hex: &str,
+    revoked: bool,
+    now_unix: u64,
+) -> Option<JoinArtifactRefusal> {
+    if info.withdrawn {
+        return Some(JoinArtifactRefusal::GroupWithdrawn);
+    }
+    if info.is_fork_quarantined() {
+        return Some(JoinArtifactRefusal::GroupQuarantined);
+    }
+    if info.is_banned(member_hex) {
+        return Some(JoinArtifactRefusal::Banned);
+    }
+    if revoked {
+        return Some(JoinArtifactRefusal::Revoked);
+    }
+    let Some(seat) = info
+        .members_v2
+        .get(member_hex)
+        .filter(|seat| seat.is_active())
+    else {
+        return Some(JoinArtifactRefusal::NotActive);
+    };
+    let owner = info.policy.admission.owner_certified_user_id()?;
+    match seat.certificate.as_ref() {
+        Some(cert) => x0x::groups::owner_cert::verify_cert_against_owner(
+            owner, member_hex, cert, false, now_unix,
+        )
+        .err()
+        .map(JoinArtifactRefusal::CertificateInvalid),
+        None if seat.certificate_digest.is_some() => {
+            Some(JoinArtifactRefusal::CertificateDigestPending)
+        }
+        None => Some(JoinArtifactRefusal::CertificateMissing),
+    }
+}
+
+/// ADR 0107: the serving guard against the CURRENT local state. Callers on
+/// a serving path hold the group's membership lock, so the check and the
+/// artifact selection are linearized with every membership mutation.
+async fn join_artifact_serving_refusal(
+    state: &AppState,
+    group_id: &str,
+    member_hex: &str,
+) -> Option<JoinArtifactRefusal> {
+    let revoked = match parse_agent_id_hex(member_hex) {
+        Ok(member) => state
+            .agent
+            .revocation_set()
+            .read()
+            .await
+            .is_agent_revoked(&member),
+        Err(_) => return Some(JoinArtifactRefusal::NotActive),
+    };
+    let now_unix = x0x::groups::owner_cert::restore_clock_now();
+    let roster = state.named_groups.read().await;
+    match crate::server::resolve_group_entry_locked(&roster, group_id) {
+        Some((_, info)) => join_artifact_serving_refusal_for(info, member_hex, revoked, now_unix),
+        None => Some(JoinArtifactRefusal::UnknownGroup),
+    }
+}
+
+/// ADR 0107: drop `member_hex`'s staged join result and Welcomes for this
+/// group (every spelling) and cancel any Welcome transfer still streaming a
+/// copy, so a previously copied cache entry cannot outlive the member's
+/// eligibility.
+async fn purge_member_join_artifacts(state: &AppState, group_id: &str, member_hex: &str) {
+    let aliases: HashSet<String> = {
+        let roster = state.named_groups.read().await;
+        let mut aliases = HashSet::from([group_id.to_string()]);
+        if let Some((key, info)) = crate::server::resolve_group_entry_locked(&roster, group_id) {
+            aliases.insert(key.to_string());
+            aliases.insert(info.stable_group_id().to_string());
+            aliases.insert(info.mls_group_id.clone());
+        }
+        aliases
+    };
+    let mut dropped_results = 0usize;
+    {
+        let mut results = state.pending_join_results.write().await;
+        for alias in &aliases {
+            if results
+                .remove(&join_result_key(alias, member_hex))
+                .is_some()
+            {
+                dropped_results += 1;
+            }
+        }
+    }
+    let welcome_ids: Vec<String> = {
+        let mut welcomes = state.pending_welcomes.write().await;
+        let ids: Vec<String> = welcomes
+            .iter()
+            .filter(|(_, pending)| {
+                pending.joiner_agent == member_hex && aliases.contains(&pending.group_id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &ids {
+            welcomes.remove(id);
+        }
+        ids
+    };
+    for welcome_id in &welcome_ids {
+        let stream = state
+            .pending_welcome_streams
+            .lock()
+            .await
+            .as_mut()
+            .and_then(|streams| streams.remove(welcome_id));
+        if let Some(stream) = stream {
+            stream.abort();
+            let _ = stream.await;
+        }
+        state.pending_welcome_acks.write().await.remove(welcome_id);
+    }
+    if dropped_results > 0 || !welcome_ids.is_empty() {
+        tracing::info!(
+            group_id = %LogHexId::group(group_id),
+            member = %LogHexId::agent(member_hex),
+            dropped_results,
+            dropped_welcomes = welcome_ids.len(),
+            "ADR 0107: dropped an ineligible member's staged join artifacts"
+        );
+    }
+}
+
+/// ADR 0107: after a membership mutation (removal, ban, a departure event),
+/// drop the member's staged join artifacts when the current roster no longer
+/// makes it eligible. A still-eligible member keeps them.
+async fn purge_join_artifacts_if_ineligible(state: &AppState, group_id: &str, member_hex: &str) {
+    if join_artifact_serving_refusal(state, group_id, member_hex)
+        .await
+        .is_some_and(JoinArtifactRefusal::is_definitive)
+    {
+        purge_member_join_artifacts(state, group_id, member_hex).await;
+    }
+}
+
 pub(in crate::server) async fn handle_join_result_message(
     state: &Arc<AppState>,
     sender: &AgentId,
@@ -35155,6 +35640,27 @@ async fn handle_join_result_message_bound(
                 tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch before result was staged");
                 return;
             };
+            // ADR 0107: the staged result is served only while the requester
+            // is eligible on the CURRENT committed roster — checked inside
+            // the same membership critical section as the selection, so a
+            // concurrent removal, ban or seal either precedes this check or
+            // follows the serve (and then purges what was staged). A
+            // definitive refusal invalidates the staged artifacts too.
+            if let Some(refusal) =
+                join_artifact_serving_refusal(state, &group_id, &member_agent_id).await
+            {
+                if refusal.is_definitive() {
+                    purge_member_join_artifacts(state, &group_id, &member_agent_id).await;
+                }
+                drop(selection_guard);
+                tracing::warn!(
+                    group_id = %LogHexId::group(&group_id),
+                    member = %LogHexId::agent(&member_agent_id),
+                    reason = refusal.reason(),
+                    "ADR 0107: staged join result withheld; the requester is not eligible on the current committed roster"
+                );
+                return;
+            }
             // The linearized result/refusal choice is complete. Network
             // transfer may take the full pull window and must not hold the
             // per-group membership lock needed by the join apply path.
@@ -36408,6 +36914,16 @@ async fn handle_welcome_fetch_request(
     welcome_id: String,
 ) {
     let sender_hex = hex::encode(sender.as_bytes());
+    // ADR 0107: the eligibility check, the staged-Welcome selection and the
+    // stream registration are linearized with membership mutations under the
+    // group's (lookup-gated) membership lock. A removal or ban either lands
+    // first and is refused below, or lands after the stream registered and
+    // its purge cancels that stream.
+    let membership_arc = group_membership_lock_for_known_group(state, &group_id).await;
+    let _membership_guard = match &membership_arc {
+        Some(arc) => Some(arc.lock().await),
+        None => None,
+    };
     let pending = {
         let welcomes = state.pending_welcomes.read().await;
         welcomes.get(&welcome_id).cloned()
@@ -36440,6 +36956,23 @@ async fn handle_welcome_fetch_request(
     }
     if pending.group_id != group_id || pending.joiner_agent != sender_hex {
         tracing::warn!(welcome_id = %LogHexId::new("welcome", &welcome_id), sender = %LogHexId::agent(&sender_hex), "unauthorized Welcome fetch request");
+        return;
+    }
+    // ADR 0107: key material is streamed only to a recipient that is
+    // eligible on the CURRENT committed roster; staging-time evidence is
+    // not enough. A definitive refusal invalidates the staged artifacts.
+    if let Some(refusal) =
+        join_artifact_serving_refusal(state, &pending.group_id, &sender_hex).await
+    {
+        if refusal.is_definitive() {
+            purge_member_join_artifacts(state, &pending.group_id, &sender_hex).await;
+        }
+        tracing::warn!(
+            welcome_id = %LogHexId::new("welcome", &welcome_id),
+            sender = %LogHexId::agent(&sender_hex),
+            reason = refusal.reason(),
+            "ADR 0107: staged Welcome withheld; the recipient is not eligible on the current committed roster"
+        );
         return;
     }
     let stream_state = Arc::clone(state);
@@ -36477,9 +37010,25 @@ async fn stream_welcome_blob(
 ) {
     let send_state = Arc::clone(state);
     let send_recipient = *recipient;
+    let send_group = pending.group_id.clone();
+    let recipient_hex = hex::encode(recipient.as_bytes());
     stream_welcome_blob_via(state, recipient, welcome_id, pending, move |msg| {
         let state = Arc::clone(&send_state);
+        let group_id = send_group.clone();
+        let recipient_hex = recipient_hex.clone();
         async move {
+            // ADR 0107: the stream holds a COPY of the staged Welcome, so it
+            // re-checks eligibility before every frame. A certificate that
+            // is revoked or expires mid-transfer stops the stream at its
+            // next frame; removal and ban also cancel it outright.
+            if let Some(refusal) =
+                join_artifact_serving_refusal(&state, &group_id, &recipient_hex).await
+            {
+                return Err(format!(
+                    "Welcome recipient is no longer eligible ({})",
+                    refusal.reason()
+                ));
+            }
             send_welcome_blob_message(&state, &send_recipient, &msg)
                 .await
                 .map(|_| ())
@@ -49332,6 +49881,28 @@ pub(in crate::server) mod tests {
         let joiner_id = joiner.agent.agent_id();
         let stranger_id = stranger.agent.agent_id();
         let group_id = "a1".repeat(32);
+        // ADR 0107: the owner serves a Welcome only to a recipient seated
+        // Active on its current committed roster.
+        {
+            let mut info = x0x::groups::GroupInfo::with_policy(
+                "welcome-handler".to_string(),
+                String::new(),
+                owner.agent.agent_id(),
+                group_id.clone(),
+                x0x::groups::GroupPolicy::default(),
+            );
+            info.add_member(
+                hex::encode(joiner_id.as_bytes()),
+                x0x::groups::GroupRole::Member,
+                Some(hex::encode(owner.agent.agent_id().as_bytes())),
+                None,
+            );
+            owner
+                .named_groups
+                .write()
+                .await
+                .insert(group_id.clone(), info);
+        }
         let bytes = b"handler authorization and replacement Welcome".to_vec();
         let welcome_id = welcome_id_for_bytes(&bytes);
         owner.pending_welcomes.write().await.insert(
