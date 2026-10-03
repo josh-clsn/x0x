@@ -1266,6 +1266,20 @@ enum Ineligible {
 /// announce/discovery cache — which the serving guard must NOT consult.
 async fn announce_valid_cert(authority: &AppState, cert: x0x::identity::AgentCertificate) {
     let agent_id = cert.agent_id().expect("cert agent id");
+    let user_id = cert.user_id().ok();
+    insert_discovery_entry(authority, agent_id, user_id, Some(cert), None).await;
+}
+
+/// Seed the authority's announce/discovery cache for `agent_id` the way a
+/// verified announce leaves it: an announced certificate digest, with the
+/// certificate bytes resolved or still in flight.
+async fn insert_discovery_entry(
+    authority: &AppState,
+    agent_id: AgentId,
+    user_id: Option<x0x::identity::UserId>,
+    cert: Option<x0x::identity::AgentCertificate>,
+    cert_digest: Option<[u8; 32]>,
+) {
     authority
         .agent
         .identity_discovery_cache()
@@ -1276,7 +1290,7 @@ async fn announce_valid_cert(authority: &AppState, cert: x0x::identity::AgentCer
             x0x::DiscoveredAgent {
                 agent_id,
                 machine_id: x0x::identity::MachineId([0u8; 32]),
-                user_id: cert.user_id().ok(),
+                user_id,
                 self_name: None,
                 addresses: Vec::new(),
                 announced_at: 0,
@@ -1288,10 +1302,10 @@ async fn announce_valid_cert(authority: &AppState, cert: x0x::identity::AgentCer
                 is_coordinator: None,
                 reachable_via: Vec::new(),
                 relay_candidates: Vec::new(),
-                cert_not_after: cert.not_after(),
-                agent_certificate: Some(cert),
+                cert_not_after: cert.as_ref().and_then(|c| c.not_after()),
+                agent_certificate: cert,
                 agent_public_key: Vec::new(),
-                cert_digest: None,
+                cert_digest,
             },
         );
 }
@@ -2404,5 +2418,220 @@ async fn s8a_r2_welcome_listener_progresses_while_a_group_lock_is_held() -> anyh
         }
     })
     .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Round 3 (ADR 0107 accepted, D57): line 64 conformance. OwnerCertified
+// serving requires the roster-embedded certificate to verify AND the
+// recipient's current roster verdict to be Clean; DigestPending, InGrace and
+// Failed verdicts fail closed.
+// ---------------------------------------------------------------------------
+
+/// The recipient's current roster verdict on the authority, from the same
+/// ladder the seal paths use (`GroupInfo::owner_cert_verdict`) with the
+/// current evidence (revocation set, clock, announce/discovery state).
+async fn roster_verdict(
+    authority: &AppState,
+    group_key: &str,
+    member_hex: &str,
+) -> Option<x0x::groups::owner_cert::MemberCertStatus> {
+    let info = authority
+        .named_groups
+        .read()
+        .await
+        .get(group_key)
+        .cloned()
+        .expect("authority group");
+    let evidence = super::super::owner_cert_evidence_for(authority, &[member_hex]).await;
+    info.clone()
+        .owner_cert_verdict(&evidence)
+        .per_member
+        .get(member_hex)
+        .cloned()
+}
+
+/// WHY (ADR 0107 line 64; line 110 for the control): an #842 inline-certified
+/// first join with no announce has a CLEAN roster verdict at serve time and
+/// is served on both paths. A recipient whose verdict is DigestPending,
+/// InGrace (here: stale evidence mid-rotation, the embedded certificate
+/// still verifying) or Failed (an announced certificate that does not chain
+/// to the owner, the embedded one still verifying) is refused on BOTH paths,
+/// each exercised on an intact cache.
+#[tokio::test]
+async fn s8a_r3_non_clean_roster_verdicts_are_refused_on_both_paths() -> anyhow::Result<()> {
+    use x0x::groups::owner_cert::MemberCertStatus;
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    let j2_hex = hex_of(&s.j2);
+    let j2_id = s.j2.agent.agent_id();
+    let welcome_id = welcome_id_of(&s.j2_add).expect("welcome ref");
+    let owner_kp = x0x::identity::UserKeypair::from_seed(&OWNER_SEED)?;
+    let owner_id = owner_kp.user_id();
+    let roster = s
+        .authority
+        .named_groups
+        .read()
+        .await
+        .get(&s.group_key)
+        .cloned()
+        .expect("authority group");
+    let result = staged(&s.authority, &s.stable, &j2_hex)
+        .await
+        .expect("staged");
+    let welcome = s
+        .authority
+        .pending_welcomes
+        .read()
+        .await
+        .get(&welcome_id)
+        .cloned()
+        .expect("staged Welcome");
+    let embedded = roster
+        .members_v2
+        .get(&j2_hex)
+        .and_then(|m| m.certificate.clone())
+        .expect("the #842 seal embedded J2's inline certificate");
+
+    let both_paths = |ctx: &'static str| {
+        let s = &s;
+        let result = result.clone();
+        let welcome = welcome.clone();
+        let welcome_id = welcome_id.clone();
+        let j2_hex = j2_hex.clone();
+        async move {
+            restore_staged_artifacts(
+                &s.authority,
+                &s.stable,
+                &j2_hex,
+                &result,
+                &welcome_id,
+                &welcome,
+            )
+            .await;
+            let result_served =
+                serve_result(&s.authority, &s.j2, &s.stable, &s.j2_attempt, Some(s.base))
+                    .await
+                    .is_some();
+            restore_staged_artifacts(
+                &s.authority,
+                &s.stable,
+                &j2_hex,
+                &result,
+                &welcome_id,
+                &welcome,
+            )
+            .await;
+            let welcome_served = serve_welcome(&s.authority, &s.j2, &s.stable, &welcome_id).await;
+            (ctx, result_served, welcome_served)
+        }
+    };
+
+    // Control (ADR 0107 line 110): the #842 first join, announce absent.
+    assert!(s
+        .authority
+        .agent
+        .identity_discovery_cache()
+        .read()
+        .await
+        .get(&j2_id)
+        .is_none());
+    let control = roster_verdict(&s.authority, &s.group_key, &j2_hex).await;
+    assert_eq!(
+        control,
+        Some(MemberCertStatus::Clean),
+        "an #842 inline-cert first join with no announce is Clean at serve time"
+    );
+    let (ctx, result_served, welcome_served) = both_paths("#842 control").await;
+    assert!(
+        result_served && welcome_served,
+        "[{ctx}] served on both paths"
+    );
+
+    let rotated = x0x::identity::AgentCertificate::issue_with_expiry(
+        &owner_kp,
+        &keypair(&s.j2_kp)?,
+        Some(x0x::groups::owner_cert::restore_clock_now() + 365 * 86_400),
+    )?;
+    let foreign_owner = x0x::identity::UserKeypair::generate()?;
+    let foreign = x0x::identity::AgentCertificate::issue(&foreign_owner, &keypair(&s.j2_kp)?)?;
+    let mut leaks = Vec::new();
+    for case in ["digest_pending", "in_grace_rotation", "failed_verdict"] {
+        s.authority
+            .named_groups
+            .write()
+            .await
+            .insert(s.group_key.clone(), roster.clone());
+        s.authority
+            .agent
+            .identity_discovery_cache()
+            .write()
+            .await
+            .remove(&j2_id);
+        match case {
+            "digest_pending" => {
+                if let Some(seat) = s
+                    .authority
+                    .named_groups
+                    .write()
+                    .await
+                    .get_mut(&s.group_key)
+                    .and_then(|info| info.members_v2.get_mut(&j2_hex))
+                {
+                    seat.certificate = None;
+                }
+            }
+            "in_grace_rotation" => {
+                // J2 announced a ROTATED certificate whose bytes are still
+                // in flight: the embedded one is stale but still verifies.
+                let digest = x0x::announce_v3::cert_digest(&Some(owner_id), &Some(rotated.clone()));
+                insert_discovery_entry(&s.authority, j2_id, Some(owner_id), None, Some(digest))
+                    .await;
+            }
+            _ => {
+                let digest =
+                    x0x::announce_v3::cert_digest(&foreign.user_id().ok(), &Some(foreign.clone()));
+                insert_discovery_entry(
+                    &s.authority,
+                    j2_id,
+                    foreign.user_id().ok(),
+                    Some(foreign.clone()),
+                    Some(digest),
+                )
+                .await;
+            }
+        }
+        let verdict = roster_verdict(&s.authority, &s.group_key, &j2_hex).await;
+        let shape_ok = match case {
+            "digest_pending" => verdict == Some(MemberCertStatus::DigestPending),
+            "in_grace_rotation" => matches!(verdict, Some(MemberCertStatus::InGrace { .. })),
+            _ => matches!(verdict, Some(MemberCertStatus::Failed { .. })),
+        };
+        assert!(shape_ok, "[{case}] fixture verdict: {verdict:?}");
+        if case != "digest_pending" {
+            assert!(
+                x0x::groups::owner_cert::verify_cert_against_owner(
+                    &owner_id,
+                    &j2_hex,
+                    &embedded,
+                    false,
+                    x0x::groups::owner_cert::restore_clock_now(),
+                )
+                .is_ok(),
+                "[{case}] the embedded certificate alone still verifies"
+            );
+        }
+        let (ctx, result_served, welcome_served) = both_paths(case).await;
+        if result_served {
+            leaks.push(format!("{ctx}: FetchRequest arm served a join result"));
+        }
+        if welcome_served {
+            leaks.push(format!("{ctx}: Welcome path streamed key material"));
+        }
+    }
+    assert!(
+        leaks.is_empty(),
+        "recipients with a non-Clean roster verdict were served: {leaks:#?}"
+    );
     Ok(())
 }
