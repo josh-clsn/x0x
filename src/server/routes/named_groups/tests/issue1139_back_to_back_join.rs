@@ -1542,6 +1542,41 @@ async fn d39_r2_preexisting_seated_invite_without_row_reports_active() -> Result
     Ok(())
 }
 
+/// ADR 0107 Validation, Shape B (separate limitation control, never combined
+/// with the carry test): a join that timed out with NO carry leaves no row —
+/// the finalizer removed the stub — so S8 (a) has nothing to re-arm. On one
+/// device, a fresh base-seated invite keeps the known #1150 limitation: the
+/// ordinary (non-re-armed) path reports the snapshot `active`, with no keys
+/// and no key recovery claimed. On another, the operator exit — owner
+/// remove-member + re-invite — restores eligible membership WITH keys.
+#[tokio::test]
+async fn s8a_shape_b_no_carry_is_not_rearmed_and_remove_reinvite_restores_keys() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    assert_eq!(
+        d39_timed_out_without_carry(&s).await,
+        "no_row",
+        "the no-carry timeout removed the stub and row"
+    );
+    let r = wa_fresh_invite_round_trip(&s).await?;
+    assert!(
+        r.new_attempt
+            && !r.authority_accepted
+            && !r.staged
+            && r.final_state == "active"
+            && !r.treekem,
+        "Shape B keeps the known limitation, with no re-arm and no key recovery: {r}"
+    );
+
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    assert_eq!(d39_timed_out_without_carry(&s).await, "no_row");
+    let after_removal = wa_owner_removes_j2(&s, true).await?;
+    let r = wa_fresh_invite_round_trip(&s).await?;
+    wa_assert_recovered(&format!("shape B, j2_after_removal={after_removal}"), &r);
+    Ok(())
+}
+
 /// Characterization (Codex r2, #1149): the #1148 recovery routes the stuck
 /// remnant onto exactly that pre-existing path — same input, same `active`.
 /// Flips in ADR 0107 S8 (a): re-arm must end non-active with Refused or a

@@ -35257,6 +35257,13 @@ async fn handle_join_result_message_bound(
                     return;
                 }
             };
+            // ADR 0107 (test-only witness): the arm decided to serve these
+            // exact bytes. In-process transport sends fail, so tests read
+            // the serve decision here.
+            #[cfg(test)]
+            if let Ok(mut served) = state.named_group_test_recorders.join_result_serves.lock() {
+                served.push((member_agent_id.clone(), group_id.clone(), payload.clone()));
+            }
             let payload_len = payload.len();
             let payload_hash = hex::encode(blake3::hash(&payload).as_bytes());
             tracing::debug!(
@@ -36867,6 +36874,7 @@ pub(in crate::server) mod tests {
     mod adr0066_treekem_gates;
     mod adr0068_quarantine_pin;
     mod adr0068_task_buffer;
+    mod adr0107_stuck_join_rearm;
     mod cache_hardening_followup;
     mod fork_quarantine;
     mod home_control_payload_size;

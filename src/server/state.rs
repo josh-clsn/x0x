@@ -1258,6 +1258,10 @@ pub(super) struct NamedGroupTestRecorders {
     pub(super) publish_attempts: StdMutex<Vec<(String, String, Option<String>)>>,
     pub(super) publish_bytes: StdMutex<Vec<(String, Vec<u8>)>>,
     pub(super) direct_deliveries: StdMutex<Vec<(String, String, &'static str, &'static str)>>,
+    /// ADR 0107: every join result the `FetchRequest` arm decided to serve,
+    /// as `(recipient, group, exact payload)`, recorded before the transport
+    /// send. In-process sends fail, so this is the only witness of a serve.
+    pub(super) join_result_serves: StdMutex<Vec<(String, String, Vec<u8>)>>,
 }
 
 #[cfg(test)]
