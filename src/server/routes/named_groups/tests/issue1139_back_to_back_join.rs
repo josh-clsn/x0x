@@ -1190,11 +1190,16 @@ async fn wa_fresh_invite_round_trip_on(s: &BackToBack, joiner: &Arc<AppState>) -
             let (chain, intervening_events) = match terminal {
                 Some(terminal) => (
                     intervening_chain_from(&info, from, terminal),
-                    super::super::intervening_membership_events(
+                    // Mirrors the authority's serve, including the re-key link.
+                    super::super::intervening_membership_events_for(
                         &s._authority,
                         std::slice::from_ref(&s.stable_group_id),
                         from,
                         terminal,
+                        super::super::join_result_rekey_member(
+                            &event,
+                            &hex::encode(joiner.agent.agent_id().as_bytes()),
+                        ),
                     )
                     .await,
                 ),
@@ -1322,20 +1327,98 @@ fn wa_assert_recovered(ctx: &str, r: &WaJoin) {
     );
 }
 
-/// #1150, flipped for this fork: after a timed-out join left the device
-/// keyless `active`, a fresh invite alone is enough on the authority side —
-/// the returning-member re-key accepts the re-join MemberJoined (a fresh
-/// KeyPackage from an Active member), commits remove + add, and stages the
-/// join result with its Welcome. This harness does not deliver that
-/// result back to the device, so the device itself is still keyless here.
+/// The authority's live tree encrypts after the re-key; `joiner` must
+/// decrypt it with the tree its Welcome installed.
+async fn wa_decrypts_post_rekey(s: &BackToBack, joiner: &Arc<AppState>) -> Result<bool> {
+    let tree = |state: &Arc<AppState>| {
+        let state = Arc::clone(state);
+        let keys = [s.group_key.clone(), s.stable_group_id.clone()];
+        async move {
+            let trees = state.treekem_groups.read().await;
+            keys.iter().find_map(|k| trees.get(k).cloned())
+        }
+    };
+    let authority = tree(&s._authority).await.context("authority tree")?;
+    let Some(device) = tree(joiner).await else {
+        return Ok(false);
+    };
+    let plaintext = b"after the returning-member re-key".to_vec();
+    let ciphertext = authority.lock().await.encrypt_message(&plaintext)?;
+    let opened = device.lock().await.decrypt_message(&ciphertext);
+    Ok(opened.is_ok_and(|bytes| bytes == plaintext))
+}
+
+/// #1150 on this fork: after a timed-out join left the device keyless
+/// `active`, a fresh invite alone re-keys it. The authority's
+/// returning-member re-key accepts the re-join MemberJoined (a fresh
+/// KeyPackage from an Active member) and commits remove + add; the join
+/// result carries the device's own removal as the last #1139 link, so the
+/// device chains from its revision to the add, installs the Welcome and
+/// reads traffic sealed after the re-key.
 #[tokio::test]
 async fn d39_1150_fresh_invite_alone_rekeys_the_keyless_device() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let s = build_back_to_back(dir.path()).await?;
     let r = wa_stuck_keyless(&s).await?;
     assert!(
-        r.new_attempt && r.authority_accepted && r.staged && r.final_state == "active",
-        "#1150: the authority must re-key the keyless device on a fresh invite: {r}"
+        r.new_attempt && r.authority_accepted && r.staged && r.final_state == "active" && r.treekem,
+        "#1150: the fresh invite must re-key the keyless device end to end: {r}"
+    );
+    assert!(
+        wa_decrypts_post_rekey(&s, &s.j2).await?,
+        "#1150: the re-keyed device must decrypt a post-re-key message"
+    );
+    Ok(())
+}
+
+/// Reinstall: a device that held keys loses every local trace of the group
+/// (app data cleared, identity kept) while the authority still seats it.
+/// A fresh invite alone must re-key it: the new stub starts at the invite's
+/// base, the result carries the device's removal, and the device ends
+/// `active` with a tree that decrypts post-re-key traffic.
+#[tokio::test]
+async fn reinstalled_device_recovers_keys_from_a_fresh_invite() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let first = wa_stuck_keyless(&s).await?;
+    anyhow::ensure!(
+        first.treekem,
+        "precondition: the device holds keys: {first}"
+    );
+
+    let aliases = [s.group_key.clone(), s.stable_group_id.clone()];
+    let removed = persist_named_groups_mutation(&s.j2, |groups| {
+        let mut any = false;
+        for alias in &aliases {
+            any |= groups.remove(alias).is_some();
+        }
+        any
+    })
+    .await;
+    anyhow::ensure!(
+        matches!(removed, Ok(AtomicWriteOutcome::Durable)),
+        "reinstall wipe persisted"
+    );
+    for alias in &aliases {
+        s.j2.treekem_groups.write().await.remove(alias);
+    }
+    wipe_local_group_crypto_material(
+        &s.j2,
+        &s.group_key,
+        Some(s.stable_group_id.as_str()),
+        "reinstall_fixture",
+    )
+    .await;
+    assert_eq!(wa_state(&s.j2, &s.group_key).await, "no_row");
+
+    let r = wa_fresh_invite_round_trip(&s).await?;
+    assert!(
+        r.new_attempt && r.authority_accepted && r.final_state == "active" && r.treekem,
+        "a reinstalled device must recover with keys from a fresh invite: {r}"
+    );
+    assert!(
+        wa_decrypts_post_rekey(&s, &s.j2).await?,
+        "the reinstalled device must decrypt a post-re-key message"
     );
     Ok(())
 }
@@ -1693,5 +1776,105 @@ async fn d39_r2_recovered_remnant_takes_the_same_seated_invite_path() -> Result<
         !s.j2.treekem_groups.read().await.contains_key(&s.group_key),
         "the banned device never ends keyed"
     );
+    Ok(())
+}
+
+/// The re-key link is the ONLY non-`MemberAdded` shape the carry admits: a
+/// removal of the member the terminal re-seats, by someone else, as the
+/// last link. A removal of anybody else, a self-leave, a removal that is
+/// not the last link, or any removal without a re-seated member is refused
+/// exactly as upstream refuses it.
+#[test]
+fn carry_admits_only_the_rekey_removal_of_the_reseated_member() {
+    let commit = |revision: u64| x0x::groups::GroupStateCommit {
+        group_id: "g".to_string(),
+        revision,
+        prev_state_hash: None,
+        roster_root: String::new(),
+        policy_hash: String::new(),
+        public_meta_hash: String::new(),
+        security_binding: None,
+        state_hash: String::new(),
+        withdrawn: false,
+        committed_by: "aa".repeat(32),
+        committed_at: 1,
+        signer_public_key: String::new(),
+        signature: String::new(),
+    };
+    let removal =
+        |actor: &str, member: &str, revision: u64| NamedGroupMetadataEvent::MemberRemoved {
+            group_id: "g".to_string(),
+            revision,
+            actor: actor.to_string(),
+            agent_id: member.to_string(),
+            treekem_commit_b64: Some("c".to_string()),
+            treekem_epoch: Some(revision),
+            secret_epoch: None,
+            commit: Some(commit(revision)),
+        };
+    let admin = "aa".repeat(32);
+    let device = "bb".repeat(32);
+    let other = "cc".repeat(32);
+    let preflight = |events: Vec<NamedGroupMetadataEvent>, member: Option<&str>| {
+        super::super::preflight_join_result_intervening_events_for("g", 4, 6, events, member)
+            .is_some()
+    };
+    assert!(preflight(vec![removal(&admin, &device, 5)], Some(&device)));
+    assert!(!preflight(vec![removal(&admin, &device, 5)], None));
+    assert!(!preflight(vec![removal(&admin, &other, 5)], Some(&device)));
+    assert!(!preflight(
+        vec![removal(&device, &device, 5)],
+        Some(&device)
+    ));
+    assert!(super::super::preflight_join_result_intervening_events_for(
+        "g",
+        3,
+        6,
+        vec![removal(&admin, &device, 4), removal(&admin, &device, 5)],
+        Some(&device),
+    )
+    .is_none());
+}
+
+/// The #376 local-only drop never clears a fork-quarantined row: the durable
+/// owner's leave answers 409 `fork_quarantined`, and the row with its fork
+/// evidence stays for the audited quarantine clear.
+#[tokio::test]
+async fn local_only_drop_refuses_a_fork_quarantined_row() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    wa_stuck_not_member(&s).await?;
+    let evidence = x0x::groups::ForkEvidence {
+        revision: 1,
+        state_hash: "ab".repeat(32),
+        committed_by: "cd".repeat(32),
+        observed_at_ms: 1,
+    };
+    s.j2.named_groups
+        .write()
+        .await
+        .get_mut(&s.group_key)
+        .and_then(|row| row.invite_lineage.as_mut())
+        .expect("lineage")
+        .fork_evidence = Some(evidence.clone());
+    let response = leave_group(
+        State(Arc::clone(&s.j2)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(s.group_key.clone()),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let body =
+        String::from_utf8_lossy(&axum::body::to_bytes(response.into_body(), usize::MAX).await?)
+            .to_string();
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("fork_quarantined"), "{body}");
+    let groups = s.j2.named_groups.read().await;
+    let lineage = groups
+        .get(&s.group_key)
+        .and_then(|row| row.invite_lineage.as_ref())
+        .expect("the quarantined row is kept");
+    assert_eq!(lineage.fork_evidence.as_ref(), Some(&evidence));
     Ok(())
 }

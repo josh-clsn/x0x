@@ -15770,7 +15770,19 @@ fn named_group_public_listener_key(
         .then(|| info.stable_group_id().to_string())
 }
 
+/// Whether a group listener must stop now. Reads (and marks seen) the
+/// current value, so a receiver subscribed after the flag was set still
+/// stops, where `changed()` alone would wait forever.
+fn listener_shutdown_flagged(shutdown_rx: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+    *shutdown_rx.borrow_and_update()
+}
+
 async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &str) {
+    // Shutdown already requested: the drain has taken (or is taking) the
+    // registries, so a listener registered now would outlive the instance.
+    if *state.shutdown_notify.borrow() {
+        return;
+    }
     // Serialize check, subscription and install. A read/check followed by
     // a later insert lets concurrent ensures spawn two live receivers.
     // A registered-but-finished handle is a listener whose subscription ended
@@ -15814,6 +15826,11 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
         // not qualify — only an apply that returned `should_exit`.
         let mut membership_exit = false;
         loop {
+            // The shutdown may have been flagged before this receiver
+            // existed, in which case `changed()` never fires for it.
+            if listener_shutdown_flagged(&mut shutdown_rx) {
+                break;
+            }
             tokio::select! {
                 _ = shutdown_rx.changed() => break,
                 maybe_msg = sub.recv() => {
@@ -18748,6 +18765,9 @@ pub(in crate::server) async fn spawn_global_public_message_listener(
 /// message published after group creation/join cannot race ahead of the local
 /// listener. The spawned task owns only the receive loop.
 async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
+    if *state.shutdown_notify.borrow() {
+        return;
+    }
     {
         // Issue #376: `GET /groups/:id/messages` calls this directly, bypassing
         // `ensure_named_group_listeners`, so the eligibility gate has to live
@@ -18794,6 +18814,11 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
     let handle = tokio::spawn(async move {
         tracing::info!(topic = %topic_for_log, "E: public-message listener subscribed");
         loop {
+            // The shutdown may have been flagged before this receiver
+            // existed, in which case `changed()` never fires for it.
+            if listener_shutdown_flagged(&mut shutdown_rx) {
+                break;
+            }
             tokio::select! {
                 _ = shutdown_rx.changed() => break,
                 maybe = sub.recv() => {
@@ -24265,6 +24290,19 @@ pub(in crate::server) async fn leave_group(
             });
             if !local_only_drop {
                 return resp;
+            }
+            // D39 containment: a fork-quarantined row is cleared only through
+            // POST /groups/:id/quarantine/clear (force + reason, audited); a
+            // local drop would erase the marker and its evidence unrecorded.
+            if groups.get(&id).is_some_and(|info| {
+                classify_not_member_join_row(info, &local_agent_hex) == NotMemberJoinRow::Quarantined
+            }) {
+                return api_error_with_reason(
+                    StatusCode::CONFLICT,
+                    "this group's local row is fork-quarantined; clear it with \
+                     POST /groups/:id/quarantine/clear before dropping it",
+                    "fork_quarantined",
+                );
             }
             drop(groups);
             return leave_treekem_group(state, id, local_agent_hex).await;
@@ -36197,6 +36235,23 @@ pub(in crate::server) async fn apply_group_metadata_event(
             );
         }
     };
+    // The recovery-courier MemberJoined (an authority attestation present)
+    // trusts the delivering sender's own active membership, which this
+    // endpoint cannot vouch for: the caller only asserts `sender_agent_id`.
+    // That shape stays on the transport-verified paths (#377).
+    if matches!(
+        event,
+        NamedGroupMetadataEvent::MemberJoined {
+            recovery_authority_signature_b64: Some(_),
+            ..
+        }
+    ) {
+        return api_error_with_reason(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a recovery-courier MemberJoined needs a transport-verified sender",
+            "recovery_courier_needs_verified_sender",
+        );
+    }
     tracing::debug!(
         target: "treekem.trace",
         stage = "apply_metadata_event_endpoint",
@@ -38044,6 +38099,7 @@ pub(in crate::server) async fn join_result_payload_with_roster_certificates(
     Ok(bare)
 }
 
+#[cfg(test)]
 /// #1139: the logged `MemberAdded` events strictly between `from_revision`
 /// and `terminal_revision`, ordered by commit revision. Returns them only
 /// when they cover EVERY revision in that gap exactly once and number at
@@ -38056,6 +38112,23 @@ async fn intervening_membership_events(
     group_keys: &[String],
     from_revision: u64,
     terminal_revision: u64,
+) -> Vec<NamedGroupMetadataEvent> {
+    intervening_membership_events_for(state, group_keys, from_revision, terminal_revision, None)
+        .await
+}
+
+/// As [`intervening_membership_events`], plus one fork shape: when
+/// `rekey_member` names the member the result re-seats, the link
+/// immediately before the terminal may be that member's own authority
+/// `MemberRemoved` — the first half of the returning-member re-key's
+/// remove + add pair. Every other non-`MemberAdded` link still empties the
+/// carry.
+async fn intervening_membership_events_for(
+    state: &AppState,
+    group_keys: &[String],
+    from_revision: u64,
+    terminal_revision: u64,
+    rekey_member: Option<&str>,
 ) -> Vec<NamedGroupMetadataEvent> {
     let Some(gap) = terminal_revision
         .checked_sub(from_revision)
@@ -38102,14 +38175,54 @@ async fn intervening_membership_events(
             }
         }
     }
+    let rekey_link_revision = terminal_revision.saturating_sub(1);
     if by_revision.len() as u64 != gap
-        || by_revision
-            .values()
-            .any(|event| !matches!(event, NamedGroupMetadataEvent::MemberAdded { .. }))
+        || by_revision.iter().any(|(revision, event)| {
+            let rekey_link =
+                *revision == rekey_link_revision && is_rekey_self_removal_link(event, rekey_member);
+            !matches!(event, NamedGroupMetadataEvent::MemberAdded { .. }) && !rekey_link
+        })
     {
         return Vec::new();
     }
     by_revision.into_values().collect()
+}
+
+/// The member a served join result may carry a re-key removal for: the
+/// member the terminal `MemberAdded` seats, and nobody else.
+fn join_result_rekey_member<'a>(
+    event: &NamedGroupMetadataEvent,
+    member_agent_id: &'a str,
+) -> Option<&'a str> {
+    match event {
+        NamedGroupMetadataEvent::MemberAdded { agent_id, .. }
+            if agent_id.eq_ignore_ascii_case(member_agent_id) =>
+        {
+            Some(member_agent_id)
+        }
+        _ => None,
+    }
+}
+
+/// The returning-member re-key's removal half for `member`: an
+/// authority-signed `MemberRemoved` of that member by an actor other than
+/// the member (an admin removal, never a self-leave), with a commit.
+fn is_rekey_self_removal_link(event: &NamedGroupMetadataEvent, member: Option<&str>) -> bool {
+    let Some(member) = member else {
+        return false;
+    };
+    matches!(
+        event,
+        NamedGroupMetadataEvent::MemberRemoved {
+            actor,
+            agent_id,
+            commit: Some(_),
+            secret_epoch: None,
+            treekem_epoch: Some(_),
+            treekem_commit_b64: Some(_),
+            ..
+        } if agent_id.eq_ignore_ascii_case(member) && !actor.eq_ignore_ascii_case(member)
+    )
 }
 
 /// #1139 (review r1 P2-3): the carry rides only a result the joiner can
@@ -38125,6 +38238,7 @@ fn join_result_carry_allowed(
     verified && accepts_control_blob_ref && has_attempt_id
 }
 
+#[cfg(test)]
 /// #1139 (review r1 P2-2): validate the WHOLE carried list before any
 /// mutation. Every entry must be a `MemberAdded` for `group_id` with a
 /// commit; revisions are unique and contiguous, the last is exactly
@@ -38137,18 +38251,46 @@ fn preflight_join_result_intervening_events(
     terminal_revision: u64,
     events: Vec<NamedGroupMetadataEvent>,
 ) -> Option<Vec<(u64, NamedGroupMetadataEvent)>> {
+    preflight_join_result_intervening_events_for(
+        group_id,
+        local_revision,
+        terminal_revision,
+        events,
+        None,
+    )
+}
+
+/// As [`preflight_join_result_intervening_events`]; with `rekey_member`
+/// set (the joiner itself, when the terminal re-seats it), the LAST link
+/// may also be that member's re-key removal ([`is_rekey_self_removal_link`]).
+fn preflight_join_result_intervening_events_for(
+    group_id: &str,
+    local_revision: u64,
+    terminal_revision: u64,
+    events: Vec<NamedGroupMetadataEvent>,
+    rekey_member: Option<&str>,
+) -> Option<Vec<(u64, NamedGroupMetadataEvent)>> {
     if events.is_empty() || events.len() > JOIN_RESULT_INTERVENING_EVENT_CAP {
         return None;
     }
     let mut ordered = Vec::with_capacity(events.len());
     for event in events {
-        let NamedGroupMetadataEvent::MemberAdded {
-            group_id: event_group,
-            commit: Some(commit),
-            ..
-        } = &event
-        else {
-            return None;
+        let (event_group, commit) = match &event {
+            NamedGroupMetadataEvent::MemberAdded {
+                group_id: event_group,
+                commit: Some(commit),
+                ..
+            } => (event_group, commit),
+            NamedGroupMetadataEvent::MemberRemoved {
+                group_id: event_group,
+                commit: Some(commit),
+                ..
+            } if is_rekey_self_removal_link(&event, rekey_member)
+                && commit.revision.checked_add(1) == Some(terminal_revision) =>
+            {
+                (event_group, commit)
+            }
+            _ => return None,
         };
         if event_group != group_id {
             return None;
@@ -38172,6 +38314,7 @@ fn preflight_join_result_intervening_events(
     Some(ordered)
 }
 
+#[cfg(test)]
 /// #1139: apply the authority-served intervening `MemberAdded` events, in
 /// commit-revision order, before the join result's own event. Carried
 /// events are applied ONLY for a bound attempt, and each goes through the
@@ -38192,6 +38335,35 @@ async fn apply_join_result_intervening_events(
     terminal_revision: Option<u64>,
     bound_join_attempt: Option<&str>,
     events: Vec<NamedGroupMetadataEvent>,
+) {
+    Box::pin(apply_join_result_intervening_events_for(
+        state,
+        sender,
+        verified,
+        group_id,
+        terminal_revision,
+        bound_join_attempt,
+        events,
+        false,
+    ))
+    .await;
+}
+
+/// As [`apply_join_result_intervening_events`]. `terminal_self_add` says the
+/// result's own event is a `MemberAdded` seating THIS device; only then may
+/// the carry end in this device's re-key removal, which is applied as a
+/// state-chain link ([`apply_rekey_self_removal_link`]) instead of the
+/// departure the ordinary arm would make of it.
+#[allow(clippy::too_many_arguments)]
+async fn apply_join_result_intervening_events_for(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    verified: bool,
+    group_id: &str,
+    terminal_revision: Option<u64>,
+    bound_join_attempt: Option<&str>,
+    events: Vec<NamedGroupMetadataEvent>,
+    terminal_self_add: bool,
 ) {
     if events.is_empty() {
         return;
@@ -38219,11 +38391,14 @@ async fn apply_join_result_intervening_events(
             None => return,
         }
     };
-    let Some(ordered) = preflight_join_result_intervening_events(
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let rekey_member = terminal_self_add.then_some(local_hex.as_str());
+    let Some(ordered) = preflight_join_result_intervening_events_for(
         group_id,
         local_revision,
         terminal_revision,
         events,
+        rekey_member,
     ) else {
         tracing::warn!(
             group_id = %LogHexId::group(group_id),
@@ -38235,16 +38410,23 @@ async fn apply_join_result_intervening_events(
         if revision <= local_revision {
             continue;
         }
-        let accepted = Box::pin(apply_named_group_metadata_event_with_binding(
-            state,
-            event,
-            *sender,
-            true,
-            None,
-            Some(bound),
-        ))
-        .await
-        .accepted;
+        let accepted = if matches!(event, NamedGroupMetadataEvent::MemberRemoved { .. }) {
+            Box::pin(apply_rekey_self_removal_link(
+                state, sender, group_id, bound, &event,
+            ))
+            .await
+        } else {
+            Box::pin(apply_named_group_metadata_event_with_binding(
+                state,
+                event,
+                *sender,
+                true,
+                None,
+                Some(bound),
+            ))
+            .await
+            .accepted
+        };
         tracing::debug!(
             target: "treekem.trace",
             stage = "join_result_intervening_event",
@@ -39541,6 +39723,143 @@ pub(in crate::server) async fn dispatch_join_result_message(
     });
 }
 
+/// Returning-member re-key, device side (#1150 on this fork). The authority
+/// re-keys a returning or keyless device with an authority-signed
+/// `MemberRemoved` of the device at r+1 and its fresh `MemberAdded` at r+2.
+/// To the device that removal is only the link between its row at r and the
+/// add it is about to apply: the ordinary arm would treat it as a departure
+/// and wipe the very row the add re-seats. So it is applied here as a
+/// state-commit link alone, and only when every condition holds:
+/// - it removes THIS device, authored by the result's sender, who is an
+///   Admin or higher in the local roster (the commit is verified against the
+///   local chain exactly as the ordinary arm verifies it);
+/// - the row is TreeKEM and keyless here (no live tree to commit into);
+/// - the bound join attempt is still current, checked under the group's
+///   membership lock, which is held through the persist.
+async fn apply_rekey_self_removal_link(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    group_id: &str,
+    bound_join_attempt: &str,
+    event: &NamedGroupMetadataEvent,
+) -> bool {
+    match apply_rekey_self_removal_link_checked(state, sender, group_id, bound_join_attempt, event)
+        .await
+    {
+        Ok(()) => true,
+        Err(reason) => {
+            tracing::debug!(
+                target: "treekem.trace",
+                stage = "join_result_rekey_link_rejected",
+                group_id = %group_id,
+                reason,
+            );
+            false
+        }
+    }
+}
+
+async fn apply_rekey_self_removal_link_checked(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    group_id: &str,
+    bound_join_attempt: &str,
+    event: &NamedGroupMetadataEvent,
+) -> std::result::Result<(), &'static str> {
+    let NamedGroupMetadataEvent::MemberRemoved {
+        revision,
+        actor,
+        treekem_epoch: Some(epoch),
+        commit: Some(commit),
+        ..
+    } = event
+    else {
+        return Err("not_a_removal");
+    };
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let sender_hex = hex::encode(sender.as_bytes());
+    if !is_rekey_self_removal_link(event, Some(&local_hex)) || *actor != sender_hex {
+        return Err("not_this_device_or_sender");
+    }
+    let Some(group_key) = ({
+        let groups = state.named_groups.read().await;
+        if groups.contains_key(group_id) {
+            Some(group_id.to_string())
+        } else {
+            groups
+                .iter()
+                .find(|(_, info)| info.stable_group_id() == group_id)
+                .map(|(key, _)| key.clone())
+        }
+    }) else {
+        return Err("unknown_local_group");
+    };
+    let membership_lock = group_membership_lock(state, &group_key).await;
+    let _membership_guard = membership_lock.lock().await;
+    let attempt_current = state
+        .pending_join_attempts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&join_result_key(group_id, &local_hex))
+        .is_some_and(|attempt| attempt.attempt_id == bound_join_attempt);
+    if !attempt_current {
+        return Err("attempt_not_current");
+    }
+    let Some(info) = state.named_groups.read().await.get(&group_key).cloned() else {
+        return Err("unknown_local_group");
+    };
+    if info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem
+        || !info
+            .caller_role(actor)
+            .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin))
+    {
+        return Err("not_treekem_or_actor_not_admin");
+    }
+    {
+        let trees = state.treekem_groups.read().await;
+        if trees.contains_key(&group_key) || trees.contains_key(info.stable_group_id()) {
+            return Err("device_holds_a_tree");
+        }
+    }
+    let Ok(next) = apply_stateful_event_with_evidence(
+        state,
+        &group_key,
+        &info,
+        commit,
+        None,
+        false,
+        None,
+        x0x::groups::ActionKind::AdminOrHigher,
+        |next| {
+            // Mirrors the authority's re-key seal: the removal commit keeps
+            // the member's roster seat (only its stale leaf leaves the tree)
+            // and advances the roster revision and the epoch binding.
+            next.roster_revision = adopt_roster_revision(next.roster_revision, *revision);
+            next.secret_epoch = *epoch;
+            next.security_binding = Some(format!("treekem:epoch={epoch}"));
+        },
+    )
+    .await
+    .map_err(|error| {
+        tracing::debug!(
+            target: "treekem.trace",
+            stage = "join_result_rekey_link_commit",
+            group_id = %group_id,
+            %error,
+        );
+    }) else {
+        return Err("state_commit_apply_failed");
+    };
+    if !matches!(
+        persist_named_group_info(state, &group_key, next).await,
+        Ok(AtomicWriteOutcome::Durable)
+    ) {
+        return Err("persist_not_durable");
+    }
+    remember_treekem_membership_event(state, event).await;
+    Ok(())
+}
+
 /// Issue #377: every arm below authorizes on `sender`, and on the raw-QUIC
 /// direct path the sender AgentId is a self-asserted 32-byte wire prefix — only
 /// the `MachineId` is authenticated by the QUIC handshake. `verified` is the
@@ -39802,11 +40121,13 @@ async fn handle_join_result_message_bound(
                             }
                             keys
                         };
-                        intervening_membership_events(
+                        let rekey_member = join_result_rekey_member(&event, &member_agent_id);
+                        intervening_membership_events_for(
                             state,
                             &keys,
                             from_revision,
                             terminal.revision,
+                            rekey_member,
                         )
                         .await
                     }
@@ -40194,7 +40515,12 @@ async fn handle_join_result_message_bound(
             // the apply future is enormous and must not be inlined into
             // this handler's async frame (a deterministic stack overflow).
             let terminal_revision = named_group_metadata_event_commit(&event).map(|c| c.revision);
-            Box::pin(apply_join_result_intervening_events(
+            let terminal_self_add = matches!(
+                &event,
+                NamedGroupMetadataEvent::MemberAdded { agent_id, .. }
+                    if agent_id.eq_ignore_ascii_case(&hex::encode(state.agent.agent_id().as_bytes()))
+            );
+            Box::pin(apply_join_result_intervening_events_for(
                 state,
                 sender,
                 verified,
@@ -40202,6 +40528,7 @@ async fn handle_join_result_message_bound(
                 terminal_revision,
                 bound_join_attempt,
                 intervening_events,
+                terminal_self_add,
             ))
             .await;
             // #458 r3/r5: expose the carried chain AND head attestation
@@ -41990,6 +42317,7 @@ pub(in crate::server) mod tests {
     mod adr0068_task_buffer;
     mod adr0107_stuck_join_rearm;
     mod cache_hardening_followup;
+    mod engine_a_apply_gate;
     mod fork_quarantine;
     mod genesis_kp_catchup_398;
     mod home_control_payload_size;
@@ -42002,6 +42330,7 @@ pub(in crate::server) mod tests {
     mod issue821_read_auth;
     mod issue877_error_body_session;
     mod join_result_390_staging;
+    mod listener_shutdown;
     mod owner_mandate;
     mod pr291_restart_marker_matrix;
     mod r17_cert_hydrate;
