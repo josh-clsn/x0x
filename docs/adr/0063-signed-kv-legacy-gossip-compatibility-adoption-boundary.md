@@ -1,6 +1,7 @@
 # ADR 0063: Signed KV legacy gossip compatibility adoption boundary
 
-- **Status:** Proposed (draft; not accepted)
+- **Status:** Rejected (2026-10-03; D27 "withdraw", mapped to Rejected by D54 because the governance statuses have no "Withdrawn")
+- **Rejected:** by David Irvine (rulings D27 and D54; D54 confirmed by him directly to Claude x0x-32 on 2026-10-03). The status change was applied by Claude (x0x-32) at his instruction. Do not build on this ADR. The V3 publish preparation is removed as dead code (D27).
 - **Date:** 2026-09-06
 - **Decision owner:** David Irvine
 - **Reviewers:** Pending
