@@ -11605,6 +11605,7 @@ fn park_role_update_for_late_member(
 /// member is seated, so this is an ordinary apply refusal, not a
 /// parking case.
 async fn replay_parked_role_updates(state: &Arc<AppState>, group_key: &str) {
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     let mut parked = {
         let mut lot = state
             .parked_role_updates
@@ -11631,8 +11632,14 @@ async fn replay_parked_role_updates(state: &Arc<AppState>, group_key: &str) {
         let member_seated = {
             let groups = state.named_groups.read().await;
             groups.get(group_key).is_some_and(|info| {
-                role_update_target(&entry.event)
-                    .is_some_and(|member| info.members_v2.contains_key(member))
+                // A device whose own entry is Removed (a re-key chain step
+                // awaiting its re-add) has not landed yet: keep its parked
+                // restore with its original `parked_at` (#876 r3).
+                role_update_target(&entry.event).is_some_and(|member| {
+                    info.members_v2
+                        .get(member)
+                        .is_some_and(|m| !(m.is_removed() && member == local_hex.as_str()))
+                })
             })
         };
         if !member_seated {
@@ -13043,6 +13050,12 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 && !self_leave_auth
                 && awaiting_rekey_by(state, &resolved_group_key, &info, &agent_id, &actor).await
             {
+                // The same TreeKEM payload requirement as the ordinary admin
+                // removal below: a removal without its tree commit is one no
+                // other member adopts, so this device must not either.
+                if treekem_commit_b64.is_none() || treekem_epoch.is_none() {
+                    return ApplyMetadataResult::REJECTED;
+                }
                 let current = info.clone();
                 let Ok(next) = apply_stateful_event_with_evidence(
                     state,
@@ -13068,11 +13081,12 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     return ApplyMetadataResult::REJECTED;
                 };
                 if !matches!(
-                    persist_named_group_info(state, &resolved_group_key, next).await,
+                    persist_named_group_info(state, &resolved_group_key, next.clone()).await,
                     Ok(AtomicWriteOutcome::Durable)
                 ) {
                     return ApplyMetadataResult::REJECTED;
                 }
+                refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
                 remember_treekem_membership_event(state, &event_for_log).await;
                 tracing::debug!(
                     target: "treekem.trace",
@@ -20324,6 +20338,18 @@ pub(in crate::server) async fn join_group_via_invite(
     // invite as an idempotent success. It is cleared below and the join
     // proceeds as a NEW attempt — unless ADR 0107 re-arms it instead.
     let mut stale_not_member_row = false;
+    // A re-key chain step whose re-add never came (pin no longer live)
+    // leaves a row that is departed in all but name; finish that departure
+    // so this invite starts a real attempt instead of answering
+    // `not_member` with nothing to do.
+    if !depart_abandoned_rekey_row(state.as_ref(), &group_id_hex, "rekey_abandoned_at_join").await {
+        depart_abandoned_rekey_row(
+            state.as_ref(),
+            invite_stable_group_id,
+            "rekey_abandoned_at_join",
+        )
+        .await;
+    }
     let existing_record = {
         let groups = state.named_groups.read().await;
         if has_withdrawn_group_record(&groups, &group_id_hex)
@@ -20925,6 +20951,7 @@ pub(in crate::server) async fn join_group_via_invite(
                     join_result_key(&stable_id_for_event, &joiner_hex),
                     invite.inviter.clone(),
                 );
+                persist_join_result_pins(state.as_ref()).await;
                 state
                     .last_join_outcomes
                     .lock()
@@ -22592,8 +22619,8 @@ async fn wipe_local_group_crypto_material(
     }
     if let Ok(mut expected) = state.expected_join_result_inviters.lock() {
         expected.retain(|key, _| !join_result_key_matches_any_group_alias(key, &aliases));
-        join_result_pins::persist(state, &expected);
     }
+    persist_join_result_pins(state).await;
 
     let _ = prune_treekem_cache_groups(state, &aliases, reason).await;
     let mut welcome_ids = Vec::new();
@@ -35919,7 +35946,7 @@ async fn persist_join_result_staging(state: &AppState) {
 /// staging never survives a restart (#384 invariant).
 pub(in crate::server) async fn load_join_result_staging(state: &AppState) {
     // The joiner-side pins live beside the staging sidecar and load with it.
-    join_result_pins::load(state);
+    join_result_pins::load(state).await;
     let path = state.join_result_staging_path.clone();
     let raw = match tokio::fs::read(&path).await {
         Ok(raw) => raw,
@@ -36057,6 +36084,13 @@ pub(in crate::server) async fn respawn_unconverged_join_polls(
 ) -> Vec<String> {
     let self_agent = state.agent.agent_id();
     let self_hex = hex::encode(self_agent.as_bytes());
+    // A re-key chain step whose pin did not survive (expired, or dropped at
+    // load) is a finished departure: drop it instead of polling the admin
+    // that removed this device.
+    let row_keys: Vec<String> = state.named_groups.read().await.keys().cloned().collect();
+    for key in row_keys {
+        depart_abandoned_rekey_row(state.as_ref(), &key, "rekey_abandoned_at_startup").await;
+    }
     struct Candidate {
         group_id: String,
         mls_group_id: String,
@@ -36351,7 +36385,6 @@ fn record_expected_join_result_inviter(state: &AppState, key: String, inviter_ag
             timed_out: false,
         },
     );
-    join_result_pins::persist(state, &expected);
 }
 
 fn expected_join_result_inviter(state: &AppState, key: &str) -> Option<String> {
@@ -36383,15 +36416,30 @@ fn mark_expected_join_result_inviter_timed_out(state: &AppState, key: &str) {
         if let Some(pending) = expected.get_mut(key) {
             pending.timed_out = true;
         }
-        join_result_pins::persist(state, &expected);
     }
+}
+
+/// Re-arm a pin for the SAME pending join: an existing pin naming the same
+/// inviter keeps its original stamp and time-out state; anything else is a
+/// new pin.
+fn rearm_expected_join_result_inviter(state: &AppState, key: String, inviter_agent_id: String) {
+    // Reads through the TTL prune, so an expired pin is never "the same".
+    let same = expected_join_result_inviter(state, &key)
+        .is_some_and(|pinned| pinned.eq_ignore_ascii_case(&inviter_agent_id));
+    if !same {
+        record_expected_join_result_inviter(state, key, inviter_agent_id);
+    }
+}
+
+/// Persist the pin map after a change; every production mutation is
+/// followed by this call (see `join_result_pins`).
+async fn persist_join_result_pins(state: &AppState) {
+    join_result_pins::persist(state).await;
 }
 
 fn clear_expected_join_result_inviter(state: &AppState, key: &str) {
     if let Ok(mut expected) = state.expected_join_result_inviters.lock() {
-        if expected.remove(key).is_some() {
-            join_result_pins::persist(state, &expected);
-        }
+        expected.remove(key);
     }
 }
 
@@ -36715,6 +36763,7 @@ pub(in crate::server) async fn apply_join_result_endpoint(
     if applied {
         note_join_result_applied_after_timeout(state.as_ref(), &group_id, &member_agent_id);
         clear_expected_join_result_inviter(state.as_ref(), &expected_key);
+        persist_join_result_pins(state.as_ref()).await;
     }
     tracing::debug!(
         target: "treekem.trace",
@@ -37148,11 +37197,14 @@ async fn refire_pending_join_volley(
             return;
         }
     };
-    record_expected_join_result_inviter(
+    // The same pending join re-fired: keep the pin's original stamp and
+    // time-out state, so a re-invite never re-opens the re-key window.
+    rearm_expected_join_result_inviter(
         state.as_ref(),
         join_result_key(&stable_group_id, &joiner_hex),
         inviter_hex.to_string(),
     );
+    persist_join_result_pins(state.as_ref()).await;
     let resend = MemberJoinedResend {
         metadata_topic,
         event,
@@ -37723,6 +37775,36 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
     reason: Option<&'static str>,
     membership_guard: JoinFinalizeGuard<'_>,
 ) -> JoinFinalizeDisposition {
+    let disposition = Box::pin(finalize_join_attempt_with_reason_inner(
+        state,
+        local_group_key,
+        event_group_id,
+        member_agent_id,
+        attempt_id,
+        outcome,
+        reason,
+        membership_guard,
+    ))
+    .await;
+    // A timed-out or refused attempt ends the pin's life; a re-key chain
+    // step still waiting on it would otherwise strand its row for good.
+    if outcome != JoinAttemptOutcome::Seated {
+        depart_abandoned_rekey_row(state, local_group_key, "rekey_abandoned").await;
+    }
+    disposition
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finalize_join_attempt_with_reason_inner(
+    state: &AppState,
+    local_group_key: &str,
+    event_group_id: &str,
+    member_agent_id: &str,
+    attempt_id: &str,
+    outcome: JoinAttemptOutcome,
+    reason: Option<&'static str>,
+    membership_guard: JoinFinalizeGuard<'_>,
+) -> JoinFinalizeDisposition {
     let expected_key = join_result_key(event_group_id, member_agent_id);
     // The caller holds the (lookup-gated) membership mutex — held for
     // this WHOLE critical section (#477 C7: unknown groups take no lock
@@ -37842,6 +37924,7 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
     } else {
         clear_expected_join_result_inviter(state, &expected_key);
     }
+    persist_join_result_pins(state).await;
     // #477 (r7 item 3): abort every owned poll/task EXCEPT the finalizer's
     // own task — the timeout owner IS a registered poll whose handle sits
     // in `polls`; aborting itself here would cancel the cleanup below at
@@ -39955,6 +40038,85 @@ pub(in crate::server) async fn dispatch_join_result_message(
     });
 }
 
+/// The fallback that finishes a re-key chain step whose re-add never came.
+///
+/// The chain step applies the pinned inviter's removal of this device
+/// without the departure teardown, because the add that re-seats the device
+/// normally follows. When it does not (the inviter meant a kick, or the
+/// re-keying authority went away), the pin eventually stops being live: the
+/// attempt times out or is refused, or the pin expires. From then on the row
+/// is a departed group in all but name, so it departs: the row under every
+/// alias is dropped (durably), the card cache entry goes, and the ordinary
+/// crypto-material wipe runs (event log, pending queue, cached packages,
+/// pins, staged results, listener registrations). Returns whether it did.
+///
+/// Applies only to a TreeKEM row that lists this device as Removed, holds no
+/// tree, and has no live expected-inviter pin. Any id alias of the row may
+/// be given.
+async fn depart_abandoned_rekey_row(state: &AppState, any_group_id: &str, reason: &str) -> bool {
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let Some((group_key, info)) = ({
+        let groups = state.named_groups.read().await;
+        groups
+            .iter()
+            .find(|(key, info)| {
+                key.as_str() == any_group_id
+                    || info.mls_group_id == any_group_id
+                    || info.stable_group_id() == any_group_id
+            })
+            .map(|(key, info)| (key.clone(), info.clone()))
+    }) else {
+        return false;
+    };
+    if info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem
+        || !info
+            .members_v2
+            .get(&local_hex)
+            .is_some_and(x0x::groups::GroupMember::is_removed)
+        || live_expected_join_result_inviter(
+            state,
+            &join_result_key(info.stable_group_id(), &local_hex),
+        )
+        .is_some()
+    {
+        return false;
+    }
+    {
+        let trees = state.treekem_groups.read().await;
+        if trees.contains_key(&group_key) || trees.contains_key(info.stable_group_id()) {
+            return false;
+        }
+    }
+    let stable_group_id = info.stable_group_id().to_string();
+    let cache_aliases = treekem_cache_group_aliases(state, &group_key).await;
+    if !matches!(
+        persist_named_groups_mutation(state, |groups| {
+            let mut aliases =
+                collect_same_stable_group_aliases(groups, &group_key, Some(&stable_group_id));
+            aliases.insert(group_key.clone());
+            aliases.insert(stable_group_id.clone());
+            let mut removed_any = false;
+            for alias in &aliases {
+                removed_any |= groups.remove(alias).is_some();
+            }
+            removed_any
+        })
+        .await,
+        Ok(AtomicWriteOutcome::Durable)
+    ) {
+        return false;
+    }
+    state.group_card_cache.write().await.remove(&group_key);
+    let _ = prune_treekem_cache_groups(state, &cache_aliases, reason).await;
+    wipe_local_group_crypto_material(state, &group_key, Some(&stable_group_id), reason).await;
+    tracing::info!(
+        group_id = %LogHexId::group(&group_key),
+        reason,
+        "re-key chain step never got its re-add: the device departs the group"
+    );
+    true
+}
+
 /// Whether this device is waiting for a returning-member re-key by `actor`:
 /// the row is TreeKEM and holds no tree, and the device's live (persisted)
 /// expected-inviter pin for the group names `actor`. Such a device takes
@@ -40848,6 +41010,7 @@ async fn handle_join_result_message_bound(
                 // refusal can find a live attempt after the seat persisted.
                 note_join_result_applied_after_timeout(state, &group_id, &member_agent_id);
                 clear_expected_join_result_inviter(state.as_ref(), &expected_key);
+                persist_join_result_pins(state.as_ref()).await;
             }
         }
         JoinResultMessage::Refused { receipt } => {
@@ -41337,6 +41500,7 @@ async fn poll_join_result_until_deadline(
         // WITHOUT touching the now-durable group and WITHOUT recording a
         // terminal outcome (seated is not a terminal refusal state).
         clear_expected_join_result_inviter(state.as_ref(), &expected_key);
+        persist_join_result_pins(state.as_ref()).await;
         finalize_join_attempt(
             state.as_ref(),
             &group_id,
@@ -43377,6 +43541,7 @@ pub(in crate::server) mod tests {
                 .join("public_group_bootstrap_outbox.json"),
             join_result_staging_path: data_dir.join("pending_join_results.json"),
             join_result_staging_persistence_lock: Mutex::new(()),
+            join_result_pins_persistence_lock: Mutex::new(()),
             treekem_member_key_packages,
             treekem_event_log: RwLock::new(HashMap::new()),
             treekem_catchup_throttle: RwLock::new(HashMap::new()),

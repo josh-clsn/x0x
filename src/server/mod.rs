@@ -1224,6 +1224,7 @@ pub async fn serve_with_options(
         public_group_bootstrap_outbox_path,
         join_result_staging_path,
         join_result_staging_persistence_lock: Mutex::new(()),
+        join_result_pins_persistence_lock: Mutex::new(()),
         treekem_event_log: RwLock::new(HashMap::new()),
         treekem_member_key_packages,
         treekem_catchup_throttle: RwLock::new(HashMap::new()),
