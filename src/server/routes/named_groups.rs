@@ -40149,13 +40149,18 @@ enum AbandonedRekeyPin {
 /// crypto-material wipe runs (event log, pending queue, cached packages,
 /// pins, staged results, listener registrations).
 ///
-/// The decision is made, and re-made, under the roster persistence lock
-/// that every seat takes before it commits: EVERY alias row must be TreeKEM,
-/// not withdrawn, not banning this device, and list this device as Removed;
-/// no tree may be held under any alias; and the pin must be gone (or, per
-/// `pin`, merely timed out). If any of that changed since the unlocked
-/// pre-check (a seat landed), nothing is dropped and nothing is wiped. The
-/// membership lock is NOT taken here: some callers already hold it.
+/// Locking (`lock`): an unlocked pre-check first skips groups that cannot
+/// qualify, so a busy group never stalls a sweep over the others. Then the
+/// group's membership lock is held (taken here with [`DepartLock::Take`],
+/// only for a group that resolves locally, or already held by the caller
+/// with [`DepartLock::HeldByCaller`]) from the alias computation to the end
+/// of the wipe: every seat holds that lock from its row read to its tree
+/// install, so no seat is in flight across the drop or the wipe. The
+/// decision itself is re-made inside the roster persistence lock: EVERY
+/// alias row must be TreeKEM, not withdrawn, not banning this device, and
+/// list this device as Removed; no tree may be held under any alias; and the
+/// pin must be gone (or, per `pin`, merely timed out). If any of that does
+/// not hold, nothing is dropped and nothing is wiped.
 async fn depart_abandoned_rekey_row(
     state: &AppState,
     any_group_id: &str,
@@ -40163,116 +40168,146 @@ async fn depart_abandoned_rekey_row(
     lock: DepartLock,
     reason: &str,
 ) -> bool {
-    // Every seat path holds the group's membership lock from its row read
-    // to its tree install; holding it here from the pre-check to the end of
-    // the wipe means no seat can be in flight across the drop or the wipe.
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    // Cheap unlocked pre-check: the common "nothing to do" exit, taken
+    // without waiting on the group's membership lock.
+    {
+        let Some((stable, aliases)) = depart_alias_set(state, any_group_id).await else {
+            return false;
+        };
+        let pin_key = join_result_key(&stable, &local_hex);
+        if !depart_rows_qualify(&*state.named_groups.read().await, &aliases, &local_hex)
+            || !depart_pin_allows(state, pin, &pin_key)
+            || !depart_tree_absent(&*state.treekem_groups.read().await, &aliases)
+        {
+            return false;
+        }
+    }
     let membership_lock = match lock {
-        DepartLock::Take => Some(group_membership_lock(state, any_group_id).await),
+        DepartLock::Take => {
+            match group_membership_lock_for_known_group(state, any_group_id).await {
+                Some(lock) => Some(lock),
+                None => return false,
+            }
+        }
         DepartLock::HeldByCaller => None,
     };
     let _membership_guard = match membership_lock.as_ref() {
         Some(lock) => Some(lock.lock().await),
         None => None,
     };
-    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
-    // The alias set, computed BEFORE anything is dropped, so the wipe covers
-    // every key the group was known under.
-    let Some((stable_group_id, aliases)) = ({
-        let groups = state.named_groups.read().await;
-        let stable = groups
-            .iter()
-            .find(|(key, info)| {
-                key.as_str() == any_group_id
-                    || info.mls_group_id == any_group_id
-                    || info.stable_group_id() == any_group_id
-            })
-            .map(|(_, info)| info.stable_group_id().to_string());
-        stable.map(|stable| {
-            let mut aliases: HashSet<String> = HashSet::new();
-            aliases.insert(stable.clone());
-            for (key, info) in groups.iter() {
-                if key.as_str() == stable || info.stable_group_id() == stable {
-                    aliases.insert(key.clone());
-                    aliases.insert(info.mls_group_id.clone());
-                }
-            }
-            (stable, aliases)
-        })
-    }) else {
+    // Under the membership lock: the alias set the drop and the teardown use.
+    let Some((stable_group_id, aliases)) = depart_alias_set(state, any_group_id).await else {
         return false;
     };
     let pin_key = join_result_key(&stable_group_id, &local_hex);
-    let qualifies = |groups: &HashMap<String, x0x::groups::GroupInfo>| -> bool {
-        let rows: Vec<&x0x::groups::GroupInfo> = groups
-            .iter()
-            .filter(|(key, _)| aliases.contains(key.as_str()))
-            .map(|(_, info)| info)
-            .collect();
-        !rows.is_empty()
-            && rows.iter().all(|info| {
-                info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
-                    && !info.withdrawn
-                    && !info.is_banned(&local_hex)
-                    && info
-                        .members_v2
-                        .get(&local_hex)
-                        .is_some_and(x0x::groups::GroupMember::is_removed)
-            })
-    };
-    let pin_allows = || match (pin, pin_presence(state, &pin_key)) {
-        (_, PinPresence::Gone) | (AbandonedRekeyPin::MayBeTimedOut, PinPresence::TimedOut) => true,
-        (_, PinPresence::Live) | (AbandonedRekeyPin::MustBeGone, PinPresence::TimedOut) => false,
-    };
-    let tree_absent = |trees: &HashMap<String, Arc<Mutex<x0x::mls::TreeKemMlsGroup>>>| {
-        !aliases.iter().any(|alias| trees.contains_key(alias))
-    };
-    // Unlocked pre-check: the common "nothing to do" exit.
-    if !qualifies(&*state.named_groups.read().await)
-        || !pin_allows()
-        || !tree_absent(&*state.treekem_groups.read().await)
-    {
-        return false;
-    }
     #[cfg(test)]
     depart_test_pause(&stable_group_id).await;
-    let mut dropped: Vec<String> = Vec::new();
+    let mut dropped = false;
     let outcome = persist_named_groups_mutation(state, |groups| {
-        // Authoritative re-check, under the persistence lock every seat
-        // takes. The tree map is read without waiting: if it is busy, a
-        // tree may be landing, so this pass departs nothing.
+        // The decision, under the persistence lock every seat takes. The tree
+        // map is read without waiting: if it is busy, a tree may be landing,
+        // so this pass departs nothing.
         let tree_ok = state
             .treekem_groups
             .try_read()
-            .is_ok_and(|trees| tree_absent(&trees));
-        if !qualifies(groups) || !pin_allows() || !tree_ok {
+            .is_ok_and(|trees| depart_tree_absent(&trees, &aliases));
+        if !depart_rows_qualify(groups, &aliases, &local_hex)
+            || !depart_pin_allows(state, pin, &pin_key)
+            || !tree_ok
+        {
             return false;
         }
         for alias in &aliases {
-            if groups.remove(alias).is_some() {
-                dropped.push(alias.clone());
-            }
+            dropped |= groups.remove(alias).is_some();
         }
-        !dropped.is_empty()
+        dropped
     })
     .await;
-    if dropped.is_empty() || !matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
+    if !dropped || !matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
         return false;
     }
-    // The teardown covers the alias set the in-lock re-check validated (the
-    // dropped rows plus their mls and stable ids), still under the
-    // membership lock, so no seat can have re-inserted any of them.
-    let cache_aliases: HashSet<String> = aliases.clone();
-    let _ = prune_treekem_cache_groups(state, &cache_aliases, reason).await;
+    // The teardown covers the whole alias set computed under the membership
+    // lock (row keys plus their mls and stable ids), which is exactly what
+    // the in-lock decision validated; no seat can have re-inserted any of it.
+    let _ = prune_treekem_cache_groups(state, &aliases, reason).await;
     for alias in &aliases {
         state.group_card_cache.write().await.remove(alias);
         wipe_local_group_crypto_material(state, alias, Some(&stable_group_id), reason).await;
     }
+    #[cfg(test)]
+    depart_test_pause_at(&DEPART_AFTER_WIPE_PAUSE, &stable_group_id).await;
     tracing::info!(
         group_id = %LogHexId::group(&stable_group_id),
         reason,
         "re-key chain step never got its re-add: the device departs the group"
     );
     true
+}
+
+/// The stable id of the group `any_group_id` names, and every key it is
+/// known under: the rows whose key or stable id match, their mls ids, and
+/// the stable id itself.
+async fn depart_alias_set(
+    state: &AppState,
+    any_group_id: &str,
+) -> Option<(String, HashSet<String>)> {
+    let groups = state.named_groups.read().await;
+    let stable = groups
+        .iter()
+        .find(|(key, info)| {
+            key.as_str() == any_group_id
+                || info.mls_group_id == any_group_id
+                || info.stable_group_id() == any_group_id
+        })
+        .map(|(_, info)| info.stable_group_id().to_string())?;
+    let mut aliases: HashSet<String> = HashSet::new();
+    aliases.insert(stable.clone());
+    for (key, info) in groups.iter() {
+        if key.as_str() == stable || info.stable_group_id() == stable {
+            aliases.insert(key.clone());
+            aliases.insert(info.mls_group_id.clone());
+        }
+    }
+    Some((stable, aliases))
+}
+
+/// Every alias row is a TreeKEM row, not withdrawn, not banning this
+/// device, and lists this device as Removed.
+fn depart_rows_qualify(
+    groups: &HashMap<String, x0x::groups::GroupInfo>,
+    aliases: &HashSet<String>,
+    local_hex: &str,
+) -> bool {
+    let mut rows = groups
+        .iter()
+        .filter(|(key, _)| aliases.contains(key.as_str()))
+        .map(|(_, info)| info)
+        .peekable();
+    rows.peek().is_some()
+        && rows.all(|info| {
+            info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+                && !info.withdrawn
+                && !info.is_banned(local_hex)
+                && info
+                    .members_v2
+                    .get(local_hex)
+                    .is_some_and(x0x::groups::GroupMember::is_removed)
+        })
+}
+
+fn depart_pin_allows(state: &AppState, pin: AbandonedRekeyPin, pin_key: &str) -> bool {
+    match (pin, pin_presence(state, pin_key)) {
+        (_, PinPresence::Gone) | (AbandonedRekeyPin::MayBeTimedOut, PinPresence::TimedOut) => true,
+        (_, PinPresence::Live) | (AbandonedRekeyPin::MustBeGone, PinPresence::TimedOut) => false,
+    }
+}
+
+fn depart_tree_absent(
+    trees: &HashMap<String, Arc<Mutex<x0x::mls::TreeKemMlsGroup>>>,
+    aliases: &HashSet<String>,
+) -> bool {
+    !aliases.iter().any(|alias| trees.contains_key(alias))
 }
 
 /// Test seam for the check-then-drop window in
@@ -40285,6 +40320,12 @@ pub(in crate::server) type DepartTestPause =
 
 #[cfg(test)]
 pub(in crate::server) static DEPART_TEST_PAUSE: StdMutex<DepartTestPause> = StdMutex::new(None);
+
+/// A second seam in [`depart_abandoned_rekey_row`], after the wipe and
+/// before the membership lock is released.
+#[cfg(test)]
+pub(in crate::server) static DEPART_AFTER_WIPE_PAUSE: StdMutex<DepartTestPause> =
+    StdMutex::new(None);
 
 /// The same seam on the seat side: a welcome seat parks just before it
 /// takes the roster persistence lock.

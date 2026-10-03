@@ -3249,6 +3249,13 @@ async fn the_refused_departure_holds_the_membership_lock_to_the_end() -> Result<
         Arc::clone(&reached),
         Arc::clone(&go),
     ));
+    let wiped = Arc::new(tokio::sync::Notify::new());
+    let go_after_wipe = Arc::new(tokio::sync::Notify::new());
+    *super::super::DEPART_AFTER_WIPE_PAUSE.lock().expect("pause") = Some((
+        s.stable_group_id.clone(),
+        Arc::clone(&wiped),
+        Arc::clone(&go_after_wipe),
+    ));
     let refuse = super::super::finalize_join_attempt(
         &s.j2,
         &s.group_key,
@@ -3263,9 +3270,15 @@ async fn the_refused_departure_holds_the_membership_lock_to_the_end() -> Result<
         let lock = super::super::group_membership_lock(&s.j2, &s.group_key).await;
         assert!(
             lock.try_lock().is_err(),
-            "the departure holds the membership lock across its window"
+            "the departure holds the membership lock before the drop"
         );
         go.notify_one();
+        wiped.notified().await;
+        assert!(
+            lock.try_lock().is_err(),
+            "the departure still holds the membership lock after the wipe"
+        );
+        go_after_wipe.notify_one();
         // The fresh invite runs under the lock, after the departure.
         let _guard = lock.lock().await;
         super::super::record_expected_join_result_inviter(
@@ -3276,6 +3289,7 @@ async fn the_refused_departure_holds_the_membership_lock_to_the_end() -> Result<
     };
     tokio::join!(refuse, fresh_invite);
     *super::super::DEPART_TEST_PAUSE.lock().expect("pause") = None;
+    *super::super::DEPART_AFTER_WIPE_PAUSE.lock().expect("pause") = None;
     assert_eq!(
         wa_state(&s.j2, &s.group_key).await,
         "no_row",
@@ -3399,5 +3413,23 @@ async fn a_tree_under_any_alias_blocks_the_departure() -> Result<()> {
     assert!(!departed);
     assert!(s.j2.named_groups.read().await.contains_key(&s.group_key));
     assert!(s.j2.treekem_groups.read().await.contains_key(&alias));
+    Ok(())
+}
+
+/// Round 8 L1: the sweep never waits on the membership lock of a group that
+/// cannot qualify (here a seated authority row), so a busy group (a seat
+/// holding its lock across a Welcome fetch) does not stall startup.
+#[tokio::test]
+async fn the_sweep_skips_a_busy_group_that_cannot_qualify() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let lock = super::super::group_membership_lock(&s._authority, &s.group_key).await;
+    let _busy = lock.lock().await;
+    let swept = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::super::sweep_abandoned_rekey_rows(&s._authority, "test"),
+    )
+    .await;
+    assert_eq!(swept.ok(), Some(0), "the sweep finished without the lock");
     Ok(())
 }
