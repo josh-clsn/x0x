@@ -4428,3 +4428,44 @@ async fn s8a_r6_seam_staged_copy_check_never_blocks() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// WHY (r6 P3): G7 admits one fetch HANDLER per (group, member), but the
+/// handler spawns the inline egress and returns, releasing its ticket. A
+/// flood of duplicate fetches while one inline egress is stalled must
+/// still leave exactly ONE in-flight egress for that (group, recipient).
+#[tokio::test]
+async fn s8a_r6_duplicate_fetches_never_overlap_inline_egress() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    let g_hex = hex_of(&g.joiner);
+    let from = remnant_revision(&g.joiner, &g.group_key).await;
+    let armed = super::super::join_egress_test_barrier::arm(&g_hex, "join_result");
+    for _ in 0..6 {
+        super::super::dispatch_join_result_message(
+            &g.authority,
+            &g.joiner.agent.agent_id(),
+            true,
+            JoinResultMessage::FetchRequest {
+                group_id: g.stable.clone(),
+                member_agent_id: g_hex.clone(),
+                from_revision: from,
+                base_state_hash: None,
+                accepts_refusal: true,
+                accepts_control_blob_ref: true,
+                attempt_id: Some(g.attempt.clone()),
+            },
+        )
+        .await;
+        // Let the handler finish (and release its G7 ticket).
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    wait_reached(&armed.gate, "inline result").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let parked = armed.gate.parked();
+    drop(armed);
+    assert_eq!(
+        parked, 1,
+        "duplicate fetches started overlapping inline egress for one (group, recipient)"
+    );
+    Ok(())
+}

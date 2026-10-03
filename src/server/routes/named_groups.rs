@@ -36658,12 +36658,18 @@ pub(in crate::server) mod join_egress_test_barrier {
 
     pub(in crate::server) struct Gate {
         reached: AtomicBool,
+        parked: std::sync::atomic::AtomicUsize,
         release: tokio::sync::Semaphore,
     }
 
     impl Gate {
         pub(in crate::server) fn reached(&self) -> bool {
             self.reached.load(Ordering::SeqCst)
+        }
+
+        /// How many egresses are parked at this gate right now.
+        pub(in crate::server) fn parked(&self) -> usize {
+            self.parked.load(Ordering::SeqCst)
         }
 
         /// Release every current and future waiter of this gate.
@@ -36682,6 +36688,7 @@ pub(in crate::server) mod join_egress_test_barrier {
     pub(in crate::server) fn arm(recipient: &str, point: &'static str) -> Armed {
         let gate = Arc::new(Gate {
             reached: AtomicBool::new(false),
+            parked: std::sync::atomic::AtomicUsize::new(0),
             release: tokio::sync::Semaphore::new(0),
         });
         if let Ok(mut gates) = GATES.lock() {
@@ -36713,8 +36720,17 @@ pub(in crate::server) mod join_egress_test_barrier {
             .ok()
             .and_then(|gates| gates.get(&(recipient.to_string(), point)).cloned());
         if let Some(gate) = gate {
+            struct Parked(Arc<Gate>);
+            impl Drop for Parked {
+                fn drop(&mut self) {
+                    self.0.parked.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            gate.parked.fetch_add(1, Ordering::SeqCst);
+            let parked = Parked(Arc::clone(&gate));
             gate.reached.store(true, Ordering::SeqCst);
             let _ = gate.release.acquire().await;
+            drop(parked);
         }
     }
 }
