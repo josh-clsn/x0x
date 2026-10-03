@@ -2635,3 +2635,425 @@ async fn s8a_r3_non_clean_roster_verdicts_are_refused_on_both_paths() -> anyhow:
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Round 4 (Codex review of 42dea10, ADR 0107 accepted): eligibility and
+// expiry are enforced at transport admission; join artifacts never take a
+// delivery path that can hand their bytes to a detached gossip retry; a
+// copied blob dies with its original; Welcome fetch admission is fair; and
+// aborted or finished egress leaves no bookkeeping behind.
+// ---------------------------------------------------------------------------
+
+async fn withdraw_via_route(authority: &Arc<AppState>, group_key: &str) -> StatusCode {
+    withdraw_group_state(
+        State(Arc::clone(authority)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_key.to_string()),
+    )
+    .await
+    .into_response()
+    .status()
+}
+
+/// WHY (review r2 P1-1): revocation has no mutation event, so the only
+/// place it can be enforced for an in-flight serve is the transport's own
+/// admission. A recipient revoked AFTER the egress task's final check but
+/// BEFORE its bytes are handed to the transport gets nothing — on the
+/// inline result, Welcome frame and result-chunk paths.
+#[tokio::test]
+async fn s8a_r4_revocation_landing_before_transport_admission_sends_nothing() -> anyhow::Result<()>
+{
+    let mut leaks = Vec::new();
+    // Inline join result (GSS).
+    {
+        let dir = tempfile::tempdir()?;
+        let g = build_gss(dir.path(), false).await?;
+        let g_hex = hex_of(&g.joiner);
+        let from = remnant_revision(&g.joiner, &g.group_key).await;
+        let armed = super::super::join_egress_test_barrier::arm(&g_hex, "join_result");
+        clear_egress(&g.authority);
+        let _ = serve_result(&g.authority, &g.joiner, &g.stable, &g.attempt, from).await;
+        wait_reached(&armed.gate, "inline result").await;
+        let kp = g.joiner.agent.identity().agent_keypair().to_bytes();
+        revoke_agent(&g.authority, &kp).await?;
+        drop(armed);
+        if egress_happens(&g.authority, &g_hex, "join_result", Duration::from_secs(1)).await {
+            leaks.push("inline join result");
+        }
+    }
+    // Welcome frame and result chunk (Home).
+    for (point, what) in [
+        ("welcome_frame", "Welcome frame"),
+        ("join_result_chunk", "join-result chunk"),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let s = build(dir.path()).await?;
+        let j2_hex = hex_of(&s.j2);
+        let reference = if point == "join_result_chunk" {
+            Some(staged_join_result_blob(&s).await?)
+        } else {
+            None
+        };
+        let armed = super::super::join_egress_test_barrier::arm(&j2_hex, point);
+        clear_egress(&s.authority);
+        match &reference {
+            Some(reference) => fetch_chunk(&s, reference).await,
+            None => {
+                let welcome_id = welcome_id_of(&s.j2_add).expect("welcome ref");
+                assert!(serve_welcome(&s.authority, &s.j2, &s.stable, &welcome_id).await);
+            }
+        }
+        wait_reached(&armed.gate, what).await;
+        revoke_agent(&s.authority, &s.j2_kp).await?;
+        drop(armed);
+        if egress_happens(&s.authority, &j2_hex, point, Duration::from_secs(1)).await {
+            leaks.push(what);
+        }
+    }
+    assert!(
+        leaks.is_empty(),
+        "bytes were handed to the transport after the recipient was revoked: {leaks:?}"
+    );
+    Ok(())
+}
+
+/// WHY (review r2 P1-1): withdrawal (group deletion) is a terminal mutation:
+/// it must quiesce ALL of the group's in-flight join-artifact egress before
+/// it commits, and nothing may leave afterwards.
+#[tokio::test]
+async fn s8a_r4_withdrawal_landing_before_transport_admission_sends_nothing() -> anyhow::Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    let g_hex = hex_of(&g.joiner);
+    let from = remnant_revision(&g.joiner, &g.group_key).await;
+    let armed = super::super::join_egress_test_barrier::arm(&g_hex, "join_result");
+    clear_egress(&g.authority);
+    let _ = serve_result(&g.authority, &g.joiner, &g.stable, &g.attempt, from).await;
+    wait_reached(&armed.gate, "inline result").await;
+    let withdrawn = tokio::time::timeout(
+        Duration::from_secs(10),
+        withdraw_via_route(&g.authority, &g.group_key),
+    )
+    .await?;
+    assert!(withdrawn.is_success(), "withdraw: {withdrawn}");
+    drop(armed);
+    assert!(
+        !egress_happens(&g.authority, &g_hex, "join_result", Duration::from_secs(1)).await,
+        "the join result left after the group was withdrawn"
+    );
+    Ok(())
+}
+
+/// WHY (review r2 P1-2): the gossip inbox's stranded-publish retry
+/// (saorsa-gossip-pubsub 0.5.86) runs DETACHED, beyond any abort of ours.
+/// Join artifacts — the inline result, Welcome frames and result chunks —
+/// must only ever be handed to a delivery path that cannot reach gossip.
+#[tokio::test]
+async fn s8a_r4_join_artifacts_never_take_a_gossip_capable_path() -> anyhow::Result<()> {
+    let paths = |state: &AppState, recipient: &str| -> Vec<(&'static str, bool)> {
+        state
+            .named_group_test_recorders
+            .join_artifact_delivery_paths
+            .lock()
+            .expect("delivery-path witness")
+            .iter()
+            .filter(|(to, _, _)| to == recipient)
+            .map(|(_, kind, gossip)| (*kind, *gossip))
+            .collect()
+    };
+    let wait_for = |state: Arc<AppState>, recipient: String, kind: &'static str| async move {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if state
+                    .named_group_test_recorders
+                    .join_artifact_delivery_paths
+                    .lock()
+                    .expect("delivery-path witness")
+                    .iter()
+                    .any(|(to, k, _)| *to == recipient && *k == kind)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok()
+    };
+    let mut observed = Vec::new();
+    {
+        let dir = tempfile::tempdir()?;
+        let g = build_gss(dir.path(), false).await?;
+        let g_hex = hex_of(&g.joiner);
+        let from = remnant_revision(&g.joiner, &g.group_key).await;
+        assert!(
+            serve_result(&g.authority, &g.joiner, &g.stable, &g.attempt, from)
+                .await
+                .is_some()
+        );
+        assert!(
+            wait_for(Arc::clone(&g.authority), g_hex.clone(), "join_result").await,
+            "the inline result reached a transport"
+        );
+        observed.extend(paths(&g.authority, &g_hex));
+    }
+    {
+        let dir = tempfile::tempdir()?;
+        let s = build(dir.path()).await?;
+        let j2_hex = hex_of(&s.j2);
+        let welcome_id = welcome_id_of(&s.j2_add).expect("welcome ref");
+        assert!(serve_welcome(&s.authority, &s.j2, &s.stable, &welcome_id).await);
+        assert!(
+            wait_for(Arc::clone(&s.authority), j2_hex.clone(), "welcome_frame").await,
+            "a Welcome frame reached a transport"
+        );
+        let reference = staged_join_result_blob(&s).await?;
+        fetch_chunk(&s, &reference).await;
+        assert!(
+            wait_for(
+                Arc::clone(&s.authority),
+                j2_hex.clone(),
+                "join_result_chunk"
+            )
+            .await,
+            "a result chunk reached a transport"
+        );
+        observed.extend(paths(&s.authority, &j2_hex));
+    }
+    let gossip_capable: Vec<_> = observed.iter().filter(|(_, gossip)| *gossip).collect();
+    assert!(
+        gossip_capable.is_empty(),
+        "join artifacts were handed to a gossip-capable delivery path: {gossip_capable:?}"
+    );
+    Ok(())
+}
+
+/// WHY (review r2 P2-4, ADR 0107 line 70): a staged control-blob copy of a
+/// join result is bound to the ORIGINAL artifact and its deadline. Once the
+/// original expires — whether it expires after the copy was staged, or the
+/// copy was staged moments before the deadline — no chunk is served.
+#[tokio::test]
+async fn s8a_r4_copied_join_result_blob_expires_with_the_original() -> anyhow::Result<()> {
+    let ttl = super::super::PENDING_JOIN_RESULT_TTL;
+    let mut leaks = Vec::new();
+    for case in [
+        "original_expires_after_staging",
+        "staged_just_before_deadline",
+    ] {
+        let dir = tempfile::tempdir()?;
+        let s = build(dir.path()).await?;
+        let j2_hex = hex_of(&s.j2);
+        let key = join_result_key(&s.stable, &j2_hex);
+        if case == "staged_just_before_deadline" {
+            if let Some(p) = s.authority.pending_join_results.write().await.get_mut(&key) {
+                p.created_at = Instant::now()
+                    .checked_sub(ttl - Duration::from_millis(1500))
+                    .expect("monotonic clock far enough from boot");
+            }
+        }
+        let reference = staged_join_result_blob(&s).await?;
+        match case {
+            "original_expires_after_staging" => {
+                if let Some(p) = s.authority.pending_join_results.write().await.get_mut(&key) {
+                    p.created_at = Instant::now()
+                        .checked_sub(ttl + Duration::from_secs(1))
+                        .expect("monotonic clock far enough from boot");
+                }
+            }
+            _ => tokio::time::sleep(Duration::from_millis(2000)).await,
+        }
+        clear_egress(&s.authority);
+        fetch_chunk(&s, &reference).await;
+        if egress_happens(
+            &s.authority,
+            &j2_hex,
+            "join_result_chunk",
+            Duration::from_secs(1),
+        )
+        .await
+        {
+            leaks.push(case);
+        }
+    }
+    assert!(
+        leaks.is_empty(),
+        "a copied join-result blob outlived the original's deadline: {leaks:?}"
+    );
+    Ok(())
+}
+
+/// WHY (review r2 P2-5): Welcome fetch admission is validated, coalesced and
+/// fair. Duplicate and bogus FetchRequests aimed at ONE group whose lock is
+/// held must not use up the slots another group's legitimate fetch needs.
+#[tokio::test]
+async fn s8a_r4_welcome_fetch_admission_is_fair_across_groups() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    let welcome_id = welcome_id_of(&s.j2_add).expect("welcome ref");
+    // A second group on the same authority with a staged Welcome for J1.
+    let other_group = "c4".repeat(32);
+    {
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "other".to_string(),
+            String::new(),
+            s.authority_id,
+            other_group.clone(),
+            x0x::groups::GroupPolicy::default(),
+        );
+        info.add_member(
+            hex_of(&s.j1),
+            x0x::groups::GroupRole::Member,
+            Some(hex::encode(s.authority_id.as_bytes())),
+            None,
+        );
+        s.authority
+            .named_groups
+            .write()
+            .await
+            .insert(other_group.clone(), info);
+    }
+    let other_bytes = b"the other group's Welcome".to_vec();
+    let other_welcome = super::super::welcome_id_for_bytes(&other_bytes);
+    s.authority.pending_welcomes.write().await.insert(
+        other_welcome.clone(),
+        super::super::PendingWelcome {
+            group_id: other_group.clone(),
+            joiner_agent: hex_of(&s.j1),
+            bytes: other_bytes,
+            created_at: Instant::now(),
+        },
+    );
+
+    let lock = super::super::group_membership_lock_for_known_group(&s.authority, &s.stable)
+        .await
+        .expect("known group");
+    let held = lock.lock().await;
+    let j2_id = s.j2.agent.agent_id();
+    for n in 0..24u32 {
+        let id = if n % 3 == 0 {
+            welcome_id.clone()
+        } else {
+            hex::encode(blake3::hash(&n.to_le_bytes()).as_bytes())
+        };
+        super::super::dispatch_welcome_blob_message(
+            &s.authority,
+            &j2_id,
+            WelcomeBlobMessage::FetchRequest {
+                group_id: s.stable.clone(),
+                welcome_id: id,
+            },
+        )
+        .await;
+    }
+    super::super::dispatch_welcome_blob_message(
+        &s.authority,
+        &s.j1.agent.agent_id(),
+        WelcomeBlobMessage::FetchRequest {
+            group_id: other_group.clone(),
+            welcome_id: other_welcome.clone(),
+        },
+    )
+    .await;
+    let admitted = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if s.authority
+                .pending_welcome_streams
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|streams| streams.contains_key(&other_welcome))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    drop(held);
+    assert!(
+        admitted.is_ok(),
+        "another group's legitimate Welcome fetch was starved by one locked group's flood"
+    );
+    Ok(())
+}
+
+/// WHY (review r2 P3): a staging task cancelled by a removal or ban releases
+/// its per-recipient staging guard itself (RAII), not only on a later
+/// acquire.
+#[tokio::test]
+async fn s8a_r4_aborted_staging_releases_its_staging_guard() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    let j2_hex = hex_of(&s.j2);
+    let armed = super::super::join_egress_test_barrier::arm(&j2_hex, "join_result_stage");
+    assert!(
+        serve_result(&s.authority, &s.j2, &s.stable, &s.j2_attempt, Some(s.base))
+            .await
+            .is_some()
+    );
+    wait_reached(&armed.gate, "staging").await;
+    let key = (s.stable.clone(), s.j2.agent.agent_id());
+    assert!(s
+        .authority
+        .join_result_staging_guards
+        .lock()
+        .expect("staging guards")
+        .contains_key(&key));
+    assert!(ban_via_route(&s.authority, &s.group_key, &j2_hex)
+        .await
+        .is_success());
+    drop(armed);
+    assert!(
+        !s.authority
+            .join_result_staging_guards
+            .lock()
+            .expect("staging guards")
+            .contains_key(&key),
+        "the aborted staging task left its staging guard behind"
+    );
+    Ok(())
+}
+
+/// WHY (review r2 registry hygiene): a finished egress task leaves the
+/// egress registry when it completes, not only when a later egress spawns.
+#[tokio::test]
+async fn s8a_r4_finished_egress_tasks_leave_the_registry() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    let g_hex = hex_of(&g.joiner);
+    let from = remnant_revision(&g.joiner, &g.group_key).await;
+    assert!(
+        serve_result(&g.authority, &g.joiner, &g.stable, &g.attempt, from)
+            .await
+            .is_some()
+    );
+    let key = (g.stable.clone(), g_hex.clone());
+    let finished = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let done = g
+                .authority
+                .join_artifact_egress
+                .lock()
+                .expect("egress registry")
+                .get(&key)
+                .is_none_or(|tasks| tasks.iter().all(tokio::task::JoinHandle::is_finished));
+            if done {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(finished.is_ok(), "the egress task never finished");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !g.authority
+            .join_artifact_egress
+            .lock()
+            .expect("egress registry")
+            .contains_key(&key),
+        "a finished egress task stayed in the registry"
+    );
+    Ok(())
+}

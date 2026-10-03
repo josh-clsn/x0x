@@ -35861,6 +35861,35 @@ pub(in crate::server) mod join_egress_test_barrier {
     }
 }
 
+/// Whether a direct-message send with `config` can end on the gossip inbox
+/// (mirrors `Agent::send_direct_with_config` routing: only a preferred
+/// raw-QUIC send that stops on a raw error never publishes to gossip).
+#[cfg(test)]
+fn dm_config_can_reach_gossip(config: &x0x::dm::DmSendConfig) -> bool {
+    config.require_gossip
+        || config.require_durable_app_ack
+        || !config.prefer_raw_quic_if_connected
+        || !config.stop_fallback_on_raw_error
+}
+
+/// ADR 0107 (review r2 P1-2): test-only witness of the delivery path a
+/// join artifact was handed to.
+#[cfg(test)]
+fn record_join_artifact_delivery_path(
+    state: &AppState,
+    recipient: &str,
+    kind: &'static str,
+    can_reach_gossip: bool,
+) {
+    if let Ok(mut paths) = state
+        .named_group_test_recorders
+        .join_artifact_delivery_paths
+        .lock()
+    {
+        paths.push((recipient.to_string(), kind, can_reach_gossip));
+    }
+}
+
 /// ADR 0107 (review r2): the test-only egress witness, at the point where
 /// a join artifact's bytes are handed to the transport (after any barrier).
 #[cfg(test)]
@@ -36278,6 +36307,13 @@ async fn handle_join_result_message_bound(
                     "join_result",
                 )
                 .await;
+                #[cfg(test)]
+                record_join_artifact_delivery_path(
+                    &task_state,
+                    &member_for_task,
+                    "join_result",
+                    dm_config_can_reach_gossip(&direct_message_send_config()),
+                );
                 if let Err(e) = task_state
                     .agent
                     .send_direct_with_config(&recipient, payload, direct_message_send_config())
@@ -37411,6 +37447,13 @@ async fn handle_welcome_fetch_request(
         move |msg: WelcomeBlobMessage| {
             let state = Arc::clone(&send_state);
             async move {
+                #[cfg(test)]
+                record_join_artifact_delivery_path(
+                    &state,
+                    &hex::encode(send_recipient.as_bytes()),
+                    "welcome_frame",
+                    dm_config_can_reach_gossip(&welcome_blob_send_config(&msg)),
+                );
                 send_welcome_blob_message(&state, &send_recipient, &msg)
                     .await
                     .map(|_| ())

@@ -1282,6 +1282,11 @@ pub(super) struct NamedGroupTestRecorders {
     /// are handed to the transport (`join_result`, `join_result_reference`,
     /// `join_result_chunk`, `welcome_frame`).
     pub(super) join_artifact_egress: StdMutex<Vec<(String, String, &'static str)>>,
+    /// ADR 0107 (review r2 P1-2): the delivery path every join-artifact
+    /// egress was handed to, as `(recipient, kind, can_reach_gossip)`. A
+    /// path that can reach the gossip inbox can leave the bytes with a
+    /// detached stranded-publish retry.
+    pub(super) join_artifact_delivery_paths: StdMutex<Vec<(String, &'static str, bool)>>,
 }
 
 #[cfg(test)]

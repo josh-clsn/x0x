@@ -759,11 +759,20 @@ pub(in crate::server) async fn handle_control_blob_message(
                         "join_result_chunk",
                     )
                     .await;
+                    #[cfg(test)]
+                    let witness_recipient = reference.recipient.clone();
                     let message = ControlBlobMessage::Chunk {
                         reference,
                         sequence,
                         data_b64: BASE64.encode(chunk),
                     };
+                    #[cfg(test)]
+                    super::record_join_artifact_delivery_path(
+                        &task_state,
+                        &witness_recipient,
+                        "join_result_chunk",
+                        super::dm_config_can_reach_gossip(&control_config(&message)),
+                    );
                     if let Err(reason) = send_message(&task_state.agent, &recipient, &message).await
                     {
                         tracing::warn!(reason, "control blob chunk send failed");
