@@ -10823,7 +10823,9 @@ async fn replay_parked_role_updates(state: &Arc<AppState>, group_key: &str) {
 /// #878 r5: drop the per-pair guard entry once its staging task ends —
 /// the map must not grow with the (group, recipient) universe. Removed
 /// only when the stored semaphore is the SAME instance and fully
-/// released (no other task holds a permit on it).
+/// released (no other task holds a permit on it). Production staging
+/// releases through [`JoinResultStagingSlot`]'s drop (r5, G9).
+#[cfg(test)]
 fn release_join_result_staging_guard(state: &AppState, key: &(String, AgentId)) {
     let mut guards = state
         .join_result_staging_guards
@@ -10859,6 +10861,52 @@ fn acquire_join_result_staging_permit(
         .or_insert_with(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)))
         .clone();
     semaphore.try_acquire_owned().ok()
+}
+
+/// ADR 0107 (r5, G9): RAII ownership of one `(group, recipient)` staging
+/// slot. Dropping it (completion, abort, deadline or panic) releases the
+/// permit, then removes the guard-map entry only when it is still THIS
+/// semaphore and idle, so an old slot never removes its replacement's
+/// entry.
+struct JoinResultStagingSlot {
+    state: Arc<AppState>,
+    key: (String, AgentId),
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl Drop for JoinResultStagingSlot {
+    fn drop(&mut self) {
+        let Some(permit) = self.permit.take() else {
+            return;
+        };
+        let semaphore = Arc::clone(permit.semaphore());
+        drop(permit);
+        let mut guards = self
+            .state
+            .join_result_staging_guards
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guards.get(&self.key).is_some_and(|current| {
+            Arc::ptr_eq(current, &semaphore) && current.available_permits() == 1
+        }) {
+            guards.remove(&self.key);
+        }
+    }
+}
+
+/// ADR 0107 (r5, G9): [`acquire_join_result_staging_permit`] as an RAII
+/// [`JoinResultStagingSlot`].
+fn acquire_join_result_staging_slot(
+    state: &Arc<AppState>,
+    group_id: &str,
+    recipient: &AgentId,
+) -> Option<JoinResultStagingSlot> {
+    let permit = acquire_join_result_staging_permit(state, group_id, recipient)?;
+    Some(JoinResultStagingSlot {
+        state: Arc::clone(state),
+        key: (group_id.to_string(), *recipient),
+        permit: Some(permit),
+    })
 }
 
 /// #876 r3: the `agent_id` a `MemberRoleUpdated` targets, if the event
@@ -35678,7 +35726,7 @@ pub(in crate::server) const WELCOME_FETCH_HANDLER_CAP: usize = 16;
 /// re-checks eligibility under the group's membership lock before it hands
 /// bytes to the transport; receipt waits run outside that lock.
 fn spawn_join_artifact_egress<F>(
-    state: &AppState,
+    state: &Arc<AppState>,
     group_id: &str,
     recipient: &str,
     deadline: Instant,
@@ -35687,8 +35735,18 @@ fn spawn_join_artifact_egress<F>(
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     let (registered, ready) = oneshot::channel::<()>();
+    let cleanup_state = Arc::clone(state);
+    let registry_key = (group_id.to_string(), recipient.to_string());
     let handle = tokio::spawn(async move {
         if ready.await.is_ok() {
+            // r5 (G9): the task leaves the registry itself when it ends —
+            // completion, deadline, abort or panic — by task id, so it never
+            // removes another task's handle.
+            let _cleanup = JoinArtifactEgressCleanup {
+                state: cleanup_state,
+                key: registry_key,
+                task: tokio::task::try_id(),
+            };
             // r5 (lifecycle note section 2.7 item 6): no egress task
             // outlives its artifact's deadline. A timeout drops the body
             // (an unfinished stream resets) and never purges.
@@ -35710,6 +35768,30 @@ fn spawn_join_artifact_egress<F>(
             .push(handle);
     }
     let _ = registered.send(());
+}
+
+/// ADR 0107 (r5, G9): removes its own task's handle from the egress registry
+/// on drop (see [`spawn_join_artifact_egress`]).
+struct JoinArtifactEgressCleanup {
+    state: Arc<AppState>,
+    key: (String, String),
+    task: Option<tokio::task::Id>,
+}
+
+impl Drop for JoinArtifactEgressCleanup {
+    fn drop(&mut self) {
+        let mut registry = self
+            .state
+            .join_artifact_egress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(tasks) = registry.get_mut(&self.key) {
+            tasks.retain(|task| Some(task.id()) != self.task && !task.is_finished());
+            if tasks.is_empty() {
+                registry.remove(&self.key);
+            }
+        }
+    }
 }
 
 /// ADR 0107 (review r2): stop every in-flight egress of `member_hex`'s join
@@ -36559,7 +36641,7 @@ async fn handle_join_result_message_bound(
                 // duplicate while a staging runs is DROPPED (the
                 // reference it would stage is byte-identical; the
                 // recipient's retry fetches the live one).
-                let Some(permit) = acquire_join_result_staging_permit(state, &group_id, sender)
+                let Some(staging_slot) = acquire_join_result_staging_slot(state, &group_id, sender)
                 else {
                     tracing::debug!(
                         group_id = %LogHexId::group(&group_id),
@@ -36573,7 +36655,6 @@ async fn handle_join_result_message_bound(
                 let attempt = attempt_id.clone();
                 let member_for_log = member_agent_id.clone();
                 let recipient = *sender;
-                let guard_key = (group_id.clone(), *sender);
                 // ADR 0107 (review r2): staging is egress of a copy of the
                 // result. Each (re)staging attempt re-checks eligibility and
                 // stages atomically under the group's membership lock, inside
@@ -36587,7 +36668,7 @@ async fn handle_join_result_message_bound(
                     &member_agent_id,
                     artifact_deadline,
                     async move {
-                        let _staging_permit = permit;
+                        let staging_slot = staging_slot;
                         let mut retries = 0;
                         let staged = loop {
                             #[cfg(test)]
@@ -36639,11 +36720,10 @@ async fn handle_join_result_message_bound(
                             }
                             Err(reason) => Err(reason),
                         };
-                        // #878 r5 (review): drop OUR permit BEFORE pruning,
-                        // so the released semaphore is observably idle — the
-                        // prune condition (available == 1) actually holds.
-                        drop(_staging_permit);
-                        release_join_result_staging_guard(&task_state, &guard_key);
+                        // #878 r5 / r5 G9: the slot releases its permit,
+                        // then its own idle guard entry (also on abort or at
+                        // the deadline).
+                        drop(staging_slot);
                         if let Err(e) = outcome {
                             tracing::warn!(group_id = %LogHexId::group(&group_id_for_task), member = %LogHexId::agent(&member_for_log), "failed to send join-result reference: {e}");
                         }
@@ -37982,7 +38062,35 @@ where
     // An aborted sender cannot run its normal ack-slot cleanup. Clear its
     // slot only after it has stopped so the replacement owns every ack.
     state.pending_welcome_acks.write().await.remove(welcome_id);
-    streams.insert(welcome_id.to_string(), tokio::spawn(stream));
+    // r5 (G9): the stream is supervised (a panic is reported, not lost)
+    // and removes its own handle when it ends, by task id, so it never
+    // removes a replacement's.
+    let task_state = Arc::clone(state);
+    let id = welcome_id.to_string();
+    streams.insert(
+        welcome_id.to_string(),
+        tokio::spawn(async move {
+            if futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(stream))
+                .await
+                .is_err()
+            {
+                tracing::error!(
+                    welcome_id = %LogHexId::new("welcome", &id),
+                    "Welcome stream panicked; its bookkeeping was released"
+                );
+            }
+            let own = tokio::task::try_id();
+            let mut streams = task_state.pending_welcome_streams.lock().await;
+            if let Some(streams) = streams.as_mut() {
+                if streams
+                    .get(&id)
+                    .is_some_and(|handle| Some(handle.id()) == own)
+                {
+                    streams.remove(&id);
+                }
+            }
+        }),
+    );
 }
 
 /// ADR 0107: stream one staged Welcome through `transport`, guarding every
@@ -38060,6 +38168,14 @@ async fn stream_welcome_blob_via<S, F>(
         }
         acks.insert(welcome_id.to_string(), Arc::clone(&ack_slot));
     }
+    // r5 (G9): the ACK slot is released whenever this stream ends —
+    // completion, failure, abort, deadline or panic — and only if it is
+    // still THIS stream's slot.
+    let _ack_slot_guard = WelcomeAckSlotGuard {
+        state: Arc::clone(state),
+        welcome_id: welcome_id.to_string(),
+        slot: Arc::clone(&ack_slot),
+    };
     #[cfg(test)]
     if let Some(gate) = WELCOME_STREAM_TEST_GATES
         .get()
@@ -38105,7 +38221,6 @@ async fn stream_welcome_blob_via<S, F>(
         let sequence = sequence as u64;
         if let Err(e) = wait_for_chunk_window(&ack_slot, sequence).await {
             tracing::warn!(welcome_id, "Welcome blob chunk window failed: {e}");
-            state.pending_welcome_acks.write().await.remove(welcome_id);
             return;
         }
         let msg = WelcomeBlobMessage::Chunk {
@@ -38119,7 +38234,6 @@ async fn stream_welcome_blob_via<S, F>(
                 sequence,
                 "failed to send Welcome blob chunk: {e}"
             );
-            state.pending_welcome_acks.write().await.remove(welcome_id);
             return;
         }
         tracing::debug!(target: "welcome.trace", stage = "chunk_sent", welcome_id, seq = sequence);
@@ -38130,7 +38244,6 @@ async fn stream_welcome_blob_via<S, F>(
         if let Err(e) = wait_for_final_acks(&ack_slot, last_seq).await {
             tracing::warn!(welcome_id, "Welcome blob final ack wait failed: {e}");
             tracing::debug!(target: "welcome.trace", stage = "final_ack_failed", welcome_id, total_chunks, last_acked = ack_slot.highest_acked(), "{e}");
-            state.pending_welcome_acks.write().await.remove(welcome_id);
             return;
         }
         tracing::debug!(target: "welcome.trace", stage = "final_ack_ok", welcome_id, total_chunks);
@@ -38141,7 +38254,45 @@ async fn stream_welcome_blob_via<S, F>(
     if let Err(e) = send(complete).await {
         tracing::warn!(welcome_id, "failed to send Welcome blob complete: {e}");
     }
-    state.pending_welcome_acks.write().await.remove(welcome_id);
+}
+
+/// ADR 0107 (r5, G9): releases a Welcome stream's ACK slot on drop, only
+/// while the slot is still that stream's (`Arc::ptr_eq`). A contended map
+/// is released by a short follow-up task.
+struct WelcomeAckSlotGuard {
+    state: Arc<AppState>,
+    welcome_id: String,
+    slot: Arc<FileChunkAckSlot>,
+}
+
+impl Drop for WelcomeAckSlotGuard {
+    fn drop(&mut self) {
+        fn release(
+            acks: &mut HashMap<String, Arc<FileChunkAckSlot>>,
+            welcome_id: &str,
+            slot: &Arc<FileChunkAckSlot>,
+        ) {
+            if acks
+                .get(welcome_id)
+                .is_some_and(|current| Arc::ptr_eq(current, slot))
+            {
+                acks.remove(welcome_id);
+            }
+        }
+        if let Ok(mut acks) = self.state.pending_welcome_acks.try_write() {
+            release(&mut acks, &self.welcome_id, &self.slot);
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let state = Arc::clone(&self.state);
+            let welcome_id = std::mem::take(&mut self.welcome_id);
+            let slot = Arc::clone(&self.slot);
+            runtime.spawn(async move {
+                let mut acks = state.pending_welcome_acks.write().await;
+                release(&mut acks, &welcome_id, &slot);
+            });
+        }
+    }
 }
 
 async fn handle_welcome_blob_chunk(

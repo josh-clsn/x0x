@@ -2402,22 +2402,14 @@ async fn s8a_r2_welcome_listener_progresses_while_a_group_lock_is_held() -> anyh
         "a receive-side frame queued behind the fetch"
     );
     drop(held);
-    // The fetch completes once the lock is free.
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if s.authority
-                .pending_welcome_streams
-                .lock()
-                .await
-                .as_ref()
-                .is_some_and(|streams| streams.contains_key(&welcome_id))
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await?;
+    // The fetch completes once the lock is free: its stream hands a Welcome
+    // frame to the transport. (r5 G9: a finished stream removes its own
+    // handle, so the stream map is no longer a durable witness.)
+    let j2_hex = hex_of(&s.j2);
+    assert!(
+        transport_seen(&s.authority, &j2_hex, "welcome_frame").await,
+        "the parked fetch never streamed once the lock was free"
+    );
     Ok(())
 }
 
