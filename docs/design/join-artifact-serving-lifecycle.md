@@ -1,8 +1,8 @@
 # Join-artifact serving lifecycle
 
-- **Status:** r3. A design note, not an ADR. r1 (`b1bb561`) was reviewed UNSOUND; r2 (`cfaeb0a`) SOUND-WITH-CORRECTIONS. r3 adds the per-exchange deadline (section 2.7, item 6) and records David's ruling D60 on class K (section 6). Section 7 maps each review item to its correction.
+- **Status:** r4. A design note, not an ADR. r1 (`b1bb561`) was reviewed UNSOUND; r2 (`cfaeb0a`) SOUND-WITH-CORRECTIONS; r3 added the per-exchange deadline and D60. r4 records the round-5 implementation (section 8). Section 7 maps each review item to its correction.
 - **Implements:** [ADR 0107](../adr/0107-stuck-join-rearm-and-serving-guard.md) (Accepted by David, D57; the header on this branch still reads Proposed). ADR 0107 is immutable; this note says how the code meets it.
-- **Code baseline:** `85bea26` (r3) plus `61533e0` (r4 WIP) on `fix/1150-stuck-join-rearm` (PR #1190, target v0.46.2).
+- **Code baseline:** sections 2–5 describe `85bea26` (r3) plus `61533e0` (r4 WIP) on `fix/1150-stuck-join-rearm` (PR #1190, target v0.46.2). Section 8 records what round 5 (`37d9133`..`447670a`) changed.
 - **Pinned dependencies:** saorsa-gossip-pubsub 0.5.86, ant-quic 0.27.54. Neither changes for v0.46.x. Section 2.7 specifies a send path that needs no change to either.
 
 ## 1. Terms
@@ -276,3 +276,29 @@ Ruling: **current eligibility is required.** Every delivery and every resend of 
 | Fault-matrix corrections | F1a/b, F1c, F1d/F2b, F1e, F2d, F5b, F5e, F6/F7 as listed in the review. |
 | r2 re-check (Codex, `cfaeb0a`): no whole-exchange timeout on the uni path | Section 2.7 item 6: per-exchange and per-task deadlines that cancel, reset and release without purging; G10 and G13 updated. Contention at the seam is a retryable withhold, never a purge. |
 | D60 | Section 6 records the ruling; G11 becomes a code fix with an epoch-bound share admission. |
+
+## 8. Implementation status (round 5)
+
+Each gap below was fixed red-then-green: the test commit is red on its parent, the fix commit turns it green. Unless noted, the evidence is the named in-process tests in `src/server/routes/named_groups/tests/adr0107_stuck_join_rearm.rs`, run in debug and in release.
+
+| Gap | Status | Red, then fix | Evidence |
+|---|---|---|---|
+| G2 | Fixed: the seam checks agent and resolved-machine revocation and `enforce_pairing` on every exchange | `37d9133`, `ffb8536` | `s8a_r5_g2_machine_revocation_before_admission_sends_nothing`; real path `s8a_r5_g13_real_machine_revocation_before_the_seam_writes_nothing` (CI only) |
+| G3 | Fixed: class R and class K use `Agent::send_direct_pinned_admitted` (section 2.7) — one exchange, admitted at the seam, no resend; no dependency change | `37d9133`, `ffb8536` | `s8a_r5_g3_recovery_responses_take_one_admitted_exchange`; real path `s8a_r5_g13_real_pinned_exchange_is_admitted_once_and_delivered_once`, `s8a_r5_g13_real_refusals_write_nothing` (CI only) |
+| Deadline (section 2.7 item 6) | Fixed: per-exchange `min(now + 10 s, artifact deadline)`; per-task artifact deadline (registry task, chunk task, Welcome stream) | `37d9133`, `ffb8536` | `s8a_r5_deadline_cuts_stalled_exchanges`; real path `s8a_r5_g13_real_deadline_cuts_a_stalled_exchange` (CI only; the stall is in the pre-phase — a stalled `write_all` is not reproducible on loopback) |
+| G14 | Fixed: DM metrics recorded; no phi short-circuit, because these sends answer the recipient's own fetch | `37d9133`, `ffb8536` | `s8a_r5_g14_recovery_response_sends_record_dm_metrics` |
+| G9 | Fixed: RAII staging slot; registry handles removed by task id; Welcome streams supervised (`catch_unwind`) and removed by task id; ACK slot released by `Arc::ptr_eq` drop guard | `aca4880`, `b8bf183` | `s8a_r4_aborted_staging_releases_its_staging_guard`, `s8a_r4_finished_egress_tasks_leave_the_registry` (un-ignored), `s8a_r5_g9_finished_welcome_stream_leaves_its_handle`, `s8a_r5_g9_panicking_welcome_stream_releases_its_bookkeeping` |
+| G4 | Fixed: `quiesce_group_join_egress` (every alias, every recipient, every Welcome stream; awaited) before the tombstone persist; the wipe awaits its aborts | `68e4719`, `3aba7e3` | `s8a_r5_g4_withdrawal_quiesces_all_group_egress_before_its_commit` (the `GroupDeleted` apply shares the code path; inspection) |
+| G5 | Fixed: `retire_local_group_join_artifacts` (quiesce, then purge) on the local drop, the active TreeKEM leave, the GSS leave and the removed-self apply | `3712cf2`, `fdb5ac0` | `s8a_r5_g5_local_drop_quiesces_and_purges_the_groups_join_artifacts`; the other three call sites share the helper (inspection) |
+| G6 | Fixed: provisional validation without the lock, `FairAdmission` (per Welcome; 2 per group; 16 global), RAII ticket, 10 s handler bound | `c173709`, `f2a27ae` | `s8a_r4_welcome_fetch_admission_is_fair_across_groups` (un-ignored), `fair_admission::tests::duplicates_coalesce_and_groups_share_fairly` |
+| G7 | Fixed: `dispatch_join_result_message` handles a `FetchRequest` (and the owner-certificate retry) off the listener: one handler per `(group, member)`; 4 per group; 32 global; 20 s bound | `f79ec5a`, `34eafc0` | `s8a_r5_g7_join_result_listener_never_waits_on_a_group_lock` |
+| G8 | Fixed: a chunk fetch must name a staged, bound copy and an existing sequence before it takes capacity; one task per chunk; 4 per group; 16 global | `b7710d2`, `fd7d8b2` | `s8a_r5_g8_chunk_fetch_admission_is_validated_and_fair` |
+| G11 (D60) | Fixed: every class-K share (joiner share, approval, ban, removal and eviction survivors) goes through a registered, epoch-bound, single-admission delivery. There is no gossip publish. Withheld shares re-check every 15 s until a 10-minute horizon; definitive refusals and epoch moves purge; transport failures back off from 8 s to 120 s. The reseal envelope stays local. | `98f7e3d`, `9210ec3` | `s8a_r5_g11_{agent_revocation_withholds_nothing_and_purges_the_share, machine_revocation_withholds_the_share, certificate_expiry_purges_the_share, verdict_change_withholds_the_share, quarantine_withholds_the_share, share_resend_is_admitted_afresh}` |
+| G13 | Added: four real loopback QUIC tests | `447670a` | CI only (isolated namespace); compiled and clippy-clean locally |
+| G1, G12 | Accepted (section 5) | — | — |
+| G10 | Accept, conditional on evidence | — | Needs e2e Home and mixed-version runs. Class K is now raw-only too: an unreachable recipient retries until the horizon. |
+
+Remaining notes:
+- **Retry classification.** Certificate expiry is classified as definitive and purges, consistent with the existing serving guard. A later certificate renewal does not re-send a purged share; the next rotation does.
+- **Joiner side.** A `Result` arm handled on the joiner's listener still waits inline for the joiner's own group lock. That is outside these gaps.
+- **Shared fault cell.** The in-process local-delete tests (`r9_local_delete_completes_without_deadlock`, `r10_delete_fault_matrix_through_production_path`) share a global delete-fault cell, so they must run in separate processes (as nextest does). This predates round 5.
