@@ -794,6 +794,19 @@ mod tests {
             .unwrap();
     }
 
+    /// Finish a tar.gz builder into a complete archive on disk: the tar
+    /// end-of-archive blocks, then the gzip footer. `Builder::finish`
+    /// alone leaves the gzip stream unflushed inside the encoder until it
+    /// is dropped — too late when a test reads the archive in the same
+    /// scope — so extraction would hit a truncated deflate stream.
+    fn finish_tar_gz(builder: TarGzBuilder) {
+        builder
+            .into_inner()
+            .expect("finish tar stream")
+            .finish()
+            .expect("finish gzip stream");
+    }
+
     fn create_tar_gz_with_entries(dir: &Path, entries: &[(&str, &[u8])]) -> PathBuf {
         let (mut builder, archive_path) = new_tar_gz(dir);
 
@@ -806,7 +819,7 @@ mod tests {
                 content,
             );
         }
-        builder.finish().unwrap();
+        finish_tar_gz(builder);
 
         archive_path
     }
@@ -904,7 +917,7 @@ mod tests {
             None,
             b"readme text\n",
         );
-        builder.finish().unwrap();
+        finish_tar_gz(builder);
 
         let daemon_output = dir.path().join("extracted-x0xd");
         extract_binary_from_archive(&archive, &daemon_output, "x0xd").unwrap();
@@ -1112,7 +1125,7 @@ mod tests {
             None,
             &content,
         );
-        builder.finish().unwrap();
+        finish_tar_gz(builder);
         let output = dir.path().join("extracted");
 
         extract_binary_from_archive(&archive_path, &output, "x0xd").unwrap();
@@ -1133,13 +1146,14 @@ mod tests {
             Some("other-entry"),
             b"",
         );
-        builder.finish().unwrap();
+        finish_tar_gz(builder);
         let output = dir.path().join("extracted");
 
         let result = extract_binary_from_archive(&archive_path, &output, "x0xd");
         assert!(matches!(
             &result,
-            Err(UpgradeError::ExtractionError(msg)) if msg.contains("not found")
+            Err(UpgradeError::ExtractionError(msg))
+                if msg == "binary 'x0xd' not found in tar.gz archive"
         ));
         assert!(!output.exists());
     }
