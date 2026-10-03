@@ -5087,6 +5087,89 @@ where
     Ok(result)
 }
 
+/// Both spelling directions must gate the clear and replace/rebind the
+/// existing entry, without creating another record under the caller's key.
+#[tokio::test]
+async fn issue1103_record_clear_other_spelling_stays_gated() -> Result<()> {
+    for stored_under_stable in [true, false] {
+        for fault in [SaveFault::Error, SaveFault::NotReplaced] {
+            let fixture = member_joined_treekem_fixture(0xD7, 0xD8).await?;
+            let state = &fixture.state;
+            let alias_key = fixture.group_id.clone();
+            let stable_key = live_record(state, &alias_key)
+                .await
+                .stable_group_id()
+                .to_string();
+            assert_ne!(alias_key, stable_key);
+            let (stored_key, request_key) = if stored_under_stable {
+                {
+                    let mut groups = state.named_groups.write().await;
+                    let info = groups.remove(&alias_key).expect("fixture record");
+                    groups.insert(stable_key.clone(), info);
+                }
+                {
+                    let mut groups = state.treekem_groups.write().await;
+                    let group = groups.remove(&alias_key).expect("fixture TreeKEM group");
+                    groups.insert(stable_key.clone(), group);
+                }
+                (stable_key, alias_key)
+            } else {
+                (alias_key, stable_key)
+            };
+            {
+                let mut groups = state.named_groups.write().await;
+                groups
+                    .get_mut(&stored_key)
+                    .expect("stored record")
+                    .fork_quarantine = Some(synthetic_marker(false)?);
+            }
+            let mut cleared = live_record(state, &stored_key).await;
+            assert_eq!(
+                persist_named_group_info(state, &stored_key, cleared.clone()).await?,
+                AtomicWriteOutcome::Durable
+            );
+            let snapshot_path = treekem_snapshot_path(&state.treekem_dir, &stored_key);
+            let original_snapshot = tokio::fs::read(&snapshot_path).await?;
+            cleared.name = "clear-from-other-spelling".to_string();
+            cleared.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
+            cleared.fork_quarantine = None;
+            cleared.reset_fork_evidence_after_quarantine_clear();
+            let task_state = Arc::clone(state);
+            let task_key = request_key.clone();
+            let task_candidate = cleared.clone();
+            let outcome = fail_clear_before_publication(state, &stored_key, 0, fault, async move {
+                persist_named_group_info(&task_state, &task_key, task_candidate).await
+            })
+            .await?;
+            assert!(!matches!(outcome, Ok(AtomicWriteOutcome::Durable)));
+            assert_eq!(tokio::fs::read(&snapshot_path).await?, original_snapshot);
+            assert!(!treekem_journal_path(&state.treekem_dir, &stored_key).exists());
+            assert!(!treekem_home_suite_journal_path(&state.treekem_dir, &stored_key).exists());
+            assert!(!state.named_groups.read().await.contains_key(&request_key));
+
+            assert_eq!(
+                persist_named_group_info(state, &request_key, cleared.clone()).await?,
+                AtomicWriteOutcome::Durable,
+                "retry must replace and rebind the resolved entry"
+            );
+            assert_eq!(live_record(state, &stored_key).await, cleared);
+            assert!(!state.named_groups.read().await.contains_key(&request_key));
+            let reloaded =
+                load_named_groups_merged(&state.named_groups_path, &state.home_suite_groups_path)
+                    .await?;
+            assert!(!reloaded[&stored_key].is_fork_quarantined());
+            assert!(!reloaded.contains_key(&request_key));
+            let bytes = tokio::fs::read(&snapshot_path).await?;
+            let envelope = decode_treekem_snapshot_envelope(&bytes)?.expect("rebound snapshot");
+            assert!(treekem_snapshot_envelope_matches_info(&envelope, &cleared));
+            assert!(!treekem_journal_path(&state.treekem_dir, &stored_key).exists());
+            assert!(!treekem_home_suite_journal_path(&state.treekem_dir, &stored_key).exists());
+            assert!(!treekem_snapshot_path(&state.treekem_dir, &request_key).exists());
+        }
+    }
+    Ok(())
+}
+
 /// The shared record-clear gate must preserve the TreeKEM rebind transaction:
 /// failed clears discard journals and keep the old snapshot, and a durable
 /// retry publishes the clear with a snapshot bound to the new commit. Cover

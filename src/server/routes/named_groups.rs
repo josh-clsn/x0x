@@ -6052,18 +6052,23 @@ async fn persist_named_group_info_inner(
     // #1103: both the all-clean SEAL and MemberAdded's mandate/gap-adoption
     // arms replace a record whose fork marker was cleared on a clone. Route
     // every such replacement through the same candidate gate as manual clear.
-    let clears_quarantine = {
+    let quarantine_clear_key = {
         let groups = state.named_groups.read().await;
-        groups.get(group_id).is_some_and(|current| {
-            current.fork_quarantine.is_some() && info.fork_quarantine.is_none()
-        })
+        crate::server::resolve_group_entry_locked(&groups, group_id)
+            // A replacement can arrive under its MLS spelling while the
+            // record is stored under its stable id. Resolve that id too.
+            .or_else(|| crate::server::resolve_group_entry_locked(&groups, info.stable_group_id()))
+            .filter(|(_, current)| {
+                current.fork_quarantine.is_some() && info.fork_quarantine.is_none()
+            })
+            .map(|(key, _)| key.to_string())
     };
-    if clears_quarantine {
+    if let Some(key) = quarantine_clear_key {
         return persist_named_groups_quarantine_clear_gated_unlocked(
             state,
             &_gss_publication_guard,
-            Some(group_id),
-            |groups| store_named_group_info_locked(groups, group_id, info),
+            Some(&key),
+            |groups| store_named_group_info_locked(groups, &key, info),
         )
         .await;
     }
