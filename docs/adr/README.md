@@ -204,6 +204,7 @@ ADR 0060 as a record; ADR 0093 adds the capability-advert registry (D08).
 
 ## Proposed
 - [ADR 0051: Peer Relay (X0X-0070) Is a Default-Off, One-Hop DM Fallback](./0051-application-level-peer-relay.md) **[overlay: rejected in practice, D27]** (proposed 2026-08-29) — signed `RelayHeader` routing (version/dst/src/pubkey/timestamp — no inner-envelope digest, substitution tracked as #437), inner `DmEnvelope` sealed end-to-end, one hop; policy default disabled, contact-required, rate/byte caps; first-eligible selection pending ADR-0035's spread model
+- [ADR 0094: M2 safe apply with supervised self-rollback](./0094-m2-safe-apply.md) (proposed 2026-10-03) — Track M-safety, goal M; signed channel, exec probe, boot counter and stable supervisor-owned recovery; staged host transaction and daemon/CLI rollback; supersedes ADR 0061 Decision §6 upon acceptance
 
 
 **ADR 0093 capability registry** (the canonical allocation table since ADR 0089, accepted 2026-09-30, amended 0093's allocation procedure; ADR 0093 itself is immutable):
