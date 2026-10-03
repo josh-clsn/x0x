@@ -1529,7 +1529,8 @@ async fn d39_r2_join_with_pre_ban_seated_invite(
 /// Characterization (Codex r2, PRE-EXISTING since eb4c6b7, tracked as
 /// #1149): a device with NO local row that joins with a stale invite whose
 /// base seats it reports local `active` from the snapshot alone, although
-/// the owner device banned it since. Flip when #1149 is fixed.
+/// the owner device banned it since. Stays unchanged in ADR 0107 S8 (a);
+/// flip when the separate no-row #1149 reporting limitation is fixed.
 #[tokio::test]
 async fn d39_r2_preexisting_seated_invite_without_row_reports_active() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1543,7 +1544,8 @@ async fn d39_r2_preexisting_seated_invite_without_row_reports_active() -> Result
 
 /// Characterization (Codex r2, #1149): the #1148 recovery routes the stuck
 /// remnant onto exactly that pre-existing path — same input, same `active`.
-/// Flip together with the test above when #1149 is fixed.
+/// Flips in ADR 0107 S8 (a): re-arm must end non-active with Refused or a
+/// typed TimedOut outcome. The no-row test above stays unchanged in that slice.
 #[tokio::test]
 async fn d39_r2_recovered_remnant_takes_the_same_seated_invite_path() -> Result<()> {
     let dir = tempfile::tempdir()?;
