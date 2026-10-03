@@ -20807,6 +20807,8 @@ async fn retain_withdrawn_group_tombstone(
     let stable_group_id = info.stable_group_id().to_string();
     info.withdrawn = true;
     clear_group_info_key_material(&mut info);
+    #[cfg(test)]
+    record_join_artifact_lifecycle(state, format!("tombstone_persist:{stable_group_id}"));
     let mut aliases = HashSet::new();
     let outcome = persist_named_groups_mutation(state, |groups| {
         aliases = collect_same_stable_group_aliases(groups, group_id, Some(&stable_group_id));
@@ -35780,6 +35782,11 @@ struct JoinArtifactEgressCleanup {
 
 impl Drop for JoinArtifactEgressCleanup {
     fn drop(&mut self) {
+        #[cfg(test)]
+        record_join_artifact_lifecycle(
+            &self.state,
+            format!("egress_ended:{}:{}", self.key.0, self.key.1),
+        );
         let mut registry = self
             .state
             .join_artifact_egress
@@ -36338,6 +36345,18 @@ fn record_join_artifact_delivery_path(
         .lock()
     {
         paths.push((recipient.to_string(), kind, can_reach_gossip));
+    }
+}
+
+/// ADR 0107 (r5, G4): test-only ordered lifecycle witness.
+#[cfg(test)]
+fn record_join_artifact_lifecycle(state: &AppState, event: String) {
+    if let Ok(mut events) = state
+        .named_group_test_recorders
+        .join_artifact_lifecycle
+        .lock()
+    {
+        events.push(event);
     }
 }
 
@@ -38267,6 +38286,11 @@ struct WelcomeAckSlotGuard {
 
 impl Drop for WelcomeAckSlotGuard {
     fn drop(&mut self) {
+        #[cfg(test)]
+        record_join_artifact_lifecycle(
+            &self.state,
+            format!("welcome_stream_ended:{}", self.welcome_id),
+        );
         fn release(
             acks: &mut HashMap<String, Arc<FileChunkAckSlot>>,
             welcome_id: &str,

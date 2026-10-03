@@ -1291,6 +1291,12 @@ pub(super) struct NamedGroupTestRecorders {
     /// was handed to, as `(recipient, kind, transport)`. Only
     /// `pinned_single_exchange` admits every physical write.
     pub(super) join_artifact_transports: StdMutex<Vec<(String, &'static str, &'static str)>>,
+    /// ADR 0107 (r5, G4): ordered lifecycle events — an egress task or
+    /// Welcome stream ending (`egress_ended:<group>:<recipient>`,
+    /// `welcome_stream_ended:<welcome id>`) and a terminal commit
+    /// (`tombstone_persist:<group>`) — so tests can check quiesce-then-commit
+    /// ordering.
+    pub(super) join_artifact_lifecycle: StdMutex<Vec<String>>,
 }
 
 #[cfg(test)]

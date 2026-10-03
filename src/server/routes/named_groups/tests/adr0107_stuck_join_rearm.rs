@@ -3452,3 +3452,69 @@ async fn s8a_r5_g9_panicking_welcome_stream_releases_its_bookkeeping() -> anyhow
     );
     Ok(())
 }
+
+fn lifecycle_of(state: &AppState) -> Vec<String> {
+    state
+        .named_group_test_recorders
+        .join_artifact_lifecycle
+        .lock()
+        .expect("lifecycle witness")
+        .clone()
+}
+
+/// WHY (note r3 G4): withdrawal is a terminal mutation. Before it commits
+/// the tombstone it must stop ALL of the group's in-flight egress — every
+/// registered task and every Welcome stream, for every recipient — and
+/// await each one, so nothing is still running when the commit lands.
+#[tokio::test]
+async fn s8a_r5_g4_withdrawal_quiesces_all_group_egress_before_its_commit() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    let j2_hex = hex_of(&s.j2);
+    let welcome_id = welcome_id_of(&s.j2_add).expect("welcome ref");
+    // A parked chunk egress (registered) and a parked Welcome stream.
+    let reference = staged_join_result_blob(&s).await?;
+    let chunk = super::super::join_egress_test_barrier::arm(&j2_hex, "join_result_chunk");
+    fetch_chunk(&s, &reference).await;
+    wait_reached(&chunk.gate, "result chunk").await;
+    let frame = super::super::join_egress_test_barrier::arm(&j2_hex, "welcome_frame");
+    assert!(serve_welcome(&s.authority, &s.j2, &s.stable, &welcome_id).await);
+    wait_reached(&frame.gate, "Welcome frame").await;
+    s.authority
+        .named_group_test_recorders
+        .join_artifact_lifecycle
+        .lock()
+        .expect("lifecycle witness")
+        .clear();
+    let withdrawn = tokio::time::timeout(
+        Duration::from_secs(10),
+        withdraw_via_route(&s.authority, &s.group_key),
+    )
+    .await?;
+    assert!(withdrawn.is_success(), "withdraw: {withdrawn}");
+    let events = lifecycle_of(&s.authority);
+    let commit = events
+        .iter()
+        .position(|e| e.starts_with("tombstone_persist:"))
+        .expect("the withdrawal committed its tombstone");
+    let chunk_ended = events
+        .iter()
+        .position(|e| *e == format!("egress_ended:{}:{}", s.stable, j2_hex));
+    let stream_ended = events
+        .iter()
+        .position(|e| *e == format!("welcome_stream_ended:{welcome_id}"));
+    drop(chunk);
+    drop(frame);
+    let mut late = Vec::new();
+    if chunk_ended.is_none_or(|at| at > commit) {
+        late.push("registered chunk egress");
+    }
+    if stream_ended.is_none_or(|at| at > commit) {
+        late.push("Welcome stream");
+    }
+    assert!(
+        late.is_empty(),
+        "egress was still running when the withdrawal committed: {late:?} (events: {events:?})"
+    );
+    Ok(())
+}
