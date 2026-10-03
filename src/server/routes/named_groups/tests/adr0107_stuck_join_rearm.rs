@@ -3518,3 +3518,77 @@ async fn s8a_r5_g4_withdrawal_quiesces_all_group_egress_before_its_commit() -> a
     );
     Ok(())
 }
+
+/// WHY (note r3 G5): a local drop of the group (here the production delete
+/// path a non-Active TreeKEM leave uses) stops every in-flight egress of
+/// the group, awaited, and purges its staged originals and copies under
+/// every spelling, instead of leaving them to expire at the TTL.
+#[tokio::test]
+async fn s8a_r5_g5_local_drop_quiesces_and_purges_the_groups_join_artifacts() -> anyhow::Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    let j2_hex = hex_of(&s.j2);
+    let welcome_id = welcome_id_of(&s.j2_add).expect("welcome ref");
+    let reference = staged_join_result_blob(&s).await?;
+    let chunk = super::super::join_egress_test_barrier::arm(&j2_hex, "join_result_chunk");
+    fetch_chunk(&s, &reference).await;
+    wait_reached(&chunk.gate, "result chunk").await;
+    s.authority
+        .named_group_test_recorders
+        .join_artifact_lifecycle
+        .lock()
+        .expect("lifecycle witness")
+        .clear();
+    let dropped = tokio::time::timeout(
+        Duration::from_secs(10),
+        super::super::tests::drop_local_named_group_state_for_test(
+            &s.authority,
+            &s.group_key,
+            Some(&s.stable),
+            "adr0107_r5_local_drop",
+        ),
+    )
+    .await?;
+    assert!(dropped, "the local drop committed");
+    let mut left = Vec::new();
+    if !lifecycle_of(&s.authority)
+        .iter()
+        .any(|e| *e == format!("egress_ended:{}:{}", s.stable, j2_hex))
+    {
+        left.push("a registered chunk egress kept running");
+    }
+    let aliases = [s.stable.clone(), s.group_key.clone()];
+    if s.authority
+        .pending_join_results
+        .read()
+        .await
+        .keys()
+        .any(|key| aliases.iter().any(|a| key.starts_with(&format!("{a}:"))))
+    {
+        left.push("staged join results");
+    }
+    if s.authority
+        .pending_welcomes
+        .read()
+        .await
+        .get(&welcome_id)
+        .is_some()
+    {
+        left.push("staged Welcome");
+    }
+    if !s
+        .authority
+        .control_blobs
+        .staged_join_result_refs_for_test(&j2_hex)
+        .is_empty()
+    {
+        left.push("staged join-result copy");
+    }
+    drop(chunk);
+    assert!(
+        left.is_empty(),
+        "the local drop left join-artifact serving state behind: {left:?}"
+    );
+    Ok(())
+}
