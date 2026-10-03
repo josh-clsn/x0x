@@ -65,7 +65,7 @@ use routes::{
     ingest_public_message, introduction, join_group_via_invite, join_kv_store, leave_group,
     list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys, list_kv_stores,
     list_machines, list_mls_groups, list_named_groups, list_revocations, list_task_lists,
-    list_tasks, load_causal_approval_queue, load_named_groups_merged,
+    list_tasks, listener_restart_context, load_causal_approval_queue, load_named_groups_merged,
     load_predecessor_relay_outbox, load_requester_offer_outbox, load_treekem_member_key_packages,
     machine_for_agent_handler, machines_by_user_handler,
     migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
@@ -90,12 +90,13 @@ use routes::{
     update_task, withdraw_group_state, AtomicWriteOutcome, ControlBlobMessage, ControlBlobState,
     JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent, PendingListenerAdmission,
     PredecessorRelayObligation, PublicGroupBootstrap, SelfPublishedReleaseManifests,
-    TreeKemCatchupRequest, TreeKemCatchupResponse, CAUSAL_ENVELOPE_MAX_BYTES,
-    CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
-    CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
-    DIRECTORY_RESUBSCRIBE_JITTER_MS, GROUP_PREDECESSOR_RELAY_DM_PREFIX,
-    GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE, KV_STORE_DELTA_DM_PREFIX,
+    StartupUpdateCheckRuntime, TreeKemCatchupRequest, TreeKemCatchupResponse,
+    CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
+    DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
+    GROUP_PREDECESSOR_RELAY_DM_PREFIX, GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE,
+    KV_STORE_DELTA_DM_PREFIX,
 };
 use sse::{direct_events_sse, events_sse, peer_events_handler, presence_events, SseEvent};
 pub use state::{
@@ -256,7 +257,7 @@ pub async fn run_update_check_and_report(
     skip_update_check: bool,
 ) -> anyhow::Result<()> {
     if config.update.enabled && !skip_update_check {
-        match run_startup_update_check(config, None, false).await {
+        match run_startup_update_check(config, None, None).await {
             Ok(Some(version)) => println!("x0xd updated to {version}"),
             Ok(None) => println!("x0xd is up to date ({})", x0x::VERSION),
             Err(e) => return Err(e).context("self-update check failed"),
@@ -449,13 +450,14 @@ pub async fn serve_with_options(
         .context("failed to create data directory")?;
 
     // Issue #601: explicit single-instance guard on the data directory.
-    // Taken BEFORE the startup update check, the API listener, identity
-    // load/generation, or any other subsystem initialises — and independent
-    // of `[history] enabled` (the previous implicit guard was SQLite's
-    // EXCLUSIVE lock on history.db, which covered only that file and
-    // surfaced as a history subsystem error). Held until the spawned
-    // supervisor below has finished draining; process exit releases it even
-    // on crash (#645 — the guard must outlive the ServerHandle's Drop).
+    // Taken BEFORE the API listener bind, identity load/generation, the
+    // post-bind startup update check, or any other subsystem initialises —
+    // and independent of `[history] enabled` (the previous implicit guard
+    // was SQLite's EXCLUSIVE lock on history.db, which covered only that
+    // file and surfaced as a history subsystem error). Held until the
+    // spawned supervisor below has finished draining; process exit releases
+    // it even on crash (#645 — the guard must outlive the ServerHandle's
+    // Drop).
     let instance_lock =
         instance_lock::InstanceLock::acquire(&config.data_dir).map_err(anyhow::Error::new)?;
     // Startup banner
@@ -469,15 +471,12 @@ pub async fn serve_with_options(
     // Note: `--check-updates` is a CLI-only print-and-exit mode handled entirely
     // by the binary (see `run_update_check_and_report`) before it ever calls
     // `serve_with_options`; it is intentionally not a `ServeOptions` field.
-
-    // Startup GitHub check (fallback mechanism — gossip is primary).
-    // Gated on `self_update_enabled` so embedders never download/install a new
-    // binary in-process; the daemon binary sets it to `config.update.enabled`.
-    if self_update_enabled && config.update.enabled {
-        if let Err(e) = run_startup_update_check(&config, None, true).await {
-            tracing::warn!(error = %e, "Startup update check failed: {e}");
-        }
-    }
+    //
+    // Startup GitHub check (fallback mechanism — gossip is primary) moved to a
+    // post-bind background task below (#1086): awaiting it here, before the
+    // API listener bound, stalled startup for the monitor's ~30 s HTTP
+    // timeout on hosts whose TCP 443 egress is firewalled. Startup must never
+    // wait on the network for update checks.
 
     tracing::info!("Starting x0xd v{}", x0x::VERSION);
     if let Some(ref name) = instance_name {
@@ -1656,6 +1655,42 @@ pub async fn serve_with_options(
             tracing::info!(removed, "Reclaimed stale upgrade artifacts at startup");
         }
     }));
+
+    // Startup GitHub check (fallback mechanism — gossip is primary), the
+    // same check the daemon used to await before anything else. #1086: it
+    // now runs as a background task spawned only after the API listener is
+    // bound, so a firewalled update endpoint blocks for the monitor's ~30 s
+    // HTTP timeout in the background instead of delaying API readiness.
+    // Gates unchanged: `self_update_enabled` (embedders /
+    // `--skip-update-check`) AND `[update] enabled`.
+    if self_update_enabled && config.update.enabled {
+        let startup_check_config = config.clone();
+        // #261: the apply's restart planner needs the bound API address
+        // (health commit) and the graceful-shutdown hook (bounded cancel) —
+        // both exist only now, post-bind.
+        let startup_api_addr = state.api_address;
+        let startup_shutdown = daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx);
+        let startup_apply_lock = Arc::clone(&state.upgrade_apply_lock);
+        bg_tasks.push(tokio::spawn(async move {
+            let data_dir = startup_check_config.data_dir.clone();
+            if let Err(e) = run_startup_update_check(
+                &startup_check_config,
+                None,
+                Some(StartupUpdateCheckRuntime {
+                    restart_context: listener_restart_context(
+                        &data_dir,
+                        startup_api_addr,
+                        startup_shutdown,
+                    ),
+                    upgrade_apply_lock: startup_apply_lock,
+                }),
+            )
+            .await
+            {
+                tracing::warn!(error = %e, "Startup update check failed: {e}");
+            }
+        }));
+    }
 
     // Gossip-based release subscription (primary update mechanism). This
     // listener can download + install + restart, so it is gated on
@@ -4985,5 +5020,155 @@ mod member_certificate_bridge_tests {
             .await
             .expect("supervisor exits on shutdown")
             .expect("supervisor task completed cleanly");
+    }
+}
+
+#[cfg(test)]
+mod startup_update_check_tests {
+    use crate::server::{serve_with_options, DaemonConfig, ServeOptions};
+    use std::time::{Duration, Instant};
+
+    /// Points the test-only upgrade-monitor API base override
+    /// (`upgrade::monitor::TEST_API_BASE_OVERRIDE`) at `base` and restores
+    /// the prior value on drop, so the redirect cannot leak into sibling
+    /// tests in the same process. The seam is `cfg(test)`-only: release
+    /// builds have no configurable update source.
+    struct ApiBaseOverrideGuard {
+        previous: Option<String>,
+    }
+
+    impl ApiBaseOverrideGuard {
+        fn set(base: String) -> Self {
+            let mut slot = crate::upgrade::monitor::TEST_API_BASE_OVERRIDE
+                .lock()
+                .expect("TEST_API_BASE_OVERRIDE poisoned");
+            let previous = slot.clone();
+            *slot = Some(base);
+            Self { previous }
+        }
+    }
+
+    impl Drop for ApiBaseOverrideGuard {
+        fn drop(&mut self) {
+            if let Ok(mut slot) = crate::upgrade::monitor::TEST_API_BASE_OVERRIDE.lock() {
+                *slot = self.previous.take();
+            }
+        }
+    }
+
+    /// #1086: the startup update check used to be awaited BEFORE the API
+    /// listener bound, so on a host whose update endpoint is a black hole
+    /// (firewalled TCP 443 egress) the API bind, `api.port`, and every
+    /// later startup log line stalled for the monitor's 30 s HTTP timeout.
+    /// The check now runs as a background task spawned after the bind.
+    ///
+    /// Observable contract: with `[update] enabled`, self-update not
+    /// skipped, and an update source that accepts connections and never
+    /// responds, the API answers `/health` within seconds while the check
+    /// is still hung. With the pre-#1086 ordering restored (the check
+    /// awaited before the bind), this test fails: the `serve_with_options`
+    /// await itself stalls on the black hole for the 30 s client timeout,
+    /// blowing the 20 s budget — deliberately below the stall, generous for
+    /// slow CI startup.
+    #[tokio::test]
+    async fn api_readiness_does_not_wait_for_the_startup_update_check() {
+        use std::io::Read;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // Black-hole update endpoint: accepts the TCP connection and never
+        // answers — the update request then blocks until the monitor's 30 s
+        // client timeout, exactly the firewalled-egress shape from the
+        // issue. No external network is touched.
+        let blackhole =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind black-hole listener");
+        let blackhole_addr = blackhole.local_addr().expect("black-hole address");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_counter = Arc::clone(&accepted);
+        std::thread::spawn(move || {
+            // Hold every accepted connection open without ever responding.
+            let mut held = Vec::new();
+            while let Ok((mut stream, _)) = blackhole.accept() {
+                let _ = stream.read(&mut [0u8; 1024]);
+                accepted_counter.fetch_add(1, Ordering::SeqCst);
+                held.push(stream);
+            }
+        });
+
+        // Aim every update fetch at the black hole BEFORE serving.
+        let _api_base = ApiBaseOverrideGuard::set(format!("http://{blackhole_addr}"));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = DaemonConfig {
+            data_dir: dir.path().to_path_buf(),
+            identity_dir: Some(dir.path().join("identity")),
+            api_address: "127.0.0.1:0".parse().expect("loopback api address"),
+            bind_address: "127.0.0.1:0".parse().expect("loopback quic address"),
+            bootstrap_peers: Some(Vec::new()),
+            network_id: Some("issue-1086.update-check-readiness".to_string()),
+            mdns_enabled: false,
+            ..DaemonConfig::default()
+        };
+        config.history.enabled = false;
+        // The daemon startup shape the issue describes: `[update] enabled`
+        // (the default) and self-update not skipped for this process.
+        assert!(
+            config.update.enabled,
+            "`[update] enabled` must be the default for this test to mean anything"
+        );
+        let options = ServeOptions {
+            skip_update_check: false,
+            cli_no_port_mapping: true,
+            cli_disable_peer_cache: true,
+            self_update_enabled: true,
+            ..ServeOptions::default()
+        };
+
+        let handle =
+            tokio::time::timeout(Duration::from_secs(20), serve_with_options(config, options))
+                .await
+                .expect("serve must not wait on the startup update check (20 s budget)")
+                .expect("hermetic serve");
+
+        // Readiness is an HTTP fact, not the handle: `/health` (auth-exempt)
+        // must answer while the update check is still hung on the black hole.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("http client");
+        let health_url = format!("http://{}/health", handle.local_addr());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match client.get(&health_url).send().await {
+                Ok(resp) if resp.status().is_success() => break,
+                _ if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                other => panic!("`/health` must answer while the update check is hung: {other:?}"),
+            }
+        }
+
+        // The checks must actually have engaged the update source — otherwise
+        // the gates were off and the readiness assert above was vacuous.
+        // Two distinct fetches go through the override — the startup check
+        // and the startup manifest broadcast (`broadcast_current_manifest`)
+        // — so `>= 1` would also pass on the broadcast alone with the
+        // startup check never running.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while accepted.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            accepted.load(Ordering::SeqCst) >= 2,
+            "the startup update check and the startup manifest broadcast must \
+             both be fetching from the update source"
+        );
+
+        // Shutdown stays prompt: the supervisor's bounded drain aborts the
+        // hung fetch tasks instead of waiting out their HTTP timeout.
+        tokio::time::timeout(Duration::from_secs(30), handle.shutdown_and_wait())
+            .await
+            .expect("shutdown must complete despite the hung update check")
+            .expect("clean shutdown");
     }
 }

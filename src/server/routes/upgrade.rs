@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch, Mutex};
@@ -122,21 +123,22 @@ pub(in crate::server) fn daemon_shutdown_hook(
     })
 }
 
-/// Startup-check context: the API listener is not bound yet (the check runs
-/// before `serve_with_options` binds), so the configured address is recorded —
-/// including a port-0 ephemeral bind, which the helper resolves via
-/// `<data_dir>/api.port`. No shutdown hook is needed: nothing is bound.
-fn startup_restart_context(config: &DaemonConfig) -> RestartContext {
-    RestartContext {
-        data_dir: Some(config.data_dir.clone()),
-        api_addr: Some(config.api_address),
-        shutdown: None,
-    }
+/// Runtime pieces the daemon's startup check needs now that it runs AFTER
+/// the API listener is bound (#1086), concurrently with the other updater
+/// tasks: the #261 restart planner context (bound API address for the
+/// health commit + the graceful-shutdown hook) and the apply lock shared
+/// with the gossip release listener and the fallback poll.
+pub(in crate::server) struct StartupUpdateCheckRuntime {
+    /// Restart planner context for a successful apply (bound API address +
+    /// shutdown hook).
+    pub restart_context: RestartContext,
+    /// Serializes destructive binary replacement with the other apply paths.
+    pub upgrade_apply_lock: Arc<Mutex<()>>,
 }
 
 /// Background-listener context (gossip + fallback poll): the running daemon's
 /// bound address and shutdown hook.
-fn listener_restart_context(
+pub(in crate::server) fn listener_restart_context(
     data_dir: &std::path::Path,
     api_addr: SocketAddr,
     shutdown: Arc<dyn Fn() + Send + Sync>,
@@ -158,16 +160,19 @@ fn deferred_restart_upgrader(stop_on_upgrade: bool, context: RestartContext) -> 
 
 /// Startup GitHub check. Returns Some(version) if an update was applied.
 ///
-/// `trigger_restart` distinguishes the two callers: the daemon's startup
-/// check (inside `serve_with_options`) hands the restart to the #261 planner
-/// because a daemon process must come back up; the CLI `--check-updates`
-/// print-and-exit mode passes `false` — there is no daemon to keep alive, and
-/// a handoff respawn of `x0xd --check-updates` could never serve `/health`,
-/// so it would spuriously roll a good update back.
+/// `runtime` distinguishes the two callers: the daemon's startup check —
+/// spawned by `serve_with_options` as a background task after the API
+/// listener is bound (#1086: a firewalled update endpoint must never gate
+/// API readiness on its ~30 s HTTP timeout) — hands the restart to the #261
+/// planner because a daemon process must come back up, and serializes its
+/// apply against the gossip release listener and the fallback poll. The CLI
+/// `--check-updates` print-and-exit mode passes `None` — there is no daemon
+/// to keep alive, and a handoff respawn of `x0xd --check-updates` could
+/// never serve `/health`, so it would spuriously roll a good update back.
 pub(in crate::server) async fn run_startup_update_check(
     config: &DaemonConfig,
     agent: Option<&Arc<Agent>>,
-    trigger_restart: bool,
+    runtime: Option<StartupUpdateCheckRuntime>,
 ) -> Result<Option<String>> {
     let monitor = UpgradeMonitor::new(&config.update.repo, "x0xd", x0x::VERSION)
         .map_err(|e| anyhow::anyhow!(e))?
@@ -199,10 +204,34 @@ pub(in crate::server) async fn run_startup_update_check(
         }
     }
 
+    // The startup check runs beside the gossip release listener and the
+    // fallback poll now that it no longer gates startup (#1086); take the
+    // shared apply lock before touching the binary, exactly as they do.
+    let apply_lock = runtime
+        .as_ref()
+        .map(|runtime| Arc::clone(&runtime.upgrade_apply_lock));
+    let _upgrade_guard = match &apply_lock {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
+
     let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd")
-        .with_stop_on_upgrade(config.update.stop_on_upgrade)
-        .with_restart_on_success(trigger_restart)
-        .with_restart_context(startup_restart_context(config));
+        .with_stop_on_upgrade(config.update.stop_on_upgrade);
+    let upgrader = match runtime {
+        Some(runtime) => upgrader
+            .with_restart_on_success(true)
+            .with_restart_context(runtime.restart_context),
+        // CLI `--check-updates`: no daemon to keep alive, so no restart —
+        // but the apply planner still needs the data dir and configured
+        // address for its bookkeeping.
+        None => upgrader
+            .with_restart_on_success(false)
+            .with_restart_context(RestartContext {
+                data_dir: Some(config.data_dir.clone()),
+                api_addr: Some(config.api_address),
+                shutdown: None,
+            }),
+    };
 
     match upgrader
         .apply_upgrade_from_manifest(&verified.manifest)
@@ -485,7 +514,9 @@ pub(in crate::server) async fn run_fallback_github_poll(
 ) {
     let interval = Duration::from_secs(config.fallback_check_interval_minutes * 60);
     let mut ticker = tokio::time::interval(interval);
-    // Skip first tick (startup check already ran)
+    // Skip first tick: the startup check covers the boot window (it runs
+    // concurrently as a post-bind background task, #1086), so the poll's
+    // first fetch waits one full interval instead of racing it.
     ticker.tick().await;
 
     let mut failed_version: Option<(String, Instant)> = None;
@@ -637,10 +668,27 @@ async fn update_skill_if_changed(manifest: &ReleaseManifest, data_dir: &std::pat
                     tracing::warn!("SKILL.md hash mismatch after download");
                     return;
                 }
-                if let Err(e) = tokio::fs::write(&skill_path, &new_contents).await {
-                    tracing::warn!(error = %e, "Failed to write SKILL.md");
-                } else {
-                    tracing::info!("SKILL.md updated successfully");
+                // The startup check and the startup manifest broadcast can
+                // both reach this write concurrently (#1086): stage the
+                // verified bytes in a unique temp file and rename it into
+                // place atomically, so readers and the other writer never
+                // observe a torn SKILL.md.
+                static SKILL_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+                let tmp_path = data_dir.join(format!(
+                    "SKILL.md.tmp.{}.{}",
+                    std::process::id(),
+                    SKILL_TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+                ));
+                let install = async {
+                    tokio::fs::write(&tmp_path, &new_contents).await?;
+                    tokio::fs::rename(&tmp_path, &skill_path).await
+                };
+                match install.await {
+                    Ok(()) => tracing::info!("SKILL.md updated successfully"),
+                    Err(e) => {
+                        let _ = tokio::fs::remove_file(&tmp_path).await;
+                        tracing::warn!(error = %e, "Failed to install SKILL.md");
+                    }
                 }
             }
             Err(e) => tracing::warn!(error = %e, "Failed to download SKILL.md: {e}"),
