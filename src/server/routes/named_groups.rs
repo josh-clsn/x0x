@@ -61463,6 +61463,9 @@ pub(in crate::server) mod tests {
                 recovery_authority_signature_b64: None,
                 recovery_authority_commit: None,
                 signature_b64: BASE64.encode(signature.as_bytes()),
+                certificate_b64: None,
+                kem_public_key_b64: None,
+                kem_signature_b64: None,
             })
         };
 
@@ -61496,7 +61499,9 @@ pub(in crate::server) mod tests {
         let kp_new_b64 = BASE64.encode(prepared_new.key_package_bytes());
         let rekey_event = signed_join(&invite2, &kp_new_b64, now_ms + 1)?;
 
-        NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+        state
+            .named_group_test_recorders
+            .publish_attempts
             .lock()
             .expect("publish-attempt recorder poisoned")
             .clear();
@@ -61511,7 +61516,9 @@ pub(in crate::server) mod tests {
             epoch_after_join + 2,
             "re-key = remove@e+1 + add@e+2, exactly one pair"
         );
-        let publishes_after_rekey = NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+        let publishes_after_rekey = state
+            .named_group_test_recorders
+            .publish_attempts
             .lock()
             .expect("publish-attempt recorder poisoned")
             .len();
@@ -61542,7 +61549,9 @@ pub(in crate::server) mod tests {
             "no second epoch pair"
         );
         assert_eq!(
-            NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+            state
+                .named_group_test_recorders
+                .publish_attempts
                 .lock()
                 .expect("publish-attempt recorder poisoned")
                 .len(),
