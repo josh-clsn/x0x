@@ -4104,3 +4104,235 @@ async fn s8a_r5_g11_share_resend_is_admitted_afresh() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Round 5, G13: the class-R/class-K transport on a REAL loopback QUIC pair.
+// These tests join a loopback-only network and are NOT run locally: CI runs
+// them inside its isolated network namespace (scripts/ci/nextest-isolated.sh).
+// ---------------------------------------------------------------------------
+
+struct TransportPair {
+    alice: Arc<AppState>,
+    _alice_dir: tempfile::TempDir,
+    bob: Arc<AppState>,
+    _bob_dir: tempfile::TempDir,
+}
+
+async fn transport_pair(tag: &str) -> anyhow::Result<TransportPair> {
+    let plane = format!("adr0107-r5-{tag}-{}", rand::random::<u32>());
+    let (alice, alice_dir) = super::networked_test_state(&plane).await?;
+    let (bob, bob_dir) = super::networked_test_state(&plane).await?;
+    super::wait_connected(&alice.agent, &bob.agent).await?;
+    pin_recipient_machine(&alice, &bob).await;
+    Ok(TransportPair {
+        alice,
+        _alice_dir: alice_dir,
+        bob,
+        _bob_dir: bob_dir,
+    })
+}
+
+/// An admission whose phases are counted; `pre` refuses in the pre-phase,
+/// `seam` decides at the stream seam, and `before_seam` runs inside the
+/// pre-phase after its checks (to land an invalidation between the two).
+fn counted_admission(
+    pre_calls: Arc<std::sync::atomic::AtomicUsize>,
+    seam_calls: Arc<std::sync::atomic::AtomicUsize>,
+    pre: bool,
+    seam: bool,
+    before_seam: Option<Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>>,
+) -> x0x::dm::ArtifactAdmission {
+    Arc::new(move || {
+        let pre_calls = Arc::clone(&pre_calls);
+        let seam_calls = Arc::clone(&seam_calls);
+        let before_seam = before_seam.clone();
+        Box::pin(async move {
+            pre_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if !pre {
+                return None;
+            }
+            if let Some(before_seam) = before_seam {
+                before_seam().await;
+            }
+            let seam_check: x0x::dm::SeamAdmission = Box::new(move || {
+                seam_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                seam
+            });
+            Some(seam_check)
+        })
+    })
+}
+
+/// Copies of `marker` Bob's receive pipeline delivers within `within`.
+async fn bob_receives(
+    rx: &mut x0x::DirectMessageReceiver,
+    marker: &[u8],
+    within: Duration,
+) -> usize {
+    let mut count = 0;
+    let deadline = tokio::time::Instant::now() + within;
+    while let Ok(Some(message)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+        if message.payload == marker {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// WHY (G13, F1/F5 inspection rows): on the real raw path, one pinned call
+/// runs the pre-phase once and the seam once, writes once, and Bob's
+/// ordinary receive pipeline (no ACK-v2 needed) gets exactly one copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s8a_r5_g13_real_pinned_exchange_is_admitted_once_and_delivered_once() -> anyhow::Result<()>
+{
+    let pair = transport_pair("once").await?;
+    let mut rx = pair.bob.agent.subscribe_direct();
+    let (pre, seam) = (Arc::default(), Arc::default());
+    let admission = counted_admission(Arc::clone(&pre), Arc::clone(&seam), true, true, None);
+    let marker = b"adr0107-r5-g13-once".to_vec();
+    let sent = pair
+        .alice
+        .agent
+        .send_direct_pinned_admitted(&pair.bob.agent.agent_id(), &marker, &admission)
+        .await;
+    assert!(sent.is_ok(), "the admitted exchange writes: {sent:?}");
+    assert_eq!(
+        bob_receives(&mut rx, &marker, Duration::from_secs(5)).await,
+        1
+    );
+    assert_eq!(pre.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(seam.load(std::sync::atomic::Ordering::SeqCst), 1);
+    pair.alice.agent.shutdown().await;
+    pair.bob.agent.shutdown().await;
+    Ok(())
+}
+
+/// WHY (G13): a refusal at the seam (after `open_uni`) or in the pre-phase
+/// writes nothing on the real path, and is reported as an admission
+/// refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s8a_r5_g13_real_refusals_write_nothing() -> anyhow::Result<()> {
+    let pair = transport_pair("refuse").await?;
+    let mut rx = pair.bob.agent.subscribe_direct();
+    for (case, pre_ok) in [("seam", true), ("pre-phase", false)] {
+        let (pre, seam) = (Arc::default(), Arc::default());
+        let admission = counted_admission(Arc::clone(&pre), Arc::clone(&seam), pre_ok, false, None);
+        let marker = format!("adr0107-r5-g13-refuse-{case}").into_bytes();
+        let sent = pair
+            .alice
+            .agent
+            .send_direct_pinned_admitted(&pair.bob.agent.agent_id(), &marker, &admission)
+            .await;
+        assert!(
+            sent.as_ref()
+                .is_err_and(|e| e.to_string().contains(x0x::dm::PINNED_ADMISSION_REFUSED)),
+            "[{case}] reported as an admission refusal: {sent:?}"
+        );
+        assert_eq!(
+            bob_receives(&mut rx, &marker, Duration::from_secs(2)).await,
+            0,
+            "[{case}] nothing reached Bob"
+        );
+    }
+    pair.alice.agent.shutdown().await;
+    pair.bob.agent.shutdown().await;
+    Ok(())
+}
+
+/// WHY (G13, G2): Bob's MACHINE revoked between the pre-phase and the seam
+/// on the real path: the transport's own seam check refuses the write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s8a_r5_g13_real_machine_revocation_before_the_seam_writes_nothing() -> anyhow::Result<()> {
+    let pair = transport_pair("machine").await?;
+    let mut rx = pair.bob.agent.subscribe_direct();
+    let alice = Arc::clone(&pair.alice);
+    let bob = Arc::clone(&pair.bob);
+    let revoke: Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync> =
+        Arc::new(move || {
+            let alice = Arc::clone(&alice);
+            let bob = Arc::clone(&bob);
+            Box::pin(async move {
+                let _ = revoke_machine(&alice, &bob).await;
+            })
+        });
+    let (pre, seam) = (Arc::default(), Arc::default());
+    let admission = counted_admission(
+        Arc::clone(&pre),
+        Arc::clone(&seam),
+        true,
+        true,
+        Some(revoke),
+    );
+    let marker = b"adr0107-r5-g13-machine".to_vec();
+    let sent = pair
+        .alice
+        .agent
+        .send_direct_pinned_admitted(&pair.bob.agent.agent_id(), &marker, &admission)
+        .await;
+    assert!(sent.is_err(), "the revoked machine is refused: {sent:?}");
+    assert_eq!(
+        bob_receives(&mut rx, &marker, Duration::from_secs(2)).await,
+        0
+    );
+    pair.alice.agent.shutdown().await;
+    pair.bob.agent.shutdown().await;
+    Ok(())
+}
+
+/// WHY (G13, section 2.7 item 6): the server's class-R wrapper on the real
+/// path. A stalled exchange is cut by its deadline and writes nothing; the
+/// next exchange on the same connection is admitted and delivered once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s8a_r5_g13_real_deadline_cuts_a_stalled_exchange() -> anyhow::Result<()> {
+    let pair = transport_pair("deadline").await?;
+    let mut rx = pair.bob.agent.subscribe_direct();
+    let bob_id = pair.bob.agent.agent_id();
+    let stall: Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync> =
+        Arc::new(|| Box::pin(futures::future::pending::<()>()));
+    let (pre, seam) = (Arc::default(), Arc::default());
+    let stalled = counted_admission(Arc::clone(&pre), Arc::clone(&seam), true, true, Some(stall));
+    let marker = b"adr0107-r5-g13-stalled".to_vec();
+    let started = tokio::time::Instant::now();
+    let outcome = super::super::send_join_artifact(
+        &pair.alice,
+        &bob_id,
+        &marker,
+        "adr0107-r5-g13",
+        "join_result",
+        stalled,
+        Instant::now() + Duration::from_secs(2),
+    )
+    .await;
+    assert!(outcome.is_err(), "the stalled exchange fails: {outcome:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "cut by its deadline"
+    );
+    assert_eq!(seam.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(
+        bob_receives(&mut rx, &marker, Duration::from_secs(2)).await,
+        0
+    );
+    let (pre2, seam2) = (Arc::default(), Arc::default());
+    let healthy = counted_admission(pre2, Arc::clone(&seam2), true, true, None);
+    let next = b"adr0107-r5-g13-next".to_vec();
+    let outcome = super::super::send_join_artifact(
+        &pair.alice,
+        &bob_id,
+        &next,
+        "adr0107-r5-g13",
+        "join_result",
+        healthy,
+        Instant::now() + Duration::from_secs(10),
+    )
+    .await;
+    assert!(outcome.is_ok(), "the next exchange writes: {outcome:?}");
+    assert_eq!(
+        bob_receives(&mut rx, &next, Duration::from_secs(5)).await,
+        1
+    );
+    assert_eq!(seam2.load(std::sync::atomic::Ordering::SeqCst), 1);
+    pair.alice.agent.shutdown().await;
+    pair.bob.agent.shutdown().await;
+    Ok(())
+}
