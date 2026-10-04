@@ -2878,16 +2878,8 @@ async fn patch_discovery_entry_when_blob_lands(
             );
             return;
         }
-        // x0x #1150 (r7d, r7e): the announced binding whose announcement
-        // committed to THIS digest learns the landed expiry. The update is
-        // keyed on the digest and runs under the store's write lock (which
-        // serialises it with ingest), whatever the discovery entry's state.
-        announced
-            .write()
-            .await
-            .record_certificate_landed(agent_id, *digest, cert.not_after());
-        let mut cache = cache.write().await;
-        if let Some(entry) = cache.get_mut(agent_id) {
+        let mut discovery = cache.write().await;
+        if let Some(entry) = discovery.get_mut(agent_id) {
             // FRESHNESS GATE (review r2, #447): the entry's LATEST announce
             // must still commit to the digest this fetch resolved. Between
             // the fetch being triggered and landing, a newer announce can
@@ -2901,9 +2893,7 @@ async fn patch_discovery_entry_when_blob_lands(
                     current_digest = ?entry.cert_digest.map(hex::encode),
                     "announce blob landed for a superseded digest; not patching (#447 r2)"
                 );
-                return;
-            }
-            if entry.agent_certificate.is_none() {
+            } else if entry.agent_certificate.is_none() {
                 entry.user_id = blob.user_id;
                 entry.cert_not_after = cert.not_after();
                 entry.agent_certificate = Some(cert.clone());
@@ -2916,6 +2906,21 @@ async fn patch_discovery_entry_when_blob_lands(
                 publish_verified_certificate(cert_events, *agent_id, cert);
             }
         }
+        drop(discovery);
+        // x0x #1150 (r7d-r7f): AFTER the discovery patch, the announced
+        // binding whose announcement committed to THIS digest learns the
+        // landed expiry. The update is keyed on the digest and runs under
+        // the store's write lock, whatever the discovery entry's state.
+        // Ingest registers its binding (and digest) in the store BEFORE it
+        // publishes its discovery merge (`cache_verified_announcement`). So
+        // if this hydration patched the discovery entry, the binding with
+        // this digest already existed, and this update finds it. Discovery
+        // never holds a certificate whose expiry the binding lacks, and
+        // nothing depends on the blob surviving for a later lookup.
+        announced
+            .write()
+            .await
+            .record_certificate_landed(agent_id, *digest, cert.not_after());
         return;
     }
 }
@@ -3074,10 +3079,12 @@ fn observed_address_is_dialable(address: &std::net::SocketAddr) -> bool {
 /// ([`dm_inbox::AuthenticatedMachineBindingCache::record_announcement`]),
 /// whether or not the discovery entry survives. The write runs under the
 /// store's write lock, which also serialises it with blob hydration's
-/// conditional update ([`patch_discovery_entry_when_blob_lands`]). Under
-/// that lock, a certificate-less announcement takes the expiry of a
-/// verified blob for its digest that has already landed. So whichever of
-/// ingest and hydration writes last, the landed expiry stands.
+/// conditional update ([`patch_discovery_entry_when_blob_lands`]). Ingest
+/// runs it BEFORE publishing its discovery merge, and hydration updates
+/// the store AFTER patching discovery, so a landed certificate's expiry
+/// always reaches the binding (r7f). As a best-effort extra (nothing
+/// depends on it), a certificate-less announcement also takes the expiry
+/// of a verified blob for its digest that is still cached.
 async fn record_announced_machine_binding(
     bindings: &dm_inbox::AuthenticatedMachineBindings,
     blob_cache: Option<&std::sync::Arc<announce_blob::AnnounceBlobCache>>,
@@ -3090,8 +3097,6 @@ async fn record_announced_machine_binding(
     if machine_id.0 == [0u8; 32] {
         return;
     }
-    #[cfg(test)]
-    announced_record_barrier::park(&agent_id).await;
     let mut store = bindings.write().await;
     let landed_not_after = match (inline_not_after, cert_digest, blob_cache) {
         (None, Some(digest), Some(blob_cache)) => blob_cache.get(&digest).await.and_then(|blob| {
@@ -3114,10 +3119,10 @@ async fn record_announced_machine_binding(
     );
 }
 
-/// x0x #1150 (r7e): a test-only barrier immediately before an announcement's
-/// announced-binding store write, so a test can land a certificate blob
-/// between an ingest's inputs and its write. Unarmed agents pass straight
-/// through.
+/// x0x #1150 (r7e, r7f): a test-only barrier between an ingest's two
+/// writes (its announced-binding store registration and its discovery
+/// merge), so a test can land a certificate blob between them. Unarmed
+/// agents pass straight through.
 #[cfg(test)]
 pub(crate) mod announced_record_barrier {
     use std::collections::HashMap;
@@ -3188,7 +3193,10 @@ async fn cache_verified_announcement(
         discovered_agent.cert_digest,
         discovered_agent.cert_not_after,
     );
-    upsert_discovered_agent(cache, cert_events, discovered_agent).await;
+    // x0x #1150 (r7f): the store registration (binding and digest) comes
+    // BEFORE the discovery merge is published, so a blob hydration that
+    // patches the merged entry always finds the matching binding
+    // (`patch_discovery_entry_when_blob_lands`).
     record_announced_machine_binding(
         announced,
         blob_cache,
@@ -3199,6 +3207,9 @@ async fn cache_verified_announcement(
         inline_not_after,
     )
     .await;
+    #[cfg(test)]
+    announced_record_barrier::park(&agent_id).await;
+    upsert_discovered_agent(cache, cert_events, discovered_agent).await;
 }
 
 async fn upsert_discovered_machine_from_agent(
