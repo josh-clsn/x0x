@@ -399,6 +399,16 @@ So if discovery holds a landed certificate, the binding already carried that dig
 |---|---|---|---|
 | NEW 1: blob eviction between hydration and the ingest's write lost the expiry | Fixed | `50bbf40`, `7ed614f` | `r7e_a_certificate_landing_mid_ingest_keeps_its_expiry`, extended: it evicts the blob before releasing the ingest and checks that discovery holding the certificate means the binding holds its expiry |
 
+**Round 7g (Codex review of `9b9d7dc..0f7c35a`: changes required).** Hydration took the announced-binding store only after it had patched discovery and released it. In between, discovery published a landed certificate, possibly already expired, while the binding still had no expiry, and the seam accepted it.
+
+Hydration now takes the store's write lock first and holds it through the digest-keyed expiry update. A pinned reader never sees the binding while its certificate's expiry is unpublished: the resolver's bounded read waits, and the seam's `try_read` refuses.
+
+Global lock order: the store, then discovery. Hydration is the only path that holds both.
+
+| Item | Status | Red, then fix | Evidence |
+|---|---|---|---|
+| The certificate was published before its expiry | Fixed | `2d17a3d`, `e1dee33` | `r7g_a_landed_certificate_is_never_published_before_its_expiry` (hydration is parked at publication by the `HYDRATION_PUBLISH` barrier) |
+
 Still open for g10: the pinned path needs a direct connection to the resolved machine. If the requester reached the owner only through the gossip inbox, and repair or redial cannot dial it, the exchange still fails (`err_not_connected`), and the joiner's retry or the share's backoff carries the delivery. That is G10.
 
 Still outstanding for merge: the G10 evidence (e2e Home joins, survivor rekeys, mixed-version delivery on raw-only), from Root's ephemeral-testnet gate.
