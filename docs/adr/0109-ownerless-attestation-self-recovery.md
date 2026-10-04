@@ -10,7 +10,7 @@
 - **Amends:** upon acceptance: [ADR 0088](./0088-group-liveness-contract.md) §2, with one named entry, "Owner-axis forked node" (D121, §3); [ADR 0085](./0085-persisted-binary-formats-are-versioned.md) rule 4, for damaged S3 sidecar files of a supported version only: automatic quarantine and rebuild (D120, §4). ADR 0085 rule 5 is not amended. [ADR 0064](./0064-owner-anchored-fork-authority.md) §1 and §1b, for re-seat invites and re-seat seals that carry a promoted-admin `ReseatMandateV1` only (D156, §3a). [ADR 0059](./0059-invite-authentication-and-seating-provenance.md) §1 and §2, for re-seat invites only (D156, §3a). ADR 0088, ADR 0085, ADR 0064 and ADR 0059 are Accepted and are not edited.
 - **Superseded by:** none
 - **Goal served:** R3 (all my machines connected) and the shared-places core
-- **Related:** rulings D34(1), D41, D54, D60, D16, D43, D64, D65, D77–D83, D97, D119–D121, D147, D148, D156; #818 (part 2), #871, #1164 (W3-H harness), #1103 and PR #1181 (merged), PR #1190 (ADR 0107 implementation); ADR 0012, 0016, 0023, 0064, 0066, 0067, 0068, 0085, 0087 rule 8, 0093, 0094, 0106, 0107, 0114. Related work only: the join-artifact serving lifecycle note (`docs/design/join-artifact-serving-lifecycle.md`, on the #1190 branch).
+- **Related:** rulings D34(1), D41, D54, D60, D16, D43, D64, D65, D77–D83, D97, D119–D121, D147, D148, D156, D170; #818 (part 2), #871, #1164 (W3-H harness), #1103 and PR #1181 (merged), PR #1190 (ADR 0107 implementation); ADR 0012, 0016, 0023, 0064, 0066, 0067, 0068, 0085, 0087 rule 8, 0093, 0094, 0106, 0107, 0114. Related work only: the join-artifact serving lifecycle note (`docs/design/join-artifact-serving-lifecycle.md`, on the #1190 branch).
 
 ## Context
 
@@ -115,7 +115,7 @@ A node needs a re-seat when an admin answers `not_on_chain` (its head is not on 
 **Named amendment to 0088 §2 (D121).** This ADR amends ADR 0088 §2 with one named entry, ruled by David (D121): **"Owner-axis forked node."** In a group with an owner anchor, a node whose head is on no admin's chain, or whose admin attestations conflict, stays contained until an admin re-seats it by hand. No owner attestation re-seats it, and no fork is resolved automatically.
 - *Kind:* a waiting entry, like item 7 (0088 L3).
 - *Typed state:* `reseat_required {cause, ref}`, where `cause` is `not_on_chain`, `attestation_conflict` or `reseat_failed` (§8).
-- *Exit:* any active admin's manual re-seat (this section). An admin whose install holds the owner's USER key uses today's owner-countersigned InviteV4. Any other admin uses §3a's promoted-admin re-seat mandate (D156). In a mixed group where some receiver lacks §3a's capability, only an owner-key admin can re-seat until that receiver upgrades. D156 accepts this as the cost of the capability floor, and the route names the members with `reseat_receiver_upgrade_required`. Until Open question 1 is ruled, the draft takes its option (a): a promoted admin re-seats only a node it removed itself, so a node that another admin removed waits for that admin or an owner-key admin (`reseat_removal_not_own`). That is an L1 exception that only David's ruling can keep or remove.
+- *Exit:* any active admin's manual re-seat (this section). An admin whose install holds the owner's USER key uses today's owner-countersigned InviteV4. Any other admin uses §3a's promoted-admin re-seat mandate (D156). In a mixed group where some receiver lacks §3a's capability, only an owner-key admin can re-seat until that receiver upgrades. D156 accepts this as the cost of the capability floor, and the route names the members with `reseat_receiver_upgrade_required`. David ruled that a promoted admin may undo only its own removals (D170). So this entry carries one named L1 limit: a node that another admin removed needs that admin, or an admin whose install holds the owner's USER key, to re-seat it. The route names the limit with `reseat_removal_not_own`.
 - *L4:* the entry relaxes no check. It names, and types, the wait that #871 already has in silence.
 - *Mixed versions:* a released node keeps today's silent #846 gate and cannot show the state. A node with the §5 capability shows it.
 - *Harness:* H-S3-c and H-S3-c2.
@@ -163,7 +163,7 @@ David ruled that, in a group with an owner axis, an active admin without the own
 11. the exact role the subject receives.
 
 **Issue.** On the promoted-admin path the route checks, in order, after §3's checks:
-- the basis is a `Removal` commit. As drafted, this admin must have committed it (`reseat_removal_not_own`); that clause is Open question 1, option (a);
+- the basis is a `Removal` commit that this admin committed (`reseat_removal_not_own`, D170);
 - every current roster member that may receive the chain, including offline survivors, has a current verified advert for `group_reseat_mandate_v1` (`reseat_receiver_upgrade_required {members}`). A member without a current advert counts as legacy; cached capability does not count. This is the capability floor, as ADR 0114 sets one for D87;
 - the admin holds the subject's owner certificate bytes, delivered as for an ordinary OwnerCertified admission (S2, ADR 0108) (`subject_certificate_unavailable`), and they verify against the owner (`subject_certificate_invalid`).
 
@@ -185,7 +185,7 @@ Refusals surface as ADR 0059's `invites_refused {reason}` diagnostics. The subje
 2. the signer holds a current Admin seat at the parent commit;
 3. the bound policy hash equals the parent's owner policy, and the bound owner is that policy's owner;
 4. the bound seating commit is on the receiver's verified chain and seated this subject;
-5. the bound removal commit is on that chain and removed this subject (a removal, not a ban), and no commit between it and the parent seats, bans or revokes the subject. As drafted, the removal must also have been committed by the signer; that clause is Open question 1, option (a);
+5. the bound removal commit is on that chain and removed this subject (a removal, not a ban), was committed by the signer (D170), and no commit between it and the parent seats, bans or revokes the subject;
 6. the subject's owner certificate matches the bound digest and verifies against the owner: valid, unexpired and unrevoked;
 7. the bound role is no higher than the subject's role in the parent of its removal commit;
 8. the bound parent hash, KeyPackage hash, epoch and terminal roster projection hash equal the commit's own, and the KeyPackage verifies against the subject's agent key exactly as an ordinary join's does.
@@ -196,7 +196,7 @@ Otherwise the receiver refuses the commit with `reseat_mandate_invalid {cause}`.
 
 **Typed states (L3).** The admin sees the route refusals above. A receiver refuses a bad commit with `reseat_mandate_invalid {cause}`. The subject shows `reseat_required` until a valid authorisation arrives, then `reseat_in_progress` (§8). The floor wait is an upgrade wait that names the members it waits for.
 
-**L4.** This is a new mandate acceptance rule, for re-seat only. It replaces the owner's countersignature on one re-seat invite and the owner mandate on one `MemberAdded`. It authorises one re-admission of one identity that the owner's policy already admitted. That re-admission is bound to the subject's removal, to the parent, the KeyPackage, the epoch and the terminal roster, to the policy, and to a role no higher than before. It never admits a new identity, never raises a role, and never stands in for an owner mandate on an ordinary add. It never brings back a device that was banned or revoked. Under Open question 1's option (a), as drafted, a promoted admin can also undo only its own removal, never one by the owner or by another admin. Under option (b) it can undo any removal. The certificate check bounds the rule to the owner's currently certified devices. A removed admin on a stale branch can sign only commits that its own branch accepts, so canonical receivers refuse them; this is the D77 exposure, contained in the same way.
+**L4.** This is a new mandate acceptance rule, for re-seat only. It replaces the owner's countersignature on one re-seat invite and the owner mandate on one `MemberAdded`. It authorises one re-admission of one identity that the owner's policy already admitted. That re-admission is bound to the subject's removal, to the parent, the KeyPackage, the epoch and the terminal roster, to the policy, and to a role no higher than before. It never admits a new identity, never raises a role, and never stands in for an owner mandate on an ordinary add. It never brings back a device that was banned or revoked. By D170, a promoted admin can undo only its own removal, never one by the owner or by another admin, so the owner's deliberate removal of a device holds against every promoted admin. The certificate check bounds the rule to the owner's currently certified devices. A removed admin on a stale branch can sign only commits that its own branch accepts, so canonical receivers refuse them; this is the D77 exposure, contained in the same way.
 
 **Amendment.** This ADR amends ADR 0064 §1 (the owner pre-mutation signature on an owner-axis invite) and §1b (the absent-mandate rule) for re-seat invites and re-seat seals that carry a `ReseatMandateV1` only, ruled by David (D156). Every other invite and add in an owner-axis group keeps both rules. ADR 0064 is Accepted and is not edited.
 
@@ -363,7 +363,7 @@ David accepted these values (D83). They bound the signing and memory work that a
 
 - Stale-base joins converge under any one capable admin, including the removal gap and gaps with renames or role changes (D82).
 - Home groups converge the same way once a release passes the §4 gate (D81).
-- #871 gets an audited exit that keeps containment until the replacement is installed, in both group types (D78). In owner-axis groups an admin without the owner's key can take it, with no owner device online (D156). Under the draft's option (a) of Open question 1, that admin must be the one that removed the node.
+- #871 gets an audited exit that keeps containment until the replacement is installed, in both group types (D78). In owner-axis groups an admin without the owner's key can take it, with no owner device online (D156), when it removed the node itself (D170).
 - Every S3 block is typed and visible (D64).
 - An unreadable S3 sidecar no longer waits for an operator (D120).
 - A confirmed member behind every admin's retained log gets an automatic exit once ADR 0114's retention re-Welcome (§7) is in effect (D119).
@@ -376,7 +376,8 @@ David accepted these values (D83). They bound the signing and memory work that a
 - Until ADR 0114's retention re-Welcome (§7) is Accepted and in effect, a confirmed member behind every admin's retained log has only D43's manual remove and re-invite (D97, D119).
 - An unreadable sidecar under a placeholder costs the node a re-admission: its authoritative record exists on no holder, so S3 cannot rebuild it (D120).
 - A forked node waits for an admin to act by hand (D78), and its operator is not asked (D79). In owner-axis groups that wait is a named §2 entry (D121). Any active admin can end it through §3a's mandate (D156), except in a mixed group below the capability floor, where only an owner-key admin can.
-- §3a adds a new mandate acceptance rule, a second capability and a narrow ADR 0059 exception (D156). Under the draft's option (a) of Open question 1, a node that another admin removed needs that admin or an owner-key admin.
+- §3a adds a new mandate acceptance rule, a second capability and a narrow ADR 0059 exception (D156).
+- Named L1 limit (D170): a forked node that another admin removed needs that admin, or an admin with the owner's USER key, to re-seat it. A fully upgraded third admin cannot.
 - Re-seating an Active subject costs a removal and a rekey, until S8 (b).
 - Bytes still travel by today's paths (DM-paged catch-up, in-memory logs, the 10-minute staged Welcome) until S5 and S8 (b).
 - During a downgrade, a group under admin-attested recovery is inert.
@@ -448,7 +449,7 @@ Setup S0′ is S0 without step 3, which leaves the clocks aligned.
 
 ## Rulings and open questions
 
-**Blocking Accept:** Open question 1 (whose removal a promoted-admin re-seat may undo). Nothing else. Acceptance order is the only other gate: S3 is accepted after S4 (§10).
+**Blocking Accept:** None: ready for David's Accept. Acceptance order is the only remaining gate: S3 is accepted after S4 (§10).
 
 David ruled this ADR's questions Q1–Q7 on 2026-10-04 (D77–D83), with the cross-slice rulings D64, D65 and D97 that touch it:
 
@@ -475,11 +476,11 @@ David ruled a third round on 2026-10-04 (D147, D148, D156):
 - **D148, keeping quarantined copies:** ADR 0108 §5a's retention rule applies. Copies are never deleted automatically and go only with the group's own files, and `GET /groups/:id/recovery` lists each with its size. This ADR's own retention question is withdrawn. See §4.
 - **D156, owner-axis re-seat without the owner's key:** the promoted-admin `ReseatMandateV1`, modelled on D87. It brings a new acceptance rule, a receiver capability floor (`group_reseat_mandate_v1`) and amendments, for re-seats only, to ADR 0064 §1 and §1b and to ADR 0059 §1 and §2 (the subject's invite check, whose owner pin comes from its own live record). See §3a, §7, §9, H-S3-c, H-S3-c3, H-S3-d4 and H-S3-rm1 to H-S3-rm4.
 
-Still open for David:
+David ruled a fourth round on 2026-10-04 (D170):
 
-1. **Whose removal a promoted-admin re-seat may undo (D156 detail; blocks Accept; round 4).** D156 did not settle this. §3a's route check and receiver check 5 carry the choice. It needs David's ruling. Receivers cannot tell an owner's removal from an admin's, so neither option can be narrowed further today.
-   - (a) *Only the admin's own removals* (the draft). A promoted admin may re-seat only a node it removed itself. It can never bring back a device that the owner or another admin removed. L1 consequence: if admin A removed the forked node J and then goes offline, a fully upgraded admin B cannot re-seat J. J waits for A, or for an admin that holds the owner's USER key. That is a particular-device wait, an L1 exception that the D121 entry would then have to name.
-   - (b) *Any removal.* A promoted admin may re-seat any removed, contained node whose owner certificate still verifies and which is not banned or revoked. L1 consequence: none. Any one upgraded admin is enough, so the D121 entry needs no exception. Cost: a promoted admin can re-admit a device that the owner, or another admin, removed on purpose. A ban or a certificate revocation is then the only way to keep a device out.
+- **D170, whose removal a promoted-admin re-seat may undo:** only the admin's own removals. §3a's route check and receiver check 5 are normative. The D121 entry names the L1 limit: a node that another admin removed needs that admin, or an admin with the owner's USER key. See §3, §3a, Consequences and H-S3-d4.
+
+Still open for David: none.
 
 ## Notes for AI-assisted work
 
