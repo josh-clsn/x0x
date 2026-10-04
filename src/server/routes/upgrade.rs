@@ -1224,4 +1224,157 @@ mod tests {
             Err(restart::RestartOwnershipError::SupervisedRestartConflict { .. })
         ));
     }
+
+    // ------------------------------------------------------------------
+    // #1196 round 2: the startup update check END TO END against the
+    // systemd start-rate window. The cfg(test) seams inject everything
+    // OUTSIDE the decision logic — the verified release (no GitHub), the
+    // systemctl show text + monotonic clock (no real systemd), and the
+    // apply attempt (no binary replacement) — while the monitor skip-in
+    // logic, the apply paths and the ADR-0061 §1 restart guard/readback
+    // between them are the production code under test. INVOCATION_ID is
+    // the REAL systemd supervision signal, set the way systemd sets it.
+    // ------------------------------------------------------------------
+
+    /// The unit invocation id fixture: 32 hex chars, as `systemctl show`
+    /// renders `InvocationID` and systemd exports `INVOCATION_ID`.
+    const SEAM_INVOCATION_ID: &str = "4a119611961196119611961196119611";
+
+    /// A `systemctl show` output for THIS process on a default unit —
+    /// interval 10 s, burst 5 (systemd's StartLimitIntervalSec/Burst
+    /// defaults), `Restart=always`, the running test binary as ExecStart
+    /// with this process's real argv and pid — with the given
+    /// activation-age inputs.
+    fn show_for_this_process(interval: &str, burst: &str, active_enter_us: u64) -> String {
+        let exec = crate::upgrade::apply::current_binary_path()
+            .expect("current binary path")
+            .to_string_lossy()
+            .into_owned();
+        let argv = restart::current_argv().join(" ");
+        format!(
+            "Type=simple\n\
+             Restart=always\n\
+             RemainAfterExit=no\n\
+             RestartPreventExitStatus=\n\
+             MainPID={pid}\n\
+             ExecStart={{ path={exec} ; argv[]={argv} ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }}\n\
+             ActiveEnterTimestampMonotonic={active_enter_us}\n\
+             StartLimitIntervalUSec={interval}\n\
+             StartLimitBurst={burst}\n\
+             InvocationID={invocation}\n\
+             Environment=X0X_TEMPLATE_VERSION=1\n",
+            pid = std::process::id(),
+            invocation = SEAM_INVOCATION_ID,
+        )
+    }
+
+    /// A newer-version manifest carrying an asset for the platform the
+    /// test binary is running on, so `apply_upgrade_from_manifest`'s
+    /// platform resolution succeeds.
+    fn manifest_for_this_platform(version: &str) -> ReleaseManifest {
+        ReleaseManifest {
+            schema_version: SCHEMA_VERSION,
+            version: version.to_string(),
+            timestamp: 4_102_444_800,
+            assets: vec![PlatformAsset {
+                target: x0x::upgrade::manifest::current_platform_target()
+                    .expect("current platform target")
+                    .to_string(),
+                archive_url: "https://example.com/x0xd-archive.tar.gz".to_string(),
+                archive_sha256: [0xAA; 32],
+                signature_url: "https://example.com/x0xd-archive.tar.gz.sig".to_string(),
+            }],
+            // Empty skill URL with the missing-file hash: SKILL.md sync
+            // takes its already-up-to-date early return, no HTTP.
+            skill_url: String::new(),
+            skill_sha256: [0u8; 32],
+        }
+    }
+
+    /// The #1196 fleet scenario, end to end: a default unit
+    /// (StartLimitIntervalUSec=10 s, StartLimitBurst=5) whose activation
+    /// is 2 s old when the daemon's startup update check first applies —
+    /// and whose start-rate window has aged out by the time the check
+    /// retries. The check must end with the apply ATTEMPTED, not refused
+    /// and skipped until the next fallback poll.
+    #[tokio::test(start_paused = true)]
+    async fn startup_check_applies_after_start_rate_window_ages_out() {
+        // systemd's INVOCATION_ID is what makes this process a
+        // systemd-signalled daemon for the real signal sampler.
+        std::env::set_var("INVOCATION_ID", SEAM_INVOCATION_ID);
+
+        // Activation entered at monotonic 1 s. The first readback observes
+        // monotonic 3 s (2 s into the 10 s window — fresh activation);
+        // the retry's observes monotonic 15 s (14 s in — the window has
+        // aged out completely).
+        let _readback =
+            restart::systemd_readback_seam::install(restart::systemd_readback_seam::Scenario {
+                cgroup: "0::/system.slice/x0xd.service".to_string(),
+                invocation_id: Some(SEAM_INVOCATION_ID.to_string()),
+                calls: vec![
+                    restart::systemd_readback_seam::ReadbackCall {
+                        show_output: show_for_this_process("10s", "5", 1_000_000),
+                        monotonic_now_us: 3_000_000,
+                    },
+                    restart::systemd_readback_seam::ReadbackCall {
+                        show_output: show_for_this_process("10s", "5", 1_000_000),
+                        monotonic_now_us: 15_000_000,
+                    },
+                ],
+            });
+
+        // The apply attempt: counts attempts and answers as the
+        // destructive half succeeding on the new version.
+        let attempts = Arc::new(AtomicU64::new(0));
+        let hook_attempts = Arc::clone(&attempts);
+        let _apply =
+            crate::upgrade::apply::apply_attempt_seam::install(Box::new(move |_plan, manifest| {
+                hook_attempts.fetch_add(1, Ordering::SeqCst);
+                x0x::upgrade::UpgradeResult::Success {
+                    version: manifest.version.clone(),
+                }
+            }));
+
+        let _release = startup_release_seam::install(crate::upgrade::monitor::VerifiedRelease {
+            manifest: manifest_for_this_platform("9.9.9"),
+            manifest_json: Vec::new(),
+            signature: Vec::new(),
+            gossip_payload: Vec::new(),
+        });
+
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let mut config = DaemonConfig::default();
+        config.data_dir = data_dir.path().to_path_buf();
+        let runtime = StartupUpdateCheckRuntime {
+            restart_context: listener_restart_context(
+                data_dir.path(),
+                SocketAddr::from(([127, 0, 0, 1], 12700)),
+                Arc::new(|| {}),
+            ),
+            upgrade_apply_lock: Arc::new(Mutex::new(())),
+        };
+
+        let before = tokio::time::Instant::now();
+        let result = run_startup_update_check(&config, None, Some(runtime)).await;
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "#1196: once the start-rate window has aged out, the startup check \
+             must end with the apply ATTEMPTED (exactly one apply attempt; the \
+             window-refused first try never reached the apply) — not refused, \
+             skipped, and deferred to the next fallback poll"
+        );
+        assert!(
+            matches!(&result, Ok(Some(v)) if v == "9.9.9"),
+            "the aged-out retry applies the new version: {result:?}"
+        );
+        assert!(
+            before.elapsed() >= Duration::from_secs(10),
+            "the retry happens only after the readback's remaining window \
+             (8 s) plus the retry margin (2 s) has been waited out; waited \
+             {:?} instead",
+            before.elapsed()
+        );
+    }
 }
