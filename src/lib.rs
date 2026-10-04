@@ -2878,9 +2878,16 @@ async fn patch_discovery_entry_when_blob_lands(
             );
             return;
         }
-        let mut landed_for: Option<u64> = None;
-        let mut cache_guard = cache.write().await;
-        if let Some(entry) = cache_guard.get_mut(agent_id) {
+        // x0x #1150 (r7d, r7e): the announced binding whose announcement
+        // committed to THIS digest learns the landed expiry. The update is
+        // keyed on the digest and runs under the store's write lock (which
+        // serialises it with ingest), whatever the discovery entry's state.
+        announced
+            .write()
+            .await
+            .record_certificate_landed(agent_id, *digest, cert.not_after());
+        let mut cache = cache.write().await;
+        if let Some(entry) = cache.get_mut(agent_id) {
             // FRESHNESS GATE (review r2, #447): the entry's LATEST announce
             // must still commit to the digest this fetch resolved. Between
             // the fetch being triggered and landing, a newer announce can
@@ -2907,23 +2914,6 @@ async fn patch_discovery_entry_when_blob_lands(
                 // E2d: the fetched certificate has now LANDED in the
                 // discovery cache — notify the hydration bridge.
                 publish_verified_certificate(cert_events, *agent_id, cert);
-                landed_for = Some(entry.announced_at);
-            }
-        }
-        drop(cache_guard);
-        // x0x #1150 (r7d): the announced binding of the SAME announcement
-        // (the digest just checked) learns the landed certificate's expiry.
-        if let Some(announced_at) = landed_for {
-            let binding = announced.read().await.peek(agent_id);
-            if let Some(binding) = binding.filter(|b| b.announced_at == announced_at) {
-                dm_inbox::record_authenticated_machine_binding_with_expiry(
-                    announced,
-                    *agent_id,
-                    binding.machine_id,
-                    announced_at,
-                    cert.not_after(),
-                )
-                .await;
             }
         }
         return;
@@ -3073,50 +3063,55 @@ fn observed_address_is_dialable(address: &std::net::SocketAddr) -> bool {
     !address.ip().is_unspecified() && address.port() != 0
 }
 
-/// x0x #1150 (r7c, r7d): record a verified identity announcement's
+/// x0x #1150 (r7c, r7d, r7e): record a verified identity announcement's
 /// agent→machine binding in the announced-binding store, apart from the
 /// discovery cache's mutable routing `machine_id`. Only a signed, non-zero
 /// machine is recorded, and an older announcement never rolls a binding
 /// back.
 ///
-/// It runs AFTER the announcement was merged into the discovery cache, and
-/// takes the certificate expiry from that merged entry. That entry couples
-/// its certificate evidence to the digest the latest announcement committed
-/// to: it keeps a known certificate (and its expiry) for an unchanged digest
-/// even when this announcement's blob was not cached, drops it when the
-/// digest changed, and gains it when the verified blob lands
-/// ([`patch_discovery_entry_when_blob_lands`] then updates this binding
-/// too). Only when no merged entry for this announcement exists does the
-/// announcement's own inline expiry apply.
+/// The store keeps the certificate expiry coupled to the digest the
+/// announcement committed to
+/// ([`dm_inbox::AuthenticatedMachineBindingCache::record_announcement`]),
+/// whether or not the discovery entry survives. The write runs under the
+/// store's write lock, which also serialises it with blob hydration's
+/// conditional update ([`patch_discovery_entry_when_blob_lands`]). Under
+/// that lock, a certificate-less announcement takes the expiry of a
+/// verified blob for its digest that has already landed. So whichever of
+/// ingest and hydration writes last, the landed expiry stands.
 async fn record_announced_machine_binding(
     bindings: &dm_inbox::AuthenticatedMachineBindings,
-    cache: &std::sync::Arc<
-        tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
-    >,
+    blob_cache: Option<&std::sync::Arc<announce_blob::AnnounceBlobCache>>,
     agent_id: identity::AgentId,
     machine_id: identity::MachineId,
     announced_at: u64,
+    cert_digest: Option<[u8; 32]>,
     inline_not_after: Option<u64>,
 ) {
     if machine_id.0 == [0u8; 32] {
         return;
     }
-    let merged_not_after = cache
-        .read()
-        .await
-        .get(&agent_id)
-        .filter(|entry| entry.announced_at == announced_at)
-        .map(|entry| entry.cert_not_after);
     #[cfg(test)]
     announced_record_barrier::park(&agent_id).await;
-    dm_inbox::record_authenticated_machine_binding_with_expiry(
-        bindings,
+    let mut store = bindings.write().await;
+    let landed_not_after = match (inline_not_after, cert_digest, blob_cache) {
+        (None, Some(digest), Some(blob_cache)) => blob_cache.get(&digest).await.and_then(|blob| {
+            blob.agent_certificate
+                .as_ref()
+                .filter(|cert| {
+                    cert.agent_id().is_ok_and(|id| id == agent_id)
+                        && cert.user_id().ok() == blob.user_id
+                })
+                .and_then(identity::AgentCertificate::not_after)
+        }),
+        _ => None,
+    };
+    store.record_announcement(
         agent_id,
         machine_id,
         announced_at,
-        merged_not_after.unwrap_or(inline_not_after),
-    )
-    .await;
+        cert_digest,
+        inline_not_after.or(landed_not_after),
+    );
 }
 
 /// x0x #1150 (r7e): a test-only barrier immediately before an announcement's
@@ -3178,7 +3173,7 @@ async fn cache_verified_announcement(
         tokio::sync::RwLock<std::collections::HashMap<identity::MachineId, DiscoveredMachine>>,
     >,
     announced: &dm_inbox::AuthenticatedMachineBindings,
-    _blob_cache: Option<&std::sync::Arc<announce_blob::AnnounceBlobCache>>,
+    blob_cache: Option<&std::sync::Arc<announce_blob::AnnounceBlobCache>>,
     cache: &std::sync::Arc<
         tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
     >,
@@ -3186,19 +3181,21 @@ async fn cache_verified_announcement(
     discovered_agent: DiscoveredAgent,
 ) {
     upsert_discovered_machine_from_agent(machine_cache, &discovered_agent).await;
-    let (agent_id, machine_id, announced_at, inline_not_after) = (
+    let (agent_id, machine_id, announced_at, cert_digest, inline_not_after) = (
         discovered_agent.agent_id,
         discovered_agent.machine_id,
         discovered_agent.announced_at,
+        discovered_agent.cert_digest,
         discovered_agent.cert_not_after,
     );
     upsert_discovered_agent(cache, cert_events, discovered_agent).await;
     record_announced_machine_binding(
         announced,
-        cache,
+        blob_cache,
         agent_id,
         machine_id,
         announced_at,
+        cert_digest,
         inline_not_after,
     )
     .await;
@@ -16656,7 +16653,8 @@ impl Agent {
         let agent_id = agent.agent_id;
         let machine_id = agent.machine_id;
         #[cfg(test)]
-        let (announced_at, inline_not_after) = (agent.announced_at, agent.cert_not_after);
+        let (announced_at, cert_digest, inline_not_after) =
+            (agent.announced_at, agent.cert_digest, agent.cert_not_after);
         upsert_discovered_machine_from_agent(&self.machine_discovery_cache, &agent).await;
         upsert_discovered_agent(
             &self.identity_discovery_cache,
@@ -16669,10 +16667,11 @@ impl Agent {
         #[cfg(test)]
         record_announced_machine_binding(
             &self.announced_machine_bindings,
-            &self.identity_discovery_cache,
+            None,
             agent_id,
             machine_id,
             announced_at,
+            cert_digest,
             inline_not_after,
         )
         .await;
