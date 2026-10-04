@@ -1,7 +1,7 @@
 ---
 name: x0x
 description: "Secure computer-to-computer networking for AI agents — gossip broadcast, direct messaging, CRDTs, group encryption. Post-quantum encrypted, NAT-traversing. Everything you need to build any decentralized application."
-version: 0.45.0
+version: 0.46.1
 license: MIT OR Apache-2.0
 repository: https://github.com/saorsa-labs/x0x
 homepage: https://saorsalabs.com
@@ -52,7 +52,7 @@ metadata:
       - kind: download
         url: "https://github.com/saorsa-labs/x0x/releases/latest/download/x0x-windows-x64.zip"
         archive: zip
-        stripComponents: 1
+        stripComponents: 0
         targetDir: ~/.local/bin
         bins: [x0xd.exe, x0x.exe]
 ---
@@ -86,7 +86,7 @@ For security details, see [docs/security.md](https://github.com/saorsa-labs/x0x/
 
 ## Beyond Messaging
 
-- **Work orchestration (Symphony)** — replicated **TaskList CRDTs** (`/task-lists`, `/stores`; task-list deltas are not group-encrypted today, see #895), a built-in **GUI board view** (state columns, badges, approve/deny). See [docs/symphony-integration.md](https://github.com/saorsa-labs/x0x/blob/main/docs/symphony-integration.md).
+- **Work orchestration (Symphony)** — replicated **TaskList CRDTs** (`/task-lists`, `/stores`; an encrypted group's list, `x0x.group.<group_id>.symphony.<list_id>`, seals its deltas with the group key like the group's KV stores (#895), while standalone and public-group lists travel in plaintext), a built-in **GUI board view** (state columns, badges, approve/deny). See [docs/symphony-integration.md](https://github.com/saorsa-labs/x0x/blob/main/docs/symphony-integration.md).
 - **Tailnet** — connect your own computers over any network and forward a local TCP port to a loopback service on a peer machine, Tailscale-style, over the same post-quantum QUIC transport. Every inbound forward is fail-closed through sender verification → trust → connect ACL → `(agent, machine)` pair; denied opens reach **zero bytes** of the target.
 
 ---
@@ -231,7 +231,7 @@ x0x home rename "David's Home"                 # renamable (sealed state update)
 
 Home always keeps ≥1 agent placed `Roaming` so it is *designed* to follow the user across machines — nominal in v1 while the move ceremony is gated off (§5.2).
 
-**Second owner device joining the Home (#447, fixed in v0.41.0).** On the new device, run `POST /announce` **with body** `{"include_user_identity":true,"human_consent":true}` once before joining — a bodyless announce publishes the ANONYMOUS cert digest, which the owner can never resolve. Then join with `x0x group join --home --owner <owner-user-id> <invite>` (the owner id is shown by `x0x home`); the certified join is admitted from that single announce, and a join that arrives before the certificate is visible stays in a typed `pending` state instead of wedging. Uncertified joiners holding a stolen invite are always rejected — the gate fails closed.
+**Second owner device joining the Home (#447, fixed in v0.41.0).** On the new device, run `POST /announce` **with body** `{"include_user_identity":true,"human_consent":true}` before joining, **and again after every restart of that daemon** (including a self-update restart: the consent is not persisted, so the daemon falls back to the anonymous announce until the human consents again) — a bodyless announce publishes the ANONYMOUS cert digest, which the owner can never resolve. Then join with `x0x group join --home --owner <owner-user-id> <invite>` (the owner id is shown by `x0x home`); the certified join is admitted from that single announce, and a join that arrives before the certificate is visible stays in a typed `pending` state instead of wedging. Uncertified joiners holding a stolen invite are always rejected — the gate fails closed.
 
 **A pending join lives in memory only.** Until the joiner observes its own
 `MemberAdded` commit from the Home authority, the join is a stub that is
@@ -363,6 +363,7 @@ curl -H "Authorization: Bearer $TOKEN" "http://$API/agents/reachability/<agent_i
 x0x agents find <agent_id>               # POST /agents/find/:id — active network-wide lookup
 x0x agents machine <agent_id>            # GET /agents/:id/machine — which machine an agent runs on
 x0x agents by-user <user_id>             # GET /users/:user_id/agents (also /users/:user_id/machines)
+x0x onboard [--no-card] [--json]         # teach a non-x0x agent: install, start, import your card, DM you back
 ```
 
 **Card import and direct-connect REST contracts**
@@ -468,7 +469,8 @@ curl -X POST "http://$API/groups/join" -H "Authorization: Bearer $TOKEN" \
 > that minted it — an invite minted by a non-owner authority for a Home
 > is refused) — re-mint the invite on the owner, it is not a body error.
 > The OWNER's primary agent must ALSO have announced with
-> `{"include_user_identity":true,"human_consent":true}` (#483) before a
+> `{"include_user_identity":true,"human_consent":true}` (#483) — again
+> after every restart, since consent is held in memory only — before a
 > seated second device can seal/leave Home state; a pending-join state
 > after a restart must be re-issued with a fresh invite. Rosters over 20
 > entries or links over 40,960 B fail typed at mint — slim the roster.
@@ -760,7 +762,7 @@ x0x sync revoke <machine_id>       # DELETE /sync/devices/:machine_id — next s
 - **Tier 2 — pull-on-demand Home history: DESIGNED, NOT SHIPPED.** ADR-0041 defines it, but the current SyncV1 module implements Tier 1 only; there is no peer history backfill. `GET /history?scope=group:<gid>` is a purely LOCAL query against your own durable history.
 - **Tier 3 — never replicates:** non-Home group history, DM history, exec session state. Per-machine, full stop.
 
-Enrollment is the ADR-0043 direction: the daemon holding the owner key signs the enrollment; a non-enrolled machine's SyncV1 stream is rejected at accept (verified on the testnet), and each side proves possession of the owner key by signing a fresh nonce. **Trust prerequisite:** SyncV1 streams ride ADR-0022 byte streams through the same stream gate as every other protocol — BOTH sides must have each other as `trusted` contacts, or the dial is silently refused with `stream peer trust rejected: agent […]` (visible in the dialer's log as `Tier-1 dial skipped/failed until next pass`; set trust on both sides with `x0x trust set <agent_id> trusted`). Cross-machine Tier-1 convergence is proven in-process; daemon-level sync sessions depend on the same certificate visibility as Home joins; per #447 the admission re-check consults the announce-blob cache directly rather than waiting for the next 600 s announce heartbeat, so a single explicit `POST /announce` with `{"include_user_identity":true,"human_consent":true}` on the second device is what makes it visible. (#449: a device with no owner-visible Home still provisions its own, but the Tier-1 Home pointer is now **applied** — `effective_canonical_home` reads the `("home")` register and `resolve_home` reports a losing local Home as `adoption_pending` against `canonical_group_id`. Applying the pointer is not adoption: moving a device into the canonical Home is the owner-driven `x0x home seat` act in §3.1, and rosters are not merged.)
+Enrollment is the ADR-0043 direction: the daemon holding the owner key signs the enrollment; a non-enrolled machine's SyncV1 stream is rejected at accept (verified on the testnet), and each side proves possession of the owner key by signing a fresh nonce. **No manual trust needed between your own machines.** SyncV1 streams ride ADR-0022 byte streams through the same stream gate as every other protocol, but an agent on an enrolled machine that carries a certificate from YOUR owner key is **owner-trusted** automatically (ADR-0070 §1) — you do not `x0x trust set … trusted` your own devices. When the peer machine has no known agent yet (e.g. right after a restart, before its identity announcement arrives), an enrolled, unrevoked machine is still admitted for SyncV1 only, on its owner-signed enrollment ([ADR 0084](https://github.com/saorsa-labs/x0x/blob/main/docs/adr/0084-enrolled-owner-sync-admission.md), #1040). Two limits: when the peer's agent IS known, an **enabled** connect ACL (`connect-acl.toml`) gates SyncV1 too — add a `principal = "owner"` entry through the API overlay (`x0x acl connect …`), not the TOML (a TOML `principal` makes a downgraded 0.45 daemon refuse to start). The enrollment-only admission above (no known agent) does **not** consult the connect ACL at all, so an ACL entry can never stop an enrolled machine syncing: use `x0x sync revoke` or a machine revocation. Certificate visibility still matters for the known-agent path: per #447 the admission re-check consults the announce-blob cache directly, so an explicit `POST /announce` with `{"include_user_identity":true,"human_consent":true}` on the second device makes it visible — **re-run it after every daemon restart** (consent is held in memory only; see §3). (ADR-0069: an owned device with owner sync now **waits** for the owner's Home pointer before creating a Home — `GET /home` reports `provisioning_pending` meanwhile, up to `(rank + 1) × 90 s`. #449: the Tier-1 Home pointer is **applied** — `effective_canonical_home` reads the `("home")` register and `resolve_home` reports a losing local Home as `adoption_pending` against `canonical_group_id`. Applying the pointer is not adoption: moving a device into the canonical Home is the owner-driven `x0x home seat` act in §3.1, and rosters are not merged.)
 
 ### 5.2 Placement: Pinned / Roaming (ADR-0037/0043)
 
@@ -809,13 +811,14 @@ Bootstrap peers: 6 global nodes by default; override with `bootstrap_peers = [..
 ### 7.2 Self-update
 
 ```bash
-x0x upgrade --check                 # STANDALONE: the CLI checks/installs releases itself (does not call the daemon)
-x0x upgrade --apply                 # standalone download + verify + install
 curl "http://$API/upgrade" -H "Authorization: Bearer $TOKEN"           # DAEMON surface: GET /upgrade (check)
-curl -X POST "http://$API/upgrade/apply" -H "Authorization: Bearer $TOKEN"   # daemon applies to the running daemon
+curl -X POST "http://$API/upgrade/apply" -H "Authorization: Bearer $TOKEN"   # USE THIS to upgrade a running daemon
+x0x upgrade --check                 # standalone CLI check only (no daemon involved)
 ```
 
-Two separate updaters: the `x0x upgrade` CLI is dispatched before any daemon client exists and updates the CLI/binary on disk; the daemon REST surface updates the daemon and is governed by the daemon config. `[update] enabled = false` disables the daemon side (`GET /upgrade` → `{"update_available":false,"reason":"updates disabled"}`). `--skip-update-check` disables MORE than the check for that one daemon process — it also turns off the process's self-update install/restart paths, including `POST /upgrade/apply` (which then returns `"self-update disabled for this process"`); it composes with `[update] enabled` (both must allow an apply). Neither flag governs the standalone CLI updater. Verified-release manifests only. See [docs/upgrade-system.md](https://github.com/saorsa-labs/x0x/blob/main/docs/upgrade-system.md).
+`x0x upgrade`, `x0x upgrade --apply`, and `x0x upgrade --force` refuse installation and direct callers to authenticated `POST /upgrade/apply`. This also applies when no daemon is running: the CLI cannot prove that no other instance is using the installed binary. `x0x upgrade --check` remains a standalone, read-only GitHub release check; `--check --force` fetches the current manifest regardless of version.
+
+The daemon REST surface owns installation and restart and is governed by the daemon config. `[update] enabled = false` disables the daemon side (`GET /upgrade` → `{"update_available":false,"reason":"updates disabled"}`). `--skip-update-check` also disables the process's self-update install/restart paths, including `POST /upgrade/apply` (which returns `"self-update disabled for this process"`); both it and `[update] enabled` must allow an apply. Verified-release manifests only. See [docs/upgrade-system.md](https://github.com/saorsa-labs/x0x/blob/main/docs/upgrade-system.md).
 
 > ℹ️ **Downgrade safety (#451, fixed in v0.41.0):** Home state now lives in a sidecar; a v0.40.x binary reads the legacy store and starts cleanly, so a failed upgrade that respawns the previous binary no longer crash-loops. Still back up the data dir before upgrading an owned install, and expect Home features to be absent while downgraded.
 
@@ -870,7 +873,7 @@ Use the [full API reference](https://github.com/saorsa-labs/x0x/blob/main/docs/a
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Second device can't join owner's Home (`no agent certificate resolved` / `pending`) | a BODYLESS announce publishes the anonymous digest, which the owner can never resolve (#447 single-announce admission is fixed in v0.41.0) | `POST /announce` with `{"include_user_identity":true,"human_consent":true}` once, then `x0x group join --home --owner <owner-user-id> <invite>`; a `pending` join clears once the joiner's owner-issued certificate reaches the Home authority and the committed add reaches the joiner |
+| Second device can't join owner's Home (`no agent certificate resolved` / `pending`) | a BODYLESS announce publishes the anonymous digest, which the owner can never resolve (#447 single-announce admission is fixed in v0.41.0) | `POST /announce` with `{"include_user_identity":true,"human_consent":true}` (repeat after any daemon restart — consent is not persisted), then `x0x group join --home --owner <owner-user-id> <invite>`; a `pending` join clears once the joiner's owner-issued certificate reaches the Home authority and the committed add reaches the joiner |
 | Two Homes for one owner | this device holds a Home that lost the `("home")` election — `GET /home` shows `state:"adoption_pending"` and names `canonical_group_id` | on the device holding the canonical Home, as the human with the durable token: `x0x home seat <this device's agent id>`, then on this device `x0x group join <invite> --home --owner <owner_user_id>`. The local Home stays usable meanwhile. Duplicates are read-only inventory (`retirement:"manual_only"`) — do NOT delete one, an empty `evidence_against_deletion` is not a safe-delete signal |
 | Strict (durable-ack) DM → 409 `recipient_ack_semantics_unavailable` | no current usable signed, machine-bound v2 advert for the recipient after one refresh (missing/unconverged, expired, v1-only, gossip-unready, bad machine binding); v0.40.x peers interoperate via frozen v1 adverts (#448 fixed); no auto-fallback | retry later, or resend with `require_durable_app_ack:false` (v1 best-effort) |
 | Peer rejects your agent card | #450: ownerless cards interoperate with v0.40.x; owner-named v2 cards are rejected by pre-ADR-0036 peers by design | upgrade the verifying peer |
@@ -994,7 +997,7 @@ Status: **GA** = working as specified · **caveat #N** = open issue, see §7.4 �
 | Voice 1:1 (datagram + fallback) | library (`voice` feature) | `--example voice_call` | GA (lib) · 2nd concurrent call refused (typed `SessionConflict` via `start_lane`; `IoError`-wrapped via trait `start()`) |
 | Diagnostics (11 areas) | `/diagnostics/*` | `x0x diagnostics <area>` | GA |
 | Durable history | `/history*` | `x0x history scopes/list/message/search/stats/purge` | GA (local-only; Tier-2 Home backfill designed, not shipped — §4.10, §5.1) |
-| Self-update | daemon: `/upgrade(+/apply)` · CLI: standalone | `x0x upgrade --check/--apply` | GA |
+| Self-update | daemon: `/upgrade(+/apply)` · CLI: read-only check | `x0x upgrade --check`; authenticated `POST /upgrade/apply` to install | GA |
 
 ---
 

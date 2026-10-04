@@ -12,21 +12,20 @@ SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parents[2]
 DEFAULT_POLICY_PATH = REPO_ROOT / ".github" / "release-metadata-policy.json"
 SEMVER_PATTERN = re.compile(r"(?<![\d.])v?\d+\.\d+\.\d+(?![\d.])")
-# A release may only run on a tag ref whose name is a full SemVer 2.0.0
-# version with the mandatory `v` prefix (optional prerelease/build suffix).
-# Strict per semver.org: no leading zeros in the numeric core or in numeric
-# prerelease identifiers (build identifiers MAY have leading zeros), no empty
-# dot-separated identifiers, ASCII digits only (Python `\d` would also accept
-# Unicode digits), and full-string matching so a trailing newline cannot slip
-# past a bare `$` anchor. Release jobs derive VERSION from GITHUB_REF_NAME and
-# assume semver, so anything else must be refused before any build, signing,
-# or publish side effect starts.
-RELEASE_TAG_REF_PATTERN = re.compile(
-    r"refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
-    r"(?:-(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
-    r"(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?"
-    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+# A release may only run on a tag ref whose name is exactly
+# `v<MAJOR>.<MINOR>.<PATCH>`. Prerelease (`-rc.1`, `-alpha`) and build
+# (`+build`) suffixes are refused (charter N3): a published release enters
+# the daemon auto-update feed and is published to crates.io and ClawHub, and
+# the promotion workflow already refuses GitHub "prerelease" releases.
+# Strict per semver.org for the numeric core: no leading zeros, ASCII digits
+# only (Python `\d` would also accept Unicode digits), and full-string
+# matching so a trailing newline cannot slip past a bare `$` anchor. Release
+# jobs derive VERSION from GITHUB_REF_NAME, so anything else must be refused
+# before any build, signing, or publish side effect starts.
+RELEASE_TAG_PATTERN = re.compile(
+    r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
 )
+RELEASE_TAG_REF_PATTERN = re.compile(r"refs/tags/" + RELEASE_TAG_PATTERN.pattern)
 
 
 class ValidationState:
@@ -533,6 +532,13 @@ def main():
                 # The run itself is invalid: exit with one clear message
                 # before any rule can produce tag-derived noise.
                 raise SystemExit(ref_error)
+        if not RELEASE_TAG_PATTERN.fullmatch(args.tag):
+            # Checked even without --ref so a direct `--tag v1.2.3-rc.1`
+            # (e.g. scripts/bump-version.sh) cannot vouch for a prerelease.
+            raise SystemExit(
+                f"Release tag must be exactly vMAJOR.MINOR.PATCH (got {args.tag!r}); "
+                "prerelease and build-metadata tags are not releasable"
+            )
         tag_version = normalize_tag(args.tag)
         print(f"Release tag version: {tag_version}")
 

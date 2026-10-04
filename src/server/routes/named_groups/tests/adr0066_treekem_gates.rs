@@ -114,6 +114,54 @@ async fn amend(state: &AppState, alias_key: &str, f: impl FnOnce(&mut x0x::group
     }
 }
 
+/// #969/#973: a named-group persistence mutation and an in-flight GSS
+/// (encrypted KV) publication are MUTUALLY EXCLUSIVE. Every GSS publisher
+/// in `kv/sync.rs` takes `gss_publication_gate.read()` BEFORE sampling the
+/// group's secret epoch for a seal (the responder announce, retained pages
+/// and merges), and `persist_named_groups_mutation` takes the WRITE lock
+/// across its live map change and durable save — that barrier is the #973
+/// fix. Without it, a group epoch/roster change could land between a
+/// publication's epoch sample and its seal, publishing a record sealed
+/// under the STALE epoch (the #969 bug class).
+///
+/// This drives the REAL production mutation path against the exact read
+/// hold shape the publishers use, deterministically and inertly: while the
+/// publication holds R, the mutation must be PENDING; once it releases,
+/// the mutation completes durably. With the barrier removed from the
+/// persist path, the mutation runs to completion under the held read lock
+/// and the pending assertion fails.
+#[tokio::test]
+async fn issue973_named_group_persistence_excludes_in_flight_gss_publication() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    // Baseline: with the gate free the real mutation path completes.
+    persist_named_groups_mutation(&state, |_| true).await?;
+
+    // The publication hold: exactly the read every kv/sync.rs GSS publisher
+    // acquires before sealing (the `_publication_guard` sites).
+    let publication = state.gss_publication_gate.read().await;
+
+    let mut mutation = Box::pin(persist_named_groups_mutation(&state, |_| true));
+    // While the publication holds R the mutation must NOT complete: the
+    // write side of the gate parks it. (A first-poll Pending alone would
+    // prove nothing — any multi-await future is pending on first poll — so
+    // the assertion is on COMPLETION within a generous window.)
+    let blocked =
+        tokio::time::timeout(std::time::Duration::from_millis(500), mutation.as_mut()).await;
+    assert!(
+        blocked.is_err(),
+        "#973: the group persistence mutation must wait for the in-flight GSS publication"
+    );
+    drop(publication);
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), mutation.as_mut())
+        .await
+        .expect("the mutation completes once the publication releases")?;
+    assert!(
+        matches!(outcome, AtomicWriteOutcome::Durable),
+        "the mutation still saves durably after the publication releases"
+    );
+    Ok(())
+}
+
 /// ADR-0066 §3: encrypt refuses with the §5 body, and the ratchet is untouched.
 #[tokio::test]
 async fn issue732_treekem_encrypt_gate_fires_for_an_alias_keyed_quarantined_group() -> Result<()> {

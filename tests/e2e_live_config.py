@@ -44,8 +44,12 @@ def render_config(network: str, repository: Path, data_dir: str) -> str:
         raise ValueError("network must be test or prod")
     # Resolve all authority before returning any usable configuration.
     peers = testnet_bootstrap_peers(repository) if network == "test" else None
+    # A named instance (`instance_name`) whose config sets no network_id
+    # refuses to start (David, 2026-09-29): state the plane explicitly.
+    plane = "x0x.testnet" if network == "test" else "x0x.prod"
     lines = [
         'instance_name = "e2e-live"',
+        f"network_id = {toml_string(plane)}",
         f"data_dir = {toml_string(data_dir)}",
         'bind_address = "0.0.0.0:15483"',
         'api_address = "127.0.0.1:19200"',
@@ -58,7 +62,6 @@ def render_config(network: str, repository: Path, data_dir: str) -> str:
         ])
     else:
         lines.append("# Explicit prod mode preserves the daemon's default seed list.")
-    # Neither tracked fleet config defines a separate network_id. Do not invent one.
     lines.extend([
         "",
         "# This temporary test child must not update itself; fleet configs differ.",

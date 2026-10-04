@@ -14,6 +14,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+#[path = "common/network_gate.rs"]
+mod network_gate;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -26,18 +29,14 @@ fn loopback_network_config() -> NetworkConfig {
         bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
         bootstrap_nodes: Vec::new(),
         mdns_enabled: false,
+        // Loopback only: no UPnP IGD discovery on the runner's LAN.
+        port_mapping_enabled: false,
         ..NetworkConfig::default()
     }
 }
 
-fn is_network_bind_permission_error(error: &impl std::fmt::Display) -> bool {
-    let message = error.to_string();
-    message.contains("Operation not permitted")
-        && (message.contains("bind UDP socket")
-            || message.contains("network initialization failed"))
-}
-
 async fn build_agent(dir: &TempDir, name: &str) -> Option<x0x::Agent> {
+    network_gate::init_stream_tracing();
     match x0x::Agent::builder()
         .with_machine_key(dir.path().join(format!("{name}-machine.key")))
         .with_agent_key_path(dir.path().join(format!("{name}-agent.key")))
@@ -48,7 +47,7 @@ async fn build_agent(dir: &TempDir, name: &str) -> Option<x0x::Agent> {
         .await
     {
         Ok(agent) => Some(agent),
-        Err(e) if is_network_bind_permission_error(&e) => None,
+        Err(e) if network_gate::skip_on_refused_network(&e) => None,
         Err(e) => panic!("agent build failed: {e}"),
     }
 }
@@ -180,7 +179,7 @@ async fn peer_stream_echoes_1mib_both_directions() {
     let alice_for_open = Arc::clone(&alice);
     let open_task = tokio::spawn(async move {
         alice_for_open
-            .open_peer_stream(&bob_agent_id, StreamProtocol::ForwardV1)
+            .open_peer_stream(&bob_agent_id, StreamProtocol::SocksV1)
             .await
             .expect("open stream")
     });
@@ -190,9 +189,9 @@ async fn peer_stream_echoes_1mib_both_directions() {
     let mut alice_stream = open_task.await.expect("open task");
 
     assert_eq!(alice_stream.peer(), bob.machine_id());
-    assert_eq!(alice_stream.protocol(), StreamProtocol::ForwardV1);
+    assert_eq!(alice_stream.protocol(), StreamProtocol::SocksV1);
     assert_eq!(bob_stream.peer(), alice.machine_id());
-    assert_eq!(bob_stream.protocol(), StreamProtocol::ForwardV1);
+    assert_eq!(bob_stream.protocol(), StreamProtocol::SocksV1);
 
     // 1 MiB each direction. QUIC flow control means the writer blocks until the
     // reader drains, so each direction is a concurrent (write || read) pair.
@@ -290,7 +289,7 @@ async fn accept_loop_not_stalled_by_missing_prefix() {
         .await
         .expect("open raw stream");
 
-    // (2) alice then opens a normal ForwardV1 stream (writes its prefix).
+    // (2) alice then opens a normal SocksV1 stream (writes its prefix).
     //     Paced behind the raw open: ant-quic's connection driver can
     //     permanently strand the first frames of burst-opened streams on an
     //     otherwise-idle connection (see `acceptor_channel_is_bounded`), and
@@ -306,7 +305,7 @@ async fn accept_loop_not_stalled_by_missing_prefix() {
         let alice_for_open = Arc::clone(&alice);
         let normal = tokio::spawn(async move {
             alice_for_open
-                .open_peer_stream(&bob_agent_id, StreamProtocol::ForwardV1)
+                .open_peer_stream(&bob_agent_id, StreamProtocol::SocksV1)
                 .await
                 .expect("open normal stream")
         });
@@ -322,7 +321,7 @@ async fn accept_loop_not_stalled_by_missing_prefix() {
         }
     }
     let surfaced = surfaced.expect("accept loop was stalled by the missing-prefix stream");
-    assert_eq!(surfaced.protocol(), StreamProtocol::ForwardV1);
+    assert_eq!(surfaced.protocol(), StreamProtocol::SocksV1);
 }
 
 // ---------------------------------------------------------------------------
@@ -536,6 +535,8 @@ async fn connect_acl_refuses_unlisted_peer_stream() {
             machine_id: alice.machine_id(),
             targets: vec!["127.0.0.1:22".parse().expect("loopback literal")],
         }],
+        owner_allow: Vec::new(),
+        grant_allow: Vec::new(),
     });
     bob.set_connect_policy(Arc::new(policy));
     let mut acceptor = bob
@@ -558,17 +559,26 @@ async fn connect_acl_refuses_unlisted_peer_stream() {
         "unlisted peer's stream must not be surfaced"
     );
 
-    // Carol observes the refusal: bob dropped the stream halves, so her read
-    // hits EOF (FIN from the dropped send half)…
+    // Carol observes the refusal: bob dropped the stream halves unfinished,
+    // which ant-quic turns into a RESET with DROPPED_UNFINISHED_ERROR_CODE
+    // (not a FIN — a FIN would let a refusal read as a complete, empty
+    // stream). The accept loop documents this as "the stream is reset". She
+    // must see exactly that reset, with zero application bytes…
     let mut buf = [0u8; 16];
     let read = tokio::time::timeout(
         Duration::from_secs(10),
         carol_stream.recv_mut().read(&mut buf),
     )
     .await
-    .expect("refused stream read must settle")
-    .expect("refused stream read must not error (FIN, not reset)");
-    assert!(read.is_none(), "refused stream reads EOF, got {read:?}");
+    .expect("refused stream read must settle");
+    assert!(
+        matches!(
+            read,
+            Err(ant_quic::high_level::ReadError::Reset(code))
+                if code == ant_quic::high_level::DROPPED_UNFINISHED_ERROR_CODE
+        ),
+        "refused stream must be reset by the gate with zero bytes, got {read:?}"
+    );
 
     // …and her writes fail (STOP_SENDING from the dropped recv half). Retry
     // a few times: the STOP_SENDING frame may lag the FIN by a packet.
@@ -658,14 +668,24 @@ async fn acceptor_channel_is_bounded() {
     /// replaced by another open below).
     const LAND_DEADLINE: Duration = Duration::from_secs(10);
 
+    /// Overall fill deadline: a bounded failure instead of an unbounded
+    /// replace-and-retry loop if streams stop landing entirely.
+    const FILL_DEADLINE: Duration = Duration::from_secs(180);
+
     let bob_agent = bob.agent_id();
     let mut held: Vec<x0x::streams::PeerStream> = Vec::new();
+    let fill_deadline = Instant::now() + FILL_DEADLINE;
 
     // Serial fill to exactly capacity: open one, wait for it to land, repeat.
     // A stranded open (rare) is replaced by a fresh one — the connection
     // stays healthy for new streams even when an earlier burst frames never
     // transmit.
     while acceptor.queued() < CAP {
+        assert!(
+            Instant::now() < fill_deadline,
+            "acceptor fill stalled at {} of {CAP} within {FILL_DEADLINE:?}",
+            acceptor.queued()
+        );
         let before = acceptor.queued();
         held.push(
             alice
@@ -775,10 +795,21 @@ async fn backpressure_throttles_writer_with_bounded_buffering() {
             offset = end;
             written_in_task.store(offset, Ordering::Release);
         }
+        // The task drops the stream on return; ant-quic resets an unfinished
+        // dropped stream, discarding the buffered tail the reader still needs.
+        alice_stream.send_mut().finish().expect("finish stream");
         offset
     });
 
+    // Wait (bounded) for the writer's first progress so a slow runner cannot
+    // turn scheduling delay into a false "no initial progress" failure.
+    let progress_deadline = Instant::now() + Duration::from_secs(15);
+    while written.load(Ordering::Acquire) == 0 && Instant::now() < progress_deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     // Stall the reader: the writer must throttle at the flow-control window.
+    // This is an observation window (proving the writer does NOT finish), so
+    // it stays a fixed duration rather than a poll.
     tokio::time::sleep(Duration::from_secs(3)).await;
     let stalled = written.load(Ordering::Acquire);
     assert!(
@@ -812,6 +843,43 @@ async fn backpressure_throttles_writer_with_bounded_buffering() {
     );
 }
 
+/// N10: a default peer has no forward consumer; the handshake must fail
+/// promptly instead of waiting in the default incoming-stream queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "two-agent loopback; binds UDP. CI-only N10 forward reset proof."]
+async fn forward_without_acceptor_resets_handshake() {
+    let dir = TempDir::new().expect("tmpdir");
+    let Some(alice) = build_agent(&dir, "alice").await else {
+        return;
+    };
+    let Some(bob) = build_agent(&dir, "bob").await else {
+        return;
+    };
+    let alice = Arc::new(alice);
+    let bob = Arc::new(bob);
+    alice.join_network().await.expect("alice joins");
+    bob.join_network().await.expect("bob joins");
+    link_pair(&alice, &bob).await;
+
+    for protocol in [StreamProtocol::ForwardV1, StreamProtocol::ForwardV2] {
+        let mut stream = alice
+            .open_peer_stream(&bob.agent_id(), protocol)
+            .await
+            .expect("open forward stream");
+        let mut response = [0u8; 1];
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            stream.recv_mut().read_exact(&mut response),
+        )
+        .await
+        .expect("forward handshake hung without an acceptor");
+        assert!(
+            result.is_err(),
+            "missing forwarder must close/reset the stream"
+        );
+    }
+}
+
 /// Large-transfer integrity: 8 MiB deterministic pattern each direction over
 /// one stream, SHA-256 verified.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -837,7 +905,7 @@ async fn large_transfer_integrity_8mib() {
     link_pair(&alice, &bob).await;
 
     let mut alice_stream = alice
-        .open_peer_stream(&bob.agent_id(), StreamProtocol::ForwardV2)
+        .open_peer_stream(&bob.agent_id(), StreamProtocol::SocksV1)
         .await
         .expect("open stream");
     let mut bob_stream = take_incoming(&bob, Duration::from_secs(15))

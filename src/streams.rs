@@ -25,7 +25,8 @@
 //! Inbound streams that clear both gates (below) and the protocol handshake
 //! are routed by the prefix byte: [`crate::Agent::register_stream_acceptor`]
 //! installs the single consumer for a protocol (e.g. the T4 forwarder owns
-//! `ForwardV1`/`ForwardV2`); protocols without a registered acceptor fall
+//! `ForwardV1`/`ForwardV2`); unregistered forward protocols are reset promptly.
+//! Other protocols without a registered acceptor fall
 //! back to the default channel drained by
 //! [`crate::Agent::next_incoming_stream`]. Every channel is bounded — a
 //! stalled consumer causes new streams to be reset, never buffered
@@ -89,7 +90,8 @@ pub const STREAM_ACCEPTOR_CAPACITY: usize = 64;
 /// Once a stream has cleared the identity gate, the connect-ACL gate, and
 /// the protocol handshake, the dispatch task routes it by its protocol-prefix
 /// byte: a protocol with a registered [`StreamAcceptor`] goes to that
-/// acceptor's bounded channel; anything else goes to the default channel
+/// acceptor's bounded channel; unregistered forward protocols are reset.
+/// Other protocols go to the default channel
 /// drained by [`crate::Agent::next_incoming_stream`]. Either way a full
 /// channel drops (resets) the stream — backpressure is never hidden behind
 /// unbounded buffering.
@@ -133,7 +135,9 @@ impl StreamAccept {
     }
 
     /// The dispatch channel for `protocol`: the registered acceptor's sender
-    /// when one is live, otherwise the default channel. The lookup runs in
+    /// when one is live, otherwise a closed channel for forward protocols
+    /// (so dispatch drops/resets the stream), or the default channel for others.
+    /// The lookup runs in
     /// the per-stream dispatch task (after the prefix read), so registration
     /// ordering relative to in-flight streams is well-defined: a stream
     /// routes by the registry state at dispatch time.
@@ -148,7 +152,28 @@ impl StreamAccept {
         acceptors
             .get(&protocol.as_u8())
             .cloned()
-            .unwrap_or_else(|| self.tx.clone())
+            .unwrap_or_else(|| match protocol {
+                // Never retain a forward handshake in the undrained default sink.
+                StreamProtocol::ForwardV1
+                | StreamProtocol::ForwardV2
+                | StreamProtocol::EvidenceV1 => tokio::sync::mpsc::channel(1).0,
+                _ => self.tx.clone(),
+            })
+    }
+
+    /// The registered acceptor's sender for `protocol`, and ONLY that: never
+    /// the default channel. The #1040 enrolled owner-sync admission routes
+    /// through this, so a stream admitted on enrollment alone reaches the
+    /// owner-sync acceptor or nothing.
+    pub(crate) fn registered_sender(
+        &self,
+        protocol: StreamProtocol,
+    ) -> Option<tokio::sync::mpsc::Sender<PeerStream>> {
+        let acceptors = self
+            .acceptors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        acceptors.get(&protocol.as_u8()).cloned()
     }
 
     /// Register the single acceptor for `protocol` (bounded channel of
@@ -215,7 +240,8 @@ impl StreamAccept {
 /// causes new streams to be reset rather than buffered.
 ///
 /// Dropping the acceptor deregisters it: subsequent streams for the protocol
-/// route to the default channel ([`crate::Agent::next_incoming_stream`]).
+/// are reset for forwarding, or route to the default channel otherwise
+/// ([`crate::Agent::next_incoming_stream`]).
 pub struct StreamAcceptor {
     protocol: StreamProtocol,
     rx: tokio::sync::mpsc::Receiver<PeerStream>,
@@ -321,22 +347,62 @@ pub(crate) fn stream_gate(
 ///   the ACL, else [`NetworkError::PeerNotInConnectAcl`]. The every-agent
 ///   rule mirrors `forward::decide_inbound` (#192): the QUIC transport
 ///   authenticates the machine, not the individual agent, so a single
-///   unlisted agent on the machine fails the whole stream closed.
+///   unlisted agent on the machine fails the whole stream closed. An agent
+///   in `owner_trusted` (ADR-0070 §1, established by [`crate::owner_trust`])
+///   is also listed when the ACL has a `principal = "owner"` entry; owner
+///   trust without such an entry lists nothing.
 ///
 /// Pure function so the Disabled/Enabled × listed/unlisted × multi-agent
 /// matrix is fast unit-testable without a network. Target membership is NOT
 /// checked here — raw byte-streams carry no target; per-target enforcement
 /// stays with the T4 forwarder's `evaluate_connect_gate` call.
+///
+/// The accept loop calls [`stream_acl_gate_with_grants`]; this form (no
+/// grant holders) is used by the outbound call gate (`src/calls.rs`) and the
+/// slice-1 matrix tests.
 pub(crate) fn stream_acl_gate(
     policy: &crate::connect::ConnectPolicy,
     agents: &[crate::identity::AgentId],
+    owner_trusted: &[crate::identity::AgentId],
+    machine_id: &MachineId,
+) -> NetworkResult<()> {
+    stream_acl_gate_with_grants(policy, agents, owner_trusted, &[], &[], machine_id)
+}
+
+/// [`stream_acl_gate`] with the ADR-0070 §2 grant selector.
+///
+/// * `grant_connect` — agents holding a current `Connect` ShareGrant for
+///   this daemon's agent. With an `Enabled` policy such an agent is also
+///   listed when the ACL has a `principal = "grant"` entry (per-port target
+///   checks stay with the forwarder).
+/// * `grant_only` — agents whose identity gate passed ONLY because of that
+///   grant (their contact/owner decision alone was not `Accept`). A grant
+///   never opens anything without an explicit rule, so under a `Disabled`
+///   policy — where the identity gate would be the sole boundary — such an
+///   agent is refused.
+pub(crate) fn stream_acl_gate_with_grants(
+    policy: &crate::connect::ConnectPolicy,
+    agents: &[crate::identity::AgentId],
+    owner_trusted: &[crate::identity::AgentId],
+    grant_connect: &[crate::identity::AgentId],
+    grant_only: &[crate::identity::AgentId],
     machine_id: &MachineId,
 ) -> NetworkResult<()> {
     let crate::connect::ConnectPolicy::Enabled(acl) = policy else {
+        if let Some(agent_id) = agents.iter().find(|a| grant_only.contains(a)) {
+            return Err(NetworkError::PeerNotInConnectAcl {
+                agent_id: agent_id.0,
+            });
+        }
         return Ok(());
     };
     for agent_id in agents {
-        if acl.entry_for(agent_id, machine_id).is_none() {
+        if !acl.has_entry_for_principals(
+            agent_id,
+            machine_id,
+            owner_trusted.contains(agent_id),
+            grant_connect.contains(agent_id),
+        ) {
             return Err(NetworkError::PeerNotInConnectAcl {
                 agent_id: agent_id.0,
             });
@@ -384,8 +450,14 @@ pub enum StreamProtocol {
     /// machines. The ADR-0022 identity gates apply exactly as for every
     /// other protocol; the sync acceptor additionally fails closed unless
     /// the remote machine is in the local owner device set (owner-key
-    /// signed enrollment).
+    /// signed enrollment). The one difference (#1040): when the
+    /// transport-authenticated machine has NO known agent, the accept loop
+    /// admits a `SyncV1` stream (and only a `SyncV1` stream) if the
+    /// machine holds a verified, current, unrevoked owner enrollment.
     SyncV1 = 0x05,
+    /// ADR 0089 relationship evidence; transport-authenticated admission only.
+    /// Routed exclusively to its bounded evidence acceptor.
+    EvidenceV1 = 0x06,
 }
 
 impl StreamProtocol {
@@ -399,6 +471,7 @@ impl StreamProtocol {
             0x03 => Some(Self::ForwardV2),
             0x04 => Some(Self::WebRtcV1),
             0x05 => Some(Self::SyncV1),
+            0x06 => Some(Self::EvidenceV1),
             _ => None,
         }
     }
@@ -434,11 +507,21 @@ pub struct PeerStream {
     /// therefore check **every** agent and fail-closed if any is
     /// unauthorized (issue #192). The list reflects announced agents only;
     /// see `docs/connect-acl.md` "Limitations: announced agents only".
+    ///
+    /// EvidenceV1 also carries an empty agent list: its acceptor verifies
+    /// the signed evidence against `peer`, never against this list.
+    ///
+    /// Exception (#1040): a `SyncV1` stream admitted or opened on the
+    /// owner-signed enrollment of a machine with no known agent carries an
+    /// EMPTY list. Such a stream reaches only the registered owner-sync
+    /// acceptor, which uses [`PeerStream::peer`]; [`PeerStream::agent`]
+    /// returns `None` for such a stream.
     agents: Vec<crate::identity::AgentId>,
     peer: MachineId,
     protocol: StreamProtocol,
     send: ant_quic::HighLevelSendStream,
     recv: ant_quic::HighLevelRecvStream,
+    pub(crate) evidence_lease: Option<crate::evidence_wire::Lease>,
 }
 
 impl PeerStream {
@@ -458,17 +541,23 @@ impl PeerStream {
             protocol,
             send,
             recv,
+            evidence_lease: None,
         }
     }
 
-    /// The first agent identity on the peer machine. For the common
-    /// single-agent-per-machine case this is that agent. When multiple
-    /// agents share the peer machine the specific opener cannot be
-    /// determined — use [`PeerStream::peer_agents`] for authorization
-    /// decisions so the connect ACL checks every agent.
+    /// The first agent identity on the peer machine, or `None` when the
+    /// stream carries no agent. For the common single-agent-per-machine case
+    /// this is that agent. When multiple agents share the peer machine the
+    /// specific opener cannot be determined — use [`PeerStream::peer_agents`]
+    /// for authorization decisions so the connect ACL checks every agent.
+    ///
+    /// Returns `None` for a `SyncV1` stream admitted on the owner-signed
+    /// enrollment of a machine with no known agent (#1040/#1044). Streams
+    /// that passed the agent identity gate always carry at least one agent,
+    /// but callers must still handle `None` by failing closed.
     #[must_use]
-    pub fn agent(&self) -> crate::identity::AgentId {
-        self.agents[0]
+    pub fn agent(&self) -> Option<crate::identity::AgentId> {
+        first_agent(&self.agents)
     }
 
     /// All agent identities known to run on the peer machine. The connect
@@ -509,6 +598,21 @@ impl PeerStream {
     }
 }
 
+/// Admission decided before reading any protocol bytes. A prefix lease is
+/// present only for machines without known agents or verified enrollment.
+pub(crate) struct InboundAdmission {
+    pub(crate) agents: Option<Vec<crate::identity::AgentId>>,
+    pub(crate) prefix: Option<crate::evidence_wire::PrefixLease>,
+}
+
+/// First agent of a stream's agent list, `None` when the list is empty
+/// (enrollment-only `SyncV1` admission, #1040). Backs [`PeerStream::agent`];
+/// a free function so the empty-list case is unit-testable without live QUIC
+/// stream halves.
+fn first_agent(agents: &[crate::identity::AgentId]) -> Option<crate::identity::AgentId> {
+    agents.first().copied()
+}
+
 /// Write the protocol-prefix byte on a freshly-opened outbound stream.
 ///
 /// Called by the opener immediately after [`ant_quic::Node::open_bi`] so the
@@ -527,8 +631,9 @@ pub(crate) async fn write_protocol_prefix(
 /// Returns the negotiated protocol, or [`NetworkError::StreamProtocolUnknown`]
 /// for a reserved/unassigned byte (the caller resets the stream).
 pub(crate) async fn read_protocol_prefix(
-    recv: &mut ant_quic::HighLevelRecvStream,
+    recv: &mut (impl tokio::io::AsyncRead + Unpin),
 ) -> NetworkResult<StreamProtocol> {
+    use tokio::io::AsyncReadExt;
     let mut buf = [0u8; 1];
     recv.read_exact(&mut buf)
         .await
@@ -542,6 +647,73 @@ pub(crate) async fn read_protocol_prefix(
 mod tests {
     use super::*;
 
+    /// #1040/#1044: the enrollment-only SyncV1 admission path builds a
+    /// `PeerStream` with an EMPTY agent list. `PeerStream::agent` must report
+    /// that as `None` so no caller can panic on it (no-panic rule).
+    #[test]
+    fn enrollment_only_stream_has_no_agent() {
+        // Exactly the list `start_stream_accept_loop` hands to
+        // `PeerStream::new` for an enrollment-only SyncV1 stream.
+        let enrollment_only: Vec<crate::identity::AgentId> = Vec::new();
+        assert_eq!(first_agent(&enrollment_only), None);
+    }
+
+    /// A gated stream still yields its (first) agent: the fix must not
+    /// weaken the common path forward/voice depend on.
+    #[test]
+    fn gated_stream_returns_its_agent() {
+        let a = crate::identity::AgentId([0xA1; 32]);
+        let b = crate::identity::AgentId([0xB2; 32]);
+        assert_eq!(first_agent(&[a]), Some(a));
+        assert_eq!(first_agent(&[a, b]), Some(a));
+    }
+
+    /// Red control (rule 9): the pre-fix body of `PeerStream::agent` was
+    /// `self.agents[0]`. On the enrollment-only (empty) list that indexes out
+    /// of bounds and panics — the latent production panic this change
+    /// removes. Kept as a control so the hazard stays documented.
+    #[test]
+    #[should_panic(expected = "index out of bounds")]
+    fn control_old_agent_accessor_panics_on_enrollment_only_stream() {
+        fn old_agent(agents: &[crate::identity::AgentId]) -> crate::identity::AgentId {
+            agents[0]
+        }
+        let enrollment_only: Vec<crate::identity::AgentId> = Vec::new();
+        let _ = old_agent(&enrollment_only);
+    }
+
+    #[tokio::test]
+    async fn s3_evidence_never_falls_back_to_default_channel() {
+        let registry = std::sync::Arc::new(StreamAccept::new(2));
+        assert_eq!(StreamProtocol::from_u8(6), Some(StreamProtocol::EvidenceV1));
+        assert!(registry
+            .registered_sender(StreamProtocol::EvidenceV1)
+            .is_none());
+        assert!(registry.sender_for(StreamProtocol::EvidenceV1).is_closed());
+        let acceptor = registry.register(StreamProtocol::EvidenceV1).unwrap();
+        assert!(registry
+            .registered_sender(StreamProtocol::EvidenceV1)
+            .is_some());
+        assert!(!registry
+            .sender_for(StreamProtocol::EvidenceV1)
+            .same_channel(registry.sender()));
+        drop(acceptor);
+        assert!(registry.sender_for(StreamProtocol::EvidenceV1).is_closed());
+        assert!(registry.receiver().lock().await.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn s3_no_first_byte_keeps_existing_prefix_timeout() {
+        let (_tx, mut rx) = tokio::io::duplex(1);
+        let start = tokio::time::Instant::now();
+        assert!(
+            tokio::time::timeout(PREFIX_READ_TIMEOUT, read_protocol_prefix(&mut rx))
+                .await
+                .is_err()
+        );
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(10));
+    }
+
     #[test]
     fn protocol_prefix_round_trips() {
         for p in [
@@ -549,6 +721,8 @@ mod tests {
             StreamProtocol::SocksV1,
             StreamProtocol::ForwardV2,
             StreamProtocol::WebRtcV1,
+            StreamProtocol::SyncV1,
+            StreamProtocol::EvidenceV1,
         ] {
             assert_eq!(StreamProtocol::from_u8(p.as_u8()), Some(p));
         }
@@ -560,7 +734,7 @@ mod tests {
         for byte in 0x00u8..=0xFF {
             let parsed = StreamProtocol::from_u8(byte);
             match byte {
-                0x01..=0x05 => {
+                0x01..=0x06 => {
                     assert!(parsed.is_some(), "byte {byte:#x} should parse")
                 }
                 _ => assert_eq!(parsed, None, "byte {byte:#x} must be unknown"),
@@ -667,6 +841,8 @@ mod tests {
             loaded_from: std::path::Path::new("/test").to_path_buf(),
             loaded_at_unix_ms: 0,
             allow,
+            owner_allow: Vec::new(),
+            grant_allow: Vec::new(),
         })
     }
 
@@ -686,24 +862,24 @@ mod tests {
 
         // Disabled ⇒ no constraint, even for a peer listing nobody.
         let disabled = crate::connect::ConnectPolicy::default();
-        assert!(stream_acl_gate(&disabled, &[unlisted], &machine).is_ok());
+        assert!(stream_acl_gate(&disabled, &[unlisted], &[], &machine).is_ok());
 
         let policy = enabled_policy_listing(&[(listed, machine), (also_listed, machine)]);
 
         // All agents listed ⇒ pass.
-        assert!(stream_acl_gate(&policy, &[listed], &machine).is_ok());
-        assert!(stream_acl_gate(&policy, &[listed, also_listed], &machine).is_ok());
+        assert!(stream_acl_gate(&policy, &[listed], &[], &machine).is_ok());
+        assert!(stream_acl_gate(&policy, &[listed, also_listed], &[], &machine).is_ok());
 
         // Single unlisted agent ⇒ PeerNotInConnectAcl naming that agent.
         assert!(matches!(
-            stream_acl_gate(&policy, &[unlisted], &machine),
+            stream_acl_gate(&policy, &[unlisted], &[], &machine),
             Err(NetworkError::PeerNotInConnectAcl { agent_id }) if agent_id == unlisted.0
         ));
 
         // Multi-agent fail-closed: one unlisted agent on the machine denies
         // the whole stream, even though another agent is listed.
         assert!(matches!(
-            stream_acl_gate(&policy, &[listed, unlisted], &machine),
+            stream_acl_gate(&policy, &[listed, unlisted], &[], &machine),
             Err(NetworkError::PeerNotInConnectAcl { agent_id }) if agent_id == unlisted.0
         ));
 
@@ -711,9 +887,88 @@ mod tests {
         // not listed at all.
         let other_machine = MachineId([8u8; 32]);
         assert!(matches!(
-            stream_acl_gate(&policy, &[listed], &other_machine),
+            stream_acl_gate(&policy, &[listed], &[], &other_machine),
             Err(NetworkError::PeerNotInConnectAcl { agent_id }) if agent_id == listed.0
         ));
+    }
+
+    // ADR-0070 §1 + PR #896 decision 1: owner trust does not open the
+    // connect ACL by itself. An owner-trusted agent passes only when the ACL
+    // carries a `principal = "owner"` entry, and a non-owner agent never
+    // matches that entry.
+    #[test]
+    fn stream_acl_gate_owner_principal_requires_explicit_entry() {
+        use crate::error::NetworkError;
+        use crate::identity::AgentId;
+
+        let machine = MachineId([7u8; 32]);
+        let owner_agent = AgentId([1u8; 32]);
+        let stranger = AgentId([3u8; 32]);
+
+        // Owner-trusted, but the ACL has no owner entry ⇒ denied.
+        let no_owner_entry = enabled_policy_listing(&[]);
+        assert!(matches!(
+            stream_acl_gate(&no_owner_entry, &[owner_agent], &[owner_agent], &machine),
+            Err(NetworkError::PeerNotInConnectAcl { .. })
+        ));
+
+        let mut with_owner_entry = enabled_policy_listing(&[]);
+        if let crate::connect::ConnectPolicy::Enabled(acl) = &mut with_owner_entry {
+            acl.owner_allow.push(crate::connect::ConnectOwnerEntry {
+                description: None,
+                targets: vec!["127.0.0.1:22".parse().expect("loopback literal")],
+            });
+        }
+        // Owner entry + owner-trusted agent ⇒ pass.
+        assert!(
+            stream_acl_gate(&with_owner_entry, &[owner_agent], &[owner_agent], &machine).is_ok()
+        );
+        // Owner entry, but the agent is not owner-trusted ⇒ denied.
+        assert!(matches!(
+            stream_acl_gate(&with_owner_entry, &[stranger], &[owner_agent], &machine),
+            Err(NetworkError::PeerNotInConnectAcl { agent_id }) if agent_id == stranger.0
+        ));
+        // Multi-agent fail-closed still holds: one non-owner agent on the
+        // machine denies the stream even though the other is owner-trusted.
+        assert!(matches!(
+            stream_acl_gate(
+                &with_owner_entry,
+                &[owner_agent, stranger],
+                &[owner_agent],
+                &machine
+            ),
+            Err(NetworkError::PeerNotInConnectAcl { agent_id }) if agent_id == stranger.0
+        ));
+    }
+
+    /// Inert regression: reserving delivery must fail immediately when no
+    /// forwarder exists, rather than queueing a handshake in an undrained sink.
+    #[test]
+    fn forward_without_acceptor_rejects_delivery() {
+        let accept = std::sync::Arc::new(StreamAccept::new(8));
+        for protocol in [StreamProtocol::ForwardV1, StreamProtocol::ForwardV2] {
+            let sender = accept.sender_for(protocol);
+            assert!(
+                matches!(
+                    sender.try_reserve(),
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(()))
+                ),
+                "{protocol:?} must reject delivery instead of retaining a waiting handshake"
+            );
+        }
+    }
+
+    #[test]
+    fn forward_acceptor_drop_rejects_delivery() {
+        let accept = std::sync::Arc::new(StreamAccept::new(8));
+        for protocol in [StreamProtocol::ForwardV1, StreamProtocol::ForwardV2] {
+            let consumer = accept.register(protocol).expect("register forwarder");
+            let sender = accept.sender_for(protocol);
+            assert!(sender.same_channel(&consumer.tx));
+            assert!(sender.try_reserve().is_ok());
+            drop(consumer);
+            assert!(accept.sender_for(protocol).is_closed());
+        }
     }
 
     // Acceptor registry: one acceptor per protocol; drop deregisters; a stale
@@ -743,7 +998,7 @@ mod tests {
             .sender_for(StreamProtocol::SocksV1)
             .same_channel(&first.tx));
         assert!(accept
-            .sender_for(StreamProtocol::ForwardV1)
+            .sender_for(StreamProtocol::SyncV1)
             .same_channel(accept.sender()));
 
         // Drop deregisters: re-registration succeeds and routing follows.

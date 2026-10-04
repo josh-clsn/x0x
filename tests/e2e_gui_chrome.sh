@@ -39,6 +39,7 @@ data_dir = "$dir"
 log_level = "info"
 bootstrap_peers = []
 instance_name = "$instance"
+network_id = "x0x.prod"
 
 [update]
 enabled = false

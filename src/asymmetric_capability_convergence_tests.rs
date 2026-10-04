@@ -56,6 +56,57 @@ async fn until(label: &'static str, mut ready: impl FnMut() -> bool) {
     });
 }
 
+/// #1135: like [`until`], but the waited-for state is produced by a
+/// BEST-EFFORT gossip publish that can reach ZERO eager peers (cooled,
+/// lazy or graft-pending), which makes the state ABSENT rather than
+/// late — no timeout can fix that. Production republishes adverts on a
+/// cadence with fresh message ids (PlumTree dedupe never suppresses
+/// them), so the fixture republishes `payload` inside the barrier
+/// window (every ~400 ms, within the documented 250-500 ms band) and
+/// counts only attempts that were actually offered to at least one
+/// eager peer (`publish_with_fanout` >= 1). The barrier budget stays
+/// [`PHASE`].
+async fn until_republished(
+    label: &'static str,
+    publisher: &Agent,
+    topic: &str,
+    payload: Vec<u8>,
+    mut ready: impl FnMut() -> bool,
+) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let counted = AtomicU32::new(0);
+    const REPUBLISH_EVERY: Duration = Duration::from_millis(400);
+    let started = std::time::Instant::now();
+    // None => publish immediately on the first poll.
+    let mut last_publish: Option<std::time::Instant> = None;
+    let outcome = tokio::time::timeout(PHASE, async {
+        loop {
+            if ready() {
+                return;
+            }
+            if last_publish.is_none_or(|t| t.elapsed() >= REPUBLISH_EVERY) {
+                let fanout = publisher
+                    .publish_with_fanout(topic, payload.clone())
+                    .await
+                    .expect("signed base republication");
+                if fanout >= 1 {
+                    counted.fetch_add(1, Ordering::Relaxed);
+                }
+                last_publish = Some(std::time::Instant::now());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    outcome.unwrap_or_else(|_| {
+        panic!(
+            "phase barrier ({PHASE:?}, waited {}ms, {} counted republications): {label}",
+            started.elapsed().as_millis(),
+            counted.load(Ordering::Relaxed),
+        )
+    });
+}
+
 async fn build(dir: &std::path::Path, name: &str, candidates: Vec<String>) -> Agent {
     Agent::builder()
         .with_machine_key(dir.join(format!("{name}-machine")))
@@ -400,8 +451,18 @@ async fn asymmetric_signed_capability_convergence_over_relay() {
         evidence.save(Some("setup"));
         let signing = gossip::SigningContext::from_keypair(r.identity.agent_keypair());
         let base = dm_capability_service::build_signed_advert(&signing, r.agent_id(), r.machine_id(), ready.clone()).expect("signed actual-ready base");
-        r.publish(dm_capability::DM_CAPABILITY_TOPIC, base).await.expect("actual signed base publication");
-        until("sender observes held relay base without extension", || s.capability_store.lookup(&r.agent_id()).is_some_and(|c| c.gossip_inbox && c.kem_public_key == ready.kem_public_key && !c.digest_support)).await;
+        // #1135: the one-shot publish here could reach ZERO eager peers
+        // (best-effort fan-out), leaving the sender without the base —
+        // absent, not late. Republish on a cadence inside the barrier,
+        // counting only fan-out-attempted republications.
+        until_republished(
+            "sender observes held relay base without extension",
+            r,
+            dm_capability::DM_CAPABILITY_TOPIC,
+            base,
+            || s.capability_store.lookup(&r.agent_id()).is_some_and(|c| c.gossip_inbox && c.kem_public_key == ready.kem_public_key && !c.digest_support),
+        )
+        .await;
         assert_eq!(s.capability_store.lookup_binding(&r.agent_id()).unwrap().machine_id, r.machine_id());
         use dm_capability_service::ServiceEvent;
         until("held service initially skips pending publication", || service_observer.snapshot().unwrap().contains(&ServiceEvent::PendingSkip)).await;

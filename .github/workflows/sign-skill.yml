@@ -2,6 +2,9 @@ name: Sign SKILL.md
 
 # Manual-only: GPG signing on release is handled by release.yml.
 # Use this for ad-hoc SKILL.md signing outside of releases.
+# The job runs in the protected `release` environment (David is the required
+# reviewer; deployments are limited to v* tags), so dispatch it from a release
+# tag ref, e.g. `gh workflow run sign-skill.yml --ref v0.46.0`.
 on:
   workflow_dispatch:
 
@@ -9,6 +12,7 @@ jobs:
   sign:
     name: GPG Sign SKILL.md
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: read
 

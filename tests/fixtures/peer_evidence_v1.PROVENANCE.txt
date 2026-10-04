@@ -1,0 +1,19 @@
+ADR 0089 S1 initial V1 fixture
+
+File: peer_evidence_v1.bin
+SHA-256: 387e4cdfb4659ac763a8420713d2ce0d340714f4cda1775eaa8442f51942baea
+Base: 4b3a570 (Accepted ADR 0089), branch feat/adr0089-s1-evidence-store.
+Generated: 2026-09-30, macOS arm64, using this slice's EvidenceFileV1::encode.
+Command:
+  cargo test --lib peer_evidence::tests::generate_initial_v1_fixture --offline -- --ignored --exact
+
+The generator uses real, freshly generated ML-DSA agent/machine keys. It writes
+one X0A4 announcement, one base advert plus X0CR trailer, and one watermark.
+The signed timestamp is 2000000000000 ms; no certificate or secret key is stored.
+The generator uses create_new and refuses to overwrite this fixture.
+The decoder test re-verifies all signatures at that explicit timestamp.
+
+This is the INITIAL, UNRELEASED encoder fixture. No released binary implements
+X0PEV1 yet. It is not represented as a v0.45 release artifact. Keep this fixture
+unchanged when this layout releases; add actual release-artifact provenance at
+that gate, as ADR 0085 requires. Accepted ADR files have not been edited.

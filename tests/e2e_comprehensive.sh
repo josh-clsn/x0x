@@ -159,6 +159,7 @@ mkdir -p /tmp/x0x-e2e-alice /tmp/x0x-e2e-bob /tmp/x0x-e2e-charlie
 
 cat>/tmp/x0x-e2e-alice/config.toml<<TOML
 instance_name = "e2e-alice"
+network_id = "x0x.prod"
 data_dir = "/tmp/x0x-e2e-alice"
 bind_address = "127.0.0.1:19001"
 api_address = "127.0.0.1:19101"
@@ -171,6 +172,7 @@ TOML
 
 cat>/tmp/x0x-e2e-bob/config.toml<<TOML
 instance_name = "e2e-bob"
+network_id = "x0x.prod"
 data_dir = "/tmp/x0x-e2e-bob"
 bind_address = "127.0.0.1:19002"
 api_address = "127.0.0.1:19102"
@@ -858,6 +860,7 @@ echo -e "\n${CYAN}[17/18] Seedless Bootstrap — Charlie${NC}"
 # Write charlie config with NO bootstrap peers
 cat>/tmp/x0x-e2e-charlie/config.toml<<TOML
 instance_name = "e2e-charlie"
+network_id = "x0x.prod"
 data_dir = "/tmp/x0x-e2e-charlie"
 bind_address = "127.0.0.1:19003"
 api_address = "127.0.0.1:19103"

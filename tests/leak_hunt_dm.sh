@@ -93,6 +93,7 @@ for i in 1 2; do
     [ "$i" = 2 ] && BOOTSTRAP='bootstrap_peers = ["127.0.0.1:13401"]'
     cat > "$NODE_DIR/config.toml" <<EOF
 instance_name = "leak-dm-$NAME"
+network_id = "x0x.prod"
 data_dir = "$(cd "$NODE_DIR" && pwd)/data"
 bind_address = "127.0.0.1:$BIND"
 api_address = "127.0.0.1:$API"

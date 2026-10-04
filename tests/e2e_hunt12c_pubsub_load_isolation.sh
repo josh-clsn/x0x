@@ -78,6 +78,7 @@ for i in $(seq 0 $((N-1))); do
 
   cat > "$NODE_DIR/config.toml" <<EOF
 instance_name = "hunt12c-$((i+1))"
+network_id = "x0x.prod"
 data_dir = "$NODE_DIR"
 bind_address = "127.0.0.1:${BIND_PORTS[$i]}"
 api_address = "127.0.0.1:${API_PORTS[$i]}"

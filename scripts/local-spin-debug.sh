@@ -314,6 +314,7 @@ write_config() {
   cat > "$cfg" <<EOF
 instance_name = "${NODE_NAMES[$idx]}"
 data_dir = "${node_dir}"
+network_id = "x0x.prod"
 bind_address = "${bind_address}"
 api_address = "127.0.0.1:${api_port}"
 log_level = "info"

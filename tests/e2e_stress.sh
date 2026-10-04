@@ -169,6 +169,7 @@ mkdir -p /tmp/x0x-stress-alice /tmp/x0x-stress-bob /tmp/x0x-stress-charlie
 
 cat>/tmp/x0x-stress-alice/config.toml<<TOML
 instance_name = "stress-alice"
+network_id = "x0x.prod"
 data_dir = "/tmp/x0x-stress-alice"
 bind_address = "127.0.0.1:19601"
 api_address = "127.0.0.1:19701"
@@ -178,6 +179,7 @@ TOML
 
 cat>/tmp/x0x-stress-bob/config.toml<<TOML
 instance_name = "stress-bob"
+network_id = "x0x.prod"
 data_dir = "/tmp/x0x-stress-bob"
 bind_address = "127.0.0.1:19602"
 api_address = "127.0.0.1:19702"
@@ -470,6 +472,7 @@ echo -e "\n${CYAN}[18.4] Concurrent Multi-Agent${NC}"
 # Start charlie (with bootstrap to alice) for multi-agent tests
 cat>/tmp/x0x-stress-charlie/config.toml<<TOML
 instance_name = "stress-charlie"
+network_id = "x0x.prod"
 data_dir = "/tmp/x0x-stress-charlie"
 bind_address = "127.0.0.1:19603"
 api_address = "127.0.0.1:19703"
@@ -656,6 +659,7 @@ mkdir -p /tmp/x0x-stress-charlie
 
 cat>/tmp/x0x-stress-charlie/config.toml<<TOML
 instance_name = "stress-charlie-seedless"
+network_id = "x0x.prod"
 data_dir = "/tmp/x0x-stress-charlie"
 bind_address = "127.0.0.1:19603"
 api_address = "127.0.0.1:19703"

@@ -69,6 +69,7 @@ for node in "${NODES[@]}"; do
     fi
     cat > "${CONFIGS[$node]}" <<TOML
 instance_name = "$node"
+network_id = "x0x.prod"
 data_dir = "${DATA_DIRS[$node]}"
 api_address = "127.0.0.1:${API_PORTS[$node]}"
 bind_address = "127.0.0.1:$quic_port"

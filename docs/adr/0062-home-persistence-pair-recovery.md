@@ -1,6 +1,7 @@
 # ADR 0062: Recover Ordinary Home Persistence as One Durable Pair
 
-- **Status:** Proposed
+- **Status:** Accepted (record) of Considered Option 1, as shipped by PR #617 (D54)
+- **Accepted:** 2026-10-03 by David Irvine (ruling D54, confirmed by him directly to Claude x0x-32 on 2026-10-03). The status change was applied by Claude (x0x-32) at his instruction. This records shipped behaviour: the in-process restore of option 1, which #617 implemented. The option 2 this ADR recommends (a durable undo intent) is NOT accepted and is not built. Existing Homes are kept (D42); ADR 0088 (group liveness) records this decision.
 - **Date:** 2026-09-06
 - **Decision owners:** David Irvine / human engineering review pending
 - **Reviewers:** Pending; Codex drafted from the #471 source proof
