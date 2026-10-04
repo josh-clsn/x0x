@@ -19,6 +19,7 @@ Two rulings used here are not in the public digest. D60 (2026-10-03): every deli
 - **Merge:** this ADR lands Proposed on `main` before any code it governs merges to any branch. David Accepts it before S5's implementation merges to `main` (0088 §4, ADR 0087 rule 8).
 - **Harness first** (D16, D54): every red case in Validation is committed to W3-H and shown red on `main` before S5's code merges. No exception applies.
 - **One lane:** S5 code that touches `named_groups.rs` takes the single lane (0088 §4).
+- **Q5 gate:** S5 is not Accepted until David answers Q5. Until then the holder-only liveness gap in Consequences stays.
 
 ## Context
 
@@ -33,7 +34,7 @@ ADR 0088 L1 says catch-up and repair complete when any one holder is online. Fou
 **2. Certificates ride per-case sidecars.**
 - Seats carry a certificate digest. The bytes ride two unsigned sidecars: on `JoinResult` (#970, `named_groups.rs:1191-1201`) and on `MemberAdded` (#1023, `named_groups.rs:1565-1583`). Each holds up to 32 (`seat_cert_fetch.rs:665`) and is trimmed from the end to fit (`named_groups.rs:34778-34817`, `seat_cert_fetch.rs:752-791`). Trimming can drop a required certificate (the #1025 review P1).
 - One certificate is about 7.25 KB in bincode (`src/identity.rs:487-516`), about 9.7 KB as base64. A full sidecar is about 310 KB, sent to every member.
-- A missing certificate is fetched by #946 on the group's metadata topic (`seat_cert_fetch.rs:112-160`, `:423`). Metadata traffic is plain JSON (`named_groups.rs:2955-2967`), so every subscriber sees the answer.
+- A missing certificate is fetched by #946 on the group's metadata topic (`seat_cert_fetch.rs:112-160`, `:423`). Metadata traffic is plain JSON (`named_groups.rs:2955-2967`), so every subscriber sees the answer. The topic mesh can include non-members (`src/gossip/pubsub.rs:1203-1228`; the non-member mesh test at `:5072`), so today's Home sidecars and answers reach peers that D38 excludes.
 - After 10 minutes #946 stages a terminal `certificate_evidence_unavailable` refusal (`seat_cert_fetch.rs:55`, `named_groups.rs:33905-33925`). §2 item 8 says such a fetch waits until a holder is online.
 - Each fix so far was a per-case patch (#970, #1025, #1056, #1132). G6 stops them. The remaining #1023 case is "every holder offline" (`r19_cert_carry.rs:1329`), which is §2 item 8. The verdict defect (#1143) is S2.
 
@@ -76,7 +77,12 @@ A fetched projection never carries `treekem_key_package_hash`. The root does not
 ### 2. Author evidence and the fetched-event apply
 
 - **Minting.** When a capable authority seals a commit-bearing metadata event, it adds an optional field `author_evidence { signer_public_key, signature }`. The field is serde-default and omitted when absent, as in ADR 0106. The signature is ML-DSA-65 over `x0x/group-event-evidence-v1\0 ‖ group_id ‖ state_hash ‖ event_digest`, with length prefixes.
-- **Digest.** `event_digest` is the BLAKE3 of the event's canonical JSON with `author_evidence` and `roster_certificates_b64` removed. Canonical JSON means sorted keys and no whitespace; event JSON holds only strings, integers, booleans, null, arrays and objects. The digest is computed over the received JSON value, so fields a newer version adds stay covered.
+- **Digest (RFC 8785 JCS).** `event_digest` is the BLAKE3 of the JCS bytes of the event value, after the top-level members `author_evidence` and `roster_certificates_b64` are removed.
+  - **Parse once.** The receiver parses the received bytes once into a JSON value. The parser rejects duplicate keys at any depth, invalid UTF-8 and lone surrogates. Verification and apply consume that one value: the event is deserialized from it and never re-parsed from the bytes.
+  - **Bytes.** Object keys are sorted by UTF-16 code units at every depth. Arrays keep their order. There is no whitespace. A string escapes only `"`, `\` and U+0000–U+001F (as `\b`, `\f`, `\n`, `\r`, `\t` or lowercase `\u00xx`). Every other character is literal UTF-8.
+  - **Numbers.** Every number must be an integer with magnitude at most 2^53 − 1, written in plain decimal (I-JSON). Any other number makes the evidence invalid: the authority does not mint it, and the receiver falls back to the legacy author-only rule.
+  - **Coverage.** Every other member is covered, including members a newer version adds.
+  - **Minting.** The authority serializes the event, parses its own output with the same parser, and signs the digest of that value.
 - **Signer.** It must be the commit's signer: `signer_public_key` and `committed_by`.
 - **Budget.** The evidence never moves an event onto a transport that a legacy receiver may not support (#970's rule). If it would, it is omitted, and that event stays servable only by its author.
 - **Apply.** A fetched event is applied through the ordinary metadata apply with an explicit origin `Fetched { author, holder }`. Every check that compares the transport sender (for example `actor == sender`) compares the verified author. The holder is never treated as the sender. All other checks run unchanged: the actor's current role, revocation, prev-hash linkage, owner mandate, TreeKEM rules and the #846 gate (`named_groups.rs:10282-10303`).
@@ -88,8 +94,14 @@ A fetched projection never carries `treekem_key_package_hash`. The root does not
 - **K = 4** (proposed). A live `MemberAdded` or `JoinResult` carries at most 4 certificates inline, in today's order (local seat first, then by agent ID). The event subject's own `certificate_b64` is not counted.
 - Every other certificate is already named by its committed seat digest, and is fetched by hash. No new reference field is needed. Trimming now costs latency only.
 - No other message carries certificates. Any future carry uses this rule (G6).
-- **Sizing.** 4 × 9.7 KB ≈ 38.7 KB, against about 310 KB today. The primary user has 2–5 machines (ADR 0095). In a 5-device Home the four seats other than the subject fit inline.
-- **Mixed fleet.** The published `MemberAdded` uses K only when every active seat's current verified advert sets the bit. A `JoinResult` uses K only when the joiner's advert does. Otherwise today's sidecar stays.
+- **Home groups (D38).** D38 discloses a Home owner's certificate only to that Home's members. The metadata topic is plaintext gossip whose mesh can include non-members (Context, item 2). So in Home groups:
+  - the gossiped `MemberAdded` carries no roster sidecar, whatever the adverts say, and the `JoinResult` carries none either;
+  - certificates leave a node only on direct, member-authenticated channels: S5's fetch by hash (§4, under §5's guard) or S2's direct Put;
+  - **S5 reuses S2's direct Put** as the Home push half of this rule. It does not retire it, and it is not a second carry rule. Under S5 a Put carries at most K certificates, goes only to a recipient that passes §5's guard, and uses §5's single admitted exchange;
+  - the subject's own `certificate_b64` on the gossiped Home `MemberAdded` also reaches the mesh. Receivers require it today (`named_groups.rs:11249-11255`), so S5 cannot drop it without a new acceptance rule (Q8).
+- **Ordinary groups:** K inline on the gossiped copy stays.
+- **Sizing.** 4 × 9.7 KB ≈ 38.7 KB, against about 310 KB today. The primary user has 2–5 machines (ADR 0095). With K = 4, one ordinary event, or one S2 Put in a Home, covers every other seat of a 5-seat group.
+- **Mixed fleet (ordinary groups).** The published `MemberAdded` uses K only when every active seat's current verified advert sets the bit. A `JoinResult` uses K only when the joiner's advert does. Otherwise today's sidecar stays.
 
 ### 4. Fetch, head discovery and catch-up
 
@@ -119,7 +131,7 @@ A holder serves an object only while **all** of these hold:
 ### 6. Holder store (ADR 0085)
 
 - Certificates and projections are served from `named_groups.json`. Nothing new is stored for them.
-- **New persisted state:** one file per event, `<data_dir>/group-holder/<stable_group_id>/<state_hash>.ev`. Each file is magic `X0GHE1\0\0`, then bincode `HeldEventV1 { revision, committed: bool, event_json }`, consumed exactly. `event_json` is the canonical event of §2.
+- **New persisted state:** one file per event, `<data_dir>/group-holder/<stable_group_id>/<state_hash>.ev`. Each file is magic `X0GHE1\0\0`, then bincode `HeldEventV1 { revision, committed: bool, event_json }`, consumed exactly. `event_json` is the JCS bytes (§2) of the event value with only `roster_certificates_b64` removed.
 - **Order and durability.**
   - Before persisting the roster for a sealed or applied commit, the node writes the event's file with `committed = false`: a temp file, fsync, rename, then fsync of the directory.
   - After the roster persist succeeds, it rewrites the file with `committed = true` by the same method.
@@ -135,7 +147,7 @@ A holder serves an object only while **all** of these hold:
 ### 7. Capability bit and mixed versions
 
 - **Bit:** `group_object_fetch_v1`: "answers and sends S5 requests, mints and verifies `author_evidence`, accepts `GroupObject` blobs, keeps a holder store". It is named here. Its number is the next unallocated bit when this ADR is Accepted. It is advertised only after the holder store has reconciled.
-- **New to old:** old peers never receive S5 requests. Sidecars stay legacy-sized while a relevant advert lacks the bit or is unknown. Old receivers ignore `author_evidence`. #946 and #818 still run.
+- **New to old:** old peers never receive S5 requests. In ordinary groups, sidecars stay legacy-sized while a relevant advert lacks the bit or is unknown. In Home groups the gossiped sidecar is gone for every member (D38); an old Home member recovers certificates through S2's Put or #946 (Q4). Old receivers ignore `author_evidence`. #946 and #818 still run.
 - **Old to new:** a new holder answers #946 and #818 as today. Legacy events stay author-served. 0.45 peers see no new message.
 - Unknown capability state is not positive evidence. Requests wait for a current advert that shows the bit.
 
@@ -171,7 +183,8 @@ A holder serves an object only while **all** of these hold:
 - A new persisted directory with two writes per commit, and a new request surface.
 - Events sealed by legacy authorities stay author-served.
 - A member that falls behind every holder's retention has no holder-only exit (Q5).
-- The metadata topic still carries up to K certificates per add, in plain JSON.
+- In ordinary groups the metadata topic still carries up to K certificates per add, in plain JSON.
+- In Home groups the subject's own `certificate_b64` (Q8) and legacy #946 answers (Q4) still reach the gossip mesh until ruled. Old Home members lose the inline sidecar.
 
 ### Neutral / Operational
 
@@ -223,6 +236,15 @@ W3-H (#1164) does not exist yet. Each case below is a specification: nodes, step
 
 **Exit tests:** H1–H3 green; C1 and C2 unchanged or better.
 - Rejections: wrong hash; bad author or commit signature; a mismatched signer; a projection carrying an uncovered field; a root no signed commit binds; a forked chain (the #846 gate fires); a legacy event from a non-author holder.
+- **Digest test vectors** (committed with the implementation, each with its expected BLAKE3):
+  - nested objects whose keys sort differently by UTF-16 code unit and by code point (for example U+E000 against U+1F600);
+  - integers 0 and 2^53 − 1 accepted; 2^53, `1.0` and `1e3` make the evidence invalid;
+  - non-ASCII text given literally and as `\u` escapes yields one digest; U+001F becomes `\u001f`;
+  - whitespace variants of one value yield one digest;
+  - a duplicate key, at the top level and nested, is rejected;
+  - an unknown member is retained and covered, so changing it fails verification;
+  - changing `roster_certificates_b64` or `author_evidence` does not change the digest.
+- **Home disclosure:** a non-member peer in a Home's metadata mesh receives no roster-sidecar certificate and no S5 answer from a capable node. Members still converge through S5 fetch or S2's Put.
 - Store crash points: before the uncommitted write, between it and the roster persist, and between the persist and the committed write. After each, committed events are servable and uncommitted ones are never served. Unknown-magic and truncated files are left byte-identical.
 
 **Serving guard:** removed, banned, revoked, expired, verdict-changed, withdrawn and quarantined cases each get `absent` and no bytes, inline and by chunk. An invalidation that races an in-flight chunk aborts it before its write. A retry is admitted afresh.
@@ -233,11 +255,11 @@ W3-H (#1164) does not exist yet. Each case below is a specification: nodes, step
 
 ## Open questions for David
 
-- **Q1. K.** Accept K = 4, sized to a 5-device Home?
+- **Q1. K.** Accept K = 4, sized so one event or one S2 Put covers a 5-seat group?
 - **Q2. KV history (#811).** D54 rules on "missed group events", not store data. If C2 is red, should retained KV images become a fourth kind, fetched by their image digest?
 - **Q3. Pre-member roster fetch (#646).** May a pending joiner fetch a projection by presenting a signed invite that binds its root? That discloses what an invite link discloses today. Or is this decided with the W4 invite change (D13)?
-- **Q4. #946 retirement.** Keep the topic answer and its 10-minute terminal refusal for legacy peers until the minimum supported version (D35), or retire them sooner for §2 item 8 and D38?
-- **Q5. Retention exhaustion (L1).** A member behind every holder's retention cannot catch up from a holder, because TreeKEM needs every commit. Which exit is it? (a) Retention tied to the slowest active member's acknowledged revision. (b) Treat it as admission: a re-Welcome by any admin (S8 (b) or later). (c) A new §2 entry, which needs an ADR amending 0088. Recommended: (b), with (a) as an optimisation.
+- **Q4. #946 retirement.** Keep the topic answer and its 10-minute terminal refusal for legacy peers until the minimum supported version (D35), or retire them sooner for §2 item 8 and D38? In Home groups a topic answer reaches non-member mesh peers.
+- **Q5. Retention exhaustion (L1).** A member behind every holder's retention cannot catch up from a holder, because TreeKEM needs every commit. Which exit is it? (a) Retention tied to the slowest active member's acknowledged revision. (b) Treat it as admission: a re-Welcome by any admin (S8 (b) or later). (c) A new §2 entry, which needs an ADR amending 0088. Recommended: (b), with (a) as an optimisation. **S5's acceptance is gated on this answer.** Until it is ruled, Consequences keeps the holder-only liveness failure.
 - **Q6. Operational values** (recommendations with sizing):
   - Retention: 128 events per group, today's in-memory cap; at 51.5 KB each that is 6.6 MB, under a 16 MiB per-group cap; 256 MiB per node.
   - Requester: 16 outstanding fetches and 3 holders at once, mirroring ADR 0089's requester budgets; one request per (digest, holder) per 30 s.
@@ -246,6 +268,7 @@ W3-H (#1164) does not exist yet. Each case below is a specification: nodes, step
   - Head probe: every 5 minutes while a group is open.
   - Completion: H1 moves two 51.5 KB events, about four 32 KiB chunks, well inside one 115 s pull.
 - **Q7. "S8" in 0088's acceptance order.** S8 (b) (0114) depends on S4, so "S2 and S8" can only mean S8 (a). Confirm that S5 does not wait for 0114.
+- **Q8. The subject's certificate on Home gossip.** The gossiped Home `MemberAdded` still carries the joiner's own `certificate_b64`, which receivers require (`named_groups.rs:11249-11255`). Removing it means receivers apply a digest-only add pending a fetch, which is a new acceptance rule, and old receivers would reject such adds. Does S2 or S5 own that change, under D38?
 
 ## Notes for AI-assisted work
 
