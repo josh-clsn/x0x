@@ -2861,6 +2861,7 @@ async fn patch_discovery_entry_when_blob_lands(
     cache: &std::sync::Arc<
         tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
     >,
+    _announced: &dm_inbox::AuthenticatedMachineBindings,
     blob_cache: &std::sync::Arc<announce_blob::AnnounceBlobCache>,
     cert_events: &tokio::sync::broadcast::Sender<VerifiedCertificate>,
     digest: &[u8; 32],
@@ -3078,6 +3079,26 @@ async fn record_announced_machine_binding(
         )
         .await;
     }
+}
+
+/// The identity listener's cache step for one announcement that passed its
+/// signature, timestamp, trust, revocation, pairing and freshness gates:
+/// the machine cache, the announced-binding store (x0x #1150 r7c) and the
+/// discovery cache.
+async fn cache_verified_announcement(
+    machine_cache: &std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<identity::MachineId, DiscoveredMachine>>,
+    >,
+    announced: &dm_inbox::AuthenticatedMachineBindings,
+    cache: &std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+    >,
+    cert_events: &tokio::sync::broadcast::Sender<VerifiedCertificate>,
+    discovered_agent: DiscoveredAgent,
+) {
+    upsert_discovered_machine_from_agent(machine_cache, &discovered_agent).await;
+    record_announced_machine_binding(announced, &discovered_agent).await;
+    upsert_discovered_agent(cache, cert_events, discovered_agent).await;
 }
 
 async fn upsert_discovered_machine_from_agent(
@@ -11058,6 +11079,8 @@ impl Agent {
                                 // lands (bounded: the fetch itself gives up
                                 // after BLOB_FETCH_TIMEOUT_SECS).
                                 let watch_cache = std::sync::Arc::clone(&cache);
+                                let watch_announced =
+                                    std::sync::Arc::clone(&announced_machine_bindings);
                                 let watch_blob_cache =
                                     std::sync::Arc::clone(&announce_blob_cache);
                                 let watch_cert_events = std::sync::Arc::clone(&cert_events);
@@ -11066,6 +11089,7 @@ impl Agent {
                                 tokio::spawn(async move {
                                     patch_discovery_entry_when_blob_lands(
                                         &watch_cache,
+                                        &watch_announced,
                                         &watch_blob_cache,
                                         &watch_cert_events,
                                         &watch_digest,
@@ -11322,10 +11346,14 @@ impl Agent {
                     now,
                     cache_freshness_ttl_secs,
                 ) {
-                    upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent).await;
-                    record_announced_machine_binding(&announced_machine_bindings, &discovered_agent)
-                        .await;
-                    upsert_discovered_agent(&cache, &cert_events, discovered_agent).await;
+                    cache_verified_announcement(
+                        &machine_cache,
+                        &announced_machine_bindings,
+                        &cache,
+                        &cert_events,
+                        discovered_agent,
+                    )
+                    .await;
                 } else {
                     tracing::debug!(
                         target: "x0x::discovery",
@@ -31056,6 +31084,7 @@ async fn patch_discovery_entry_when_blob_lands_merges_verified_pair() {
 
     patch_discovery_entry_when_blob_lands(
         &cache,
+        &Default::default(),
         &blob_cache,
         &cert_events,
         &digest,
@@ -31105,6 +31134,7 @@ async fn patch_discovery_entry_when_blob_lands_merges_verified_pair() {
         .await;
     patch_discovery_entry_when_blob_lands(
         &cache,
+        &Default::default(),
         &blob_cache,
         &cert_events,
         &other_digest,
@@ -31170,6 +31200,7 @@ async fn patch_discovery_entry_rejects_superseded_digest_fetch() {
 
     patch_discovery_entry_when_blob_lands(
         &cache,
+        &Default::default(),
         &blob_cache,
         &cert_events,
         &d1,
