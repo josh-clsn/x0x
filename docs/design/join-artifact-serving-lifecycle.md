@@ -309,6 +309,28 @@ The review found the call-site audit clean: every class-R and class-K write conv
 | P3: inline egress outlived its G7 handler ticket, so duplicate fetches overlapped | Fixed: `join_result_egress_admission` (one per (stable group, recipient), 8 per group, 64 global); the ticket lives in the egress task | `388a42f`, `a2d7d68` | `s8a_r6_duplicate_fetches_never_overlap_inline_egress` (6 duplicate fetches against a stalled egress leave 1 in flight) |
 | P4: withholding masked terminal share invalidations | Fixed: the serving guard decides every definitive refusal before quarantine or pending evidence (class R and K); the share verdict checks the epoch first | `96d103c`, `d12a42e` | `s8a_r6_terminal_share_invalidations_outrank_withholding` (quarantine plus agent revocation, and quarantine plus a moved epoch: both purged) |
 
+### Round 7 (ephemeral testnet run g10-1190a: owner restart)
+
+The owner restarted 12–22 s before it acted, so its discovery cache, DM registry and peer evidence were cold. `resolve_raw_quic_target` read them once and gave up (`err_agent_not_found`). The gossip fallback that used to hide this is gone, and it stays gone. Class-K shares landed at about 120 s, against the joiner's 120 s deadline, or not at all. A Welcome chunk failed with `recipient_undiscovered`.
+
+The fix resolves the recipient's machine before the admitted exchange, from verified sources only. Each source is read where it is used and copied nowhere:
+
+1. The discovery cache.
+2. The DM registry.
+3. The ADR-0021 authenticated machine binding. `resolve_raw_quic_target` never read it. It is the attestation that verified a gossip-inbox request, and it outlives the registry entry that a disconnect clears.
+4. Peer evidence.
+
+If no source knows the recipient, the send starts one EvidenceV1 Lookup and re-reads the sources until one learns it. It holds no lock while it waits. The wait ends at the smaller of `PINNED_RESOLUTION_WAIT` (5 s) and half of the exchange budget. If the recipient is still unresolved, the send returns the typed, retryable `recipient_undiscovered` inside the deadline, before any admission runs. The B/P checks, the pre-phase and the seam are unchanged.
+
+A class-K share whose exchange ends `recipient_undiscovered` is resent after 1 s, with no backoff, because the exchange's own bounded wait already paces it. Every other transport failure still backs off from 8 s to 120 s. Each exchange is still one physical write. The in-process stand-in runs the same resolver in strict mode (`set_pinned_standin_strict_resolution_for_testing`); other tests keep the earlier stand-in.
+
+| Item | Status | Red, then fix | Evidence |
+|---|---|---|---|
+| Restart-cold recipient resolution, class K and class R | Fixed: bounded resolution from verified sources (`Agent::await_pinned_recipient_machine`); a typed error inside the exchange deadline | `b869d1e`, `4e28f26` | `s8a_r7_owner_restart_class_k_share_lands_when_discovery_arrives_within_the_bound`, `s8a_r7_owner_restart_welcome_chunk_lands_on_the_requesters_attested_binding`; controls `s8a_r7_a_machine_learned_during_the_wait_is_refused_at_the_seam_when_revoked`, `s8a_r7_an_unresolved_recipient_ends_in_a_typed_error_within_the_bound` |
+| Class-K resend pacing after an undiscovered exchange | Fixed: 1 s resend with no backoff | `b869d1e`, `4e28f26` | `s8a_r7_class_k_share_resends_promptly_after_an_undiscovered_exchange` |
+
+Still open for g10: the pinned path needs a direct connection to the resolved machine. If the requester reached the owner only through the gossip inbox, and repair or redial cannot dial it, the exchange still fails (`err_not_connected`), and the joiner's retry or the share's backoff carries the delivery. That is G10.
+
 Still outstanding for merge: the G10 evidence (e2e Home joins, survivor rekeys, mixed-version delivery on raw-only), from Root's ephemeral-testnet gate.
 
 Remaining notes:
