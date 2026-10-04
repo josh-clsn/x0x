@@ -346,6 +346,18 @@ A class-K share whose exchange ends `recipient_undiscovered` is resent after 1 s
 | P2-2: a held source lock escaped the resolution bound | Fixed | `45e9ab3`, `887434d` | `s8a_r7b_a_held_source_lock_ends_in_the_typed_error_within_the_bound` (discovery cache; authenticated bindings) |
 | P3: the pacing test did not prove a resend | Test fixed | `45e9ab3` | `s8a_r7_class_k_share_resends_promptly_after_an_undiscovered_exchange` (fails with the resend arm disabled) |
 
+**Round 7c (Codex re-review of `a3c85dd..dc1eb49`: changes required).**
+
+- **Announcement bindings apart from routing state (NEW 1).** The discovery cache's `machine_id` is routing state: the connector reconciles it to any connected machine and keeps the old announcement time. So the pinned rule no longer reads it. A new announced-binding store records each peer's latest verified identity announcement, with its certificate expiry. It is written at announcement ingest only, never by routing. Live authority is the newer of that announcement and the ADR-0021 attestation. The pinned redial dials only the bound machine, on hints that name it, and never runs the general connector.
+- **One deadline through revalidation (NEW 2).** One absolute deadline covers resolution, the B/P checks and the post-repair binding re-read. A lock held past it is `recipient_undiscovered`. A free lock may still be taken within a 100 ms grace.
+- **Non-blocking evidence policy (NEW 3).** `EvidencePolicy::try_relation` and `try_revoked` reach owner enrollment, share grants and the group slot with `try_*` reads only. Contention reports busy, so the seam refuses and the resolver re-polls. The blocking receive-path check is unchanged.
+
+| Item | Status | Red, then fix | Evidence |
+|---|---|---|---|
+| NEW 1: the production redial promoted stale routing state into pinned authority | Fixed | `7a88e6a` (redial over the transport seam, no behaviour change), `f9f67ac`, `db0d47b` | `s8a_r7c_stale_routing_state_never_becomes_pinned_authority`. It replaces `s8a_r7b_a_redial_off_the_current_binding_writes_nothing`, whose scripted redial result never reproduced the mutation. |
+| NEW 2: post-repair reads escaped the bound | Fixed | `f9f67ac`, `db0d47b` | `s8a_r7c_a_source_lock_held_after_resolution_ends_typed_within_the_bound` |
+| NEW 3: the non-blocking evidence check blocked in policy evaluation | Fixed | `f9f67ac`, `db0d47b` | `peer_evidence::tests::r7c_try_usable_agent_reports_busy_while_the_grant_store_is_held` |
+
 Still open for g10: the pinned path needs a direct connection to the resolved machine. If the requester reached the owner only through the gossip inbox, and repair or redial cannot dial it, the exchange still fails (`err_not_connected`), and the joiner's retry or the share's backoff carries the delivery. That is G10.
 
 Still outstanding for merge: the G10 evidence (e2e Home joins, survivor rekeys, mixed-version delivery on raw-only), from Root's ephemeral-testnet gate.
