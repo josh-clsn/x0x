@@ -9436,6 +9436,15 @@ impl Agent {
         std::sync::Arc::clone(&self.authenticated_machine_bindings)
     }
 
+    /// Test seam (x0x #1150 r7d): the announced-binding store. Test builds
+    /// only.
+    #[cfg(test)]
+    pub(crate) fn announced_machine_bindings_for_testing(
+        &self,
+    ) -> dm_inbox::AuthenticatedMachineBindings {
+        std::sync::Arc::clone(&self.announced_machine_bindings)
+    }
+
     /// Test seam for #1088: record an authenticated machine binding the
     /// way the inbox records one after a verified fresh machine-key
     /// attestation.
@@ -31221,6 +31230,105 @@ async fn patch_discovery_entry_rejects_superseded_digest_fetch() {
         entry.cert_digest,
         Some(d2),
         "#447 r2: the entry keeps its CURRENT announce digest"
+    );
+}
+
+/// WHY (x0x #1150 r7d, Codex NEW 1): a V3 announcement whose certificate
+/// blob was not yet cached records only the digest, with no expiry. When
+/// the verified blob lands, the announced binding (the pinned path's live
+/// authority) must learn the certificate's expiry, as the discovery entry
+/// does. Then a certificate that has since expired is refused.
+#[tokio::test]
+async fn r7d_announced_binding_learns_expiry_when_the_certificate_blob_lands() {
+    let user_kp = identity::UserKeypair::from_seed(&[0x5d; 32]).expect("owner kp");
+    let joiner = identity::AgentKeypair::generate().expect("joiner kp");
+    let not_after = Agent::unix_timestamp_secs() + 600;
+    let cert = identity::AgentCertificate::issue_with_expiry(&user_kp, &joiner, Some(not_after))
+        .expect("joiner cert");
+    let digest = announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()));
+    let cache = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let machine_cache =
+        std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let announced: dm_inbox::AuthenticatedMachineBindings = Default::default();
+    let cert_events = test_cert_events();
+    let mut entry = discovered_agent_fixture(0x5d, 100, &[], None);
+    entry.agent_id = joiner.agent_id();
+    entry.cert_digest = Some(digest);
+    cache_verified_announcement(&machine_cache, &announced, &cache, &cert_events, entry).await;
+    let blob_cache = std::sync::Arc::new(announce_blob::AnnounceBlobCache::new(None));
+    blob_cache
+        .insert_verified(announce_blob::CachedBlob {
+            digest,
+            user_id: cert.user_id().ok(),
+            agent_certificate: Some(cert),
+            payload_version: 1,
+            fetched_at_unix: 1,
+        })
+        .await;
+    patch_discovery_entry_when_blob_lands(
+        &cache,
+        &announced,
+        &blob_cache,
+        &cert_events,
+        &digest,
+        &joiner.agent_id(),
+    )
+    .await;
+    let binding = announced.read().await.peek(&joiner.agent_id());
+    assert_eq!(
+        binding.and_then(|b| b.cert_not_after),
+        Some(not_after),
+        "the announced binding never learned the landed certificate's expiry"
+    );
+    assert!(
+        select_pinned_binding(
+            binding,
+            None,
+            None,
+            || None,
+            not_after + identity::EXPIRY_CLOCK_SKEW_SECS + 1
+        )
+        .is_none(),
+        "an expired announced binding still resolved"
+    );
+}
+
+/// WHY (x0x #1150 r7d, Codex NEW 1): a later announcement that commits to
+/// the SAME certificate digest, but whose blob is not cached here (no
+/// inline certificate, so no expiry), must not erase the expiry already
+/// known for that unchanged evidence. The discovery entry keeps it; so must
+/// the announced binding.
+#[tokio::test]
+async fn r7d_announced_binding_keeps_known_expiry_across_a_same_digest_blob_miss() {
+    let user_kp = identity::UserKeypair::from_seed(&[0x5e; 32]).expect("owner kp");
+    let joiner = identity::AgentKeypair::generate().expect("joiner kp");
+    let not_after = Agent::unix_timestamp_secs() + 600;
+    let cert = identity::AgentCertificate::issue_with_expiry(&user_kp, &joiner, Some(not_after))
+        .expect("joiner cert");
+    let digest = announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()));
+    let cache = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let machine_cache =
+        std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let announced: dm_inbox::AuthenticatedMachineBindings = Default::default();
+    let cert_events = test_cert_events();
+    let mut first = discovered_agent_fixture(0x5e, 100, &[], cert.user_id().ok());
+    first.agent_id = joiner.agent_id();
+    first.cert_not_after = cert.not_after();
+    first.agent_certificate = Some(cert);
+    first.cert_digest = Some(digest);
+    cache_verified_announcement(&machine_cache, &announced, &cache, &cert_events, first).await;
+    let mut miss = discovered_agent_fixture(0x5e, 200, &[], None);
+    miss.agent_id = joiner.agent_id();
+    miss.cert_digest = Some(digest);
+    cache_verified_announcement(&machine_cache, &announced, &cache, &cert_events, miss).await;
+    assert_eq!(
+        announced
+            .read()
+            .await
+            .peek(&joiner.agent_id())
+            .and_then(|b| b.cert_not_after),
+        Some(not_after),
+        "a same-digest blob miss erased the known expiry"
     );
 }
 

@@ -5072,7 +5072,8 @@ async fn s8a_r7b_a_binding_that_changes_before_the_seam_is_refused_at_the_seam(
 }
 
 /// WHY (r7b P2-2): the whole resolution is bounded, lock waits included. A
-/// held source lock (the discovery cache, then the authenticated bindings)
+/// held source lock (the announced bindings, then the authenticated
+/// bindings; r7d: the discovery cache is no longer a resolver source)
 /// must not stretch resolution to the exchange deadline. The send still
 /// ends with the typed, retryable `recipient_undiscovered` inside the
 /// deadline, before any admission, with nothing written.
@@ -5080,12 +5081,12 @@ async fn s8a_r7b_a_binding_that_changes_before_the_seam_is_refused_at_the_seam(
 async fn s8a_r7b_a_held_source_lock_ends_in_the_typed_error_within_the_bound() -> anyhow::Result<()>
 {
     let mut wrong = Vec::new();
-    for case in ["discovery cache", "authenticated bindings"] {
+    for case in ["announced bindings", "authenticated bindings"] {
         let dir = tempfile::tempdir()?;
         let g = build_gss(dir.path(), false).await?;
         let g_hex = hex_of(&g.joiner);
         restart_cold(&g.authority, &g.joiner, &g.stable).await;
-        let cache = g.authority.agent.identity_discovery_cache();
+        let announced = g.authority.agent.announced_machine_bindings_for_testing();
         let bindings = g
             .authority
             .agent
@@ -5095,8 +5096,8 @@ async fn s8a_r7b_a_held_source_lock_ends_in_the_typed_error_within_the_bound() -
         clear_egress(&g.authority);
         let started = std::time::Instant::now();
         let outcome = {
-            let _cache_held = if case == "discovery cache" {
-                Some(cache.write().await)
+            let _announced_held = if case == "announced bindings" {
+                Some(announced.write().await)
             } else {
                 None
             };
