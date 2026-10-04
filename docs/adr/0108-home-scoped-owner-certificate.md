@@ -360,7 +360,7 @@ No replacement is written before steps 2 and 3 succeed. The original bytes are a
    - **Missing:** if `V` is empty (every pending copy failed verification), write no replacement: the slice runs memory-only as `sidecar_quarantine_failed { step: verify }` and the next load retries. Otherwise remove any `F.tmp-*` left by these transactions, then build one replacement (step 4) that covers `V`.
    - **Valid and supported:** keep `F`. Each `txid` in `V` is finalized (step 5), whether or not `F` lists it in `rebuilt_from`; a listed `txid` means step 4 already completed, and an unlisted one needs no rebuild.
    - **Newer or unreadable:** keep `F` byte-identical and run memory-only as `sidecar_newer_format` or `sidecar_unavailable`. Leave every pending copy as it is. A binary that can read `F` resumes them later.
-   - **Damaged:** quarantine `F` as its own transaction, with a new `txid` (steps 1 to 3). If it verifies, add its `txid` to `V`. `F` is now missing, so build one replacement that covers `V`.
+   - **Damaged:** quarantine `F` as its own transaction, with a new `txid` (steps 1 to 3). If it verifies, add its `txid` to `V`. `F` is now missing, so apply the missing-file rule above: if `V` is still empty, write no replacement; otherwise build one replacement that covers `V`.
 4. **Finalize.** Run step 5 for each `txid` in `V`, in `txid` order.
 
 **Coverage.** One replacement's `rebuilt_from` lists every `txid` in `V` when step 4 runs, including a `txid` just created for a newly damaged `F`. If `V` exceeds the slice's bound, the replacement lists the first `txid`s in order. The rest are finalized as history beside the valid `F`, which needs no further rebuild.
