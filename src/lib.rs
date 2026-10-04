@@ -275,6 +275,109 @@ impl PinnedMachineSource {
 /// the verified sources of its recipient's machine.
 const PINNED_RESOLUTION_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// x0x #1150 (r7b): the transport operations raw-QUIC target resolution
+/// uses (connection state, send-readiness repair, discovery redial).
+/// Production always uses the network; test builds can script them, so the
+/// production resolution logic runs in process without a network.
+enum RawQuicTransport<'a> {
+    Network(&'a std::sync::Arc<network::NetworkNode>),
+    #[cfg(test)]
+    Scripted(std::sync::Arc<PinnedTransportScript>),
+}
+
+impl RawQuicTransport<'_> {
+    async fn is_connected(&self, peer: &ant_quic::PeerId) -> bool {
+        match self {
+            Self::Network(network) => network.is_connected(peer).await,
+            #[cfg(test)]
+            Self::Scripted(script) => script.is_connected(peer),
+        }
+    }
+
+    async fn ensure_peer_send_ready(&self, peer: &ant_quic::PeerId) -> error::NetworkResult<()> {
+        match self {
+            Self::Network(network) => network.ensure_peer_send_ready(peer).await,
+            #[cfg(test)]
+            Self::Scripted(script) => script.repair(peer),
+        }
+    }
+
+    async fn redial(
+        &self,
+        agent: &Agent,
+        agent_id: &identity::AgentId,
+    ) -> Option<identity::MachineId> {
+        match self {
+            Self::Network(network) => {
+                agent
+                    .redial_direct_machine_from_discovery(agent_id, network)
+                    .await
+            }
+            #[cfg(test)]
+            Self::Scripted(script) => script.redial(),
+        }
+    }
+}
+
+/// x0x #1150 (r7b): a scripted transport for the strict in-process pinned
+/// stand-in. The default reports every machine connected. Test builds only.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct PinnedTransportScript {
+    all_disconnected: bool,
+    repair_connects: bool,
+    redial: Option<identity::MachineId>,
+    connected: std::sync::Mutex<std::collections::HashSet<identity::MachineId>>,
+}
+
+#[cfg(test)]
+impl PinnedTransportScript {
+    fn is_connected(&self, peer: &ant_quic::PeerId) -> bool {
+        !self.all_disconnected
+            || self
+                .connected
+                .lock()
+                .is_ok_and(|connected| connected.contains(&identity::MachineId(peer.0)))
+    }
+
+    fn repair(&self, peer: &ant_quic::PeerId) -> error::NetworkResult<()> {
+        if !self.repair_connects {
+            return Err(error::NetworkError::ConnectionFailed(
+                "scripted repair failed".to_string(),
+            ));
+        }
+        if let Ok(mut connected) = self.connected.lock() {
+            connected.insert(identity::MachineId(peer.0));
+        }
+        Ok(())
+    }
+
+    fn redial(&self) -> Option<identity::MachineId> {
+        let machine = self.redial?;
+        if let Ok(mut connected) = self.connected.lock() {
+            connected.insert(machine);
+        }
+        Some(machine)
+    }
+}
+
+/// x0x #1150 (r7b): per-agent transport scripts for the strict stand-in.
+#[cfg(test)]
+static PINNED_STANDIN_TRANSPORT: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<identity::AgentId, std::sync::Arc<PinnedTransportScript>>,
+    >,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+fn pinned_standin_transport(agent: &identity::AgentId) -> std::sync::Arc<PinnedTransportScript> {
+    PINNED_STANDIN_TRANSPORT
+        .lock()
+        .ok()
+        .and_then(|scripts| scripts.get(agent).cloned())
+        .unwrap_or_default()
+}
+
 /// x0x #1150 (g10-1190a): agents whose in-process pinned stand-in resolves
 /// the recipient's machine strictly, as the real path does (see
 /// `Agent::set_pinned_standin_strict_resolution_for_testing`).
@@ -7831,7 +7934,7 @@ impl Agent {
         let target = self
             .resolve_raw_quic_target(
                 to,
-                network,
+                &RawQuicTransport::Network(network),
                 &agent_prefix,
                 payload.len(),
                 send_start,
@@ -7926,11 +8029,26 @@ impl Agent {
         resolve_within: std::time::Duration,
     ) -> Result<dm::DmReceipt, dm::DmError> {
         let machine = if pinned_standin_is_strict(&self.identity.agent_id()) {
-            // The real path's resolution (g10-1190a), shared code.
-            let (machine, _source) = self
+            // The real path's resolution and target selection (repair,
+            // redial, B/P), shared code, over a scripted transport (r7b).
+            let (machine, source) = self
                 .await_pinned_recipient_machine(to, resolve_within)
                 .await?;
-            Some(machine)
+            let attested = (source == PinnedMachineSource::AuthenticatedBinding).then_some(machine);
+            let transport =
+                RawQuicTransport::Scripted(pinned_standin_transport(&self.identity.agent_id()));
+            let target = self
+                .resolve_raw_quic_target(
+                    to,
+                    &transport,
+                    &network::hex_prefix(&to.0, 4),
+                    0,
+                    std::time::Instant::now(),
+                    attested,
+                )
+                .await
+                .map_err(Self::map_raw_quic_dm_error)?;
+            Some(target.machine_id)
         } else {
             let cached = self
                 .identity_discovery_cache
@@ -8118,6 +8236,9 @@ impl Agent {
     /// AND after resolution. Shared by the general raw path and the x0x
     /// #1150 pinned single-exchange path.
     ///
+    /// `transport` supplies connection state, repair and redial: the network
+    /// in production, a script for the strict in-process stand-in (r7b).
+    ///
     /// `attested` (pinned path only, g10-1190a) is the recipient's ADR-0021
     /// authenticated machine binding, used when the discovery cache and the
     /// DM registry know no machine, before peer evidence (live authority
@@ -8126,7 +8247,7 @@ impl Agent {
     async fn resolve_raw_quic_target(
         &self,
         agent_id: &identity::AgentId,
-        network: &std::sync::Arc<network::NetworkNode>,
+        transport: &RawQuicTransport<'_>,
         agent_prefix: &str,
         bytes: usize,
         send_start: std::time::Instant,
@@ -8156,10 +8277,10 @@ impl Agent {
             None
         };
         let (mut machine_id, mut resolution) = match (cached_machine_id, registry_machine_id) {
-            (Some(id), _) if network.is_connected(&ant_quic::PeerId(id.0)).await => {
+            (Some(id), _) if transport.is_connected(&ant_quic::PeerId(id.0)).await => {
                 (id, "cached_connected")
             }
-            (_, Some(id)) if network.is_connected(&ant_quic::PeerId(id.0)).await => {
+            (_, Some(id)) if transport.is_connected(&ant_quic::PeerId(id.0)).await => {
                 if cached_machine_id != Some(id) {
                     let mut cache = self.identity_discovery_cache.write().await;
                     if let Some(entry) = cache.get_mut(agent_id) {
@@ -8234,7 +8355,7 @@ impl Agent {
         // until a raw probe/send path observes the live connection.
         let mut ant_peer_id = ant_quic::PeerId(machine_id.0);
         let mut machine_prefix = network::hex_prefix(&machine_id.0, 4);
-        let mut connected = network.is_connected(&ant_peer_id).await;
+        let mut connected = transport.is_connected(&ant_peer_id).await;
 
         // X0X-0033: when machine_id is known (resolved from cache or registry)
         // but ant-quic isn't currently connected, the X0X-0031 send-readiness
@@ -8249,7 +8370,7 @@ impl Agent {
             const REPAIR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
             let outcome = match tokio::time::timeout(
                 REPAIR_TIMEOUT,
-                network.ensure_peer_send_ready(&ant_peer_id),
+                transport.ensure_peer_send_ready(&ant_peer_id),
             )
             .await
             {
@@ -8267,17 +8388,14 @@ impl Agent {
                 outcome,
                 "send-readiness repair on disconnected peer"
             );
-            connected = network.is_connected(&ant_peer_id).await;
+            connected = transport.is_connected(&ant_peer_id).await;
 
             // Presence/discovery and transport readiness are deliberately
             // separate. If the fast bootstrap-cache repair cannot recover a
             // known machine, use the discovery card's current addresses in
             // the same logical send instead of returning AgentNotConnected.
             if !connected {
-                if let Some(redialed_machine_id) = self
-                    .redial_direct_machine_from_discovery(agent_id, network)
-                    .await
-                {
+                if let Some(redialed_machine_id) = transport.redial(self, agent_id).await {
                     machine_id = redialed_machine_id;
                     ant_peer_id = ant_quic::PeerId(machine_id.0);
                     machine_prefix = network::hex_prefix(&machine_id.0, 4);
@@ -8430,7 +8548,14 @@ impl Agent {
             machine_prefix,
             resolution,
         } = self
-            .resolve_raw_quic_target(agent_id, network, &agent_prefix, bytes, send_start, None)
+            .resolve_raw_quic_target(
+                agent_id,
+                &RawQuicTransport::Network(network),
+                &agent_prefix,
+                bytes,
+                send_start,
+                None,
+            )
             .await?;
 
         tracing::debug!(
