@@ -113,15 +113,15 @@ advert sets `grant_revocation_push_v1`. The push is best-effort. The
 
 ### 1. Capability bit
 
-- **Name:** `grant_revocation_push_v1`. **Proposed bit:** 3, the next free
-  bit in the canonical allocation table in the ADR index.
+- **Name:** `grant_revocation_push_v1`.
 - **Meaning:** "Accepts the single-record grant revocation push
   (`x0x-grant-revocation-push-v1\0`) and ingests it through the v3
   revocation path."
-- **Allocation:** this ADR reserves bit 3 in the canonical table, as ADR
-  0089 did for bit 2. The bit is effective only when this ADR is Accepted.
-  No build advertises it before then. If another ADR takes bit 3 first,
-  this ADR takes the next free bit. The name and meaning do not change.
+- **Number:** allocated at acceptance, in acceptance order, as the next
+  free bit in the README registry. This ADR reserves no numbered row now.
+  The accepting PR adds the row and fixes the number in this ADR, the code
+  constant and the compatibility tests together. After that the number and
+  meaning are frozen. No build advertises the bit before then.
 - **Advertising:** a receiver advertises the bit only when its typed route
   for the prefix is registered and ready. A pending receiver does not.
 - **Gate direction:** the sender needs **positive evidence**. Bits 0 and 1
@@ -190,34 +190,51 @@ advert sets `grant_revocation_push_v1`. The push is best-effort. The
 
 ### 4. Receiver
 
-The receiver handles the prefix in this order. It stops at the first
-failure.
+**Prefix ownership comes first, and it is unconditional.** A payload that
+starts with `x0x-grant-revocation-push-v1\0` never reaches DM history or
+DM subscribers. This holds:
+- on every DM ingress path: the raw direct path and the gossip DM path;
+- for verified and unverified frames;
+- before and after the inbox is ready, and on success or failure.
 
-1. **Route.** The typed route owns the prefix. The bytes never reach DM
-   history or DM subscribers, on success or failure. The prefix joins the
-   production typed-prefix table, so the raw path catches it before the
-   inbox starts.
-2. **Decode.** At most 8 KiB. Decode exactly one `RevocationRecord` and
+Before the typed route is ready, the payload is dropped and counted
+`not_ready`. Gossip still carries the record. This case is real: a sender
+can still hold the receiver's advert from before a restart (the ADR 0093
+TTL is 900 s) and push during the startup window. Today the static
+typed-prefix table suppresses only **unverified** frames. A verified frame
+with no registered route still falls through to history and subscribers,
+and startup supplies an empty route list. The implementation must close
+that gap for this prefix.
+
+After ownership, the receiver handles the payload in this order. It stops
+at the first failure. Steps 1 to 5 use no signature verify.
+
+1. **Decode.** At most 8 KiB. Decode exactly one `RevocationRecord` and
    consume every byte. Otherwise drop and count `malformed`.
-3. **Subject.** `ShareGrant` with a finite `grant_expiry`. Otherwise drop
+2. **Subject.** `ShareGrant` with a finite `grant_expiry`. Otherwise drop
    and count `wrong_subject`.
-4. **Stale.** If the record is past its GC horizon (`grant_expiry` plus
+3. **Stale.** If the record is past its GC horizon (`grant_expiry` plus
    the existing slack), drop and count `stale`. The grant can no longer
    be honoured.
-5. **Duplicate.** If the set already holds a revocation for the same
-   `(owner, grant_id)`, drop and count `duplicate`. No signature verify is
-   done.
-6. **Rate.** At most 16 pushes per minute from one sending agent, and 256
+4. **Known record.** If the record's hash is already in the set, drop and
+   count `duplicate`. Every record in the set was verified when it entered,
+   so this needs no verify. The test is the **record hash**, not
+   `(owner, grant_id)`. A distinct record for the same grant goes on to
+   step 6. A retried DELETE makes one (a new `revoked_at`). A distinct
+   record may also carry a later `grant_expiry`, and v3 must keep the
+   latest horizon.
+5. **Rate.** At most 16 pushes per minute from one sending agent, and 256
    per minute in total. Drop the excess and count `rate_limited`.
-7. **Verify.** The same authority check as the v3 carrier: the owner's
-   ML-DSA-65 signature over the record's canonical bytes, and the issuer
-   key must hash to the record's `owner`. On failure, drop and count it
-   with the forged-v3 counter. Every verify is counted.
-8. **Ingest.** As a one-record batch through the same v3 ingest path,
-   under the same owner-trust revocation barrier. Persist through the same
-   store writer (section 6). Everything a v3 insert triggers also fires
-   for a pushed record. That includes live-session re-evaluation once ADR
-   0074 s3 lands.
+6. **Ingest.** Hand the one record, as a one-record batch, to the shared
+   v3 ingest, under the same owner-trust revocation barrier. That ingest
+   does the **only** verify: the owner's ML-DSA-65 signature over the
+   record's canonical bytes, and the issuer key must hash to the record's
+   `owner`. The push handler has no verify of its own. A failure is
+   counted with the forged-v3 counter. A distinct valid record is merged
+   through v3: it is kept, and the grant's horizon becomes the maximum
+   `grant_expiry`. Persistence follows section 6. Everything a v3 insert
+   triggers also fires for a pushed record. That includes live-session
+   re-evaluation once ADR 0074 s3 lands.
 
 The receiver does not need to hold the grant. A push can arrive before the
 grant DM that it revokes. The receiver stores the revocation, and the
@@ -229,15 +246,18 @@ effect, because the record carries its own authority.
 
 ### 5. Idempotence, replay and ordering
 
-- **Idempotence.** The key is `(owner, grant_id)`. A second push, the
-  gossip copy, or a new record from a retried DELETE is a duplicate. It
-  changes nothing and costs no verify.
+- **Idempotence.** The dedupe key is the record hash. A second push of the
+  same record, or its gossip copy, is a duplicate. It changes nothing and
+  costs no verify. A distinct record for the same grant, such as one from
+  a retried DELETE, costs one verify and is merged by v3. The grant is
+  revoked either way. Only its GC horizon can move, and only later.
 - **Replay.** A revocation only ever removes access. A replayed valid
   record cannot grant or widen access. It can only re-state a revocation
-  the owner signed. Steps 4 to 6 bound the work a replay can cause: a
-  stale record is dropped, a duplicate is dropped before verify, and each
-  sender is rate-limited. The push needs no nonce and no recipient
-  binding. The record is public and is gossiped to everyone anyway.
+  the owner signed. Steps 3 to 5 bound the work a replay can cause: a
+  stale record is dropped, a known record is dropped before any verify,
+  and each sender is rate-limited. The push needs no nonce and no
+  recipient binding. The record is public and is gossiped to everyone
+  anyway.
 - **Order on the owner.** Durable record (ADR 0077), then the v3 gossip
   publish (unchanged), then the push. The push never runs before the
   record is durable. Gossip and push do not wait for each other.
@@ -252,22 +272,68 @@ effect, because the record carries its own authority.
 
 ### 6. The revocation store (#1116)
 
-Today a `revocations-v3.bin` that fails to decode loads as an empty set
-(fail-open). The v3 writer then rewrites an undecodable file from memory.
-ADR 0098 makes the store fail closed (D23). This ADR does not decide how.
-It sets these rules for the push path only:
+**Today.**
+- A `revocations-v3.bin` that fails to decode loads as an empty set
+  (fail-open, #1116).
+- Every v3 persist re-reads the file. If the file does not decode, the
+  writer replaces it with the in-memory set. So any later insert, from any
+  carrier, can destroy the corrupt file's bytes.
+- Every v3 persist also decodes and re-verifies every record in the file
+  and every record in the live snapshot, then rewrites the whole set. For
+  a set of N records, that is about 2N signature verifies and one O(N)
+  rewrite per persist.
 
-- A pushed record is written only through the same store writer as a
-  gossiped record. There is no separate push store and no separate
-  listing. The one listing that ADR 0098 defines shows pushed records too.
-- A pushed record is never the write that replaces a store file that
-  failed to load. If the v3 store failed to load in this run, the push
-  applies the record in memory only and counts `persist_held`.
-- If a write fails, the record stays in memory. The daemon fails closed
-  for this run, as for gossip, and counts the failure.
-- A push carries one record. It never counts as a full re-sync. If ADR
-  0098 holds gates until a full re-sync, a pushed record is applied and the
-  hold stays.
+ADR 0098 makes the store fail closed (D23) and decides the recovery. This
+ADR does not. It requires only what keeps the push from adding a new
+overwrite path or new O(N) work.
+
+**One store.** A pushed record is written only through the shared v3
+writer. There is no separate push store and no separate listing. The one
+listing that ADR 0098 defines shows pushed records too.
+
+**A shared store-failure latch.**
+- There is one latch for the v3 store file. Every v3 writer checks it: the
+  local revoke, the v3 gossip ingest, share-grant records that arrive on
+  the v1 and v2 carriers, and the push.
+- The latch is set when the file fails to load, or when any writer finds
+  that the file does not decode.
+- While the latch is set, no writer replaces, truncates or renames over
+  the file. Its original bytes are preserved for ADR 0098's recovery.
+- A writer that is held counts `persist_held`. Until ADR 0098 defines a
+  hold, new records stay in the in-memory set, as gossip records do today,
+  so this run fails closed. Once it does, its policy applies (below).
+- On the owner, a local revoke cannot be durable while the latch is set.
+  `DELETE /grants/:id` answers 503, as ADR 0077 requires, and no push is
+  sent (section 3).
+- Only ADR 0098's recovery clears the latch.
+
+**Bounded persistence work.**
+- One verify per distinct new record, in the shared ingest (section 4,
+  step 6). Nothing verifies it twice.
+- The shared writer coalesces. At most one v3 persist is in flight and at
+  most one is pending. A pending persist takes the latest in-memory
+  snapshot when it starts. A record that arrives while a persist is
+  pending adds no persist work. So at most one snapshot is ever queued.
+- A persist triggered only by pushed records starts at most once every
+  5 s. A crash inside that window loses only those in-memory records.
+  Gossip still carries them.
+- The live snapshot is built from verified memory. The writer merges it
+  from memory and does not decode and re-verify it.
+- The writer re-verifies the disk copy only when its bytes differ from
+  what this process last read or wrote. That happens, for example, when
+  another process that shares the identity directory wrote it.
+- With these rules, a burst of K pushes costs K verifies and at most 2
+  persists. A persist costs no verifies unless another process changed
+  the file, plus one O(N) rewrite. This ADR does not bound N. With D35's
+  90-day maximum lifetime, each record becomes collectable within about
+  90 days.
+- These writer rules also apply to gossip-triggered persists. They change
+  no file format.
+
+**Holds and repair.**
+- Under an ADR 0098 hold, the push follows ADR 0098's policy for new
+  records (open question 3). A push never lifts the hold. It carries one
+  record and never counts as a full re-sync.
 - The push does not repair #1116. It is sent once, at revoke time. It does
   not restore the older records that a lost store held.
 
@@ -321,13 +387,22 @@ It sets these rules for the push path only:
 - Until the `deliver_to` list is recorded, a `deliver_to` daemon that is
   neither a host nor a grantee agent gets only gossip.
 - The push does not repair #1116 or #1111. ADR 0098 must still land.
+- The latch and the writer rules change the shared v3 writer, so they
+  also affect gossip ingest and the local revoke. While the latch is set,
+  `DELETE /grants/:id` answers 503 until ADR 0098's recovery runs.
+- A receiver downgraded to a build without the route can still get a push
+  while the sender holds its earlier advert. That build shows the push as
+  an ordinary DM. The advert TTL (900 s) bounds the window.
 
 ### Neutral / Operational
 
 - ADR 0077's ordering text stays authoritative. This ADR adds propagation
   only.
-- `/diagnostics` gains sender counters (section 3) and receiver counters
-  (section 4).
+- `/diagnostics` gains sender counters (section 3), receiver counters
+  (section 4) and `persist_held` (section 6).
+- The startup gap in section 4 (a verified frame with no registered route
+  reaches history) also applies to the existing production typed
+  prefixes. This ADR closes it only for its own prefix.
 - **Efficiency (E-D15).**
   - Audience: the recipients of one grant only.
   - Rate: once per revoke per recipient, plus at most 2 retries on a local
@@ -337,11 +412,16 @@ It sets these rules for the push path only:
     about 10 KB per recipient in one direction, and no ACK bytes. These
     figures are estimates from the key and signature sizes, not
     measurements.
-  - Verifies: one per new record at the receiver. A duplicate costs none.
-    All are counted.
-  - Persistence: O(change), one record merged into the existing file.
-  - No new periodic task. The only queue is the bounded in-memory pending
-    set.
+  - Verifies: one per distinct new record at the receiver, in the shared
+    ingest. A known record costs none. All are counted.
+  - Persistence (section 6): today every v3 persist costs about 2N
+    verifies and one O(N) rewrite. Under this ADR's writer rules, a burst
+    of K pushes costs K verifies and at most 2 persists. A persist costs
+    one O(N) rewrite and no verifies, unless another process changed the
+    file. Push-only persists start at most once every 5 s. N is not
+    bounded here.
+  - No new periodic task. The queues are the bounded in-memory pending
+    pushes (at most 1,024) and at most one pending persist snapshot.
   - Compatibility carrier: none. The push is never sent to a peer without
     the bit, so no sunset is needed. The cost of the v3 whole-set
     re-publication is out of scope.
@@ -363,25 +443,41 @@ Tests for the implementing PR. Each one needs a recorded red run.
      subscribers.
 
    Red: gate disabled.
-4. **Forged or malformed pushes are refused.** Each case is dropped, counted
+4. **Prefix ownership at startup.** A **verified** push frame arrives
+   before the inbox is ready, on the raw direct path and on the gossip DM
+   path. The sender used the receiver's pre-restart advert. Each frame is
+   dropped and counted `not_ready`. Nothing reaches DM history or
+   subscribers. An unverified frame and a frame after readiness give the
+   same result. Red: ownership limited to unverified frames, as today.
+5. **Forged or malformed pushes are refused.** Each case is dropped, counted
    and leaves no state and no DM history: a wrong key, a foreign owner,
    tampered bytes, a non-`ShareGrant` subject, an unknown grant
    (`u64::MAX`), a `Vec` payload, trailing bytes, and an oversize payload.
-   Red: verify disabled.
-5. **Idempotence and replay.** Same record twice; gossip then push; push
-   then gossip; two records from a retried DELETE. Each gives one effect.
-   Duplicates leave the verify counter unchanged. A record past its GC
-   horizon is dropped.
-6. **Order against outbox redelivery.** At another owner install, a pushed
+   Each forged case costs exactly one verify. Red: verify disabled.
+6. **Idempotence, horizon and replay.**
+   - The same record twice, gossip then push, and push then gossip each
+     give one effect. The second copy leaves the verify counter unchanged.
+   - Two distinct records for one grant, the second with a later
+     `grant_expiry`: both are verified once and kept, and the horizon is
+     the later expiry. Red: dedupe on `(owner, grant_id)`.
+   - A record past its GC horizon is dropped.
+7. **Order against outbox redelivery.** At another owner install, a pushed
    record and a concurrent redelivery pass go through the same barrier. No
    redelivery starts after the ingest.
-7. **The store.**
+8. **The store latch.**
+   - Corrupt `revocations-v3.bin`, start the daemon, deliver a push (held,
+     `persist_held`), then deliver a distinct gossip record. The file is
+     still byte-identical to the corrupt original. Red: today's writer.
+   - The same with a local revoke: the DELETE answers 503, no push is sent,
+     and the file is unchanged.
    - A failed persist keeps the record in memory and counts it.
-   - A v3 store that failed to load is not overwritten by a push
-     (`persist_held`).
    - Once ADR 0098 lands, a push does not end a re-sync hold.
-8. **The owner.** A DELETE that answers 503 sends no push. Its retry does.
-9. **Mixed versions** (sealed testnet, the release-gate row style). 0.45
+9. **Persistence bounds.** A burst of K distinct pushes gives exactly K
+   verifies and at most 2 persists. A persist does not re-verify the live
+   snapshot, and it re-verifies the disk copy only after another process
+   wrote it. Push-only persists start at most once every 5 s.
+10. **The owner.** A DELETE that answers 503 sends no push. Its retry does.
+11. **Mixed versions** (sealed testnet, the release-gate row style). 0.45
    and pre-bit 0.46 receivers get no push and no DM history entry, and
    gossip still revokes the grant.
 
@@ -400,8 +496,9 @@ Tests for the implementing PR. Each one needs a recorded red run.
    record per live id. ADR 0098 decides, and this ADR follows.
 3. **The fail-closed form (#1116).** ADR 0098 chooses between refusing to
    start and a quarantine with a hold until re-sync. This ADR works with
-   both. Please confirm that a pushed record may be applied in memory
-   during a hold.
+   both, and a push never lifts a hold. Open: during an ADR 0098 hold, may
+   a pushed record enter the in-memory set, or is it dropped until the
+   re-sync? This ADR follows whatever ADR 0098 sets for new records.
 4. **Live sessions.** ADR 0074 s3 tears down live sessions within 5 s of
    receipt. Please confirm that the bound counts from receipt over either
    carrier.
@@ -409,9 +506,10 @@ Tests for the implementing PR. Each one needs a recorded red run.
    list, so the push reaches those daemons? That is a versioned
    share-grant store change (ADR 0085). The recommendation is yes, in the
    implementing slice.
-6. **The bit.** Bit 3, with the positive-evidence gate in section 1, and
-   the unknown-capability wait of one advert period from D35. Please
-   confirm, or set a shorter wait.
+6. **The gate.** The positive-evidence gate in section 1, and the
+   unknown-capability wait of one advert period from D35. Please confirm,
+   or set a shorter wait. The bit number is fixed at acceptance (section
+   1).
 7. **The D28 hold.** Does this slice wait for the ADR 0070 and ADR 0077
    review, or is it exempt as part of the D23 revocation work?
 
