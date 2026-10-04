@@ -36632,6 +36632,19 @@ pub(super) async fn send_join_artifact(
         Ok(Err(e)) => Err(e.to_string()),
         Err(_) => Err(format!("{kind} exchange deadline elapsed")),
     };
+    // Test builds: every exchange's outcome, in order (r7b).
+    #[cfg(test)]
+    if let Ok(mut outcomes) = state
+        .named_group_test_recorders
+        .join_artifact_outcomes
+        .lock()
+    {
+        outcomes.push((
+            recipient_hex.clone(),
+            kind,
+            outcome.as_ref().err().cloned().unwrap_or_default(),
+        ));
+    }
     // Test builds: the in-process stand-in reports an admitted exchange
     // through its marker error; record the egress witness for it.
     #[cfg(test)]

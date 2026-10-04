@@ -4887,11 +4887,64 @@ async fn s8a_r7_an_unresolved_recipient_ends_in_a_typed_error_within_the_bound(
     Ok(())
 }
 
-/// WHY (g10-1190a, class K): a share exchange that ends
+/// The class-R/class-K exchanges to `recipient` of `kind` started so far
+/// (each is recorded when it is handed to the pinned transport).
+fn exchange_starts(state: &AppState, recipient: &str, kind: &str) -> usize {
+    transports_for(state, recipient)
+        .iter()
+        .filter(|(k, _)| *k == kind)
+        .count()
+}
+
+/// Forget every recorded exchange start and outcome.
+fn clear_exchanges(state: &AppState) {
+    let recorders = &state.named_group_test_recorders;
+    recorders
+        .join_artifact_transports
+        .lock()
+        .expect("transport witness")
+        .clear();
+    recorders
+        .join_artifact_outcomes
+        .lock()
+        .expect("outcome witness")
+        .clear();
+}
+
+/// Wait (bounded) until an exchange of `kind` to `recipient` has ended
+/// with an error text starting with `prefix`.
+async fn exchange_ended_with(
+    state: &AppState,
+    recipient: &str,
+    kind: &str,
+    prefix: &str,
+    within: Duration,
+) -> bool {
+    let ended = || {
+        state
+            .named_group_test_recorders
+            .join_artifact_outcomes
+            .lock()
+            .expect("outcome witness")
+            .iter()
+            .any(|(to, k, reason)| to == recipient && *k == kind && reason.starts_with(prefix))
+    };
+    let deadline = tokio::time::Instant::now() + within;
+    while tokio::time::Instant::now() < deadline {
+        if ended() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    ended()
+}
+
+/// WHY (g10-1190a, class K; r7b P3): a share exchange that ends
 /// `recipient_undiscovered` (nothing learned the member within its bound)
-/// is resent promptly, because the bounded wait already paces it, not after
-/// the transport backoff. Discovery landing a little after the first bound
-/// still delivers the share within seconds.
+/// is resent promptly, not after the transport backoff, because the bounded
+/// wait already paces it. The test waits for that first exchange to END
+/// undiscovered, then lets discovery land, and requires a SECOND exchange to
+/// deliver the share within the resend pause plus a margin.
 #[tokio::test]
 async fn s8a_r7_class_k_share_resends_promptly_after_an_undiscovered_exchange() -> anyhow::Result<()>
 {
@@ -4900,19 +4953,244 @@ async fn s8a_r7_class_k_share_resends_promptly_after_an_undiscovered_exchange() 
     let g_hex = hex_of(&g.joiner);
     restart_cold(&g.authority, &g.joiner, &g.stable).await;
     clear_share_witnesses(&g.authority);
-    let started = std::time::Instant::now();
+    clear_exchanges(&g.authority);
     deliver_current_share(&g).await?;
-    // Nothing learns the member during the first exchange's bound.
-    tokio::time::sleep(Duration::from_millis(5_500)).await;
+    assert!(
+        exchange_ended_with(
+            &g.authority,
+            &g_hex,
+            "secure_share",
+            "recipient_undiscovered",
+            Duration::from_secs(15),
+        )
+        .await,
+        "the first share exchange never ended recipient_undiscovered"
+    );
+    let undiscovered_at = std::time::Instant::now();
+    let first = exchange_starts(&g.authority, &g_hex, "secure_share");
     let early = share_writes(&g.authority, &g_hex);
     pin_recipient_machine(&g.authority, &g.joiner).await;
     let delivered =
-        egress_happens(&g.authority, &g_hex, "secure_share", Duration::from_secs(2)).await;
+        egress_happens(&g.authority, &g_hex, "secure_share", Duration::from_secs(3)).await;
+    let resent_after = undiscovered_at.elapsed();
+    let starts = exchange_starts(&g.authority, &g_hex, "secure_share");
+    assert_eq!(first, 1, "one exchange before discovery");
     assert_eq!(early, 0, "a share was written before any machine was known");
     assert!(
         delivered,
-        "the share was not resent promptly after an undiscovered exchange ({:?} since the delivery started)",
-        started.elapsed()
+        "no second exchange delivered the share within 3 s of the undiscovered one ({resent_after:?})"
+    );
+    assert!(
+        starts >= 2,
+        "the share was not delivered by a second exchange ({starts} exchanges)"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// r7b (Codex review of e645ce2..a3c85dd): binding provenance survives repair
+// and redial and is re-validated at the seam; the whole resolution, lock
+// waits included, is bounded.
+// ---------------------------------------------------------------------------
+
+/// WHY (r7b P2-1): the binding a pinned send resolved from must still name
+/// the machine it finally writes to. Cold discovery cache and DM registry;
+/// the current attestation names J's machine B, which is not connected and
+/// does not repair. The discovery redial connects another machine, A (in
+/// production the redial falls back to older peer evidence when the cache
+/// and registry are cold). A is not what the current binding names, so
+/// nothing is admitted or written.
+#[tokio::test]
+async fn s8a_r7b_a_redial_off_the_current_binding_writes_nothing() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    let g_hex = hex_of(&g.joiner);
+    restart_cold(&g.authority, &g.joiner, &g.stable).await;
+    g.authority
+        .agent
+        .record_authenticated_binding_for_testing(
+            g.joiner.agent.agent_id(),
+            g.joiner.agent.machine_id(),
+            unix_secs_now(),
+        )
+        .await;
+    let stale_evidence_machine = x0x::identity::MachineId([0xa5; 32]);
+    g.authority
+        .agent
+        .script_pinned_standin_transport_for_testing(x0x::PinnedTransportScript::disconnected(
+            false,
+            Some(stale_evidence_machine),
+        ));
+    let (pre, seam) = (Arc::default(), Arc::default());
+    let admission = counted_admission(Arc::clone(&pre), Arc::clone(&seam), true, true, None);
+    clear_egress(&g.authority);
+    let outcome = super::super::send_join_artifact(
+        &g.authority,
+        &g.joiner.agent.agent_id(),
+        b"adr0107-r7b-redial-off-binding",
+        &g.stable,
+        "join_result",
+        admission,
+        Instant::now() + Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        outcome
+            .as_ref()
+            .is_err_and(|reason| !reason.contains(x0x::dm::PINNED_STANDIN_ADMITTED)),
+        "a machine the current binding does not name was admitted: {outcome:?}"
+    );
+    assert_eq!(
+        pre.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "admission ran for a machine the current binding does not name"
+    );
+    assert_eq!(egress_count(&g.authority, &g_hex, "join_result"), 0);
+    Ok(())
+}
+
+/// WHY (r7b P2-1): the seam re-validates the binding too. The send resolves
+/// J's machine from its current attestation; between the pre-phase and the
+/// seam, a newer attestation moves J to another machine, or J's binding now
+/// carries an expired certificate. The seam refuses (an admission refusal),
+/// and nothing is written.
+#[tokio::test]
+async fn s8a_r7b_a_binding_that_changes_before_the_seam_is_refused_at_the_seam(
+) -> anyhow::Result<()> {
+    let mut wrong = Vec::new();
+    for case in ["moved", "certificate expired"] {
+        let dir = tempfile::tempdir()?;
+        let g = build_gss(dir.path(), false).await?;
+        let g_hex = hex_of(&g.joiner);
+        restart_cold(&g.authority, &g.joiner, &g.stable).await;
+        let joiner_id = g.joiner.agent.agent_id();
+        let joiner_machine = g.joiner.agent.machine_id();
+        let now = unix_secs_now();
+        g.authority
+            .agent
+            .record_authenticated_binding_for_testing(joiner_id, joiner_machine, now - 10)
+            .await;
+        let authority = Arc::clone(&g.authority);
+        let change: Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync> =
+            Arc::new(move || {
+                let authority = Arc::clone(&authority);
+                Box::pin(async move {
+                    if case == "moved" {
+                        authority
+                            .agent
+                            .record_authenticated_binding_for_testing(
+                                joiner_id,
+                                x0x::identity::MachineId([0x5b; 32]),
+                                now,
+                            )
+                            .await;
+                    } else {
+                        authority
+                            .agent
+                            .record_authenticated_binding_with_expiry_for_testing(
+                                joiner_id,
+                                joiner_machine,
+                                now,
+                                Some(now - 86_400),
+                            )
+                            .await;
+                    }
+                })
+            });
+        let (pre, seam) = (Arc::default(), Arc::default());
+        let admission = counted_admission(
+            Arc::clone(&pre),
+            Arc::clone(&seam),
+            true,
+            true,
+            Some(change),
+        );
+        clear_egress(&g.authority);
+        let outcome = super::super::send_join_artifact(
+            &g.authority,
+            &joiner_id,
+            b"adr0107-r7b-binding-changes",
+            &g.stable,
+            "join_result",
+            admission,
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await;
+        let refused = outcome
+            .as_ref()
+            .is_err_and(|reason| reason.contains(x0x::dm::PINNED_ADMISSION_REFUSED));
+        let written = egress_count(&g.authority, &g_hex, "join_result");
+        if !refused || written != 0 || seam.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            wrong.push(format!("[{case}] {outcome:?}, {written} written"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "the seam admitted a binding that changed after the pre-phase: {wrong:?}"
+    );
+    Ok(())
+}
+
+/// WHY (r7b P2-2): the whole resolution is bounded, lock waits included. A
+/// held source lock (the discovery cache, then the authenticated bindings)
+/// must not stretch resolution to the exchange deadline. The send still
+/// ends with the typed, retryable `recipient_undiscovered` inside the
+/// deadline, before any admission, with nothing written.
+#[tokio::test]
+async fn s8a_r7b_a_held_source_lock_ends_in_the_typed_error_within_the_bound() -> anyhow::Result<()>
+{
+    let mut wrong = Vec::new();
+    for case in ["discovery cache", "authenticated bindings"] {
+        let dir = tempfile::tempdir()?;
+        let g = build_gss(dir.path(), false).await?;
+        let g_hex = hex_of(&g.joiner);
+        restart_cold(&g.authority, &g.joiner, &g.stable).await;
+        let cache = g.authority.agent.identity_discovery_cache();
+        let bindings = g
+            .authority
+            .agent
+            .authenticated_machine_bindings_for_testing();
+        let (pre, seam) = (Arc::default(), Arc::default());
+        let admission = counted_admission(Arc::clone(&pre), Arc::clone(&seam), true, true, None);
+        clear_egress(&g.authority);
+        let started = std::time::Instant::now();
+        let outcome = {
+            let _cache_held = if case == "discovery cache" {
+                Some(cache.write().await)
+            } else {
+                None
+            };
+            let _bindings_held = if case == "authenticated bindings" {
+                Some(bindings.write().await)
+            } else {
+                None
+            };
+            super::super::send_join_artifact(
+                &g.authority,
+                &g.joiner.agent.agent_id(),
+                b"adr0107-r7b-held-lock",
+                &g.stable,
+                "join_result",
+                admission,
+                Instant::now() + Duration::from_secs(3),
+            )
+            .await
+        };
+        let elapsed = started.elapsed();
+        let typed = outcome
+            .as_ref()
+            .is_err_and(|reason| reason.starts_with("recipient_undiscovered"));
+        if !typed
+            || elapsed >= Duration::from_millis(2_800)
+            || pre.load(std::sync::atomic::Ordering::SeqCst) != 0
+            || egress_count(&g.authority, &g_hex, "join_result") != 0
+        {
+            wrong.push(format!("[{case}] {outcome:?} after {elapsed:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "a held source lock escaped the resolution bound: {wrong:?}"
     );
     Ok(())
 }

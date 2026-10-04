@@ -1305,6 +1305,9 @@ pub(super) struct NamedGroupTestRecorders {
     /// was handed to, as `(recipient, kind, transport)`. Only
     /// `pinned_single_exchange` admits every physical write.
     pub(super) join_artifact_transports: StdMutex<Vec<(String, &'static str, &'static str)>>,
+    /// x0x #1150 (r7b): every class-R/class-K exchange's outcome, in
+    /// order, as `(recipient, kind, error text)`; an empty text is a write.
+    pub(super) join_artifact_outcomes: StdMutex<Vec<(String, &'static str, String)>>,
     /// ADR 0107 (r5, G4): ordered lifecycle events — an egress task or
     /// Welcome stream ending (`egress_ended:<group>:<recipient>`,
     /// `welcome_stream_ended:<welcome id>`) and a terminal commit

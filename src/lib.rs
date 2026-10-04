@@ -332,6 +332,18 @@ pub(crate) struct PinnedTransportScript {
 
 #[cfg(test)]
 impl PinnedTransportScript {
+    /// No machine is connected. The send-readiness repair connects the
+    /// machine it repairs when `repair_connects`; the discovery redial
+    /// connects (and returns) `redial`.
+    pub(crate) fn disconnected(repair_connects: bool, redial: Option<identity::MachineId>) -> Self {
+        Self {
+            all_disconnected: true,
+            repair_connects,
+            redial,
+            connected: Default::default(),
+        }
+    }
+
     fn is_connected(&self, peer: &ant_quic::PeerId) -> bool {
         !self.all_disconnected
             || self
@@ -8106,6 +8118,19 @@ impl Agent {
             } else {
                 agents.remove(&self.identity.agent_id());
             }
+        }
+    }
+
+    /// Test seam (x0x #1150, r7b): the transport the strict stand-in's
+    /// target selection sees (connection state, repair, redial). Without a
+    /// script every machine reports connected. Test builds only.
+    #[cfg(test)]
+    pub(crate) fn script_pinned_standin_transport_for_testing(
+        &self,
+        script: PinnedTransportScript,
+    ) {
+        if let Ok(mut scripts) = PINNED_STANDIN_TRANSPORT.lock() {
+            scripts.insert(self.identity.agent_id(), std::sync::Arc::new(script));
         }
     }
 
