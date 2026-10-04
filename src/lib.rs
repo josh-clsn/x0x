@@ -373,13 +373,22 @@ impl RawQuicTransport<'_> {
         agent_id: &identity::AgentId,
     ) -> Option<identity::MachineId> {
         match self {
-            Self::Network(network) => {
+            Self::Network(_) => {
                 agent
-                    .redial_direct_machine_from_discovery(agent_id, network)
+                    .redial_direct_machine_from_discovery(agent_id, self)
                     .await
             }
+            // A scripted result, or the production redial over the script's
+            // connection state (r7b).
             #[cfg(test)]
-            Self::Scripted(script) => script.redial(),
+            Self::Scripted(script) => match script.redial() {
+                Some(machine) => Some(machine),
+                None => {
+                    agent
+                        .redial_direct_machine_from_discovery(agent_id, self)
+                        .await
+                }
+            },
         }
     }
 }
@@ -7781,7 +7790,7 @@ impl Agent {
     async fn connected_direct_machine(
         &self,
         agent_id: &identity::AgentId,
-        network: &network::NetworkNode,
+        transport: &RawQuicTransport<'_>,
     ) -> Option<identity::MachineId> {
         let cached_machine_id = {
             let cache = self.identity_discovery_cache.read().await;
@@ -7791,14 +7800,20 @@ impl Agent {
                 .filter(|machine_id| machine_id.0 != [0_u8; 32])
         };
         if let Some(machine_id) = cached_machine_id {
-            if network.is_connected(&ant_quic::PeerId(machine_id.0)).await {
+            if transport
+                .is_connected(&ant_quic::PeerId(machine_id.0))
+                .await
+            {
                 return Some(machine_id);
             }
         }
 
         let registry_machine_id = self.direct_messaging.get_machine_id(agent_id).await;
         if let Some(machine_id) = registry_machine_id {
-            if network.is_connected(&ant_quic::PeerId(machine_id.0)).await {
+            if transport
+                .is_connected(&ant_quic::PeerId(machine_id.0))
+                .await
+            {
                 if cached_machine_id != Some(machine_id) {
                     let mut cache = self.identity_discovery_cache.write().await;
                     if let Some(entry) = cache.get_mut(agent_id) {
@@ -7814,7 +7829,7 @@ impl Agent {
                 .peer_evidence()
                 .usable_agent(*agent_id, dm_capability::now_unix_ms())
             {
-                if network
+                if transport
                     .is_connected(&ant_quic::PeerId(view.announcement.machine_id.0))
                     .await
                 {
@@ -7831,7 +7846,7 @@ impl Agent {
     async fn redial_direct_machine_from_discovery(
         &self,
         agent_id: &identity::AgentId,
-        network: &network::NetworkNode,
+        transport: &RawQuicTransport<'_>,
     ) -> Option<identity::MachineId> {
         if let Err(error) = self.connect_to_agent(agent_id).await {
             tracing::debug!(
@@ -7844,7 +7859,7 @@ impl Agent {
             return None;
         }
 
-        self.connected_direct_machine(agent_id, network).await
+        self.connected_direct_machine(agent_id, transport).await
     }
 
     /// Legacy raw-QUIC direct-send path. Internal fallback only.
