@@ -207,8 +207,9 @@ advert sets `grant_revocation_push_v1`. The push is best-effort. The
   - `sending`: shows attempt n of 3. Exits: `pushed` or `send_failed`.
   - A restart drops every pending push. Gossip still carries the record.
 
-  The same endpoint keeps the latest outcomes, at most 1,024, each with
-  its `grant_id`, its recipient and its outcome.
+  The same endpoint keeps a bounded list of recent outcomes, each with its
+  `grant_id`, its recipient and its outcome. Its size and retention are
+  open question 4.
 
 ### 3a. The recorded `deliver_to` list (D112)
 
@@ -233,6 +234,14 @@ the push reaches those daemons too (D112).
   file or the new one, never a mix. No sidecar write runs before ADR
   0094's host commit (ADR 0094 allows no persisted-format upgrade write
   before it).
+- **One sidecar writer at a time.** A single writer lock serializes every
+  sidecar persist, from issue and from prune. A persist holds it from the
+  moment it takes its snapshot of the map, through the durable rename, to
+  the update of each entry's state. So a later snapshot always holds every
+  entry that an earlier completed persist wrote, and a stale snapshot can
+  never overwrite a newer file. An entry becomes `recorded` only when a
+  persist whose snapshot held it has completed. A revoke never takes this
+  lock.
 - **Order against revoke.** The in-memory map is the only source for
   item 3. The issue call runs these steps in order:
   1. Insert the list into the in-memory map under the new `grant_id`.
@@ -244,8 +253,8 @@ the push reaches those daemons too (D112).
 
   A revoke reads the issued grant first and the map second. So a revoke
   that can see the grant always sees its list. A paused or slow sidecar
-  write delays only its own issue call. A revoke of another grant does not
-  wait for it.
+  write delays its own issue call and any issue call queued behind it on
+  the writer lock. No revoke waits for it.
 - **Crash outcomes.**
   - Before the sidecar write lands: neither the entry nor the grant is
     durable, and the issue never returned.
@@ -676,7 +685,8 @@ and 13 and their variants.
      announcements never reach O. `x0x.revocation.v3` gossip to D is held
      for the whole case. To H and G it flows.
    - **The issue call.** `POST /grants` on O with `grantee_user: U`,
-     `agents: [A]`, `ttl_secs: 86400` and `deliver_to: [D's agent]`.
+     `agents: [A]`, `caps: ["dm"]`, `ttl_secs: 86400` and
+     `deliver_to: [D's agent]`.
    - **"D refuses Gn"** means that D's `GET /grants/received` lists Gn
      with `revoked: true` while v3 gossip to D is still held.
 
@@ -734,19 +744,38 @@ and 13 and their variants.
      starts again and shows G9 as `recorded`. ADR 0085 rule 6: the `X0SG`
      fixture from the released encoder still loads. Control: on a data
      dir from main, the released binary gives the same result.
+   - **12g, two issues that complete in reverse order (red).** At
+     T = 2 s, issue G10. The hook pauses its sidecar write after the
+     snapshot is taken. At T = 3 s, issue G11. Release G10's write at
+     T = 10 s. Both calls return `recorded`, and G11's call returns no
+     earlier than G10's write completes. Restart O at T = 12 s.
+     `GET /grants` shows G10 and G11 as `recorded`, and the sidecar holds
+     both entries. Revoke both: D refuses both. Red on main: there is no
+     sidecar. It is also red against a writer that does not serialize
+     snapshots, because G10's stale snapshot overwrites G11's entry and
+     the restart loses it.
 13. **The live-session bound from receipt (D111).** A W3-H case. It needs
    ADR 0074 s3.
    - **Nodes.** Three daemons on the candidate build, each advertising the
      bit: O (the owner install, which issues and revokes), H (a second
      install of the owner, which hosts agent A, with a loopback TCP echo
      target on port p), and G (the grantee agent's daemon).
+   - **Connect fixtures.** G and H each start with a connect ACL that sets
+     `[connect] enabled = true`. H's ACL also has one
+     `[[connect.allow]]` entry with `principal = "grant"` and
+     `targets = ["127.0.0.1:p"]`. Without both, `POST /forwards` answers
+     409 or the grant authorises nothing (see the grant principal in
+     [the connect ACL](../connect-acl.md)).
    - **Clock and schedule.** One deterministic clock from T = 0 s. Direct
      DMs arrive 100 ms after send. Capability adverts reach O at T = 1 s.
    - **Steps.** At T = 2 s, `POST /grants` on O with `grantee_agent: G`,
-     `agents: [A]`, `caps: [Connect{ports: [p]}]` and `ttl_secs: 86400`.
-     At T = 4 s, `POST /forwards` on G to A, port p. The harness opens a
-     TCP connection through G's forward and sends 1 KiB every 100 ms. At
-     T = 10 s, `DELETE /grants/:id` on O.
+     `agents: [A]`, `caps: [{"connect": {"ports": [p]}}]` and
+     `ttl_secs: 86400`. At T = 4 s, `POST /forwards` on G to A, port p.
+     The harness opens a TCP connection through G's forward and sends
+     1 KiB every 100 ms. Before T = 10 s, the harness checks that the
+     stream is up: each 1 KiB echoes back, and H's
+     `GET /diagnostics/connect` counts the stream as allowed. If not, the
+     run is invalid, not a pass. At T = 10 s, `DELETE /grants/:id` on O.
    - **Assertion.** Let t0 be the time the first copy of the record
      reaches H. The harness connection is reset by t0 + 5 s, and H counts
      one live-stream teardown.
@@ -774,7 +803,7 @@ and 13 and their variants.
 ## Rulings and open questions
 
 **Blocking David's Accept:** open questions 1 and 3, and the cross-model
-review named under Reviewers. Open question 2 blocks only the
+review named under Reviewers. Open questions 2 and 4 block only the
 implementing slice's code.
 
 David ruled Q1–Q7 on 2026-10-04 (D108–D114):
@@ -854,6 +883,12 @@ Still open for David:
 
    Recommended: (a). A host can act only on a copy it can admit. Case 13
    gains a variant for whichever option David rules.
+4. **Retention of recent push outcomes (section 3). Blocks code, not
+   Accept.** `GET /diagnostics/grants` keeps a bounded list of recent
+   outcomes, so a skip or a failure stays visible with its grant and its
+   recipient. Proposal: keep the latest 1,024 outcomes in memory, the same
+   bound as pending pushes, drop the oldest first, and lose the list on
+   restart. The counters keep the totals. The value needs David's ruling.
 
 ## Notes for AI-assisted work
 

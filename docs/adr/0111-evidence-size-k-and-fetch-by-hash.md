@@ -159,7 +159,7 @@ A holder serves an object, or answers a head query, only while **all** of these 
 - when the invite is addressed, the sender is its intended joiner;
 - the sender is not Banned or Removed on the holder's current committed roster.
 
-A pre-member gets no other kind and no other root. This discloses only the root-covered fields that the invite already binds. A v4 invite carries them inline (`invite.rs:123-130`). Above the 20-entry cap, ADR 0112's V5 view signs the base `roster_root` and omits the projection (ADR 0112 §1). A pending joiner asks its inviter and the other admins its invite names.
+A pre-member gets no other kind and no other root. This discloses only the root-covered fields that the invite already binds. A v4 invite carries them inline (`invite.rs:123-130`). Above the 20-entry cap, ADR 0112's V5 view signs the base `roster_root` and omits the projection (ADR 0112 §1). A pending joiner asks its inviter and the other base admins it can reach through an authenticated peer relationship and a current advert (ADR 0112 §2). How it finds a holder confers no authority; the holder admits it only by the invite.
 - **Ownership.** S5 owns this serving rule (0088's S5 row: "the #646 primitive"). ADR 0112 owns the invite shape. #646 closes when both have shipped. S6 is Accepted after S5, so ADR 0112's V5 path depends on this rule.
 - **Ruled and open.** D95 rules only the roster at the invite's root. Whether a pending joiner may also receive the chain after that root, such as a promotion, is still open (Q9). S5 serves no such chain.
 
@@ -371,13 +371,15 @@ W3-H (#1164) does not exist yet. Each case below is a specification: nodes, step
 
 **D95 cases.**
 - **H6, invite-bound roster fetch above the cap (red on `main`).**
-  - Nodes: admin A (issuer), member H, 23 further members (25 Active seats), joiner J.
+  - Nodes: admin A (issuer); admin H, an Admin on the invite's base roster that stays online; 23 further members (25 Active seats); joiner J.
+  - Setup: before step 3, J and H have an authenticated peer relationship, with H's agent bound to its machine by ADR 0089 `EvidenceV1`, and J holds H's current verified advert showing the bit.
   - Steps:
     1. The 25 seats converge.
-    2. A mints an invite for J through the public invite API. Above the cap this is ADR 0112's V5 view, which binds the base root.
-    3. A stops.
+    2. A mints an invite for J through the public invite API. Above the cap this is ADR 0112's V5 view, which binds the base root R.
+    3. A stops. H stays online.
     4. J calls the public join API.
-  - Assert: within 120 s, J obtains the projection at the invite's root from H, re-derives the root, and makes no other pre-member fetch.
+    5. J's join flow sends H one `group_object_fetch_v1 { group_id, kind: roster_projection, digest: R, request_id, invite }`, carrying the signed invite. A request to A, if sent, times out and counts as one holder tried.
+  - Assert: H admits the request under §5's D95 conditions, inside the membership lock, and answers with the projection at R, inline or as a `GroupObject` blob. Within 120 s, J re-derives R from it. J makes no other pre-member fetch.
   - Baseline on `main`: red. A cannot mint an invite past 20 entries (#646, `invite.rs:201-217`).
   - Gate: H6 is committed red on `main` before S5's code merges. It turns green only once ADR 0112's V5 invite has also merged; it mirrors the D95 variant of ADR 0112's `s6_promoted_admin_stale_invite`.
 - **C4, no roster to anyone else (control: green on `main`, must stay green).**
