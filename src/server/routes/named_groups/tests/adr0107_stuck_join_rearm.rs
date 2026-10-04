@@ -3071,37 +3071,33 @@ async fn transport_seen(state: &AppState, recipient: &str, kind: &str) -> bool {
 }
 
 /// Make the authority resolve `recipient` to its REAL machine through the
-/// announce/discovery cache, as it would for an announced peer.
+/// announce/discovery cache, as it would for an announced peer (the same
+/// ingest a verified identity announcement takes).
 async fn pin_recipient_machine(authority: &AppState, recipient: &AppState) {
     let agent_id = recipient.agent.agent_id();
     authority
         .agent
-        .identity_discovery_cache()
-        .write()
-        .await
-        .insert(
+        .insert_discovered_agent_for_testing(x0x::DiscoveredAgent {
             agent_id,
-            x0x::DiscoveredAgent {
-                agent_id,
-                machine_id: recipient.agent.machine_id(),
-                user_id: None,
-                self_name: None,
-                addresses: Vec::new(),
-                announced_at: 0,
-                last_seen: 0,
-                machine_public_key: Vec::new(),
-                nat_type: None,
-                can_receive_direct: None,
-                is_relay: None,
-                is_coordinator: None,
-                reachable_via: Vec::new(),
-                relay_candidates: Vec::new(),
-                cert_not_after: None,
-                agent_certificate: None,
-                agent_public_key: Vec::new(),
-                cert_digest: None,
-            },
-        );
+            machine_id: recipient.agent.machine_id(),
+            user_id: None,
+            self_name: None,
+            addresses: Vec::new(),
+            announced_at: 0,
+            last_seen: 0,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: None,
+            agent_certificate: None,
+            agent_public_key: Vec::new(),
+            cert_digest: None,
+        })
+        .await;
 }
 
 /// Self-revoke `owner`'s MACHINE (not its agent) in the authority's
@@ -4993,62 +4989,6 @@ async fn s8a_r7_class_k_share_resends_promptly_after_an_undiscovered_exchange() 
 // waits included, is bounded.
 // ---------------------------------------------------------------------------
 
-/// WHY (r7b P2-1): the binding a pinned send resolved from must still name
-/// the machine it finally writes to. Cold discovery cache and DM registry;
-/// the current attestation names J's machine B, which is not connected and
-/// does not repair. The discovery redial connects another machine, A (in
-/// production the redial falls back to older peer evidence when the cache
-/// and registry are cold). A is not what the current binding names, so
-/// nothing is admitted or written.
-#[tokio::test]
-async fn s8a_r7b_a_redial_off_the_current_binding_writes_nothing() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let g = build_gss(dir.path(), false).await?;
-    let g_hex = hex_of(&g.joiner);
-    restart_cold(&g.authority, &g.joiner, &g.stable).await;
-    g.authority
-        .agent
-        .record_authenticated_binding_for_testing(
-            g.joiner.agent.agent_id(),
-            g.joiner.agent.machine_id(),
-            unix_secs_now(),
-        )
-        .await;
-    let stale_evidence_machine = x0x::identity::MachineId([0xa5; 32]);
-    g.authority
-        .agent
-        .script_pinned_standin_transport_for_testing(x0x::PinnedTransportScript::disconnected(
-            false,
-            Some(stale_evidence_machine),
-        ));
-    let (pre, seam) = (Arc::default(), Arc::default());
-    let admission = counted_admission(Arc::clone(&pre), Arc::clone(&seam), true, true, None);
-    clear_egress(&g.authority);
-    let outcome = super::super::send_join_artifact(
-        &g.authority,
-        &g.joiner.agent.agent_id(),
-        b"adr0107-r7b-redial-off-binding",
-        &g.stable,
-        "join_result",
-        admission,
-        Instant::now() + Duration::from_secs(10),
-    )
-    .await;
-    assert!(
-        outcome
-            .as_ref()
-            .is_err_and(|reason| !reason.contains(x0x::dm::PINNED_STANDIN_ADMITTED)),
-        "a machine the current binding does not name was admitted: {outcome:?}"
-    );
-    assert_eq!(
-        pre.load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "admission ran for a machine the current binding does not name"
-    );
-    assert_eq!(egress_count(&g.authority, &g_hex, "join_result"), 0);
-    Ok(())
-}
-
 /// WHY (r7b P2-1): the seam re-validates the binding too. The send resolves
 /// J's machine from its current attestation; between the pre-phase and the
 /// seam, a newer attestation moves J to another machine, or J's binding now
@@ -5192,5 +5132,153 @@ async fn s8a_r7b_a_held_source_lock_ends_in_the_typed_error_within_the_bound() -
         wrong.is_empty(),
         "a held source lock escaped the resolution bound: {wrong:?}"
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// r7c (Codex review of a3c85dd..dc1eb49): verified announcement bindings stay
+// apart from mutable routing state; the bound covers revalidation after
+// repair; the evidence policy never blocks a non-blocking check.
+// ---------------------------------------------------------------------------
+
+/// WHY (r7c, Codex NEW 1): stale routing state never becomes pinned
+/// authority. J's verified announcement names its machine B; the DM registry
+/// still names an older machine A, which is connected. B is not connected
+/// and does not repair, so the send redials. The PRODUCTION redial
+/// (`redial_direct_machine_from_discovery`, here over a scripted connection
+/// state) reconciles the discovery cache to the connected registry machine:
+/// the cache then names A under B's announcement timestamp. Neither that
+/// send nor the next one may write to A. The general connector rewriting
+/// the cache directly (as `connect_to_agent` does) must not move the pinned
+/// target either.
+#[tokio::test]
+async fn s8a_r7c_stale_routing_state_never_becomes_pinned_authority() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    let g_hex = hex_of(&g.joiner);
+    let joiner_id = g.joiner.agent.agent_id();
+    restart_cold(&g.authority, &g.joiner, &g.stable).await;
+    pin_recipient_machine(&g.authority, &g.joiner).await;
+    let stale = x0x::identity::MachineId([0xa7; 32]);
+    g.authority
+        .agent
+        .direct_messaging()
+        .mark_connected(joiner_id, stale)
+        .await;
+    g.authority
+        .agent
+        .script_pinned_standin_transport_for_testing(x0x::PinnedTransportScript::connected_only(
+            &[stale],
+            false,
+        ));
+    clear_egress(&g.authority);
+    let mut admitted = Vec::new();
+    for attempt in ["first", "resend", "after a connector rewrite"] {
+        if attempt == "after a connector rewrite" {
+            if let Some(entry) = g
+                .authority
+                .agent
+                .identity_discovery_cache()
+                .write()
+                .await
+                .get_mut(&joiner_id)
+            {
+                entry.machine_id = stale;
+            }
+        }
+        let (pre, seam) = (Arc::default(), Arc::default());
+        let admission = counted_admission(Arc::clone(&pre), Arc::clone(&seam), true, true, None);
+        let outcome = super::super::send_join_artifact(
+            &g.authority,
+            &joiner_id,
+            b"adr0107-r7c-stale-routing",
+            &g.stable,
+            "join_result",
+            admission,
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await;
+        if pre.load(std::sync::atomic::Ordering::SeqCst) != 0
+            || outcome
+                .as_ref()
+                .is_err_and(|reason| reason.contains(x0x::dm::PINNED_STANDIN_ADMITTED))
+        {
+            admitted.push(format!("[{attempt}] {outcome:?}"));
+        }
+    }
+    assert!(
+        admitted.is_empty(),
+        "a stale routing machine was admitted as the pinned target: {admitted:?}"
+    );
+    assert_eq!(egress_count(&g.authority, &g_hex, "join_result"), 0);
+    Ok(())
+}
+
+/// WHY (r7c, Codex NEW 2): the bound covers revalidation after repair too.
+/// The binding resolves at once from J's attestation; while the
+/// send-readiness repair runs, a writer takes the authenticated-binding
+/// store and holds it. The post-repair re-read must end in the typed,
+/// retryable `recipient_undiscovered` inside the resolution bound, not wait
+/// out the exchange deadline.
+#[tokio::test]
+async fn s8a_r7c_a_source_lock_held_after_resolution_ends_typed_within_the_bound(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    let g_hex = hex_of(&g.joiner);
+    restart_cold(&g.authority, &g.joiner, &g.stable).await;
+    g.authority
+        .agent
+        .record_authenticated_binding_for_testing(
+            g.joiner.agent.agent_id(),
+            g.joiner.agent.machine_id(),
+            unix_secs_now(),
+        )
+        .await;
+    g.authority
+        .agent
+        .script_pinned_standin_transport_for_testing(
+            x0x::PinnedTransportScript::connected_only(&[], true)
+                .with_repair_delay(Duration::from_millis(600)),
+        );
+    let bindings = g
+        .authority
+        .agent
+        .authenticated_machine_bindings_for_testing();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let holder = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _held = bindings.write().await;
+        let _ = tokio::time::timeout(Duration::from_secs(8), release_rx).await;
+    });
+    let (pre, seam) = (Arc::default(), Arc::default());
+    let admission = counted_admission(Arc::clone(&pre), Arc::clone(&seam), true, true, None);
+    clear_egress(&g.authority);
+    let started = std::time::Instant::now();
+    let outcome = super::super::send_join_artifact(
+        &g.authority,
+        &g.joiner.agent.agent_id(),
+        b"adr0107-r7c-held-after-resolution",
+        &g.stable,
+        "join_result",
+        admission,
+        Instant::now() + Duration::from_secs(3),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    let _ = release_tx.send(());
+    holder.await?;
+    assert!(
+        outcome
+            .as_ref()
+            .is_err_and(|reason| reason.starts_with("recipient_undiscovered")),
+        "a typed, retryable refusal: {outcome:?} after {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(2_800),
+        "the post-repair re-read waited out the exchange deadline: {elapsed:?}"
+    );
+    assert_eq!(pre.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(egress_count(&g.authority, &g_hex, "join_result"), 0);
     Ok(())
 }

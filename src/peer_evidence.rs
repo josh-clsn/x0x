@@ -1609,6 +1609,52 @@ mod tests {
             PeerEvidenceStore::open(dir.path(), EvidenceConfig::default(), p.clone(), NOW).unwrap();
         (dir, p, store)
     }
+    /// WHY (x0x #1150 r7c, Codex NEW 3): the non-blocking point-of-use
+    /// check is the pinned seam's and the bounded resolution's. Its policy
+    /// evaluation (RuntimePolicy, through owner trust into the share-grant
+    /// store) must never wait on a held policy lock: while a writer holds
+    /// the grant store it reports busy, and it never blocks.
+    #[test]
+    fn r7c_try_usable_agent_reports_busy_while_the_grant_store_is_held() {
+        let p = Peer::new();
+        let dir = tempfile::tempdir().unwrap();
+        let local = AgentKeypair::generate().unwrap().agent_id();
+        let grants = Arc::new(crate::share_grant::ShareGrantStore::in_memory(local, None));
+        let owner = crate::owner_trust::OwnerTrust::new(None, Default::default());
+        owner.install_share_grant_store(Arc::clone(&grants));
+        let revoked = Arc::new(tokio::sync::RwLock::new(
+            crate::revocation::RevocationSet::new(),
+        ));
+        let policy = Arc::new(RuntimePolicy::new(local, owner, revoked));
+        policy.set_groups(Arc::new(|_| Some(true)));
+        let store = Arc::new(
+            PeerEvidenceStore::open(dir.path(), EvidenceConfig::default(), policy, NOW).unwrap(),
+        );
+        store
+            .ingest(p.record(NOW, NOW), IngestSource::Hello, NOW)
+            .unwrap();
+        assert!(
+            store
+                .try_usable_agent(p.a(), NOW)
+                .is_ok_and(|view| view.is_some()),
+            "control: usable while no policy lock is held"
+        );
+        let held = grants.hold_state_for_testing();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let checker = Arc::clone(&store);
+        let agent = p.a();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(checker.try_usable_agent(agent, NOW));
+        });
+        let outcome = rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        let _ = worker.join();
+        assert!(
+            matches!(outcome, Ok(Err(()))),
+            "the non-blocking check waited on (or ignored) a held policy lock: {outcome:?}"
+        );
+    }
+
     #[test]
     fn cached_views_do_zero_verifies_on_use_and_maintenance() {
         let p = Peer::new();

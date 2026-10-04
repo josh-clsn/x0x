@@ -363,7 +363,7 @@ impl RawQuicTransport<'_> {
         match self {
             Self::Network(network) => network.ensure_peer_send_ready(peer).await,
             #[cfg(test)]
-            Self::Scripted(script) => script.repair(peer),
+            Self::Scripted(script) => script.repair(peer).await,
         }
     }
 
@@ -372,61 +372,56 @@ impl RawQuicTransport<'_> {
         agent: &Agent,
         agent_id: &identity::AgentId,
     ) -> Option<identity::MachineId> {
-        match self {
-            Self::Network(_) => {
-                agent
-                    .redial_direct_machine_from_discovery(agent_id, self)
-                    .await
-            }
-            // A scripted result, or the production redial over the script's
-            // connection state (r7b).
-            #[cfg(test)]
-            Self::Scripted(script) => match script.redial() {
-                Some(machine) => Some(machine),
-                None => {
-                    agent
-                        .redial_direct_machine_from_discovery(agent_id, self)
-                        .await
-                }
-            },
-        }
+        // Scripted too: the production redial over the script's connection
+        // state (r7c).
+        agent
+            .redial_direct_machine_from_discovery(agent_id, self)
+            .await
     }
 }
 
-/// x0x #1150 (r7b): a scripted transport for the strict in-process pinned
-/// stand-in. The default reports every machine connected. Test builds only.
+/// x0x #1150 (r7b, r7c): a scripted connection state for the strict
+/// in-process pinned stand-in. The default reports every machine
+/// connected. Test builds only.
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub(crate) struct PinnedTransportScript {
-    all_disconnected: bool,
+    only_listed_connected: bool,
     repair_connects: bool,
-    redial: Option<identity::MachineId>,
+    repair_delay: std::time::Duration,
     connected: std::sync::Mutex<std::collections::HashSet<identity::MachineId>>,
 }
 
 #[cfg(test)]
 impl PinnedTransportScript {
-    /// No machine is connected. The send-readiness repair connects the
-    /// machine it repairs when `repair_connects`; the discovery redial
-    /// connects (and returns) `redial`.
-    pub(crate) fn disconnected(repair_connects: bool, redial: Option<identity::MachineId>) -> Self {
+    /// Only `machines` are connected. The send-readiness repair connects
+    /// the machine it repairs when `repair_connects`. The discovery redial
+    /// is the production one, over this connection state.
+    pub(crate) fn connected_only(machines: &[identity::MachineId], repair_connects: bool) -> Self {
         Self {
-            all_disconnected: true,
+            only_listed_connected: true,
             repair_connects,
-            redial,
-            connected: Default::default(),
+            repair_delay: std::time::Duration::ZERO,
+            connected: std::sync::Mutex::new(machines.iter().copied().collect()),
         }
     }
 
+    /// The send-readiness repair takes `delay` before it reports.
+    pub(crate) fn with_repair_delay(mut self, delay: std::time::Duration) -> Self {
+        self.repair_delay = delay;
+        self
+    }
+
     fn is_connected(&self, peer: &ant_quic::PeerId) -> bool {
-        !self.all_disconnected
+        !self.only_listed_connected
             || self
                 .connected
                 .lock()
                 .is_ok_and(|connected| connected.contains(&identity::MachineId(peer.0)))
     }
 
-    fn repair(&self, peer: &ant_quic::PeerId) -> error::NetworkResult<()> {
+    async fn repair(&self, peer: &ant_quic::PeerId) -> error::NetworkResult<()> {
+        tokio::time::sleep(self.repair_delay).await;
         if !self.repair_connects {
             return Err(error::NetworkError::ConnectionFailed(
                 "scripted repair failed".to_string(),
@@ -436,14 +431,6 @@ impl PinnedTransportScript {
             connected.insert(identity::MachineId(peer.0));
         }
         Ok(())
-    }
-
-    fn redial(&self) -> Option<identity::MachineId> {
-        let machine = self.redial?;
-        if let Ok(mut connected) = self.connected.lock() {
-            connected.insert(machine);
-        }
-        Some(machine)
     }
 }
 

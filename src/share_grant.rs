@@ -577,6 +577,13 @@ impl ShareGrantStore {
         }
     }
 
+    /// Test seam (x0x #1150 r7c): hold the store's state as a writer does,
+    /// until the returned guard drops. Test builds only.
+    #[cfg(test)]
+    pub(crate) fn hold_state_for_testing(&self) -> impl Sized + '_ {
+        self.write_state()
+    }
+
     fn read_state(&self) -> std::sync::RwLockReadGuard<'_, StoreState> {
         self.state
             .read()
