@@ -3126,6 +3126,7 @@ async fn cache_verified_announcement(
         tokio::sync::RwLock<std::collections::HashMap<identity::MachineId, DiscoveredMachine>>,
     >,
     announced: &dm_inbox::AuthenticatedMachineBindings,
+    _blob_cache: Option<&std::sync::Arc<announce_blob::AnnounceBlobCache>>,
     cache: &std::sync::Arc<
         tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
     >,
@@ -11409,6 +11410,7 @@ impl Agent {
                     cache_verified_announcement(
                         &machine_cache,
                         &announced_machine_bindings,
+                        Some(&announce_blob_cache),
                         &cache,
                         &cert_events,
                         discovered_agent,
@@ -31319,7 +31321,15 @@ async fn r7d_announced_binding_learns_expiry_when_the_certificate_blob_lands() {
     let mut entry = discovered_agent_fixture(0x5d, 100, &[], None);
     entry.agent_id = joiner.agent_id();
     entry.cert_digest = Some(digest);
-    cache_verified_announcement(&machine_cache, &announced, &cache, &cert_events, entry).await;
+    cache_verified_announcement(
+        &machine_cache,
+        &announced,
+        None,
+        &cache,
+        &cert_events,
+        entry,
+    )
+    .await;
     let blob_cache = std::sync::Arc::new(announce_blob::AnnounceBlobCache::new(None));
     blob_cache
         .insert_verified(announce_blob::CachedBlob {
@@ -31381,11 +31391,19 @@ async fn r7d_announced_binding_keeps_known_expiry_across_a_same_digest_blob_miss
     first.cert_not_after = cert.not_after();
     first.agent_certificate = Some(cert);
     first.cert_digest = Some(digest);
-    cache_verified_announcement(&machine_cache, &announced, &cache, &cert_events, first).await;
+    cache_verified_announcement(
+        &machine_cache,
+        &announced,
+        None,
+        &cache,
+        &cert_events,
+        first,
+    )
+    .await;
     let mut miss = discovered_agent_fixture(0x5e, 200, &[], None);
     miss.agent_id = joiner.agent_id();
     miss.cert_digest = Some(digest);
-    cache_verified_announcement(&machine_cache, &announced, &cache, &cert_events, miss).await;
+    cache_verified_announcement(&machine_cache, &announced, None, &cache, &cert_events, miss).await;
     assert_eq!(
         announced
             .read()
