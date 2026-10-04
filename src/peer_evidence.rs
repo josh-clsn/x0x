@@ -640,8 +640,32 @@ impl PeerEvidenceStore {
         machine: MachineId,
         now: u64,
     ) -> std::result::Result<Arc<EvidenceView>, &'static str> {
+        self.check_usable_with(agent, machine, now, true)
+    }
+    /// The state lock, taken blocking, or without blocking (`STORE_BUSY`
+    /// on contention) for synchronous seams.
+    fn state_for_check(
+        &self,
+        blocking: bool,
+    ) -> std::result::Result<std::sync::MutexGuard<'_, State>, &'static str> {
+        if blocking {
+            return self.state.lock().map_err(|_| "store_lock");
+        }
+        match self.state.try_lock() {
+            Ok(state) => Ok(state),
+            Err(std::sync::TryLockError::WouldBlock) => Err(STORE_BUSY),
+            Err(std::sync::TryLockError::Poisoned(_)) => Err("store_lock"),
+        }
+    }
+    fn check_usable_with(
+        &self,
+        agent: AgentId,
+        machine: MachineId,
+        now: u64,
+        blocking: bool,
+    ) -> std::result::Result<Arc<EvidenceView>, &'static str> {
         let view = {
-            let state = self.state.lock().map_err(|_| "store_lock")?;
+            let state = self.state_for_check(blocking)?;
             if state.suspended.contains(&agent) {
                 return Err("suspended_or_superseded");
             }
@@ -660,7 +684,7 @@ impl PeerEvidenceStore {
             return Err("relationship_or_revocation");
         }
         {
-            let mut state = self.state.lock().map_err(|_| "store_lock")?;
+            let mut state = self.state_for_check(blocking)?;
             // A move/removal may have raced the policy calls. Never return the
             // old authority if it was suspended or replaced in the meantime.
             if state.suspended.contains(&agent)
@@ -696,6 +720,29 @@ impl PeerEvidenceStore {
             .announcement
             .machine_id;
         self.usable(agent, machine, now)
+    }
+    /// [`Self::usable_agent`] without blocking on the store lock, for
+    /// synchronous admission seams and bounded waits (x0x #1150 r7b): the
+    /// same point-of-use authority check, or `Err(())` while the lock is
+    /// contended. Diagnostic counters are not updated.
+    pub(crate) fn try_usable_agent(
+        &self,
+        agent: AgentId,
+        now: u64,
+    ) -> std::result::Result<Option<Arc<EvidenceView>>, ()> {
+        let machine = match self.state.try_lock() {
+            Ok(state) => match state.verified.get(&agent) {
+                Some(view) => view.announcement.machine_id,
+                None => return Ok(None),
+            },
+            Err(std::sync::TryLockError::WouldBlock) => return Err(()),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Ok(None),
+        };
+        match self.check_usable_with(agent, machine, now, false) {
+            Ok(view) => Ok(Some(view)),
+            Err(STORE_BUSY) => Err(()),
+            Err(_) => Ok(None),
+        }
     }
     /// Indexed candidates only; never substitutes for `usable` checks.
     pub(crate) fn agents_on_machine(&self, machine: MachineId, limit: usize) -> Vec<AgentId> {
@@ -1436,6 +1483,9 @@ impl VerifiedWireCapture {
         fresh(value.timestamp, now, W_MS).then(|| value.bytes.clone())
     }
 }
+
+/// The reason a non-blocking point-of-use check could not take the store lock.
+const STORE_BUSY: &str = "store_busy";
 
 #[cfg(test)]
 mod tests {

@@ -251,6 +251,12 @@ impl AuthenticatedMachineBindingCache {
         self.recency.insert((tick.0, tick.1, agent_id.0));
     }
 
+    /// The retained binding for `agent_id`, without touching its recency
+    /// (x0x #1150 r7b: the pinned send's point-of-use reads).
+    pub(crate) fn peek(&self, agent_id: &AgentId) -> Option<AuthenticatedMachineBinding> {
+        self.entries.get(agent_id).copied()
+    }
+
     fn resolve(&mut self, agent_id: &AgentId) -> Option<MachineId> {
         self.resolve_evidence(agent_id)
             .map(|binding| binding.machine_id)

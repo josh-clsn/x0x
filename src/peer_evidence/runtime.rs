@@ -297,6 +297,21 @@ impl EvidenceRuntime {
         }
         self.store.get()?.usable_agent(agent, now)
     }
+    /// [`Self::usable_agent`] without blocking on the store lock (x0x #1150
+    /// r7b); `Err(())` while the lock is contended.
+    pub(crate) fn try_usable_agent(
+        &self,
+        agent: AgentId,
+        now: u64,
+    ) -> std::result::Result<Option<Arc<EvidenceView>>, ()> {
+        if !self.ready.is_cancelled() {
+            return Ok(None);
+        }
+        match self.store.get() {
+            Some(store) => store.try_usable_agent(agent, now),
+            None => Ok(None),
+        }
+    }
     /// Startup, barrier and persistence diagnostics.
     pub fn diagnostics(&self) -> serde_json::Value {
         let mut value = self
