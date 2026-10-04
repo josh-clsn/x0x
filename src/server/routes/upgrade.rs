@@ -158,6 +158,55 @@ fn deferred_restart_upgrader(stop_on_upgrade: bool, context: RestartContext) -> 
         .with_restart_context(context)
 }
 
+/// #1196 round 2 test seam (cfg(test) only; no env vars, no cargo
+/// features): lets an in-process test inject the
+/// [`x0x::upgrade::monitor::VerifiedRelease`] that
+/// [`run_startup_update_check`]'s monitor would have fetched and
+/// signature-verified, so the whole startup check — apply decision,
+/// restart guard, systemd readback — runs for real without GitHub (the
+/// release private key is deliberately not in the repo, so no test can
+/// mint a signature the monitor would accept). Compiled out entirely in
+/// non-test builds; an uninstalled injection leaves the production fetch
+/// untouched.
+#[cfg(test)]
+mod startup_release_seam {
+    use crate::upgrade::monitor::VerifiedRelease;
+    use std::sync::Mutex;
+
+    static INJECTED: Mutex<Option<VerifiedRelease>> = Mutex::new(None);
+
+    /// Uninstalls the injection on drop, so a test cannot leak its release
+    /// into sibling tests in the same process.
+    pub(super) struct Guard {
+        _private: (),
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if let Ok(mut slot) = INJECTED.lock() {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Inject `release` as the monitor's next answer for the guard's
+    /// lifetime.
+    pub(super) fn install(release: VerifiedRelease) -> Guard {
+        let mut slot = INJECTED.lock().expect("startup release seam poisoned");
+        *slot = Some(release);
+        Guard { _private: () }
+    }
+
+    /// Take the injected release, or `None` when nothing is installed
+    /// (fall through to the real monitor fetch).
+    pub(super) fn take() -> Option<VerifiedRelease> {
+        INJECTED
+            .lock()
+            .expect("startup release seam poisoned")
+            .take()
+    }
+}
+
 /// Startup GitHub check. Returns Some(version) if an update was applied.
 ///
 /// `runtime` distinguishes the two callers: the daemon's startup check —
@@ -178,11 +227,33 @@ pub(in crate::server) async fn run_startup_update_check(
         .map_err(|e| anyhow::anyhow!(e))?
         .with_include_prereleases(config.update.include_prereleases);
 
-    let Some(verified) = monitor
-        .check_for_updates()
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?
-    else {
+    // #1196 round 2 test seam (cfg(test) only): an in-process test can
+    // inject the verified release the monitor would have fetched and
+    // signature-verified, so the startup check runs end to end against the
+    // real apply/restart-guard logic without GitHub (the release private
+    // key is deliberately not in the repo, so a test cannot mint a real
+    // signature). The production fetch below is compiled verbatim in
+    // non-test builds; an uninstalled injection changes nothing.
+    let checked = {
+        #[cfg(test)]
+        {
+            match startup_release_seam::take() {
+                Some(injected) => Some(injected),
+                None => monitor
+                    .check_for_updates()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+            }
+        }
+        #[cfg(not(test))]
+        {
+            monitor
+                .check_for_updates()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+        }
+    };
+    let Some(verified) = checked else {
         return Ok(None);
     };
 

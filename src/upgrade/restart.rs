@@ -1799,6 +1799,16 @@ pub fn readback_systemd_policy(
     if systemd_signal_name(signals).is_none() {
         return SystemdPolicyReadback::NotApplicable;
     }
+    // #1196 round 2 test seam (cfg(test) only): an in-process test that
+    // installed a [`systemd_readback_seam::Scenario`] answers the readback
+    // from the REAL decision logic with an injected `systemctl show`
+    // output, busctl snapshot and monotonic clock, instead of this
+    // driver's `/proc` + subprocess sampling. Compiled out in non-test
+    // builds; an uninstalled scenario changes nothing.
+    #[cfg(test)]
+    if let Some(verdict) = systemd_readback_seam::intercept(executable, argv) {
+        return verdict;
+    }
     let cgroup = match std::fs::read_to_string("/proc/self/cgroup") {
         Ok(c) => c,
         Err(e) => {
@@ -1834,6 +1844,17 @@ pub fn readback_systemd_policy(
     _executable: &Path,
     _argv: &[String],
 ) -> SystemdPolicyReadback {
+    // #1196 round 2 test seam (cfg(test) only): the non-Linux twin of the
+    // driver seam above, behind the same signal gate, so an in-process
+    // test drives the real readback decision table on any platform.
+    // Compiled out in non-test builds, where this stub always answers
+    // `NotApplicable`.
+    #[cfg(test)]
+    if systemd_signal_name(_signals).is_some() {
+        if let Some(verdict) = systemd_readback_seam::intercept(_executable, _argv) {
+            return verdict;
+        }
+    }
     SystemdPolicyReadback::NotApplicable
 }
 
@@ -1853,6 +1874,159 @@ pub async fn readback_systemd_policy_offloaded(
         .unwrap_or_else(|e| SystemdPolicyReadback::NotGuaranteed {
             detail: format!("systemd readback task failed: {e}"),
         })
+}
+
+/// #1196 round 2 test seam (cfg(test) only; no env vars, no cargo
+/// features): lets an in-process test drive the daemon's startup update
+/// check END TO END against the REAL readback decision logic
+/// ([`readback_systemd_policy_in`]) by injecting the world the Linux
+/// driver would have sampled — the `systemctl show` property text, the
+/// structured `ExecStart` snapshot derived from it, the monotonic clock,
+/// the cgroup and the invocation id — instead of shelling out to a real
+/// systemd (none exists on the test hosts). The seam intercepts
+/// [`readback_systemd_policy`] behind the same supervision-signal gate the
+/// Linux driver uses; it is compiled out entirely in non-test builds, and
+/// a test that installs no scenario observes production behaviour.
+#[cfg(test)]
+pub(crate) mod systemd_readback_seam {
+    use super::{
+        parse_invocation_id_hex, readback_systemd_policy_in, BusctlExecStart,
+        SystemdPolicyReadback, SystemdReadbackInput,
+    };
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    /// What the readback's Nth call should observe.
+    pub(crate) struct ReadbackCall {
+        /// Full `systemctl show` property text for the unit, exactly as
+        /// the bounded collector would return it.
+        pub show_output: String,
+        /// Monotonic clock (µs) at the readback — the value the Linux
+        /// driver samples from `CLOCK_MONOTONIC`.
+        pub monotonic_now_us: u64,
+    }
+
+    /// An installed readback scenario. `calls[n]` (0-based) answers the
+    /// readback's n-th invocation; calls beyond the table reuse the last
+    /// entry, so a scenario of one Verified call stays Verified.
+    pub(crate) struct Scenario {
+        /// This process's cgroup, naming the unit under test (fixture:
+        /// `0::/system.slice/x0xd.service`).
+        pub cgroup: String,
+        /// The `INVOCATION_ID` the environment reports, when set. Tests
+        /// that also set the real env var must keep the two identical —
+        /// the readback cross-checks them like production does.
+        pub invocation_id: Option<String>,
+        /// Per-call show output + monotonic clock.
+        pub calls: Vec<ReadbackCall>,
+    }
+
+    struct Installed {
+        scenario: Scenario,
+        next_call: usize,
+    }
+
+    static INSTALLED: Mutex<Option<Installed>> = Mutex::new(None);
+
+    /// Uninstalls the scenario on drop, so a test cannot leak its fixture
+    /// into sibling tests in the same process.
+    pub(crate) struct Guard {
+        _private: (),
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if let Ok(mut slot) = INSTALLED.lock() {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Install `scenario` as the readback's world for the guard's lifetime.
+    pub(crate) fn install(scenario: Scenario) -> Guard {
+        let mut slot = INSTALLED.lock().expect("systemd readback seam poisoned");
+        *slot = Some(Installed {
+            scenario,
+            next_call: 0,
+        });
+        Guard { _private: () }
+    }
+
+    /// The readback verdict for the n-th call of an installed scenario, or
+    /// `None` when no scenario is installed (fall through to the driver).
+    pub(crate) fn intercept(executable: &Path, argv: &[String]) -> Option<SystemdPolicyReadback> {
+        let (show_output, monotonic_now_us, cgroup, invocation_id) = {
+            let mut slot = INSTALLED.lock().expect("systemd readback seam poisoned");
+            let installed = slot.as_mut()?;
+            let call = installed
+                .scenario
+                .calls
+                .get(installed.next_call)
+                .or_else(|| installed.scenario.calls.last())?;
+            installed.next_call += 1;
+            (
+                call.show_output.clone(),
+                call.monotonic_now_us,
+                installed.scenario.cgroup.clone(),
+                installed.scenario.invocation_id.clone(),
+            )
+        };
+        let pid = std::process::id();
+        let structured = structured_from_show(&show_output, pid, invocation_id.as_deref());
+        Some(readback_systemd_policy_in(
+            SystemdReadbackInput {
+                cgroup: &cgroup,
+                pid,
+                invocation_id: invocation_id.as_deref(),
+                executable,
+                argv,
+                monotonic_now_us: Some(monotonic_now_us),
+            },
+            &mut move |_user_manager, _unit| Ok(Some(show_output.clone())),
+            &mut move |_user_manager, _unit| Ok(structured.clone()),
+            // Fixture ExecStart paths are the running executable verbatim,
+            // so plain path equality is the fixture's same-executable
+            // relation; production canonicalization stays on the Linux
+            // driver path this seam replaces.
+            &|loaded, ours| Path::new(loaded) == ours,
+        ))
+    }
+
+    /// Test-fixture bridge: derive the structured `ExecStart` snapshot the
+    /// way the fixture's `systemctl show` ExecStart line renders it — the
+    /// same derivation the readback unit tests use. Production boundaries
+    /// come from the busctl JSON array, never this split.
+    fn structured_from_show(show: &str, pid: u32, invocation: Option<&str>) -> BusctlExecStart {
+        let line = show
+            .lines()
+            .find(|l| l.starts_with("ExecStart="))
+            .unwrap_or("");
+        let path = line
+            .split("path=")
+            .nth(1)
+            .unwrap_or("")
+            .split(" ; ")
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let argv: Vec<String> = line
+            .split("argv[]=")
+            .nth(1)
+            .unwrap_or("")
+            .split(" ; ")
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .map(String::from)
+            .collect();
+        BusctlExecStart {
+            path,
+            argv,
+            main_pid: pid,
+            invocation_id: invocation.and_then(parse_invocation_id_hex),
+        }
+    }
 }
 
 /// The instance's restart contract could not be resolved, so no bytes may be
