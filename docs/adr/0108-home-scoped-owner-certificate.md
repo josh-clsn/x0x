@@ -357,7 +357,7 @@ No replacement is written before steps 2 and 3 succeed. The original bytes are a
 1. **Barrier.** Repeat the fsync of `D` (step 2). Only after it succeeds does the node read, check or write anything.
 2. **Verify.** In `txid` order, check each pending copy against the `h` in its name (step 3). A copy that fails stays pending and shows `sidecar_quarantine_failed { step: verify }`. No replacement covers it, and the next load retries it. The copies that pass form the set `V`.
 3. **Classify `F`** exactly as at load:
-   - **Missing:** remove any `F.tmp-*` left by these transactions, then build one replacement (step 4) that covers `V`.
+   - **Missing:** if `V` is empty (every pending copy failed verification), write no replacement: the slice runs memory-only as `sidecar_quarantine_failed { step: verify }` and the next load retries. Otherwise remove any `F.tmp-*` left by these transactions, then build one replacement (step 4) that covers `V`.
    - **Valid and supported:** keep `F`. Each `txid` in `V` is finalized (step 5), whether or not `F` lists it in `rebuilt_from`; a listed `txid` means step 4 already completed, and an unlisted one needs no rebuild.
    - **Newer or unreadable:** keep `F` byte-identical and run memory-only as `sidecar_newer_format` or `sidecar_unavailable`. Leave every pending copy as it is. A binary that can read `F` resumes them later.
    - **Damaged:** quarantine `F` as its own transaction, with a new `txid` (steps 1 to 3). If it verifies, add its `txid` to `V`. `F` is now missing, so build one replacement that covers `V`.
@@ -369,7 +369,7 @@ Finalize is idempotent. If the pending name is gone and the history name exists,
 
 **History.** A copy without `.pending` is history. It never triggers a resume or a rebuild, whether `F` is present or absent. If `F` is absent and only history copies exist, the slice applies its rule for a missing file. That is not a resume.
 
-**Failures.** A failed step shows `sidecar_quarantine_failed { file, txid, step, error }`, with `step` one of `rename`, `fsync`, `verify`, `replace` or `finalize`. The slice runs memory-only for that file and retries at the next load. A `verify` failure keeps the pending copy and writes no replacement.
+**Failures.** A failed step shows `sidecar_quarantine_failed { file, txid, step, error }`, with `step` one of `rename`, `fsync`, `verify`, `replace` or `finalize`. The slice runs memory-only for that file and retries at the next load. A `verify` failure keeps that pending copy, and no replacement covers it. When other copies verify, the replacement covers only those (Resume, step 3); when none verify, no replacement is written.
 
 **Harness.** Each slice instantiates these W3-H fault cases for its files. Each is red on `main`, where no binary quarantines, unless the slice marks it as a control.
 - **Cut points:** after each step's rename or fsync call.
