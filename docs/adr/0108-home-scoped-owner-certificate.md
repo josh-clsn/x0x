@@ -4,13 +4,13 @@
 - **Date:** 2026-10-04
 - **Decision owners:** David Irvine
 - **Author:** Codex (GPT-6)
-- **Reviewers:** TBD (cross-model review)
+- **Reviewers:** Claude (cross-model r1)
 - **Slice:** Slice S2 of [ADR 0088](./0088-group-liveness-contract.md).
-- **Amends, upon acceptance:** [ADR 0038](./0038-home-owner-certified-personal-space.md), the seal-time owner-certificate verdict (interim); [ADR 0007](./0007-three-layer-identity-model.md), consent for disclosure to Home members only.
+- **Amends, upon acceptance:** [ADR 0038](./0038-home-owner-certified-personal-space.md), A Home-scoped owner certificate and a new verdict rule (interim; including the direct disclosure channel that 0038:50–51 excludes); [ADR 0007](./0007-three-layer-identity-model.md), consent for disclosure to Home members only.
 - **Supersedes:** none
 - **Superseded by:** none
 - **Goal served:** **R3** (all my machines connected) and the shared-places core.
-- **Related:** D16, D38, D54, D63; [direction digest](../design/x0x-direction.md); ADR 0085, 0087, 0089, 0093, 0106, 0107; [#1143](https://github.com/saorsa-labs/x0x/issues/1143), [#1023](https://github.com/saorsa-labs/x0x/issues/1023), [#1164](https://github.com/saorsa-labs/x0x/issues/1164).
+- **Related:** D16, D38, D40, D54, D60, D63; [direction digest](../design/x0x-direction.md); ADR 0085, 0087, 0089, 0093, 0106, 0107; [#1143](https://github.com/saorsa-labs/x0x/issues/1143), [#1023](https://github.com/saorsa-labs/x0x/issues/1023), [#1164](https://github.com/saorsa-labs/x0x/issues/1164), [#1107](https://github.com/saorsa-labs/x0x/issues/1107).
 
 Keep owner-issued certificates in a Home scope and deliver them directly to its members.
 An anonymous public announce never invalidates a certificate in that scope.
@@ -32,7 +32,7 @@ Current behaviour is grounded at commit `8b35dd1f447774e1a952166f32910fc41b51262
 | The evidence builder records the latest public digest even when no certificate is present. | `src/server/routes/named_groups.rs:22397–22415` |
 | Both the pure failure check and the grace-aware verdict reject embedded bytes when that digest differs. Neither distinguishes an anonymous digest. | `src/groups/mod.rs:1462–1475`, `:1575–1588` |
 | The seal gathers evidence for all active seats and refuses a verdict that is not all clean. | `src/server/routes/named_groups.rs:22513–22541`, `:22638–22665` |
-| The regression test requires the anonymous announce to make the seal pending. S2 reverses this expectation. | `src/server/routes/named_groups/tests/r19_cert_carry.rs:45–93` (`anonymous_announce_invalidates_hand_installed_cert`) |
+| The regression test uses an ordinary PublicRequestSecure + OwnerCertified group, without Home metadata; retain its pending expectation. Add a Home twin with the opposite expectation. | `src/server/routes/named_groups/tests/r19_cert_carry.rs:45–93` (`anonymous_announce_invalidates_hand_installed_cert`) |
 | Digest-only seats remain pending until matching bytes hydrate them. Hydration does not change their commitment. | `src/groups/mod.rs:1564–1573`, `:1743–1786` |
 
 #1023 initially asked for another certificate carry while keeping the verdict unchanged.
@@ -40,7 +40,13 @@ Its later triage separates missing bytes from #1143's false contradiction.
 D54 stops per-case carry patches: S2 changes the rule; S5 owns the general carry and fetch rule.
 S2 closes the false contradiction and gives Home evidence a disclosure scope.
 It does not close #1023's all-holders-offline case or remove its seal-time structural dependency.
-Those parts remain with S5 and S7.
+Those parts remain with S5 and S7. ADR 0088's S2 row says “then #1023's structural part”; read it with its S5/S7 rows, not as retirement of the seal dependency in S2.
+The [#1023 triage of 2026-10-03](https://github.com/saorsa-labs/x0x/issues/1023) assigns completed carry to #1025/#1056 and the remaining false contradiction to #1143; the general carry and structural retirement stay staged.
+
+D38 derives implied disclosure consent from ownership of this committed Home, not `user_identity_consented`.
+That consent survives restart by construction: revalidate Home metadata and policy, rather than restore a global flag.
+S2 does not persist the global consent flag, carry certificates on stream/exec/forward/SyncV1 opens, or fix ADR 0070 owner trust ([#1107](https://github.com/saorsa-labs/x0x/issues/1107)).
+The restart proof must avoid those owner-trust gates; #1107 is an excluded confounder, not claimed fixed.
 
 ## Decision Drivers
 
@@ -68,8 +74,9 @@ The disclosure context is `(group_id, owner_user_id, subject_agent_id, committed
 Use fixed 32-byte IDs and the roster's BLAKE3 certificate digest, not the public announce digest.
 The existing digest hashes canonical bincode certificate bytes (`src/groups/owner_cert.rs:321–329`).
 
-The scope is an existing Home with its owner policy, identified by its group ID.
-Use the existing Home resolution and policy predicate (`src/server/routes/home.rs:68–87`).
+Define a per-group predicate: verified Home metadata covered by the current state hash, policy equal to `home_policy(owner)`, and not withdrawn; serving also excludes deleted or quarantined state.
+Use the exact policy check at `src/server/routes/home.rs:68–76`.
+Do not use `resolve_home` (`:320–366`): it needs the local user keypair and selects one Home, whereas this predicate works for each committed group without that keypair.
 Do not extend implied consent to every ordinary OwnerCertified group or to another Home of the same owner.
 S7 owns adoption and election changes; S2 introduces no Tier-1 kind or Home replacement.
 An invite alone does not make its holder a member entitled to receive this evidence.
@@ -77,39 +84,68 @@ The joiner's existing submission of its own admission certificate stays unchange
 
 ### 2. Direct delivery on EvidenceV1
 
-Propose ADR 0093 registry-v1 bit **3**, `home_owner_certificate_v1`.
-It means support for both this scoped exchange and this verdict rule.
-Bit 3 is unallocated in the canonical README table at this baseline.
-Bit 2, `peer_evidence_v1`, proves only support for the older Hello/Lookup semantics.
-Require both bits in a current verified, machine-bound advert before a scoped send.
+Name the ADR 0093 registry-v1 capability **`home_owner_certificate_v1`**.
+It means support for this scoped exchange, carrier redaction and Home verdict rule.
+Its number is allocated at acceptance, in acceptance order, as the next free bit in the README registry.
+Do not allocate a number or add a registry row here; the accepting PR updates the registry and constants together.
+Require both `home_owner_certificate_v1` and `peer_evidence_v1` in a current verified, machine-bound advert before a scoped send.
 Unknown, expired, card-only or stored capabilities do not authorize a send.
 Refresh the advert through the existing route; expose missing support as retryable `recipient_upgrade_required`.
-Do not probe an unknown receiver with certificate bytes.
-This stricter positive gate protects disclosure; ADR 0093's existing sends keep their existing gates.
-Upon acceptance, record the allocation in the canonical table and add the code constant and compatibility test; until then the bit is only proposed.
+Do not probe an unknown receiver with certificate bytes; other ADR 0093 sends retain their existing gates.
 
-Reuse stream protocol `EvidenceV1 = 0x06`, with two new frame types:
+Reuse stream protocol `EvidenceV1 = 0x06`; retain Put/Ack frame types 7/8 and add the small completion receipt needed to suppress other holders:
 
 | Type | Frozen fixed-integer bincode body |
 |---|---|
 | 7, `HomeCertificatePutV1` | Four `[u8; 32]` context fields in the order above, then `certificate: Vec<u8>` |
-| 8, `HomeCertificateAckV1` | `accepted: bool` |
+| 8, `HomeCertificateAckV1` | Typed `Accepted`, `Retry(reason)` or `Refused(reason)`, encoded by explicit `u8` tags, with one `u8` reason for Retry/Refused |
+| 9, `HomeCertificateReceiptV1` | Four context fields, then recipient `[u8;32]`; no certificate bytes |
 
 Carry the certificate's existing `to_storage_bytes()` encoding verbatim.
-The receiver decodes that encoding exactly and recomputes the canonical roster digest.
-Each stream carries one Put and one Ack. Types 1–6 and their bodies stay unchanged.
+On wire and file intake, require `to_storage_bytes(decoded) == received_certificate_bytes` and recompute the canonical roster digest.
+`from_storage_bytes` uses permissive `bincode::deserialize` (`src/identity.rs:810,813`); decoding alone does not reject trailing bytes.
+Each Put stream carries one Put and one Ack; a receipt-only stream carries one Receipt with no reply. Types 1–6 and their bodies stay unchanged.
 No announcement, advert or user key is added to this body.
-Existing verified mutual agent/machine evidence must authenticate the sender and recipient agents on the live transport machines.
+Derive each sender/recipient agent from verified current evidence binding it to the live transport machine; refuse an ambiguous binding.
 The pre-identity admission of EvidenceV1 alone grants no right to send or receive Home evidence.
 
-Any active Home holder may push a committed certificate to another active member.
-Push on a new committed seat, on reconnect, and when an eligible seal retry has locally held evidence to distribute.
-Coalesce by context and recipient; retry at most once per 30 s per pair while eligible.
-An Ack stops the current retry; restart can derive missing deliveries from the roster and local evidence.
-Ack means durable evidence acceptance, never membership admission or key installation.
+Ack has a frozen manual tagged encoding, not bincode's four-byte Rust enum discriminant: Accepted=0; Retry=1; Refused=2.
+The reason is a typed `u8`: Retry uses context_unavailable=0, recipient_upgrade_required=1, capacity=2, persistence_failed=3, busy=4; Refused uses invalid_certificate=0, digest_mismatch=1, ineligible=2, ambiguous_binding=3, malformed=4.
+Unknown tags/reasons or extra bytes are protocol errors and never acceptance.
+Accepted means durable evidence acceptance, never membership admission or key installation; persist the sender's acknowledgement receipt and stop that pair's retries.
+Retry sends no receipt and waits for its named condition to clear, with the proposed retry interval below; re-admit each attempt.
+Refused terminates that context/recipient delivery, persists the visible terminal cause and cancels retries across reconnect/restart; a newly verified context or eligibility change may create a fresh delivery.
+Timeout, lost Ack or transport failure stays unacknowledged and retries idempotently; no transport-layer automatic replay.
+
+Use one designated pusher per context/recipient, with ordered fallback in the D40 pattern; independent all-holder pushes are forbidden.
+Rank active committed seats other than the recipient by agent ID, independent of each node's discovery view. A candidate must hold verified matching bytes before it can act.
+The first rank gets the first attempt; later ranks get successive fallback slots only after no acknowledged completion in earlier slots. A rank without bytes lets its slot lapse.
+The recipient returns Accepted for an already-durable duplicate, then sends Receipt directly to the other N−2 candidate holders to suppress later fallback slots.
+Authenticate a Receipt as coming from its named recipient on the live bound machine, require current matching Home context/membership and persist it as an Accepted receipt; a pusher cannot assert another recipient's acceptance. Gate Receipt by the same capabilities; never gossip or forward it. Lost Receipt can permit a counted duplicate in a later fallback slot.
+A slot holder alone retries within its slot; a late earlier holder must wait for a new round instead of racing the current rank.
+Slot timing/coordination is a proposed policy in Open questions: recommend 30 s fallback/retry with deterministic shared rounds anchored to the committed delivery trigger, not local reconnect times.
+Push on new committed seats, reconnect or eligible seal retries only for unacknowledged `(context, recipient)` pairs; persist receipts in the scoped sidecar before suppressing work across restart.
+Lost receipt persistence can cause duplicates in later fallback slots; Accepted is idempotent and restores the receipt. It never causes an all-holder burst.
 Sealing does not wait for all recipients to acknowledge.
-This is a scoped disclosure exchange, not a new hash-fetch protocol, inline K rule or catch-up log.
-S5 will supply general missing-evidence retrieval; S2 works with bytes already held locally.
+S5 (ADR 0111) reuses this Home push and its scope rather than starting a parallel push; it adds its general retrieval/inline-K rule without duplicate distributions. Any later retirement of this push needs an explicit successor decision.
+
+#### Existing certificate carriers: Home egress is part of S2
+
+| Carrier today | Home rule under S2 |
+|---|---|
+| #970 `JoinResult.roster_certificates_b64` | Serve only directly to the currently committed, authenticated recipient under ADR 0107; no public blob or gossip fallback. |
+| #1023 `MemberAdded.roster_certificates_b64` | Retain in guarded direct member copies; drop from the gossip copy. |
+| `MemberAdded.certificate_b64` (joiner's own certificate) | Retain in guarded direct member copies; drop from the gossip copy. |
+| #946 `GroupCertFetchResponse.cert_json_b64` | Answer only directly to a bound current member; the metadata-topic request never authorizes a topic answer. |
+
+The #1023 sidecar is built at `src/server/routes/named_groups/seat_cert_fetch.rs:696–732,752–789`, attached at `named_groups.rs:14061`, and published with `certificate_b64` at `:14051,14080`; equivalent publish paths include `:19290,19298,19562,19570`.
+#946 currently publishes answers at `seat_cert_fetch.rs:403–425`.
+The metadata topic is plaintext and its mesh can contain non-members (`src/gossip/pubsub.rs:1203–1228`, non-member-mesh test around `:5072`); a topic subscription is not membership authentication.
+Redact only the gossip projection, retaining the committed certificate digest and signed commitment; never rewrite signed bytes. If any nested artifact contains certificate bytes, withhold that artifact from gossip and deliver it directly under the same guard.
+Audit all event, state/snapshot, recovery, blob and retransmission serializers for nested copies; no owner-certificate bytes may leave a Home node except to a directly authenticated member of that Home.
+The joiner's existing direct submission of its own admission certificate remains unchanged.
+S5's K inline certificates follow the same Home rule; its general carry rule cannot restore gossip leakage.
+Legacy nodes can still leak through today's carriers: upgraded nodes enforce this rule on every own write, and S2 makes no fleet-wide privacy claim while legacy senders remain.
 
 ### 3. Size before implementation
 
@@ -123,23 +159,41 @@ These are calculated encoded sizes, not measured transport throughput.
 | Canonical certificate for roster hashing | 7,246 | 7,254 |
 | Certificate storage bytes carried by Put | 7,245 | 7,258 |
 | Put, including 128-byte context, 8-byte vector length, 5-byte frame and 1-byte protocol prefix | 7,387 | 7,400 |
-| Put plus 6-byte Ack | **7,393** | **7,406** |
+| Accepted Ack (5-byte frame + 1-byte tag; same EvidenceV1 stream) | 6 | 6 |
+| Retry/Refused Ack (adds one reason byte) | 7 | 7 |
+| Put plus Accepted Ack | **7,393** | **7,406** |
+| Put plus Retry/Refused Ack | 7,394 | 7,407 |
+| Receipt (160-byte body + 5-byte frame + 1-byte protocol prefix) | 166 | 166 |
 
-For N active seats, distributing one changed certificate to the other N−1 seats costs at most `7,406 × (N−1)` application bytes.
-For N=5 that is 29,624 bytes; each receiving member gets 7,406 bytes including its Ack.
-A cold new member receiving N−1 existing certificates has the same total cost.
-A seal with all local bytes present and all deliveries acknowledged adds **zero** S2 wire bytes.
-If a seal retry distributes q missing deliveries, its extra cost is at most `7,406 × q`; certificate verification is still per active seat.
-QUIC/TLS overhead, capability refresh and existing commit/Welcome traffic are excluded.
-Do not batch N certificates into a frame or repeat them in every seal.
-Keep ADR 0089's 32 KiB frame cap, 5 s deadline, per-machine stream/rate limits and global budgets.
-Charge Put and Ack to those budgets; use fair admission so other Homes can progress.
+With one designated pusher, the successful no-loss costs below use the worst-case expiring certificate. Put/Ack costs include Accepted Acks; the total column also counts one 166-byte Receipt to each other candidate. These are not transport throughput or a loss-independent bound.
+
+| Distribution at N active seats | Put/Ack pairs | N=5 Put/Ack bytes | N=5 receipt bytes | N=5 total application bytes |
+|---|---:|---:|---:|---:|
+| One changed certificate to all other seats | N−1 | 29,624 | 1,992 | 31,616 |
+| One cold member gets the N−1 existing certificates | N−1 | 29,624 | 1,992 | 31,616 |
+| Initial complete fleet distribution | N(N−1) | 148,120 | 9,960 | 158,080 |
+| Reconnect/fleet restart with all Accepted receipts durably stored | 0 | 0 | 0 | 0 |
+| Restart with q unacknowledged pairs (q≤20 for one N=5 distribution) | q | 7,406 × q | 498 × q | 7,904 × q |
+| One duplicate/fallback wave covering all fleet pairs after lost Acks/receipts | N(N−1) | 148,120 | 9,960 | 158,080 |
+| All-local, acknowledged seal | 0 | 0 | 0 | 0 |
+
+Receipt traffic is `166 × (N−2)` per successful pair; N=2 has no other candidate to notify.
+Each Retry/Refused adds one byte to its attempted pair; a lost Ack costs the Put alone, and each actual retry/fallback adds a separately counted exchange.
+The rejected all-holder policy costs `(N−1)^2` pairs (118,496 bytes at N=5) for one cold member, and `N(N−1)^2` pairs (592,480 bytes) for a fleet restart without receipts.
+Designation removes that sender multiplier; losses, changed rosters and fallback rounds can still add duplicates. Do not claim a universal traffic bound under faults.
+A seal retry distributing q eligible unacknowledged pairs costs `[7,406 + 166 × (N−2)] × q` on success; verification remains per active seat.
+QUIC/TLS overhead, capability refresh and existing commit/Welcome traffic are excluded. Every failed attempt, repeated Receipt or capability exchange must be counted separately; no coordination traffic is hidden in the successful totals.
+Do not batch N certificates into a frame or repeat acknowledged bytes in every seal.
+Keep ADR 0089's 32 KiB frame cap, 5 s deadline, per-machine stream/rate limits and global budgets; charge all frames to them.
+Fair scheduling and the new file/retention limits remain recommendations for David, not unruled Decisions.
 
 ### 4. Verdict and L4 security argument
 
-Use one Home-scoped evidence view for both `owner_cert_admission_failures` and `owner_cert_verdict`.
-Hydrate a working roster view from verified scoped bytes before computing the verdict; newly scoped bytes persist only in the scoped file, never in legacy roster or public-cache files.
-Require the bytes to match the committed seat digest; hydration must leave the roster root unchanged.
+Add scoped bytes as an extra committed-bytes source in `OwnerCertEvidence`, selected only by the per-group Home predicate and matching committed seat digest.
+Evaluate `owner_cert_verdict(&mut self, ...)` on the real roster, not a hydrated clone: preserve its stamps and clears of `certificate_missing_since_ms` (`src/groups/mod.rs:1509,1538–1542,1595–1600,1630–1635`).
+Matching scoped bytes satisfy the digest-only seat before its DigestPending branch; they leave the roster root and legacy byte fields unchanged.
+The two production evaluation sites are `src/server/routes/named_groups.rs:21305,22638`; `owner_cert_admission_failures` (`src/groups/mod.rs:1432`) has no caller today, but keep its pure semantics consistent.
+Newly scoped bytes persist only in the scoped file, never in legacy roster or public-cache files.
 Re-check owner, subject, signature, expiry and current revocation at each use.
 Use the existing verifier (`src/groups/owner_cert.rs:345–380`).
 
@@ -150,38 +204,51 @@ A different certificate-bearing public digest retains today's stale-evidence han
 Absent bytes stay pending. Invalid, wrong-owner, wrong-agent, expired or revoked evidence never becomes clean.
 Ordinary groups retain their current rules.
 
+An anonymous digest now has the same effect as no discovery entry, which already permits clean committed evidence (`src/groups/mod.rs:1463,1576`).
+Only the subject agent's authenticated bound machine can sign its announce; an arbitrary third party cannot manufacture this absence signal.
+Residual risk: an anonymous announce after re-issue erases the public rotation signal, so an older, valid committed certificate can seat again. S2 neither detects nor solves that rotation case; revocation remains the kill switch (`src/groups/owner_cert.rs:337–344`).
+
 The security argument is separation of consent scopes: anonymity says nothing about the owner's signed binding inside Home.
 Transport delivery adds no authority to the certificate; the owner signature and committed digest establish it.
 No signature, sender-authority, prev-hash, owner-mandate, fork, revocation or TreeKEM adoption check is relaxed.
 Seals still require all active seats clean; missing evidence is not permission to seal.
 
 Before every Put or resend, require sender, subject and recipient to be active in this Home and not banned or revoked.
-Require current valid owner certificates for sender and recipient and valid current machine bindings.
+For third-party certificates require current Clean sender/recipient evidence and valid current machine bindings.
+Allow a self-subject Put (`subject = sender`): verify the sender's own certificate against its committed digest and owner, and allow an active committed recipient with a current authenticated binding even if its own certificate bytes are DigestPending.
+Check bans, agent/machine/binding revocations, known expiry and definitive invalid evidence; this narrowly scoped certificate bootstrap avoids the mutual-digest deadlock. It grants no Clean verdict, admission or class-K entitlement to the recipient.
 Refuse withdrawn, deleted or quarantined Home state.
-Linearize selection and membership invalidations under the Home membership lock.
+Apply ADR 0107's serving guard to every join/recovery artifact and D60 to class-K material: “every delivery and resend requires current recipient eligibility and the current secret epoch” (David, 2026-10-03), including agent/machine/binding revocation, expiry, verdict change and quarantine.
+For scoped-only Home seats, ADR 0107 uses its permitted current `Clean` verdict alternative, computed from scoped committed bytes; it does not require writing those bytes into the roster or use discovery as authority.
+The self-subject Put bootstrap exception cannot authorize a join artifact, Welcome or K share.
+Linearize selection, the immediate pre-write eligibility/epoch check, and each physical exchange with membership invalidations under the Home membership lock; re-admit every resend.
 Track and cancel in-flight disclosure before removal, ban or deletion commits; check current revocation, expiry and bindings at each transport handoff.
 Use one bounded direct QUIC exchange with no hidden resend, gossip fallback or relay.
 The receiver repeats these checks against its verified local committed roster; missing context is retryable and grants no evidence authority.
 Keep scoped bytes out of public announces, public blob fetch, AgentCards, general EvidenceV1 Lookup and unrelated grant/trust views.
-Any existing output fed by hydrated bytes must enforce this same disclosure scope; already delivered bytes cannot be recalled from a former member.
+Any existing output fed by scoped bytes must enforce this same disclosure scope; already delivered bytes cannot be recalled from a former member.
 The [join-artifact lifecycle note on #1190](https://github.com/saorsa-labs/x0x/blob/e645ce253bac6fc36b1dffd2398836da1f0096e8/docs/design/join-artifact-serving-lifecycle.md) is related work on serving and egress only.
 S2 does not depend on that branch, its caches or its implementation.
 
 ### 5. Persisted state and mixed versions
 
-Use a separate `<data_dir>/home-owner-certificates.bin`, magic **`X0HCV1\0\0`**.
-The frozen V1 body is a bincode vector of the four context fields plus certificate storage bytes.
-Read with exact consumption; validate signatures and commitments before use, with current membership and revocation checked again at use.
-Atomically persist before sending an accepted Ack; duplicate Put is idempotent.
+Use a separate `<data_dir>/home-owner-certificates.hscert`, new extension and magic **`X0HCV1\0\0`**; old binaries do not scan this extension.
+Freeze the V1 body as three ordered vectors: certificate entries (four context fields, storage-byte vector), Accepted receipts (four context fields, recipient `[u8;32]`), and terminal Refused deliveries (four context fields, recipient `[u8;32]`, typed `u8` refusal reason). Sort each by its fixed-field tuple and reject duplicates/conflicting Accepted and Refused entries. A newly verified context/eligibility change clears the obsolete refusal atomically; restart alone does not.
+Use `DefaultOptions::new().with_fixint_encoding().reject_trailing_bytes()` for wire and file bodies, with bounded decoding (`src/evidence_wire.rs:45–50`); bare DefaultOptions is varint.
+Require exact body consumption and canonical certificate re-encoding equality on file as on wire; validate signatures/commitments before use and membership/revocation again at use.
+Persist accepted bytes before Accepted Ack, and sender receipts before durable retry suppression: temp file, fsync file, atomic rename, fsync directory (ADR 0089 §3). A write failure yields Retry(persistence_failed); duplicate Put is idempotent.
 Do not append fields to `peer-evidence.bin` or persist derived `Clean` verdicts.
-Cap the file at 16 MiB and each certificate at ADR 0089's 10 KiB limit; retain current local Home seats only.
-Capacity refusal stays retryable and visible; it never makes an unverified certificate usable.
+Retain ADR 0089's 10 KiB certificate limit; capacity pressure yields Retry(capacity), never usable unverified evidence.
+A proposed 16 MiB sidecar cap and retention/pruning policy await David in Open questions.
+Keep `named_groups.json` and `home-suite-groups.json` in their unchanged legacy-safe JSON formats (#451); do not place scoped bytes or new fields there. Use inert legacy-view placeholders only where required by #451's safety pattern.
+Defer any first sidecar write that changes host behaviour until ADR 0094's host commit where applicable.
 Follow ADR 0085: new magic for a changed body, frozen released decoders, lazy rewrite, atomic replace and released-binary fixtures.
+No released binary yet writes X0HCV1: before code merges supply a golden encoder fixture plus SHA-256 and provenance; the first release writing it supplies the actual released-binary fixture, retained by every later decoder test.
 Unknown or corrupt formats are reported and left byte-identical; disable writes to that path until repaired.
 Older binaries ignore this separate file and keep today's verdict; re-upgrade validates and reuses it.
 They may still reproduce #1143. Downgrade never implies successful Home recovery.
 
-New to old: send no scoped frames without the new bit; keep existing join/commit formats and their limitations.
+New to old: send no scoped frames without `home_owner_certificate_v1`; Home certificate gossip stays redacted even for a legacy receiver; keep existing join/commit formats and their limitations.
 Old to new: old announces and commits decode unchanged; a committed valid Home certificate survives anonymous announces under the new verdict.
 New code does not infer fresh capability bits from stored evidence.
 One upgraded admin with the required bytes can pass its seal gate; legacy admins retain the old refusal.
@@ -195,24 +262,29 @@ This is not a claim that every mixed-version Home converges before S5–S7.
 
 ## Validation
 
-All names below are required **W3-H cases to implement**, tracked by #1164; this draft claims no harness run.
+The W3-H harness (#1164) does not exist yet; these are specified cases, not claimed runs. Recommend a dedicated S2 tracking issue linked to #1164.
+Each red case must be committed and shown red on main before S2 code merges; in-process red tests alone do not satisfy D16/D54.
 Run daemon cases only in the isolated loopback-only Linux namespace; macOS fails closed.
+All cases use a deterministic clock t=0, public create/admit/promote/invite/redeem APIs, and a scheduled transport that records every write; advance time only at the named barriers. Fixtures prepare signed metadata/capabilities, never inject discovered certificate bytes.
 
-- **`s2_home_anonymous_owner_offline` (red first):** create Home on O, admit X and A, and commit A's admin promotion. Deliver the creator's certificate to A and verify its committed digest. Ingest O's signed anonymous public announce at A, then disconnect O. Let A redeem its own valid invite for J with all other required evidence present. Before S2, assert `OwnerCertMemberPending` naming O and no completed join. After S2, assert an authoritative add, J active with usable TreeKEM keys, unchanged anonymous public output and no need for O. Rotate the creator and admin roles.
-- **`s2_home_scoped_evidence_restart` (red first):** repeat the first case after restarting A with a persisted roster and creator certificate delivered by the real membership path. Re-ingest O's anonymous announce, disconnect O and redeem J's invite at A. The baseline verdict blocks despite held bytes. The fixed case must also obtain those bytes through scoped Put, persist before Ack, restart with public discovery empty and complete the same add; an injected cache is not harness evidence.
-- **Exit test:** with the holder/admin reachable and no faults, both cases complete within the existing 120 s TreeKEM join window. With a lost Put/Ack, repeat after the 30 s retry and converge within that window; Ack alone never reports joined. Missing evidence exposes the seat and retry cause without reporting keyed-active.
-- **Non-regressions:** flip `anonymous_announce_invalidates_hand_installed_cert` to require a clean Home verdict and successful seal; exercise both verdict sites. Keep wrong-owner, agent mismatch, signature failure, expiry, agent/machine revocation, digest mismatch, non-anonymous replacement and ordinary-group controls fail-closed. Preserve ADR 0106 carry, ADR 0107 serving guards, fork containment and TreeKEM gap exclusion.
-- **Privacy/concurrency:** capture public announce, blob, Lookup and direct output. A stranger, grant-only peer, invite-only joiner or member of another Home receives no scoped bytes. Race removal, ban, withdrawal, expiry, revocation and connection replacement against each send and resend; prevent a later eligible-looking retry from releasing cancelled evidence. Validate malformed contexts, duplicate frames, oversize input, deadline and fairness limits.
-- **Mixed versions/storage:** use released v0.45.0 and v0.46.0 peers in both directions, plus a peer with bit 2 only. Assert no new frame without bit 3, unchanged old decoding and documented legacy refusal. Load released fixtures, restart after lost Ack, downgrade without touching or publicly exposing the scoped file, then re-upgrade; corrupt and unknown magic remain byte-identical.
-- **Boundary control:** all holders of a missing committed certificate offline stays retryable under 0088 §2 item 8; no owner bypass. S5 owns recovery when a holder returns. Invalid OwnerCertified joiners remain refused under item 2; removed epochs, signed deletion and unanchored forks keep their listed exclusions.
+- **`s2_home_anonymous_owner_offline` (red baseline):** nodes O (creator), X (holder), A (promoted admin), J (joiner). At t=0 create Home O, admit X/A and commit A's promotion; deliver O's certificate through the actual member path and verify its digest on A. At t=1 O emits a machine-signed anonymous announce; deliver it to A, then disconnect O. At t=2 redeem J's valid A-issued invite with other evidence already present. Main returns OwnerCertMemberPending for O; S2 completes the authoritative add and J's Welcome/key installation without O. Anonymous public output stays unchanged. Repeat with creator/admin identities permuted.
+- **`s2_home_scoped_evidence_restart` (red baseline, store isolation):** same nodes; at t=0 drive the trimmed-sidecar shape of `trimmed_member_added_all_holders_offline_stays_pending` (`r19_cert_carry.rs:1329`), but keep X online with O's bytes. A is seated/promoted from a real trimmed MemberAdded and has only O's committed digest; no JoinResult, #946 answer or discovery entry may supply O's bytes. At t=1 X establishes the authenticated binding and sends the real scoped Put; A persists it before Accepted, then disconnect O/X and restart A at t=2 with empty discovery and unchanged digest-only legacy roster. At t=3 redeem J's invite and seal using only the new sidecar as O's byte source. Main remains pending/no scoped durable recovery; S2 seals and installs J's keys. Delete/disable only the new sidecar in a negative run and require pending again. Avoid ADR 0070 owner-trust APIs; #1107 is excluded. Keep the old membership-carried restart shape as a separate red verdict reproduction, not evidence for the new store.
+- **`s2_home_ordinary_group_twin` (control + red):** nodes A/J, clock t=0; create the ordinary PublicRequestSecure + OwnerCertified shape via APIs. Preserve `anonymous_announce_invalidates_hand_installed_cert` as the fail-closed ordinary-group control. At t=1 deliver A's own signed anonymous announce; its seal stays pending on main and S2. Repeat with committed Home metadata/policy: only that twin changes from red/pending to Clean and successful seal. Exercise both production verdict sites and assert real-roster grace stamps survive evaluations/restart.
+- **`s2_home_all_egress_privacy` (red baseline):** O/X/A plus stranger S, grant-only G, invite-only J and other-Home H; t=0 create the memberships and attach S to the non-member topic mesh. At t=1 drive each #970, #1023, certificate_b64 and #946 carrier, all gossip publish/recovery/blob paths, and Put. Capture EVERY egress, including publishes before mesh delivery, and decode nested JSON/base64/bincode/storage encodings. Search every byte string/candidate certificate for a canonical digest equal to ANY Home member certificate, including locally held/embedded bytes rather than only the new store. Main leaks to the topic; S2 emits those bytes only on bound direct member channels. At t=2 race removal/ban/withdrawal/expiry/agent-machine-binding revocation/verdict/quarantine and connection replacement with writes; no subsequent cancelled send/resend may leak. K paths also require the current epoch. Record public announces/cards/Lookup unchanged.
+- **`s2_home_designated_push_and_ack` (control for counts, red for new protocol):** five active nodes, t=0 commit one shared delivery trigger and freeze candidate ranks; all hold the same certificate. Deliver first-rank traffic before fallback and require four Puts, 29,624 Put/Ack bytes plus 1,992 Receipt bytes, total 31,616 application bytes; deliver/persist all receipts before later slots. Give a cold recipient four existing certificates and require four Puts, not sixteen. Restart all nodes after fsync'd Accepted receipts: zero certificate re-push. Delay or drop Receipt and assert only the named recipient can authorize retry suppression; count the resulting fallback duplicates. In separate schedules lose Put, Ack or receipt fsync; advance the proposed shared fallback clock by 30 s, admit only the scheduled rank, and count every duplicate. Exercise each typed Retry/Refused reason: condition-cleared retry, terminal cancellation, no receipt on failure and no false membership confirmation. Two digest-only nodes exchange self-subject Puts through authenticated bindings without a mutual-cert deadlock; the exception never releases K/join artifacts.
+- **Exit/non-regressions (controls):** with one holder/admin reachable and no faults, complete each Home add within the existing 120 s TreeKEM window; loss/fallback scenarios use the proposed schedule and expose typed waits. Preserve ADR 0106 carry and ADR 0107 serving guards. Keep wrong-owner/agent, signature, expiry, revocation, commitment mismatch, non-anonymous replacement, fork/TreeKEM-adoption exclusions and ordinary groups fail-closed. All holders offline remains retryable under 0088 §2 item 8; return one holder and resume without owner bypass. Cover malformed/duplicate/oversize frames, canonical re-encoding, trailing bytes, deadlines, budgets and fairness.
+- **Mixed versions/storage (controls):** at t=0 pair candidate with released v0.45.0/v0.46.0 in both directions and a peer advertising only `peer_evidence_v1`; no new frame without `home_owner_certificate_v1`, no certificate-bearing Home gossip fallback, legacy verdict limitations visible. After t=1 accepted Put/fsync, crash before/after file rename, directory fsync and Ack; restart with empty discovery, lose Ack, downgrade, then re-upgrade. Old binaries start on unchanged legacy JSON and leave `.hscert` byte-identical; unknown/corrupt magic stays intact with writes disabled. Load golden and, once available, first-released X0HCV1 fixtures with SHA-256 checks.
 
-Harness red evidence must precede S2 code under D16/D54; D55's exception applies only to S8(a).
-Land this ADR Proposed on main, obtain cross-model review and David's separate acceptance before S2 code merges.
-Follow 0088's acceptance order and its single code lane for `named_groups.rs`.
+Land this ADR Proposed on main, obtain cross-model review and David's acceptance before any S2 governed code merges.
+Restate 0088's acceptance order: contract, then S2 and S8(a), then S4 and S3, then S5, then S6, then S7. “S8” here means ADR 0107 S8(a); S8(b) is Accepted only after S4 as ADR 0107 requires.
+S2's prerequisites are the Accepted contract, red-on-main W3-H evidence, capability allocation and sidecar/wire fixtures; S2 does not wait for S5. Seal-check retirement waits for S7 after S4 is Accepted and shipped.
+Use the single `named_groups.rs` code lane. D55's harness exception applies only to S8(a), never S2.
 
 ## Open questions for David
 
-- **G7 (inherited):** does L3 bind every slice, including the 120 s join poll versus the later certificate refusal, or remain a goal? S2 does not extend that timeout or settle the contract question.
+- **G7 (inherited):** does L3 bind every slice, including the 120 s join poll versus later certificate refusal, or remain a goal? S2 does not extend that timeout.
+- **Push coordination/bounds (recommendation):** accept a 30 s fallback/retry slot? Recommend shared rounds anchored to the signed committed delivery trigger timestamp, using the same verified committed roster for ranks; reconnect/restart must not reset the anchor. Divergent/quarantined views wait for verified reconciliation instead of inventing a local rank. Before acceptance settle the round policy and any persisted coordination fields; if fields are needed, freeze them in V1 before its first release. This recommendation is not yet a ruled timeout Decision; Receipt frame/receipt persistence and their costs are specified above.
+- **Capacity/retention/fairness (recommendation):** accept a 16 MiB sidecar cap, prune certificates/receipts for departed Home seats only after membership invalidation, and schedule fairly by Home within ADR 0089's existing budgets? New rates, limits and retention remain proposals until ruled.
 
 ## Notes for AI-assisted work
 
