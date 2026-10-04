@@ -2142,6 +2142,12 @@ fn controlled_load_producer_allowlist_is_exact() {
     )
     .expect("stale registry fixture");
     assert!(!reviewed_pubsub_producer(&stale_registry));
+    // The previously reviewed 0.5.86 registry package is superseded too.
+    let prior_registry: toml::Value = toml::from_str(
+        "version = '0.5.86'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = '6325b0efd16dc1d1cafc33da30921bd6bf9009026ca36906dcc3eac73225aa82'",
+    )
+    .expect("prior registry fixture");
+    assert!(!reviewed_pubsub_producer(&prior_registry));
     let mut wrong_registry = registry.clone();
     wrong_registry["source"] = toml::Value::String("registry+https://example.invalid".into());
     assert!(!reviewed_pubsub_producer(&wrong_registry));

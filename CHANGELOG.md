@@ -8,8 +8,8 @@ All notable changes to this project will be documented in this file.
 
 - **Pub/sub no longer stalls for 22–60 s after a whole-network restart (#857).**
   The saorsa-gossip-* pins move to 0.5.87 (saorsa-gossip #106). A local publish
-  whose eager candidates were all claim-skipped is announced by IHAVE within one
-  flush, and deferred IWANT replies are retried through the bounded,
+  whose eager candidates were all claim-skipped is queued for the next IHAVE
+  flush, with unresolved connected targets retained for up to 30 seconds, and deferred IWANT replies are retried through the bounded,
   Critical-gated send path. The #501 meter premise moves to the 0.5.87 registry
   package; its meter accounting is unchanged.
 
