@@ -409,6 +409,21 @@ Global lock order: the store, then discovery. Hydration is the only path that ho
 |---|---|---|---|
 | The certificate was published before its expiry | Fixed | `2d17a3d`, `e1dee33` | `r7g_a_landed_certificate_is_never_published_before_its_expiry` (hydration is parked at publication by the `HYDRATION_PUBLISH` barrier) |
 
+**Round 7h (real-network re-run g10-1190b, finding 3).** Class K passed: shares were delivered about 0.1 s after an owner restart, 4 of 4. The Welcome stalled for 85.8 s after an owner restart because only its Chunk frames took the pinned path. Offer and Complete kept the general DM config: the gossip inbox's ACK-v2 receipt with one internal resend, a raw fallback with a receive ACK, and the general resolver, which an owner restart leaves cold.
+
+Every owner Welcome frame (Offer, Chunk, Complete) now takes the admitted single-exchange path under `welcome_frame_admission`. The reference to a staged oversized join result takes it too, under the copy's own admission.
+
+None of these frames needs a transport receipt:
+- the Offer is advisory (#825);
+- chunks are acknowledged by the joiner's application-level ChunkAck;
+- a lost Complete or reference is recovered by the joiner's fetch retry, with fresh admission.
+
+Still on the general path: #477 refusal responses (no artifact bytes) and the joiner's own FetchRequest and ChunkAck.
+
+| Item | Status | Red, then fix | Evidence |
+|---|---|---|---|
+| Welcome Offer and Complete on the general resolver and ACK-v2 resend | Fixed | `2581561`, `ddd3614` | `s8a_r7h_owner_restart_welcome_offer_and_complete_take_the_admitted_path`; `s8a_r5_g3_recovery_responses_take_one_admitted_exchange` now also sees the join-result reference on the pinned transport |
+
 Still open for g10: the pinned path needs a direct connection to the resolved machine. If the requester reached the owner only through the gossip inbox, and repair or redial cannot dial it, the exchange still fails (`err_not_connected`), and the joiner's retry or the share's backoff carries the delivery. That is G10.
 
 Still outstanding for merge: the G10 evidence (e2e Home joins, survivor rekeys, mixed-version delivery on raw-only), from Root's ephemeral-testnet gate.
