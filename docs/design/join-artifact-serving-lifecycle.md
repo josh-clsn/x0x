@@ -388,6 +388,17 @@ A class-K share whose exchange ends `recipient_undiscovered` is resent after 1 s
 | NEW 1: the ingest and hydration race lost the landed expiry | Fixed | `b84b338` (ingest receives the blob cache, no behaviour change), `ec07fb9`, `e4f64d7` | `r7e_a_certificate_landing_mid_ingest_keeps_its_expiry` (the interleaving is forced through `announced_record_barrier`) |
 | NEW 2: discovery eviction erased a retained expiry | Fixed | `ec07fb9`, `e4f64d7` | `r7e_discovery_eviction_never_erases_a_retained_expiry` (includes a digest-change control) |
 
+**Round 7f (Codex review of `b2899f3..9b9d7dc`: changes required).** The late ingest's repair depended on the landed blob surviving for a second lookup in the 256-entry announce-blob cache. Ordering now replaces that dependency:
+
+- Ingest registers its binding and digest in the announced-binding store BEFORE it publishes its discovery merge.
+- Hydration patches discovery first, then updates the store by digest on every path.
+
+So if discovery holds a landed certificate, the binding already carried that digest when the store update ran. The ingest's blob lookup stays as a best-effort extra; nothing depends on it.
+
+| Item | Status | Red, then fix | Evidence |
+|---|---|---|---|
+| NEW 1: blob eviction between hydration and the ingest's write lost the expiry | Fixed | `50bbf40`, `7ed614f` | `r7e_a_certificate_landing_mid_ingest_keeps_its_expiry`, extended: it evicts the blob before releasing the ingest and checks that discovery holding the certificate means the binding holds its expiry |
+
 Still open for g10: the pinned path needs a direct connection to the resolved machine. If the requester reached the owner only through the gossip inbox, and repair or redial cannot dial it, the exchange still fails (`err_not_connected`), and the joiner's retry or the share's backoff carries the delivery. That is G10.
 
 Still outstanding for merge: the G10 evidence (e2e Home joins, survivor rekeys, mixed-version delivery on raw-only), from Root's ephemeral-testnet gate.
