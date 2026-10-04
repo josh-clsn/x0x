@@ -2907,6 +2907,8 @@ async fn patch_discovery_entry_when_blob_lands(
             }
         }
         drop(discovery);
+        #[cfg(test)]
+        announced_record_barrier::park(agent_id, announced_record_barrier::HYDRATION_PUBLISH).await;
         // x0x #1150 (r7d-r7f): AFTER the discovery patch, the announced
         // binding whose announcement committed to THIS digest learns the
         // landed expiry. The update is keyed on the digest and runs under
@@ -3119,47 +3121,53 @@ async fn record_announced_machine_binding(
     );
 }
 
-/// x0x #1150 (r7e, r7f): a test-only barrier between an ingest's two
-/// writes (its announced-binding store registration and its discovery
-/// merge), so a test can land a certificate blob between them. Unarmed
-/// agents pass straight through.
+/// x0x #1150 (r7e, r7f, r7g): test-only barriers keyed by (agent, point).
+/// The points are `INGEST_BETWEEN_WRITES` (between an ingest's
+/// announced-binding store registration and its discovery merge) and
+/// `HYDRATION_PUBLISH` (in blob hydration, after the discovery patch and
+/// before the binding's expiry update). Unarmed points pass straight
+/// through.
 #[cfg(test)]
 pub(crate) mod announced_record_barrier {
     use std::collections::HashMap;
     use std::sync::{Arc, LazyLock, Mutex};
 
+    pub(crate) const INGEST_BETWEEN_WRITES: &str = "ingest_between_writes";
+    pub(crate) const HYDRATION_PUBLISH: &str = "hydration_publish";
+
     pub(crate) struct Gate {
-        /// One permit each time an ingest parks here.
+        /// One permit each time a task parks here.
         pub(crate) reached: tokio::sync::Semaphore,
-        /// One permit releases one parked ingest.
+        /// One permit releases one parked task.
         pub(crate) release: tokio::sync::Semaphore,
     }
 
-    static GATES: LazyLock<Mutex<HashMap<crate::identity::AgentId, Arc<Gate>>>> =
-        LazyLock::new(Default::default);
+    type Key = (crate::identity::AgentId, &'static str);
 
-    pub(crate) fn arm(agent: crate::identity::AgentId) -> Arc<Gate> {
+    static GATES: LazyLock<Mutex<HashMap<Key, Arc<Gate>>>> = LazyLock::new(Default::default);
+
+    pub(crate) fn arm(agent: crate::identity::AgentId, point: &'static str) -> Arc<Gate> {
         let gate = Arc::new(Gate {
             reached: tokio::sync::Semaphore::new(0),
             release: tokio::sync::Semaphore::new(0),
         });
         if let Ok(mut gates) = GATES.lock() {
-            gates.insert(agent, Arc::clone(&gate));
+            gates.insert((agent, point), Arc::clone(&gate));
         }
         gate
     }
 
-    pub(crate) fn disarm(agent: &crate::identity::AgentId) {
+    pub(crate) fn disarm(agent: &crate::identity::AgentId, point: &'static str) {
         if let Ok(mut gates) = GATES.lock() {
-            gates.remove(agent);
+            gates.remove(&(*agent, point));
         }
     }
 
-    pub(crate) async fn park(agent: &crate::identity::AgentId) {
+    pub(crate) async fn park(agent: &crate::identity::AgentId, point: &'static str) {
         let gate = GATES
             .lock()
             .ok()
-            .and_then(|gates| gates.get(agent).cloned());
+            .and_then(|gates| gates.get(&(*agent, point)).cloned());
         if let Some(gate) = gate {
             gate.reached.add_permits(1);
             if let Ok(permit) = gate.release.acquire().await {
@@ -3208,7 +3216,8 @@ async fn cache_verified_announcement(
     )
     .await;
     #[cfg(test)]
-    announced_record_barrier::park(&agent_id).await;
+    announced_record_barrier::park(&agent_id, announced_record_barrier::INGEST_BETWEEN_WRITES)
+        .await;
     upsert_discovered_agent(cache, cert_events, discovered_agent).await;
 }
 
@@ -31504,7 +31513,8 @@ async fn r7e_a_certificate_landing_mid_ingest_keeps_its_expiry() {
     let mut entry = discovered_agent_fixture(0x6a, 100, &[], None);
     entry.agent_id = joiner_id;
     entry.cert_digest = Some(digest);
-    let gate = announced_record_barrier::arm(joiner_id);
+    let gate =
+        announced_record_barrier::arm(joiner_id, announced_record_barrier::INGEST_BETWEEN_WRITES);
     let ingest = {
         let (machine_cache, announced, blob_cache, cache, cert_events) = (
             std::sync::Arc::clone(&machine_cache),
@@ -31567,7 +31577,7 @@ async fn r7e_a_certificate_landing_mid_ingest_keeps_its_expiry() {
     );
     gate.release.add_permits(1);
     ingest.await.expect("ingest task");
-    announced_record_barrier::disarm(&joiner_id);
+    announced_record_barrier::disarm(&joiner_id, announced_record_barrier::INGEST_BETWEEN_WRITES);
     let stored = announced
         .read()
         .await
@@ -31588,6 +31598,110 @@ async fn r7e_a_certificate_landing_mid_ingest_keeps_its_expiry() {
         stored,
         Some(not_after),
         "a late ingest write erased the expiry its racing hydration landed"
+    );
+}
+
+/// WHY (x0x #1150 r7g, Codex r7f): a certificate is never published before
+/// its expiry. Blob verification checks the signature, not the expiry, so
+/// an already-expired certificate can land. Hydration is parked at the
+/// moment the certificate is published (after its discovery patch, before
+/// the binding's expiry update). At that moment, a pinned read of the
+/// announced-binding store, the non-blocking read the seam makes, must not
+/// accept the binding: either the expiry is already there, or the store is
+/// held and the seam refuses.
+#[tokio::test]
+async fn r7g_a_landed_certificate_is_never_published_before_its_expiry() {
+    let user_kp = identity::UserKeypair::from_seed(&[0x6c; 32]).expect("owner kp");
+    let joiner = identity::AgentKeypair::generate().expect("joiner kp");
+    let joiner_id = joiner.agent_id();
+    let now = Agent::unix_timestamp_secs();
+    let expired = now - 86_400;
+    let cert = identity::AgentCertificate::issue_with_expiry(&user_kp, &joiner, Some(expired))
+        .expect("joiner cert");
+    let digest = announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()));
+    let cache = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let machine_cache =
+        std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let announced: dm_inbox::AuthenticatedMachineBindings = Default::default();
+    let cert_events = test_cert_events();
+    let blob_cache = std::sync::Arc::new(announce_blob::AnnounceBlobCache::new(None));
+    let mut entry = discovered_agent_fixture(0x6c, now, &[], None);
+    entry.agent_id = joiner_id;
+    entry.cert_digest = Some(digest);
+    cache_verified_announcement(
+        &machine_cache,
+        &announced,
+        None,
+        &cache,
+        &cert_events,
+        entry,
+    )
+    .await;
+    blob_cache
+        .insert_verified(announce_blob::CachedBlob {
+            digest,
+            user_id: cert.user_id().ok(),
+            agent_certificate: Some(cert),
+            payload_version: 1,
+            fetched_at_unix: 1,
+        })
+        .await;
+    let gate =
+        announced_record_barrier::arm(joiner_id, announced_record_barrier::HYDRATION_PUBLISH);
+    let hydration = {
+        let (cache, announced, blob_cache, cert_events) = (
+            std::sync::Arc::clone(&cache),
+            std::sync::Arc::clone(&announced),
+            std::sync::Arc::clone(&blob_cache),
+            cert_events.clone(),
+        );
+        tokio::spawn(async move {
+            patch_discovery_entry_when_blob_lands(
+                &cache,
+                &announced,
+                &blob_cache,
+                &cert_events,
+                &digest,
+                &joiner_id,
+            )
+            .await;
+        })
+    };
+    let parked = tokio::time::timeout(std::time::Duration::from_secs(10), gate.reached.acquire())
+        .await
+        .expect("hydration reached the publication point")
+        .expect("barrier open");
+    parked.forget();
+    // The seam's read: try_read the store; contention refuses.
+    let seam_accepts = match announced.try_read() {
+        Ok(store) => {
+            select_pinned_binding(store.peek(&joiner_id), None, None, || None, now).is_some()
+        }
+        Err(_) => false,
+    };
+    let published = cache.try_read().ok().and_then(|discovery| {
+        discovery
+            .get(&joiner_id)
+            .map(|e| e.agent_certificate.is_some())
+    });
+    gate.release.add_permits(1);
+    hydration.await.expect("hydration task");
+    announced_record_barrier::disarm(&joiner_id, announced_record_barrier::HYDRATION_PUBLISH);
+    assert!(
+        !seam_accepts,
+        "the seam accepted the binding while discovery held its expired certificate \
+         (discovery published: {published:?})"
+    );
+    assert!(
+        select_pinned_binding(
+            announced.read().await.peek(&joiner_id),
+            None,
+            None,
+            || None,
+            now
+        )
+        .is_none(),
+        "after hydration the expired certificate's binding still resolves"
     );
 }
 
