@@ -224,6 +224,20 @@ impl AutoApplyUpgrader {
             "Restart contract resolved before replacement"
         );
 
+        // #1196 round 2 test seam (cfg(test) only): when an in-process
+        // test has installed an apply attempt, the destructive half —
+        // downloads, hash/signature verification, extraction, binary
+        // replacement and the restart itself — is the INJECTION, not the
+        // filesystem or the network. Everything above (version/platform
+        // resolution and the ADR-0061 §1 restart-contract resolution the
+        // #1196 behaviour lives in) still runs for real, so a refused
+        // contract never reaches this hook. Compiled out entirely in
+        // non-test builds; an uninstalled hook changes nothing.
+        #[cfg(test)]
+        if let Some(result) = apply_attempt_seam::intercept(&restart_plan, manifest) {
+            return Ok(result);
+        }
+
         let upgrader = Upgrader::new(target_path.clone(), current_version.clone());
         let temp_dir = upgrader.create_temp_dir()?;
         // Guarantees temp-dir removal on every early-return error path below.
@@ -424,6 +438,60 @@ pub fn current_binary_path() -> Result<PathBuf, UpgradeError> {
         Ok(PathBuf::from(clean))
     } else {
         Ok(exe)
+    }
+}
+
+/// #1196 round 2 test seam (cfg(test) only; no env vars, no cargo
+/// features): lets an in-process test observe — and stand in for — ONE
+/// apply attempt of [`AutoApplyUpgrader::apply_upgrade_from_manifest`].
+/// The hook fires only after the ADR-0061 §1 restart contract has resolved
+/// for real (a refused contract never reaches it), and replaces the
+/// destructive half of the apply: downloads, verification, extraction,
+/// replacement, restart. Compiled out entirely in non-test builds; an
+/// uninstalled hook changes nothing.
+#[cfg(test)]
+pub(crate) mod apply_attempt_seam {
+    use super::UpgradeResult;
+    use crate::upgrade::manifest::ReleaseManifest;
+    use crate::upgrade::restart::RestartPlan;
+    use std::sync::Mutex;
+
+    /// An installed apply attempt: sees the resolved restart plan and the
+    /// manifest being applied, and answers as the destructive half would.
+    pub(crate) type Attempt =
+        Box<dyn Fn(&RestartPlan, &ReleaseManifest) -> UpgradeResult + Send + Sync>;
+
+    static INSTALLED: Mutex<Option<Attempt>> = Mutex::new(None);
+
+    /// Uninstalls the attempt on drop, so a test cannot leak its injection
+    /// into sibling tests in the same process.
+    pub(crate) struct Guard {
+        _private: (),
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if let Ok(mut slot) = INSTALLED.lock() {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Install `attempt` for the guard's lifetime.
+    pub(crate) fn install(attempt: Attempt) -> Guard {
+        let mut slot = INSTALLED.lock().expect("apply attempt seam poisoned");
+        *slot = Some(attempt);
+        Guard { _private: () }
+    }
+
+    /// Run the installed attempt, or `None` when nothing is installed
+    /// (fall through to the real destructive half).
+    pub(crate) fn intercept(
+        plan: &RestartPlan,
+        manifest: &ReleaseManifest,
+    ) -> Option<UpgradeResult> {
+        let slot = INSTALLED.lock().expect("apply attempt seam poisoned");
+        slot.as_ref().map(|attempt| attempt(plan, manifest))
     }
 }
 

@@ -1,6 +1,7 @@
 # ADR 0088: Group Liveness Contract (I8)
 
-- **Status:** Proposed
+- **Status:** Accepted
+- **Accepted:** 2026-10-03 by David Irvine (D58, as written: the Proposed text merged via #1160, commit 9369e0c; his instruction to Claude directly). The Open questions remain open for later rulings. The status change was applied by Claude at his instruction.
 - **Date:** 2026-10-03
 - **Decision owners:** David Irvine
 - **Reviewers:** Codex (cross-model review of the text), Root

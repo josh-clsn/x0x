@@ -4,7 +4,45 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.46.2] - 2026-10-04
+
 ### Fixed
+
+- **A restart now applies a pending self-update on systemd hosts (#1196).**
+  The startup update check ran about 3 s after start, inside systemd's 10 s
+  start-rate window, so the restart-safety guard always refused, and the update
+  waited for the 30-minute retry. The startup check now waits out the window
+  read from the unit (plus 2 s) and retries once. Every other refusal is
+  unchanged.
+
+- **Group task-list deltas can no longer go out in plaintext after a policy
+  flip (#1100).** A signed-public group's plaintext task delta or full-state
+  response now holds the publication gate's permit and re-checks the policy. If
+  the group became MlsEncrypted meanwhile, the payload is sealed instead.
+
+- **Pub/sub no longer stalls for 22–60 s after a whole-network restart (#857).**
+  The saorsa-gossip-* pins move to 0.5.87 (saorsa-gossip #106). A local publish
+  whose eager candidates were all claim-skipped is queued for the next IHAVE
+  flush, with unresolved connected targets retained for up to 30 seconds, and deferred IWANT replies are retried through the bounded,
+  Critical-gated send path. The #501 meter premise moves to the 0.5.87 registry
+  package; its meter accounting is unchanged.
+
+## [v0.46.1] - 2026-10-03
+
+### Fixed
+
+- **Fork-quarantine clears are durable before they are published (#1103).**
+  The explicit seal's eviction and all-clean arms, the owner-mandate
+  MemberAdded arm and gap adoption now clear a fork quarantine through the
+  same candidate-gated write as the manual clear (#1073). While the write is
+  in flight, and on NotReplaced or Err, the group stays quarantined. On
+  ReplacedNotDurable the clear is already published (as in #759) and the
+  route returns 503. The lookup resolves both group-id spellings.
+
+- **The startup update check no longer delays the REST API (#1086).** The
+  check runs in the background after the API binds, so an unreachable
+  GitHub no longer holds `/health` for about 30 s. Release builds have no
+  configurable update source.
 
 - **Self-update extraction matches the exact binary basename (#1144).**
   Archive extraction for the `x0xd`/`x0x` self-update now accepts only a
