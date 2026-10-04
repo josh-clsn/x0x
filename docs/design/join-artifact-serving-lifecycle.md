@@ -372,6 +372,22 @@ A class-K share whose exchange ends `recipient_undiscovered` is resent after 1 s
 | NEW 3: an unchecked test helper wrote authority in production builds | Fixed (`#[cfg(test)]`) | `97d91ff` | Inspection: compile-time gate |
 | The held-cache control no longer held a resolver lock | Test fixed: it now holds the announced-binding store | `e7a8f89` | `s8a_r7b_a_held_source_lock_ends_in_the_typed_error_within_the_bound` |
 
+**Round 7e (Codex review of `d528d28..b2899f3`: changes required).**
+
+- **Expiry provenance in the store itself (NEW 2).** The announced-binding store records the certificate digest that each announcement committed to. The expiry stays coupled to that digest whether or not the discovery entry survives:
+  - an unchanged digest keeps its known expiry, including after discovery eviction;
+  - a verified digest change clears it until that certificate lands.
+- **Ingest and hydration serialised (NEW 1).** Both write under the store's write lock:
+  - Hydration updates the binding whose digest matches, whatever the discovery entry's state.
+  - A certificate-less ingest takes the expiry of a verified blob for its digest that has already landed.
+
+  Whichever writes last, the landed expiry stands.
+
+| Item | Status | Red, then fix | Evidence |
+|---|---|---|---|
+| NEW 1: the ingest and hydration race lost the landed expiry | Fixed | `b84b338` (ingest receives the blob cache, no behaviour change), `ec07fb9`, `e4f64d7` | `r7e_a_certificate_landing_mid_ingest_keeps_its_expiry` (the interleaving is forced through `announced_record_barrier`) |
+| NEW 2: discovery eviction erased a retained expiry | Fixed | `ec07fb9`, `e4f64d7` | `r7e_discovery_eviction_never_erases_a_retained_expiry` (includes a digest-change control) |
+
 Still open for g10: the pinned path needs a direct connection to the resolved machine. If the requester reached the owner only through the gossip inbox, and repair or redial cannot dial it, the exchange still fails (`err_not_connected`), and the joiner's retry or the share's backoff carries the delivery. That is G10.
 
 Still outstanding for merge: the G10 evidence (e2e Home joins, survivor rekeys, mixed-version delivery on raw-only), from Root's ephemeral-testnet gate.
