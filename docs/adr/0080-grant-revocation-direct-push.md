@@ -279,8 +279,9 @@ the push reaches those daemons too (D112).
   keeps `POST /grants` compatible and bounds the sidecar at about 2 MiB
   (1,024 grants × 64 × 32 B).
 - **Load failure: quarantine, not an operator stop (D120).** Load detects
-  the format family before it decodes. The sidecar's magic is a fixed
-  family prefix plus a version number.
+  the format family before it decodes. The sidecar's header is a fixed
+  family prefix plus a fixed-width version field. Every version keeps that
+  header shape, and versions are numbered from 1.
   - **The prefix is reserved.** This sidecar's family prefix is reserved
     for its path forever. Every future format of the file keeps the prefix
     and takes a higher version number. That version is the "new magic"
@@ -288,32 +289,45 @@ the push reaches those daemons too (D112).
     without the prefix cannot come from any binary, earlier or later.
 
   Load tells four cases apart:
-  - **A damaged file.** Either the file has no recognised family prefix,
-    or the prefix is recognised and the version is one this build
-    supports but the body does not decode exactly. Only a damaged file is
-    quarantined (below).
-  - **A newer format.** The family prefix is right, but the version is
-    higher than this build supports. That includes a future magic in the
-    family, for example after a downgrade. It is never quarantined. It
-    stays byte-identical at its path, as ADR 0085 rules 4 and 5 require,
-    so an upgrade again restores it in full. No write runs while it is
-    there.
+  - **A newer format.** The header is complete, the prefix is right, and
+    the version is a valid number higher than this build supports. That
+    includes a future magic in the family, for example after a downgrade.
+    Only this case counts as newer. It is never quarantined. It stays
+    byte-identical at its path, as ADR 0085 rules 4 and 5 require, so an
+    upgrade again restores it in full. No write runs while it is there.
+  - **A damaged file.** Anything else that is not a clean file of a
+    supported version: no recognised prefix, a header cut short even
+    with the prefix, version 0 or another invalid version, damaged bytes
+    in a supported-version header, or a body that does not decode
+    exactly. Only a damaged file is quarantined (below).
   - **A read error** (an I/O error, not a decode failure). The file is not
     quarantined. Each later issue retries the read before it writes. A
     successful read loads the file and merges the entries held in memory.
-  - **No file, but a quarantined copy beside it.** An earlier quarantine
-    stopped before its replacement existed. Load resumes it (below).
+  - **An unfinished quarantine.** A copy still carries the pending mark
+    (below). Load resumes that transaction before anything else. A
+    finished quarantine copy is history: it never triggers a resume or a
+    rebuild, whether the sidecar beside it is healthy or missing. A
+    missing sidecar with no pending copy is a fresh start.
 - **The quarantine lifecycle.** It runs under the sidecar writer lock,
   and only after ADR 0094's host commit. Before the commit, the damaged
   file stays in place, and the sidecar state is `awaiting_quarantine`.
   1. Rename the damaged file to a free quarantine name in the same
-     directory. The name is always new, so no earlier copy is replaced.
-  2. Fsync the directory. Only now are the original bytes preserved.
+     directory, with a pending mark in the name. The name is always new,
+     so no earlier copy is replaced.
+  2. Fsync the directory. The copy sits in the same directory, so one
+     fsync covers both names. An implementation that puts copies in
+     another directory fsyncs both directories. Only now are the original
+     bytes preserved.
   3. Create the replacement sidecar with the durable write: a temp file,
      fsync, rename onto the sidecar path, then a directory fsync. No
      replacement write starts before step 2 succeeds. What the
      replacement holds is open question 1.
-  4. Set the sidecar state to `ok`, and update each grant's state.
+  4. Rename the copy to drop the pending mark, then fsync the directory.
+     The transaction is now finished, and the copy is history.
+  5. Set the sidecar state to `ok`, and update each grant's state.
+
+  At most one transaction is open at a time. Load resumes it before any
+  other sidecar work.
 
   Failures at each boundary:
   - **Step 1 or 2 fails.** The sidecar state is `quarantine_failed`, with
@@ -321,18 +335,26 @@ the push reaches those daemons too (D112).
     the damaged file is still at its path, byte-identical. Each later
     issue retries from the failed step before it writes, and so does a
     restart.
-  - **A crash between step 1 and step 3.** If the rename did not survive,
-    load finds the damaged file again and starts over at step 1. If it
-    did, load finds no file and the quarantined copy, so the state is
-    `quarantine_resumed`: it repeats step 2, which is harmless, and goes
-    on to step 3.
+  - **A crash after step 1, before step 4 is durable.** If the rename did
+    not survive, load finds the damaged file again and starts over at
+    step 1. If it did, load finds the pending copy, and the state is
+    `quarantine_resumed`. Resume always starts at step 2: it repeats the
+    directory fsync (both directories, if they differ). Only after that
+    fsync succeeds does it inspect any file or write. Then it runs step 3
+    if the sidecar path holds no valid replacement, and step 4 in any
+    case.
+  - **The fsync fails during resume.** The state is `quarantine_failed`,
+    step 2, and nothing is inspected or written. The pending copy stays,
+    so the next issue or restart resumes again.
+  - **A crash during resume.** The pending copy is still there, so the
+    next load resumes again from step 2. Every step is safe to repeat.
   - **Step 3 fails.** The original bytes are already preserved. The
     sidecar state is `write_failed`, new issues hold their lists in memory,
-    and the next persist retries step 3.
+    and the next persist retries step 3, then step 4.
 
   No quarantined copy is ever deleted, truncated or overwritten.
-  `GET /diagnostics/grants` lists each copy with its name, time, size and
-  sha256.
+  `GET /diagnostics/grants` lists each copy with its name, time, size,
+  sha256 and whether it is still pending.
 - **What the replacement restores (open question 1).** D120 rules a
   quarantine and a rebuild from holders. For this sidecar no holder
   exists: only the issuing install ever has the list, and no protocol
@@ -820,10 +842,12 @@ and 13 and their variants.
      `deliver_to: [D's agent]`.
    - **"D refuses Gn"** means that D's `GET /grants/received` lists Gn
      with `revoked: true` while v3 gossip to D is still held.
-   - Each variant is its own run. A variant that names G0 first seeds it
-     in a separate clean setup run: start O, issue G0, wait for
-     `recorded`, then stop O. Any file change the variant names is made
-     while O is stopped. The variant's own run then starts at T = 0 s.
+   - Each variant is its own run. Variants 12d, 12d2, 12d3, 12i and the
+     second run of 12e need G0 at startup. They seed it in a separate
+     clean setup run: start O, issue G0, wait for `recorded`, then stop
+     O. Any file change the variant names is made while O is stopped. The
+     variant's own run then starts at T = 0 s. Variant 12b issues its own
+     G0 during its run, with no setup run.
 
    Variants:
    - **12a, the list survives a restart (red).** Issue G1 at T = 2 s. The
@@ -903,10 +927,28 @@ and 13 and their variants.
        `quarantine_failed`, step 2, and no replacement file is written
        until a retry of step 2 succeeds.
      - **A crash after the rename.** A hook pauses after step 2. Kill O
-       with SIGKILL and restart it. Load finds no sidecar and the
-       quarantined copy, reports `quarantine_resumed`, and creates the
-       replacement. The copy's sha256 equals the recorded one, and only
-       one copy exists.
+       with SIGKILL and restart it. Load finds the pending copy, reports
+       `quarantine_resumed`, repeats the directory fsync, then creates
+       the replacement and drops the pending mark. The copy's sha256
+       equals the recorded one, and only one copy exists.
+     - **A crash after the replacement, before the mark is dropped.** A
+       hook pauses after step 3. Kill O and restart it. Resume repeats
+       the fsync, finds a valid replacement, writes no second one, and
+       runs step 4. One copy exists, and it is no longer pending.
+     - **The fsync fails during resume.** As the crash after the rename,
+       but a hook fails the resume's directory fsync. The state is
+       `quarantine_failed`, step 2. No file is inspected, no replacement
+       is written, and the copy stays pending. Release the hook and
+       restart: resume completes.
+     - **A crash during resume.** As the crash after the rename, but a
+       hook kills O again inside resume, after its fsync. The next restart
+       resumes from step 2 and completes. One copy exists.
+     - **History does not trigger a rebuild.** After a finished
+       quarantine, restart O with the healthy sidecar and the finished
+       copy beside it. Nothing is renamed or rewritten, and the sidecar's
+       sha256 is unchanged. Then stop O, delete the sidecar, and start O:
+       it is a fresh start with no resume, and G0 shows `not_recorded`,
+       cause `absent`.
      - **A crash before the rename is durable.** A hook kills O between
        step 1 and step 2, and the harness drops the unsynced rename. After
        the restart, the damaged file is back at its path, and the
@@ -917,6 +959,11 @@ and 13 and their variants.
        recorded sha256, the sidecar is `ok`, and G0 shows `not_recorded`,
        cause `quarantined` (option (a) of open question 1). Issue G19:
        `recorded`, and `DELETE /grants/G19` reaches D.
+     - **Other damage is not "newer".** Repeat the last sub-case three
+       times: with the header cut short after the prefix, with version 0,
+       and with damaged bytes in a supported-version header. Each is
+       quarantined as in 12d. 12d2 is the control: a complete header with
+       a valid higher version is never quarantined.
      - **The replacement write fails.** A hook fails step 3. The copy
        exists with the recorded sha256. The sidecar state is
        `write_failed`, and an issue holds its list in memory. Release the
