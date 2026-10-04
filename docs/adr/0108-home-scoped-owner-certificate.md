@@ -101,7 +101,7 @@ Reuse stream protocol `EvidenceV1 = 0x06`; retain Put/Ack frame types 7/8 and ad
 | 8, `HomeCertificateAckV1` | Typed `Accepted`, `Retry(reason)` or `Refused(reason)`, encoded by explicit `u8` tags, with one `u8` reason for Retry/Refused |
 | 9, `HomeCertificateReceiptV1` | Four context fields, then recipient `[u8;32]`; no certificate bytes |
 
-K = 1 for S2; S5 (ADR 0111) may raise K at its acceptance. The V1 vector shape is frozen now; validate its 1..K bound before accepting any entry.
+K = 1 for S2; S5 (ADR 0111) may raise K at its acceptance. The V1 vector shape is frozen now; validate its 1..K bound before accepting any entry. The V1 Ack covers the whole frame, all-or-nothing: Accepted means every entry was stored; any Retry or Refused means none was. A Receipt names one context per entry. So a later K > 1 needs no new Ack shape.
 Carry each certificate's existing `to_storage_bytes()` encoding verbatim.
 On wire and file intake, require `to_storage_bytes(decoded) == received_certificate_bytes` and recompute the canonical roster digest.
 `from_storage_bytes` uses permissive `bincode::deserialize` (`src/identity.rs:810,813`); decoding alone does not reject trailing bytes.
@@ -111,7 +111,7 @@ Derive each sender/recipient agent from verified current evidence binding it to 
 The pre-identity admission of EvidenceV1 alone grants no right to send or receive Home evidence.
 
 Ack has a frozen manual tagged encoding, not bincode's four-byte Rust enum discriminant: Accepted=0; Retry=1; Refused=2.
-The reason is a typed `u8`: Retry uses context_unavailable=0, recipient_upgrade_required=1, capacity=2, persistence_failed=3, busy=4; Refused uses invalid_certificate=0, digest_mismatch=1, ineligible=2, ambiguous_binding=3, malformed=4.
+The reason is a typed `u8`: Retry uses context_unavailable=0, recipient_upgrade_required=1, capacity=2, persistence_failed=3, busy=4, ambiguous_binding=5 (bindings move under ADR 0089, so this must stay retryable); Refused uses invalid_certificate=0, digest_mismatch=1, ineligible=2, malformed=3.
 Unknown tags/reasons or extra bytes are protocol errors and never acceptance.
 Accepted means durable evidence acceptance, never membership admission or key installation; persist the sender's acknowledgement receipt and stop that pair's retries.
 Retry sends no receipt and waits for its named condition to clear, with the proposed retry interval below; re-admit each attempt.
@@ -145,7 +145,7 @@ The joiner's own certificate is on `MemberJoined` at `named_groups.rs:33647`, pu
 The metadata topic is plaintext and its mesh can contain non-members (`src/gossip/pubsub.rs:1203–1228`, non-member-mesh test around `:5072`); a topic subscription is not membership authentication.
 Redact only the gossip projection, retaining the committed certificate digest and signed commitment; never rewrite signed bytes. Apart from the named Q8 joiner-certificate and Q4 #946 exceptions, if any nested artifact contains certificate bytes, withhold that artifact from gossip and deliver it directly under the same guard.
 Audit all event, state/snapshot, recovery, blob and retransmission serializers for nested copies; apart from those named interim exceptions pending David's answers to ADR 0111 Q8 and Q4, no owner-certificate bytes may leave a Home node except to a directly authenticated member of that Home.
-The joiner's existing direct submission of its own admission certificate remains unchanged.
+The joiner's existing submission of its own admission certificate remains unchanged (it is gossiped; see the interim exception above).
 S5's K inline certificates follow the same Home rule, subject to David's Q8 and Q4 rulings; its general carry rule cannot restore other gossip leakage.
 Legacy nodes can still leak through today's carriers: upgraded nodes enforce this rule on every own write, and S2 makes no fleet-wide privacy claim while legacy senders remain.
 
@@ -242,7 +242,7 @@ Persist accepted bytes before Accepted Ack, and sender receipts before durable r
 Do not append fields to `peer-evidence.bin` or persist derived `Clean` verdicts.
 Retain ADR 0089's 10 KiB certificate limit; capacity pressure yields Retry(capacity), never usable unverified evidence.
 A proposed 16 MiB sidecar cap and retention/pruning policy await David in Open questions.
-Keep `named_groups.json` and `home-suite-groups.json` in their unchanged legacy-safe JSON formats (#451); do not place scoped bytes or new fields there. Use inert legacy-view placeholders only where required by #451's safety pattern.
+Keep `named_groups.json` and `home-suite-groups.json` in their unchanged legacy-safe JSON formats (#451); do not place scoped bytes or new fields there. S2 writes no legacy-view placeholder; existing #451 behaviour is unchanged.
 Defer any first sidecar write that changes host behaviour until ADR 0094's host commit where applicable.
 Follow ADR 0085: new magic for a changed body, frozen released decoders, lazy rewrite, atomic replace and released-binary fixtures.
 No released binary yet writes X0HCV1: before code merges supply a golden encoder fixture plus SHA-256 and provenance; the first release writing it supplies the actual released-binary fixture, retained by every later decoder test.
@@ -291,7 +291,6 @@ Use the single `named_groups.rs` code lane. D55's harness exception applies only
 ## Follow-ups
 
 - **Restart harness hook:** add `s2_strip_owner_certificate_from_direct_member_added` to remove O's certificate from the direct MemberAdded roster sidecar, leaving its committed digest intact, so the restart case isolates scoped persistence.
-- **Moving bindings:** change `Refused(ambiguous_binding)` to `Retry(ambiguous_binding)` before the V1 encoding freezes; bindings move under ADR 0089.
 - **S2 duplicate bytes:** count the interim direct #970/#1023 sidecar bytes duplicated by Put in the size table.
 - **Length:** shorten this ADR in a later editorial pass while preserving the decision, named exceptions and validation gates.
 
