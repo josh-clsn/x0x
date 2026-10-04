@@ -336,6 +336,8 @@ This is not a claim that every mixed-version Home converges before S5–S7.
 
 Every ADR 0088 slice, and ADR 0080, quarantines and rebuilds its own unreadable sidecar files by this one lifecycle. Each slice names only its own files, their family prefixes and header layout, its rebuild source, and the outcome for state no holder has. This section is normative for all of them; a slice that cites it adds no lifecycle text of its own.
 
+**Writer exclusion.** Each file has one writer lock that serializes every write to `F`. Classification, every quarantine step, resume and finalize run while holding it, from the first read of `F` to the last fsync of `D`. Ordinary persists of `F` wait for the lock and then use their normal atomic write. So the bytes that classification hashes are the bytes step 1 renames.
+
 **Classification at load, before any decode.**
 - A read error leaves the file untouched. The slice runs memory-only for that file as `sidecar_unavailable { file, cause: read_error }` and retries at the next load.
 - The family prefix is reserved for the file's path forever, and every future format keeps it with a higher version. A header is *valid* only when it is complete and every byte matches the slice's layout: prefix, version field, terminator and padding.
@@ -351,16 +353,19 @@ Every ADR 0088 slice, and ADR 0080, quarantines and rebuilds its own unreadable 
 
 No replacement is written before steps 2 and 3 succeed. The original bytes are always at `F`, in a pending copy, or in a history copy, and the lifecycle never deletes them; retention is each slice's open question.
 
-**Resume at startup.** Each `F.q-<txid>-<h>.pending` in `D` is one unfinished transaction, identified by its `txid`.
-- Resume always starts at step 2 and repeats the fsync of `D`. Only after that succeeds does the node check bytes or write anything.
-- Step 3 checks the pending copy against `h`, which is taken from its name.
-- If `F` exists, is a valid supported file and lists this `txid` in `rebuilt_from`, step 4 already completed, so go to step 5.
-- If `F` exists, is valid and does not list this `txid`, keep `F` and finalize the copy as history (step 5) without rebuilding.
-- If `F` is missing, remove any `F.tmp-<txid>`, run step 4, then step 5.
-- Finalize is idempotent. If the pending name is gone and the history name exists, only fsync `D`.
-- Several pending copies are handled in `txid` order, and one replacement may list all of them in `rebuilt_from`.
+**Resume at startup.** Each `F.q-<txid>-<h>.pending` in `D` is one unfinished transaction, identified by its `txid`. Resume runs under the writer lock, in this order:
+1. **Barrier.** Repeat the fsync of `D` (step 2). Only after it succeeds does the node read, check or write anything.
+2. **Verify.** In `txid` order, check each pending copy against the `h` in its name (step 3). A copy that fails stays pending and shows `sidecar_quarantine_failed { step: verify }`. No replacement covers it, and the next load retries it. The copies that pass form the set `V`.
+3. **Classify `F`** exactly as at load:
+   - **Missing:** remove any `F.tmp-*` left by these transactions, then build one replacement (step 4) that covers `V`.
+   - **Valid and supported:** keep `F`. Each `txid` in `V` is finalized (step 5), whether or not `F` lists it in `rebuilt_from`; a listed `txid` means step 4 already completed, and an unlisted one needs no rebuild.
+   - **Newer or unreadable:** keep `F` byte-identical and run memory-only as `sidecar_newer_format` or `sidecar_unavailable`. Leave every pending copy as it is. A binary that can read `F` resumes them later.
+   - **Damaged:** quarantine `F` as its own transaction, with a new `txid` (steps 1 to 3). If it verifies, add its `txid` to `V`. `F` is now missing, so build one replacement that covers `V`.
+4. **Finalize.** Run step 5 for each `txid` in `V`, in `txid` order.
 
-A crash at any point, including during a resume, leaves a state from which these rules resume again.
+**Coverage.** One replacement's `rebuilt_from` lists every `txid` in `V` when step 4 runs, including a `txid` just created for a newly damaged `F`. If `V` exceeds the slice's bound, the replacement lists the first `txid`s in order. The rest are finalized as history beside the valid `F`, which needs no further rebuild.
+
+Finalize is idempotent. If the pending name is gone and the history name exists, only fsync `D`. A crash at any point, including during a resume, leaves a state from which these rules resume again.
 
 **History.** A copy without `.pending` is history. It never triggers a resume or a rebuild, whether `F` is present or absent. If `F` is absent and only history copies exist, the slice applies its rule for a missing file. That is not a resume.
 
@@ -371,6 +376,9 @@ A crash at any point, including during a resume, leaves a state from which these
 - **fsync failures:** at steps 2, 4 and 5.
 - **Resume crashes:** a crash during a resume, and a second crash in the same resume.
 - **Pending copies:** a pending copy beside a healthy `F` that is not from this transaction; one beside the completed replacement; one with `F` missing.
+- **Resume with a bad `F`:** a pending copy beside an `F` that was damaged after its replacement, which must start a new transaction and end with one replacement listing both `txid`s; beside a newer `F`, and beside an unreadable `F`, both of which must stay byte-identical with the pending copy untouched.
+- **Several pending copies:** three pending copies, one of which fails verify. The replacement lists the two that pass, the failed one stays pending, and the next load finalizes it as history beside the valid `F`.
+- **Writer exclusion:** an ordinary persist issued between classification and step 1, and another during a resume. Each waits for the lock, step 3 passes, and the persist then lands in the replacement.
 - **History:** history copies with `F` present and with `F` absent. Neither may trigger a rebuild.
 - **Classification:** header damage forms (missing prefix, truncated, invalid version, bad padding), a newer valid version, a read error, and a clock rollback between two corruptions, which must have no effect.
 

@@ -341,7 +341,7 @@ the push reaches those daemons too (D112).
   | `held_in_memory`, cause one of ADR 0108 §5a's sidecar states, with its fields | the sidecar is not usable, so it runs memory-only and no write runs | §5a's exit for that state; for `awaiting_host_commit`, the host commit | none | host commit: the quarantine runs, then a persist: `recorded`. Otherwise a restart: `not_recorded`, cause `absent` |
   | `unavailable`, cause one of ADR 0108 §5a's sidecar states, with its fields | the grant was in the issued store at load; its list, if any, is in that file | §5a's exit for that state; for `awaiting_host_commit`, the host commit | none | a load that reads the file: `recorded` if it holds an entry, else `not_recorded`, cause `absent`. A quarantine: as open question 1 rules |
   | `not_recorded`, cause `over_cap` (D141) | the request named more than 64 agents | nothing | none | terminal |
-  | `not_recorded`, cause `quarantined` (D120; option (a) of open question 1) | the entry was in a quarantined file, and the replacement does not restore it | nothing | none | terminal |
+  | `not_recorded`, cause `quarantined` (D120; option (a) of open question 1) | the entry was in a quarantined file, and the replacement does not restore it | nothing | none | terminal. After a restart the grant shows cause `absent`, because the damaged file cannot say which grants it held |
   | `not_recorded`, cause `absent` | no entry: issued before the sidecar existed, on another owner install, while downgraded, or lost at a restart | nothing | none | terminal |
 - **Mixed versions and downgrade.** There is no wire change. A released
   binary never reads the sidecar or a quarantined copy, so a downgrade
@@ -867,11 +867,26 @@ and 13 and their variants.
      `X0GDTx\0\0` (not a digit), `X0GDT1\0\x01` (bad padding), a file
      without the prefix, and a version 1 body with trailing bytes. A valid
      `X0GDT2\0\0` file is the control, as in 12d2. Besides §5a's
-     assertions, each run that completes a quarantine checks this ADR's
-     outcome as in 12d: G0 is `not_recorded`, cause `quarantined`, a new
-     issue is `recorded`, and `DELETE /grants/G0` pushes to H and G only.
-     Each run that stops in a §5a failure state checks that a new issue is
-     `held_in_memory` with that state and that its revoke still reaches D.
+     assertions, each run checks this ADR's outcome by its kind:
+     - **Replacement runs.** §5a writes a replacement at step 4: the file
+       was damaged at load, or a pending copy sits beside a missing file.
+       The loss outcome of 12d applies. G0 has no list and shows
+       `not_recorded`, cause `quarantined` in that run. A new issue is
+       `recorded`, and `DELETE /grants/G0` pushes to H and G only.
+     - **Finalize-only runs.** §5a finds a pending copy beside a healthy
+       file and only finalizes the copy as history. The file stays
+       byte-identical, and no replacement is written. When the healthy
+       file is not from this transaction and still records G0, G0 stays
+       `recorded`, and `DELETE /grants/G0` reaches D. When the healthy
+       file is this transaction's completed replacement, it stands
+       unchanged: G0 still has no list, and its revoke pushes to H and G
+       only. No loss is asserted for a grant whose list the healthy file
+       holds.
+     - **Failure runs.** §5a stops in a failure state. A file still at
+       its path stays byte-identical. G0 shows `unavailable` with that
+       state. A new issue is `held_in_memory` with that state, and its
+       revoke still reaches D.
+
      Red on main: there is no sidecar, no quarantine and no state.
    - **12e, the host-commit wait (red).** O starts the candidate as an
      ADR 0094 update that is not yet host-committed. Issue G7:
