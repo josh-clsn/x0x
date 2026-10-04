@@ -614,7 +614,34 @@ impl ShareGrantStore {
         revoked: &RevocationSet,
         now: u64,
     ) -> bool {
-        let state = self.read_state();
+        self.evidence_related_in(&self.read_state(), agent, cert, revoked, now)
+    }
+
+    /// [`Self::evidence_related`] without ever blocking (x0x #1150 r7c,
+    /// synchronous seams): `None` while a writer holds the store.
+    pub(crate) fn try_evidence_related(
+        &self,
+        agent: AgentId,
+        cert: Option<&crate::identity::AgentCertificate>,
+        revoked: &RevocationSet,
+        now: u64,
+    ) -> Option<bool> {
+        let state = match self.state.try_read() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        Some(self.evidence_related_in(&state, agent, cert, revoked, now))
+    }
+
+    fn evidence_related_in(
+        &self,
+        state: &StoreState,
+        agent: AgentId,
+        cert: Option<&crate::identity::AgentCertificate>,
+        revoked: &RevocationSet,
+        now: u64,
+    ) -> bool {
         state.issued.values().any(|g| {
             g.is_active_at(now)
                 && g.agents.contains(&self.local_agent)

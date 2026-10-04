@@ -88,6 +88,47 @@ impl EvidencePolicy for RuntimePolicy {
             || r.is_machine_revoked(&machine)
             || r.is_binding_revoked(&agent, &machine)
     }
+    fn try_relation(
+        &self,
+        agent: AgentId,
+        machine: MachineId,
+        cert: Option<&AgentCertificate>,
+        now: u64,
+    ) -> Option<u8> {
+        if agent == self.local_agent {
+            return Some(0);
+        }
+        let revoked = self.revoked.try_read().ok()?;
+        let mut flags = self
+            .owner
+            .try_evidence_relation(agent, machine, cert, &revoked, now)?;
+        let groups = match self.groups.try_read() {
+            Ok(slot) => slot.clone(),
+            Err(std::sync::TryLockError::Poisoned(_)) => None,
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        if let Some(groups) = groups {
+            match groups(agent) {
+                Some(true) => flags |= GROUP,
+                Some(false) => {}
+                None => return None,
+            }
+        }
+        Some(flags)
+    }
+    fn try_revoked(
+        &self,
+        agent: AgentId,
+        machine: MachineId,
+        _user: Option<UserId>,
+    ) -> Option<bool> {
+        let r = self.revoked.try_read().ok()?;
+        Some(
+            r.is_agent_revoked(&agent)
+                || r.is_machine_revoked(&machine)
+                || r.is_binding_revoked(&agent, &machine),
+        )
+    }
     fn contains_agent(&self, agent: AgentId, now: u64) -> bool {
         // Without a record, only explicit agent grants and active rosters
         // resolve this agent. Enrollment/user-grant resolution needs a record;

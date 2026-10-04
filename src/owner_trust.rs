@@ -131,6 +131,40 @@ impl OwnerTrust {
         Some(relation)
     }
 
+    /// [`Self::evidence_relation`] without ever blocking (x0x #1150 r7c,
+    /// synchronous seams): `None` while any store it reads is held by a
+    /// writer.
+    pub(crate) fn try_evidence_relation(
+        &self,
+        agent: AgentId,
+        machine: MachineId,
+        cert: Option<&AgentCertificate>,
+        revoked: &RevocationSet,
+        now: u64,
+    ) -> Option<u8> {
+        fn try_slot<T: Clone>(slot: &std::sync::RwLock<T>) -> Option<T> {
+            match slot.try_read() {
+                Ok(value) => Some(value.clone()),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    Some(poisoned.into_inner().clone())
+                }
+                Err(std::sync::TryLockError::WouldBlock) => None,
+            }
+        }
+        let mut relation = 0;
+        if let (Some(owner), Some(devices)) = (self.local_owner, try_slot(&self.devices)?) {
+            if devices.try_evidence_enrolled(&machine, &owner, now)? {
+                relation |= crate::peer_evidence::ENROLLED;
+            }
+        }
+        if let Some(grants) = try_slot(&self.grants)? {
+            if grants.try_evidence_related(agent, cert, revoked, now / 1000)? {
+                relation |= crate::peer_evidence::GRANT;
+            }
+        }
+        Some(relation)
+    }
+
     /// Install the #926 grant redelivery outbox. Every clone sees it.
     pub fn install_share_grant_outbox(
         &self,

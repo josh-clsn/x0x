@@ -348,6 +348,27 @@ pub trait EvidencePolicy: Send + Sync {
     /// Checks agent, machine and binding revocations. The certificate user is
     /// available to policies with a user revocation subject; RuntimePolicy has none.
     fn revoked(&self, agent: AgentId, machine: MachineId, user: Option<UserId>) -> bool;
+    /// [`Self::relation`] for synchronous admission seams (x0x #1150 r7c):
+    /// `None` while a policy read would block. Never waits on a lock.
+    fn try_relation(
+        &self,
+        agent: AgentId,
+        machine: MachineId,
+        cert: Option<&AgentCertificate>,
+        now_ms: u64,
+    ) -> Option<u8> {
+        Some(self.relation(agent, machine, cert, now_ms))
+    }
+    /// [`Self::revoked`] for synchronous admission seams (x0x #1150 r7c):
+    /// `None` while the revocation read would block. Never waits on a lock.
+    fn try_revoked(
+        &self,
+        agent: AgentId,
+        machine: MachineId,
+        user: Option<UserId>,
+    ) -> Option<bool> {
+        Some(self.revoked(agent, machine, user))
+    }
     /// Used to protect watermarks even when their record is absent.
     fn contains_agent(&self, agent: AgentId, now_ms: u64) -> bool;
 }
@@ -680,8 +701,16 @@ impl PeerEvidenceStore {
         if !current(&view, now, self.max_age) {
             return Err("age_or_certificate_expiry");
         }
-        if !allowed(&*self.policy, &view, now) {
-            return Err("relationship_or_revocation");
+        if blocking {
+            if !allowed(&*self.policy, &view, now) {
+                return Err("relationship_or_revocation");
+            }
+        } else {
+            match try_allowed(&*self.policy, &view, now) {
+                Some(true) => {}
+                Some(false) => return Err("relationship_or_revocation"),
+                None => return Err(STORE_BUSY),
+            }
         }
         {
             let mut state = self.state_for_check(blocking)?;
@@ -1309,6 +1338,17 @@ fn allowed(policy: &dyn EvidencePolicy, view: &EvidenceView, now: u64) -> bool {
             m,
             view.certificate.as_ref().and_then(|c| c.user_id().ok()),
         )
+}
+/// [`allowed`] without ever blocking (x0x #1150 r7c): `None` while a policy
+/// read would block.
+fn try_allowed(policy: &dyn EvidencePolicy, view: &EvidenceView, now: u64) -> Option<bool> {
+    let a = view.announcement.agent_id;
+    let m = view.announcement.machine_id;
+    if policy.try_relation(a, m, view.certificate.as_ref(), now)? == 0 {
+        return Some(false);
+    }
+    let user = view.certificate.as_ref().and_then(|c| c.user_id().ok());
+    Some(!policy.try_revoked(a, m, user)?)
 }
 fn disqualified(
     watermarks: &HashMap<AgentId, MoveWatermarkV1>,
