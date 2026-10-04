@@ -193,9 +193,22 @@ advert sets `grant_revocation_push_v1`. The push is best-effort. The
   restart drops pending pushes. Gossip still carries the record.
 - **The DELETE response:** the success contract stays ADR 0077's. The
   DELETE does not wait for pushes. It reports `push_recipients`, the
-  number of pushes scheduled. Results go to `/diagnostics` counters:
+  number of pushes scheduled, and the grant's `deliver_to_record` state
+  (section 3a). Results go to counters in `GET /diagnostics/grants`:
   `pushed`, `send_failed`, `skipped_not_capable`,
   `skipped_unknown_capability` and `skipped_bound`.
+- **Pending pushes are visible.** `GET /diagnostics/grants` lists each
+  pending push with its `grant_id`, its recipient and its state:
+  - `awaiting_capability`: waits for a current verified advert from the
+    recipient, after one targeted refresh. It shows its deadline, 600 s
+    after the wait began. Exits: the advert has the bit (`sending`), the
+    advert lacks it (`skipped_not_capable`), or the deadline passes
+    (`skipped_unknown_capability`).
+  - `sending`: shows attempt n of 3. Exits: `pushed` or `send_failed`.
+  - A restart drops every pending push. Gossip still carries the record.
+
+  The same endpoint keeps the latest outcomes, at most 1,024, each with
+  its `grant_id`, its recipient and its outcome.
 
 ### 3a. The recorded `deliver_to` list (D112)
 
@@ -214,24 +227,62 @@ the push reaches those daemons too (D112).
   make a downgraded v0.46.1 install refuse its whole share-grant store, so
   it would hold and enforce no grants. The sidecar leaves the released
   store as it is.
-- **When.** The issue call writes the entry after the grant is durable. A
-  failed write does not fail the issue. The response field
-  `deliver_to_recorded` is false, and the failure is counted. The field is
-  true only when a non-empty list is durable. The first sidecar write
-  waits for ADR 0094's host commit; until then the field is false.
+- **Atomic persistence.** Each sidecar persist writes the whole in-memory
+  map with the share-grant store's durable write: a temp file, fsync,
+  rename over the sidecar, then a directory fsync. A crash leaves the old
+  file or the new one, never a mix. No sidecar write runs before ADR
+  0094's host commit (ADR 0094 allows no persisted-format upgrade write
+  before it).
+- **Order against revoke.** The in-memory map is the only source for
+  item 3. The issue call runs these steps in order:
+  1. Insert the list into the in-memory map under the new `grant_id`.
+  2. Persist the sidecar, when writes are allowed (see the states below).
+  3. Only then insert the grant into the issued store. Before this step,
+     `GET /grants` does not list the grant, and its random id has not been
+     returned, so no caller can revoke it.
+  4. If step 3 fails, the issue fails and the map entry is removed.
+
+  A revoke reads the issued grant first and the map second. So a revoke
+  that can see the grant always sees its list. A paused or slow sidecar
+  write delays only its own issue call. A revoke of another grant does not
+  wait for it.
+- **Crash outcomes.**
+  - Before the sidecar write lands: neither the entry nor the grant is
+    durable, and the issue never returned.
+  - After the sidecar write, before the grant is durable: the entry is an
+    orphan. Load drops an entry whose grant is not in the issued store,
+    and the next persist removes it.
+  - After both: the two are consistent.
+  - An entry held only in memory (below) is lost on restart, and its
+    grant becomes `not_recorded`.
 - **Lifetime.** An entry lives as long as its grant stays in the issued
   store. A revoke reads the entry and does not remove it, so a retried
-  DELETE pushes to the same set. Load drops an entry whose grant is not in
-  the issued store, and the next sidecar persist removes it. The issued
-  store's cap (1,024 grants) bounds the entry count. The cap on one list's
-  length is open question 2.
+  DELETE pushes to the same set. When the issued store prunes a grant, its
+  entry goes too. The issued store's cap (1,024 grants) bounds the entry
+  count. The cap on one list's length is open question 2.
 - **Load failure.** An unknown magic or a body that does not decode is
   refused with an explicit error. The file is left byte-identical and is
-  never rewritten (ADR 0085 rule 4). The grants are unaffected. While the
-  sidecar is refused, each revoke pushes to items 1 and 2 only and counts
-  `deliver_to_unavailable`, and each issue reports
-  `deliver_to_recorded: false`. This state is visible in `/diagnostics`
-  and ends only when an operator moves the file aside.
+  never rewritten (ADR 0085 rule 4). The grants are unaffected. The
+  refusal ends only when an operator moves or repairs the file and the
+  daemon restarts.
+- **Typed states.** Each issued grant has one `deliver_to_record` state.
+  The `POST /grants` response, each `GET /grants` entry and the
+  `DELETE /grants/:id` response report it with its `grant_id`.
+  `GET /diagnostics/grants` reports the sidecar's own state (`ok`,
+  `awaiting_host_commit`, or `refused` with its error) and a count per
+  grant state. A revoke uses the list in `recorded` and `held_in_memory`.
+  In every other state it pushes to items 1 and 2 only. In `unavailable`
+  it also counts `deliver_to_unavailable`.
+
+  | State | Cause | Waits for | Deadline | Exit |
+  |---|---|---|---|---|
+  | `none_requested` | the request's `deliver_to` was empty | nothing | none | terminal |
+  | `recorded` | the list is durable in the sidecar | nothing | none | terminal; removed with the grant |
+  | `held_in_memory`, cause `awaiting_host_commit` | ADR 0094 has not yet host-committed the running binary | ADR 0094's host commit | none of its own; ADR 0094's commit or rollback ends it | host commit, then a persist: `recorded`. A rollback or restart first: `not_recorded` |
+  | `held_in_memory`, cause `write_failed`, with the error | the sidecar persist failed | the next successful persist (the next issue or prune) | none | that persist: `recorded`. A restart first: `not_recorded` |
+  | `held_in_memory`, cause `sidecar_refused` | the sidecar did not load, so no write runs | nothing in this run | none | a restart: `not_recorded` |
+  | `unavailable`, cause `sidecar_refused` | the grant was in the issued store when the sidecar was refused; its list, if any, is in the refused file | a restart that loads a readable sidecar | none | that restart: `recorded` if the file holds an entry, else `not_recorded` |
+  | `not_recorded` | no entry: issued before the sidecar existed, on another owner install, while downgraded, or lost at a restart | nothing | none | terminal |
 - **Mixed versions and downgrade.** There is no wire change. A released
   binary never reads the sidecar, so a downgrade keeps its share-grant
   store and its grants as they are. After a re-upgrade, a grant issued
@@ -302,15 +353,14 @@ effect, because the record carries its own authority.
 **The live-session bound starts at receipt (D111).** ADR 0074 s3 closes a
 live session within 5 s. That bound starts when the host first receives
 the record, by push or by gossip, whichever comes first.
-- "Receives" means the first copy that reaches the shared ingest: a pushed
-  copy that passes steps 1 to 5, or a gossip batch that holds the record.
-  A copy dropped before step 6 (`not_ready`, `malformed`, `rate_limited`
-  and the rest) is not a receipt. The next copy that reaches the ingest
-  starts the bound.
 - Live-session re-evaluation runs on the in-memory insert. It does not
   wait for the coalesced persist (section 6) or for a store hold.
-- On a daemon whose own grant sends hold the outbox send gate, step 6 can
-  wait for that gate before it inserts. Open question 1 covers that case.
+- As written, this ADR cannot meet the bound in two cases. Both are open
+  for David, and neither is an exception until he rules:
+  - on a daemon whose own grant sends hold the outbox send gate, step 6
+    waits for that gate before it inserts (open question 1);
+  - a valid pushed copy dropped as `not_ready` or `rate_limited` never
+    reaches the ingest (open question 3).
 
 ### 5. Idempotence, replay and ordering
 
@@ -482,9 +532,12 @@ listing that ADR 0098 defines shows pushed records too.
 - The owner learns nothing from a successful push, because there is no
   ACK. The DELETE reports what it scheduled, not what arrived.
 - A `deliver_to` daemon that is neither a host nor a grantee agent gets
-  only gossip for a grant issued before the sidecar existed, issued while
-  downgraded, revoked from another owner install, or revoked while the
-  sidecar is refused (section 3a).
+  only gossip for a grant in state `not_recorded` or `unavailable`: one
+  issued before the sidecar existed, issued while downgraded, revoked from
+  another owner install, held only in memory across a restart, or present
+  when the sidecar was refused (section 3a).
+- The issue call now persists the sidecar before the grant becomes
+  visible, so a slow sidecar write delays that issue call (section 3a).
 - One store format to add (the sidecar), with its fixture and downgrade
   tests (D112).
 - The code waits for the D28 review of ADRs 0070 and 0077, so revocation
@@ -503,9 +556,12 @@ listing that ADR 0098 defines shows pushed records too.
 
 - ADR 0077's ordering text stays authoritative. This ADR adds propagation
   only.
-- `/diagnostics` gains sender counters (section 3), receiver counters
-  (section 4), `persist_held` (section 6) and `deliver_to_unavailable`
-  (section 3a). The `POST /grants` response gains `deliver_to_recorded`.
+- A new `GET /diagnostics/grants` carries the sender counters, pending
+  pushes and recent outcomes (section 3), the receiver counters
+  (section 4), `persist_held` (section 6), and the sidecar state and
+  `deliver_to_unavailable` (section 3a). The `POST /grants`,
+  `GET /grants` and `DELETE /grants/:id` responses gain the
+  `deliver_to_record` state.
 - The startup gap in section 4 (a verified frame with no registered route
   reaches history) also applies to the existing production typed
   prefixes. This ADR closes it only for its own prefix.
@@ -537,7 +593,14 @@ listing that ADR 0098 defines shows pushed records too.
 
 ## Validation
 
-Tests for the implementing PR. Each one needs a recorded red run.
+Tests for the implementing PR.
+
+**Merge gate.** Cases 12 and 13 are W3-H harness cases (#1164). Each red
+variant is committed and shown red on main before this slice's code
+merges. A control variant passes on main and must stay green. Cases 1 to
+11 are the implementing PR's own tests, and each needs a recorded red run
+as marked. Until the harness exists, a tracking issue should list cases 12
+and 13 and their variants.
 
 1. **The push alone revokes.** With gossip disabled, a capable host that
    stored the grant stops honouring it after the push. Red: push disabled.
@@ -548,8 +611,11 @@ Tests for the implementing PR. Each one needs a recorded red run.
    - Unknown capability (D113), on a deterministic clock: one refresh is
      requested. A current advert with the bit that arrives before 600 s
      gets the push. With no such advert by 600 s, the push is skipped and
-     counted `skipped_unknown_capability`. Gossip revokes the grant in
-     both runs.
+     counted `skipped_unknown_capability`. During the wait,
+     `GET /diagnostics/grants` lists the push as `awaiting_capability`
+     with its grant, its recipient and its deadline. Afterwards the
+     outcome list shows how it ended. Gossip revokes the grant in both
+     runs.
    - A card-only claim does not count.
    - A receiver without the route gets nothing in DM history or
      subscribers.
@@ -595,38 +661,121 @@ Tests for the implementing PR. Each one needs a recorded red run.
 11. **Mixed versions** (sealed testnet, the release-gate row style). 0.45
    and pre-bit 0.46 receivers get no push and no DM history entry, and
    gossip still revokes the grant.
-12. **The recorded `deliver_to` list (D112).**
-   - Issue a grant whose `deliver_to` names a capable agent that is
-     neither a host nor a grantee agent. Restart the owner, then revoke.
-     That agent's daemon gets the push. Red: no recorded list, as today.
-   - Corrupt the sidecar and restart. The file stays byte-identical, the
-     grants load and are enforced, a revoke counts
-     `deliver_to_unavailable` and pushes to items 1 and 2, and an issue
-     reports `deliver_to_recorded: false`.
-   - Downgrade (control): the released v0.46.1 binary starts on a data
-     dir that holds the sidecar. It loads its share-grant store, enforces
-     its grants, and leaves the sidecar byte-identical. ADR 0085 rule 6:
-     the `X0SG` fixture from the released encoder still loads.
-   - Before ADR 0094's host commit, no sidecar write happens.
-13. **The live-session bound from receipt (D111)**, once ADR 0074 s3
-   lands. Deterministic clock. A capable host has a live stream under the
-   grant.
-   - Gossip disabled: the push reaches the ingest at t0, and the stream
-     is closed by t0 + 5 s.
-   - Push disabled: the gossip batch arrives at t0, with the same result.
-   - A push dropped as `rate_limited` does not start the bound; the next
-     copy that reaches the ingest does.
+12. **The recorded `deliver_to` list (D112).** A W3-H case.
+   - **Nodes.** Four daemons on the candidate build, each advertising the
+     bit:
+     - O: the owner install, with the user key. It issues and revokes,
+       and it holds the sidecar.
+     - H: a second install of the same owner. It hosts the shared agent A.
+     - G: an agent of the grantee user U. O's discovery cache knows it.
+     - D: a second agent of U. It is not in O's discovery cache, so only
+       `deliver_to` names it.
+   - **Clock and schedule.** One deterministic clock from T = 0 s. Direct
+     DMs arrive 100 ms after send. Capability adverts from H, G and D
+     reach O at T = 1 s, and again 1 s after each O restart. D's identity
+     announcements never reach O. `x0x.revocation.v3` gossip to D is held
+     for the whole case. To H and G it flows.
+   - **The issue call.** `POST /grants` on O with `grantee_user: U`,
+     `agents: [A]`, `ttl_secs: 86400` and `deliver_to: [D's agent]`.
+   - **"D refuses Gn"** means that D's `GET /grants/received` lists Gn
+     with `revoked: true` while v3 gossip to D is still held.
 
-   Red: re-evaluation that waits for the coalesced persist.
+   Variants:
+   - **12a, the list survives a restart (red).** Issue G1 at T = 2 s. The
+     response state is `recorded`. Restart O at T = 10 s. Call
+     `DELETE /grants/G1` at T = 20 s. By T = 21 s, D refuses G1, and O's
+     `GET /diagnostics/grants` shows the outcome `pushed` for D. Red on
+     main: there is no push, so D still honours G1.
+   - **12b, a paused write and a concurrent DELETE (red).** Issue G0 at
+     T = 2 s (`recorded`). A harness fault hook pauses O's next sidecar
+     write. Issue G1 at T = 5 s. The call blocks in the paused write.
+     - From T = 5 s to T = 15 s, `GET /grants` lists G0 and not G1.
+     - `DELETE /grants/G0` at T = 6 s answers 200 by T = 7 s, and D
+       refuses G0 by T = 8 s.
+     - The hook releases the write at T = 15 s. The G1 call returns
+       `recorded`, and `GET /grants` lists G1 as `recorded`.
+     - `DELETE /grants/G1` at T = 16 s. D refuses G1 by T = 17 s.
+
+     Red on main: G1 is listed at once, and D refuses neither grant.
+   - **12c, a failed write and crashes (red).**
+     - The hook fails O's next sidecar write with an I/O error. Issue G2.
+       The response and `GET /grants` show `held_in_memory`, cause
+       `write_failed`, with the error. `DELETE /grants/G2`: D refuses G2.
+     - The hook fails the next write again. Issue G3, then kill O with
+       SIGKILL and restart it. `GET /grants` shows G3 as `not_recorded`.
+       `DELETE /grants/G3` pushes to H and G only, and D gets no push.
+     - The hook pauses the sidecar write for G4. Kill O. After the
+       restart, G4 is not listed, and the sidecar's bytes equal the file
+       from before the pause.
+     - The hook pauses O's share-grant store write for G5, after its
+       sidecar write. Kill O. After the restart, G5 is not listed, and the
+       sidecar holds no G5 entry after the next persist.
+
+     Red on main: none of these states exists.
+   - **12d, a refused sidecar (red).** Stop O. Overwrite the sidecar with
+     random bytes, and record its sha256. Start O.
+     `GET /diagnostics/grants` shows the sidecar `refused`, with its
+     error. G0 shows `unavailable`, cause `sidecar_refused`.
+     `DELETE /grants/G0` pushes to H and G only and counts
+     `deliver_to_unavailable`. Issue G6: `held_in_memory`, cause
+     `sidecar_refused`. `DELETE /grants/G6`: D refuses G6. At the end,
+     the sidecar's sha256 is unchanged. Red on main: there is no sidecar
+     and no state.
+   - **12e, the host-commit wait (red).** O starts the candidate as an
+     ADR 0094 update that is not yet host-committed. Issue G7:
+     `held_in_memory`, cause `awaiting_host_commit`, and no sidecar file
+     is written. `DELETE /grants/G7`: D refuses G7. The harness completes
+     the host commit. Issue G8: `recorded`, and the sidecar exists. Red on
+     main: none of these states exists.
+   - **12f, a downgrade (control).** The candidate O issues G9
+     (`recorded`) and stops. The released v0.46.1 binary starts on the
+     same data dir. It lists G9 in `GET /grants` with no `store_error`.
+     After it stops, the sidecar's sha256 is unchanged. The candidate
+     starts again and shows G9 as `recorded`. ADR 0085 rule 6: the `X0SG`
+     fixture from the released encoder still loads. Control: on a data
+     dir from main, the released binary gives the same result.
+13. **The live-session bound from receipt (D111).** A W3-H case. It needs
+   ADR 0074 s3.
+   - **Nodes.** Three daemons on the candidate build, each advertising the
+     bit: O (the owner install, which issues and revokes), H (a second
+     install of the owner, which hosts agent A, with a loopback TCP echo
+     target on port p), and G (the grantee agent's daemon).
+   - **Clock and schedule.** One deterministic clock from T = 0 s. Direct
+     DMs arrive 100 ms after send. Capability adverts reach O at T = 1 s.
+   - **Steps.** At T = 2 s, `POST /grants` on O with `grantee_agent: G`,
+     `agents: [A]`, `caps: [Connect{ports: [p]}]` and `ttl_secs: 86400`.
+     At T = 4 s, `POST /forwards` on G to A, port p. The harness opens a
+     TCP connection through G's forward and sends 1 KiB every 100 ms. At
+     T = 10 s, `DELETE /grants/:id` on O.
+   - **Assertion.** Let t0 be the time the first copy of the record
+     reaches H. The harness connection is reset by t0 + 5 s, and H counts
+     one live-stream teardown.
+
+   Variants:
+   - **13a, push only (red).** v3 gossip to H is held for the whole case.
+     The push reaches H at t0 = 10.1 s. Red on main: there is no push, so
+     the stream runs on.
+   - **13b, gossip only (control).** The harness drops O's push frames to
+     H. The v3 gossip batch reaches H at t0 = 12 s. Control: it passes on
+     main once ADR 0074 s3 is there.
+   - **13c, a slow persist (red).** As 13a, with H's `revocations-v3.bin`
+     write paused for 30 s. The stream is still reset by t0 + 5 s. Red on
+     main: there is no push. It is also red against an implementation
+     whose re-evaluation waits for the persist.
+   - Variants for open questions 1 and 3 are written once David rules.
+
+   If ADR 0074 s3 is not on main when this slice is ready, 13a and 13c
+   are still committed and shown red on main, because no teardown exists
+   there. 13b then becomes a control when s3 lands.
 
 **Revisit** when ADR 0098 is drafted, when renewal is designed, or if
 `Outbox<T>` makes a durable push cheap.
 
 ## Rulings and open questions
 
-**Blocking David's Accept:** open question 1, and the cross-model review
-named under Reviewers. Open question 2 blocks only the implementing
-slice's code.
+**Blocking David's Accept:** open questions 1 and 3, and the cross-model
+review named under Reviewers. Open question 2 blocks only the
+implementing slice's code.
 
 David ruled Q1–Q7 on 2026-10-04 (D108–D114):
 
@@ -641,7 +790,8 @@ David ruled Q1–Q7 on 2026-10-04 (D108–D114):
   never lifts the hold (D110; section 6).
 - **Q4, live sessions:** the ADR 0074 s3 5 s bound starts when the host
   first receives the record, by push or gossip (D111; section 4). Open
-  question 1 records one case where the ADR's text cannot yet meet it.
+  questions 1 and 3 record two cases where the ADR's text cannot yet
+  meet it.
 - **Q5, `deliver_to`:** recorded in the implementing slice, as a versioned
   share-grant store change under ADR 0085 (D112; section 3a).
 - **Q6, the gate:** confirmed. Push only on positive evidence, and wait up
@@ -680,10 +830,30 @@ Still open for David:
 2. **The cap on one recorded `deliver_to` list (D112). Blocks code, not
    Accept.** `POST /grants` sets no cap on `deliver_to` today. Proposal:
    record at most 64 agents, the shared-agent cap (`MAX_GRANT_AGENTS`). A
-   longer list is still delivered in full, but it is not recorded, and the
-   response reports `deliver_to_recorded: false`. This keeps `POST /grants`
-   compatible and bounds the sidecar at about 2 MiB (1,024 grants × 64 ×
-   32 B). The value needs David's ruling.
+   longer list is still delivered in full, but it is not recorded. The
+   grant's state is then `not_recorded`, cause `over_cap`, a terminal
+   state, and a revoke pushes to items 1 and 2 only. This keeps
+   `POST /grants` compatible and bounds the sidecar at about 2 MiB (1,024
+   grants × 64 × 32 B). The value needs David's ruling.
+3. **Valid copies dropped before the ingest (D111). Blocks Accept.**
+   Section 4 drops a pushed copy as `not_ready` (before the typed route is
+   ready) or `rate_limited` (over 16 a minute from one sender, or 256 in
+   total). That copy may hold a valid record. D111 starts the bound at
+   first receipt, with no exception. The receiver cannot verify a copy
+   before the ingest, and the rate limit exists to bound verify work.
+   - (a) Exclude these drops: the bound starts at the first copy that
+     reaches the shared ingest, meaning a pushed copy that passes steps 1
+     to 5, or a gossip batch that holds the record. A dropped copy starts
+     nothing, and the next copy that reaches the ingest starts the bound.
+     Cost: during startup or a flood, the bound can slip until gossip or a
+     later push arrives.
+   - (b) Keep D111 with no exception: buffer a `not_ready` copy until the
+     route is ready, and queue rate-limited copies instead of dropping
+     them. Cost: two new bounded queues. The bound still fails if startup
+     takes more than 5 s or a flood fills a queue.
+
+   Recommended: (a). A host can act only on a copy it can admit. Case 13
+   gains a variant for whichever option David rules.
 
 ## Notes for AI-assisted work
 

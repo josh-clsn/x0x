@@ -118,7 +118,7 @@ D68 makes S5 remove the joiner's own certificate from Home gossip. This ends ADR
 - **Digest-only add.** When every active seat and the joiner set the bit in a current verified advert, a capable authority seals the Home add in digest-only form. The `MemberAdded` carries a new serde-default field `certificate_digest` (the seat digest, §1) and no `certificate_b64`. Any nested copy of the joiner's `MemberJoined` in it (for example `member_joined_recovery`, `named_groups.rs:1539`) also has no `certificate_b64`. The author evidence (§2) covers `certificate_digest`.
 - **Receiver: hold, fetch, verify, then apply.** A capable receiver handles a digest-only Home add the same way however it arrives: by gossip, direct copy, #818 page, S5 fetch or ADR 0106's carry.
   1. It runs every check that does not need the bytes: the commit signature, the actor's role, prev-hash linkage, the owner mandate, the TreeKEM payload fields, and the roster root. The roster with the joiner seated at `certificate_digest` must re-derive the commit's `roster_root`.
-  2. It takes the bytes from local verified evidence (S2's store or an earlier fetch). Otherwise it fetches the `certificate` object by that digest (§4). It asks the add's actor, the joiner and any active member.
+  2. It takes the bytes from local verified evidence: S2's scoped store, or an earlier fetch still in memory. Otherwise it fetches the `certificate` object by that digest (§4). It asks the add's actor, the joiner and any active member. A holder serves it from either source in §6.
   3. It runs today's certificate check on those bytes (`named_groups.rs:11249-11295`). The bytes must hash to the digest and decode, the certificate must verify against the group owner, and the joiner must not be in the local revocation set.
   - Only after step 3 does it apply the add, TreeKEM commit included. Until then the add is held, not applied, and later events wait behind it, as at any gap. Its typed state is `subject_certificate_pending` (§8). A held add is kept in memory only; after a restart the node learns it again by catch-up (§4).
   - If step 3 fails, the receiver rejects the add as today and records `subject_certificate_invalid` (§8). Bytes that do not hash to the digest do not fail the add: the receiver discards them and asks another holder.
@@ -159,7 +159,9 @@ A holder serves an object, or answers a head query, only while **all** of these 
 - when the invite is addressed, the sender is its intended joiner;
 - the sender is not Banned or Removed on the holder's current committed roster.
 
-A pre-member gets no other kind and no other root. This discloses only what the invite already discloses: the roster at its base, which today's v4 invite carries inline (`invite.rs:123-130`). A pending joiner asks its inviter and the other admins its invite names. S5 supplies this primitive (0088's S5 row: "the #646 primitive"). #646 closes when an invite shape that binds only the root ships (Q10).
+A pre-member gets no other kind and no other root. This discloses only the root-covered fields that the invite already binds. A v4 invite carries them inline (`invite.rs:123-130`). Above the 20-entry cap, ADR 0112's V5 view signs the base `roster_root` and omits the projection (ADR 0112 §1). A pending joiner asks its inviter and the other admins its invite names.
+- **Ownership.** S5 owns this serving rule (0088's S5 row: "the #646 primitive"). ADR 0112 owns the invite shape. #646 closes when both have shipped. S6 is Accepted after S5, so ADR 0112's V5 path depends on this rule.
+- **Ruled and open.** D95 rules only the roster at the invite's root. Whether a pending joiner may also receive the chain after that root, such as a promotion, is still open (Q9). S5 serves no such chain.
 
 **Answers to a refused requester (L3).**
 - A requester with no seat on the holder's committed roster, and no valid invite for the pre-member rule, gets `group_object_absent_v1`. That is the same answer as "not held", so S5 adds no membership oracle. A forged or invalid invite gets the same answer.
@@ -167,16 +169,23 @@ A pre-member gets no other kind and no other root. This discloses only what the 
 - Holder-side states (not an active member, withdrawn, deleted, quarantined) answer `absent`, and the requester tries another holder.
 - **Responder limits (D98):** the existing staging caps (`control_blob.rs:14-20`) and 8 requests per requester per 10 s. Over a limit, a requester that passes the guard gets the retryable `refused { capacity }` or `refused { rate_limited }`, with `retry_after`. Any other requester gets `absent`.
 
-**Every physical exchange is admitted afresh.** That covers each inline answer, each chunk and each retry. Admission runs right before the transport write, in one single-exchange send with no transport-level resend. Each retry is a new request, admitted again.
-- Today the chunk path copies the bytes and only then spawns the send (`control_blob.rs:633-657`). So the S5 chunk task re-admits inside the task.
+**Every physical exchange is admitted afresh, under the membership lock** (cross-slice rule 5; ADR 0107's linearization). This covers each inline answer, each head answer, each pre-member (D95) answer, each blob chunk and each retry.
+- For each exchange the holder takes the group's membership lock. It then selects the artifact, checks the requester's current eligibility (§5's guard, or the D95 conditions), and makes the one transport write. Only then does it release the lock. It makes one single-exchange send with no transport-level resend. Each retry is a new request, admitted again.
+- Every membership change takes the same lock: removal, ban, revocation, a verdict change, withdrawal, deletion, local leave and quarantine. So each write happens wholly before or wholly after such a change, never across it. Certificate expiry needs no lock, because each admission checks the current time.
+- Today the chunk path copies the bytes and only then spawns the send (`control_blob.rs:633-657`). So the S5 chunk task takes the lock and re-admits for every chunk, inside the task.
 - Object bytes never use gossip or the gossip-capable direct-message fallback.
-- On removal, ban, revocation, certificate expiry, a verdict change, withdrawal, deletion, local leave or quarantine, the holder aborts and awaits that requester's in-flight S5 sends, then purges its staged copies.
+- No S5 write is in progress while a membership change holds the lock. After the change, the holder cancels that requester's S5 tasks and purges its staged copies. A task already waiting for the lock re-checks eligibility after the change and sends nothing.
 - These are the class-R properties of the #1190 lifecycle note (related work). S5 requires the properties; it does not depend on that branch merging.
 - S5 never serves Welcomes or class-K key envelopes. D60's epoch-bound share admission stays the separate guard for them.
 
 ### 6. Holder store (ADR 0085)
 
-- Certificates and projections are served from `named_groups.json`. Nothing new is stored for them.
+- **Serving sources.** Projections are served from `named_groups.json`. Certificates are served from the seat certificates in `named_groups.json` and, in a Home, also from S2's scoped store (`home-owner-certificates.hscert`, ADR 0108 §5). S5 adds no file for them.
+- **Where fetched certificates persist.**
+  - In a Home, a fetched certificate persists only in S2's scoped store, as an S2 entry with its disclosure context (group, owner, subject, committed digest), under S2's write, cap and pruning rules. It never goes into `named_groups.json`.
+  - A certificate fetched for a held add (§3a) has no committed context until the add applies, so it stays in memory until then. A restart before that fetches it again.
+  - In an ordinary group, a fetched certificate is stored as today's hydrate stores it (`seat_cert_fetch.rs:915`).
+  - If the persist fails, including S2's `Retry(capacity)`, the node still uses the verified bytes for the apply in progress, and fetches them again after a restart.
 - **New persisted state:** one file per event, `<data_dir>/group-holder/<stable_group_id>/<state_hash>.ev`. Each file is magic `X0GHE1\0\0`, then bincode `HeldEventV1 { revision, committed: bool, event_json }`, consumed exactly. `event_json` is the JCS bytes (§2) of the event value with only `roster_certificates_b64` removed.
 - **Order and durability.**
   - Before persisting the roster for a sealed or applied commit, the node writes the event's file with `committed = false`: a temp file, fsync, rename, then fsync of the directory.
@@ -341,7 +350,7 @@ W3-H (#1164) does not exist yet. Each case below is a specification: nodes, step
   - Assert: a capable holder (O or P) answers L's #946 request on the topic, as today, and S sees that answer. O stages `certificate_evidence_unavailable` toward J0 at 10 minutes (the named §2 entry "#946 legacy refusal", §8). New with S5: no #946 answer goes to a requester that sets the bit.
   - Baseline: green on `main` for the first two assertions. They must stay green until the minimum supported version (D35) drops legacy peers.
 
-**Exit tests:** H1–H5 green; C1–C3 unchanged or better.
+**Exit tests:** H1–H5 green, and H6 once ADR 0112's V5 invite has merged; C1–C4 unchanged or better.
 - Rejections: wrong hash; bad author or commit signature; a mismatched signer; a projection carrying an uncovered field; a root no signed commit binds; a forked chain (the #846 gate fires); a legacy event from a non-author holder; a digest-only add whose `certificate_digest` the roster root does not bind.
 - **Digest test vectors** (committed with the implementation, each with its expected BLAKE3):
   - nested objects whose keys sort differently by UTF-16 code unit and by code point (for example U+E000 against U+1F600);
@@ -358,11 +367,24 @@ W3-H (#1164) does not exist yet. Each case below is a specification: nodes, step
 - Removed, banned, revoked, expired and verdict-changed requesters each get `refused` with that reason and no bytes, inline and by chunk. Withdrawn and quarantined holders, and a stranger, answer `absent`.
 - An invalidation that races an in-flight chunk aborts it before its write. A retry is admitted afresh.
 - Over the responder limits, a seated requester gets the retryable `refused`, and a stranger gets `absent`.
-- **Pre-member roster fetch (D95).**
-  - Nodes: admin A (inviter), member H, joiner J holding A's signed invite at root R, banned identity Z holding an older valid invite, stranger X with a forged invite.
-  - Steps: A stops. J, Z and X each fetch the projection at R from H. J then asks for a projection at another root, and for a `commit_event`. J retries with an expired copy of its invite.
-  - Assert: J gets exactly the projection at R and re-derives R. J's other requests get `absent`. Z gets `refused { banned }`. X gets `absent`. The expired invite gets `refused { invite_expired }`.
-  - Baseline: control. `main` serves no pre-member fetch, so the refusals hold there; the answer to J is new.
+- The D95 rule has a red case (H6) and a separate control (C4), below.
+
+**D95 cases.**
+- **H6, invite-bound roster fetch above the cap (red on `main`).**
+  - Nodes: admin A (issuer), member H, 23 further members (25 Active seats), joiner J.
+  - Steps:
+    1. The 25 seats converge.
+    2. A mints an invite for J through the public invite API. Above the cap this is ADR 0112's V5 view, which binds the base root.
+    3. A stops.
+    4. J calls the public join API.
+  - Assert: within 120 s, J obtains the projection at the invite's root from H, re-derives the root, and makes no other pre-member fetch.
+  - Baseline on `main`: red. A cannot mint an invite past 20 entries (#646, `invite.rs:201-217`).
+  - Gate: H6 is committed red on `main` before S5's code merges. It turns green only once ADR 0112's V5 invite has also merged; it mirrors the D95 variant of ADR 0112's `s6_promoted_admin_stale_invite`.
+- **C4, no roster to anyone else (control: green on `main`, must stay green).**
+  - Nodes: admin A, member H, banned identity Z holding an older valid invite, stranger X with a forged invite.
+  - Steps: A stops. Z and X each call the public join API with their invites.
+  - Assert: H sends Z and X no roster projection and no other object bytes. On `main` there is no pre-member fetch, so this holds today.
+  - New with S5 (typed answers, not on `main`): Z gets `refused { banned }`, X gets `absent`, and an expired copy of J's invite gets `refused { invite_expired }`. J's requests for another root or for a `commit_event` get `absent`.
 
 **Non-regressions:** ADR 0106's carry; ADR 0107's guard; the R19 suite; KV sync tests; D60 share admission unchanged.
 
@@ -377,17 +399,18 @@ David ruled G7 and Q1–Q8 on 2026-10-04 (D64, D65, D68, D93–D98):
 - **G7, L3 binds every slice (D64):** a hard rule. Every block S5 adds or touches ends in a typed refusal or a typed, visible wait, including the joiner's 120 s poll and upgrade and backoff waits (§8).
 - **Q1, K (D93):** K = 4 (§3).
 - **Q2, KV history (#811) (D94):** if C2 is red, retained KV images become a fourth object kind, `kv_image`, served under the same guard (§1, §5).
-- **Q3, pre-member roster fetch (#646) (D95):** a pending joiner with a signed invite that binds the root may fetch that roster (§5).
+- **Q3, pre-member roster fetch (#646) (D95):** a pending joiner with a signed invite that binds the root may fetch that roster (§5). This rules the roster at the invite's root only. ADR 0112 §1 defines the V5 invite that binds only that root above the 20-entry cap.
 - **Q4, #946 retirement (D96), against the recommendation:** #946 topic answers and the 10-minute refusal stay for legacy peers in all groups, Home included, until the minimum supported version (D35) (§4). The legacy-joiner refusal is the named ADR 0088 §2 entry "#946 legacy refusal", the same entry ADR 0108 records (§8).
 - **Q5, retention exhaustion (D97):** treated as admission. Any admin re-Welcomes the member, through S8 (b) or a later ADR (§4). A confirmed member likely needs that later ADR, because ADR 0114 as drafted repairs only never-confirmed seats.
 - **Q6, operational values (D98):** accepted as recommended (§4, §5, §6).
 - **Q7, "S8" in the order (D65):** "S8" means S8 (a), ADR 0107. ADR 0114 follows S4, and S5 does not wait for it (Gates).
 - **Q8, the joiner's own certificate on Home gossip (D68):** S5 removes it, with the digest-only add (§3a), its security argument (§9) and its mixed-version plan (§3a, §7).
 
-Still open for David (neither blocks S5's Accept):
+Still open for David (it does not block S5's Accept):
 
-- **Q9. Pre-member fetch beyond the invite root.** D95 lets a pending joiner fetch only the roster at its invite's root. ADR 0112's promoted-admin path also needs, before membership, the signed chain from that root to the promoted admin. Later commits disclose joins made after the invite, so this is new disclosure. **Proposal:** S5 serves no chain to pre-members. The admin that the joiner redeems at carries that chain in its direct answer, under ADR 0112. This needs David's ruling before ADR 0112's promoted-admin path ships.
-- **Q10. Which ADR defines a root-only invite (#646)?** S5 supplies the fetch, but #646 closes only when an invite binds just the root. As drafted, ADR 0112's InviteV5 keeps V4's semantic fields. **Proposal:** the W4 invite change (D13) defines it. This needs David's ruling before #646 can close.
+- **Q9. Disclosure of the chain after the invite root to a pending joiner.** D95 rules only the roster at the invite's root. ADR 0112's promoted-admin path has the redeeming admin carry the signed chain from the invite base through its own promotion, with its result. That chain discloses joins made after the invite to an identity that is not yet a member, which D95 did not rule. **Proposal:** allow only that chain, only from the redeeming admin, and only on the direct encrypted result path under ADR 0107's guard. S5 still serves no chain to pre-members. This is an open gate for ADR 0112's promoted-admin path, not for S5.
+
+Q10 is withdrawn: ADR 0112 §1 already defines the invite that binds only the root (D95 above).
 
 ## Notes for AI-assisted work
 
