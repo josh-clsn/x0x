@@ -38581,7 +38581,7 @@ async fn handle_welcome_fetch_request(
                             welcome_id,
                             &hex::encode(send_recipient.as_bytes()),
                         );
-                        send_join_artifact(
+                        let outcome = send_join_artifact(
                             &state,
                             &send_recipient,
                             &payload,
@@ -38590,7 +38590,8 @@ async fn handle_welcome_fetch_request(
                             admission,
                             deadline,
                         )
-                        .await
+                        .await;
+                        welcome_frame_delivered(&state, outcome)
                     }
                     _ => send_welcome_blob_message(&state, &send_recipient, &msg)
                         .await
@@ -38600,6 +38601,28 @@ async fn handle_welcome_fetch_request(
         },
     )
     .await;
+}
+
+/// The outcome of one Welcome frame's admitted exchange, as the stream
+/// sees it. Test builds: under the STRICT in-process stand-in (x0x #1150
+/// r7h), an exchange its admission passed counts as delivered, so a test
+/// can drive a stream past its first frame. The default stand-in keeps its
+/// marker error.
+fn welcome_frame_delivered(
+    state: &AppState,
+    outcome: std::result::Result<(), String>,
+) -> std::result::Result<(), String> {
+    #[cfg(test)]
+    if state.agent.pinned_standin_strict_for_testing()
+        && outcome
+            .as_ref()
+            .is_err_and(|reason| reason.contains(x0x::dm::PINNED_STANDIN_ADMITTED))
+    {
+        return Ok(());
+    }
+    #[cfg(not(test))]
+    let _ = state;
+    outcome
 }
 
 /// [`handle_welcome_fetch_request`] with an injectable frame transport

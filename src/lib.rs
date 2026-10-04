@@ -8416,6 +8416,13 @@ impl Agent {
         }
     }
 
+    /// Test seam (x0x #1150, r7h): whether this agent's pinned stand-in is
+    /// strict. Test builds only.
+    #[cfg(test)]
+    pub(crate) fn pinned_standin_strict_for_testing(&self) -> bool {
+        pinned_standin_is_strict(&self.identity.agent_id())
+    }
+
     /// Test seam (x0x #1150, r7b): the transport the strict stand-in's
     /// target selection sees (connection state, repair, redial). Without a
     /// script every machine reports connected. Test builds only.

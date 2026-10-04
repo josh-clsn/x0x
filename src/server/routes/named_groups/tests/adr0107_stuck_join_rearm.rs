@@ -5283,3 +5283,93 @@ async fn s8a_r7c_a_source_lock_held_after_resolution_ends_typed_within_the_bound
     assert_eq!(egress_count(&g.authority, &g_hex, "join_result"), 0);
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// r7h (real-network re-run g10-1190b, finding 3): after an owner restart the
+// Welcome stalled 85.8 s on the Offer and Complete frames, which still took
+// the general DM path's resolver. Every owner Welcome frame must take the
+// bounded, admitted, single-exchange path.
+// ---------------------------------------------------------------------------
+
+/// WHY (r7h): a cold-cache owner restart, then a Welcome fetch verified by
+/// J2's attestation, whose binding lands 300 ms in. The Offer, and after
+/// J2's final ChunkAck the Complete, must each be handed to the admitted
+/// single-exchange transport, within the resolution bound. Before the fix,
+/// both took `send_direct_with_config` (gossip inbox, ACK-v2 receipt with
+/// internal retries).
+#[tokio::test]
+async fn s8a_r7h_owner_restart_welcome_offer_and_complete_take_the_admitted_path(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    let j2_hex = hex_of(&s.j2);
+    let j2_id = s.j2.agent.agent_id();
+    restart_cold(&s.authority, &s.j2, &s.stable).await;
+    let welcome_id = welcome_id_of(&s.j2_add).expect("welcome ref");
+    let total_chunks = {
+        let welcomes = s.authority.pending_welcomes.read().await;
+        let pending = welcomes
+            .get(&welcome_id)
+            .ok_or_else(|| anyhow::anyhow!("staged Welcome"))?;
+        x0x::files::total_chunks_for_size(
+            pending.bytes.len() as u64,
+            x0x::files::DEFAULT_CHUNK_SIZE,
+        )
+    };
+    clear_egress(&s.authority);
+    clear_exchanges(&s.authority);
+    let started = std::time::Instant::now();
+    assert!(serve_welcome(&s.authority, &s.j2, &s.stable, &welcome_id).await);
+    let authority = Arc::clone(&s.authority);
+    let j2_machine = s.j2.agent.machine_id();
+    let attest = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        authority
+            .agent
+            .record_authenticated_binding_for_testing(j2_id, j2_machine, unix_secs_now())
+            .await;
+    });
+    let offered = egress_happens(
+        &s.authority,
+        &j2_hex,
+        "welcome_offer",
+        Duration::from_secs(4),
+    )
+    .await;
+    let offered_after = started.elapsed();
+    if offered && total_chunks > 0 {
+        super::super::handle_welcome_blob_message(
+            &s.authority,
+            &j2_id,
+            WelcomeBlobMessage::ChunkAck {
+                welcome_id: welcome_id.clone(),
+                sequence: total_chunks - 1,
+            },
+        )
+        .await;
+    }
+    let completed = egress_happens(
+        &s.authority,
+        &j2_hex,
+        "welcome_complete",
+        Duration::from_secs(4),
+    )
+    .await;
+    attest.await?;
+    let wrong_transport: Vec<_> = transports_for(&s.authority, &j2_hex)
+        .into_iter()
+        .filter(|(kind, transport)| {
+            kind.starts_with("welcome") && *transport != "pinned_single_exchange"
+        })
+        .collect();
+    assert!(
+        offered,
+        "the Welcome Offer never reached the admitted transport ({offered_after:?})"
+    );
+    assert!(
+        completed,
+        "the Welcome Complete never reached the admitted transport"
+    );
+    assert!(wrong_transport.is_empty(), "{wrong_transport:?}");
+    Ok(())
+}
