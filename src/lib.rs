@@ -3107,6 +3107,8 @@ async fn record_announced_machine_binding(
         .get(&agent_id)
         .filter(|entry| entry.announced_at == announced_at)
         .map(|entry| entry.cert_not_after);
+    #[cfg(test)]
+    announced_record_barrier::park(&agent_id).await;
     dm_inbox::record_authenticated_machine_binding_with_expiry(
         bindings,
         agent_id,
@@ -3115,6 +3117,56 @@ async fn record_announced_machine_binding(
         merged_not_after.unwrap_or(inline_not_after),
     )
     .await;
+}
+
+/// x0x #1150 (r7e): a test-only barrier immediately before an announcement's
+/// announced-binding store write, so a test can land a certificate blob
+/// between an ingest's inputs and its write. Unarmed agents pass straight
+/// through.
+#[cfg(test)]
+pub(crate) mod announced_record_barrier {
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    pub(crate) struct Gate {
+        /// One permit each time an ingest parks here.
+        pub(crate) reached: tokio::sync::Semaphore,
+        /// One permit releases one parked ingest.
+        pub(crate) release: tokio::sync::Semaphore,
+    }
+
+    static GATES: LazyLock<Mutex<HashMap<crate::identity::AgentId, Arc<Gate>>>> =
+        LazyLock::new(Default::default);
+
+    pub(crate) fn arm(agent: crate::identity::AgentId) -> Arc<Gate> {
+        let gate = Arc::new(Gate {
+            reached: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        if let Ok(mut gates) = GATES.lock() {
+            gates.insert(agent, Arc::clone(&gate));
+        }
+        gate
+    }
+
+    pub(crate) fn disarm(agent: &crate::identity::AgentId) {
+        if let Ok(mut gates) = GATES.lock() {
+            gates.remove(agent);
+        }
+    }
+
+    pub(crate) async fn park(agent: &crate::identity::AgentId) {
+        let gate = GATES
+            .lock()
+            .ok()
+            .and_then(|gates| gates.get(agent).cloned());
+        if let Some(gate) = gate {
+            gate.reached.add_permits(1);
+            if let Ok(permit) = gate.release.acquire().await {
+                permit.forget();
+            }
+        }
+    }
 }
 
 /// The identity listener's cache step for one announcement that passed its
@@ -31412,6 +31464,167 @@ async fn r7d_announced_binding_keeps_known_expiry_across_a_same_digest_blob_miss
             .and_then(|b| b.cert_not_after),
         Some(not_after),
         "a same-digest blob miss erased the known expiry"
+    );
+}
+
+/// WHY (x0x #1150 r7e, Codex NEW 1): ingest and hydration race. An ingest
+/// of a V3 announcement whose certificate blob is not yet cached computes
+/// its inputs, then the verified blob lands and hydration runs to
+/// completion, then the ingest writes its binding. The landed expiry must
+/// survive, so a late ingest write must never record a stale "no expiry".
+/// The interleaving is forced with the test-only barrier before the
+/// ingest's store write.
+#[tokio::test]
+async fn r7e_a_certificate_landing_mid_ingest_keeps_its_expiry() {
+    let user_kp = identity::UserKeypair::from_seed(&[0x6a; 32]).expect("owner kp");
+    let joiner = identity::AgentKeypair::generate().expect("joiner kp");
+    let joiner_id = joiner.agent_id();
+    let not_after = Agent::unix_timestamp_secs() + 600;
+    let cert = identity::AgentCertificate::issue_with_expiry(&user_kp, &joiner, Some(not_after))
+        .expect("joiner cert");
+    let digest = announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()));
+    let cache = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let machine_cache =
+        std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let announced: dm_inbox::AuthenticatedMachineBindings = Default::default();
+    let cert_events = test_cert_events();
+    let blob_cache = std::sync::Arc::new(announce_blob::AnnounceBlobCache::new(None));
+    let mut entry = discovered_agent_fixture(0x6a, 100, &[], None);
+    entry.agent_id = joiner_id;
+    entry.cert_digest = Some(digest);
+    let gate = announced_record_barrier::arm(joiner_id);
+    let ingest = {
+        let (machine_cache, announced, blob_cache, cache, cert_events) = (
+            std::sync::Arc::clone(&machine_cache),
+            std::sync::Arc::clone(&announced),
+            std::sync::Arc::clone(&blob_cache),
+            std::sync::Arc::clone(&cache),
+            cert_events.clone(),
+        );
+        tokio::spawn(async move {
+            cache_verified_announcement(
+                &machine_cache,
+                &announced,
+                Some(&blob_cache),
+                &cache,
+                &cert_events,
+                entry,
+            )
+            .await;
+        })
+    };
+    let parked = tokio::time::timeout(std::time::Duration::from_secs(5), gate.reached.acquire())
+        .await
+        .expect("the ingest reached its store write")
+        .expect("barrier open");
+    parked.forget();
+    blob_cache
+        .insert_verified(announce_blob::CachedBlob {
+            digest,
+            user_id: cert.user_id().ok(),
+            agent_certificate: Some(cert),
+            payload_version: 1,
+            fetched_at_unix: 1,
+        })
+        .await;
+    patch_discovery_entry_when_blob_lands(
+        &cache,
+        &announced,
+        &blob_cache,
+        &cert_events,
+        &digest,
+        &joiner_id,
+    )
+    .await;
+    gate.release.add_permits(1);
+    ingest.await.expect("ingest task");
+    announced_record_barrier::disarm(&joiner_id);
+    assert_eq!(
+        announced
+            .read()
+            .await
+            .peek(&joiner_id)
+            .and_then(|b| b.cert_not_after),
+        Some(not_after),
+        "a late ingest write erased the expiry its racing hydration landed"
+    );
+}
+
+/// WHY (x0x #1150 r7e, Codex NEW 2): the announced binding keeps the
+/// certificate expiry for an unchanged digest whether or not the discovery
+/// entry survives. After the entry is evicted (TTL or the cache cap), a
+/// same-digest V3 blob miss must not erase the known expiry. A verified
+/// digest change does clear it.
+#[tokio::test]
+async fn r7e_discovery_eviction_never_erases_a_retained_expiry() {
+    let user_kp = identity::UserKeypair::from_seed(&[0x6b; 32]).expect("owner kp");
+    let joiner = identity::AgentKeypair::generate().expect("joiner kp");
+    let joiner_id = joiner.agent_id();
+    let not_after = Agent::unix_timestamp_secs() + 600;
+    let cert = identity::AgentCertificate::issue_with_expiry(&user_kp, &joiner, Some(not_after))
+        .expect("joiner cert");
+    let digest = announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()));
+    let cache = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let machine_cache =
+        std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let announced: dm_inbox::AuthenticatedMachineBindings = Default::default();
+    let cert_events = test_cert_events();
+    let ingest = |at: u64, digest: [u8; 32], cert: Option<identity::AgentCertificate>| {
+        let mut entry = discovered_agent_fixture(0x6b, at, &[], None);
+        entry.agent_id = joiner_id;
+        entry.cert_digest = Some(digest);
+        entry.cert_not_after = cert
+            .as_ref()
+            .and_then(identity::AgentCertificate::not_after);
+        entry.user_id = cert.as_ref().and_then(|c| c.user_id().ok());
+        entry.agent_certificate = cert;
+        entry
+    };
+    let expiry = || async {
+        announced
+            .read()
+            .await
+            .peek(&joiner_id)
+            .and_then(|b| b.cert_not_after)
+    };
+    cache_verified_announcement(
+        &machine_cache,
+        &announced,
+        None,
+        &cache,
+        &cert_events,
+        ingest(100, digest, Some(cert)),
+    )
+    .await;
+    assert_eq!(expiry().await, Some(not_after), "control: inline expiry");
+    cache.write().await.remove(&joiner_id);
+    cache_verified_announcement(
+        &machine_cache,
+        &announced,
+        None,
+        &cache,
+        &cert_events,
+        ingest(200, digest, None),
+    )
+    .await;
+    assert_eq!(
+        expiry().await,
+        Some(not_after),
+        "a same-digest blob miss after discovery eviction erased the retained expiry"
+    );
+    cache_verified_announcement(
+        &machine_cache,
+        &announced,
+        None,
+        &cache,
+        &cert_events,
+        ingest(300, [0x77; 32], None),
+    )
+    .await;
+    assert_eq!(
+        expiry().await,
+        None,
+        "control: a verified digest change clears the expiry"
     );
 }
 
