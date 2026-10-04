@@ -346,11 +346,6 @@ impl PinnedMachineSource {
 /// the verified sources of its recipient's machine.
 const PINNED_RESOLUTION_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// x0x #1150 (r7c): past its resolution deadline, a pinned send's source
-/// read may still take a lock that is free; it never waits longer than this
-/// for one that is held.
-const PINNED_LOCK_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
-
 /// x0x #1150 (r7b): the transport operations raw-QUIC target resolution
 /// uses (connection state, send-readiness repair, discovery redial).
 /// Production always uses the network; test builds can script them, so the
@@ -2861,7 +2856,7 @@ async fn patch_discovery_entry_when_blob_lands(
     cache: &std::sync::Arc<
         tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
     >,
-    _announced: &dm_inbox::AuthenticatedMachineBindings,
+    announced: &dm_inbox::AuthenticatedMachineBindings,
     blob_cache: &std::sync::Arc<announce_blob::AnnounceBlobCache>,
     cert_events: &tokio::sync::broadcast::Sender<VerifiedCertificate>,
     digest: &[u8; 32],
@@ -2883,8 +2878,9 @@ async fn patch_discovery_entry_when_blob_lands(
             );
             return;
         }
-        let mut cache = cache.write().await;
-        if let Some(entry) = cache.get_mut(agent_id) {
+        let mut landed_for: Option<u64> = None;
+        let mut cache_guard = cache.write().await;
+        if let Some(entry) = cache_guard.get_mut(agent_id) {
             // FRESHNESS GATE (review r2, #447): the entry's LATEST announce
             // must still commit to the digest this fetch resolved. Between
             // the fetch being triggered and landing, a newer announce can
@@ -2911,6 +2907,23 @@ async fn patch_discovery_entry_when_blob_lands(
                 // E2d: the fetched certificate has now LANDED in the
                 // discovery cache — notify the hydration bridge.
                 publish_verified_certificate(cert_events, *agent_id, cert);
+                landed_for = Some(entry.announced_at);
+            }
+        }
+        drop(cache_guard);
+        // x0x #1150 (r7d): the announced binding of the SAME announcement
+        // (the digest just checked) learns the landed certificate's expiry.
+        if let Some(announced_at) = landed_for {
+            let binding = announced.read().await.peek(agent_id);
+            if let Some(binding) = binding.filter(|b| b.announced_at == announced_at) {
+                dm_inbox::record_authenticated_machine_binding_with_expiry(
+                    announced,
+                    *agent_id,
+                    binding.machine_id,
+                    announced_at,
+                    cert.not_after(),
+                )
+                .await;
             }
         }
         return;
@@ -3060,25 +3073,48 @@ fn observed_address_is_dialable(address: &std::net::SocketAddr) -> bool {
     !address.ip().is_unspecified() && address.port() != 0
 }
 
-/// x0x #1150 (r7c): record a verified identity announcement's agent→machine
-/// binding (and certificate expiry) in the announced-binding store, apart
-/// from the discovery cache's mutable routing `machine_id`. Only a
-/// signed, non-zero machine is recorded; an older announcement never rolls
-/// a binding back.
+/// x0x #1150 (r7c, r7d): record a verified identity announcement's
+/// agent→machine binding in the announced-binding store, apart from the
+/// discovery cache's mutable routing `machine_id`. Only a signed, non-zero
+/// machine is recorded, and an older announcement never rolls a binding
+/// back.
+///
+/// It runs AFTER the announcement was merged into the discovery cache, and
+/// takes the certificate expiry from that merged entry. That entry couples
+/// its certificate evidence to the digest the latest announcement committed
+/// to: it keeps a known certificate (and its expiry) for an unchanged digest
+/// even when this announcement's blob was not cached, drops it when the
+/// digest changed, and gains it when the verified blob lands
+/// ([`patch_discovery_entry_when_blob_lands`] then updates this binding
+/// too). Only when no merged entry for this announcement exists does the
+/// announcement's own inline expiry apply.
 async fn record_announced_machine_binding(
     bindings: &dm_inbox::AuthenticatedMachineBindings,
-    agent: &DiscoveredAgent,
+    cache: &std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+    >,
+    agent_id: identity::AgentId,
+    machine_id: identity::MachineId,
+    announced_at: u64,
+    inline_not_after: Option<u64>,
 ) {
-    if agent.machine_id.0 != [0u8; 32] {
-        dm_inbox::record_authenticated_machine_binding_with_expiry(
-            bindings,
-            agent.agent_id,
-            agent.machine_id,
-            agent.announced_at,
-            agent.cert_not_after,
-        )
-        .await;
+    if machine_id.0 == [0u8; 32] {
+        return;
     }
+    let merged_not_after = cache
+        .read()
+        .await
+        .get(&agent_id)
+        .filter(|entry| entry.announced_at == announced_at)
+        .map(|entry| entry.cert_not_after);
+    dm_inbox::record_authenticated_machine_binding_with_expiry(
+        bindings,
+        agent_id,
+        machine_id,
+        announced_at,
+        merged_not_after.unwrap_or(inline_not_after),
+    )
+    .await;
 }
 
 /// The identity listener's cache step for one announcement that passed its
@@ -3097,8 +3133,22 @@ async fn cache_verified_announcement(
     discovered_agent: DiscoveredAgent,
 ) {
     upsert_discovered_machine_from_agent(machine_cache, &discovered_agent).await;
-    record_announced_machine_binding(announced, &discovered_agent).await;
+    let (agent_id, machine_id, announced_at, inline_not_after) = (
+        discovered_agent.agent_id,
+        discovered_agent.machine_id,
+        discovered_agent.announced_at,
+        discovered_agent.cert_not_after,
+    );
     upsert_discovered_agent(cache, cert_events, discovered_agent).await;
+    record_announced_machine_binding(
+        announced,
+        cache,
+        agent_id,
+        machine_id,
+        announced_at,
+        inline_not_after,
+    )
+    .await;
 }
 
 async fn upsert_discovered_machine_from_agent(
@@ -8338,16 +8388,17 @@ impl Agent {
         ))
     }
 
-    /// x0x #1150 (r7c): `read` with its lock waits bounded by `deadline`.
-    /// A read that does not need to wait finishes even past the deadline:
-    /// waits never extend past `max(deadline, now + PINNED_LOCK_GRACE)`.
+    /// x0x #1150 (r7c, r7d): `read`, whose lock waits all end at the one
+    /// absolute `deadline` shared by the resolution and every re-check.
+    /// There is no per-check grace. `timeout_at` polls the read before its
+    /// timer, so a read that does not have to wait still completes after the
+    /// deadline. A read that would wait is refused at it.
     async fn pinned_bounded<T>(
         deadline: tokio::time::Instant,
         stage: &str,
         read: impl std::future::Future<Output = T>,
     ) -> Result<T, dm::DmError> {
-        let until = std::cmp::max(deadline, tokio::time::Instant::now() + PINNED_LOCK_GRACE);
-        tokio::time::timeout_at(until, read)
+        tokio::time::timeout_at(deadline, read)
             .await
             .map_err(|_| Self::pinned_bound_expired(stage))
     }
@@ -14296,11 +14347,12 @@ impl Agent {
                             };
                             upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent)
                                 .await;
-                            record_announced_machine_binding(
-                                &self.announced_machine_bindings,
-                                &discovered_agent,
-                            )
-                            .await;
+                            // x0x #1150 (r7d): no announced-binding write
+                            // here. This lookup skips the listener's
+                            // timestamp, freshness, trust, revocation and
+                            // pairing gates, so only the gated listener
+                            // ingest (`cache_verified_announcement`) records
+                            // pinned authority.
                             upsert_discovered_agent(&cache, &self.verified_cert_tx, discovered_agent).await;
                             return Ok(Some(addrs));
                         }
@@ -16549,12 +16601,25 @@ impl Agent {
     pub async fn insert_discovered_agent_for_testing(&self, agent: DiscoveredAgent) {
         let agent_id = agent.agent_id;
         let machine_id = agent.machine_id;
+        #[cfg(test)]
+        let (announced_at, inline_not_after) = (agent.announced_at, agent.cert_not_after);
         upsert_discovered_machine_from_agent(&self.machine_discovery_cache, &agent).await;
-        record_announced_machine_binding(&self.announced_machine_bindings, &agent).await;
         upsert_discovered_agent(
             &self.identity_discovery_cache,
             &self.verified_cert_tx,
             agent,
+        )
+        .await;
+        // x0x #1150 (r7d): pinned authority comes from gated announcement
+        // ingest only. This unchecked seam writes it in test builds only.
+        #[cfg(test)]
+        record_announced_machine_binding(
+            &self.announced_machine_bindings,
+            &self.identity_discovery_cache,
+            agent_id,
+            machine_id,
+            announced_at,
+            inline_not_after,
         )
         .await;
 
