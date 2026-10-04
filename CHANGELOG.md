@@ -4,7 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.46.2] - 2026-10-04
+
 ### Fixed
+
+- **A restart now applies a pending self-update on systemd hosts (#1196).**
+  The startup update check ran about 3 s after start, inside systemd's 10 s
+  start-rate window, so the restart-safety guard always refused, and the update
+  waited for the 30-minute retry. The startup check now waits out the window
+  read from the unit (plus 2 s) and retries once. Every other refusal is
+  unchanged.
+
+- **Group task-list deltas can no longer go out in plaintext after a policy
+  flip (#1100).** A signed-public group's plaintext task delta or full-state
+  response now holds the publication gate's permit and re-checks the policy. If
+  the group became MlsEncrypted meanwhile, the payload is sealed instead.
 
 - **Pub/sub no longer stalls for 22–60 s after a whole-network restart (#857).**
   The saorsa-gossip-* pins move to 0.5.87 (saorsa-gossip #106). A local publish
