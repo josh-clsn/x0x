@@ -9,7 +9,7 @@
 - **Supersedes:** none. ADR 0088's supersession table assigns nothing to S5.
 - **Amends:**
   - ADR 0088 §2, by one named entry ruled by David (D96) and confirmed by him (D118): "#946 legacy refusal" (§8). ADR 0108 records the same entry; this ADR restates it and adds no second one. ADR 0088 itself is not edited.
-  - ADR 0085 rule 4, for S5's holder files only, ruled by David (D120). A damaged holder file (no `X0GHE` prefix, or an undecodable version-1 file) is moved aside intact and rebuilt from holders, instead of being left in place (§6). Rule 5 is not amended. ADR 0085 itself is not edited.
+  - ADR 0085 rule 4, for S5's holder files only, ruled by David (D120). A damaged holder file is quarantined by ADR 0108 §5a, with its bytes preserved, and rebuilt from holders, instead of being left in place (§6). Rule 5 is not amended. ADR 0085 itself is not edited.
 - **Superseded by:** none
 - **Goal served:** R3 (all my machines connected) and the shared-places core.
 - **Related:** D34(3), D35, D38, D43, D54, D60, D63, D64, D65, D68, D93–D98, D117–D120, D125, D133; ADR 0088 L1–L4, §2, G6, G7; [ADR 0106](./0106-join-result-carries-intervening-membership-events.md) (its deferred option 3); [ADR 0107](./0107-stuck-join-rearm-and-serving-guard.md) (serving guard); [ADR 0108](./0108-home-scoped-owner-certificate.md) (S2: the Home push and its named interim exceptions); [ADR 0109](./0109-ownerless-attestation-self-recovery.md) (S3: `base_beyond_retention`); [ADR 0112](./0112-any-admin-invite-redemption.md) (S6); [ADR 0114](./0114-authority-re-welcome.md) (S8 (b)); [ADR 0089](./0089-relationship-peer-evidence-survives-restart.md) (`EvidenceV1`); [ADR 0085](./0085-persisted-binary-formats-are-versioned.md); [ADR 0093](./0093-capability-advert-registry.md); [ADR 0087](./0087-repository-and-release-governance.md) rule 8; ADR 0028; #811, #1023, #1143, #646, #1164, #818, #946, #970, #1025. Related work only: the join-artifact serving lifecycle note on the #1190 branch.
@@ -199,36 +199,25 @@ A pre-member gets no other kind and no other root. This discloses only the root-
   - A certificate fetched for a held add (§3a) has no committed context until the add applies, so it stays in memory until then. A restart before that fetches it again.
   - In an ordinary group, a fetched certificate is stored as today's hydrate stores it (`seat_cert_fetch.rs:915`).
   - If the persist fails, including S2's `Retry(capacity)`, the node still uses the verified bytes for the apply in progress, and fetches them again after a restart.
-- **New persisted state:** one file per event, `<data_dir>/group-holder/<stable_group_id>/<state_hash>.ev`. Each file is magic `X0GHE1\0\0`, then bincode `HeldEventV1 { revision, committed: bool, event_json }`, consumed exactly. `event_json` is the JCS bytes (§2) of the event value with only `roster_certificates_b64` removed.
+- **New persisted state:** one file per event, `<data_dir>/group-holder/<stable_group_id>/<state_hash>.ev`. Each file is magic `X0GHE1\0\0`, then bincode `HeldEventV1 { revision, committed: bool, rebuilt_from: Vec<[u8; 16]>, event_json }`, consumed exactly. `event_json` is the JCS bytes (§2) of the event value with only `roster_certificates_b64` removed. `rebuilt_from` lists the quarantine `txid`s a replacement covers (ADR 0108 §5a); it is empty for an ordinary write.
 - **Order and durability.**
   - Before persisting the roster for a sealed or applied commit, the node writes the event's file with `committed = false`: a temp file, fsync, rename, then fsync of the directory.
   - After the roster persist succeeds, it rewrites the file with `committed = true` by the same method.
-  - On restart it reconciles: a file whose `state_hash` is on the committed chain (`commit_log` or head) becomes committed. Any other file is deleted.
+  - On restart it reconciles: a file whose `state_hash` is on the committed chain (`commit_log` or head) becomes committed. Any other `<state_hash>.ev` file is deleted. Quarantine copies (`.q-` names) and temp files (`.tmp-` names) are never touched by reconcile; ADR 0108 §5a governs them.
   - An uncommitted file is never served. A crashed seal therefore cannot leak a commit that might be replaced at the same revision. A held add (§3a) is not applied, so it has no file.
 - **Failure:** a failed write is logged and never blocks the commit; coverage drops by one event.
-- **Unreadable file: quarantine and rebuild (D120).** David ruled that S5 quarantines an unreadable holder file and rebuilds it from holders, instead of waiting for an operator.
-  - **Format family first.** Before decoding, the node reads the file's magic. S5's family prefix is `X0GHE`, followed by a version. This binary supports version 1 (`X0GHE1\0\0`).
-    - **Reservation.** The prefix `X0GHE` is reserved for files under `group-holder/` forever. Every future holder format keeps it, with a higher version.
-    - **A newer version** means only a well-formed family header with a valid version higher than 1, including any future magic of that form. It is never quarantined. The file stays byte-identical at its path (ADR 0085 rule 5), and the node never writes to that path. The event is `holder_event_memory_only { state_hash, reason: newer_format }`: the node may fetch it (§4), verify it as §2 does, and serve it from memory for this run. It writes nothing for it.
-    - **Damage** is any other unreadable file: a file without the `X0GHE` prefix (including one too short to hold a magic); a truncated header that keeps the prefix; a version-1 header with damaged padding; version 0 or any other invalid version; and a version-1 file whose body does not decode or is not consumed exactly. Because of the reservation, none of these is ever a newer format. Only damage is quarantined and rebuilt.
-  - **Quarantine lifecycle (durable order).**
-    1. The node renames the damaged file, intact, to `<data_dir>/group-holder-quarantine/<stable_group_id>/<state_hash>.<unix_ms>.evbad`. The new directory and extension mean no binary reads it again.
-    2. It fsyncs the quarantine directory, then the group's directory; they are different directories, so both are fsynced. The group shows `holder_store_quarantined { state_hash, since }`.
-    3. Only after both fsyncs succeed does it fetch the event and create the replacement by the ordinary durability order. No replacement write starts before step 2 completes, so the original bytes are durable first.
-    - **The rename fails:** the original stays byte-identical at its path, and no replacement is written. The event is `holder_event_memory_only { state_hash, reason: quarantine_failed }`.
-    - **An fsync in step 2 fails:** no replacement is written, and the event is `holder_event_memory_only { state_hash, reason: quarantine_fsync_failed }`. The node may serve a fetched, verified copy from memory for this run. It resumes at step 2 at the next start.
-    - **An unfinished transaction** is one whose event path is empty, whose `state_hash` is on the committed chain, and which has a quarantine copy for that `state_hash`. Only this triggers a resume. A quarantine copy beside a healthy file at the path is history: it never triggers a rebuild, and the healthy file is never touched.
-    - **A crash anywhere between the rename and the finished replacement:** at the next start the node finds the unfinished transaction and resumes at step 2. It repeats both directory fsyncs, and only after they succeed does it check bytes or write a replacement (step 3). A leftover replacement temp file is the node's own unfinished write, not the original, and is removed before step 3. If the rename itself was not yet durable, the damaged file is still at its path, and the node quarantines it again from step 1.
-    - **A second crash during the resume** leaves the same unfinished transaction, so the next start resumes at step 2 again. Every step is safe to repeat, and the original bytes are at its path or in the quarantine directory at every point. In no case are both lost.
-    - S5 never deletes, truncates or overwrites a quarantined file. An operator may remove it.
-  - **What is rebuilt.** Every byte in a holder file is a copy of a signed committed event that other holders retain. The `committed` flag and `revision` are re-derived from `commit_log`. If the quarantined file's `state_hash` is on the committed chain and within retention, the node fetches that `commit_event` from other holders (§4), verifies it as §2 does, and writes it by the ordinary durability order. While it waits, it shows `holder_store_rebuild_pending { state_hash, since, holders_tried }` (§2 item 8). A legacy event without author evidence comes only from its author (`awaiting_author`, §8).
-  - **What is not rebuilt.** A file whose `state_hash` is not on the committed chain would be deleted at reconcile anyway, so nothing is lost. An event beyond retention is dropped from coverage. No holder file holds local-only state, so nothing else is lost.
-  - **Safe outcome.** Nothing the node decides comes from this store (D54). Its own group state and `named_groups.json` are never changed by a quarantine or a rebuild. Only its serving coverage drops, until the rebuild completes.
-  - **Bound.** The node rebuilds each `state_hash` a bounded number of times per daemon run (proposal in Q11). After that, the file stays quarantined, and the group shows `holder_store_unavailable { state_hash, reason }` until the next start.
-  - **I/O failure.** If the node cannot list, read or rename in a group's directory, it disables that group's holder store for the run. It shows `holder_store_unavailable { group, error }`, answers `absent` for that group's events, and retries at the next start.
-  - **Amendment to ADR 0085 rule 4 (D120), scoped to S5's holder files.** Rule 4 says an unreadable file "is left untouched". For a damaged file in `group-holder/` (no `X0GHE` prefix, or an undecodable version-1 file), S5 instead moves it aside intact and rebuilds it. It is never auto-deleted, truncated or overwritten, so the rest of rule 4 holds. Rule 5 is not amended: a newer-version file stays byte-identical at its path.
-- **Deletion:** the group's directory is deleted on local removal, ban, withdrawal or signed delete. Quarantined files live outside it, so this never deletes a file S5 could not read.
-- **Downgrade:** older binaries never open `group-holder/` or `group-holder-quarantine/`. Upgrading again reconciles the store.
+- **Unreadable file: quarantine and rebuild (D120).** David ruled that S5 quarantines an unreadable holder file and rebuilds it from holders, instead of waiting for an operator. S5 follows the shared lifecycle in ADR 0108 §5a: its classification, transaction, resume, history, failure states (`sidecar_unavailable`, `sidecar_newer_format`, `sidecar_quarantine_failed`, each with a `file` field) and fault cases. S5 adds only what is specific to its files:
+  - **Files.** Each `<data_dir>/group-holder/<stable_group_id>/<state_hash>.ev` is one §5a file `F`, and its group directory is `D`.
+  - **Header layout.** 8 bytes: the family prefix `X0GHE` (bytes 0–4), a version field of one ASCII digit (byte 5), the terminator `\0` (byte 6) and one padding byte `\0` (byte 7). Version `0` is invalid. The highest version this binary supports is 1 (`X0GHE1\0\0`). The prefix `X0GHE` is reserved for this path forever.
+  - **Memory-only.** When §5a runs a holder file memory-only, the node may fetch that event (§4), verify it as §2 does, and serve it from memory for this run. It writes nothing at `F`.
+  - **Rebuild source (step 4).** If the file's `state_hash` is on the committed chain and within retention, the node fetches that `commit_event` from other holders by S5's fetch (§4) and verifies it as §2 does. It writes the replacement as a committed `HeldEventV1`, with `revision` from the verified event and `rebuilt_from` set as §5a says. While it waits for a holder, the group shows `holder_store_rebuilding { state_hash, txid, since, holders_tried }` (§2 item 8). A legacy event without author evidence comes only from its author (`awaiting_author`, §8).
+  - **No rebuild.** If the `state_hash` is not on the committed chain, reconcile would delete it anyway. If it is beyond retention, the event drops out of coverage. In both cases step 4 writes no replacement, and the transaction goes to step 5. A missing file with only history copies follows the same rule.
+  - **Local-only state.** None. Every byte in a holder file is a copy of a signed committed event that other holders retain, and `committed` and `revision` are re-derived from `commit_log`. Nothing the node decides comes from this store (D54), so a quarantine or a rebuild never changes its group state or `named_groups.json`. Only its serving coverage drops until the rebuild completes.
+  - **Bound.** The node runs step 4 for one `state_hash` a bounded number of times per daemon run (proposal in Q11). After that the file shows `sidecar_unavailable { file, cause: rebuild_bound }` until the next start.
+  - **Directory failure.** If the node cannot list a group's directory, that group's holder store shows `sidecar_unavailable { file: D, cause: read_error }` for the run. The node answers `absent` for that group's events and retries at the next start.
+  - **Amendment to ADR 0085 rule 4 (D120), scoped to S5's holder files.** Rule 4 says an unreadable file "is left untouched". For a damaged `group-holder/<stable_group_id>/<state_hash>.ev`, S5 instead quarantines it by ADR 0108 §5a and rebuilds it. Its bytes are never deleted, truncated or overwritten. Rule 5 is not amended.
+- **Deletion:** on local removal, ban, withdrawal or signed delete, the node deletes the group's `<state_hash>.ev` and temp files. It keeps every quarantine copy, which §5a never deletes, so the directory stays until those copies go under Q12.
+- **Downgrade:** older binaries never open `group-holder/`. Upgrading again reconciles the store.
 - **Not an authority log (D54):** every member keeps its own copy; any member serves it; requests are by hash; nothing is decided from it.
 - **Retention (D98):** 128 committed events per group, today's in-memory cap; at 51.5 KB each that is about 6.6 MB. Caps: 16 MiB per group and 256 MiB per node. Over a cap, the oldest committed events go first. A member that falls behind them is handled in §4 (D97).
 - The implementing PR adds round-trip, fail-closed and crash-point tests. The first release that writes the format supplies the released fixture (ADR 0085 rule 6).
@@ -250,7 +239,7 @@ L3 binds S5 as a hard rule (D64). Every block S5 adds or touches ends in one of 
 - `awaiting_author { state_hash, author }`: a legacy event without author evidence that only its author may serve (§2). This is today's path toward legacy authorities; 0088 lets each slice degrade to it toward peers without the bit.
 - `awaiting_evidence { digests, since }`: a capable joiner whose authority reports `evidence_pending` (below).
 - A retryable `refused { capacity }` or `refused { rate_limited }` (§5) waits until `retry_after` and counts as one holder tried.
-- `holder_store_rebuild_pending { state_hash, since, holders_tried }`: a quarantined holder file waits for a holder to serve its event (§6, D120; §2 item 8). The local states `holder_store_quarantined`, `holder_event_memory_only` and `holder_store_unavailable` (§6) block no operation; they report reduced serving coverage.
+- `holder_store_rebuilding { state_hash, txid, since, holders_tried }`: a quarantined holder file waits for a holder to serve its event (§6, D120; §2 item 8). ADR 0108 §5a's `sidecar_unavailable`, `sidecar_newer_format` and `sidecar_quarantine_failed` (§6) block no S5 operation; for S5 they report reduced serving coverage.
 
 **Refusals** (terminal for that request):
 - `group_object_refused_v1` with `removed` (§2 item 6), `banned` or `revoked` (§2 item 1), `certificate_not_current` (§2 item 2), `invite_expired` or `too_large` (§1, §5).
@@ -302,7 +291,7 @@ L3 binds S5 as a hard rule (D64). Every block S5 adds or touches ends in one of 
 - A Home join needs one certificate fetch by each receiver that lacks the bytes, and a held add delays the events behind it (§3a).
 - Events sealed by legacy authorities stay author-served.
 - A member behind every holder's retention waits for ADR 0114's repair (D97, D119). Until ADR 0114 is Accepted and shipped, its exit is D43's manual remove and re-invite.
-- A damaged holder file costs a refetch, and its quarantined copy stays on disk until an operator removes it (D120).
+- A damaged holder file costs a refetch, and its quarantine copy stays on disk under Q12 (D120).
 - A joiner redeeming at a promoted admin learns that admin's promotion history, and the other commits after its invite base, before it accepts membership (D133).
 - In ordinary groups the metadata topic still carries up to K certificates per add, in plain JSON.
 - In a Home with any seat that lacks the bit, the joiner's own certificate still reaches the gossip mesh (§3a). #946 answers to legacy requesters reach it in every Home until the minimum supported version (D35). Legacy joiners keep a 10-minute refusal that ADR 0088 §2 did not list; it is now the named entry "#946 legacy refusal" (D96, §8). Old Home members lose the inline sidecar.
@@ -390,7 +379,7 @@ W3-H (#1164) does not exist yet. Each case below is a specification: nodes, step
   - Assert: a capable holder (O or P) answers L's #946 request on the topic, as today, and S sees that answer. O stages `certificate_evidence_unavailable` toward J0 at 10 minutes (the named §2 entry "#946 legacy refusal", §8). New with S5: no #946 answer goes to a requester that sets the bit.
   - Baseline: green on `main` for the first two assertions. They must stay green until the minimum supported version (D35) drops legacy peers.
 
-**Exit tests:** H1–H5 and H8 green; H6 and H7 green once ADR 0112's V5 redemption has merged; C1–C5 unchanged or better.
+**Exit tests:** H1–H5 and H8 green; H6 and H7 green once ADR 0112's V5 redemption has merged; H9 and C1–C4 unchanged or better; the H8 lifecycle row passes.
 - Rejections: wrong hash; bad author or commit signature; a mismatched signer; a projection carrying an uncovered field; a root no signed commit binds; a forked chain (the #846 gate fires); a legacy event from a non-author holder; a digest-only add whose `certificate_digest` the roster root does not bind.
 - **Digest test vectors** (committed with the implementation, each with its expected BLAKE3):
   - nested objects whose keys sort differently by UTF-16 code unit and by code point (for example U+E000 against U+1F600);
@@ -429,28 +418,21 @@ W3-H (#1164) does not exist yet. Each case below is a specification: nodes, step
   - New with S5 (typed answers, not on `main`): Z gets `refused { banned }`, X gets `absent`, and an expired copy of J's invite gets `refused { invite_expired }`. J's requests for another root or for a `commit_event` get `absent`.
 
 **D120 cases.** H8 is a red case, so it is in the pre-code gate like every other red case (Gates).
-- **H8, holder-file recovery (red on `main`).**
+- **H8, holder-file rebuild through S5 (red on `main`).**
   - Nodes: authority A and members B, C and D, all candidate binaries, on the deterministic clock.
   - Schedule: messages are delivered in step order. D is partitioned from B for the whole case, so D can catch up only through C; C can reach B. In variant (b), C is also partitioned from B until +60 s after step 4.
   - Steps:
     1. A, B, C and D converge. D stops. A seals three events E1–E3, and B and C hold them.
-    2. A stops. C stops. The harness damages the body of C's E1 and E2 files, keeping S5's magic.
+    2. A stops. C stops. The harness damages the body of C's E1 and E2 files, keeping a valid version-1 header.
     3. C starts.
     4. D starts.
   - Assert:
-    - C moves E1 and E2 intact into its quarantine directory, byte-identical, before it writes any replacement. It shows `holder_store_quarantined`, then `holder_store_rebuild_pending`.
-    - Within 60 s of C reaching B, C holds verified copies of E1 and E2, and serves E1–E3 to D. Within 120 s of step 4, D's state hash equals B's. In (b), C shows `holder_store_rebuild_pending` naming B until the partition heals.
+    - C quarantines E1 and E2 by ADR 0108 §5a, with their bytes preserved, before it writes any replacement. It shows `holder_store_rebuilding`.
+    - Within 60 s of C reaching B, C holds verified copies of E1 and E2 fetched by S5, each listing its `txid` in `rebuilt_from`, and serves E1–E3 to D. Within 120 s of step 4, D's state hash equals B's. In (b), C shows `holder_store_rebuilding` naming B until the partition heals.
     - C's group state and `named_groups.json` never change.
-  - Fault variants at the lifecycle boundaries (new with S5): (c) the quarantine rename fails: the original stays byte-identical at its path, no replacement is written, and C shows `holder_event_memory_only` with `quarantine_failed`; (d) C crashes after the rename but before the directory fsyncs: at restart it repeats both fsyncs before any byte check or replacement write; (e) C crashes after the fsyncs but before the replacement write; (f) C crashes during the replacement's temp write; (g) a step-2 fsync fails: no replacement is written, and C shows `holder_event_memory_only` with `quarantine_fsync_failed`; (h) C crashes again during the resume of (d). After each restart the original bytes exist in exactly one place, no replacement is written before both fsyncs succeed, and the rebuild completes. (i) A retained quarantine copy beside a healthy rebuilt file triggers no rebuild across a restart, and the healthy file stays byte-identical.
   - Baseline on `main`: red. With A offline, C cannot serve events it did not author (`actor == sender`), and `main` keeps no copy across C's restart, so D never catches up.
-- **C5, a newer-format holder file is kept; a prefix-less file keeps its bytes (control: green on `main`, must stay green).**
-  - Nodes: member C and holder B, both holding committed events E1 and E2, on the deterministic clock. Messages are delivered in step order.
-  - Steps:
-    1. C stops.
-    2. The harness rewrites C's E1 file with a newer `X0GHE` magic, and C's E2 file with a magic that lacks the `X0GHE` prefix.
-    3. C starts and runs for 10 minutes, through at least one head probe.
-  - Assert: the E1 file stays byte-identical at its path, nothing is written at that path, and it never enters the quarantine directory. The E2 file's original bytes still exist, byte-identical. On `main` no binary opens `group-holder/`, so both hold today.
-  - New with S5: C shows `holder_event_memory_only` with `newer_format` for E1 and may serve E1 from memory after fetching it from B. C treats E2 as damage: it moves the E2 file intact into the quarantine directory, then rebuilds E2 from B.
+- **H8 lifecycle row.** S5 instantiates ADR 0108 §5a's W3-H fault cases for its holder files (`group-holder/<stable_group_id>/<state_hash>.ev`), with H8's nodes and S5's fetch as the rebuild source. As §5a allows, S5 marks two of them as controls: the newer-valid-version case and the history cases. They hold on `main`, because no released binary opens `group-holder/`.
+- **H9, no rebuild for an event off the chain or beyond retention.** As H8, but C's damaged file is for an event that is not on the committed chain, and in variant (b) for one beyond retention. Assert: C quarantines it with its bytes preserved, writes no replacement, finalizes the copy as history, and serves `absent` for it. Baseline on `main`: control (`main` never opens the file); new with S5: the quarantine and the history copy.
 
 **D133 case.**
 - **H7, promotion chain only on the redeemer's result path.** It runs inside the promoted-admin run of ADR 0112's `s6_promoted_admin_stale_invite`, which is red on `main`.
@@ -473,7 +455,7 @@ W3-H (#1164) does not exist yet. Each case below is a specification: nodes, step
 
 ## Rulings and open questions
 
-**Blocking David's Accept:** Q11 (the D120 rebuild bound). Accept also waits for the acceptance order (S2, S4 and S3 Accepted first), for ADR 0108's pending cause notice (D117), which §8 reuses, and for a cross-model review of the round-2 text.
+**Blocking David's Accept:** Q11 (the D120 rebuild bound) and Q12 (quarantine-copy retention). Accept also waits for the acceptance order (S2, S4 and S3 Accepted first), for ADR 0108's pending cause notice (D117), which §8 reuses, and for a cross-model review of the round-2 text.
 
 David ruled G7 and Q1–Q8 on 2026-10-04 (D64, D65, D68, D93–D98):
 
@@ -491,14 +473,15 @@ David ruled round 2 on 2026-10-04 (D117, D118, D119, D120, D125, D133):
 
 - **Q9, the promotion chain for a joiner before membership (D133):** yes, narrowly. The redeeming admin may carry its promotion chain to the joiner: only that chain, and only on its own direct, guarded result path (§5). This ADR owns the disclosure rule; ADR 0112 uses it. A chain that fails is ADR 0112's `redeemer_authority_unproven`, and the attempt stays open under D99's failover rule; J never fails over while B's add may have committed.
 - **Confirmed member behind retention (D119), against the recommendation:** S8 (b) is widened now, so ADR 0114 also repairs confirmed members. S5 routes `catchup_beyond_retention` to ADR 0114's retention re-Welcome (§7) and defines none itself (§4, §8).
-- **Unreadable sidecar files (D120), against the recommendation:** automatic quarantine and rebuild. S5 moves a damaged file aside intact and rebuilds it from holders. A file without the reserved `X0GHE` prefix counts as damage. A newer-version file is never quarantined; it stays byte-identical at its path, and its event is memory-only. This amends ADR 0085 rule 4 for S5's holder files only; rule 5 is not amended (§6).
+- **Unreadable sidecar files (D120), against the recommendation:** automatic quarantine and rebuild. S5 follows ADR 0108 §5a's shared lifecycle and adds only its file names, its `X0GHE` header layout, S5's fetch as the rebuild source and its no-rebuild cases. This amends ADR 0085 rule 4 for S5's holder files only; rule 5 is not amended (§6).
 - **Named §2 entries (D118):** David confirmed "#946 legacy refusal" as a named ADR 0088 §2 entry (§8).
 - **End date of the D96 and D68 exceptions (D125):** set in a later ruling. Until then neither exception has an end date (§3a, §8).
 - **The joiner's 120 s timeout cause (D117):** ADR 0108's `JoinPendingNotice` (its §8). S5 owns the `evidence_pending` cause registered there, and that cause rides the notice (this ADR's §8).
 
-Still open for David (it blocks Accept):
+Still open for David (both block Accept):
 
-- **Q11. Rebuild attempts per holder file (D120).** How many times may a node try to rebuild one quarantined `state_hash` in one daemon run? **Proposal:** once. Each try already uses D98's fetch limits, and a second failure in the same run points to local disk trouble, which `holder_store_unavailable` reports. The Decision text does not fix a number until David rules. This needs David's ruling before Accept.
+- **Q11. Rebuild attempts per holder file (D120).** How many times may a node try to rebuild one quarantined `state_hash` in one daemon run? **Proposal:** once. Each try already uses D98's fetch limits, and a second failure in the same run points to local disk trouble, which `sidecar_unavailable { cause: rebuild_bound }` reports. The Decision text does not fix a number until David rules. This needs David's ruling before Accept.
+- **Q12. Retention of holder quarantine copies (D120).** ADR 0108 §5a never deletes a quarantine copy and leaves retention to each slice. How long does S5 keep its copies? **Proposal:** keep each copy until the group's holder directory goes on local removal, ban, withdrawal or signed delete, then delete it with the directory; never delete it otherwise. Copies count toward the 256 MiB node cap; at the cap, the node stops writing replacements and shows `sidecar_unavailable { cause: capacity }`. Deleting a copy on group removal is an auto-delete under ADR 0085 rule 4, so this proposal widens the D120 amendment and needs David's ruling before Accept. Until he rules, §6 deletes no copy.
 
 Q9 is ruled (D133). Q10 is withdrawn: ADR 0112 §1 already defines the invite that binds only the root (D95 above).
 
