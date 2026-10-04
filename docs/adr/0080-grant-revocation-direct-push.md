@@ -2,9 +2,10 @@
 
 - **Status:** Proposed
 - **Date:** 2026-09-27 (first draft); revised 2026-10-04 under D63; rulings
-  D108–D114 recorded 2026-10-04
+  D108–D114 recorded 2026-10-04; round-2 rulings D120 and D139–D143
+  recorded 2026-10-04
 - **Decision owners:** David Irvine (#994 Root decision, 2026-09-27; D23;
-  D63; D108–D114)
+  D63; D108–D114; D120; D139–D143)
 - **Author:** OMP (first draft); revised by Claude (Opus)
 - **Reviewers:** cross-model review required before acceptance; David Irvine (acceptance)
 - **Supersedes:** none
@@ -21,9 +22,10 @@
   #1111 (Critical revocation carriers), #1116 (corrupt store fails open),
   #891; rulings D23, D35 and D28 in the
   [rulings digest](../design/x0x-direction.md), D63 (2026-10-04: revise
-  this ADR) and D108–D114 (2026-10-04: this ADR's open questions);
+  this ADR), D108–D114 and D139–D143 (2026-10-04: this ADR's open
+  questions) and D120 (2026-10-04: unreadable sidecars are quarantined);
   [ADR 0085](./0085-persisted-binary-formats-are-versioned.md) (the
-  `deliver_to` sidecar); [ADR 0093](./0093-capability-advert-registry.md) (capability
+  `deliver_to` sidecar; rule 4 amended for it, section 3a); [ADR 0093](./0093-capability-advert-registry.md) (capability
   bits) and its allocation table in the [ADR index](./README.md);
   [ADR 0089](./0089-relationship-peer-evidence-survives-restart.md) (the
   allocation procedure); ADR 0098 (prov., the revocation surface); ADR 0074
@@ -81,7 +83,7 @@ waits for that review (D114).
 - One verify path and one ingest path. A pushed record and a gossiped
   record are the same bytes and must have the same effect.
 - Stay inside ADR 0098's scope. Decide only what David ruled for the push
-  (D108, D110). Leave the rest to ADR 0098.
+  (D108, D110, D142). Leave the rest to ADR 0098.
 - Goal E: small, bounded bytes per revoke; no new periodic task. The only
   new durable state is the recorded `deliver_to` list (D112).
 
@@ -207,9 +209,10 @@ advert sets `grant_revocation_push_v1`. The push is best-effort. The
   - `sending`: shows attempt n of 3. Exits: `pushed` or `send_failed`.
   - A restart drops every pending push. Gossip still carries the record.
 
-  The same endpoint keeps a bounded list of recent outcomes, each with its
-  `grant_id`, its recipient and its outcome. Its size and retention are
-  open question 4.
+  The same endpoint keeps the last 1,024 outcomes in memory, oldest out
+  first, each with its `grant_id`, its recipient and its outcome (D143).
+  A restart clears the list. The counters keep running totals for the
+  life of the process.
 
 ### 3a. The recorded `deliver_to` list (D112)
 
@@ -223,7 +226,8 @@ the push reaches those daemons too (D112).
   time.
 - **Where.** In a new versioned sidecar next to the share-grant store,
   under ADR 0085: its own magic, a file extension that no released binary
-  reads, and a strict decode that consumes every byte. The `X0SG`
+  reads, and a strict decode that consumes every byte (the file and its
+  header are below). The `X0SG`
   share-grant store file does not change format. A new `X0SG` magic would
   make a downgraded v0.46.1 install refuse its whole share-grant store, so
   it would hold and enforce no grants. The sidecar leaves the released
@@ -268,40 +272,89 @@ the push reaches those daemons too (D112).
   store. A revoke reads the entry and does not remove it, so a retried
   DELETE pushes to the same set. When the issued store prunes a grant, its
   entry goes too. The issued store's cap (1,024 grants) bounds the entry
-  count. The cap on one list's length is open question 2.
-- **Load failure.** An unknown magic or a body that does not decode is
-  refused with an explicit error. The file is left byte-identical and is
-  never rewritten (ADR 0085 rule 4). The grants are unaffected. The
-  refusal ends only when an operator moves or repairs the file and the
-  daemon restarts.
+  count.
+- **The list cap (D141).** An entry records at most 64 agents, the
+  shared-agent cap. A longer `deliver_to` list is still delivered in full
+  at issue, but it is not recorded. The grant's state is `not_recorded`,
+  cause `over_cap`, and a revoke pushes to items 1 and 2 only. The cap
+  keeps `POST /grants` compatible and bounds the sidecar at about 2 MiB
+  (1,024 grants × 64 × 32 B).
+- **The file and its header.** The sidecar is `share-grants.deliverto`
+  in the data directory, next to `share-grants.bin`. No released binary
+  reads that extension. Its family prefix is `X0GDT`, reserved for this
+  path forever. A valid header is eight bytes: the prefix, the family
+  version as one ASCII digit from `1` to `9` in byte 5, and two zero
+  bytes. This build supports version 1 only (`X0GDT1\0\0`). The version 1
+  body is bincode, consumed exactly: first ADR 0108 §5a's `rebuilt_from`
+  list of quarantine `txid`s (empty after an ordinary write), then the map
+  from `grant_id` to the recorded agents. Every future layout keeps the
+  prefix and takes a higher version, which is the new magic that ADR 0085
+  rule 1 asks for. Versions above 9 need a later ADR first.
+- **Unreadable files: the shared lifecycle (D120).** This sidecar uses
+  ADR 0108 §5a: its classification, quarantine transaction, resume,
+  history and failure rules, and its states `sidecar_unavailable`,
+  `sidecar_newer_format` and `sidecar_quarantine_failed`, each with
+  `file: share-grants.deliverto`. This ADR adds only these points:
+  - Every lifecycle step, resume included, holds the sidecar writer lock
+    and runs only after ADR 0094's host commit. Before the commit, a
+    damaged file stays at its path, and the sidecar shows
+    `sidecar_unavailable { file, cause: awaiting_host_commit }`. At the
+    commit, the lifecycle runs in the same process.
+  - A missing file with no pending copy, whether or not history copies
+    exist, is a fresh start: an empty map, and every grant is
+    `not_recorded`, cause `absent`.
+  - **The step 4 replacement** is set by open question 1. Under option
+    (a), it is an empty map whose `rebuilt_from` lists the transaction's
+    `txid`. Under option (b), it would be rebuilt from the other copy.
+- **What no holder has (D120).** The list is issuer-only state. No
+  grantee, host or `deliver_to` agent keeps a copy, and no protocol asks
+  for one. So nothing can be rebuilt from holders, and this ADR claims no
+  such rebuild. Under option (a) of open question 1, each grant whose
+  entry was in the quarantined file becomes `not_recorded`, cause
+  `quarantined`, and its list is lost. Its `deliver_to` daemons get gossip
+  only at revoke. The grants themselves live in the `X0SG` store, so they
+  are unaffected.
+- **The amendment.** This ADR proposes to amend ADR 0085 rule 4 for
+  `share-grants.deliverto` only, as ADR 0108 §5a describes. D120 rules the
+  quarantine. What replaces the file is open question 1, so the amendment
+  is complete only once David rules on that. ADR 0085 rule 5 is not
+  amended. The lifecycle never deletes a quarantined copy; how long copies
+  are kept is open question 2. The amendment takes effect when this ADR
+  is Accepted.
 - **Typed states.** Each issued grant has one `deliver_to_record` state.
   The `POST /grants` response, each `GET /grants` entry and the
   `DELETE /grants/:id` response report it with its `grant_id`.
-  `GET /diagnostics/grants` reports the sidecar's own state (`ok`,
-  `awaiting_host_commit`, or `refused` with its error) and a count per
-  grant state. A revoke uses the list in `recorded` and `held_in_memory`.
-  In every other state it pushes to items 1 and 2 only. In `unavailable`
-  it also counts `deliver_to_unavailable`.
+  `GET /diagnostics/grants` reports the sidecar's state (`ok`,
+  `awaiting_host_commit` for a held persist, `write_failed` with its
+  error, or one of ADR 0108 §5a's states with all its fields), a count
+  per grant state, and each quarantined copy with its `txid`, its hash
+  and whether it is pending. A revoke uses the list in `recorded` and
+  `held_in_memory`. In every other state it pushes to items 1 and 2 only.
+  In `unavailable` it also counts `deliver_to_unavailable`.
 
   | State | Cause | Waits for | Deadline | Exit |
   |---|---|---|---|---|
   | `none_requested` | the request's `deliver_to` was empty | nothing | none | terminal |
   | `recorded` | the list is durable in the sidecar | nothing | none | terminal; removed with the grant |
-  | `held_in_memory`, cause `awaiting_host_commit` | ADR 0094 has not yet host-committed the running binary | ADR 0094's host commit | none of its own; ADR 0094's commit or rollback ends it | host commit, then a persist: `recorded`. A rollback or restart first: `not_recorded` |
-  | `held_in_memory`, cause `write_failed`, with the error | the sidecar persist failed | the next successful persist (the next issue or prune) | none | that persist: `recorded`. A restart first: `not_recorded` |
-  | `held_in_memory`, cause `sidecar_refused` | the sidecar did not load, so no write runs | nothing in this run | none | a restart: `not_recorded` |
-  | `unavailable`, cause `sidecar_refused` | the grant was in the issued store when the sidecar was refused; its list, if any, is in the refused file | a restart that loads a readable sidecar | none | that restart: `recorded` if the file holds an entry, else `not_recorded` |
-  | `not_recorded` | no entry: issued before the sidecar existed, on another owner install, while downgraded, or lost at a restart | nothing | none | terminal |
+  | `held_in_memory`, cause `awaiting_host_commit` | ADR 0094 has not yet host-committed the running binary | ADR 0094's host commit | none of its own; ADR 0094's commit or rollback ends it | host commit, then a persist: `recorded`. A rollback or restart first: `not_recorded`, cause `absent` |
+  | `held_in_memory`, cause `write_failed`, with the error | an ordinary sidecar persist failed | the next successful persist (the next issue or prune) | none | that persist: `recorded`. A restart first: `not_recorded`, cause `absent` |
+  | `held_in_memory`, cause one of ADR 0108 §5a's sidecar states, with its fields | the sidecar is not usable, so it runs memory-only and no write runs | §5a's exit for that state; for `awaiting_host_commit`, the host commit | none | host commit: the quarantine runs, then a persist: `recorded`. Otherwise a restart: `not_recorded`, cause `absent` |
+  | `unavailable`, cause one of ADR 0108 §5a's sidecar states, with its fields | the grant was in the issued store at load; its list, if any, is in that file | §5a's exit for that state; for `awaiting_host_commit`, the host commit | none | a load that reads the file: `recorded` if it holds an entry, else `not_recorded`, cause `absent`. A quarantine: as open question 1 rules |
+  | `not_recorded`, cause `over_cap` (D141) | the request named more than 64 agents | nothing | none | terminal |
+  | `not_recorded`, cause `quarantined` (D120; option (a) of open question 1) | the entry was in a quarantined file, and the replacement does not restore it | nothing | none | terminal. After a restart the grant shows cause `absent`, because the damaged file cannot say which grants it held |
+  | `not_recorded`, cause `absent` | no entry: issued before the sidecar existed, on another owner install, while downgraded, or lost at a restart | nothing | none | terminal |
 - **Mixed versions and downgrade.** There is no wire change. A released
-  binary never reads the sidecar, so a downgrade keeps its share-grant
-  store and its grants as they are. After a re-upgrade, a grant issued
+  binary never reads the sidecar or a quarantined copy, so a downgrade
+  keeps its share-grant store and its grants as they are. After a re-upgrade, a grant issued
   while downgraded has no entry, so its `deliver_to` daemons get gossip
   only.
 - **Security.** The list gives no authority, and the push carries a record
   that gossip delivers to everyone anyway. A corrupt or altered sidecar
   can only add or drop push recipients. An added recipient still passes
   the positive gate in section 1 and learns nothing that gossip does not
-  carry. A dropped recipient falls back to gossip.
+  carry. A dropped recipient falls back to gossip. So a quarantine (D120)
+  costs only push latency: every revocation still reaches those daemons
+  by gossip, and no grant is widened or kept alive.
 
 ### 4. Receiver
 
@@ -341,15 +394,27 @@ at the first failure. Steps 1 to 5 use no signature verify.
 5. **Rate.** At most 16 pushes per minute from one sending agent, and 256
    per minute in total. Drop the excess and count `rate_limited`.
 6. **Ingest.** Hand the one record, as a one-record batch, to the shared
-   v3 ingest, under the same owner-trust revocation barrier. That ingest
-   does the **only** verify: the owner's ML-DSA-65 signature over the
-   record's canonical bytes, and the issuer key must hash to the record's
-   `owner`. The push handler has no verify of its own. A failure is
-   counted with the forged-v3 counter. A distinct valid record is merged
-   through v3: it is kept, and the grant's horizon becomes the maximum
-   `grant_expiry`. Persistence follows section 6. Everything a v3 insert
-   triggers also fires for a pushed record. That includes live-session
-   re-evaluation once ADR 0074 s3 lands.
+   v3 ingest. That ingest does the **only** verify: the owner's ML-DSA-65
+   signature over the record's canonical bytes, and the issuer key must
+   hash to the record's `owner`. The push handler has no verify of its
+   own. A failure is counted with the forged-v3 counter. A distinct valid
+   record is merged through v3: it is kept, and the grant's horizon
+   becomes the maximum `grant_expiry`. Persistence follows section 6.
+   Everything a v3 insert triggers also fires for a pushed record. That
+   includes live-session re-evaluation once ADR 0074 s3 lands. The ingest
+   runs in two phases (D139):
+   - **6a, insert.** After the verify, insert the record into the
+     in-memory revocation set at once, and start live-session
+     re-evaluation. This phase never waits for the outbox send gate.
+   - **6b, order the outbox.** Then take the outbox send gate
+     exclusively, and release it. Only then does the ingest count as done
+     for outbox ordering (section 5). 6b runs whenever 6a inserted a new
+     record.
+   The ingest holds the revocation set only for the insert. It never holds
+   the set while it waits for the gate, so the lock order has no cycle.
+   The split applies to every remote carrier: the push, `x0x.revocation.v3`
+   gossip, and share-grant records on the v1 and v2 carriers. The local
+   revoke keeps ADR 0077's order: it takes the gate before it records.
 
 The receiver does not need to hold the grant. A push can arrive before the
 grant DM that it revokes. The receiver stores the revocation, and the
@@ -359,17 +424,26 @@ The sending agent's identity gives no authority. It is used only for the
 rate limit and the counters. A valid record relayed by anyone has the same
 effect, because the record carries its own authority.
 
-**The live-session bound starts at receipt (D111).** ADR 0074 s3 closes a
-live session within 5 s. That bound starts when the host first receives
-the record, by push or by gossip, whichever comes first.
-- Live-session re-evaluation runs on the in-memory insert. It does not
-  wait for the coalesced persist (section 6) or for a store hold.
-- As written, this ADR cannot meet the bound in two cases. Both are open
-  for David, and neither is an exception until he rules:
-  - on a daemon whose own grant sends hold the outbox send gate, step 6
-    waits for that gate before it inserts (open question 1);
-  - a valid pushed copy dropped as `not_ready` or `rate_limited` never
-    reaches the ingest (open question 3).
+**The live-session bound starts at receipt (D111, D140).** ADR 0074 s3
+closes a live session within 5 s. That bound starts when the host first
+receives the record, by push or by gossip, whichever comes first.
+- **Receipt** is the first copy that reaches the shared ingest: a pushed
+  copy that passes steps 1 to 5, or a gossip batch that holds the record
+  (D140). A copy dropped before step 6, as `not_ready` or `rate_limited`,
+  starts nothing. The next copy that reaches the ingest starts the bound.
+  So during startup or a flood, the bound can slip until gossip or a later
+  push arrives. Each drop is counted, by kind, in
+  `GET /diagnostics/grants`.
+- Live-session re-evaluation runs on the in-memory insert (step 6a). It
+  does not wait for the outbox send gate (D139), the coalesced persist
+  (section 6) or a store hold. So the bound holds on a daemon whose own
+  grant sends hold the gate.
+- **The 6b wait is visible.** `GET /diagnostics/grants` lists each ingest
+  waiting in 6b as `awaiting_send_gate`, with the record's grant and the
+  time the wait began. It waits for this daemon's own in-flight grant
+  sends to return, so the outbox send deadline (30 s) plus local I/O
+  bounds it. Its exit is the gate. The revocation is already in force
+  during the wait.
 
 ### 5. Idempotence, replay and ordering
 
@@ -391,9 +465,17 @@ the record, by push or by gossip, whichever comes first.
 - **Order on the receiver.** Either carrier can arrive first. The result
   is the same.
 - **Order against the grant DM.** See section 4: a late grant is refused.
-- **Order against outbox redelivery.** Ingest takes the same barrier as
-  the v3 carrier. No redelivery of the grant starts after either carrier
-  ingests. How long that barrier may delay the insert is open question 1.
+- **Order against outbox redelivery (D139).** A redelivery pass holds the
+  send gate shared from its revocation check until its sends return, and
+  it re-checks the revocation set before it sends (ADR 0077). A pass that
+  checks after step 6a sees the record and skips the grant. A pass that
+  checked before 6a may still start its sends, but step 6b waits for it to
+  finish. So no send of the grant starts after the ingest is done (6b),
+  as before the split. The only change is that enforcement now starts at
+  6a instead of after the gate. This relaxes no acceptance rule: the
+  verify still comes first, and a revocation only removes access. The
+  split is local to each daemon, with no wire or format change, so mixed
+  versions are unaffected.
 - **Gossip schedule.** The v3 carrier still re-publishes the whole set on
   change and on its fallback tick. This ADR does not change that.
 
@@ -464,20 +546,20 @@ listing that ADR 0098 defines shows pushed records too.
   re-delivers it. ADR 0098 must keep this for pushed records.
 - A push never lifts the hold. It carries one record and never counts as
   a full re-sync.
-- A pushed record and a gossiped record must have the same effect
-  (Decision Drivers). So ADR 0098 should give gossiped records the same
-  rule during a hold. If it chooses otherwise, the two carriers diverge,
-  and David must rule on that.
+- **Gossiped records follow the same rule (D142).** This is a
+  requirement on ADR 0098: during its hold, a gossiped record also enters
+  the in-memory set and acts at once, with the file untouched. So both
+  carriers give the same result, as the Decision Drivers require.
 - The push does not repair #1116. It is sent once, at revoke time. It does
   not restore the older records that a lost store held.
 
 ### 7. Alignment with ADR 0098 and D35
 
 - This ADR does not depend on ADR 0098 to be correct. David's rulings set
-  two points that ADR 0098 must keep: it reuses this push pattern for
-  Machine and Agent revocations (D108), and a pushed record enters the
-  in-memory set during its hold (D110). Renewal identity stays with ADR
-  0098 (D109).
+  three points that ADR 0098 must keep: it reuses this push pattern for
+  Machine and Agent revocations (D108), and during its hold both a pushed
+  record (D110) and a gossiped record (D142) enter the in-memory set and
+  act at once. Renewal identity stays with ADR 0098 (D109).
 - **No sweep before `not_after`.** Share-grant revocations are already
   collected only at their grant's GC horizon, not by the 90-day sweep. The
   push uses the same horizon. With D35's 90-day maximum lifetime, every
@@ -516,6 +598,9 @@ listing that ADR 0098 defines shows pushed records too.
   review either.
 - D112: the `deliver_to` sidecar (section 3a) lands in the same
   implementing slice as the push.
+- D139: the split ingest changes the shared revocation barrier and its
+  lock order for every remote carrier. The D28 review covers that change,
+  and the code waits for it (D114).
 
 ## Consequences
 
@@ -543,8 +628,15 @@ listing that ADR 0098 defines shows pushed records too.
 - A `deliver_to` daemon that is neither a host nor a grantee agent gets
   only gossip for a grant in state `not_recorded` or `unavailable`: one
   issued before the sidecar existed, issued while downgraded, revoked from
-  another owner install, held only in memory across a restart, or present
-  when the sidecar was refused (section 3a).
+  another owner install, held only in memory across a restart, listed with
+  more than 64 agents (D141), in a quarantined file (D120), or present
+  while the sidecar is unreadable (section 3a).
+- Under option (a) of open question 1, a quarantine loses the lists in
+  that file for good, because no holder has a copy (D120). The lifecycle
+  never deletes a quarantined copy, so each damaged file leaves one copy
+  of at most about 2 MiB until open question 2 sets a retention rule.
+- The split ingest (D139) changes the shared barrier and its lock order
+  for every remote carrier, not only the push.
 - The issue call now persists the sidecar before the grant becomes
   visible, so a slow sidecar write delays that issue call (section 3a).
 - One store format to add (the sidecar), with its fixture and downgrade
@@ -566,8 +658,9 @@ listing that ADR 0098 defines shows pushed records too.
 - ADR 0077's ordering text stays authoritative. This ADR adds propagation
   only.
 - A new `GET /diagnostics/grants` carries the sender counters, pending
-  pushes and recent outcomes (section 3), the receiver counters
-  (section 4), `persist_held` (section 6), and the sidecar state and
+  pushes and the last 1,024 outcomes (section 3), the receiver counters
+  and `awaiting_send_gate` ingests (section 4), `persist_held`
+  (section 6), and the sidecar state, quarantined copies and
   `deliver_to_unavailable` (section 3a). The `POST /grants`,
   `GET /grants` and `DELETE /grants/:id` responses gain the
   `deliver_to_record` state.
@@ -592,10 +685,11 @@ listing that ADR 0098 defines shows pushed records too.
     file. Push-only persists start at most once every 5 s. N is not
     bounded here.
   - No new periodic task. The queues are the bounded in-memory pending
-    pushes (at most 1,024) and at most one pending persist snapshot.
-  - Storage (D112): the `deliver_to` sidecar holds at most one entry per
-    issued grant (at most 1,024), each a list of 32-byte agent IDs. The
-    list cap is open question 2. A revoke reads it once.
+    pushes (at most 1,024), at most one pending persist snapshot, and the
+    last 1,024 outcomes (D143).
+  - Storage (D112, D141): the `deliver_to` sidecar holds at most one entry
+    per issued grant (at most 1,024), each at most 64 agent IDs of 32 B,
+    so about 2 MiB at most. A revoke reads it once.
   - Compatibility carrier: none. The push is never sent to a peer without
     the bit, so no sunset is needed. The cost of the v3 whole-set
     re-publication is out of scope.
@@ -648,9 +742,12 @@ and 13 and their variants.
      `grant_expiry`: both are verified once and kept, and the horizon is
      the later expiry. Red: dedupe on `(owner, grant_id)`.
    - A record past its GC horizon is dropped.
-7. **Order against outbox redelivery.** At another owner install, a pushed
-   record and a concurrent redelivery pass go through the same barrier. No
-   redelivery starts after the ingest.
+7. **Order against outbox redelivery (D139).** At another owner install,
+   a redelivery pass for the grant holds the send gate when a push
+   arrives. The record is in the in-memory set at once (6a). The pass
+   that checked before 6a finishes, and 6b completes only after it. No
+   send of the grant starts after 6b, and a pass that starts after 6a
+   skips the grant. Red: an ingest that skips 6b.
 8. **The store latch.**
    - Corrupt `revocations-v3.bin`, start the daemon, deliver a push (held,
      `persist_held`), then deliver a distinct gossip record. The file is
@@ -658,10 +755,11 @@ and 13 and their variants.
    - The same with a local revoke: the DELETE answers 503, no push is sent,
      and the file is unchanged.
    - A failed persist keeps the record in memory and counts it.
-   - Once ADR 0098 lands (D110): a push during a hold enters the in-memory
-     set, and the host refuses the grant at once. The file stays
-     byte-identical, and the hold stays set. Red: a push dropped during
-     the hold, or a push that clears it.
+   - Once ADR 0098 lands (D110, D142): a push during a hold enters the
+     in-memory set, and the host refuses the grant at once. A gossiped
+     record during the hold does the same. The file stays byte-identical,
+     and the hold stays set. Red: a push or a gossiped record dropped
+     during the hold, or one that clears it.
 9. **Persistence bounds.** A burst of K distinct pushes gives exactly K
    verifies and at most 2 persists. A persist does not re-verify the live
    snapshot, and it re-verifies the disk copy only after another process
@@ -689,6 +787,12 @@ and 13 and their variants.
      `deliver_to: [D's agent]`.
    - **"D refuses Gn"** means that D's `GET /grants/received` lists Gn
      with `revoked: true` while v3 gossip to D is still held.
+   - Each variant is its own run. Variants 12d, 12d2, 12d3, 12i and the
+     second run of 12e need G0 at startup. They seed it in a separate
+     clean setup run: start O, issue G0, wait for `recorded`, then stop
+     O. Any file change the variant names is made while O is stopped. The
+     variant's own run then starts at T = 0 s. Variant 12b issues its own
+     G0 during its run, with no setup run.
 
    Variants:
    - **12a, the list survives a restart (red).** Issue G1 at T = 2 s. The
@@ -722,21 +826,79 @@ and 13 and their variants.
        sidecar holds no G5 entry after the next persist.
 
      Red on main: none of these states exists.
-   - **12d, a refused sidecar (red).** Stop O. Overwrite the sidecar with
-     random bytes, and record its sha256. Start O.
-     `GET /diagnostics/grants` shows the sidecar `refused`, with its
-     error. G0 shows `unavailable`, cause `sidecar_refused`.
+   - **12d, a damaged sidecar is quarantined (D120, red).** After the
+     setup run, keep the `X0GDT1\0\0` header, overwrite the body with
+     random bytes, and record the file's sha256. Start O
+     (host-committed) at T = 0 s. The assertions follow option (a) of
+     open question 1. Then:
+     - `GET /diagnostics/grants` lists one history copy whose sha256
+       equals the recorded one. The sidecar state is `ok`, and the
+       replacement's `rebuilt_from` lists that copy's `txid`.
+     - G0 shows `not_recorded`, cause `quarantined`.
+       `DELETE /grants/G0` pushes to H and G only, and D gets no push.
+     - Issue G6: `recorded`. `DELETE /grants/G6`: D refuses G6.
+     - Restart O. G6 is still `recorded`, and the history copy is still
+       there, unchanged.
+
+     Red on main: there is no sidecar and no state.
+   - **12d2, a newer format is not quarantined (red).** After the setup
+     run, replace the sidecar with a valid `X0GDT2\0\0` file, as a newer
+     build would write it. Record its sha256. Start O at T = 0 s. The
+     sidecar shows `sidecar_newer_format { file, version: 2 }`, and no
+     quarantined copy exists. G0 shows `unavailable` with that state.
      `DELETE /grants/G0` pushes to H and G only and counts
-     `deliver_to_unavailable`. Issue G6: `held_in_memory`, cause
-     `sidecar_refused`. `DELETE /grants/G6`: D refuses G6. At the end,
-     the sidecar's sha256 is unchanged. Red on main: there is no sidecar
-     and no state.
+     `deliver_to_unavailable`. Issue G6b: `held_in_memory` with that
+     state. `DELETE /grants/G6b`: D refuses G6b. At the end, the file's
+     sha256 is unchanged. Red on main: there is no sidecar and no state.
+   - **12d3, a read error (red).** G0 is durable from the setup run. In
+     the faulted run, a hook fails O's sidecar reads with an I/O error.
+     Start O at T = 0 s. The sidecar shows
+     `sidecar_unavailable { file, cause: read_error }`, and G0 shows
+     `unavailable` with that state. Issue G12 at T = 10 s:
+     `held_in_memory` with that state, and `DELETE /grants/G12` reaches
+     D. Release the hook and restart O at T = 40 s. The next load reads
+     the file: G0 shows `recorded`, G12 shows `not_recorded`, cause
+     `absent`, because it was held only in memory, and no quarantined
+     copy exists. Red on main: there is no sidecar and no state.
+   - **12i, the shared lifecycle's fault cases (D120, red).** This ADR
+     instantiates every W3-H fault case of ADR 0108 §5a for
+     `share-grants.deliverto`, with G0 seeded in the setup run. The header
+     forms are `X0GDT` (cut short), `X0GDT1` (6 bytes), `X0GDT0\0\0`,
+     `X0GDTx\0\0` (not a digit), `X0GDT1\0\x01` (bad padding), a file
+     without the prefix, and a version 1 body with trailing bytes. A valid
+     `X0GDT2\0\0` file is the control, as in 12d2. Besides §5a's
+     assertions, each run checks this ADR's outcome by its kind:
+     - **Replacement runs.** §5a writes a replacement at step 4: the file
+       was damaged at load, or a pending copy sits beside a missing file.
+       The loss outcome of 12d applies. G0 has no list and shows
+       `not_recorded`, cause `quarantined` in that run. A new issue is
+       `recorded`, and `DELETE /grants/G0` pushes to H and G only.
+     - **Finalize-only runs.** §5a finds a pending copy beside a healthy
+       file and only finalizes the copy as history. The file stays
+       byte-identical, and no replacement is written. When the healthy
+       file is not from this transaction and still records G0, G0 stays
+       `recorded`, and `DELETE /grants/G0` reaches D. When the healthy
+       file is this transaction's completed replacement, it stands
+       unchanged: G0 still has no list, and its revoke pushes to H and G
+       only. No loss is asserted for a grant whose list the healthy file
+       holds.
+     - **Failure runs.** §5a stops in a failure state. A file still at
+       its path stays byte-identical. G0 shows `unavailable` with that
+       state. A new issue is `held_in_memory` with that state, and its
+       revoke still reaches D.
+
+     Red on main: there is no sidecar, no quarantine and no state.
    - **12e, the host-commit wait (red).** O starts the candidate as an
      ADR 0094 update that is not yet host-committed. Issue G7:
      `held_in_memory`, cause `awaiting_host_commit`, and no sidecar file
      is written. `DELETE /grants/G7`: D refuses G7. The harness completes
-     the host commit. Issue G8: `recorded`, and the sidecar exists. Red on
-     main: none of these states exists.
+     the host commit. Issue G8: `recorded`, and the sidecar exists. In a
+     second run, the sidecar body is damaged at start. The sidecar shows
+     `sidecar_unavailable { file, cause: awaiting_host_commit }`, G0
+     shows `unavailable` with that state, and nothing is moved until the
+     host commit. After it, the quarantine runs, and G0 shows
+     `not_recorded`, cause `quarantined` (option (a) of open question 1).
+     Red on main: none of these states exists.
    - **12f, a downgrade (control).** The candidate O issues G9
      (`recorded`) and stops. The released v0.46.1 binary starts on the
      same data dir. It lists G9 in `GET /grants` with no `store_error`.
@@ -754,6 +916,13 @@ and 13 and their variants.
      sidecar. It is also red against a writer that does not serialize
      snapshots, because G10's stale snapshot overwrites G11's entry and
      the restart loses it.
+   - **12h, the list cap (D141, red).** Issue G14 with `deliver_to` naming
+     D and 64 more agent IDs, 65 in all. D receives the grant DM. The
+     response and `GET /grants` show `not_recorded`, cause `over_cap`.
+     `DELETE /grants/G14` pushes to H and G only, and D still honours G14
+     while v3 gossip to D is held. Issue G15 with D and 63 more, 64 in
+     all: `recorded`, and its revoke reaches D. Red on main: there is no
+     state and no push.
 13. **The live-session bound from receipt (D111).** A W3-H case. It needs
    ADR 0074 s3.
    - **Nodes.** Three daemons on the candidate build, each advertising the
@@ -791,7 +960,24 @@ and 13 and their variants.
      write paused for 30 s. The stream is still reset by t0 + 5 s. Red on
      main: there is no push. It is also red against an implementation
      whose re-evaluation waits for the persist.
-   - Variants for open questions 1 and 3 are written once David rules.
+   - **13d, a daemon that is sending grants (D139, red).** H holds the
+     owner's user key. At T = 8 s, `POST /grants` on H issues a grant to
+     an agent X whose DMs the harness holds, so H's delivery holds the
+     outbox send gate until its 30 s send deadline. The push reaches H at
+     t0 = 10.1 s, and v3 gossip to H is held. The stream is reset by
+     t0 + 5 s, while H's `GET /diagnostics/grants` still lists the ingest
+     as `awaiting_send_gate`. That entry clears once H's send to X returns,
+     by about T = 38 s plus I/O. Red on main: there is no push. It is also
+     red against an ingest that inserts only after the gate, because the
+     reset then comes near T = 38 s.
+   - **13e, a rate-limited copy starts nothing (D140, red).** Before
+     T = 10 s, O sends H 16 pushes for 16 other revoked
+     grants, within one minute. The push for this grant reaches H at
+     T = 10.1 s and is dropped as `rate_limited`. The v3 gossip batch
+     reaches H at t0 = 14 s. The stream is reset by t0 + 5 s, and H counts
+     one `rate_limited` drop. The assertion holds the bound from the
+     gossip copy, not from the dropped push. Red on main: the
+     `rate_limited` count does not exist.
 
    If ADR 0074 s3 is not on main when this slice is ready, 13a and 13c
    are still committed and shown red on main, because no teardown exists
@@ -802,9 +988,10 @@ and 13 and their variants.
 
 ## Rulings and open questions
 
-**Blocking David's Accept:** open questions 1 and 3, and the cross-model
-review named under Reviewers. Open questions 2 and 4 block only the
-implementing slice's code.
+**Blocking David's Accept:** open question 1, and the cross-model review
+named under Reviewers. Open question 2 blocks only the implementing
+slice's code. The code also waits for the D28 review of ADRs 0070 and
+0077 (D114).
 
 David ruled Q1–Q7 on 2026-10-04 (D108–D114):
 
@@ -818,77 +1005,77 @@ David ruled Q1–Q7 on 2026-10-04 (D108–D114):
   in-memory set and acts at once. The file stays untouched, and a push
   never lifts the hold (D110; section 6).
 - **Q4, live sessions:** the ADR 0074 s3 5 s bound starts when the host
-  first receives the record, by push or gossip (D111; section 4). Open
-  questions 1 and 3 record two cases where the ADR's text cannot yet
-  meet it.
+  first receives the record, by push or gossip (D111; section 4). D139
+  and D140 settle the two cases the earlier text could not meet.
 - **Q5, `deliver_to`:** recorded in the implementing slice, as a versioned
-  share-grant store change under ADR 0085 (D112; section 3a).
+  share-grant store change under ADR 0085 (D112; section 3a). It is a
+  new sidecar, not a new `X0SG` magic, so a downgraded v0.46.1 keeps its
+  grants.
 - **Q6, the gate:** confirmed. Push only on positive evidence, and wait up
   to 600 s for a peer of unknown capability (D113; sections 1 and 3). The
   bit number is still fixed at acceptance.
 - **Q7, the D28 hold:** the slice waits. Code merges only after the D28
   review of ADRs 0070 and 0077 is recorded (D114; section 8).
 
+David ruled the round-2 questions on 2026-10-04 (D120, D139–D143):
+
+- **D139, the 5 s bound on a daemon that is sending grants:** split the
+  ingest. A remote record enters the in-memory set and starts
+  re-evaluation at once (6a), then takes the send gate for outbox
+  ordering (6b) (section 4, step 6; section 5).
+- **D140, valid copies dropped before the ingest:** excluded. The bound
+  starts at the first copy that reaches the ingest. In startup or a
+  flood it can slip until gossip or a later push arrives (section 4).
+- **D141, the list cap:** 64 agents. A longer list is still delivered but
+  not recorded: `not_recorded`, cause `over_cap` (section 3a).
+- **D142, gossiped records during a store hold:** the same rule as pushed
+  records. This is a requirement on ADR 0098 (sections 6 and 7).
+- **D143, recent outcomes:** keep the last 1,024 in memory, oldest out
+  first (section 3).
+- **D120, an unreadable sidecar:** quarantine and rebuild, against the
+  recommendation. Applied to the quarantine of this ADR's one sidecar, the
+  `deliver_to` list (section 3a), through the shared lifecycle of ADR 0108
+  §5a. A damaged file is moved aside byte-identical. A valid newer
+  version is never quarantined, so ADR 0085 rule 5 holds. D120 rules the quarantine, so this ADR proposes an
+  amendment to ADR 0085 rule 4 for this sidecar only. The rebuild part
+  cannot be met as written: no holder has the lists. What replaces the
+  file is open question 1. This ADR is not an ADR 0088 slice, so it adds
+  no ADR 0088 §2 entry.
+
 Still open for David:
 
-1. **The receipt bound on a daemon that is sending grants (D111). Blocks
-   Accept.** Section 4, step 6 inserts the record only after it takes the
-   outbox send gate exclusively. A daemon's own `POST /grants` delivery or
-   redelivery pass holds that gate shared until its sends return. Each
-   send is bounded by the outbox send deadline (30 s). So on that daemon
-   the insert can start about 30 s after receipt, plus local I/O. D111
-   starts the 5 s bound at receipt, so it cannot hold there. ADR 0074 §4
-   counts from when the daemon applies the event, so ADR 0074 itself is
-   met. A daemon that issues no grants never holds the gate and never
-   waits.
-   - (a) Accept the exception: on a daemon whose own grant sends hold the
-     gate, the bound starts when the insert runs, at most one send
-     deadline after receipt. Cost: up to about 35 s there.
-   - (b) Split the ingest (a candidate, for review): insert the verified
-     record into the in-memory set and start re-evaluation at once, then
-     take the send gate exclusively before the ingest counts as done for
-     outbox ordering. ADR 0077 already makes every pass re-check the
-     revocation set before it sends, so a pass that checks after the
-     insert skips the grant. The gate still orders a pass that checked
-     before. The ingest never holds the set while it waits for the gate.
-     Cost: a change to the shared barrier and its lock order, which the
-     D28 review covers.
+1. **What replaces a quarantined `deliver_to` sidecar (D120). Blocks
+   Accept.** D120 rules a rebuild from holders. Only the issuing install
+   ever has a grant's `deliver_to` list. No grantee, host or `deliver_to`
+   agent keeps a copy, and no protocol asks for one. So nothing can be
+   rebuilt from holders.
+   - (a) Approve an empty replacement. The quarantine writes an empty
+     sidecar. Each grant whose entry was in the damaged file becomes
+     `not_recorded`, cause `quarantined`, and its list is lost for good.
+     Its `deliver_to` daemons then get gossip only at revoke. Cost: slower
+     revocation at those daemons. There is no access risk, because gossip
+     still revokes and the list gives no authority.
+   - (b) Keep a recoverable local copy (a candidate, for review). Every
+     persist writes two copies with the durable write, first A, then B,
+     each with a generation number. Load uses the highest generation that
+     decodes. A damaged copy is quarantined, and the replacement is
+     rebuilt from the other copy. Only when both are damaged does (a)
+     apply. A crash between the two writes leaves A one generation ahead,
+     and load rewrites B from it. Cost: twice the sidecar writes, up to
+     about 2 MiB more disk, and one more file in the downgrade and fault
+     tests.
 
-   Recommended: (b). It meets D111 as ruled, and the code waits for the
-   D28 review anyway (D114).
-2. **The cap on one recorded `deliver_to` list (D112). Blocks code, not
-   Accept.** `POST /grants` sets no cap on `deliver_to` today. Proposal:
-   record at most 64 agents, the shared-agent cap (`MAX_GRANT_AGENTS`). A
-   longer list is still delivered in full, but it is not recorded. The
-   grant's state is then `not_recorded`, cause `over_cap`, a terminal
-   state, and a revoke pushes to items 1 and 2 only. This keeps
-   `POST /grants` compatible and bounds the sidecar at about 2 MiB (1,024
-   grants × 64 × 32 B). The value needs David's ruling.
-3. **Valid copies dropped before the ingest (D111). Blocks Accept.**
-   Section 4 drops a pushed copy as `not_ready` (before the typed route is
-   ready) or `rate_limited` (over 16 a minute from one sender, or 256 in
-   total). That copy may hold a valid record. D111 starts the bound at
-   first receipt, with no exception. The receiver cannot verify a copy
-   before the ingest, and the rate limit exists to bound verify work.
-   - (a) Exclude these drops: the bound starts at the first copy that
-     reaches the shared ingest, meaning a pushed copy that passes steps 1
-     to 5, or a gossip batch that holds the record. A dropped copy starts
-     nothing, and the next copy that reaches the ingest starts the bound.
-     Cost: during startup or a flood, the bound can slip until gossip or a
-     later push arrives.
-   - (b) Keep D111 with no exception: buffer a `not_ready` copy until the
-     route is ready, and queue rate-limited copies instead of dropping
-     them. Cost: two new bounded queues. The bound still fails if startup
-     takes more than 5 s or a flood fills a queue.
-
-   Recommended: (a). A host can act only on a copy it can admit. Case 13
-   gains a variant for whichever option David rules.
-4. **Retention of recent push outcomes (section 3). Blocks code, not
-   Accept.** `GET /diagnostics/grants` keeps a bounded list of recent
-   outcomes, so a skip or a failure stays visible with its grant and its
-   recipient. Proposal: keep the latest 1,024 outcomes in memory, the same
-   bound as pending pushes, drop the oldest first, and lose the list on
-   restart. The counters keep the totals. The value needs David's ruling.
+   Recommended: (a). The list only speeds up revocation, and losing it
+   never keeps a grant alive. (b) doubles every sidecar write to guard
+   against a rare fault. Section 3a and cases 12d, 12e and 12i are written
+   for (a). Under (b), they gain a restore-from-copy step and a
+   both-copies-damaged case.
+2. **Retention of quarantined `deliver_to` copies (D120). Blocks code,
+   not Accept.** ADR 0108 §5a never deletes a quarantined copy and leaves
+   retention to each ADR. Proposal: keep every copy until an operator
+   removes it, and list each one in `GET /diagnostics/grants` with its
+   `txid`, hash and size. Each copy is at most about 2 MiB, and a copy
+   only appears when the file is damaged. The rule needs David's ruling.
 
 ## Notes for AI-assisted work
 

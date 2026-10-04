@@ -1,7 +1,7 @@
 # x0x design direction and rulings digest
 
 - **Status:** maintained digest, not an ADR. It records the design rulings
-  David Irvine made from 2026-09-28 to 2026-10-04 (decisions D01–D114 and the
+  David Irvine made from 2026-09-28 to 2026-10-04 (decisions D01–D143 and the
   efficiency decisions E-D1–E-D17).
 - **Updated:** 2026-10-04.
 - **Relationship to ADRs:** ADRs remain the decision records, and only David
@@ -114,7 +114,7 @@ wave that fixes each is in section 7.
 | I12 | **Resource bounds.** A daemon never fills its host's disk, spends a user's uplink as infrastructure, or grows queues without bound, and every bound is visible. |
 | I13 | **Plane isolation.** A test or named daemon never joins production by accident. |
 
-## 5. Decisions D01–D114
+## 5. Decisions D01–D143
 
 Status key: **implemented** = in effect on `main` (code, configuration or an
 Accepted ADR); **ruled** = decided by David, work outstanding or ongoing;
@@ -241,6 +241,35 @@ and D29 (an ADR 0089 slice pulled into v0.46).
 | D112 | ADR 0080, record deliver_to for the push: **Yes, in the implementing slice**. Record it as a versioned share-grant store change (ADR 0085). | Ruled (2026-10-04); ADR 0080 Proposed |
 | D113 | ADR 0080, positive-evidence gate and unknown wait: **Confirm both**. Push only on positive evidence and wait up to 600 s for an unknown peer. | Ruled (2026-10-04); ADR 0080 Proposed |
 | D114 | ADR 0080, does the D28 hold cover this? **Wait for the review**. Code merges after the D28 review is recorded. | Ruled (2026-10-04); ADR 0080 Proposed |
+| D115 | GO to publish saorsa-gossip 0.5.87 (#106 and #108, for x0x#857); the x0x exact-pin bump follows as a normal PR gated by the v0.46.2 test-host checks. | Ruled (2026-10-04) |
+| D116 | Cut v0.46.2 without #1190: the test-host run found late or missing key shares after an owner restart. v0.46.2 = #857, #1196, #1100; #1150 moves to v0.46.3. | Ruled (2026-10-04) |
+| D117 | ADR 0088 slices, cause notice for the 120 s join timeout: **One notice, owned by S2**. The admin signs an attempt-bound pending notice with a cause, served on the joiner's existing join-result poll under ADR 0107's guard. Later slices reuse it. | Ruled (2026-10-04); ADR 0088 slices Proposed |
+| D118 | ADR 0088 slices, confirm the named additions to 0088 §2: **Confirm all four**. Cost: the §2 list grows from 8 to 12 entries, each with a harness case. | Ruled (2026-10-04); ADR 0088 slices Proposed |
+| D119 | ADR 0088 slices, confirmed member behind every holder's retention: **Widen S8(b) now**. 0114 also repairs confirmed members. Not the recommendation. | Ruled (2026-10-04); ADR 0088 slices Proposed |
+| D120 | ADR 0088 slices, unreadable slice sidecar files: **Automatic rebuild**. Each slice quarantines the file and rebuilds it from holders. Not the recommendation. | Ruled (2026-10-04); ADR 0088 slices Proposed |
+| D121 | ADR 0088 slices, D78 and 0088 §2 item 7: **Named amendment**. Add the owner-axis case to §2 explicitly. | Ruled (2026-10-04); ADR 0088 slices Proposed |
+| D122 | ADR 0088 slices, 'Lowest online' or 'lowest roster' admin: **D74 everywhere**. 'Online' in D88 and 0088 §3 reads as 'eligible on the roster'. The others fall back after W. | Ruled (2026-10-04); ADR 0088 slices Proposed |
+| D123 | ADR 0108, push pair with no anchor proof: **Re-anchor on the current head**. Capture the node's current verified head as the new proof and persist it. | Ruled (2026-10-04); ADR 0108 Proposed |
+| D124 | ADR 0108, two Home disclosures to non-members: **Keep both and name them**. I add both to the ADR 0007 overlay in the ADR README. | Ruled (2026-10-04); ADR 0108 Proposed |
+| D125 | ADR 0108, end date for the D96 and D68 exceptions: **Later ruling**. The exceptions have no date until then. | Ruled (2026-10-04); ADR 0108 Proposed |
+| D126 | ADR 0110, exit when no eligible admin remains: **Proposed set**. Owner-certified groups: an owner-signed recovery commit removes the revoked admin and promotes one eligible member. Every admin expired: the self-rebind in the rebinding question below. Ordinary groups: a deletion exit, typed `group_admin_revoked`, with a re-create offer, as a named §2 entry. | Ruled (2026-10-04); ADR 0110 Proposed |
+| D127 | ADR 0110, expiry tolerance τ: **τ = 300 s**. Today's `EXPIRY_CLOCK_SKEW_SECS`, so eviction and D60's delivery refusal use one test. | Ruled (2026-10-04); ADR 0110 Proposed |
+| D128 | ADR 0110, limits for completed eviction evidence: **Accept**. Drop evidence bodies 30 days after verified completion. Keep a compact record, at most 4,096 per group, until group deletion. A node that leaves ends local retention once it has handed its evidence to an eligible admin, or at once if it may no longer send. | Ruled (2026-10-04); ADR 0110 Proposed |
+| D129 | ADR 0110, in-place certificate rebinding commit: **Define it; admins or the seat's own agent**. As (a), and the seat's own agent may rebind its own seat. This supplies the every-admin-expired exit. | Ruled (2026-10-04); ADR 0110 Proposed |
+| D130 | ADR 0112, ownerCertified fork prevention: **Develop the candidate**. The authors write it as normative text with its L4 argument, for your review. | Ruled (2026-10-04); ADR 0112 Proposed |
+| D131 | ADR 0112, discovery, fetch and retry limits: **Accept**. Discovery: 8 candidates per round, 3 lookups in flight, 30 s rounds, then every 5 min. Fetch: S5's ruled values. Redeemer: answer within 90 s (TreeKEM) or 9 min (GSS). The 2 s poll with a resend about every 6 s. Probes at 30 s, 1, 2 and 4 min, then every 5 min, ±10% jitter. | Ruled (2026-10-04); ADR 0112 Proposed |
+| D132 | ADR 0112, V5 lifetime, skew, storage and exhaustion: **Accept**. Lifetime: default 7 days, maximum 30. Skew: 5 min. Storage: 4,096 tombstones per group and 16 MiB per node. Exhaustion exit: a 5-minute maintenance pass with designated-first prune. With no admin online, the wait falls under §2 item 3. | Ruled (2026-10-04); ADR 0112 Proposed |
+| D133 | ADR 0112, promotion chain for a joiner before membership: **Yes, narrowly**. Only that chain, and only on that admin's direct, guarded result path. | Ruled (2026-10-04); ADR 0112 Proposed |
+| D134 | ADR 0113, home setup for seeded identities: **Exception**. Setup creates a Home only for a new random identity on a fresh install. Seeded, rotated or re-created identities report `home: not_requested` with the next step. | Ruled (2026-10-04); ADR 0113 Proposed |
+| D135 | ADR 0113, announced renewals no longer keep a seat: **Accept**. An expiring seat needs a rebinding commit. | Ruled (2026-10-04); ADR 0113 Proposed |
+| D136 | ADR 0114, evidence that a seat was never confirmed: **Admission-time marker**. The sealing admin signs a marker bound to the seating commit, carried on the chain, so any admin can check it. Seats without a marker, including every pre-upgrade seat, use the manual exit. | Ruled (2026-10-04); ADR 0114 Proposed |
+| D137 | ADR 0114, retention of repair budget records: **Accept**. Keep a seat's limiter and budget record while that seat generation is on the roster and unconfirmed. Delete it on a verified receipt. Keep an exhausted budget until removal, ban or group deletion, so restarts cannot reset it. Drop entries for identities that leave the roster. | Ruled (2026-10-04); ADR 0114 Proposed |
+| D138 | ADR 0114, roles that repair cannot restore: **Add to the S8(b) §2 entry**. Part of the named 'S8(b) manual-exit repair' entry. | Ruled (2026-10-04); ADR 0114 Proposed |
+| D139 | ADR 0080, 5 s bound on a daemon that is sending grants: **Split the ingest**. Insert into the in-memory set and start re-evaluation at once, then take the gate for outbox ordering. | Ruled (2026-10-04); ADR 0080 Proposed |
+| D140 | ADR 0080, valid copies dropped before the ingest: **No, exclude them**. The bound starts at the first copy that reaches the ingest. | Ruled (2026-10-04); ADR 0080 Proposed |
+| D141 | ADR 0080, cap on a recorded deliver_to list: **64 agents**. The shared-agent cap. A longer list is still delivered but not recorded (`not_recorded`, cause `over_cap`). It bounds the file at about 2 MiB. | Ruled (2026-10-04); ADR 0080 Proposed |
+| D142 | ADR 0080, gossiped records during a store hold: **Same rule**. Recorded as a requirement on ADR 0098: a gossiped record also acts in memory during a hold. | Ruled (2026-10-04); ADR 0080 Proposed |
+| D143 | ADR 0080, recent outcomes kept for the grants diagnostics: **Keep the last 1,024 outcomes**. In memory, oldest first out. | Ruled (2026-10-04); ADR 0080 Proposed |
 | COMMS | Use plain controlled language (about 80% toward ASD-STE100), fixed decision templates and one release contact; record and share each ruling, check live GitHub before requesting approval, keep the release dashboard current and include diagrams in briefs. Trial explainer videos after promotion. | Ruled; adopted 2026-10-02 |
 
 ## 6. Efficiency decisions E-D1–E-D17 (Track E)
