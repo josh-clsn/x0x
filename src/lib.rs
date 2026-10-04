@@ -2878,6 +2878,13 @@ async fn patch_discovery_entry_when_blob_lands(
             );
             return;
         }
+        // x0x #1150 (r7g): the announced-binding store is taken FIRST and
+        // held until the binding carries the landed expiry, so no pinned
+        // reader (the resolver waits, the seam's try_read refuses) sees the
+        // binding while discovery publishes the certificate without its
+        // expiry. Lock order: the announced-binding store, then discovery.
+        // No path takes them the other way round.
+        let mut store = announced.write().await;
         let mut discovery = cache.write().await;
         if let Some(entry) = discovery.get_mut(agent_id) {
             // FRESHNESS GATE (review r2, #447): the entry's LATEST announce
@@ -2909,20 +2916,17 @@ async fn patch_discovery_entry_when_blob_lands(
         drop(discovery);
         #[cfg(test)]
         announced_record_barrier::park(agent_id, announced_record_barrier::HYDRATION_PUBLISH).await;
-        // x0x #1150 (r7d-r7f): AFTER the discovery patch, the announced
+        // x0x #1150 (r7d-r7g): still under the store lock taken above, the
         // binding whose announcement committed to THIS digest learns the
-        // landed expiry. The update is keyed on the digest and runs under
-        // the store's write lock, whatever the discovery entry's state.
-        // Ingest registers its binding (and digest) in the store BEFORE it
-        // publishes its discovery merge (`cache_verified_announcement`). So
-        // if this hydration patched the discovery entry, the binding with
-        // this digest already existed, and this update finds it. Discovery
-        // never holds a certificate whose expiry the binding lacks, and
-        // nothing depends on the blob surviving for a later lookup.
-        announced
-            .write()
-            .await
-            .record_certificate_landed(agent_id, *digest, cert.not_after());
+        // landed expiry. The update is keyed on the digest, whatever the
+        // discovery entry's state. Ingest registers its binding (and digest)
+        // in the store BEFORE it publishes its discovery merge
+        // (`cache_verified_announcement`). So if this hydration patched the
+        // discovery entry, the binding with this digest already existed and
+        // is updated here, before the store lock is released. Nothing
+        // depends on the blob surviving for a later lookup.
+        store.record_certificate_landed(agent_id, *digest, cert.not_after());
+        drop(store);
         return;
     }
 }
