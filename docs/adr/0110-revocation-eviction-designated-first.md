@@ -187,7 +187,7 @@ Other deadline misses are defects, not new may-block-forever entries.
 
 ### 5. Separate versioned persistence and mixed versions
 
-**Never change either legacy JSON format:** `named_groups.json` and `home-suite-groups.json` remain released-reader-safe maps, with existing #451 inert placeholders where required. Ordinary membership changes still use their existing encoders.
+**Never change either legacy JSON format:** `named_groups.json` and `home-suite-groups.json` remain released-reader-safe maps, existing #451 placeholders are left unchanged; S4 adds none. Ordinary membership changes still use their existing encoders.
 Use S4's own `<data_dir>/revocation-evictions.evs` sidecar with magic **`X0XEVICT1`**, followed by its frozen v1 postcard body, consumed exactly.
 Use new `<data_dir>/treekem/<stable-group-id>.evjournal` journals with distinct magic **`X0XEVJ1`**, followed by their own frozen v1 postcard body, consumed exactly. Legacy `*.journal` and `.hsjournal` scans ignore both extensions.
 Do not add fields to `TreeKemNamedPersistJournal` or alter its postcard layout; it replays before load (`src/server/mod.rs:726`).
@@ -218,6 +218,7 @@ A legacy admin may stay idle or race a valid removal; new admins wait then fallb
 - Positive: revocation and self-leave no longer need an unrelated seal or original admin; #1113 is in scope.
 - Positive: legacy startup remains safe; crashes retain evidence without automatic stale-event publication.
 - Cost: an Active survivor whose current verified advert lacks `crypto_exclusion_v1` holds crypto-only exclusion at `waiting_for_receiver_upgrade` until upgrade or the hold no longer applies; seated-target revocations still use legacy `MemberRemoved`. Timeout races still require containment.
+- Not protected: a legacy survivor that is offline, or whose advert has expired, when the crypto-only exclusion commits does not hold it. On return it cannot cross the chain and epoch gap, because the gated catch-up is never served to it. It stays stranded until it upgrades, which a pinned install may never do. A closed laptop during a self-leave is the typical case. Open question 8 asks David to rule.
 - Cost: longer fallback reduces ordinary-group fork risk but delays key exclusion; timing needs measured tail latency and David's decision.
 - Operational: seal-time certificate re-checks stay until S7, after S4 is Accepted and shipped.
 
@@ -260,7 +261,11 @@ Preserve 0106 intervening-event carry for legacy-understood events, with §4's g
 5. Does **lowest eligible roster admin first, others wait W** satisfy D40's “online” while preserving common designation and one-admin fallback? It removes direct-QUIC/presence ambiguity but makes a higher reachable admin wait for an offline lower ID. If David requires lowest reachable instead, define the shared reachability evidence/expiry before code; local online views alone cannot safely decide early priority.
 6. **Sole admin revoked:** may this wait indefinitely, and what authenticated recovery/deletion exit is allowed while preserving last-admin and revoked-signer rules? Recommend `waiting_for_eligible_admin_revocation` on every member and **blocking member sends meanwhile**, with recovery decided explicitly. It is not 0088's admin-empty item 3; no new exception is silently added.
 7. Does 0088 L3 bind this slice (G7)? The typed states here do not settle the contract-wide ruling.
-8. **Legacy rollout:** does David instead want to commit crypto-only exclusion despite a known Active legacy survivor and accept stranding that member behind the chain/epoch gap; if so, for how long during a rollout?
+8. **Legacy rollout:** which rule for legacy survivors?
+   - (a) Treat a survivor's last verified advert as holding the commit even after it expires. This protects offline legacy members, but a dead legacy device that still holds an Active seat then blocks the exclusion, which costs L1.
+   - (b) Accept stranding for legacy survivors that are unknown, expired or offline, as the Decision does today.
+   - (c) Commit despite a known Active legacy survivor during a rollout. If so, for how long?
+   An indefinite hold on a pinned legacy survivor is today's behaviour toward that member, which 0088:172 allows, but it is not on 0088's §2 list of permitted permanent waits (L2). So David should rule on it explicitly.
 
 ## Follow-ups
 
