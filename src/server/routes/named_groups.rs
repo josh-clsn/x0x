@@ -36514,10 +36514,10 @@ pub(super) fn join_result_chunk_admission(
     })
 }
 
-/// ADR 0107 (r5): the admission of one Welcome chunk: the staged Welcome
-/// still stands, unexpired, for this recipient, and the recipient is
-/// eligible.
-fn welcome_chunk_admission(
+/// ADR 0107 (r5, r7h): the admission of one Welcome frame (Offer, Chunk or
+/// Complete): the staged Welcome still stands, unexpired, for this
+/// recipient, and the recipient is eligible.
+fn welcome_frame_admission(
     state: &Arc<AppState>,
     welcome_id: &str,
     recipient_hex: &str,
@@ -36814,21 +36814,6 @@ fn record_join_artifact_lifecycle(state: &AppState, event: String) {
         .lock()
     {
         events.push(event);
-    }
-}
-
-/// ADR 0107 (review r2): the test-only egress witness, at the point where
-/// a join artifact's bytes are handed to the transport (after any barrier).
-#[cfg(test)]
-async fn join_egress_test_point(
-    state: &AppState,
-    recipient: &str,
-    group: &str,
-    kind: &'static str,
-) {
-    join_egress_test_barrier::park(recipient, kind).await;
-    if let Ok(mut egress) = state.named_group_test_recorders.join_artifact_egress.lock() {
-        egress.push((recipient.to_string(), group.to_string(), kind));
     }
 }
 
@@ -37280,21 +37265,34 @@ async fn handle_join_result_message_bound(
                             }
                         };
                         let outcome = match staged {
+                            // x0x #1150 (r7h): the reference to the staged
+                            // copy is a class-R response frame too. It takes
+                            // the admitted single-exchange path, under the
+                            // copy's own admission (still staged, bound to its
+                            // original, recipient eligible), with bounded
+                            // resolution and no ACK-v2 resend. A lost
+                            // reference is recovered by the joiner's fetch
+                            // retry.
                             Ok(reference) => {
-                                #[cfg(test)]
-                                join_egress_test_point(
-                                    &task_state,
-                                    &member_for_log,
-                                    &group_id_for_task,
-                                    "join_result_reference",
-                                )
-                                .await;
-                                control_blob::send_reference_message(
-                                    &task_state.agent,
-                                    &recipient,
-                                    reference,
-                                )
-                                .await
+                                let admission =
+                                    join_result_chunk_admission(&task_state, &reference);
+                                match control_blob::encode_message(
+                                    &control_blob::ControlBlobMessage::Reference { reference },
+                                ) {
+                                    Ok(payload) => {
+                                        send_join_artifact(
+                                            &task_state,
+                                            &recipient,
+                                            &payload,
+                                            &group_id_for_task,
+                                            "join_result_reference",
+                                            admission,
+                                            artifact_deadline,
+                                        )
+                                        .await
+                                    }
+                                    Err(reason) => Err(reason),
+                                }
                             }
                             Err(reason) => Err(reason),
                         };
@@ -38560,43 +38558,55 @@ async fn handle_welcome_fetch_request(
             let state = Arc::clone(&send_state);
             let group_id = send_group.clone();
             async move {
-                match &msg {
-                    // ADR 0107 (review r4 P1): a chunk carries the Welcome's
-                    // bytes, so it takes the owned, admitted raw-QUIC path
-                    // only. Offer and Complete carry no artifact bytes and
-                    // keep their delivery config.
-                    WelcomeBlobMessage::Chunk { welcome_id, .. } => {
-                        let payload = welcome_blob_payload(&msg)?;
-                        let Some(deadline) = state
-                            .pending_welcomes
-                            .read()
-                            .await
-                            .get(welcome_id)
-                            .map(|pending| pending.created_at + PENDING_WELCOME_TTL)
-                        else {
-                            return Err("the staged Welcome was withdrawn".to_string());
-                        };
-                        let admission = welcome_chunk_admission(
-                            &state,
-                            welcome_id,
-                            &hex::encode(send_recipient.as_bytes()),
-                        );
-                        let outcome = send_join_artifact(
-                            &state,
-                            &send_recipient,
-                            &payload,
-                            &group_id,
-                            "welcome_frame",
-                            admission,
-                            deadline,
-                        )
-                        .await;
-                        welcome_frame_delivered(&state, outcome)
+                // ADR 0107 (review r4 P1; x0x #1150 r7h): EVERY owner Welcome
+                // frame (Offer, Chunk, Complete) takes the owned, admitted,
+                // single-exchange raw-QUIC path, with bounded recipient
+                // resolution. The Offer and Complete used to keep the general
+                // DM config: the gossip inbox's ACK-v2 receipt with one
+                // internal resend, and a raw fallback with a receive ACK.
+                // Those resends were not admitted, and the general resolver
+                // went cold after an owner restart (g10-1190b: an 85.8 s
+                // stall). None of these frames needs a transport receipt:
+                // - the Offer is advisory (#825);
+                // - chunks are acknowledged by the joiner's application-level
+                //   ChunkAck;
+                // - a lost Complete is recovered by the joiner's own fetch
+                //   retry, which restreams with fresh admission.
+                let (welcome_id, kind) = match &msg {
+                    WelcomeBlobMessage::Offer { welcome_id, .. } => (welcome_id, "welcome_offer"),
+                    WelcomeBlobMessage::Chunk { welcome_id, .. } => (welcome_id, "welcome_frame"),
+                    WelcomeBlobMessage::Complete { welcome_id } => (welcome_id, "welcome_complete"),
+                    WelcomeBlobMessage::FetchRequest { .. }
+                    | WelcomeBlobMessage::ChunkAck { .. } => {
+                        return Err("not an owner Welcome frame".to_string());
                     }
-                    _ => send_welcome_blob_message(&state, &send_recipient, &msg)
-                        .await
-                        .map(|_| ()),
-                }
+                };
+                let payload = welcome_blob_payload(&msg)?;
+                let Some(deadline) = state
+                    .pending_welcomes
+                    .read()
+                    .await
+                    .get(welcome_id)
+                    .map(|pending| pending.created_at + PENDING_WELCOME_TTL)
+                else {
+                    return Err("the staged Welcome was withdrawn".to_string());
+                };
+                let admission = welcome_frame_admission(
+                    &state,
+                    welcome_id,
+                    &hex::encode(send_recipient.as_bytes()),
+                );
+                let outcome = send_join_artifact(
+                    &state,
+                    &send_recipient,
+                    &payload,
+                    &group_id,
+                    kind,
+                    admission,
+                    deadline,
+                )
+                .await;
+                welcome_frame_delivered(&state, outcome)
             }
         },
     )
@@ -38877,7 +38887,7 @@ async fn stream_welcome_blob_via<S, F>(
     if let Err(e) = send(offer).await {
         tracing::warn!(
             welcome_id,
-            "Welcome blob offer receipt not confirmed, streaming chunks anyway: {e}"
+            "Welcome blob offer not delivered, streaming chunks anyway: {e}"
         );
     }
     tracing::debug!(
