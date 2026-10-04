@@ -1968,6 +1968,14 @@ const SECURE_SHARE_WITHHELD_RETRY: Duration = Duration::from_secs(15);
 /// retried, admitted afresh each time, until the horizon).
 const SECURE_SHARE_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(120);
 
+/// x0x #1150 (g10-1190a): the pause before resending a share whose exchange
+/// ended `recipient_undiscovered`. That exchange already waited its bound
+/// (up to [`x0x::dm::PINNED_RESOLUTION_WAIT`]) for a verified source to
+/// learn the recipient, so the resend does not back off: it lands within
+/// about this pause of the recipient's discovery, until the horizon. The
+/// transport backoff stays for every other failure.
+const SECURE_SHARE_UNDISCOVERED_RETRY: Duration = Duration::from_secs(1);
+
 /// ADR 0107 / D60 (r5, G11): what a class-K share delivery may do now.
 enum SecureShareDeliveryVerdict {
     Deliver,
@@ -2186,6 +2194,14 @@ fn spawn_secure_share_delivery(state: &Arc<AppState>, event: &NamedGroupMetadata
                             return;
                         }
                         tokio::time::sleep(SECURE_SHARE_WITHHELD_RETRY).await;
+                    }
+                    Err(reason) if reason.starts_with(x0x::dm::RECIPIENT_UNDISCOVERED) => {
+                        // g10-1190a: no verified source learned the recipient
+                        // within the exchange's bounded wait (a restart left
+                        // them cold). Nothing was admitted or written; resend
+                        // promptly, admitted afresh, without backing off.
+                        tracing::debug!(group_id = %LogHexId::group(&group), recipient = %LogHexId::agent(&recipient_hex), "secure share recipient not yet discovered; resending: {reason}");
+                        tokio::time::sleep(SECURE_SHARE_UNDISCOVERED_RETRY).await;
                     }
                     Err(reason) => {
                         // A transport failure: retry with backoff (each retry is
@@ -36568,6 +36584,14 @@ const JOIN_ARTIFACT_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 /// `min(now + JOIN_ARTIFACT_EXCHANGE_TIMEOUT, deadline)`: on timeout the
 /// future is dropped, so an unfinished stream resets. The deadline only
 /// cancels; it never purges.
+///
+/// g10-1190a: resolving the recipient's machine (which waits for a verified
+/// source when a restart left them cold) may use at most half of the
+/// exchange's budget, and at most [`x0x::dm::PINNED_RESOLUTION_WAIT`]. An
+/// unresolved recipient therefore ends in the typed, retryable
+/// `recipient_undiscovered` inside the deadline, and the rest of the budget
+/// is left for any repair, the pre-phase and the write. No membership lock
+/// is held while it waits: the pre-phase takes it after resolution.
 pub(super) async fn send_join_artifact(
     state: &AppState,
     recipient: &AgentId,
@@ -36594,9 +36618,13 @@ pub(super) async fn send_join_artifact(
                 transports.push((recipient_hex.clone(), kind, "pinned_single_exchange"));
             }
         }
+        let resolve_within = std::cmp::min(
+            x0x::dm::PINNED_RESOLUTION_WAIT,
+            exchange_deadline.saturating_duration_since(Instant::now()) / 2,
+        );
         state
             .agent
-            .send_direct_pinned_admitted(recipient, payload, &admission)
+            .send_direct_pinned_admitted(recipient, payload, &admission, resolve_within)
             .await
     };
     let outcome = match tokio::time::timeout_at(exchange_deadline.into(), exchange).await {

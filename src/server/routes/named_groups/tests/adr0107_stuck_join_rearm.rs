@@ -4193,7 +4193,12 @@ async fn s8a_r5_g13_real_pinned_exchange_is_admitted_once_and_delivered_once() -
     let sent = pair
         .alice
         .agent
-        .send_direct_pinned_admitted(&pair.bob.agent.agent_id(), &marker, &admission)
+        .send_direct_pinned_admitted(
+            &pair.bob.agent.agent_id(),
+            &marker,
+            &admission,
+            x0x::dm::PINNED_RESOLUTION_WAIT,
+        )
         .await;
     assert!(sent.is_ok(), "the admitted exchange writes: {sent:?}");
     assert_eq!(
@@ -4221,7 +4226,12 @@ async fn s8a_r5_g13_real_refusals_write_nothing() -> anyhow::Result<()> {
         let sent = pair
             .alice
             .agent
-            .send_direct_pinned_admitted(&pair.bob.agent.agent_id(), &marker, &admission)
+            .send_direct_pinned_admitted(
+                &pair.bob.agent.agent_id(),
+                &marker,
+                &admission,
+                x0x::dm::PINNED_RESOLUTION_WAIT,
+            )
             .await;
         assert!(
             sent.as_ref()
@@ -4267,7 +4277,12 @@ async fn s8a_r5_g13_real_machine_revocation_before_the_seam_writes_nothing() -> 
     let sent = pair
         .alice
         .agent
-        .send_direct_pinned_admitted(&pair.bob.agent.agent_id(), &marker, &admission)
+        .send_direct_pinned_admitted(
+            &pair.bob.agent.agent_id(),
+            &marker,
+            &admission,
+            x0x::dm::PINNED_RESOLUTION_WAIT,
+        )
         .await;
     assert!(sent.is_err(), "the revoked machine is refused: {sent:?}");
     assert_eq!(

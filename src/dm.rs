@@ -1130,6 +1130,17 @@ pub(crate) type ArtifactAdmission = std::sync::Arc<
 /// x0x #1150: the error text of a pinned send that its admission refused.
 pub(crate) const PINNED_ADMISSION_REFUSED: &str = "recovery-response admission refused";
 
+/// x0x #1150 (g10-1190a): the longest a pinned send waits for a verified
+/// source to learn its recipient's machine. A daemon that has just
+/// restarted has a cold discovery cache, DM registry and peer evidence.
+/// Callers also cap the wait to their exchange budget.
+pub(crate) const PINNED_RESOLUTION_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// x0x #1150 (g10-1190a): the error-text prefix of
+/// [`DmError::RecipientUndiscovered`], the typed, retryable outcome of a
+/// pinned send whose recipient no verified source resolved in time.
+pub(crate) const RECIPIENT_UNDISCOVERED: &str = "recipient_undiscovered";
+
 /// x0x #1150: the error text the in-process stand-in returns for an
 /// exchange its admission passed (test builds only).
 #[cfg(test)]
@@ -2195,6 +2206,14 @@ fn _type_witness(_: AgentId, _: MachineId) {}
 
 #[cfg(test)]
 mod tests {
+
+    /// x0x #1150 (g10-1190a): callers classify an unresolved pinned
+    /// recipient by this prefix, so it must lead the error text.
+    #[test]
+    fn recipient_undiscovered_text_leads_with_its_marker() {
+        let error = super::DmError::RecipientUndiscovered("x".to_string());
+        assert!(error.to_string().starts_with(super::RECIPIENT_UNDISCOVERED));
+    }
 
     /// #979 r2 (B1 hazard pin): the in-flight ACK registry is keyed by
     /// request id ALONE — registering the SAME id twice replaces (and

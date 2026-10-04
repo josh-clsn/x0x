@@ -250,6 +250,31 @@ struct RawQuicTarget {
     resolution: &'static str,
 }
 
+/// x0x #1150 (g10-1190a): the verified source a pinned send resolved its
+/// recipient's machine from (see `Agent::pinned_recipient_machine`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinnedMachineSource {
+    DiscoveryCache,
+    DmRegistry,
+    AuthenticatedBinding,
+    PeerEvidence,
+}
+
+impl PinnedMachineSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::DiscoveryCache => "discovery_cache",
+            Self::DmRegistry => "dm_registry",
+            Self::AuthenticatedBinding => "authenticated_binding",
+            Self::PeerEvidence => "peer_evidence",
+        }
+    }
+}
+
+/// x0x #1150 (g10-1190a): how often a pinned send's bounded wait re-reads
+/// the verified sources of its recipient's machine.
+const PINNED_RESOLUTION_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// x0x #1150 (g10-1190a): agents whose in-process pinned stand-in resolves
 /// the recipient's machine strictly, as the real path does (see
 /// `Agent::set_pinned_standin_strict_resolution_for_testing`).
@@ -7723,6 +7748,13 @@ impl Agent {
     /// never retries: the caller's protocol owns every resend, and each one
     /// runs both admission phases again.
     ///
+    /// The recipient's machine comes from a verified source only (see
+    /// [`Self::await_pinned_recipient_machine`]). When none knows it yet, as
+    /// on a daemon that has just restarted, the send waits up to
+    /// `resolve_within` for one to learn it, holding no lock, then fails
+    /// with the typed, retryable [`dm::DmError::RecipientUndiscovered`]
+    /// before any admission runs (g10-1190a).
+    ///
     /// `admission` runs in two phases. Its async pre-phase runs after
     /// machine resolution, repair or redial and the B/P pairing checks; it
     /// is advisory and returns the synchronous seam check bound to its
@@ -7731,12 +7763,14 @@ impl Agent {
     /// immediately before `write_all`, together with this agent's own
     /// agent, machine and pairing revocation checks. Any refusal, or lock
     /// contention at the seam, writes nothing. The caller bounds the whole
-    /// call with its exchange deadline.
+    /// call with its exchange deadline, and `resolve_within` must leave
+    /// part of that deadline for the exchange itself.
     pub(crate) async fn send_direct_pinned_admitted(
         &self,
         to: &identity::AgentId,
         payload: &[u8],
         admission: &dm::ArtifactAdmission,
+        resolve_within: std::time::Duration,
     ) -> Result<dm::DmReceipt, dm::DmError> {
         // ADR-0043 signing gate: the same egress refusal the general path
         // applies before any envelope or transport work.
@@ -7757,7 +7791,7 @@ impl Agent {
         // stale suspicion must not suppress the recovery.
         self.direct_messaging.record_outgoing_started(*to, None);
         let result = self
-            .send_direct_pinned_admitted_inner(to, payload, admission)
+            .send_direct_pinned_admitted_inner(to, payload, admission, resolve_within)
             .await;
         match &result {
             Ok(_) => self
@@ -7773,10 +7807,13 @@ impl Agent {
         to: &identity::AgentId,
         payload: &[u8],
         admission: &dm::ArtifactAdmission,
+        resolve_within: std::time::Duration,
     ) -> Result<dm::DmReceipt, dm::DmError> {
         #[cfg(test)]
         if self.network.is_none() {
-            return self.pinned_admission_standin(to, admission).await;
+            return self
+                .pinned_admission_standin(to, admission, resolve_within)
+                .await;
         }
         let send_start = std::time::Instant::now();
         let agent_prefix = network::hex_prefix(&to.0, 4);
@@ -7784,8 +7821,22 @@ impl Agent {
             .network
             .as_ref()
             .ok_or_else(|| dm::DmError::NoConnectivity("network not initialized".to_string()))?;
+        // g10-1190a: a verified source must know the machine before the
+        // shared selection runs; the ADR-0021 authenticated binding is one
+        // the shared selection does not read, so it is handed over.
+        let (machine, source) = self
+            .await_pinned_recipient_machine(to, resolve_within)
+            .await?;
+        let attested = (source == PinnedMachineSource::AuthenticatedBinding).then_some(machine);
         let target = self
-            .resolve_raw_quic_target(to, network, &agent_prefix, payload.len(), send_start)
+            .resolve_raw_quic_target(
+                to,
+                network,
+                &agent_prefix,
+                payload.len(),
+                send_start,
+                attested,
+            )
             .await
             .map_err(Self::map_raw_quic_dm_error)?;
         let Some(seam) = admission().await else {
@@ -7872,9 +7923,14 @@ impl Agent {
         &self,
         to: &identity::AgentId,
         admission: &dm::ArtifactAdmission,
+        resolve_within: std::time::Duration,
     ) -> Result<dm::DmReceipt, dm::DmError> {
         let machine = if pinned_standin_is_strict(&self.identity.agent_id()) {
-            Some(self.pinned_standin_strict_machine(to).await?)
+            // The real path's resolution (g10-1190a), shared code.
+            let (machine, _source) = self
+                .await_pinned_recipient_machine(to, resolve_within)
+                .await?;
+            Some(machine)
         } else {
             let cached = self
                 .identity_discovery_cache
@@ -7935,16 +7991,21 @@ impl Agent {
         }
     }
 
-    /// The strict stand-in's resolution: the real path's recipient
-    /// resolution without a network. `resolve_raw_quic_target` reads the
-    /// discovery cache, the DM registry, then peer evidence; in process its
-    /// last-resort `connect_to_agent` reaches only peer evidence again, and
-    /// an unresolved recipient is `AgentNotFound`.
-    #[cfg(test)]
-    async fn pinned_standin_strict_machine(
+    /// x0x #1150 (g10-1190a): the pinned recipient's machine from a
+    /// VERIFIED source, read at the point of use and copied nowhere. In
+    /// order: the discovery cache (a verified identity announcement), the DM
+    /// registry (a verified connection), the ADR-0021 authenticated machine
+    /// binding, then peer evidence (the EvidenceV1 binding, through its own
+    /// point-of-use check). The authenticated binding is the origin
+    /// attestation or announcement that verified the recipient's own
+    /// request, when it was one; it outlives the DM registry entry a
+    /// disconnect clears, and the shared raw-QUIC selection never reads it.
+    /// An expired certificate disqualifies it, as on the receive path
+    /// (#1088). Holds no lock after it returns.
+    async fn pinned_recipient_machine(
         &self,
         to: &identity::AgentId,
-    ) -> Result<identity::MachineId, dm::DmError> {
+    ) -> Option<(identity::MachineId, PinnedMachineSource)> {
         let cached = self
             .identity_discovery_cache
             .read()
@@ -7953,22 +8014,102 @@ impl Agent {
             .map(|d| d.machine_id)
             .filter(|m| m.0 != [0u8; 32]);
         if let Some(machine) = cached {
-            return Ok(machine);
+            return Some((machine, PinnedMachineSource::DiscoveryCache));
         }
         if let Some(machine) = self.direct_messaging.get_machine_id(to).await {
-            return Ok(machine);
+            return Some((machine, PinnedMachineSource::DmRegistry));
         }
-        if self.peer_evidence().wait(0).await {
-            if let Some(view) = self
-                .peer_evidence()
-                .usable_agent(*to, dm_capability::now_unix_ms())
-            {
-                return Ok(view.announcement.machine_id);
+        let now_ms = dm_capability::now_unix_ms();
+        if let Some(binding) = dm_inbox::authenticated_machine_binding_evidence(
+            &self.authenticated_machine_bindings,
+            to,
+        )
+        .await
+        {
+            if !identity::is_expired(binding.cert_not_after, now_ms / 1000) {
+                return Some((
+                    binding.machine_id,
+                    PinnedMachineSource::AuthenticatedBinding,
+                ));
             }
         }
-        Err(Self::map_raw_quic_dm_error(
-            error::NetworkError::AgentNotFound(to.0),
-        ))
+        self.peer_evidence().usable_agent(*to, now_ms).map(|view| {
+            (
+                view.announcement.machine_id,
+                PinnedMachineSource::PeerEvidence,
+            )
+        })
+    }
+
+    /// x0x #1150 (ADR 0107, g10-1190a): resolve a pinned recipient's
+    /// machine, waiting at most `within`.
+    ///
+    /// A daemon that has just restarted has a cold discovery cache, DM
+    /// registry and peer evidence, and the gossip fallback that used to hide
+    /// that is gone (single admission, no hidden resend). So: read the
+    /// verified sources ([`Self::pinned_recipient_machine`]). While none
+    /// knows the recipient, let the evidence store finish loading, ask once
+    /// for the recipient's relationship evidence (an EvidenceV1 Lookup over
+    /// connected peers), and re-read the sources until one learns the
+    /// recipient (an identity announcement, an attested DM, the Lookup's
+    /// answer) or `within` elapses. It holds no lock while it waits, writes
+    /// nothing and runs before any admission. An unresolved recipient is
+    /// the typed, retryable [`dm::DmError::RecipientUndiscovered`]: the
+    /// caller's own protocol resends, and every resend is admitted afresh.
+    async fn await_pinned_recipient_machine(
+        &self,
+        to: &identity::AgentId,
+        within: std::time::Duration,
+    ) -> Result<(identity::MachineId, PinnedMachineSource), dm::DmError> {
+        if let Some(found) = self.pinned_recipient_machine(to).await {
+            return Ok(found);
+        }
+        let started = tokio::time::Instant::now();
+        let deadline = started + within;
+        let evidence = self.peer_evidence();
+        let lookup = async {
+            if evidence.wait(0).await {
+                evidence.lookup(*to, None).await;
+            }
+        };
+        tokio::pin!(lookup);
+        let mut lookup_done = false;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let tick = std::cmp::min(now + PINNED_RESOLUTION_POLL, deadline);
+            tokio::select! {
+                () = &mut lookup, if !lookup_done => lookup_done = true,
+                () = tokio::time::sleep_until(tick) => {}
+                () = self.shutdown_token.cancelled() => break,
+            }
+            if let Some((machine, source)) = self.pinned_recipient_machine(to).await {
+                tracing::debug!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    agent_prefix = %network::hex_prefix(&to.0, 4),
+                    source = source.label(),
+                    waited_ms = started.elapsed().as_millis() as u64,
+                    "pinned recipient resolved within its bounded wait"
+                );
+                return Ok((machine, source));
+            }
+        }
+        let waited_ms = started.elapsed().as_millis() as u64;
+        tracing::warn!(
+            target: "x0x::direct",
+            stage = "send",
+            agent_prefix = %crate::logging::LogHexId::agent(&network::hex_prefix(&to.0, 4)),
+            outcome = "err_recipient_undiscovered",
+            waited_ms,
+            "pinned send: no verified source knows the recipient's machine; the caller resends"
+        );
+        Err(dm::DmError::RecipientUndiscovered(format!(
+            "no verified machine for the recipient after {waited_ms} ms \
+             (discovery cache, DM registry, authenticated binding, peer evidence)"
+        )))
     }
 
     /// Resolve `agent_id` to a connected machine for a raw-QUIC send:
@@ -7976,6 +8117,12 @@ impl Agent {
     /// repair or discovery redial, and the ADR-0043 B/P pairing check before
     /// AND after resolution. Shared by the general raw path and the x0x
     /// #1150 pinned single-exchange path.
+    ///
+    /// `attested` (pinned path only, g10-1190a) is the recipient's ADR-0021
+    /// authenticated machine binding, used when the discovery cache and the
+    /// DM registry know no machine, before peer evidence (live authority
+    /// before stored authority). It must still name the final machine after
+    /// any repair, and it gets the same B/P checks.
     async fn resolve_raw_quic_target(
         &self,
         agent_id: &identity::AgentId,
@@ -7983,6 +8130,7 @@ impl Agent {
         agent_prefix: &str,
         bytes: usize,
         send_start: std::time::Instant,
+        attested: Option<identity::MachineId>,
     ) -> error::NetworkResult<RawQuicTarget> {
         // Resolve the best known machine_id, preferring a machine that is
         // actually connected right now. Discovery cache entries can lag behind
@@ -8023,6 +8171,10 @@ impl Agent {
             (Some(id), None) => (id, "cached_not_connected"),
             (Some(id), Some(_)) => (id, "cached_both_disconnected"),
             (None, Some(id)) => (id, "registry_not_connected"),
+            (None, None) if attested.is_some() => {
+                let id = attested.ok_or(error::NetworkError::AgentNotFound(agent_id.0))?;
+                (id, "authenticated_binding")
+            }
             (None, None) if evidence_machine.is_some() => {
                 let id = evidence_machine.ok_or(error::NetworkError::AgentNotFound(agent_id.0))?;
                 let _ = self.connect_from_evidence(*agent_id).await;
@@ -8140,6 +8292,19 @@ impl Agent {
                 .peer_evidence()
                 .usable(*agent_id, machine_id, dm_capability::now_unix_ms())
                 .is_none()
+        {
+            return Err(error::NetworkError::AgentNotFound(agent_id.0));
+        }
+        // g10-1190a: the authenticated binding is re-read at its point of
+        // use too; a later attestation or announcement that moved the agent
+        // supersedes the machine resolved above.
+        if resolution == "authenticated_binding"
+            && dm_inbox::authenticated_machine_binding(
+                &self.authenticated_machine_bindings,
+                agent_id,
+            )
+            .await
+                != Some(machine_id)
         {
             return Err(error::NetworkError::AgentNotFound(agent_id.0));
         }
@@ -8265,7 +8430,7 @@ impl Agent {
             machine_prefix,
             resolution,
         } = self
-            .resolve_raw_quic_target(agent_id, network, &agent_prefix, bytes, send_start)
+            .resolve_raw_quic_target(agent_id, network, &agent_prefix, bytes, send_start, None)
             .await?;
 
         tracing::debug!(
