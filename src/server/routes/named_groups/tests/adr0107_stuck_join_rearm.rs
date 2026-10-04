@@ -4650,3 +4650,254 @@ async fn s8a_r6_a_fetch_after_a_cancelled_egress_is_admitted() -> anyhow::Result
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// g10-1190a (ephemeral testnet, 2026-10-04): an owner that restarted 12–22 s
+// before acting has a cold discovery cache, DM registry and peer evidence.
+// The pinned path must resolve the recipient's machine from a VERIFIED
+// source before its single admitted exchange, waiting a bounded time inside
+// the exchange deadline for one to learn the recipient. An unresolved
+// recipient is a typed, retryable error. The authority's in-process stand-in
+// runs the real path's resolution (strict mode).
+// ---------------------------------------------------------------------------
+
+/// The authority restarted: what it held about `recipient`'s machine (its
+/// discovery cache entry, its DM registry entry) is gone, its egress for the
+/// recipient is not running, and its pinned stand-in resolves as the real
+/// path does.
+async fn restart_cold(authority: &AppState, recipient: &AppState, group: &str) {
+    let id = recipient.agent.agent_id();
+    super::super::quiesce_member_join_egress(authority, group, &hex_of(recipient)).await;
+    authority
+        .agent
+        .identity_discovery_cache()
+        .write()
+        .await
+        .remove(&id);
+    authority
+        .agent
+        .direct_messaging()
+        .mark_disconnected(&id)
+        .await;
+    authority
+        .agent
+        .set_pinned_standin_strict_resolution_for_testing(true);
+}
+
+fn unix_secs_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// WHY (g10-1190a, class K, case 1): the owner restarted just before
+/// approving, so nothing it holds names the new member's machine. The
+/// member's identity announcement lands 300 ms into the share's exchange,
+/// inside the bound: that exchange delivers the share. Before the fix it
+/// gave up at once (`err_agent_not_found`) and the share waited out the
+/// transport backoff (8, 16, 32, 64 s on the testnet run, against the
+/// joiner's 120 s deadline).
+#[tokio::test]
+async fn s8a_r7_owner_restart_class_k_share_lands_when_discovery_arrives_within_the_bound(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    let g_hex = hex_of(&g.joiner);
+    restart_cold(&g.authority, &g.joiner, &g.stable).await;
+    let armed = super::super::join_egress_test_barrier::arm(&g_hex, "secure_share");
+    clear_share_witnesses(&g.authority);
+    deliver_current_share(&g).await?;
+    wait_reached(&armed.gate, "the share's exchange").await;
+    armed.gate.release();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let early = share_writes(&g.authority, &g_hex);
+    pin_recipient_machine(&g.authority, &g.joiner).await;
+    let delivered =
+        egress_happens(&g.authority, &g_hex, "secure_share", Duration::from_secs(3)).await;
+    drop(armed);
+    assert_eq!(early, 0, "a share was written before any machine was known");
+    assert!(
+        delivered,
+        "the share was not delivered on the exchange whose bound the discovery landed in"
+    );
+    Ok(())
+}
+
+/// WHY (g10-1190a, class R, case 2): the owner restarted, so its discovery
+/// cache and DM registry are cold. The Welcome fetch it answers was verified
+/// by J2's ADR-0021 origin attestation (the gossip inbox records that
+/// binding): it is the only verified source of J2's machine, and it lands
+/// 300 ms into the first chunk's exchange, inside the bound. That exchange
+/// delivers the chunk. Before the fix the pinned path never read
+/// authenticated bindings and gave up at once ("failed to send Welcome blob
+/// chunk: recipient_undiscovered"), so the stream ended.
+#[tokio::test]
+async fn s8a_r7_owner_restart_welcome_chunk_lands_on_the_requesters_attested_binding(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    let j2_hex = hex_of(&s.j2);
+    restart_cold(&s.authority, &s.j2, &s.stable).await;
+    let welcome_id = welcome_id_of(&s.j2_add).expect("welcome ref");
+    let armed = super::super::join_egress_test_barrier::arm(&j2_hex, "welcome_frame");
+    clear_egress(&s.authority);
+    assert!(serve_welcome(&s.authority, &s.j2, &s.stable, &welcome_id).await);
+    wait_reached(&armed.gate, "the first chunk's exchange").await;
+    armed.gate.release();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let early = egress_count(&s.authority, &j2_hex, "welcome_frame");
+    s.authority
+        .agent
+        .record_authenticated_binding_for_testing(
+            s.j2.agent.agent_id(),
+            s.j2.agent.machine_id(),
+            unix_secs_now(),
+        )
+        .await;
+    let delivered = egress_happens(
+        &s.authority,
+        &j2_hex,
+        "welcome_frame",
+        Duration::from_secs(3),
+    )
+    .await;
+    drop(armed);
+    assert_eq!(early, 0, "a chunk was written before any machine was known");
+    assert!(
+        delivered,
+        "the Welcome chunk was not delivered on the requester's attested binding"
+    );
+    Ok(())
+}
+
+/// WHY (g10-1190a control): a machine learned during the bounded wait gets
+/// the same checks as any other. The binding that arrives names a REVOKED
+/// machine: the pre-phase runs once after resolution, the seam refuses (an
+/// admission refusal, a retryable withhold for the caller), nothing is
+/// written.
+#[tokio::test]
+async fn s8a_r7_a_machine_learned_during_the_wait_is_refused_at_the_seam_when_revoked(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    let g_hex = hex_of(&g.joiner);
+    restart_cold(&g.authority, &g.joiner, &g.stable).await;
+    revoke_machine(&g.authority, &g.joiner).await?;
+    let (pre, seam) = (Arc::default(), Arc::default());
+    let admission = counted_admission(Arc::clone(&pre), Arc::clone(&seam), true, true, None);
+    let arrival = {
+        let authority = Arc::clone(&g.authority);
+        let joiner = Arc::clone(&g.joiner);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            pin_recipient_machine(&authority, &joiner).await;
+        })
+    };
+    clear_egress(&g.authority);
+    let outcome = super::super::send_join_artifact(
+        &g.authority,
+        &g.joiner.agent.agent_id(),
+        b"adr0107-r7-revoked-machine",
+        &g.stable,
+        "join_result",
+        admission,
+        Instant::now() + Duration::from_secs(10),
+    )
+    .await;
+    arrival.await?;
+    assert!(
+        outcome
+            .as_ref()
+            .is_err_and(|reason| reason.contains(x0x::dm::PINNED_ADMISSION_REFUSED)),
+        "the revoked machine is refused at the seam: {outcome:?}"
+    );
+    assert_eq!(
+        pre.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the pre-phase ran once, after resolution"
+    );
+    assert_eq!(
+        seam.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the agent's own machine-revocation check refused before the caller's seam"
+    );
+    assert_eq!(egress_count(&g.authority, &g_hex, "join_result"), 0);
+    Ok(())
+}
+
+/// WHY (g10-1190a control): when no verified source learns the recipient,
+/// the exchange gets its bounded wait (half of its 3 s budget here), then
+/// ends in the typed, retryable `recipient_undiscovered` inside the exchange
+/// deadline (not as a deadline cut), before any admission ran and with
+/// nothing written.
+#[tokio::test]
+async fn s8a_r7_an_unresolved_recipient_ends_in_a_typed_error_within_the_bound(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    let g_hex = hex_of(&g.joiner);
+    restart_cold(&g.authority, &g.joiner, &g.stable).await;
+    let (pre, seam) = (Arc::default(), Arc::default());
+    let admission = counted_admission(Arc::clone(&pre), Arc::clone(&seam), true, true, None);
+    clear_egress(&g.authority);
+    let started = std::time::Instant::now();
+    let outcome = super::super::send_join_artifact(
+        &g.authority,
+        &g.joiner.agent.agent_id(),
+        b"adr0107-r7-unresolved",
+        &g.stable,
+        "join_result",
+        admission,
+        Instant::now() + Duration::from_secs(3),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert!(
+        outcome
+            .as_ref()
+            .is_err_and(|reason| reason.starts_with("recipient_undiscovered")),
+        "a typed, retryable resolution error: {outcome:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(1_200),
+        "the recipient got no bounded wait: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(2_800),
+        "the typed error did not land inside the exchange deadline: {elapsed:?}"
+    );
+    assert_eq!(pre.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(seam.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(egress_count(&g.authority, &g_hex, "join_result"), 0);
+    Ok(())
+}
+
+/// WHY (g10-1190a, class K): a share exchange that ends
+/// `recipient_undiscovered` (nothing learned the member within its bound)
+/// is resent promptly, because the bounded wait already paces it, not after
+/// the transport backoff. Discovery landing a little after the first bound
+/// still delivers the share within seconds.
+#[tokio::test]
+async fn s8a_r7_class_k_share_resends_promptly_after_an_undiscovered_exchange() -> anyhow::Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let g = build_gss(dir.path(), false).await?;
+    let g_hex = hex_of(&g.joiner);
+    restart_cold(&g.authority, &g.joiner, &g.stable).await;
+    clear_share_witnesses(&g.authority);
+    let started = std::time::Instant::now();
+    deliver_current_share(&g).await?;
+    // Nothing learns the member during the first exchange's bound.
+    tokio::time::sleep(Duration::from_millis(5_500)).await;
+    let early = share_writes(&g.authority, &g_hex);
+    pin_recipient_machine(&g.authority, &g.joiner).await;
+    let delivered =
+        egress_happens(&g.authority, &g_hex, "secure_share", Duration::from_secs(2)).await;
+    assert_eq!(early, 0, "a share was written before any machine was known");
+    assert!(
+        delivered,
+        "the share was not resent promptly after an undiscovered exchange ({:?} since the delivery started)",
+        started.elapsed()
+    );
+    Ok(())
+}

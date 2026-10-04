@@ -250,6 +250,21 @@ struct RawQuicTarget {
     resolution: &'static str,
 }
 
+/// x0x #1150 (g10-1190a): agents whose in-process pinned stand-in resolves
+/// the recipient's machine strictly, as the real path does (see
+/// `Agent::set_pinned_standin_strict_resolution_for_testing`).
+#[cfg(test)]
+static PINNED_STANDIN_STRICT: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<identity::AgentId>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+fn pinned_standin_is_strict(agent: &identity::AgentId) -> bool {
+    PINNED_STANDIN_STRICT
+        .lock()
+        .is_ok_and(|agents| agents.contains(agent))
+}
+
 /// The core agent that participates in the x0x gossip network.
 ///
 /// Each agent is a peer — there is no client/server distinction.
@@ -7858,16 +7873,20 @@ impl Agent {
         to: &identity::AgentId,
         admission: &dm::ArtifactAdmission,
     ) -> Result<dm::DmReceipt, dm::DmError> {
-        let cached = self
-            .identity_discovery_cache
-            .read()
-            .await
-            .get(to)
-            .map(|d| d.machine_id)
-            .filter(|m| m.0 != [0u8; 32]);
-        let machine = match cached {
-            Some(machine) => Some(machine),
-            None => self.direct_messaging.get_machine_id(to).await,
+        let machine = if pinned_standin_is_strict(&self.identity.agent_id()) {
+            Some(self.pinned_standin_strict_machine(to).await?)
+        } else {
+            let cached = self
+                .identity_discovery_cache
+                .read()
+                .await
+                .get(to)
+                .map(|d| d.machine_id)
+                .filter(|m| m.0 != [0u8; 32]);
+            match cached {
+                Some(machine) => Some(machine),
+                None => self.direct_messaging.get_machine_id(to).await,
+            }
         };
         let refused = || {
             Err(dm::DmError::NoConnectivity(
@@ -7899,6 +7918,57 @@ impl Agent {
         } else {
             refused()
         }
+    }
+
+    /// Test seam (x0x #1150, g10-1190a): make this agent's in-process
+    /// pinned stand-in resolve the recipient's machine as the real path
+    /// does, and fail where the real path fails, instead of admitting an
+    /// unresolved recipient on its agent alone. Test builds only.
+    #[cfg(test)]
+    pub(crate) fn set_pinned_standin_strict_resolution_for_testing(&self, strict: bool) {
+        if let Ok(mut agents) = PINNED_STANDIN_STRICT.lock() {
+            if strict {
+                agents.insert(self.identity.agent_id());
+            } else {
+                agents.remove(&self.identity.agent_id());
+            }
+        }
+    }
+
+    /// The strict stand-in's resolution: the real path's recipient
+    /// resolution without a network. `resolve_raw_quic_target` reads the
+    /// discovery cache, the DM registry, then peer evidence; in process its
+    /// last-resort `connect_to_agent` reaches only peer evidence again, and
+    /// an unresolved recipient is `AgentNotFound`.
+    #[cfg(test)]
+    async fn pinned_standin_strict_machine(
+        &self,
+        to: &identity::AgentId,
+    ) -> Result<identity::MachineId, dm::DmError> {
+        let cached = self
+            .identity_discovery_cache
+            .read()
+            .await
+            .get(to)
+            .map(|d| d.machine_id)
+            .filter(|m| m.0 != [0u8; 32]);
+        if let Some(machine) = cached {
+            return Ok(machine);
+        }
+        if let Some(machine) = self.direct_messaging.get_machine_id(to).await {
+            return Ok(machine);
+        }
+        if self.peer_evidence().wait(0).await {
+            if let Some(view) = self
+                .peer_evidence()
+                .usable_agent(*to, dm_capability::now_unix_ms())
+            {
+                return Ok(view.announcement.machine_id);
+            }
+        }
+        Err(Self::map_raw_quic_dm_error(
+            error::NetworkError::AgentNotFound(to.0),
+        ))
     }
 
     /// Resolve `agent_id` to a connected machine for a raw-QUIC send:
