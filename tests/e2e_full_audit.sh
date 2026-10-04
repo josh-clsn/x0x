@@ -59,6 +59,7 @@ start_daemon() {
   mkdir -p "$dir"
   cat > "$dir/config.toml" <<TOML
 instance_name = "$name"
+network_id = "x0x.prod"
 data_dir = "$dir"
 bind_address = "127.0.0.1:$bind_port"
 api_address = "127.0.0.1:$api_port"

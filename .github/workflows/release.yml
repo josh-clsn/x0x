@@ -101,7 +101,9 @@ jobs:
           done
 
   # ============================================================
-  # Resolve one dependency graph for every release build and signer.
+  # Capture the committed dependency graph for every release build and
+  # signer. The release ships exactly the Cargo.lock that CI tested on the
+  # tagged commit; it never re-resolves against the live registry.
   # ============================================================
   resolve-release-lock:
     name: Resolve release dependency graph
@@ -110,9 +112,19 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - name: Resolve and capture release lock
+      - name: Require committed, current Cargo.lock
         run: |
-          cargo generate-lockfile
+          set -euo pipefail
+          if [ ! -f Cargo.lock ] || ! git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1; then
+            echo "::error::Cargo.lock is not committed at ${GITHUB_SHA}. Releases build only from the tracked lock."
+            exit 1
+          fi
+          if ! cargo metadata --locked --format-version 1 >/dev/null; then
+            echo "::error::Committed Cargo.lock is stale against Cargo.toml at ${GITHUB_SHA}. Update and commit the lock, then re-tag."
+            exit 1
+          fi
+      - name: Capture committed release lock
+        run: |
           python3 .github/scripts/release_artifact_custody.py resolve \
             --repo . --output "${RUNNER_TEMP}/release-lock"
       - uses: actions/upload-artifact@v5
@@ -130,6 +142,11 @@ jobs:
     # The lock job also depends on both, but direct needs make accidental
     # rewiring of that artifact producer fail closed under the static guard.
     needs: [validate-release-metadata, require-green-ci, resolve-release-lock]
+    # The macOS legs import the Developer ID certificate and notarize, and
+    # every leg produces the bytes that are signed and shipped. The `release`
+    # environment only admits v* tag refs; this workflow only runs on tag
+    # pushes or a tag dispatch (validate-release-metadata refuses branches).
+    environment: release
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -396,6 +413,8 @@ jobs:
   sign-release:
     name: ML-DSA-65 Sign Archives
     needs: build-release
+    # Uses the ML-DSA-65 release signing key.
+    environment: release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -473,8 +492,8 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           # Validate that VERSION is a valid semver string (defense in depth:
           # the metadata-validation job already refused non-tag refs)
-          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
-            echo "ERROR: '$VERSION' is not a valid semver version (expected tag like v1.2.3)"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ERROR: '$VERSION' is not a plain X.Y.Z release version (expected tag like v1.2.3; prerelease/build tags are refused)"
             exit 1
           fi
           ./target/release/x0x-keygen manifest \
@@ -517,6 +536,8 @@ jobs:
   create-release:
     name: Create GitHub Release
     needs: [build-release, sign-release]
+    # Uses the GPG release key and creates the (draft) GitHub Release.
+    environment: release
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -29,6 +29,14 @@ pub struct DaemonClient {
     dump: bool,
 }
 
+/// Read the daemon's bearer token from its effective data directory.
+fn read_api_token_in(data_dir: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(data_dir.join("api-token"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 impl DaemonClient {
     /// Create a new client, discovering the daemon address and API token.
     ///
@@ -61,13 +69,7 @@ impl DaemonClient {
         let api_token = std::env::var("X0X_API_TOKEN")
             .ok()
             .filter(|t| !t.is_empty())
-            .or_else(|| {
-                let token_path = data_dir.join(&dir_name).join("api-token");
-                std::fs::read_to_string(&token_path)
-                    .ok()
-                    .map(|t| t.trim().to_string())
-                    .filter(|t| !t.is_empty())
-            });
+            .or_else(|| read_api_token_in(&data_dir.join(&dir_name)));
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -519,6 +521,40 @@ pub fn print_error(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_api_token_uses_daemon_filename() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let x0x_dir = dir.path().join("x0x");
+        std::fs::create_dir_all(&x0x_dir).expect("create x0x dir");
+        std::fs::write(x0x_dir.join("api-token"), "test-token\n").expect("write token");
+        assert_eq!(
+            read_api_token_in(&dir.path().join("x0x")).as_deref(),
+            Some("test-token")
+        );
+    }
+
+    #[test]
+    fn read_api_token_returns_none_without_token_file() {
+        // An isolated data dir with no token file means no configured token
+        let dir = tempfile::tempdir().expect("temp dir");
+        let result = read_api_token_in(&dir.path().join("x0x"));
+        assert!(
+            result.is_none(),
+            "should return None without a configured token"
+        );
+    }
+
+    #[test]
+    fn read_api_token_ignores_empty_token_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let x0x_dir = dir.path().join("x0x");
+        std::fs::create_dir_all(&x0x_dir).expect("create x0x dir");
+        std::fs::write(x0x_dir.join("api-token"), "  \n").expect("write token file");
+
+        let result = read_api_token_in(&dir.path().join("x0x"));
+        assert!(result.is_none(), "whitespace-only token must be ignored");
+    }
 
     /// WHY (ADR-0066 §5, CLI surface): a CLI user's only view of a
     /// refusal is this line. R5 removed the warn-only window on the

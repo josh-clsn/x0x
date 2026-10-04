@@ -7,7 +7,8 @@ Manifest-based decentralized self-update with symmetric gossip propagation.
 - **`manifest.rs`**: `ReleaseManifest` and `PlatformAsset` types, length-prefixed wire format (`[4-byte BE len][JSON][ML-DSA-65 sig]`), platform target detection (including musl vs glibc)
 - **`signature.rs`**: ML-DSA-65 signing/verification for archives and manifests. Embedded release public key.
 - **`monitor.rs`**: `UpgradeMonitor` polls GitHub releases, `fetch_verified_manifest()` downloads and verifies manifest+signature, returns `VerifiedRelease` with pre-encoded gossip payload
-- **`apply.rs`**: `apply_upgrade_from_manifest()` — downloads archive, verifies SHA-256 hash, extracts binary, performs atomic replacement with rollback. A `TempDirGuard` (RAII) removes the per-attempt `.x0x-upgrade-*` temp dir on every exit path, including early-return errors, so a failed apply never leaks the downloaded archive.
+- **`apply.rs`**: `apply_upgrade_from_manifest()` — downloads archive, verifies SHA-256 hash, extracts binary, performs atomic replacement with rollback. Extraction accepts only a regular file whose final path component is exactly the binary name, refuses archives holding more than one such entry, and requires the extracted file to carry the platform's native executable magic (ELF/Mach-O/MZ) (#1144). A `TempDirGuard` (RAII) removes the per-attempt `.x0x-upgrade-*` temp dir on every exit path, including early-return errors, so a failed apply never leaks the downloaded archive.
+
 - **`restart.rs`**: the #261 restart transaction — supervision classification (`RestartMode`), the `upgrade-handoff.json` intent record, the detached handoff helper, and the loud `UPGRADE_FAILED` artifact.
 - **`rollout.rs`**: Staged rollout with deterministic delay based on machine ID hash (configurable window)
 
@@ -295,7 +296,7 @@ no gossip, binds nothing, and takes no instance lock.
 
 ## Update Flow (for x0xd)
 
-1. **Startup**: Check GitHub for new release, broadcast manifest to gossip if found
+1. **Startup (background, post-bind)**: after the API listener is bound — and as a non-blocking background task, so an unreachable GitHub never delays API readiness (#1086) — check GitHub for a new release and apply it if found (the startup manifest broadcast is a separate task, run by `broadcast_current_manifest`)
 2. **Gossip listener**: Receive manifests on `x0x/releases` topic, verify signature, rebroadcast, apply if newer
 3. **GitHub poller**: Periodic fallback poll, broadcast discovered manifests to gossip
 

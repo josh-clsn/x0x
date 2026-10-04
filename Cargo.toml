@@ -1,6 +1,6 @@
 [package]
 name = "x0x"
-version = "0.45.0"
+version = "0.46.1"
 edition = "2021"
 rust-version = "1.95.0"
 license = "MIT OR Apache-2.0"
@@ -19,10 +19,11 @@ exclude = ["proofs/**", "tests/proof-reports/**", "target/**"]
 
 [dependencies]
 anyhow = "1.0"
-ant-quic = "0.27.52"
+ant-quic = "=0.27.54"
 # CI pin (2026-09-03): tinyvec 1.13.0 (published 2026-09-03) fails to compile on the
-# pinned rustc 1.95.0 ("cannot find macro `vec`"); Cargo.lock is not committed, so
-# constrain the transitive dep (via ant-quic) until tinyvec or the toolchain moves.
+# pinned rustc 1.95.0 ("cannot find macro `vec`"). Cargo.lock is now tracked, but
+# keep the bound so a `cargo update` or a downstream fresh resolve cannot pick it
+# (transitive via ant-quic) until tinyvec or the toolchain moves.
 tinyvec = { version = ">=1.9, <1.13", default-features = false }
 saorsa-mls = "0.3.8"
 async-trait = "0.1"
@@ -44,17 +45,17 @@ hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 rand = "0.8"
-saorsa-gossip-coordinator = "=0.5.84"
-saorsa-gossip-crdt-sync = "=0.5.84"
-saorsa-gossip-groups = "=0.5.84"
-saorsa-gossip-identity = "=0.5.84"
-saorsa-gossip-membership = "=0.5.84"
-saorsa-gossip-presence = "=0.5.84"
-saorsa-gossip-pubsub = "=0.5.84"
-saorsa-gossip-rendezvous = "=0.5.84"
-saorsa-gossip-runtime = "=0.5.84"
-saorsa-gossip-transport = "=0.5.84"
-saorsa-gossip-types = "=0.5.84"
+saorsa-gossip-coordinator = "=0.5.86"
+saorsa-gossip-crdt-sync = "=0.5.86"
+saorsa-gossip-groups = "=0.5.86"
+saorsa-gossip-identity = "=0.5.86"
+saorsa-gossip-membership = "=0.5.86"
+saorsa-gossip-presence = "=0.5.86"
+saorsa-gossip-pubsub = "=0.5.86"
+saorsa-gossip-rendezvous = "=0.5.86"
+saorsa-gossip-runtime = "=0.5.86"
+saorsa-gossip-transport = "=0.5.86"
+saorsa-gossip-types = "=0.5.86"
 saorsa-pqc = "0.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -193,8 +194,9 @@ members = [
     "tests/harness",
 ]
 
+
 # #703: the 100k signing-path test spends most CPU time in Keccak. Optimize
-# only its concrete crypto path and test target; dev and release stay unchanged.
+# only its concrete crypto path in `test`; dev and release stay unchanged.
 [profile.test.package.keccak]
 opt-level = 3
 
@@ -207,7 +209,13 @@ opt-level = 3
 [profile.test.package.ant-quic]
 opt-level = 3
 
-[profile.test.package.x0x]
+# x0x itself is optimized only for the #703 test (`--cargo-profile
+# signing-acceptance`). On `test` it compiled all ~115 x0x test binaries at
+# opt-level 3, which took the CI workspace test build from ~20 to ~57 minutes.
+[profile.signing-acceptance]
+inherits = "test"
+
+[profile.signing-acceptance.package.x0x]
 opt-level = 3
 
 [profile.release-profiling]

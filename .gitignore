@@ -1,6 +1,5 @@
 /target
 /audit.jsonl
-Cargo.lock
 /node_modules
 /python/dist
 /python/*.egg-info

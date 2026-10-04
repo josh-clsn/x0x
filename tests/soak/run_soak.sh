@@ -78,6 +78,7 @@ start_agent() {
     mkdir -p "$data_dir"
 
     cat > "$config" <<TOML
+network_id = "x0x.prod"
 api_address = "127.0.0.1:$api_port"
 bind_address = "0.0.0.0:$bind_port"
 data_dir = "$data_dir"

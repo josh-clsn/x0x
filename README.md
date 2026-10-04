@@ -138,12 +138,13 @@ Sync is owner-to-owner only (Tier 1: profile, names, Home roster pointer, sub-ag
 
 **8. Voice.** Ratified in [ADR-0042](docs/adr/0042-voice-media-over-tailnet-streams.md). What is implemented today is **point-to-point (two-party) calls**: signaling over DMs (`x0x-voice-sig-v1`), audio over `WebRtcV1` streams with an opt-in unreliable-datagram lane (audio only, mutually negotiated) and reliable-stream fallback. It is a library surface behind the `voice` cargo feature (`x0x::voice`) — there is **no CLI or GUI call button yet**, and multi-party mesh (design-bounded at four participants), SFU, and browser access are recorded ADR follow-ups.
 
-**9. Stay current.** Two updaters, deliberately separate:
+**9. Stay current.** The daemon installs updates; the CLI only checks:
 
 ```bash
-x0x upgrade --check    # standalone updater: checks GitHub for a signed release (no daemon needed)
-                      # --apply runs the same standalone path — the flag is accepted but the
-                      # daemon REST endpoints are NOT what the CLI calls
+x0x upgrade --check    # read-only: checks GitHub for a signed release (no daemon needed)
+                      # x0x upgrade / --apply / --force REFUSE to install (v0.46.0, N2)
+# install on a running daemon with the authenticated endpoint (or let self-update apply it):
+# curl -X POST -H "Authorization: Bearer $(cat <data_dir>/api-token)" http://127.0.0.1:<api-port>/upgrade/apply
 ```
 
 The daemon's own `GET /upgrade` / `POST /upgrade/apply` distribute ML-DSA-65-signed manifests over the `x0x/release` gossip topic with transactional restart (GitHub is the first-discovery fallback) — drive those over REST or the GUI. See [docs/upgrade-system.md](./docs/upgrade-system.md), and never downgrade an owned install to v0.40.x (#451).
@@ -242,7 +243,7 @@ The sidebar is your map:
 | Encrypted groups (MLS) | `x0x groups …` | [docs/security.md](./docs/security.md) |
 | Remote exec (ACL-gated, off by default) | `x0x exec <agent> -- <argv…>` | [docs/exec.md](./docs/exec.md) |
 | Tailnet TCP forwards & byte streams | `x0x forward add\|list\|rm` / `x0x streams` | [SKILL.md](./SKILL.md) |
-| Self-update | `x0x upgrade [--check\|--apply]` | [docs/upgrade-system.md](./docs/upgrade-system.md) |
+| Self-update | `x0x upgrade --check` (read-only); install via authenticated `POST /upgrade/apply` | [docs/upgrade-system.md](./docs/upgrade-system.md) |
 | Diagnostics | `x0x diagnostics <area>` / `x0x network status` | [docs/diagnostics.md](./docs/diagnostics.md) |
 
 **Machine pinning** deserves a note: every agent runs on a machine with its own hardware-pinned key. `x0x machines pin <agent_id> <machine_id>` rejects the `(agent, machine)` pair if the agent later appears on unexpected hardware — a cheap defence against key theft.

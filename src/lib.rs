@@ -68,6 +68,9 @@ pub mod identity;
 /// persistent storage of MachineKeypair and AgentKeypair.
 pub mod storage;
 
+/// Cross-process advisory file locks (instance lock, revocations-v3 writer).
+pub(crate) mod file_lock;
+
 /// Signed identity revocation records and the grow-only revocation set.
 ///
 /// See [`revocation::RevocationRecord`] for the authority rules (self- and
@@ -84,6 +87,8 @@ pub mod key_move;
 /// ADR-0041 Tier-1 cross-machine owner-state sync (owner-signed versioned
 /// records over `SyncV1` streams between the owner's enrolled machines).
 pub mod owner_sync;
+pub mod owner_trust;
+pub mod share_grant;
 
 pub mod announce_blob;
 /// V3 identity announcement (L3 slimming — merged + digest, self-verifying).
@@ -155,6 +160,9 @@ pub mod dm;
 /// store to decide whether to use the gossip DM path or fall back to
 /// raw-QUIC for a given recipient.
 pub mod dm_capability;
+mod evidence_wire;
+/// Relationship-peer evidence store and point-of-use runtime (ADR 0089).
+pub mod peer_evidence;
 
 /// Bounded per-peer DM digest diagnostic observations.
 pub mod dm_digest_diagnostics;
@@ -195,6 +203,9 @@ pub mod history;
 /// (`X0xLinkTransport`, `StreamProtocol::WebRtcV1`).
 #[cfg(feature = "voice")]
 pub mod voice;
+
+/// Call lifecycle signalling over the voice DM channel (ADR-0073 slice 1).
+pub mod calls;
 
 pub mod connect;
 /// Secure Tier-1 remote exec protocol and runtime.
@@ -263,6 +274,12 @@ pub struct Agent {
     /// Default false; sender bus fallback is unchanged. Bus-only senders
     /// cannot reach this inbox when enabled.
     skip_legacy_dm_bus: bool,
+    /// #1135: gossip publishes that reached ZERO eager peers
+    /// (best-effort fan-out; solo node, or every eligible peer
+    /// cooled/excluded). Surfaced via /diagnostics/gossip so an
+    /// absent-message convergence stall is distinguishable from a slow
+    /// one.
+    gossip_zero_fanout_publishes: std::sync::atomic::AtomicU64,
     /// Agent self-name (ADR-0036 display_name). Interior-mutable so
     /// `PUT /profile` updates apply to the next heartbeat without a
     /// restart; `None` announces anonymously (no self_name field).
@@ -481,6 +498,9 @@ pub struct Agent {
     /// [`Agent::set_connect_policy`]. `std` RwLock: gate reads are a brief
     /// clone of the inner `Arc`, never held across an await.
     connect_policy: std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
+    /// ADR-0070 §1 owner trust (local owner + owner device set), consulted
+    /// by the stream gates; see [`owner_trust`].
+    owner_trust: owner_trust::OwnerTrust,
     /// ADR-0043 §2.1: this machine's ML-KEM-768 enrollment keypair — the
     /// export-envelope recipient key. Generated at first start, persisted
     /// beside the machine key (`machine-kem.key`); `None` when no
@@ -702,6 +722,14 @@ pub const MACHINE_ANNOUNCE_V3_TOPIC: &str = "x0x.machine.announce.v3";
 /// [`ActivationBundle`](key_move::MoveRecord::ActivationBundle)s on
 /// [`MOVE_ACTIVATION_TOPIC`].
 pub const REVOCATION_V2_TOPIC: &str = "x0x.revocation.v2";
+
+/// Reserved gossip topic for ADR-0070 share-grant revocation records
+/// (`Vec<RevocationRecord>` of `ShareGrant` subjects only).
+///
+/// Older daemons decode the v1/v2 batches as one whole
+/// `Vec<RevocationRecord>` and drop the batch on an unknown variant, so
+/// share-grant revocations ride only this topic (and `revocations-v3.bin`).
+pub const REVOCATION_V3_TOPIC: &str = "x0x.revocation.v3";
 
 /// Reserved gossip topic for ADR-0043 move activation bundles.
 ///
@@ -1087,6 +1115,18 @@ fn local_direct_probe_addrs(addresses: &[std::net::SocketAddr]) -> Vec<std::net:
         })
         .collect::<Vec<_>>();
     local_direct_probe_addrs_with_local_v4s(addresses, &local_v4s)
+}
+
+/// Outcome of [`Agent::route_enrolled_owner_sync`] (#1040).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum EnrolledOwnerSyncRoute<T> {
+    /// Still no known agent, `SyncV1`, and the enrollment verifies: the
+    /// admission closure ran (its result carried here).
+    Admitted(T),
+    /// An agent is known on the machine now: the shared gate decides.
+    SharedGate,
+    /// Not `SyncV1`, or the machine is not in the verified enrollment set.
+    Denied,
 }
 
 /// Default interval between identity heartbeat re-announcements (seconds).
@@ -1577,11 +1617,15 @@ async fn record_authenticated_machine_binding_from_message(
         );
         return false;
     }
-    dm_inbox::record_authenticated_machine_binding(
+    dm_inbox::record_authenticated_machine_binding_with_expiry(
         bindings,
         announcement.agent_id,
         announcement.machine_id,
         announcement.announced_at,
+        announcement
+            .agent_certificate
+            .as_ref()
+            .and_then(identity::AgentCertificate::not_after),
     )
     .await;
     true
@@ -3063,7 +3107,6 @@ pub struct AgentBuilder {
     history_config: Option<history::HistoryConfig>,
 }
 
-/// Context captured by the background identity heartbeat task.
 struct HeartbeatContext {
     /// ADR-0043: this machine's enrolled ML-KEM public bytes (publishes
     /// on the V3 machine announce); `None` disables V3 publication.
@@ -3640,6 +3683,17 @@ impl HeartbeatContext {
                         .await;
                 }
             }
+            // ADR-0070: share-grant revocations ride v3 only, same gating.
+            let share_grant_records = self.revocation_set.read().await.share_grant_records();
+            if !share_grant_records.is_empty() {
+                if let Ok(bytes) = bincode::serialize(&share_grant_records) {
+                    let _ = self
+                        .runtime
+                        .pubsub()
+                        .publish(REVOCATION_V3_TOPIC.to_string(), bytes::Bytes::from(bytes))
+                        .await;
+                }
+            }
 
             let records = self.revocation_set.read().await.all_records();
             if !records.is_empty() {
@@ -3680,6 +3734,7 @@ fn raw_dm_history_record(
     verified: bool,
     trust_decision: Option<trust::TrustDecision>,
     now_ms: i64,
+    rejected_typed_prefix: bool,
 ) -> Option<history::HistoryRecord> {
     if !verified
         || matches!(
@@ -3689,9 +3744,12 @@ fn raw_dm_history_record(
     {
         return None;
     }
-    let history::classify::DmPayloadClass::Durable(content_type) =
+    let class = if rejected_typed_prefix {
+        history::classify::classify_ordinary_dm_payload(payload)
+    } else {
         history::classify::classify_dm_payload(payload)
-    else {
+    };
+    let history::classify::DmPayloadClass::Durable(content_type) = class else {
         return None;
     };
     Some(history::HistoryRecord {
@@ -3718,6 +3776,426 @@ fn raw_dm_history_record(
         ingress_sender_agent: None,
         logical_request_id: None,
     })
+}
+
+/// File (in the identity dir) holding ADR-0070 share-grant revocations.
+pub(crate) const SHARE_GRANT_REVOCATIONS_FILE: &str = "revocations-v3.bin";
+
+/// Apply a `x0x.revocation.v3` batch (ADR-0070): verify each share-grant
+/// record's owner-key authority, insert, and persist `revocations-v3.bin`
+/// when anything was new. Records of any other subject are ignored here —
+/// they have their own carriers.
+pub(crate) async fn ingest_share_grant_revocations(
+    owner_trust: &owner_trust::OwnerTrust,
+    revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
+    identity_dir: Option<std::path::PathBuf>,
+    payload: &[u8],
+) -> bool {
+    const MAX_V3_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+    if payload.len() > MAX_V3_PAYLOAD_BYTES {
+        return false;
+    }
+    let Ok(records) = bincode::deserialize::<Vec<revocation::RevocationRecord>>(payload) else {
+        return false;
+    };
+    let mut inserted = false;
+    {
+        // #926: ordered against in-flight grant redeliveries.
+        let _barrier = owner_trust
+            .share_grant_revocation_barrier(&records, revocation_set)
+            .await;
+        let mut set = revocation_set.write().await;
+        for record in records {
+            if !matches!(record.subject, revocation::RevokedSubject::ShareGrant(_))
+                || set.contains_hash(&record.record_hash())
+            {
+                continue;
+            }
+            match set.verify_and_insert(record, None) {
+                Ok(true) => inserted = true,
+                Ok(false) => {}
+                Err(e) => tracing::debug!("v3 share-grant revocation rejected: {e}"),
+            }
+        }
+    }
+    if inserted {
+        persist_share_grant_revocations(revocation_set, identity_dir.as_deref()).await;
+    }
+    inserted
+}
+
+/// Best-effort write of `revocations-v3.bin` (see
+/// [`persist_share_grant_revocations_durable`]); failures are logged. The
+/// in-memory set stays authoritative for this run if the write fails.
+pub(crate) async fn persist_share_grant_revocations(
+    revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
+    identity_dir: Option<&std::path::Path>,
+) {
+    if let Err(e) = persist_share_grant_revocations_durable(revocation_set, identity_dir).await {
+        tracing::warn!("revocations-v3 persist failed: {e}");
+    }
+}
+
+/// Serializes the v3 writers of THIS process before they contend for the
+/// cross-process file lock (keeps in-process writers from spinning on it).
+static SHARE_GRANT_REVOCATIONS_WRITE_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+/// Retention applied when merging `revocations-v3.bin`: the same rule the
+/// heartbeat sweep applies in memory
+/// ([`revocation::RevocationSet::expire_records_older_than`]; share-grant
+/// records ignore the TTL and are collected at their grant's GC horizon).
+const SHARE_GRANT_REVOCATIONS_TTL_SECS: u64 = 90 * 24 * 3600;
+
+/// How long a v3 writer waits for another process's lock before failing.
+const SHARE_GRANT_REVOCATIONS_LOCK_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
+/// Durable, MONOTONIC write of `revocations-v3.bin` (temp, fsync, rename,
+/// dir fsync; mode 0600). Every writer — local revoke, the v3 gossip
+/// carrier, share-grant records arriving on the v1/v2 carriers — comes
+/// through here. See [`merge_write_share_grant_revocations`]. `Ok` when
+/// there is no identity directory (an in-memory agent).
+///
+/// # Errors
+/// Encoding, locking, reading (other than not-found) or writing failed.
+pub(crate) async fn persist_share_grant_revocations_durable(
+    revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
+    identity_dir: Option<&std::path::Path>,
+) -> std::result::Result<(), String> {
+    let Some(dir) = identity_dir
+        .map(std::path::Path::to_path_buf)
+        .or_else(storage::x0x_home_dir)
+    else {
+        return Ok(());
+    };
+    let live = revocation_set
+        .read()
+        .await
+        .to_bytes_v3()
+        .map_err(|e| format!("revocations-v3 encode: {e}"))?;
+    let _in_process = SHARE_GRANT_REVOCATIONS_WRITE_LOCK.lock().await;
+    merge_write_share_grant_revocations(
+        &dir.join(SHARE_GRANT_REVOCATIONS_FILE),
+        &live,
+        unix_now_secs_for_gc(),
+        || {},
+        || async {},
+    )
+    .await
+}
+
+fn unix_now_secs_for_gc() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The cross-process core of the v3 writer (#926 r3). Holding an exclusive
+/// OS advisory lock on the sibling `revocations-v3.bin.lock` for the whole
+/// read → merge → rename, it re-reads the file, unions it with `live_v3`
+/// (bytes from [`revocation::RevocationSet::to_bytes_v3`]), applies the
+/// retention rule at `now_unix` (a zero clock applies none), and writes the
+/// result durably. Revocations only grow and every writer — in this process
+/// or another daemon sharing the identity dir — holds the same lock, so no
+/// writer can erase a record another persisted, while records past their
+/// horizon are still collected rather than resurrected from disk.
+///
+/// `on_contended` / `after_read` are test hooks (no-ops in production).
+pub(crate) async fn merge_write_share_grant_revocations<A, AF>(
+    path: &std::path::Path,
+    live_v3: &[u8],
+    now_unix: u64,
+    on_contended: impl Fn(),
+    after_read: A,
+) -> std::result::Result<(), String>
+where
+    A: FnOnce() -> AF,
+    AF: std::future::Future<Output = ()>,
+{
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("revocations-v3 dir {}: {e}", parent.display()))?;
+    }
+    let mut lock_path = path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let _lock = file_lock::lock_exclusive_with_retry(
+        std::path::Path::new(&lock_path),
+        std::time::Duration::from_millis(20),
+        SHARE_GRANT_REVOCATIONS_LOCK_TIMEOUT,
+        on_contended,
+    )
+    .await
+    .map_err(|e| format!("revocations-v3 lock: {e}"))?;
+    let mut merged = match tokio::fs::read(path).await {
+        Ok(bytes) => revocation::RevocationSet::from_bytes_v3(&bytes).unwrap_or_else(|e| {
+            tracing::warn!("revocations-v3 on disk unreadable, rewriting from memory: {e}");
+            revocation::RevocationSet::new()
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => revocation::RevocationSet::new(),
+        Err(e) => return Err(format!("revocations-v3 read {}: {e}", path.display())),
+    };
+    after_read().await;
+    let live = revocation::RevocationSet::from_bytes_v3(live_v3)
+        .map_err(|e| format!("revocations-v3 re-decode: {e}"))?;
+    merged.merge_v3(live);
+    if now_unix != 0 {
+        merged.expire_records_older_than(SHARE_GRANT_REVOCATIONS_TTL_SECS, now_unix);
+    }
+    let bytes = merged
+        .to_bytes_v3()
+        .map_err(|e| format!("revocations-v3 encode: {e}"))?;
+    storage::write_private_bytes_durable(path, bytes)
+        .await
+        .map_err(|e| format!("revocations-v3 write {}: {e}", path.display()))
+}
+
+struct RawDirectDelivery {
+    sender: identity::AgentId,
+    machine_id: identity::MachineId,
+    data: Vec<u8>,
+    verified: bool,
+    trust_decision: Option<trust::TrustDecision>,
+    observed_origin: Option<connectivity::ObservedOrigin>,
+    digest: String,
+}
+
+/// Resolve raw-frame evidence by signed announcement time (#1098).
+/// Discovery wins timestamp ties, so a conflicting cached move cannot be
+/// undone by an equally old registry record. A strictly newer authenticated
+/// registry binding still wins over stale discovery (#898 C1 / #927).
+fn raw_delivery_binding(
+    cache: Option<&DiscoveredAgent>,
+    registry: Option<dm_inbox::AuthenticatedMachineBinding>,
+    machine_id: identity::MachineId,
+) -> (bool, bool, Option<u64>) {
+    if let Some(binding) = registry {
+        if cache.is_none_or(|entry| binding.announced_at > entry.announced_at) {
+            return (
+                false,
+                binding.machine_id == machine_id,
+                // A cert-less attestation cannot erase expiry already known
+                // from discovery (#1088), even if its machine binding is newer.
+                binding
+                    .cert_not_after
+                    .or_else(|| cache.and_then(|entry| entry.cert_not_after)),
+            );
+        }
+    }
+    cache
+        .map(|entry| (entry.machine_id == machine_id, false, entry.cert_not_after))
+        .unwrap_or((false, false, None))
+}
+
+/// #1088/#1098: neither live authority arm verifies an expired certificate.
+/// The downstream drop gate uses the same expiry; None retains compatibility
+/// with peers without certificates.
+fn raw_delivery_verified(
+    cache_verified: bool,
+    registry_names_this_machine: bool,
+    cert_not_after: Option<u64>,
+    now_unix_secs: u64,
+) -> bool {
+    (cache_verified || registry_names_this_machine)
+        && !identity::is_expired(cert_not_after, now_unix_secs)
+}
+
+/// Select live authority first; stored authority never overrides a known
+/// binding, even if the known binding names another transport machine.
+fn raw_delivery_with_evidence(
+    cache: Option<&DiscoveredAgent>,
+    registry: Option<dm_inbox::AuthenticatedMachineBinding>,
+    evidence: Option<&peer_evidence::EvidenceRuntime>,
+    agent: identity::AgentId,
+    machine: identity::MachineId,
+    now: u64,
+) -> (bool, bool, Option<u64>) {
+    let (cached, registered, expiry) = raw_delivery_binding(cache, registry, machine);
+    let live = raw_delivery_verified(cached, registered, expiry, now / 1000);
+    if cache.is_some() || registry.is_some() {
+        return (live, live, expiry);
+    }
+    let view = evidence.and_then(|e| e.usable(agent, machine, now));
+    let expiry = view
+        .as_ref()
+        .and_then(|v| v.certificate.as_ref())
+        .and_then(identity::AgentCertificate::not_after);
+    (view.is_some(), false, expiry)
+}
+
+/// Freeze this frame's authority before scheduling recovery for later frames.
+fn raw_delivery_and_schedule_lookup(
+    cache: Option<&DiscoveredAgent>,
+    registry: Option<dm_inbox::AuthenticatedMachineBinding>,
+    evidence: Option<&std::sync::Arc<peer_evidence::EvidenceRuntime>>,
+    agent: identity::AgentId,
+    machine: identity::MachineId,
+    now: u64,
+) -> (bool, bool, Option<u64>) {
+    let authority = raw_delivery_with_evidence(
+        cache,
+        registry,
+        evidence.map(std::sync::Arc::as_ref),
+        agent,
+        machine,
+        now,
+    );
+    if !authority.0 {
+        if let Some(evidence) = evidence {
+            evidence.spawn_lookup(agent, machine);
+        }
+    }
+    authority
+}
+
+/// Relay injection supplies a synthesized origin, not a direct host claim.
+/// Preserve delivery authority, but never seed routing hints or spawn recovery
+/// from that origin. Direct frames freeze authority before scheduling Lookup.
+fn raw_delivery_from_ingress(
+    cache: Option<&DiscoveredAgent>,
+    registry: Option<dm_inbox::AuthenticatedMachineBinding>,
+    evidence: Option<&std::sync::Arc<peer_evidence::EvidenceRuntime>>,
+    agent: identity::AgentId,
+    machine: identity::MachineId,
+    now: u64,
+    ingress: network::DirectIngress,
+) -> (bool, bool, Option<u64>) {
+    match ingress {
+        network::DirectIngress::Transport => {
+            raw_delivery_and_schedule_lookup(cache, registry, evidence, agent, machine, now)
+        }
+        network::DirectIngress::Relay => raw_delivery_with_evidence(
+            cache,
+            registry,
+            evidence.map(std::sync::Arc::as_ref),
+            agent,
+            machine,
+            now,
+        ),
+    }
+}
+
+async fn dispatch_raw_direct_after_gates(
+    dm: &direct::DirectMessaging,
+    history_handle: Option<&history::HistoryHandle>,
+    typed_routes: &[dm_inbox::DmTypedPayloadRoute],
+    delivery: RawDirectDelivery,
+) -> dm_inbox::TypedRouteOutcome {
+    let RawDirectDelivery {
+        sender,
+        machine_id,
+        data,
+        verified,
+        trust_decision,
+        observed_origin,
+        digest,
+    } = delivery;
+
+    // The raw transport has verified the AgentId→MachineId binding by this
+    // point. A recognized typed payload follows the same prefix order as the
+    // gossip inbox and never enters the generic direct-message/history path.
+    // Raw transport ACKs remain transport receipts, regardless of whether a
+    // bounded typed-route channel accepts or its handler processes the item.
+    let mut route_outcome = dm_inbox::TypedRouteOutcome::NoPrefix;
+    if verified
+        && !matches!(
+            trust_decision,
+            Some(trust::TrustDecision::RejectBlocked | trust::TrustDecision::RejectMachineMismatch)
+        )
+    {
+        let hash = blake3::hash(&data);
+        let mut request_id = [0u8; 16];
+        request_id.copy_from_slice(&hash.as_bytes()[..16]);
+        route_outcome = dm_inbox::InboxPipeline::try_route_typed_payload(
+            typed_routes,
+            dm,
+            dm_inbox::DmTypedPayload {
+                sender,
+                machine_id,
+                payload: data.clone(),
+                verified: true,
+                trust_decision,
+                received_at_unix_ms: dm::now_unix_ms(),
+                request_id,
+                completion: None,
+            },
+        );
+        if route_outcome == dm_inbox::TypedRouteOutcome::Recognized {
+            return route_outcome;
+        }
+    }
+
+    // N12: an UNVERIFIED frame whose bytes claim a typed protocol route is
+    // (the static production table covers the inbox-not-ready startup window)
+    // not a user DM. The typed router already refuses unverified frames;
+    // such a frame must not fall through to the generic bus either, where
+    // SSE/WS consumers would show its payload as an ordinary direct
+    // message. An unverified frame that matches no typed route keeps the
+    // documented contract: deliver with `verified: false`, the consumer
+    // decides.
+    if !verified
+        && (dm_inbox::InboxPipeline::typed_route_recognizes(typed_routes, &data)
+            || dm_inbox::recognized_production_typed_prefix(&data))
+    {
+        tracing::debug!(
+            target: "x0x::direct",
+            stage = "recv_unverified_typed_suppressed",
+            sender = %network::hex_prefix(&sender.0, 4),
+            payload_bytes = data.len(),
+            "unverified typed-protocol frame dropped before the generic bus"
+        );
+        return dm_inbox::TypedRouteOutcome::RejectedPrefix;
+    }
+
+    if let (Some(history), Some(record)) = (
+        history_handle,
+        raw_dm_history_record(
+            sender,
+            machine_id,
+            &data,
+            verified,
+            trust_decision,
+            i64::try_from(dm::now_unix_ms()).unwrap_or(i64::MAX),
+            route_outcome == dm_inbox::TypedRouteOutcome::RejectedPrefix,
+        ),
+    ) {
+        history.record(record);
+    }
+
+    let payload_bytes = data.len();
+    let delivered = dm
+        .handle_incoming(
+            machine_id,
+            sender,
+            data,
+            verified,
+            trust_decision,
+            observed_origin,
+        )
+        .await;
+
+    tracing::debug!(
+        target: "dm.trace",
+        stage = "inbound_broadcast_published",
+        sender = %hex::encode(sender.as_bytes()),
+        machine_id = %hex::encode(machine_id.as_bytes()),
+        path = "raw_quic",
+        delivered,
+        subscribers = dm.subscriber_count(),
+        digest = %digest,
+    );
+
+    tracing::debug!(
+        target: "x0x::direct",
+        stage = "recv",
+        sender_prefix = %network::hex_prefix(&sender.0, 4),
+        payload_bytes,
+        subscriber_count = dm.subscriber_count(),
+        "direct message dispatched"
+    );
+    route_outcome
 }
 
 // ─── ADR 0030: strict capability refresh ───────────────────────────────────
@@ -3956,13 +4434,24 @@ impl Drop for CapabilityRefreshGuard {
 /// send that raced an in-flight advert from paying the full window.
 async fn run_strict_capability_refresh(
     recipient: identity::AgentId,
+    required_application: Option<u64>,
+    require_durable_ack: bool,
     capability_store: std::sync::Arc<dm_capability::CapabilityStore>,
     shutdown_token: tokio_util::sync::CancellationToken,
     deadline: tokio::time::Instant,
     publish: impl std::future::Future<Output = error::NetworkResult<()>> + Send,
 ) {
-    if capability_binding_supports_durable_ack(capability_store.lookup_binding(&recipient).as_ref())
-    {
+    let ready = || {
+        let binding = capability_store.lookup_binding(&recipient);
+        (!require_durable_ack || capability_binding_supports_durable_ack(binding.as_ref()))
+            && required_application.is_none_or(|bit| {
+                binding.as_ref().is_some_and(|binding| {
+                    binding.machine_id.0 != [0; 32]
+                        && binding.capabilities.application_registry.supports(bit)
+                })
+            })
+    };
+    if ready() {
         return;
     }
 
@@ -3984,9 +4473,7 @@ async fn run_strict_capability_refresh(
     }
 
     loop {
-        if capability_binding_supports_durable_ack(
-            capability_store.lookup_binding(&recipient).as_ref(),
-        ) {
+        if ready() {
             return;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -4166,6 +4653,29 @@ impl Agent {
         self.gossip_runtime.as_ref().map(|rt| rt.pubsub().stats())
     }
 
+    /// Refresh preferred eager peers from committed named-group rosters.
+    /// Agent ids are never used as transport peer ids: pub/sub resolves each
+    /// member through retained authenticated machine bindings, then checks
+    /// live transport connectivity and the current security vetoes.
+    pub async fn replace_group_rosters_for_gossip(
+        &self,
+        rosters: Vec<(String, String, Vec<identity::AgentId>)>,
+    ) {
+        let Some(runtime) = self.gossip_runtime.as_ref() else {
+            return;
+        };
+        runtime.pubsub().replace_group_rosters(rosters).await;
+    }
+
+    /// #908/R17 Home blocker: the live pub/sub handle for seal-time
+    /// warranted certificate fetches (None when gossip is disabled -
+    /// callers treat that as unobtainable evidence, fail closed).
+    #[must_use]
+    pub(crate) fn pubsub(&self) -> Option<std::sync::Arc<gossip::PubSubManager>> {
+        self.gossip_runtime
+            .as_ref()
+            .map(|rt| std::sync::Arc::clone(rt.pubsub()))
+    }
     /// Leaf vs Full participation snapshot (issue #380).
     ///
     /// Returns `None` when the agent has no gossip runtime. Exposed through
@@ -4213,7 +4723,7 @@ impl Agent {
         data: bytes::Bytes,
     ) {
         if let Some(rt) = &self.gossip_runtime {
-            rt.pubsub().handle_incoming(peer, data).await;
+            rt.pubsub().handle_incoming(peer, None, data).await;
         }
     }
 
@@ -4679,6 +5189,51 @@ impl Agent {
         Ok(outcome)
     }
 
+    /// Dial from a freshly checked evidence view, without creating any agent
+    /// binding or discovery entry. ant-quic authenticates the expected machine.
+    async fn connect_from_evidence(
+        &self,
+        agent: identity::AgentId,
+    ) -> Option<connectivity::ConnectOutcome> {
+        if !self.peer_evidence().wait(0).await {
+            return None;
+        }
+        self.peer_evidence().lookup(agent, None).await;
+        let view = self
+            .peer_evidence()
+            .usable_agent(agent, dm_capability::now_unix_ms())?;
+        let machine = view.announcement.machine_id;
+        if self
+            .recipient_pairing_denied(&agent, &machine)
+            .await
+            .is_some()
+        {
+            return None;
+        }
+        let network = self.network.as_ref()?;
+        let peer = ant_quic::PeerId(machine.0);
+        if network.is_connected(&peer).await {
+            return Some(connectivity::ConnectOutcome::AlreadyConnected);
+        }
+        let addrs = filter_discovery_announcement_addrs(
+            view.announcement.addresses.clone(),
+            allow_local_discovery_addresses(network.config()),
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            network.connect_peer_with_addrs(peer, addrs),
+        )
+        .await;
+        self.peer_evidence()
+            .usable(agent, machine, dm_capability::now_unix_ms())?;
+        Some(match result {
+            Ok(Ok((addr, connected))) if connected == peer => {
+                connectivity::ConnectOutcome::Direct(addr)
+            }
+            _ => connectivity::ConnectOutcome::Unreachable,
+        })
+    }
+
     async fn connect_to_agent_inner(
         &self,
         agent_id: &identity::AgentId,
@@ -4697,9 +5252,39 @@ impl Agent {
             cache.get(agent_id).cloned()
         };
 
+        // A live identity can legitimately carry no dial hints. Borrow the
+        // stored addresses only for that exact live machine, never rebind it.
+        let mut discovered = discovered;
+        if discovered
+            .as_ref()
+            .is_some_and(|entry| entry.addresses.is_empty())
+            && self.peer_evidence().wait(0).await
+        {
+            if let Some(entry) = discovered.as_mut() {
+                if let Some(view) = self.peer_evidence().usable(
+                    *agent_id,
+                    entry.machine_id,
+                    dm_capability::now_unix_ms(),
+                ) {
+                    let local_scope = self
+                        .network
+                        .as_ref()
+                        .is_some_and(|n| allow_local_discovery_addresses(n.config()));
+                    entry.addresses = filter_discovery_announcement_addrs(
+                        view.announcement.addresses.clone(),
+                        local_scope,
+                    );
+                }
+            }
+        }
+
         let agent = match discovered {
             Some(a) => a,
             None => {
+                if let Some(outcome) = self.connect_from_evidence(*agent_id).await {
+                    return Ok(outcome);
+                }
+
                 tracing::info!(
                     target: "x0x::connect",
                     stage = "connect_to_agent",
@@ -5111,6 +5696,30 @@ impl Agent {
                         // Use the real PeerId from the QUIC handshake (may differ
                         // from a zeroed placeholder in the discovery cache).
                         let real_machine_id = identity::MachineId(connected_peer_id.0);
+                        // #898 (S1): an address is NOT identity. When the
+                        // agent's machine is KNOWN (non-zero), only that
+                        // machine may answer the dial — a different machine
+                        // at the stale address (CGNAT reuse, a second daemon
+                        // on the host) must not rebind the cache and the
+                        // DirectMessaging map, which would also turn its
+                        // later raw-Direct claims for this agent "verified".
+                        // A zero machine id is trust-on-first-use, as before.
+                        if agent.machine_id.0 != [0u8; 32]
+                            && connected_peer_id.0 != agent.machine_id.0
+                        {
+                            tracing::warn!(
+                                target: "x0x::connect",
+                                stage = "connect_to_agent",
+                                %agent_prefix,
+                                strategy = "direct_per_addr",
+                                outcome = "mismatched_machine",
+                                selected_addr = %addr,
+                                expected_machine_prefix = %network::hex_prefix(&agent.machine_id.0, 4),
+                                answered_machine_prefix = %network::hex_prefix(&real_machine_id.0, 4),
+                                "address answered by a different machine than the agent's known binding; not rebinding (#898)"
+                            );
+                            continue;
+                        }
                         // Enrich bootstrap cache with this successful address
                         if let Some(ref bc) = self.bootstrap_cache {
                             bc.add_from_connection(connected_peer_id, vec![*addr], None)
@@ -5761,7 +6370,7 @@ impl Agent {
     /// teardown step, so an aborted leader can neither wedge a snapshot
     /// path in `Retiring` nor let a follower return while the drained
     /// writer is still running.
-    pub async fn shutdown(&self) {
+    pub async fn try_shutdown(&self) -> error::NetworkResult<()> {
         // #765 r4 test instrument: this future was polled. Counted before
         // anything else so a caller parked on the serialize lock below
         // still counts as entered.
@@ -5927,16 +6536,39 @@ impl Agent {
         // keepalive tasks hold the transport (and thus the ant-quic endpoint)
         // alive; the daemon binary survives only by process exit, but an
         // embedded host needs these released to re-`serve()` on the same port.
+        let mut shutdown_errors = Vec::new();
         if let Some(ref runtime) = self.gossip_runtime {
             if let Err(e) = runtime.shutdown().await {
                 tracing::warn!("Gossip runtime shutdown error: {e}");
+                shutdown_errors.push(format!("gossip runtime: {e}"));
             } else {
                 tracing::info!("Gossip runtime shut down");
             }
         }
         if let Some(ref network) = self.network {
-            network.shutdown().await;
-            tracing::info!("Network node shut down");
+            if let Err(e) = network.try_shutdown().await {
+                tracing::warn!("Network node shutdown error: {e}");
+                shutdown_errors.push(format!("network node: {e}"));
+            } else {
+                tracing::info!("Network node shut down");
+            }
+        }
+
+        if shutdown_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(error::NetworkError::NodeError(format!(
+                "agent shutdown incomplete: {}",
+                shutdown_errors.join("; ")
+            )))
+        }
+    }
+
+    /// Compatibility shutdown for callers that cannot consume a typed result.
+    /// Release-sensitive callers must use [`try_shutdown`](Self::try_shutdown).
+    pub async fn shutdown(&self) {
+        if let Err(error) = self.try_shutdown().await {
+            tracing::warn!(%error, "agent shutdown did not fully release its resources");
         }
     }
 
@@ -6337,15 +6969,56 @@ impl Agent {
         let send_started = std::time::Instant::now();
         let mut stages = dm::DurableSendStages::default();
         let mut advert_binding = self.capability_store.lookup_binding(to);
+        let evidence_ready = if advert_binding.is_none() {
+            self.peer_evidence().wait(payload.len()).await
+        } else {
+            true
+        };
+        if advert_binding.is_none() && !evidence_ready {
+            return Err(dm::DmError::RecipientUndiscovered(
+                "peer evidence startup barrier unavailable".into(),
+            ));
+        }
+        if advert_binding.is_none() {
+            self.peer_evidence().lookup(*to, None).await;
+            advert_binding = self.capability_store.lookup_binding(to);
+        }
+        let stored_cap = if advert_binding.is_none() {
+            self.peer_evidence()
+                .usable_agent(*to, dm_capability::now_unix_ms())
+        } else {
+            None
+        };
+
         // ADR 0030 §2: one forced targeted refresh before refusing. A daemon
         // whose advert we simply have not heard yet must not be reported as
         // incapable, but the refusal must still be bounded — the whole point
         // of the 409 is that it is fast and deterministic, never a hang.
-        if config.require_durable_app_ack
-            && !capability_binding_supports_durable_ack(advert_binding.as_ref())
+        if (config.require_durable_app_ack
+            && stored_cap.is_none()
+            && !capability_binding_supports_durable_ack(advert_binding.as_ref()))
+            || self
+                .capability_store
+                .require_payload_capability(to, &payload)
+                .is_err()
         {
-            self.refresh_strict_dm_capability(*to).await;
+            self.refresh_strict_dm_capability(
+                *to,
+                dm::CapabilityRegistry::required_for_payload(&payload).map(|(bit, _)| bit),
+                config.require_durable_app_ack,
+            )
+            .await;
             advert_binding = self.capability_store.lookup_binding(to);
+        }
+        // ADR 0093: only positive, current advert evidence of missing support
+        // holds product payloads. Unknown capabilities keep existing behaviour.
+        if let Err(error) = self
+            .capability_store
+            .require_payload_capability(to, &payload)
+        {
+            tracing::info!(recipient = %hex::encode(to.as_bytes()), %error,
+                "typed delivery retained pending recipient capability");
+            return Err(error);
         }
         let advert_machine = advert_binding.as_ref().map(|binding| binding.machine_id);
         let advert_cap = advert_binding.map(|binding| binding.capabilities);
@@ -6354,6 +7027,23 @@ impl Agent {
             .is_some_and(|caps| caps.gossip_inbox && !caps.kem_public_key.is_empty());
         let (cap, cap_machine, cap_source) = if advert_gossip_ready {
             (advert_cap, advert_machine, "advert_cache")
+        } else if advert_cap.is_none() && stored_cap.is_some() {
+            // Re-check after the refresh await; never retain authority across it.
+            match self
+                .peer_evidence()
+                .usable_agent(*to, dm_capability::now_unix_ms())
+            {
+                Some(view) => (
+                    Some(view.advert.capabilities.clone()),
+                    Some(view.announcement.machine_id),
+                    "peer_evidence",
+                ),
+                None => {
+                    return Err(dm::DmError::RecipientUndiscovered(
+                        "peer evidence no longer usable".into(),
+                    ))
+                }
+            }
         } else if config.require_durable_app_ack {
             // Strict semantics need a signed, machine-bound capability from
             // the TTL-bounded runtime cache. The unbound contact-card fallback
@@ -6527,6 +7217,19 @@ impl Agent {
                     self.direct_messaging.record_outgoing_failed(*to);
                     return Err(dm::DmError::RecipientKeyInvalid(reason));
                 }
+            }
+        }
+
+        if cap_source == "peer_evidence" {
+            let _ = self.connect_from_evidence(*to).await;
+            let still_usable = cap_machine.and_then(|m| {
+                self.peer_evidence()
+                    .usable(*to, m, dm_capability::now_unix_ms())
+            });
+            if still_usable.is_none() {
+                return Err(dm::DmError::RecipientUndiscovered(
+                    "peer evidence no longer usable".into(),
+                ));
             }
         }
 
@@ -6877,6 +7580,19 @@ impl Agent {
             }
         }
 
+        if cached_machine_id.is_none() && registry_machine_id.is_none() {
+            if let Some(view) = self
+                .peer_evidence()
+                .usable_agent(*agent_id, dm_capability::now_unix_ms())
+            {
+                if network
+                    .is_connected(&ant_quic::PeerId(view.announcement.machine_id.0))
+                    .await
+                {
+                    return Some(view.announcement.machine_id);
+                }
+            }
+        }
         None
     }
 
@@ -6922,11 +7638,16 @@ impl Agent {
     /// Ask one recipient to republish its signed runtime capability and give
     /// the local subscriber a bounded window to ingest it.
     ///
-    /// Used only by strict (ADR 0030) sends after a TTL-bounded cache miss: a
-    /// daemon whose advert we simply have not heard yet gets one chance to
-    /// answer before the gate refuses. Concurrent strict sends to the same
-    /// recipient share a single flight.
-    async fn refresh_strict_dm_capability(&self, recipient: identity::AgentId) {
+    /// Used when a strict send lacks durable ACK support (ADR 0030), or a
+    /// current advert lacks the payload's application bit (ADR 0093). The
+    /// recipient gets one chance to answer before the gate refuses.
+    /// Concurrent sends to the same recipient share a single flight.
+    async fn refresh_strict_dm_capability(
+        &self,
+        recipient: identity::AgentId,
+        required_application: Option<u64>,
+        require_durable_ack: bool,
+    ) {
         let Some(runtime) = self.gossip_runtime.as_ref() else {
             return;
         };
@@ -6940,6 +7661,8 @@ impl Agent {
             move |guard, completion_tx| async move {
                 run_strict_capability_refresh(
                     recipient,
+                    required_application,
+                    require_durable_ack,
                     capability_store,
                     shutdown_token,
                     deadline,
@@ -7010,6 +7733,16 @@ impl Agent {
         };
         let registry_machine_id = self.direct_messaging.get_machine_id(agent_id).await;
 
+        let evidence_machine = if cached_machine_id.is_none()
+            && registry_machine_id.is_none()
+            && self.peer_evidence().wait(0).await
+        {
+            self.peer_evidence()
+                .usable_agent(*agent_id, dm_capability::now_unix_ms())
+                .map(|v| v.announcement.machine_id)
+        } else {
+            None
+        };
         let (mut machine_id, mut resolution) = match (cached_machine_id, registry_machine_id) {
             (Some(id), _) if network.is_connected(&ant_quic::PeerId(id.0)).await => {
                 (id, "cached_connected")
@@ -7026,6 +7759,11 @@ impl Agent {
             (Some(id), None) => (id, "cached_not_connected"),
             (Some(id), Some(_)) => (id, "cached_both_disconnected"),
             (None, Some(id)) => (id, "registry_not_connected"),
+            (None, None) if evidence_machine.is_some() => {
+                let id = evidence_machine.ok_or(error::NetworkError::AgentNotFound(agent_id.0))?;
+                let _ = self.connect_from_evidence(*agent_id).await;
+                (id, "peer_evidence")
+            }
             (None, None) => {
                 tracing::debug!(
                     target: "x0x::direct",
@@ -7131,6 +7869,15 @@ impl Agent {
                     resolution = "discovery_redial";
                 }
             }
+        }
+
+        if resolution == "peer_evidence"
+            && self
+                .peer_evidence()
+                .usable(*agent_id, machine_id, dm_capability::now_unix_ms())
+                .is_none()
+        {
+            return Err(error::NetworkError::AgentNotFound(agent_id.0));
         }
 
         // ADR-0043 §9 (review r5 H5): ANY machine reassignment above
@@ -7596,7 +8343,9 @@ impl Agent {
     fn map_raw_quic_dm_error(err: error::NetworkError) -> dm::DmError {
         match err {
             error::NetworkError::AgentNotFound(_) => {
-                dm::DmError::RecipientKeyUnavailable(err.to_string())
+                // #1091: an unresolved agent is a DISCOVERY gap (retry when
+                // the peer re-announces), not missing key material.
+                dm::DmError::RecipientUndiscovered(err.to_string())
             }
             error::NetworkError::AgentNotConnected(_)
             | error::NetworkError::NotConnected(_)
@@ -7674,6 +8423,64 @@ impl Agent {
     ///     }
     /// }
     /// ```
+    /// Test seam for #1088's frame-level listener tests (unit and the
+    /// connectivity integration file): the authenticated machine-binding
+    /// registry the raw delivery path consults.
+    pub fn authenticated_machine_bindings_for_testing(
+        &self,
+    ) -> dm_inbox::AuthenticatedMachineBindings {
+        std::sync::Arc::clone(&self.authenticated_machine_bindings)
+    }
+
+    /// Test seam for #1088: record an authenticated machine binding the
+    /// way the inbox records one after a verified fresh machine-key
+    /// attestation.
+    pub async fn record_authenticated_binding_for_testing(
+        &self,
+        agent: identity::AgentId,
+        machine: identity::MachineId,
+        announced_at: u64,
+    ) {
+        dm_inbox::record_authenticated_machine_binding(
+            &self.authenticated_machine_bindings,
+            agent,
+            machine,
+            announced_at,
+        )
+        .await;
+    }
+
+    /// Test seam for a retained binding whose certificate has since expired.
+    #[doc(hidden)]
+    pub async fn record_authenticated_binding_with_expiry_for_testing(
+        &self,
+        agent: identity::AgentId,
+        machine: identity::MachineId,
+        announced_at: u64,
+        cert_not_after: Option<u64>,
+    ) {
+        dm_inbox::record_authenticated_machine_binding_with_expiry(
+            &self.authenticated_machine_bindings,
+            agent,
+            machine,
+            announced_at,
+            cert_not_after,
+        )
+        .await;
+    }
+
+    /// Test seam: read one discovery-cache entry.
+    pub async fn discovered_agent_for_testing(
+        &self,
+        agent: &identity::AgentId,
+    ) -> Option<crate::DiscoveredAgent> {
+        self.identity_discovery_cache
+            .read()
+            .await
+            .get(agent)
+            .cloned()
+    }
+
     pub async fn recv_direct_annotated(&self) -> Option<direct::DirectMessage> {
         self.recv_direct_inner().await
     }
@@ -8539,6 +9346,7 @@ impl Agent {
         let own_agent_id = self.agent_id();
         let own_user_id = self.user_id();
         let cache_freshness_ttl_secs = self.identity_ttl_secs;
+        let evidence_capture_store = std::sync::Arc::clone(&self.capability_store);
         let rebroadcast_pubsub = std::sync::Arc::clone(runtime.pubsub());
         let token = self.shutdown_token.clone();
         // Subscribe to revocation records so they are applied on receipt.
@@ -8548,6 +9356,9 @@ impl Agent {
             .await;
         let revocation_set = std::sync::Arc::clone(&self.revocation_set);
         let identity_dir_for_listener = self.identity_dir.clone();
+        // #926: every share-grant revocation insert takes the redelivery
+        // outbox's barrier (see `share_grant::outbox`).
+        let owner_trust_for_listener = self.owner_trust.clone();
         let contact_store_for_evict = std::sync::Arc::clone(&self.contact_store);
         // L3 fetch-on-miss: the listener resolves V3 cert digests from the
         // blob cache (hit) or fires a background fetch (miss) — never
@@ -8565,6 +9376,11 @@ impl Agent {
             .pubsub()
             .subscribe(REVOCATION_V2_TOPIC.to_string())
             .await;
+        // ADR-0070: share-grant revocations (v3 carrier).
+        let mut sub_revocation_v3 = runtime
+            .pubsub()
+            .subscribe(REVOCATION_V3_TOPIC.to_string())
+            .await;
         let mut sub_move_activation = runtime
             .pubsub()
             .subscribe(MOVE_ACTIVATION_TOPIC.to_string())
@@ -8580,6 +9396,7 @@ impl Agent {
                 Revocation(crate::gossip::PubSubMessage),
                 MachineV3(crate::gossip::PubSubMessage),
                 RevocationV2(crate::gossip::PubSubMessage),
+                RevocationV3(crate::gossip::PubSubMessage),
                 MoveActivation(crate::gossip::PubSubMessage),
             }
 
@@ -8639,6 +9456,7 @@ impl Agent {
                     Some(m) = sub_revocation.recv() => DiscoveryMessage::Revocation(m),
                     Some(m) = sub_machine_v3.recv() => DiscoveryMessage::MachineV3(m),
                     Some(m) = sub_revocation_v2.recv() => DiscoveryMessage::RevocationV2(m),
+                    Some(m) = sub_revocation_v3.recv() => DiscoveryMessage::RevocationV3(m),
                     Some(m) = sub_move_activation.recv() => DiscoveryMessage::MoveActivation(m),
                     // Required for PROMPT shutdown: without this arm the listener
                     // only exits when every gossip subscription closes (the
@@ -8841,6 +9659,9 @@ impl Agent {
                         // no two identity locks are held at once.
                         let subject_certs = collect_subject_certs(&*cache.read().await);
                         {
+                            let _share_grant_barrier = owner_trust_for_listener
+                                .share_grant_revocation_barrier(&records, &revocation_set)
+                                .await;
                             let mut set = revocation_set.write().await;
                             for record in records {
                                 if set.contains_hash(&record.record_hash()) {
@@ -8862,6 +9683,18 @@ impl Agent {
                                     }
                                 }
                             }
+                        }
+                        // #926 r3: the legacy v1 file filters share-grant
+                        // records out; one that arrived on this carrier must
+                        // reach `revocations-v3.bin` or a restart forgets it.
+                        if newly_inserted.iter().any(|record| {
+                            matches!(record.subject, revocation::RevokedSubject::ShareGrant(_))
+                        }) {
+                            persist_share_grant_revocations(
+                                &revocation_set,
+                                identity_dir_for_listener.as_deref(),
+                            )
+                            .await;
                         }
                         if !newly_inserted.is_empty() {
                             // Persist asynchronously — best-effort; if it fails
@@ -8916,6 +9749,10 @@ impl Agent {
                                             "evicted revoked machine (received via gossip)"
                                         );
                                     }
+                                    // A share-grant record on v1 is never
+                                    // republished there (allowlist); grants
+                                    // are denied at evaluation time.
+                                    revocation::RevokedSubject::ShareGrant(_) => {}
                                     // Binding tombstones evict nothing (§7):
                                     // the pairing dies at the B/P gates.
                                     revocation::RevokedSubject::AgentMachineBinding(
@@ -9000,7 +9837,11 @@ impl Agent {
                         };
                         let subject_certs = collect_subject_certs(&*cache.read().await);
                         let mut inserted = false;
+                        let mut share_grant_inserted = false;
                         {
+                            let _share_grant_barrier = owner_trust_for_listener
+                                .share_grant_revocation_barrier(&records, &revocation_set)
+                                .await;
                             let mut set = revocation_set.write().await;
                             for record in records {
                                 if set.contains_hash(&record.record_hash()) {
@@ -9012,8 +9853,15 @@ impl Agent {
                                     }
                                     _ => None,
                                 };
+                                let is_share_grant = matches!(
+                                    record.subject,
+                                    revocation::RevokedSubject::ShareGrant(_)
+                                );
                                 match set.verify_and_insert(record, subject_cert) {
-                                    Ok(true) => inserted = true,
+                                    Ok(true) => {
+                                        inserted = true;
+                                        share_grant_inserted |= is_share_grant;
+                                    }
                                     Ok(false) => {}
                                     Err(e) => {
                                         tracing::debug!(
@@ -9022,6 +9870,15 @@ impl Agent {
                                     }
                                 }
                             }
+                        }
+                        // #926 r3: the v2 file filters share-grant records
+                        // out; persist them in v3 so a restart keeps them.
+                        if share_grant_inserted {
+                            persist_share_grant_revocations(
+                                &revocation_set,
+                                identity_dir_for_listener.as_deref(),
+                            )
+                            .await;
                         }
                         if inserted {
                             let persisted = revocation_set.read().await.to_bytes_v2();
@@ -9038,6 +9895,17 @@ impl Agent {
                                 }
                             });
                         }
+                        continue;
+                    }
+                    // ADR-0070: share-grant revocations on the v3 carrier.
+                    DiscoveryMessage::RevocationV3(msg) => {
+                        ingest_share_grant_revocations(
+                            &owner_trust_for_listener,
+                            &revocation_set,
+                            identity_dir_for_listener.clone(),
+                            &msg.payload,
+                        )
+                        .await;
                         continue;
                     }
                     // ADR-0043 §3.3: a carried ActivationBundle under the
@@ -9450,6 +10318,14 @@ impl Agent {
                     agent_public_key: announcement.agent_public_key.clone(),
                     cert_digest,
                 };
+                // Keep the verified X0A3/X0A4 body verbatim, after the existing
+                // signature, timestamp, trust and revocation gates. The S2 worker pairs it.
+                if announce_v3::is_v3_payload(&raw_payload) {
+                    evidence_capture_store.evidence_wire.capture(
+                        announcement.agent_id, true, &raw_payload,
+                        announcement.announced_at.saturating_mul(1000), now.saturating_mul(1000),
+                    );
+                }
                 record_authenticated_machine_binding_from_message(
                     &authenticated_machine_bindings,
                     &msg,
@@ -9911,18 +10787,21 @@ impl Agent {
             if let Some(ref runtime) = self.gossip_runtime {
                 let active = runtime.membership().active_view();
                 let active_view_count = active.len();
-                let mut broadcast_peers = active;
 
-                let mut connected_peer_count = 0usize;
+                let mut connected = Vec::new();
                 if let Some(ref net) = self.network {
-                    let connected = net.connected_peers().await;
-                    connected_peer_count = connected.len();
-                    broadcast_peers.extend(
-                        connected
-                            .into_iter()
-                            .map(|peer| saorsa_gossip_types::PeerId::new(peer.0)),
-                    );
+                    connected = net
+                        .connected_peers()
+                        .await
+                        .into_iter()
+                        .map(|peer| saorsa_gossip_types::PeerId::new(peer.0))
+                        .collect();
                 }
+                let connected_peer_count = connected.len();
+                // x0x#1036: never beacon to active-view peers without a
+                // connection; those sends can only fail ("Peer not found").
+                let broadcast_peers =
+                    gossip::stale_targets::presence_broadcast_targets(active, &connected);
 
                 pw.manager().replace_broadcast_peers(broadcast_peers).await;
                 let broadcast_peer_count = pw.manager().broadcast_peer_count().await;
@@ -9959,18 +10838,21 @@ impl Agent {
 
                         let active = runtime_clone.membership().active_view();
                         let active_view_count = active.len();
-                        let mut broadcast_peers = active;
 
-                        let mut connected_peer_count = 0usize;
+                        let mut connected = Vec::new();
                         if let Some(ref net) = network_clone {
-                            let connected = net.connected_peers().await;
-                            connected_peer_count = connected.len();
-                            broadcast_peers.extend(
-                                connected
-                                    .into_iter()
-                                    .map(|peer| saorsa_gossip_types::PeerId::new(peer.0)),
-                            );
+                            connected = net
+                                .connected_peers()
+                                .await
+                                .into_iter()
+                                .map(|peer| saorsa_gossip_types::PeerId::new(peer.0))
+                                .collect();
                         }
+                        let connected_peer_count = connected.len();
+                        // x0x#1036: active-view peers without a connection
+                        // are not beacon targets (see presence_broadcast_targets).
+                        let broadcast_peers =
+                            gossip::stale_targets::presence_broadcast_targets(active, &connected);
 
                         pw_clone
                             .manager()
@@ -10259,6 +11141,11 @@ impl Agent {
                 sender_agent_id: self.identity.agent_id(),
             }) as std::sync::Arc<dyn dm_inbox::DirectAckHedge>
         });
+        // ADR-0070 §2: DM acceptance consults this agent's share grants.
+        let config = config.with_share_grant_gate(share_grant::ShareGrantDmGate::new(
+            self.owner_trust.clone(),
+            std::sync::Arc::clone(&self.identity_discovery_cache),
+        ));
         let service = dm_inbox::DmInboxService::spawn_with_hedge_options(
             std::sync::Arc::clone(runtime.pubsub()),
             signing,
@@ -10500,7 +11387,7 @@ impl Agent {
                 "gossip runtime not initialized - configure agent with network first",
             ))
         })?;
-        runtime
+        let fanout = runtime
             .pubsub()
             .publish_with_fanout(topic.to_string(), bytes::Bytes::from(payload))
             .await
@@ -10509,7 +11396,23 @@ impl Agent {
                     "publish failed: {}",
                     e
                 )))
-            })
+            })?;
+        // #1135: a zero-fanout publish is a silent best-effort miss
+        // (solo node, or every eligible peer cooled/excluded) — count
+        // it so /diagnostics/gossip can distinguish an absent message
+        // from a slow one.
+        if fanout == 0 {
+            self.gossip_zero_fanout_publishes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(fanout)
+    }
+
+    /// #1135: how many gossip publishes reached zero eager peers.
+    #[must_use]
+    pub fn gossip_zero_fanout_publishes(&self) -> u64 {
+        self.gossip_zero_fanout_publishes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     // Same publish path and error mapping; test-only send-stage observation.
@@ -10808,8 +11711,13 @@ impl Agent {
         record: revocation::RevocationRecord,
         subject_cert: Option<&identity::AgentCertificate>,
     ) -> error::Result<()> {
-        // 1. Verify and insert.
+        // 1. Verify and insert (under the #926 barrier if it is a
+        //    share-grant revocation).
         {
+            let _share_grant_barrier = self
+                .owner_trust
+                .share_grant_revocation_barrier(std::iter::once(&record), &self.revocation_set)
+                .await;
             let mut set = self.revocation_set.write().await;
             if let Err(e) = set.verify_and_insert(record.clone(), subject_cert) {
                 return Err(error::IdentityError::CertificateVerification(format!(
@@ -10818,12 +11726,21 @@ impl Agent {
             }
         }
 
-        // 2. Persist.
+        // 2. Persist. The legacy file filters share-grant records out
+        //    (#926 r3), so those also go to `revocations-v3.bin`.
         storage::save_revocation_set(
             &*self.revocation_set.read().await,
             self.identity_dir.as_deref(),
         )
         .await?;
+        if matches!(record.subject, revocation::RevokedSubject::ShareGrant(_)) {
+            persist_share_grant_revocations_durable(
+                &self.revocation_set,
+                self.identity_dir.as_deref(),
+            )
+            .await
+            .map_err(|e| error::IdentityError::Storage(std::io::Error::other(e)))?;
+        }
 
         // 3. Evict from caches.
         self.evict_revoked_subject(&record.subject).await;
@@ -11575,7 +12492,9 @@ impl Agent {
                 retired.push(this_move);
             }
             retired.sort_by_key(|b| (b.agent.0, b.machine.0, b.move_epoch));
-            // The certificate: journal/discovery evidence for coherence.
+            // The certificate: journal/discovery evidence for coherence —
+            // and, since #797, the identity-dir certificate when the
+            // activating agent is this daemon's own.
             let cert = self.agent_certificate_for(agent_id).await.ok_or_else(|| {
                 error::IdentityError::Revocation(
                     "no certificate known for the agent — cannot activate".to_string(),
@@ -11960,6 +12879,21 @@ impl Agent {
                 "no certificate known for the agent — binding revocation requires it".to_string(),
             )
         })?;
+
+        // #797 review item 4: a binding tombstone never expires (ADR-0043
+        // grow-only set) — revoking the LOCAL machine's own binding
+        // permanently bars this daemon's agent from signing here until the
+        // owner re-issues the certificate. That is a legitimate retirement
+        // action, so it proceeds — but never silently.
+        if *machine == self.machine_id() {
+            tracing::warn!(
+                agent = %hex::encode(agent.as_bytes()),
+                move_epoch,
+                "revoking the LOCAL machine's own binding — the tombstone never \
+                 expires; this daemon's agent cannot sign from this machine \
+                 again until re-issued"
+            );
+        }
         let subject =
             revocation::RevokedSubject::AgentMachineBinding(revocation::AgentMachineBinding {
                 agent: *agent,
@@ -11997,12 +12931,41 @@ impl Agent {
         Ok(record)
     }
 
+    /// #797: the identity-held certificate for the daemon's own agent, but
+    /// ONLY when its issuer is the currently loaded owner user key — a
+    /// cert issued by an earlier owner key is NOT authoritative here and
+    /// must not short-circuit the peer/journal certificate lookups
+    /// (review item 3).
+    fn local_agent_certificate_if_current_issuer(
+        identity: &identity::Identity,
+    ) -> Option<identity::AgentCertificate> {
+        let cert = identity.agent_certificate()?;
+        let user = identity.user_keypair()?;
+        cert.user_id()
+            .is_ok_and(|uid| uid == user.user_id())
+            .then(|| cert.clone())
+    }
+
     /// The newest certificate known for an agent: discovery cache first,
     /// then the owner journal's retained bytes.
     async fn agent_certificate_for(
         &self,
         agent: &identity::AgentId,
     ) -> Option<identity::AgentCertificate> {
+        // #797: the daemon's OWN agent. Self-issuance deliberately keeps the
+        // cert journal lean (agent.cert is the durable copy) and the peer
+        // discovery cache never contains ourselves, so neither source below
+        // can resolve the local agent — the identity accessor is
+        // authoritative for it, but ONLY when the held certificate was
+        // issued by the LOADED owner user key: a cert left behind by an
+        // earlier owner key must fall through to the peer/journal lookups
+        // instead of failing the caller's authority check with the
+        // less-actionable "issuer is neither..." (review item 3).
+        if *agent == self.agent_id() {
+            if let Some(cert) = Self::local_agent_certificate_if_current_issuer(self.identity()) {
+                return Some(cert);
+            }
+        }
         if let Ok(Some(entry)) = self.discovered_agent(*agent).await {
             if let Some(cert) = entry.agent_certificate {
                 return Some(cert);
@@ -12106,6 +13069,14 @@ impl Agent {
                 tracing::info!(
                     machine = %hex::encode(machine_id.as_bytes()),
                     "evicted revoked machine from discovery cache"
+                );
+            }
+            // ADR-0070: a revoked share grant evicts nothing; grants are
+            // re-evaluated against the revocation set at every gate.
+            revocation::RevokedSubject::ShareGrant(grant) => {
+                tracing::info!(
+                    grant_id = %hex::encode(grant.grant_id),
+                    "share grant revoked"
                 );
             }
             // ADR-0043: a binding tombstone retires ONE (agent, machine)
@@ -12688,6 +13659,7 @@ impl Agent {
                 match event {
                     network::NetworkEvent::PeerConnected { peer_id, address } => {
                         let machine_id = identity::MachineId(peer_id);
+
                         let cached_agent_id = {
                             let cache = cache.read().await;
                             cache
@@ -12886,6 +13858,87 @@ impl Agent {
         });
     }
 
+    /// Start ADR 0089 after installing the live relationship stores. Loading
+    /// runs off the async executor; consumers wait at most five seconds.
+    /// The group predicate returns `None` while its live roster is locked.
+    /// Such a read fails closed without making a durable removal.
+    pub fn start_peer_evidence(
+        &self,
+        data_dir: std::path::PathBuf,
+        config: peer_evidence::EvidenceConfig,
+        groups: std::sync::Arc<dyn Fn(identity::AgentId) -> Option<bool> + Send + Sync>,
+    ) -> Result<(), peer_evidence::EvidenceError> {
+        config.validate()?;
+        let policy = std::sync::Arc::new(peer_evidence::RuntimePolicy::new(
+            self.agent_id(),
+            self.owner_trust.clone(),
+            std::sync::Arc::clone(&self.revocation_set),
+        ));
+        policy.set_groups(groups);
+        let evidence = std::sync::Arc::clone(&self.capability_store.evidence);
+        self.owner_trust.install_evidence(&evidence);
+        if !evidence.start(
+            data_dir,
+            config,
+            policy,
+            std::sync::Arc::clone(&self.capability_store.evidence_wire),
+        ) {
+            return Ok(());
+        }
+        self.start_evidence_wire();
+        let capture = std::sync::Arc::clone(&self.capability_store.evidence_wire);
+        let discovery = std::sync::Arc::clone(&self.identity_discovery_cache);
+        let token = self.shutdown_token.clone();
+        self.spawn_tracked(async move {
+            let mut last_maintenance = 0;
+            let mut processed = peer_evidence::GossipPairing::default();
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        if let Some(store) = evidence.store() {
+                            let _ = tokio::task::spawn_blocking(move || store.flush(dm_capability::now_unix_ms(), true)).await;
+                        }
+                        break;
+                    }
+                    _ = tick.tick() => {}
+                    _ = capture.changed.notified() => {}
+                }
+                let Some(store) = evidence.store() else { continue; };
+                let now = dm_capability::now_unix_ms();
+                let mut records = Vec::new();
+                for agent in capture.agents(now) {
+                    let (Some(announcement), Some(advert)) = (capture.get(agent, true, now), capture.get(agent, false, now)) else { continue; };
+                    let certificate = discovery.read().await.get(&agent).and_then(|d| d.agent_certificate.as_ref()).and_then(|c| c.to_storage_bytes().ok());
+                    let Ok(ann) = announce_v3::deserialize_v3(&announcement) else { continue; };
+                    let cert = certificate.as_deref().and_then(|c| identity::AgentCertificate::from_storage_bytes(c).ok());
+                    if !store.related(agent, ann.machine_id, cert.as_ref(), now) { continue; }
+                    records.push((agent, peer_evidence::EvidenceRecordV1 { announcement, advert, certificate, relation: 0, stored_at_ms: now }));
+                }
+                let maintain = now.saturating_sub(last_maintenance) >= 60_000;
+                if maintain { last_maintenance = now; }
+                processed.retain_fresh(&capture, now);
+                let mut attempts = std::mem::take(&mut processed);
+                if let Ok(attempts) = tokio::task::spawn_blocking(move || {
+                    for (agent, record) in records {
+                        let _ = attempts.ingest(&store, agent, record, now);
+                    }
+                    if maintain { let _ = store.maintain(now); }
+                    let _ = store.flush(now, false);
+                    attempts
+                }).await {
+                    processed = attempts;
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// ADR 0089 counters and point-of-use handle. No authority cache is seeded.
+    pub fn peer_evidence(&self) -> &std::sync::Arc<peer_evidence::EvidenceRuntime> {
+        &self.capability_store.evidence
+    }
+
     /// Start the direct message listener background task.
     ///
     /// This task reads raw direct messages from the network layer and
@@ -12904,6 +13957,7 @@ impl Agent {
         let Some(network) = self.network.as_ref().map(std::sync::Arc::clone) else {
             return;
         };
+        let evidence = std::sync::Arc::clone(&self.capability_store.evidence);
         let dm = std::sync::Arc::clone(&self.direct_messaging);
         let discovery_cache = std::sync::Arc::clone(&self.identity_discovery_cache);
         let contact_store = std::sync::Arc::clone(&self.contact_store);
@@ -12913,18 +13967,32 @@ impl Agent {
         let token = self.shutdown_token.clone();
         let observed_prefix_enabled = self.observed_prefix_enabled;
         let dm_inbox_service = std::sync::Arc::clone(&self.dm_inbox_service);
+        let authenticated_machine_bindings =
+            std::sync::Arc::clone(&self.authenticated_machine_bindings);
 
         self.spawn_tracked(async move {
             tracing::info!(target: "x0x::direct", stage = "listener", "direct message listener started");
+            use futures::StreamExt;
+            let mut pending = futures::stream::FuturesUnordered::new();
             loop {
                 // direct_tx is a NetworkNode struct field that outlives
                 // network.shutdown(), so recv_direct() does not return None on
                 // shutdown; the token is what stops this loop now.
                 let recv = tokio::select! {
+                    biased;
                     _ = token.cancelled() => break,
-                    r = network.recv_direct() => r,
+                    ready = pending.next(), if !pending.is_empty() => ready,
+                    r = network.recv_direct_with_ingress() => {
+                        let Some((peer, payload, ingress)) = r else { break; };
+                        let barrier = std::sync::Arc::clone(&evidence);
+                        pending.push(async move {
+                            let usable = barrier.wait(payload.len()).await;
+                            (peer, payload, ingress, usable)
+                        });
+                        continue;
+                    }
                 };
-                let Some((ant_peer_id, payload)) = recv else {
+                let Some((ant_peer_id, payload, ingress, evidence_ready)) = recv else {
                     tracing::warn!(
                         target: "x0x::direct",
                         stage = "listener",
@@ -12967,13 +14035,16 @@ impl Agent {
                     digest = %digest,
                 );
 
-                // Verify AgentId→MachineId binding against identity discovery cache.
-                let (verified, cert_not_after) = {
+                // Select one authoritative binding and its expiry for both
+                // delivery verification and the runtime expiry gate (#1098).
+                let registry = crate::dm_inbox::authenticated_machine_binding_evidence(
+                    &authenticated_machine_bindings,
+                    &sender,
+                )
+                .await;
+                let (verified, live_verified, cert_not_after) = {
                     let cache = discovery_cache.read().await;
-                    cache
-                        .get(&sender)
-                        .map(|entry| (entry.machine_id == machine_id, entry.cert_not_after))
-                        .unwrap_or((false, None))
+                    raw_delivery_from_ingress(cache.get(&sender), registry, evidence_ready.then_some(&evidence), sender, machine_id, dm_capability::now_unix_ms(), ingress)
                 };
 
                 // Evaluate trust for the (AgentId, MachineId) pair.
@@ -13094,6 +14165,9 @@ impl Agent {
                                 .map(|entry| entry.agent_public_key.clone())
                                 .filter(|key| !key.is_empty())
                         };
+                        let sender_public_key = if sender_public_key.is_none() && evidence_ready && verified {
+                            evidence.usable(sender, machine_id, dm_capability::now_unix_ms()).map(|v| v.announcement.agent_public_key.clone())
+                        } else { sender_public_key };
                         if let Some(sender_public_key) = sender_public_key {
                             let inbox = dm_inbox_service.lock().await;
                             if let Some(service) = inbox.as_ref() {
@@ -13110,8 +14184,19 @@ impl Agent {
                     }
                 }
 
-                // Register and mark the sender as connected for future reverse direct sends.
-                dm.mark_connected(sender, machine_id).await;
+                // Register and mark the sender as connected for future reverse
+                // direct sends — only with EVIDENCE (#898): the discovery-cache
+                // binding matches this transport-authentic machine, OR an
+                // AuthenticatedMachineBindings entry (C1) names THIS machine
+                // for the sender — a moved agent whose announcement is too
+                // stale for the discovery cache still updates once its
+                // authenticated binding lands, matching the #927 evidence
+                // rule. Since #1088 the registry arm is computed once, above,
+                // and is already part of the DELIVERY `verified` (with the
+                // expiry guard and #1098 timestamp supersession); an
+                // unverified or superseded claim still never rebinds.
+                dm.mark_raw_direct_sender_connected(sender, machine_id, live_verified)
+                    .await;
 
                 // Issue #120: opt-in coarsened origin token from the live
                 // connection table (the same source add_from_connection()
@@ -13125,58 +14210,31 @@ impl Agent {
                     None
                 };
 
-                // ADR-0023: the gossip-inbox path records after its envelope
-                // verification gates, but the receive-ACK raw-QUIC path joins
-                // the same application stream here. Persist an artifact-less
-                // row only when the transport AgentId->MachineId binding was
-                // verified and trust did not reject the sender. Buzz message
-                // envelopes carry a per-send clientId in their payload, so
-                // payload-derived ids remain distinct for repeated user text.
-                if let (Some(history), Some(record)) = (
+                let typed_routes = {
+                    let inbox = dm_inbox_service.lock().await;
+                    // Before the inbox starts there are no registered routes;
+                    // retain the existing generic raw delivery in that case.
+                    inbox
+                        .as_ref()
+                        .map(dm_inbox::DmInboxService::typed_payload_routes)
+                        .unwrap_or_default()
+                        .to_vec()
+                };
+                dispatch_raw_direct_after_gates(
+                    &dm,
                     history_handle.as_ref(),
-                    raw_dm_history_record(
+                    &typed_routes,
+                    RawDirectDelivery {
                         sender,
                         machine_id,
-                        &data,
-                        verified,
-                        trust_decision,
-                        i64::try_from(dm::now_unix_ms()).unwrap_or(i64::MAX),
-                    ),
-                ) {
-                    history.record(record);
-                }
-
-                // Fan out to all subscribe_direct() receivers with verification info.
-                let delivered = dm
-                    .handle_incoming(
-                        machine_id,
-                        sender,
                         data,
                         verified,
                         trust_decision,
                         observed_origin,
-                    )
-                    .await;
-
-                tracing::debug!(
-                    target: "dm.trace",
-                    stage = "inbound_broadcast_published",
-                    sender = %hex::encode(sender.as_bytes()),
-                    machine_id = %hex::encode(machine_id.as_bytes()),
-                    path = "raw_quic",
-                    delivered,
-                    subscribers = dm.subscriber_count(),
-                    digest = %digest,
-                );
-
-                tracing::debug!(
-                    target: "x0x::direct",
-                    stage = "recv",
-                    sender_prefix = %network::hex_prefix(&sender.0, 4),
-                    payload_bytes,
-                    subscriber_count = dm.subscriber_count(),
-                    "direct message dispatched"
-                );
+                        digest,
+                    },
+                )
+                .await;
             }
         });
     }
@@ -13220,6 +14278,129 @@ impl Agent {
         ))
     }
 
+    /// #1040: open an owner-sync (`SyncV1`) stream to an enrolled owner
+    /// machine that the discovery cache does not know (no agent announced
+    /// on it yet, e.g. right after this device restarted).
+    ///
+    /// Admission mirrors the inbound branch: the machine must be in this
+    /// device's verified owner enrollment set
+    /// ([`owner_trust::OwnerTrust::is_enrolled_owner_machine`]: signature
+    /// chain to the local owner, current, not revoked).
+    ///
+    /// Dial source: the signed `OwnerEnrollment` carries NO addresses, so
+    /// the only source is the bootstrap cache entry for the enrolled
+    /// machine's PeerId. Every dial is peer-authenticated by that PeerId
+    /// ([`network::NetworkNode::connect_peer_with_addrs`] rejects any other
+    /// answering peer), so an address can only ever reach the enrolled
+    /// machine. No announcement, rendezvous, or other unauthenticated hint
+    /// is consulted. An existing connection to the machine is reused.
+    ///
+    /// The returned stream carries no agent ([`streams::PeerStream::peer`]
+    /// is the enrolled machine).
+    pub(crate) async fn open_enrolled_owner_sync_stream(
+        &self,
+        machine_id: &identity::MachineId,
+    ) -> error::NetworkResult<streams::PeerStream> {
+        if !self
+            .owner_trust
+            .is_enrolled_owner_machine(&self.revocation_set, machine_id)
+            .await
+        {
+            return Err(error::NetworkError::PeerNotVerified {
+                agent_id: machine_id.0,
+            });
+        }
+        let network = self
+            .network
+            .as_ref()
+            .ok_or_else(|| error::NetworkError::NodeError("network not initialized".to_string()))?;
+        let peer = ant_quic::PeerId(machine_id.0);
+        if !network.is_connected(&peer).await {
+            let addrs: Vec<std::net::SocketAddr> = match network.bootstrap_cache() {
+                Some(cache) => cache
+                    .get_peer(&peer)
+                    .await
+                    .map(|cached| cached.preferred_addresses())
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            if addrs.is_empty() {
+                return Err(error::NetworkError::ConnectionFailed(format!(
+                    "enrolled owner machine {} has no bootstrap-cache address \
+                     (owner enrollments carry no addresses) (#1040)",
+                    hex::encode(machine_id.as_bytes())
+                )));
+            }
+            let mut last_error = None;
+            let mut connected = false;
+            for addr in addrs {
+                match network.connect_peer_with_addrs(peer, vec![addr]).await {
+                    Ok((_, answered)) if answered == peer => {
+                        connected = true;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(e) => last_error = Some(e),
+                }
+            }
+            if !connected {
+                return Err(last_error.unwrap_or_else(|| {
+                    error::NetworkError::ConnectionFailed(format!(
+                        "enrolled owner machine {} did not answer at any bootstrap-cache address (#1040)",
+                        hex::encode(machine_id.as_bytes())
+                    ))
+                }));
+            }
+        }
+        let protocol = streams::StreamProtocol::SyncV1;
+        let (mut send, recv) = network.open_bi(&peer).await?;
+        streams::write_protocol_prefix(&mut send, protocol).await?;
+        tracing::info!(
+            target: "x0x::streams",
+            machine = %hex::encode(machine_id.as_bytes()),
+            protocol = ?protocol,
+            "outbound owner-sync stream opened on verified owner enrollment (no known agent, #1040)"
+        );
+        Ok(streams::PeerStream::new(
+            Vec::new(),
+            *machine_id,
+            protocol,
+            send,
+            recv,
+        ))
+    }
+
+    /// Publish a fresh identity announcement now, off the heartbeat cycle
+    /// (#1040: an enrolled owner machine just connected and may have
+    /// restarted with an empty discovery cache). The caller rate-limits.
+    /// A no-op without a gossip runtime and network.
+    pub(crate) async fn reannounce_identity(&self) -> error::Result<()> {
+        let (Some(runtime), Some(network)) = (&self.gossip_runtime, &self.network) else {
+            return Ok(());
+        };
+        let ctx = HeartbeatContext {
+            identity: std::sync::Arc::clone(&self.identity),
+            runtime: std::sync::Arc::clone(runtime),
+            network: std::sync::Arc::clone(network),
+            selection_skew: std::sync::Arc::clone(&self.selection_skew),
+            interval_secs: self.heartbeat_interval_secs,
+            cache: std::sync::Arc::clone(&self.identity_discovery_cache),
+            machine_cache: std::sync::Arc::clone(&self.machine_discovery_cache),
+            user_identity_consented: std::sync::Arc::clone(&self.user_identity_consented),
+            allow_local_discovery_addrs: allow_local_discovery_addresses(network.config()),
+            revocation_set: std::sync::Arc::clone(&self.revocation_set),
+            last_revocation_generation: std::sync::atomic::AtomicU64::new(0),
+            heartbeat_tick: std::sync::atomic::AtomicU64::new(0),
+            verified_cert_tx: std::sync::Arc::clone(&self.verified_cert_tx),
+            machine_kem_public: self.machine_kem_public_key(),
+            move_state: std::sync::Arc::clone(&self.move_state),
+            legacy_announce: self.legacy_announce,
+            self_name: std::sync::Arc::clone(&self.self_name),
+            self_name_ever_set: std::sync::Arc::clone(&self.self_name_ever_set),
+        };
+        ctx.announce().await
+    }
+
     /// Outbound identity gate shared by every lane a peer connection can
     /// carry — byte-streams ([`Self::open_peer_stream`]) and the
     /// unreliable datagram lane ([`Self::open_peer_datagram_lane`]) — so
@@ -13249,14 +14430,18 @@ impl Agent {
         // returns false, preserving compatibility with pre-#130 peers.
         let expired = identity::is_expired(cert_not_after, Self::unix_timestamp_secs());
 
-        let trust_decision = {
-            let contacts = self.contact_store.read().await;
-            let evaluator = trust::TrustEvaluator::new(&contacts);
-            Some(evaluator.evaluate(&trust::TrustContext {
-                agent_id,
-                machine_id: &machine_id,
-            }))
-        };
+        let trust_decision = Some(
+            self.owner_trust
+                .evaluate_pair(
+                    &self.contact_store,
+                    &self.identity_discovery_cache,
+                    &self.revocation_set,
+                    agent_id,
+                    &machine_id,
+                )
+                .await
+                .decision,
+        );
         let (revoked_agent, revoked_machine) = {
             let revoked = self.revocation_set.read().await;
             (
@@ -13320,7 +14505,49 @@ impl Agent {
         revocation_set: &std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
         move_state: &std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>>,
         connect_policy: &std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
+        owner_trust: &owner_trust::OwnerTrust,
         machine_id: &identity::MachineId,
+    ) -> error::NetworkResult<Vec<identity::AgentId>> {
+        Self::gate_peer_machine_inbound_with_call_grant(
+            discovery_cache,
+            contact_store,
+            revocation_set,
+            move_state,
+            connect_policy,
+            owner_trust,
+            machine_id,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::gate_peer_machine_inbound`] with the ADR-0073 × ADR-0070
+    /// call-signaling input (#980), used ONLY by
+    /// [`Agent::call_gate_inbound`](crate::Agent::call_gate_inbound).
+    ///
+    /// `call_caller` is the agent ringing us. If it holds a live, unrevoked,
+    /// unexpired ShareGrant carrying `Call` for this daemon's agent (the
+    /// same [`owner_trust::OwnerTrust::grant_access`] lookup the Connect
+    /// grant uses), its trust decision is promoted exactly as owner trust
+    /// promotes it (`Unknown`/`AcceptWithFlag` → `Accept`). Every other gate
+    /// is unchanged: revocation and cert expiry are checked before trust in
+    /// [`streams::stream_gate`], `Blocked` / machine-pin mismatch are never
+    /// promoted (and confer no grant), every OTHER agent on the machine must
+    /// still pass on its own, and an Enabled connect ACL must still list the
+    /// caller. `None` adds nothing: the accept loop and datagram lane pass
+    /// `None`, so a `Call` grant opens no stream or media lane.
+    #[allow(clippy::too_many_arguments)]
+    async fn gate_peer_machine_inbound_with_call_grant(
+        discovery_cache: &std::sync::Arc<
+            tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+        >,
+        contact_store: &std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+        revocation_set: &std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+        move_state: &std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>>,
+        connect_policy: &std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
+        owner_trust: &owner_trust::OwnerTrust,
+        machine_id: &identity::MachineId,
+        call_caller: Option<&identity::AgentId>,
     ) -> error::NetworkResult<Vec<identity::AgentId>> {
         // Identity gate — resolve ALL agents on this machine from the
         // discovery cache, then check each (revoked → trust). A single
@@ -13357,18 +14584,52 @@ impl Agent {
         // agents drop from the surfaced list; if NONE survive, the
         // machine has no live pairing and is denied.
         let mut surviving: Vec<identity::AgentId> = Vec::with_capacity(agents.len());
+        let mut owner_trusted: Vec<identity::AgentId> = Vec::new();
+        // ADR-0070 §2: agents holding a current Connect grant for this
+        // daemon's agent, and those admitted by that grant alone.
+        let mut grant_connect: Vec<identity::AgentId> = Vec::new();
+        let mut grant_only: Vec<identity::AgentId> = Vec::new();
         for (agent_id, cert_not_after) in &agents {
             // Runtime cert-expiry gate (issue #191): a cached entry whose
             // cert has expired must be refused on the live path.
             let expired = identity::is_expired(*cert_not_after, now_secs);
-            let trust_decision = {
-                let contacts = contact_store.read().await;
-                let evaluator = trust::TrustEvaluator::new(&contacts);
-                Some(evaluator.evaluate(&trust::TrustContext {
+            let pair = owner_trust
+                .evaluate_pair(
+                    contact_store,
+                    discovery_cache,
+                    revocation_set,
                     agent_id,
                     machine_id,
-                }))
-            };
+                )
+                .await;
+            if pair.owner_trusted {
+                owner_trusted.push(*agent_id);
+            }
+            let access = owner_trust
+                .grant_access(
+                    contact_store,
+                    discovery_cache,
+                    revocation_set,
+                    agent_id,
+                    machine_id,
+                )
+                .await;
+            let has_connect_grant = !access.connect_ports.is_empty();
+            // ADR-0073 × ADR-0070 (#980): only on the call-signaling gate,
+            // and only for the ringing agent itself.
+            let has_call_grant = access.call && call_caller == Some(agent_id);
+            if has_connect_grant {
+                grant_connect.push(*agent_id);
+                // A caller admitted by its Call grant is not "Connect-grant
+                // only": the Call cap is the explicit rule for ringing.
+                if pair.decision != trust::TrustDecision::Accept && !has_call_grant {
+                    grant_only.push(*agent_id);
+                }
+            }
+            let trust_decision = Some(
+                pair.decision
+                    .with_owner_trust(has_connect_grant || has_call_grant),
+            );
             let (revoked_agent, revoked_machine) = {
                 let revoked = revocation_set.read().await;
                 (
@@ -13448,7 +14709,14 @@ impl Agent {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             std::sync::Arc::clone(&guard)
         };
-        if let Err(e) = streams::stream_acl_gate(&policy, &agents, machine_id) {
+        if let Err(e) = streams::stream_acl_gate_with_grants(
+            &policy,
+            &agents,
+            &owner_trusted,
+            &grant_connect,
+            &grant_only,
+            machine_id,
+        ) {
             tracing::info!(
                 target: "x0x::streams",
                 machine = %hex::encode(machine_id.as_bytes()),
@@ -13498,6 +14766,7 @@ impl Agent {
             &self.revocation_set,
             &self.move_state,
             &self.connect_policy,
+            &self.owner_trust,
             &machine_id,
         )
         .await?;
@@ -13523,7 +14792,8 @@ impl Agent {
     /// Returns `None` when the accept loop has stopped (e.g. after shutdown).
     /// Protocols with a registered acceptor
     /// ([`Self::register_stream_acceptor`]) are routed there instead — this
-    /// default sink never sees them.
+    /// default sink never sees them. Forward protocols without an acceptor
+    /// are reset instead of entering this sink.
     pub async fn next_incoming_stream(&self) -> Option<streams::PeerStream> {
         let mut rx = self.stream_accept.receiver().lock().await;
         rx.recv().await
@@ -13541,8 +14811,8 @@ impl Agent {
     /// Exactly one acceptor may be live per protocol: a duplicate
     /// registration fails with
     /// [`error::NetworkError::StreamAcceptorConflict`]. Dropping the
-    /// acceptor deregisters it — subsequent streams for the protocol fall
-    /// back to the default sink ([`Self::next_incoming_stream`]).
+    /// acceptor deregisters it — subsequent forward streams are reset;
+    /// other protocols fall back to the default sink ([`Self::next_incoming_stream`]).
     ///
     /// # Errors
     /// [`error::NetworkError::StreamAcceptorConflict`] if an acceptor is
@@ -13587,18 +14857,307 @@ impl Agent {
         std::sync::Arc::clone(&guard)
     }
 
+    /// #1040 pre-prefix check: whether an inbound stream from `machine_id`
+    /// takes the enrolled owner-sync branch instead of the shared gate.
+    ///
+    /// True only when the discovery cache knows NO agent on the machine
+    /// (the case the shared gate denies as `deny_not_verified`) AND the
+    /// machine is in this device's verified owner enrollment set
+    /// ([`owner_trust::OwnerTrust::is_enrolled_owner_machine`]). A machine
+    /// with any known agent always goes through the shared gate, so its
+    /// agent-level denials (revoked, expired, blocked, dead pairing, ACL)
+    /// are never bypassed.
+    #[cfg(test)]
+    pub(crate) async fn enrolled_owner_sync_candidate(
+        discovery_cache: &tokio::sync::RwLock<
+            std::collections::HashMap<identity::AgentId, DiscoveredAgent>,
+        >,
+        revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
+        owner_trust: &owner_trust::OwnerTrust,
+        machine_id: &identity::MachineId,
+    ) -> bool {
+        let has_known_agent = {
+            let cache = discovery_cache.read().await;
+            cache.values().any(|agent| agent.machine_id == *machine_id)
+        };
+        !has_known_agent
+            && owner_trust
+                .is_enrolled_owner_machine(revocation_set, machine_id)
+                .await
+    }
+
+    /// #1040 post-prefix decision for a stream that took the enrolled
+    /// owner-sync branch, made atomic with its admission.
+    ///
+    /// 1. If ANY agent is known on the machine NOW, the enrollment is
+    ///    irrelevant: the stream must go through the shared agent-level gate
+    ///    ([`EnrolledOwnerSyncRoute::SharedGate`]), exactly like a stream
+    ///    from a known machine. This matters because an agent can become
+    ///    known during the prefix read, and it may be revoked, blocked, or
+    ///    not on the connect ACL (#1044 review round 1).
+    /// 2. Otherwise only `SyncV1` from a machine that is STILL in the
+    ///    verified owner enrollment set is admitted: `admit` runs and its
+    ///    result is returned as [`EnrolledOwnerSyncRoute::Admitted`].
+    ///    Everything else is [`EnrolledOwnerSyncRoute::Denied`].
+    ///
+    /// The enrollment (revocation set + device store) is verified first,
+    /// each lock in its own scope. The discovery-cache read guard is then
+    /// taken and held across the "no known agent" check AND `admit`, so no
+    /// agent can become known between the decision and the handoff. `admit`
+    /// must be synchronous and must not take identity locks. Only the cache
+    /// guard is held while it runs; no two identity locks are ever held at
+    /// once.
+    pub(crate) async fn route_enrolled_owner_sync<T>(
+        discovery_cache: &tokio::sync::RwLock<
+            std::collections::HashMap<identity::AgentId, DiscoveredAgent>,
+        >,
+        revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
+        owner_trust: &owner_trust::OwnerTrust,
+        machine_id: &identity::MachineId,
+        protocol: streams::StreamProtocol,
+        admit: impl FnOnce() -> T,
+    ) -> EnrolledOwnerSyncRoute<T> {
+        let enrolled = protocol == streams::StreamProtocol::SyncV1
+            && owner_trust
+                .is_enrolled_owner_machine(revocation_set, machine_id)
+                .await;
+        let cache = discovery_cache.read().await;
+        if cache.values().any(|agent| agent.machine_id == *machine_id) {
+            return EnrolledOwnerSyncRoute::SharedGate;
+        }
+        if !enrolled {
+            return EnrolledOwnerSyncRoute::Denied;
+        }
+        let admitted = admit();
+        drop(cache);
+        EnrolledOwnerSyncRoute::Admitted(admitted)
+    }
+
+    /// Keep the main gate-first path independent of strangers' prefix reads.
+    /// Known denials never get a pre-identity exception, including EvidenceV1.
+    #[allow(clippy::too_many_arguments)]
+    async fn admit_stream_before_prefix(
+        discovery_cache: &std::sync::Arc<
+            tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+        >,
+        contact_store: &std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+        revocation_set: &std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+        move_state: &std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>>,
+        connect_policy: &std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
+        owner_trust: &owner_trust::OwnerTrust,
+        machine_id: &identity::MachineId,
+        limits: &std::sync::Arc<evidence_wire::Limits>,
+    ) -> Option<streams::InboundAdmission> {
+        let known = discovery_cache
+            .read()
+            .await
+            .values()
+            .any(|a| a.machine_id == *machine_id);
+        if known {
+            let agents = Self::gate_peer_machine_inbound(
+                discovery_cache,
+                contact_store,
+                revocation_set,
+                move_state,
+                connect_policy,
+                owner_trust,
+                machine_id,
+            )
+            .await
+            .ok()?;
+            return Some(streams::InboundAdmission {
+                agents: Some(agents),
+                prefix: None,
+            });
+        }
+        if owner_trust
+            .is_enrolled_owner_machine(revocation_set, machine_id)
+            .await
+        {
+            return Some(streams::InboundAdmission {
+                agents: None,
+                prefix: None,
+            });
+        }
+        Some(streams::InboundAdmission {
+            agents: None,
+            prefix: Some(limits.admit_prefix(*machine_id)?),
+        })
+    }
+
+    /// Dispatch after gate-first admission. EvidenceV1 goes exclusively to its
+    /// evidence acceptor. Known peers retain their gate result; machines with
+    /// no known agent apply [`Self::route_enrolled_owner_sync`]:
+    ///
+    /// - An admitted `SyncV1` stream goes to the REGISTERED `SyncV1`
+    ///   acceptor only, never the default channel.
+    /// - A machine whose agent became known meanwhile goes through the
+    ///   shared gate ([`Self::gate_peer_machine_inbound`]: identity, trust,
+    ///   pairing and connect ACL) and is routed exactly as the normal
+    ///   accept path routes it.
+    /// - Anything else drops the halves (→ QUIC reset) with zero
+    ///   application bytes surfaced, logged `deny_not_verified` as the
+    ///   shared gate would log it.
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_admitted_stream(
+        incoming: std::sync::Arc<streams::StreamAccept>,
+        discovery_cache: std::sync::Arc<
+            tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+        >,
+        contact_store: std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+        revocation_set: std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+        move_state: std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>>,
+        connect_policy: std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
+        owner_trust: owner_trust::OwnerTrust,
+        evidence: std::sync::Arc<peer_evidence::EvidenceRuntime>,
+        admission: streams::InboundAdmission,
+        machine_id: identity::MachineId,
+        send: ant_quic::HighLevelSendStream,
+        mut recv: ant_quic::HighLevelRecvStream,
+    ) {
+        let protocol = match tokio::time::timeout(
+            streams::PREFIX_READ_TIMEOUT,
+            streams::read_protocol_prefix(&mut recv),
+        )
+        .await
+        {
+            Ok(Ok(protocol)) => protocol,
+            Ok(Err(e)) => {
+                tracing::info!(
+                    target: "x0x::streams",
+                    machine = %hex::encode(machine_id.as_bytes()),
+                    outcome = "deny_protocol",
+                    error = %e,
+                    "inbound stream protocol prefix rejected"
+                );
+                return;
+            }
+            Err(_) => {
+                tracing::info!(
+                    target: "x0x::streams",
+                    machine = %hex::encode(machine_id.as_bytes()),
+                    outcome = "deny_prefix_timeout",
+                    "inbound stream prefix byte timed out — resetting"
+                );
+                return;
+            }
+        };
+        // Keep the pre-identity slot through dispatch, including asynchronous
+        // relationship checks. Evidence bodies then hold a separate reservation
+        // through queueing and verification.
+        let _prefix = admission.prefix;
+        let evidence_limits = &evidence.wire_limits;
+        // ADR 0089: transport authentication alone admits only EvidenceV1.
+        // Acquire both the machine stream slot and aggregate allocation permit
+        // before queueing. The lease carries the original body deadline.
+        if protocol == streams::StreamProtocol::EvidenceV1 {
+            if let (Some(sender), Some(lease)) = (
+                incoming.registered_sender(protocol),
+                evidence_limits.admit(
+                    machine_id,
+                    evidence_wire::reserved_peer(
+                        evidence.store().as_deref(),
+                        &owner_trust,
+                        &revocation_set,
+                        machine_id,
+                    )
+                    .await,
+                ),
+            ) {
+                let mut stream =
+                    streams::PeerStream::new(Vec::new(), machine_id, protocol, send, recv);
+                stream.evidence_lease = Some(lease);
+                if sender.try_send(stream).is_err() {
+                    evidence_limits.reset(machine_id);
+                }
+            } else {
+                evidence_limits.reset(machine_id);
+            }
+            return;
+        }
+        if let Some(agents) = admission.agents {
+            let stream = streams::PeerStream::new(agents, machine_id, protocol, send, recv);
+            if incoming.sender_for(protocol).try_send(stream).is_err() {
+                tracing::debug!(target: "x0x::streams", ?protocol,
+                    "incoming-stream channel full or closed; resetting stream");
+            }
+            return;
+        }
+        let mut halves = Some((send, recv));
+        let route = Self::route_enrolled_owner_sync(
+            &discovery_cache,
+            &revocation_set,
+            &owner_trust,
+            &machine_id,
+            protocol,
+            || {
+                let sender = incoming.registered_sender(streams::StreamProtocol::SyncV1)?;
+                let (send, recv) = halves.take()?;
+                let peer_stream =
+                    streams::PeerStream::new(Vec::new(), machine_id, protocol, send, recv);
+                Some(sender.try_send(peer_stream).is_ok())
+            },
+        )
+        .await;
+        match route {
+            EnrolledOwnerSyncRoute::Admitted(Some(delivered)) => {
+                tracing::info!(
+                    target: "x0x::streams",
+                    machine = %hex::encode(machine_id.as_bytes()),
+                    outcome = "admit_enrolled_owner_sync",
+                    delivered,
+                    "SyncV1 stream admitted on verified owner enrollment (no known agent, #1040)"
+                );
+            }
+            EnrolledOwnerSyncRoute::Admitted(None) | EnrolledOwnerSyncRoute::Denied => {
+                tracing::info!(
+                    target: "x0x::streams",
+                    machine = %hex::encode(machine_id.as_bytes()),
+                    protocol = ?protocol,
+                    outcome = "deny_not_verified",
+                    "inbound traffic from machine with no known agent — denied"
+                );
+            }
+            EnrolledOwnerSyncRoute::SharedGate => {
+                // An agent became known during the prefix read: the shared
+                // gate decides, exactly as for any known machine. Denials
+                // are logged inside the gate.
+                let Some((send, recv)) = halves.take() else {
+                    return;
+                };
+                let Ok(agents) = Self::gate_peer_machine_inbound(
+                    &discovery_cache,
+                    &contact_store,
+                    &revocation_set,
+                    &move_state,
+                    &connect_policy,
+                    &owner_trust,
+                    &machine_id,
+                )
+                .await
+                else {
+                    return;
+                };
+                let peer_stream =
+                    streams::PeerStream::new(agents, machine_id, protocol, send, recv);
+                if incoming.sender_for(protocol).try_send(peer_stream).is_err() {
+                    tracing::debug!(
+                        target: "x0x::streams",
+                        protocol = ?protocol,
+                        "incoming-stream channel full or closed (no acceptor); resetting stream"
+                    );
+                }
+            }
+        }
+    }
+
     /// Start the inbound byte-stream accept loop (idempotent).
     ///
-    /// Called automatically by [`Agent::join_network`]. The loop is the SOLE
-    /// consumer of [`network::NetworkNode::accept_bi`]; every inbound stream
-    /// clears the identity gate (machine has a known agent → not revoked →
-    /// trust `Accept`), then the connect-ACL gate ([`Self::set_connect_policy`]
-    /// — every announced agent pair-listed when the policy is `Enabled`),
-    /// then the protocol handshake, before being routed by protocol byte to
-    /// the registered acceptor ([`Self::register_stream_acceptor`]) or the
-    /// default sink ([`Self::next_incoming_stream`]). A stream that fails a
-    /// gate is reset (its halves are dropped) with zero application bytes
-    /// exchanged.
+    /// Called automatically by [`Agent::join_network`]. The loop is the sole
+    /// transport acceptor. Known peers clear the identity and ACL gates before
+    /// any prefix read. Verified enrollment bypasses the pre-identity pool;
+    /// strangers alone use its two-per-machine, 32-total slots. Body bytes
+    /// reach only the selected acceptor after protocol admission.
     fn start_stream_accept_loop(&self) {
         if !self.stream_accept.start_once() {
             return;
@@ -13611,9 +15170,10 @@ impl Agent {
         let revocation_set = std::sync::Arc::clone(&self.revocation_set);
         let move_state = std::sync::Arc::clone(&self.move_state);
         let connect_policy = std::sync::Arc::clone(&self.connect_policy);
+        let owner_trust = self.owner_trust.clone();
         let incoming = std::sync::Arc::clone(&self.stream_accept);
         let token = self.shutdown_token.clone();
-
+        let evidence = std::sync::Arc::clone(self.peer_evidence());
         self.spawn_tracked(async move {
             tracing::info!(target: "x0x::streams", "byte-stream accept loop started");
             loop {
@@ -13621,7 +15181,7 @@ impl Agent {
                     _ = token.cancelled() => break,
                     r = network.accept_bi() => r,
                 };
-                let (ant_peer_id, send, mut recv) = match accepted {
+                let (ant_peer_id, send, recv) = match accepted {
                     Ok(triple) => triple,
                     Err(e) => {
                         tracing::warn!(target: "x0x::streams", error=%e, "accept_bi failed; continuing");
@@ -13630,84 +15190,32 @@ impl Agent {
                 };
                 let machine_id = identity::MachineId(ant_peer_id.0);
 
-                // Identity gate + connect-ACL gate — the shared inbound
-                // posture (also used by the datagram lane) resolves every
-                // agent announced on the transport-authenticated machine
-                // and denies unless ALL clear: revoked → expired → trust
-                // `Accept` per agent (#192 fail-closed), then the ACL
-                // pair gate when the policy is Enabled (#131). Denials
-                // are logged inside the gate; the stream halves are
-                // dropped (→ QUIC reset) with zero application bytes.
-                let agents = match Agent::gate_peer_machine_inbound(
-                    &discovery_cache,
-                    &contact_store,
-                    &revocation_set,
-                    &move_state,
-                    &connect_policy,
-                    &machine_id,
-                )
-                .await
-                {
-                    Ok(agents) => agents,
-                    Err(_) => continue,
+                let Some(admission) = Agent::admit_stream_before_prefix(
+                    &discovery_cache, &contact_store, &revocation_set, &move_state,
+                    &connect_policy, &owner_trust, &machine_id, &evidence.wire_limits,
+                ).await else {
+                    // Drop both halves unfinished, as on every other denial
+                    // before surfacing. ant-quic sends RESET_STREAM with
+                    // DROPPED_UNFINISHED_ERROR_CODE (ADR 0022), not code 0,
+                    // and STOP_SENDING for the receive half.
+                    // Capacity refusal is counted and logged by admit_prefix.
+                    continue;
                 };
-
-
-                // DISPATCH (DoS hardening, issue #132): the protocol-prefix
-                // read + surfacing run in a per-stream task so a peer that
-                // opens a stream and never sends the prefix cannot block this
-                // accept loop (and thus every other peer's inbound streams).
-                // The identity gate above already cleared; this task owns the
-                // stream halves and drops them (→ QUIC reset) on any failure.
-                let incoming_for_task = std::sync::Arc::clone(&incoming);
-                tokio::spawn(async move {
-                    // Belt-and-braces: bound the prefix read so a silent peer
-                    // holds the task/stream for at most PREFIX_READ_TIMEOUT.
-                    let protocol = match tokio::time::timeout(
-                        streams::PREFIX_READ_TIMEOUT,
-                        streams::read_protocol_prefix(&mut recv),
-                    )
-                    .await
-                    {
-                        Ok(Ok(p)) => p,
-                        Ok(Err(e)) => {
-                            tracing::info!(
-                                target: "x0x::streams",
-                                machine = %hex::encode(machine_id.as_bytes()),
-                                outcome = "deny_protocol",
-                                error = %e,
-                                "inbound stream protocol prefix rejected"
-                            );
-                            return;
-                        }
-                        Err(_) => {
-                            tracing::info!(
-                                target: "x0x::streams",
-                                machine = %hex::encode(machine_id.as_bytes()),
-                                outcome = "deny_prefix_timeout",
-                                "inbound stream prefix byte timed out — resetting"
-                            );
-                            return;
-                        }
-                    };
-                    let peer_stream =
-                        streams::PeerStream::new(agents, machine_id, protocol, send, recv);
-                    // Route by protocol byte to the registered acceptor (or
-                    // the default sink), then try_send so a slow consumer
-                    // cannot pile up accepted streams in memory; a full
-                    // channel drops (resets) the stream.
-                    if incoming_for_task
-                        .sender_for(protocol)
-                        .try_send(peer_stream)
-                        .is_err()
-                    {
-                        tracing::debug!(
-                            target: "x0x::streams",
-                            protocol = ?protocol,
-                            "incoming-stream channel full; dropping accepted stream"
-                        );
-                    }
-                });
+                let dispatch = Agent::dispatch_admitted_stream(
+                    std::sync::Arc::clone(&incoming),
+                    std::sync::Arc::clone(&discovery_cache),
+                    std::sync::Arc::clone(&contact_store),
+                    std::sync::Arc::clone(&revocation_set),
+                    std::sync::Arc::clone(&move_state),
+                    std::sync::Arc::clone(&connect_policy),
+                    owner_trust.clone(),
+                    std::sync::Arc::clone(&evidence),
+                    admission,
+                    machine_id,
+                    send,
+                    recv,
+                );
+                tokio::spawn(dispatch);
             }
         });
     }
@@ -13980,6 +15488,32 @@ impl Agent {
             .insert(agent_id, machine_id, capabilities, dm::now_unix_ms());
     }
 
+    /// Record an authenticated agent→machine binding (for testing only).
+    ///
+    /// Mirrors exactly what the identity-announcement path does at ingest
+    /// (`record_authenticated_machine_binding`) so tests can stage the
+    /// "binding landed but the discovery cache is stale" state that the
+    /// #898 C1 evidence branch resolves.
+    ///
+    /// # Visibility
+    ///
+    /// `#[doc(hidden)]` - tests-only seam. Production callers reach this
+    /// through the live announcement pipeline, never directly.
+    #[doc(hidden)]
+    pub async fn record_authenticated_machine_binding_for_testing(
+        &self,
+        agent_id: identity::AgentId,
+        machine_id: identity::MachineId,
+    ) {
+        dm_inbox::record_authenticated_machine_binding(
+            &self.authenticated_machine_bindings,
+            agent_id,
+            machine_id,
+            Self::unix_timestamp_secs(),
+        )
+        .await;
+    }
+
     /// # Arguments
     ///
     /// * `agent` - The agent entry to insert.
@@ -14249,6 +15783,15 @@ impl Agent {
         if let Some(gate) = binding.ingest_gate {
             sync.ingest_gate().install(gate);
         }
+        // #895: the protector is captured by the loops at start, so it too
+        // must be in place first — otherwise a group list would publish and
+        // merge plaintext until it was installed.
+        if let Some(protector) = binding.delta_protector {
+            sync.install_protector(protector);
+        }
+        if let Some(gate) = binding.state_serve_gate {
+            sync.install_serve_gate(gate);
+        }
         let sync = std::sync::Arc::new(sync);
         if storage.is_some() {
             // Fail closed at registration: refuse to run a "persistent"
@@ -14346,6 +15889,12 @@ pub struct TaskListBinding {
     /// The ADR-0068 D2 inbound-delta gate. `None` for a list with no group
     /// binding.
     pub ingest_gate: Option<std::sync::Arc<dyn crdt::TaskIngestGate>>,
+    /// #895: the group-key protector for a list bound to a named group.
+    /// `None` for a personal list (plaintext wire format, unchanged).
+    pub delta_protector: Option<std::sync::Arc<dyn crdt::TaskDeltaProtector>>,
+    /// #895: who may trigger a full-state serve of this list. `None` answers
+    /// any requester (the pre-#895 behaviour).
+    pub state_serve_gate: Option<crdt::StateServeGate>,
 }
 
 impl std::fmt::Debug for TaskListBinding {
@@ -14359,6 +15908,8 @@ impl std::fmt::Debug for TaskListBinding {
                     .map(std::collections::HashSet::len),
             )
             .field("ingest_gate", &self.ingest_gate.is_some())
+            .field("delta_protector", &self.delta_protector.is_some())
+            .field("state_serve_gate", &self.state_serve_gate.is_some())
             .finish()
     }
 }
@@ -15485,6 +17036,13 @@ impl AgentBuilder {
                         Err(e) => tracing::warn!("revocations-v2.bin unreadable: {e}"),
                     }
                 }
+                // ADR-0070: share-grant revocations (v3 file).
+                if let Ok(bytes) = tokio::fs::read(dir.join(SHARE_GRANT_REVOCATIONS_FILE)).await {
+                    match revocation::RevocationSet::from_bytes_v3(&bytes) {
+                        Ok(v3) => revoked_for_load.merge_v3(v3),
+                        Err(e) => tracing::warn!("revocations-v3.bin unreadable: {e}"),
+                    }
+                }
             }
             (state, logs_corrupt)
         };
@@ -15561,6 +17119,20 @@ impl AgentBuilder {
 
         // Initialize direct messaging infrastructure
         let direct_messaging = std::sync::Arc::new(direct::DirectMessaging::new());
+        let authenticated_machine_bindings = std::sync::Arc::new(tokio::sync::RwLock::new(
+            dm_inbox::AuthenticatedMachineBindingCache::default(),
+        ));
+        let owner_trust = owner_trust::OwnerTrust::new(
+            identity.user_id(),
+            std::sync::Arc::clone(&authenticated_machine_bindings),
+        );
+        if let Some(runtime) = gossip_runtime.as_ref() {
+            runtime.pubsub().set_group_identity_context(
+                std::sync::Arc::clone(&authenticated_machine_bindings),
+                std::sync::Arc::clone(&revocation_set),
+                std::sync::Arc::clone(&move_state),
+            );
+        }
 
         // Create presence wrapper if network exists
         let presence = if let Some(ref net) = network {
@@ -15645,13 +17217,12 @@ impl AgentBuilder {
             network,
             gossip_runtime,
             skip_legacy_dm_bus: self.skip_legacy_dm_bus,
+            gossip_zero_fanout_publishes: std::sync::atomic::AtomicU64::new(0),
             bootstrap_cache,
             gossip_cache_adapter,
             machine_kem,
             identity_discovery_cache,
-            authenticated_machine_bindings: std::sync::Arc::new(tokio::sync::RwLock::new(
-                dm_inbox::AuthenticatedMachineBindingCache::default(),
-            )),
+            authenticated_machine_bindings,
             machine_discovery_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
@@ -15715,6 +17286,7 @@ impl AgentBuilder {
             connect_policy: std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(
                 connect::ConnectPolicy::default(),
             ))),
+            owner_trust,
         })
     }
 }
@@ -16105,6 +17677,82 @@ impl TaskListHandle {
             tracing::warn!("failed to publish add_task delta: {}", e);
         }
         Ok((task_id, version))
+    }
+
+    /// #895 one-time board migration: copy every task of `source` into this
+    /// list under its EXISTING id, title, description, priority, creator and
+    /// creation time. Returns how many tasks were added.
+    ///
+    /// Ids already present are skipped, so a re-run — or another member
+    /// migrating the same board concurrently — converges on one entry per
+    /// task instead of duplicating (CRDT adds keyed by the same id merge).
+    ///
+    /// Copies arrive unclaimed: claim/complete attestations are bound to the
+    /// SOURCE list's scope and signed by the agents who made them, so this
+    /// agent cannot re-sign them without misattributing the work.
+    ///
+    /// # Errors
+    ///
+    /// The durability gate, a local add, or the snapshot write fails. Nothing
+    /// is published unless the snapshot succeeded.
+    pub async fn import_tasks_from(&self, source: &TaskListHandle) -> error::Result<usize> {
+        self.sync.ensure_durable().await.map_err(durability_err)?;
+        let copies: Vec<(crdt::TaskId, crdt::TaskMetadata)> = source
+            .sync
+            .read()
+            .await
+            .tasks_ordered()
+            .into_iter()
+            .map(|task| {
+                (
+                    *task.id(),
+                    crdt::TaskMetadata::new(
+                        task.title(),
+                        task.description(),
+                        task.priority(),
+                        *task.created_by(),
+                        task.created_at(),
+                    ),
+                )
+            })
+            .collect();
+        let delta = {
+            let mut list = self.sync.write().await;
+            let mut added = Vec::new();
+            for (task_id, metadata) in copies {
+                if list.get_task(&task_id).is_some() {
+                    continue;
+                }
+                let seq = list.next_seq();
+                let task = crdt::TaskItem::new(task_id, metadata, self.peer_id);
+                list.add_task(task.clone(), self.peer_id, seq)
+                    .map_err(|e| {
+                        error::IdentityError::Storage(std::io::Error::other(format!(
+                            "board migration add failed: {e}"
+                        )))
+                    })?;
+                added.push((task_id, task, (self.peer_id, seq)));
+            }
+            if added.is_empty() {
+                return Ok(0);
+            }
+            let mut delta = crdt::TaskListDelta::new(list.current_version());
+            for (task_id, task, tag) in added {
+                delta.added_tasks.insert(task_id, (task, tag));
+            }
+            delta
+        };
+        let count = delta.added_tasks.len();
+        self.sync.persist().await.map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "board migration applied locally but snapshot persistence FAILED ({e}); \
+                 delta not published; task list is durability-degraded"
+            )))
+        })?;
+        if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
+            tracing::warn!("failed to publish board migration delta: {}", e);
+        }
+        Ok(count)
     }
 
     /// Claim a task in the list.
@@ -16628,8 +18276,17 @@ impl Agent {
         persist_path: Option<std::path::PathBuf>,
         snapshot_lease: Option<&kv::snapshot_fence::StoreOpenLease>,
     ) -> error::Result<(std::sync::Arc<kv::KvStoreSync>, saorsa_gossip_types::PeerId)> {
-        self.spawn_kv_sync_inner(store, topic, persist_path, snapshot_lease, None, None, None)
-            .await
+        self.spawn_kv_sync_inner(
+            store,
+            topic,
+            persist_path,
+            snapshot_lease,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
     /// Construct, arm persistence for, and start a `KvStoreSync` bound to a
@@ -16648,6 +18305,7 @@ impl Agent {
         secure: Option<std::sync::Arc<dyn kv::encrypted::KvSecureContext>>,
         secure_refresh: Option<kv::sync::SecureRefreshFn>,
         treekem_secure: Option<kv::SharedTreeKemKvProtector>,
+        gss_publication_gate: Option<kv::sync::GssPublicationGate>,
     ) -> error::Result<(std::sync::Arc<kv::KvStoreSync>, saorsa_gossip_types::PeerId)> {
         let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
             error::IdentityError::Storage(std::io::Error::other(
@@ -16676,6 +18334,9 @@ impl Agent {
                 kv::encrypted::AuthorSigning::from_keypair(self.identity().agent_keypair())
                     .map_err(|e| kv_storage_err(format!("kv author signing setup failed: {e}")))?;
             sync.set_author_signing(signing);
+        }
+        if let Some(gate) = gss_publication_gate {
+            sync.set_gss_publication_gate(gate);
         }
         // Arm persistence BEFORE start so no merged delta can land
         // unpersisted, and write an initial snapshot so the file exists from
@@ -16753,6 +18414,7 @@ impl Agent {
     /// Gossip runtime not initialized; a corrupt/foreign snapshot (fail
     /// closed); a context bound to a different group; snapshot persistence
     /// failures; sync start failures.
+    #[allow(clippy::too_many_arguments)]
     pub async fn open_group_kv_store_persistent(
         &self,
         name: &str,
@@ -16761,6 +18423,7 @@ impl Agent {
         secure: std::sync::Arc<dyn kv::encrypted::KvSecureContext>,
         secure_refresh: kv::sync::SecureRefreshFn,
         snapshot_lease: KvStoreOpenLease,
+        gss_publication_gate: kv::sync::GssPublicationGate,
     ) -> error::Result<KvStoreHandle> {
         if name.is_empty() {
             return Err(kv_storage_err(
@@ -16795,6 +18458,7 @@ impl Agent {
                 Some(secure),
                 Some(secure_refresh),
                 None,
+                Some(gss_publication_gate),
             )
             .await?;
         self.commit_snapshot_lease(Some(&snapshot_lease), &sync, "group store open")?;
@@ -16890,6 +18554,7 @@ impl Agent {
                 None,
                 None,
                 Some(protector),
+                None,
             )
             .await?;
         self.commit_snapshot_lease(Some(&snapshot_lease), &sync, "TreeKEM group store open")?;
@@ -16962,6 +18627,7 @@ impl Agent {
                 Some(&snapshot_lease),
                 Some(context),
                 Some(refresh),
+                None,
                 None,
             )
             .await?;
@@ -17669,6 +19335,11 @@ impl std::fmt::Debug for KvStoreHandle {
 }
 
 impl KvStoreHandle {
+    /// Cumulative local state-sync counters for this open store.
+    pub fn state_sync_snapshot(&self) -> kv::sync::StateSyncSnapshot {
+        self.sync.state_sync_snapshot()
+    }
+
     pub(crate) async fn retained_content_digest_hex(&self) -> String {
         hex::encode(self.sync.read().await.served_digest())
     }
@@ -17684,6 +19355,12 @@ impl KvStoreHandle {
             .map_err(|error| {
                 error::IdentityError::Storage(std::io::Error::other(error.to_string()))
             })
+    }
+
+    /// #976 test hook (see kv_put_reports_publish_failure_and_keeps_the_local_write).
+    #[cfg(test)]
+    pub(crate) async fn sync_fail_next_publish_for_test(&self) {
+        self.sync.fail_next_publish_for_test();
     }
 
     #[cfg(test)]
@@ -18066,6 +19743,28 @@ impl KvStoreHandle {
         value: Vec<u8>,
         content_type: String,
     ) -> error::Result<kv::KvStoreDelta> {
+        Ok(self.put_with_outcome(key, value, content_type).await?.delta)
+    }
+
+    /// Put a key-value pair and return the published delta together with
+    /// the writer's own keys that the put evicted.
+    ///
+    /// Under [`kv::AccessPolicy::SelfKeyed`], ADR-0047 lowest-N admission can
+    /// evict the writer's lexicographically highest live keys when a put
+    /// takes it over the quota. That rule is unchanged. This method only
+    /// reports the eviction so the writer sees it (issue #849). A put whose
+    /// own key would fall outside the admitted set is refused before
+    /// anything changes, as with [`put_with_delta`](Self::put_with_delta).
+    ///
+    /// # Errors
+    ///
+    /// As [`put_with_delta`](Self::put_with_delta).
+    pub async fn put_with_outcome(
+        &self,
+        key: String,
+        value: Vec<u8>,
+        content_type: String,
+    ) -> error::Result<KvPutOutcome> {
         self.sync
             .authorize_local_write(&self.agent_id)
             .await
@@ -18083,18 +19782,84 @@ impl KvStoreHandle {
                  local writes refused until a snapshot succeeds"
             )))
         })?;
-        let delta = {
+        // #976 r3: an identical AppendOnly re-put is a no-op for the
+        // STORE but still RE-ANNOUNCES this entry — through the NORMAL
+        // publish_delta path (sealed, #973-gated), with NO store write
+        // lock held across the send. The entry + a fresh wire tag are
+        // captured under the lock; the publish runs after it drops.
+        let noop_republish: Option<(kv::KvStoreDelta, u64)> = {
+            let store = self.sync.write().await;
+            let would_mutate =
+                Self::check_local_put(&store, &self.agent_id, &key, &value, &content_type)?;
+            let version_before = store.current_version();
+            if !would_mutate {
+                let Some(entry) = store.get(&key).cloned() else {
+                    return Ok(KvPutOutcome {
+                        delta: kv::KvStoreDelta::new(version_before),
+                        evicted_keys: Vec::new(),
+                        published: true,
+                        publish_error: None,
+                    });
+                };
+                let Ok(seq) = store.reserve_sequences(1) else {
+                    return Ok(KvPutOutcome {
+                        delta: kv::KvStoreDelta::new(version_before),
+                        evicted_keys: Vec::new(),
+                        published: false,
+                        publish_error: Some("sequence reservation failed".to_string()),
+                    });
+                };
+                Some((
+                    kv::KvStoreDelta::for_put(
+                        key.clone(),
+                        entry,
+                        (self.peer_id, seq),
+                        version_before,
+                    ),
+                    version_before,
+                ))
+            } else {
+                None
+            }
+        };
+        if let Some((noop_delta, _version_before)) = noop_republish {
+            let (published, publish_error) = match self
+                .sync
+                .publish_delta(self.peer_id, noop_delta.clone())
+                .await
+            {
+                Ok(()) => (true, None),
+                Err(e) => {
+                    tracing::warn!("failed to re-announce append-only entry: {e}");
+                    (false, Some(format!("{e}")))
+                }
+            };
+            return Ok(KvPutOutcome {
+                delta: noop_delta,
+                evicted_keys: Vec::new(),
+                published,
+                publish_error,
+            });
+        }
+        let (delta, evicted_keys) = {
             let mut store = self.sync.write().await;
             let would_mutate =
                 Self::check_local_put(&store, &self.agent_id, &key, &value, &content_type)?;
             let version_before = store.current_version();
             if !would_mutate {
-                return Ok(kv::KvStoreDelta::new(version_before));
+                // Unreachable for AppendOnly (handled above); kept for any
+                // policy whose preflight reports a no-op here.
+                return Ok(KvPutOutcome {
+                    delta: kv::KvStoreDelta::new(version_before),
+                    evicted_keys: Vec::new(),
+                    published: true,
+                    publish_error: None,
+                });
             }
             let first_seq = store.reserve_sequences(2).map_err(|e| {
                 error::IdentityError::Storage(std::io::Error::other(format!("kv put failed: {e}")))
             })?;
-            store
+            let evicted_keys = store
                 .put_with_reserved_sequence(
                     key.clone(),
                     value.clone(),
@@ -18115,7 +19880,12 @@ impl KvStoreHandle {
             // must not advance for a non-mutation), publish nothing, and
             // persist nothing. Retries stay observationally silent.
             if store.current_version() == version_before {
-                return Ok(kv::KvStoreDelta::new(version_before));
+                return Ok(KvPutOutcome {
+                    delta: kv::KvStoreDelta::new(version_before),
+                    evicted_keys: Vec::new(),
+                    published: true,
+                    publish_error: None,
+                });
             }
             let entry = store.get(&key).cloned();
             let version = store.current_version();
@@ -18155,7 +19925,7 @@ impl KvStoreHandle {
                 // (content_root binds the store name).
                 delta.name_update = Some(store.name_register().clone());
             }
-            delta
+            (delta, evicted_keys)
         };
         // Durability before announcement: persist the committed mutation and
         // DO NOT publish if the snapshot fails — announcing state the disk
@@ -18171,10 +19941,25 @@ impl KvStoreHandle {
                  delta not published; store is durability-degraded"
             )))
         })?;
-        if let Err(e) = self.sync.publish_delta(self.peer_id, delta.clone()).await {
-            tracing::warn!("failed to publish kv put delta: {e}");
-        }
-        Ok(delta)
+        // #976 ruling: the local write is KEPT, so an unpublished put is
+        // NOT an error. Report it — published=false + the cause — queue
+        // the delta for re-publish (anti-entropy alone does NOT
+        // re-announce: it only serves empty replicas), and let the
+        // caller's direct-peer fallback run.
+        let (published, publish_error) =
+            match self.sync.publish_delta(self.peer_id, delta.clone()).await {
+                Ok(()) => (true, None),
+                Err(e) => {
+                    tracing::warn!("failed to publish kv put delta: {e}");
+                    (false, Some(format!("{e}")))
+                }
+            };
+        Ok(KvPutOutcome {
+            delta,
+            evicted_keys,
+            published,
+            publish_error,
+        })
     }
 
     /// Get a value by key.
@@ -18221,7 +20006,7 @@ impl KvStoreHandle {
     /// Returns an error if the key does not exist, or
     /// [`error::IdentityError::Unauthorized`] if this agent is not permitted
     /// to write under the store's access policy.
-    pub async fn remove_with_delta(&self, key: &str) -> error::Result<kv::KvStoreDelta> {
+    pub async fn remove_with_outcome(&self, key: &str) -> error::Result<KvRemoveOutcome> {
         self.sync
             .authorize_local_write(&self.agent_id)
             .await
@@ -18266,10 +20051,30 @@ impl KvStoreHandle {
                  delta not published; store is durability-degraded"
             )))
         })?;
-        if let Err(e) = self.sync.publish_delta(self.peer_id, delta.clone()).await {
-            tracing::warn!("failed to publish kv remove delta: {e}");
-        }
-        Ok(delta)
+        // #976 symmetry: a failed remove-publish is queued for
+        // re-publish (reported via diagnostics; the remove IS applied and
+        // persisted — a CRDT remove cannot be unwound either).
+        // #976 r3: honest DELETE outcome — applied + persisted, publish
+        // reported, NO replay (a replayed remove could wipe a newer
+        // value remotely; see the r2 review B2).
+        let (published, publish_error) =
+            match self.sync.publish_delta(self.peer_id, delta.clone()).await {
+                Ok(()) => (true, None),
+                Err(e) => {
+                    tracing::warn!("failed to publish kv remove delta: {e}");
+                    (false, Some(format!("{e}")))
+                }
+            };
+        Ok(KvRemoveOutcome {
+            delta,
+            published,
+            publish_error,
+        })
+    }
+
+    /// As remove_with_outcome without the publish report.
+    pub async fn remove_with_delta(&self, key: &str) -> error::Result<kv::KvStoreDelta> {
+        Ok(self.remove_with_outcome(key).await?.delta)
     }
 
     /// Apply a verified remote delta received through a non-pubsub channel.
@@ -18349,6 +20154,37 @@ impl KvStoreHandle {
         let store = self.sync.read().await;
         Ok(store.name().to_string())
     }
+}
+
+/// Result of a local KV put: the delta plus any keys it evicted, and
+/// whether the delta reached the wire (#976 ruling: the local write is
+/// KEPT, so an unpublished put is NOT an error — it is reported).
+#[derive(Debug, Clone)]
+pub struct KvPutOutcome {
+    /// The CRDT delta for this put.
+    pub delta: kv::KvStoreDelta,
+    /// The writer's own keys that this put evicted under the `SelfKeyed`
+    /// lowest-N quota (ADR-0047), sorted. Empty when nothing was evicted.
+    pub evicted_keys: Vec<String>,
+    /// #976: false when the gossip publish failed (timeout/refusal). The
+    /// write IS applied and persisted locally; the delta is queued for
+    /// re-publish and the direct-peer side channel still ran.
+    pub published: bool,
+    /// The publish failure cause when `published` is false.
+    pub publish_error: Option<String>,
+}
+
+/// Result of a local KV remove (#976 ruling symmetry): the delta and
+/// whether it reached the wire. The remove IS applied and persisted;
+/// an unpublished remove is reported, never replayed.
+#[derive(Debug, Clone)]
+pub struct KvRemoveOutcome {
+    /// The CRDT remove delta.
+    pub delta: kv::KvStoreDelta,
+    /// False when the gossip publish failed. No queue, no replay.
+    pub published: bool,
+    /// The publish failure cause when published is false.
+    pub publish_error: Option<String>,
 }
 
 /// Read-only snapshot of a KvStore entry.
@@ -18838,6 +20674,168 @@ fn spawn_relay_dm_listener(
 
 #[cfg(test)]
 mod tests {
+
+    /// #1135: a gossip publish that reaches zero eager peers is counted
+    /// (`publish_with_fanout` == 0 on a solo node), so
+    /// /diagnostics/gossip can distinguish an absent message from a
+    /// slow one.
+    #[tokio::test]
+    async fn zero_fanout_publishes_are_counted() {
+        let dir = tempfile::TempDir::new().expect("dir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback")),
+                bootstrap_nodes: vec![],
+                mdns_enabled: false,
+                ..network::NetworkConfig::default()
+            })
+            .build()
+            .await
+            .expect("agent");
+        agent.join_network().await.expect("join");
+        let before = agent.gossip_zero_fanout_publishes();
+        let fanout = agent
+            .publish_with_fanout("x0x/test/zero-fanout", vec![1, 2, 3])
+            .await
+            .expect("solo publish still succeeds locally");
+        assert_eq!(fanout, 0, "solo node has no eager peer");
+        assert_eq!(
+            agent.gossip_zero_fanout_publishes(),
+            before + 1,
+            "the zero-fanout miss must be counted"
+        );
+        agent.shutdown().await;
+    }
+
+    mod own_agent_certificate_lookup_797 {
+        use super::*;
+
+        /// #797: revoking the daemon's OWN agent binding must work from the
+        /// identity certificate when neither secondary source can answer —
+        /// the discovery cache never contains ourselves, and the issuance
+        /// journal is stripped here. FAIL-BEFORE (the local-identity
+        /// fallback in `agent_certificate_for` removed): revoke_binding
+        /// errors "no certificate known for the agent".
+        #[tokio::test]
+        async fn revoke_own_agent_binding_uses_identity_certificate() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let agent = Agent::builder()
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_identity_dir(dir.path())
+                .with_user_key(identity::UserKeypair::generate().expect("owner user key"))
+                .with_peer_cache_disabled()
+                .build()
+                .await
+                .expect("agent");
+            let own = agent.agent_id();
+            let user_kp = agent
+                .identity()
+                .user_keypair()
+                .expect("owner user key (self-issuance implies one)");
+            // Strip the issuance journal the journal source would answer
+            // from (the builder appends the self-issuance record next to
+            // agent.cert); the discovery cache is empty by construction.
+            std::fs::remove_file(dir.path().join(profile::CERT_JOURNAL_FILE))
+                .expect("issuance journal stripped");
+
+            // Seed the placement the revocation epoch order needs.
+            let owner_pk = user_kp.public_key().as_bytes().to_vec();
+            let secret = user_kp.secret_key();
+            let record = key_move::PlacementRecord::sign(
+                own,
+                &owner_pk,
+                key_move::Placement::Roaming,
+                1,
+                1,
+                secret,
+            )
+            .expect("placement sign");
+            {
+                let mut state = agent.move_state.write().await;
+                let cert = agent.identity().agent_certificate().expect("cert");
+                let authority = key_move::PlacementAuthority::cert_issuer(cert).expect("authority");
+                state
+                    .cache_placement(record, authority)
+                    .expect("placement cached");
+            }
+
+            let machine = agent.machine_id();
+            let outcome = agent.revoke_binding(&own, &machine, 1, None).await;
+            assert!(
+                outcome.is_ok(),
+                "own-agent binding revocation must use the identity certificate: {outcome:?}"
+            );
+            // Review item 2: the tombstone actually LANDED — is_ok alone
+            // could hide a silent no-op. The tombstone never expires, so
+            // this pairing is barred for peers from here on.
+            {
+                let revocation_set = agent.revocation_set();
+                let revoked = revocation_set.read().await;
+                assert!(
+                    revoked.is_binding_revoked(&own, &machine),
+                    "the (own agent, local machine) tombstone is in the grow-only set"
+                );
+            }
+        }
+
+        /// #797 review item 1 (negative): a STRANGER agent resolves to NO
+        /// certificate — the local-identity fallback must not widen
+        /// resolution beyond the daemon's own agent id, and with the
+        /// journal stripped and the discovery cache empty there is no
+        /// other source. (Through revoke_binding the refusal surfaces as
+        /// "no certificate known for the agent".)
+        #[tokio::test]
+        async fn stranger_agent_still_gets_no_certificate() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let agent = Agent::builder()
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_identity_dir(dir.path())
+                .with_user_key(identity::UserKeypair::generate().expect("owner user key"))
+                .with_peer_cache_disabled()
+                .build()
+                .await
+                .expect("agent");
+            std::fs::remove_file(dir.path().join(profile::CERT_JOURNAL_FILE))
+                .expect("issuance journal stripped");
+            let stranger = identity::AgentId([0xEE; 32]);
+            assert!(
+                agent.agent_certificate_for(&stranger).await.is_none(),
+                "a stranger resolves to no certificate; the local-identity \
+                 fallback is scoped to the daemon's own agent id"
+            );
+        }
+
+        /// #797 review items 1+3 (negative): a local agent.cert issued by a
+        /// DIFFERENT user key than the loaded owner must NOT short-circuit
+        /// the lookup — it falls through to the (here empty) peer/journal
+        /// sources instead of poisoning the caller's authority check.
+        #[test]
+        fn local_certificate_from_a_previous_issuer_falls_through() {
+            let machine_kp = identity::MachineKeypair::generate().expect("machine keypair");
+            let agent_kp = identity::AgentKeypair::generate().expect("agent keypair");
+            let previous_owner = identity::UserKeypair::generate().expect("previous owner");
+            let current_owner = identity::UserKeypair::generate().expect("current owner");
+            let stale_cert =
+                identity::AgentCertificate::issue(&previous_owner, &agent_kp).expect("cert");
+            let identity =
+                identity::Identity::new_with_user(machine_kp, agent_kp, current_owner, stale_cert);
+            assert!(
+                Agent::local_agent_certificate_if_current_issuer(&identity).is_none(),
+                "a cert issued by a previous owner key must fall through"
+            );
+            // Control: with the MATCHING owner loaded, the same accessor
+            // answers the local cert.
+            let machine_kp = identity::MachineKeypair::generate().expect("machine keypair");
+            let agent_kp = identity::AgentKeypair::generate().expect("agent keypair");
+            let owner = identity::UserKeypair::generate().expect("owner");
+            let cert = identity::AgentCertificate::issue(&owner, &agent_kp).expect("cert");
+            let identity = identity::Identity::new_with_user(machine_kp, agent_kp, owner, cert);
+            assert!(Agent::local_agent_certificate_if_current_issuer(&identity).is_some());
+        }
+    }
+
     mod announcement_role_honesty {
         use super::*;
 
@@ -19035,6 +21033,7 @@ mod tests {
             true,
             Some(trust::TrustDecision::Accept),
             123,
+            false,
         )
         .expect("verified user DM should produce history");
 
@@ -19046,13 +21045,627 @@ mod tests {
         record.validate().expect("raw DM history record is valid");
     }
 
+    /// #1088: the raw DELIVERY `verified` decision — the registry arm
+    /// (a fresh machine-key attestation's binding) must verify a frame from
+    /// a post-restart node whose discovery cache is still empty, a KNOWN
+    /// expired certificate must not be resurrected by it, and a binding for
+    /// a DIFFERENT machine must not. This pins the arithmetic the raw loop
+    /// delegates to `raw_delivery_verified`; the frame-level behaviour
+    /// (SSE/WS annotation, the #1070 decode gates) is the loop's use of it
+    /// and is covered by the CI listener tests.
+    #[test]
+    fn raw_delivery_verified_registry_arm() {
+        let now = 1_800_000_000u64;
+        // Post-restart shape: cache empty (no match, no cert), registry
+        // names THIS machine — the g46r2 finding-3 case.
+        assert!(raw_delivery_verified(false, true, None, now));
+        // Cache hit unchanged.
+        assert!(raw_delivery_verified(true, false, None, now));
+        // #898 preserved: no cache match AND no registry binding -> false.
+        assert!(!raw_delivery_verified(false, false, None, now));
+        // Registry binding for a DIFFERENT machine -> false.
+        assert!(!raw_delivery_verified(false, false, None, now));
+        // A KNOWN expired cert (past the clock-skew grace) is not
+        // resurrected by the registry arm...
+        assert!(!raw_delivery_verified(
+            false,
+            true,
+            Some(now - 100_000),
+            now
+        ));
+        // ...one inside the EXPIRY_CLOCK_SKEW_SECS grace still is (the
+        // downstream is_expired gate allows the same grace), and a valid
+        // known cert is fine.
+        assert!(raw_delivery_verified(false, true, Some(now - 1), now));
+        assert!(raw_delivery_verified(false, true, Some(now + 3_600), now));
+        // The cache arm observes the same expiry grace and fails closed
+        // before delivery verification, as well as at the downstream gate.
+        assert!(raw_delivery_verified(true, false, Some(now - 1), now));
+        assert!(!raw_delivery_verified(
+            true,
+            false,
+            Some(now - 100_000),
+            now
+        ));
+    }
+
+    /// #1098 acceptance: a newer cached move supersedes the old registry.
+    #[tokio::test]
+    async fn raw_delivery_newer_cache_supersedes_registry_1098() {
+        let agent = identity::AgentId([0x98; 32]);
+        let old_machine = identity::MachineId([1; 32]);
+        let new_machine = identity::MachineId([2; 32]);
+        let now = 1_800_000_000;
+        let bindings = dm_inbox::AuthenticatedMachineBindings::default();
+        dm_inbox::record_authenticated_machine_binding(&bindings, agent, old_machine, now - 10)
+            .await;
+        let registry = dm_inbox::authenticated_machine_binding_evidence(&bindings, &agent).await;
+        let mut cache = DiscoveredAgent {
+            agent_id: agent,
+            machine_id: new_machine,
+            announced_at: now,
+            ..test_discovered_agent_for_1098()
+        };
+        let (cached, retained, expiry) = raw_delivery_binding(Some(&cache), registry, old_machine);
+        assert!(
+            !raw_delivery_verified(cached, retained, expiry, now),
+            "#1098: old registry machine must not verify after a cached move"
+        );
+
+        // Equal timestamps fail closed to the cached move.
+        cache.announced_at = now - 10;
+        let (cached, retained, expiry) = raw_delivery_binding(Some(&cache), registry, old_machine);
+        assert!(!raw_delivery_verified(cached, retained, expiry, now));
+        // A newer registry supersedes an older cache in BOTH directions.
+        cache.announced_at = now - 20;
+        for (machine, expected) in [(old_machine, true), (new_machine, false)] {
+            let (cached, retained, expiry) = raw_delivery_binding(Some(&cache), registry, machine);
+            assert_eq!(
+                raw_delivery_verified(cached, retained, expiry, now),
+                expected
+            );
+        }
+        // A newer cert-less attestation must not bypass known cache expiry.
+        cache.cert_not_after = Some(now - 1000);
+        let (cached, retained, expiry) = raw_delivery_binding(Some(&cache), registry, old_machine);
+        assert!(!raw_delivery_verified(cached, retained, expiry, now));
+        assert!(identity::is_expired(expiry, now));
+        cache.cert_not_after = None;
+        // Expiry belongs to the selected binding, including after eviction.
+        dm_inbox::record_authenticated_machine_binding_with_expiry(
+            &bindings,
+            agent,
+            old_machine,
+            now,
+            Some(now - 1000),
+        )
+        .await;
+        // Attestations contain no cert: refreshing one cannot erase expiry.
+        dm_inbox::record_authenticated_machine_binding(&bindings, agent, old_machine, now + 1)
+            .await;
+        // Nor may replay of an older cert-less announcement clear it.
+        dm_inbox::record_authenticated_machine_binding_with_expiry(
+            &bindings,
+            agent,
+            new_machine,
+            now - 1,
+            None,
+        )
+        .await;
+        let registry = dm_inbox::authenticated_machine_binding_evidence(&bindings, &agent).await;
+        for discovery in [None, Some(&cache)] {
+            let (cached, retained, expiry) = raw_delivery_binding(discovery, registry, old_machine);
+            assert_eq!(expiry, Some(now - 1000));
+            assert!(identity::is_expired(expiry, now));
+            assert!(!raw_delivery_verified(cached, retained, expiry, now));
+        }
+    }
+
+    fn test_discovered_agent_for_1098() -> DiscoveredAgent {
+        DiscoveredAgent {
+            self_name: None,
+            cert_digest: None,
+            agent_id: identity::AgentId([0; 32]),
+            machine_id: identity::MachineId([0; 32]),
+            user_id: None,
+            addresses: Vec::new(),
+            announced_at: 0,
+            last_seen: 0,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: None,
+            agent_certificate: None,
+            agent_public_key: Vec::new(),
+        }
+    }
+
+    /// N12 (raw-path Blocked delivery): the raw 0x10 path must NOT deliver
+    /// a BLOCKED sender — or a sender whose machine fails the contact's
+    /// machine pin — to the generic direct bus. Every raw-prefix consumer
+    /// reads that bus: SSE `/direct/events`, the WS tap, and the background
+    /// file/welcome/join-result/control/catch-up/bootstrap/meta listeners.
+    /// The typed-route gate already refuses exactly these two decisions;
+    /// before N12 the generic fallback delivered them anyway.
+    #[tokio::test]
+    async fn raw_path_rejected_trust_never_reaches_generic_consumers() {
+        let dm = direct::DirectMessaging::new();
+        let mut generic = dm.subscribe();
+        let sender = identity::AgentId([0x91; 32]);
+        let machine_id = identity::MachineId([0x92; 32]);
+        for decision in [
+            trust::TrustDecision::RejectBlocked,
+            trust::TrustDecision::RejectMachineMismatch,
+        ] {
+            let payload = format!("blocked-send-{decision:?}").into_bytes();
+            let delivered = dm
+                .handle_incoming(
+                    machine_id,
+                    sender,
+                    payload.clone(),
+                    true,
+                    Some(decision),
+                    None,
+                )
+                .await;
+            assert_eq!(
+                delivered, 0,
+                "a trust-rejected sender is delivered to no consumer ({decision:?})"
+            );
+            assert!(
+                generic.try_recv().is_none(),
+                "a trust-rejected sender must not reach the generic bus ({decision:?})"
+            );
+        }
+        // The identical sender with an accepting decision IS delivered: the
+        // trust gate is the only thing that changed.
+        let accepted = b"same sender, accepted".to_vec();
+        let delivered = dm
+            .handle_incoming(
+                machine_id,
+                sender,
+                accepted.clone(),
+                true,
+                Some(trust::TrustDecision::Accept),
+                None,
+            )
+            .await;
+        assert_eq!(delivered, 1, "an accepted sender is delivered");
+        assert_eq!(
+            generic.try_recv().expect("accepted delivery").payload,
+            accepted
+        );
+        // Unknown and AcceptWithFlag keep the documented contract: deliver
+        // with the tag, the consumer decides.
+        for decision in [
+            trust::TrustDecision::Unknown,
+            trust::TrustDecision::AcceptWithFlag,
+        ] {
+            let payload = format!("tagged-{decision:?}").into_bytes();
+            let delivered = dm
+                .handle_incoming(
+                    machine_id,
+                    sender,
+                    payload.clone(),
+                    true,
+                    Some(decision),
+                    None,
+                )
+                .await;
+            assert_eq!(delivered, 1, "({decision:?})");
+            assert_eq!(
+                generic.try_recv().expect("tagged delivery").payload,
+                payload,
+                "({decision:?})"
+            );
+        }
+    }
+
+    /// N12 round 2 (the startup window): the raw listener starts BEFORE the
+    /// DM inbox, and until the inbox exists it passes dispatch an EMPTY
+    /// route list — so in that window an unverified frame claiming a
+    /// production typed protocol must still be suppressed by the STATIC
+    /// production-prefix table, not only by the registered routes.
+    #[tokio::test]
+    async fn raw_path_unverified_production_frame_suppressed_before_inbox_starts() {
+        let dm = direct::DirectMessaging::new();
+        let mut generic = dm.subscribe();
+        let sender = identity::AgentId([0x95; 32]);
+        let machine_id = identity::MachineId([0x96; 32]);
+        // The startup-window shape: no registered routes at all.
+        let no_routes: Vec<dm_inbox::DmTypedPayloadRoute> = Vec::new();
+        for prefix in [
+            crate::history::classify::KV_STORE_DELTA_DM_PREFIX,
+            crate::share_grant::SHARE_GRANT_DM_PREFIX,
+            crate::history::classify::GROUP_PUBLIC_MESSAGE_DM_PREFIX,
+            crate::exec::EXEC_DM_PREFIX,
+            b"X0X-GROUP-PREDECESSOR-RELAY-V1\n".as_slice(),
+            b"X0X-PUBLIC-GROUP-BOOTSTRAP-V2\n".as_slice(),
+        ] {
+            let mut payload = prefix.to_vec();
+            payload.extend_from_slice(b"unverified-startup-window-frame");
+            dispatch_raw_direct_after_gates(
+                &dm,
+                None,
+                &no_routes,
+                RawDirectDelivery {
+                    sender,
+                    machine_id,
+                    data: payload.clone(),
+                    verified: false,
+                    trust_decision: Some(trust::TrustDecision::Unknown),
+                    observed_origin: None,
+                    digest: direct::dm_payload_digest_hex(&payload),
+                },
+            )
+            .await;
+            assert!(
+                generic.try_recv().is_none(),
+                "an unverified {} frame must not reach the generic bus before the inbox starts",
+                String::from_utf8_lossy(prefix.split_at(12.min(prefix.len())).0)
+            );
+        }
+        // Control: an unverified ORDINARY frame still uses the bus in the
+        // same window (the consumer-decides contract is unchanged).
+        let ordinary = b"ordinary startup-window DM".to_vec();
+        dispatch_raw_direct_after_gates(
+            &dm,
+            None,
+            &no_routes,
+            RawDirectDelivery {
+                sender,
+                machine_id,
+                data: ordinary.clone(),
+                verified: false,
+                trust_decision: Some(trust::TrustDecision::Unknown),
+                observed_origin: None,
+                digest: direct::dm_payload_digest_hex(&ordinary),
+            },
+        )
+        .await;
+        assert_eq!(
+            generic
+                .try_recv()
+                .expect("ordinary DMs still delivered")
+                .payload,
+            ordinary
+        );
+    }
+
+    /// N12 (typed-frame leak, second half): an UNVERIFIED frame whose bytes
+    /// claim a typed protocol route is not a user DM. The typed router
+    /// already refuses unverified frames; before N12 such a frame fell
+    /// through to the generic bus and its payload was shown to SSE/WS
+    /// consumers as an ordinary direct message. An unverified frame that
+    /// does NOT claim a typed route keeps the documented contract (deliver
+    /// with `verified: false`, the consumer decides).
+    #[tokio::test]
+    async fn raw_path_unverified_typed_frame_is_not_shown_as_a_user_dm() {
+        let dm = direct::DirectMessaging::new();
+        let mut generic = dm.subscribe();
+        let (typed_tx, mut typed_rx) = tokio::sync::mpsc::channel(4);
+        let routes = vec![dm_inbox::DmTypedPayloadRoute {
+            prefix: b"TEST-TYPED-ROUTE\n".to_vec(),
+            sender: typed_tx,
+            durable_completion: false,
+            validator: None,
+        }];
+        let sender = identity::AgentId([0x93; 32]);
+        let machine_id = identity::MachineId([0x94; 32]);
+        let typed_bytes = b"TEST-TYPED-ROUTE\nunverified-protocol-frame".to_vec();
+
+        dispatch_raw_direct_after_gates(
+            &dm,
+            None,
+            &routes,
+            RawDirectDelivery {
+                sender,
+                machine_id,
+                data: typed_bytes.clone(),
+                verified: false,
+                trust_decision: Some(trust::TrustDecision::Unknown),
+                observed_origin: None,
+                digest: direct::dm_payload_digest_hex(&typed_bytes),
+            },
+        )
+        .await;
+        assert!(
+            generic.try_recv().is_none(),
+            "an unverified typed frame must not be shown as a user DM"
+        );
+        assert!(
+            typed_rx.try_recv().is_err(),
+            "unverified payload never reaches typed route"
+        );
+
+        // Control: an unverified ORDINARY payload is still delivered with
+        // `verified: false` — the documented consumer-decides contract.
+        let ordinary = b"hello from an unverified stranger".to_vec();
+        dispatch_raw_direct_after_gates(
+            &dm,
+            None,
+            &routes,
+            RawDirectDelivery {
+                sender,
+                machine_id,
+                data: ordinary.clone(),
+                verified: false,
+                trust_decision: Some(trust::TrustDecision::Unknown),
+                observed_origin: None,
+                digest: direct::dm_payload_digest_hex(&ordinary),
+            },
+        )
+        .await;
+        let shown = generic
+            .try_recv()
+            .expect("unverified ordinary DMs keep the consumer-decides contract");
+        assert_eq!(shown.payload, ordinary);
+        assert!(!shown.verified);
+    }
+
+    #[tokio::test]
+    async fn raw_post_validation_routes_verified_typed_before_generic_broadcast() {
+        let dm = direct::DirectMessaging::new();
+        let mut generic = dm.subscribe();
+        let (typed_tx, mut typed_rx) = tokio::sync::mpsc::channel(4);
+        let routes = vec![dm_inbox::DmTypedPayloadRoute {
+            prefix: b"TEST-TYPED-ROUTE\n".to_vec(),
+            sender: typed_tx,
+            durable_completion: false,
+            validator: None,
+        }];
+        let sender = identity::AgentId([0x81; 32]);
+        let machine_id = identity::MachineId([0x82; 32]);
+        let typed_bytes = b"TEST-TYPED-ROUTE\nsigned-event".to_vec();
+
+        dispatch_raw_direct_after_gates(
+            &dm,
+            None,
+            &routes,
+            RawDirectDelivery {
+                sender,
+                machine_id,
+                data: typed_bytes.clone(),
+                verified: true,
+                trust_decision: Some(trust::TrustDecision::Accept),
+                observed_origin: None,
+                digest: direct::dm_payload_digest_hex(&typed_bytes),
+            },
+        )
+        .await;
+        let routed = typed_rx
+            .try_recv()
+            .expect("verified typed payload reaches route");
+        assert_eq!(routed.payload, typed_bytes);
+        assert!(routed.verified);
+        assert_eq!(routed.sender, sender);
+        assert_eq!(routed.machine_id, machine_id);
+        assert!(
+            generic.try_recv().is_none(),
+            "typed payload bypasses generic bus"
+        );
+
+        let ordinary = b"ordinary direct message".to_vec();
+        dispatch_raw_direct_after_gates(
+            &dm,
+            None,
+            &routes,
+            RawDirectDelivery {
+                sender,
+                machine_id,
+                data: ordinary.clone(),
+                verified: true,
+                trust_decision: Some(trust::TrustDecision::Accept),
+                observed_origin: None,
+                digest: direct::dm_payload_digest_hex(&ordinary),
+            },
+        )
+        .await;
+        assert_eq!(
+            generic
+                .try_recv()
+                .expect("ordinary payload is broadcast")
+                .payload,
+            ordinary
+        );
+
+        dispatch_raw_direct_after_gates(
+            &dm,
+            None,
+            &routes,
+            RawDirectDelivery {
+                sender,
+                machine_id,
+                data: typed_bytes.clone(),
+                verified: false,
+                trust_decision: Some(trust::TrustDecision::Unknown),
+                observed_origin: None,
+                digest: direct::dm_payload_digest_hex(&typed_bytes),
+            },
+        )
+        .await;
+        // N12: an unverified frame claiming a typed route is neither
+        // routed (unverified) nor shown as a user DM on the generic bus.
+        assert!(
+            generic.try_recv().is_none(),
+            "unverified typed frame must not reach the generic bus"
+        );
+        assert!(
+            typed_rx.try_recv().is_err(),
+            "unverified payload never reaches typed route"
+        );
+
+        dispatch_raw_direct_after_gates(
+            &dm,
+            None,
+            &routes,
+            RawDirectDelivery {
+                sender,
+                machine_id,
+                data: typed_bytes.clone(),
+                verified: true,
+                trust_decision: Some(trust::TrustDecision::RejectMachineMismatch),
+                observed_origin: None,
+                digest: direct::dm_payload_digest_hex(&typed_bytes),
+            },
+        )
+        .await;
+        // N12: a trust-rejected sender is delivered to no consumer at
+        // all - not the typed route and not the generic bus.
+        assert!(
+            generic.try_recv().is_none(),
+            "rejected trust must not reach the generic bus"
+        );
+        assert!(
+            typed_rx.try_recv().is_err(),
+            "rejected trust never reaches typed route"
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_raw_ordinary_dm_with_predecessor_prefix_reaches_generic_subscriber() {
+        let dm = direct::DirectMessaging::new();
+        let mut generic = dm.subscribe();
+        let (typed_tx, mut typed_rx) = tokio::sync::mpsc::channel(1);
+        let routes = vec![dm_inbox::DmTypedPayloadRoute {
+            prefix: b"X0X-GROUP-PREDECESSOR-RELAY-V1\n".to_vec(),
+            sender: typed_tx,
+            durable_completion: false,
+            validator: None,
+        }];
+        let ordinary = b"X0X-GROUP-PREDECESSOR-RELAY-V1\nhello from an ordinary DM".to_vec();
+        dispatch_raw_direct_after_gates(
+            &dm,
+            None,
+            &routes,
+            RawDirectDelivery {
+                sender: identity::AgentId([0x81; 32]),
+                machine_id: identity::MachineId([0x82; 32]),
+                data: ordinary.clone(),
+                verified: true,
+                trust_decision: Some(trust::TrustDecision::Accept),
+                observed_origin: None,
+                digest: direct::dm_payload_digest_hex(&ordinary),
+            },
+        )
+        .await;
+        assert_eq!(
+            generic
+                .try_recv()
+                .expect("ordinary DM must reach generic subscriber")
+                .payload,
+            ordinary
+        );
+        assert!(
+            typed_rx.try_recv().is_err(),
+            "ordinary DM must not enter relay handler"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_typed_prefixes_are_ordinary_raw_dms_with_history() {
+        let history_dir = tempfile::tempdir().expect("history tempdir");
+        let history_config = history::HistoryConfig {
+            db_path: Some(history_dir.path().join("history.db")),
+            ..history::HistoryConfig::daemon_default()
+        };
+        let history_service = history::HistoryService::start(&history_config, history_dir.path())
+            .expect("history service");
+        let history_handle = history_service.handle();
+        type TypedPrefixCase<'a> = (&'a [u8], fn(&[u8]) -> bool);
+        let cases: [TypedPrefixCase<'_>; 5] = [
+            (exec::EXEC_DM_PREFIX, server::valid_exec_typed_dm),
+            (
+                history::classify::GROUP_PUBLIC_MESSAGE_DM_PREFIX,
+                server::valid_group_public_typed_dm,
+            ),
+            (
+                b"X0X-PUBLIC-GROUP-BOOTSTRAP-V2\n",
+                server::valid_public_group_bootstrap_typed_dm,
+            ),
+            (
+                history::classify::KV_STORE_DELTA_DM_PREFIX,
+                server::valid_kv_store_delta_typed_dm,
+            ),
+            (
+                dm_inbox::GROUP_PREDECESSOR_RELAY_DM_PREFIX,
+                server::valid_predecessor_relay_typed_dm,
+            ),
+        ];
+        for (prefix, validator) in cases {
+            let dm = direct::DirectMessaging::new();
+            let mut generic = dm.subscribe();
+            let (typed_tx, mut typed_rx) = tokio::sync::mpsc::channel(1);
+            let routes = vec![dm_inbox::DmTypedPayloadRoute {
+                prefix: prefix.to_vec(),
+                sender: typed_tx,
+                durable_completion: false,
+                validator: Some(validator),
+            }];
+            let sender = identity::AgentId([0x81; 32]);
+            let machine_id = identity::MachineId([0x82; 32]);
+            let mut ordinary = prefix.to_vec();
+            ordinary.extend_from_slice(b"ordinary message");
+            let route_outcome = dispatch_raw_direct_after_gates(
+                &dm,
+                Some(&history_handle),
+                &routes,
+                RawDirectDelivery {
+                    sender,
+                    machine_id,
+                    data: ordinary.clone(),
+                    verified: true,
+                    trust_decision: Some(trust::TrustDecision::Accept),
+                    observed_origin: None,
+                    digest: direct::dm_payload_digest_hex(&ordinary),
+                },
+            )
+            .await;
+            assert_eq!(
+                route_outcome,
+                dm_inbox::TypedRouteOutcome::RejectedPrefix,
+                "prefix {prefix:?}"
+            );
+            assert_eq!(
+                generic
+                    .try_recv()
+                    .expect("ordinary DM reaches generic subscriber")
+                    .payload,
+                ordinary,
+                "prefix {prefix:?}"
+            );
+            assert!(typed_rx.try_recv().is_err(), "prefix {prefix:?}");
+            let msg_id = history::HistoryRecord::compute_msg_id(None, &ordinary);
+            let recorded = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if let Some(row) = history_handle
+                        .store()
+                        .get_by_msg_id(msg_id)
+                        .expect("history lookup")
+                    {
+                        break row;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("ordinary DM history row");
+            assert_eq!(recorded.record.payload, ordinary, "prefix {prefix:?}");
+        }
+        history_service.shutdown().await;
+    }
+
     #[test]
     fn raw_dm_history_rejects_unverified_blocked_and_plumbing_payloads() {
         let sender = identity::AgentId([7; 32]);
         let machine = identity::MachineId([9; 32]);
         let payload = br#"{"text":"hello","clientId":"raw-history"}"#;
 
-        assert!(raw_dm_history_record(sender, machine, payload, false, None, 1).is_none());
+        assert!(raw_dm_history_record(sender, machine, payload, false, None, 1, false).is_none());
         assert!(raw_dm_history_record(
             sender,
             machine,
@@ -19060,15 +21673,51 @@ mod tests {
             true,
             Some(trust::TrustDecision::RejectBlocked),
             1,
+            false,
         )
         .is_none());
-        assert!(raw_dm_history_record(
+        let malformed_group_public = raw_dm_history_record(
             sender,
             machine,
             history::classify::GROUP_PUBLIC_MESSAGE_DM_PREFIX,
             true,
             Some(trust::TrustDecision::Accept),
             1,
+            false,
+        )
+        .expect("bare typed prefix is ordinary DM history");
+        assert_eq!(
+            malformed_group_public.payload,
+            history::classify::GROUP_PUBLIC_MESSAGE_DM_PREFIX
+        );
+
+        let keypair = identity::AgentKeypair::generate().expect("generate group author");
+        let group_message = groups::GroupPublicMessage::sign(
+            "g".into(),
+            "state-hash".into(),
+            1,
+            &keypair,
+            None,
+            groups::GroupPublicMessageKind::Chat,
+            "hello group".into(),
+            1_000,
+            None,
+            None,
+            None,
+        )
+        .expect("sign group public message");
+        let mut typed_payload = history::classify::GROUP_PUBLIC_MESSAGE_DM_PREFIX.to_vec();
+        typed_payload.extend_from_slice(
+            &serde_json::to_vec(&group_message).expect("serialize group public message"),
+        );
+        assert!(raw_dm_history_record(
+            sender,
+            machine,
+            &typed_payload,
+            true,
+            Some(trust::TrustDecision::Accept),
+            1,
+            false,
         )
         .is_none());
     }
@@ -19123,7 +21772,7 @@ mod tests {
         let topic = saorsa_gossip_types::TopicId::from_entity(IDENTITY_ANNOUNCE_TOPIC);
         let mut subscriptions = Vec::with_capacity(NODE_COUNT);
         for (node_index, node) in nodes.iter().enumerate() {
-            subscriptions.push(node.subscribe(topic));
+            subscriptions.push(node.subscribe_ready(topic).await);
             let connected = peers
                 .iter()
                 .copied()
@@ -20014,6 +22663,39 @@ mod tests {
             mdns_enabled: false,
             ..network::NetworkConfig::default()
         }
+    }
+
+    #[tokio::test]
+    async fn typed_shutdown_returns_and_caches_network_release_failure() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_dir(dir.path().join("peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("networked agent");
+        let network = agent.network().expect("network");
+        network.fail_shutdown_for_test("injected socket release failure");
+
+        let first = agent
+            .try_shutdown()
+            .await
+            .expect_err("typed shutdown must propagate the network failure")
+            .to_string();
+        assert!(first.contains("injected socket release failure"));
+        let second = agent
+            .try_shutdown()
+            .await
+            .expect_err("later callers must observe the cached failure")
+            .to_string();
+        assert_eq!(second, first);
+
+        // Source-compatible wrapper remains idempotent and callable after a
+        // typed failure; it logs the same cached outcome.
+        agent.shutdown().await;
     }
 
     #[tokio::test]
@@ -21289,6 +23971,107 @@ mod tests {
         creator.shutdown().await;
     }
 
+    /// #976 r3: the local write is KEPT and the put is NOT an error —
+    /// published=false + the cause, the value stays readable, NO queue
+    /// exists anywhere (removed: plaintext leak + delete replay), and a
+    /// later put with the wire working succeeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kv_put_reports_publish_failure_and_keeps_the_local_write() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("agent");
+        let store = agent
+            .create_kv_store_persistent(
+                "p976",
+                "p976-topic",
+                kv::AccessPolicy::Signed,
+                &dir.path().join("kv"),
+            )
+            .await
+            .expect("create store");
+        store
+            .put_with_delta("warm".to_string(), b"up".to_vec(), "text/plain".to_string())
+            .await
+            .expect("warm-up put publishes normally");
+        store.sync_fail_next_publish_for_test().await;
+        let outcome = store
+            .put_with_outcome("k976".to_string(), b"v".to_vec(), "text/plain".to_string())
+            .await
+            .expect("the put SUCCEEDS: the write is kept");
+        assert!(!outcome.published, "published=false is reported");
+        let cause = outcome.publish_error.expect("the cause is carried");
+        assert!(cause.contains("forced failure"), "{cause}");
+        let kept = store
+            .get("k976")
+            .await
+            .expect("read")
+            .expect("kept locally");
+        assert_eq!(kept.value, b"v");
+        store
+            .put_with_delta(
+                "after".to_string(),
+                b"ok".to_vec(),
+                "text/plain".to_string(),
+            )
+            .await
+            .expect("a later put with the wire working succeeds");
+        agent.shutdown().await;
+    }
+
+    /// #976 r3 (F3): an identical AppendOnly re-put RE-ANNOUNCES the
+    /// entry through the normal publish path (sealed, gated) and reports
+    /// its own publish outcome — no queue anywhere.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn appendonly_retry_republishes_an_unpublished_entry() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("agent");
+        let store = agent
+            .create_kv_store_persistent(
+                "p976ao",
+                "p976ao-topic",
+                kv::AccessPolicy::AppendOnly,
+                &dir.path().join("kv"),
+            )
+            .await
+            .expect("create store");
+        store
+            .put_with_delta("warm".to_string(), b"up".to_vec(), "text/plain".to_string())
+            .await
+            .expect("warm-up put publishes");
+        store.sync_fail_next_publish_for_test().await;
+        let first = store
+            .put_with_outcome("k".to_string(), b"v".to_vec(), "text/plain".to_string())
+            .await
+            .expect("write kept");
+        assert!(!first.published);
+        // The identical retry: a store no-op that RE-ANNOUNCES via the
+        // normal path and reports its own outcome (published=true here).
+        let retry = store
+            .put_with_outcome("k".to_string(), b"v".to_vec(), "text/plain".to_string())
+            .await
+            .expect("retry succeeds");
+        assert!(
+            retry.published,
+            "the retry re-announced through the normal path"
+        );
+        agent.shutdown().await;
+    }
+
     /// Durability blockers (round-3 review): (1) the direct-delivery path
     /// (`apply_remote_delta`, used by the daemon's delta side channel) must
     /// persist like the gossip receive loop — otherwise an attacker who
@@ -21854,6 +24637,180 @@ mod tests {
             matches!(outcome2, crate::TaskMutationOutcome::Committed { .. }),
             "a post-restart token at the current revision must commit"
         );
+
+        agent.shutdown().await;
+    }
+
+    /// GSS protector for the #895 board-migration fixture: seals and opens
+    /// with the same library functions the daemon's protector calls.
+    struct BoardFixtureProtector {
+        info: crate::groups::GroupInfo,
+        topic: String,
+        signing: crate::kv::AuthorSigning,
+    }
+
+    impl crate::crdt::TaskDeltaProtector for BoardFixtureProtector {
+        fn seal<'a>(
+            &'a self,
+            kind: crate::kv::KvMutationKind,
+            payload: &'a [u8],
+        ) -> crate::crdt::sealed::TaskSealFuture<
+            'a,
+            Option<crate::crdt::sealed::SealedTaskRecordBody>,
+        > {
+            Box::pin(async move {
+                crate::crdt::sealed::seal_gss_task_payload(
+                    &self.info,
+                    &self.signing,
+                    kind,
+                    &self.topic,
+                    payload,
+                )
+                .map(Some)
+            })
+        }
+
+        fn open<'a>(
+            &'a self,
+            body: &'a crate::crdt::sealed::SealedTaskRecordBody,
+        ) -> crate::crdt::sealed::TaskSealFuture<'a, crate::crdt::sealed::OpenedTaskPayload>
+        {
+            Box::pin(async move {
+                match body {
+                    crate::crdt::sealed::SealedTaskRecordBody::Gss(record) => {
+                        crate::crdt::sealed::open_gss_task_record(&self.info, &self.topic, record)
+                    }
+                    crate::crdt::sealed::SealedTaskRecordBody::TreeKem(_) => {
+                        Err(crate::crdt::CrdtError::Gossip("GSS fixture".to_string()))
+                    }
+                }
+            })
+        }
+
+        fn admits_plaintext(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
+            Box::pin(async move { false })
+        }
+
+        fn on_rejected(&self, _reason: crate::crdt::TaskSealRejection) {}
+
+        fn local_agent(&self) -> Option<crate::identity::AgentId> {
+            Some(self.signing.agent_id)
+        }
+
+        /// A fixed `GroupInfo` snapshot: its epoch can never move.
+        fn confirm_publication<'a>(
+            &'a self,
+            _body: &'a crate::crdt::sealed::SealedTaskRecordBody,
+        ) -> crate::crdt::sealed::TaskSealFuture<'a, crate::crdt::TaskPublication> {
+            Box::pin(async {
+                Ok(crate::crdt::TaskPublication::Current(
+                    crate::crdt::TaskPublicationPermit::none(),
+                ))
+            })
+        }
+    }
+
+    /// #895 (David, 2026-09-25) WHY: the space Board moves from its legacy
+    /// plaintext list to the sealed group list by copying once. The copy must
+    /// keep each task's id (so a re-run, or a second member migrating, adds
+    /// nothing), and what the new board publishes must carry no plaintext.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn board_migration_copies_once_and_publishes_only_sealed_bytes() {
+        const TITLES: [&str; 2] = ["LEGACY-BOARD-TITLE-895-A", "LEGACY-BOARD-TITLE-895-B"];
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("agent");
+
+        let legacy = agent
+            .create_task_list("Board", "x0x-board-g895migration")
+            .await
+            .expect("legacy board");
+        let mut legacy_ids = Vec::new();
+        for title in TITLES {
+            legacy_ids.push(
+                legacy
+                    .add_task(title.to_string(), "legacy".to_string())
+                    .await
+                    .expect("legacy task"),
+            );
+        }
+
+        let topic = "x0x.group.g895migration.symphony.board";
+        let mut info = crate::groups::GroupInfo::new(
+            "g895migration".to_string(),
+            String::new(),
+            agent.agent_id(),
+            "g895migration".to_string(),
+        );
+        info.migrate_from_v1();
+        let _ = info.rotate_shared_secret();
+        let binding = TaskListBinding {
+            delta_protector: Some(std::sync::Arc::new(BoardFixtureProtector {
+                info,
+                topic: topic.to_string(),
+                signing: crate::kv::AuthorSigning::from_keypair(agent.identity().agent_keypair())
+                    .expect("signing"),
+            })),
+            ..TaskListBinding::default()
+        };
+        let board = agent
+            .create_task_list_persistent_bound("Board", topic, &dir.path().join("lists"), binding)
+            .await
+            .expect("sealed board");
+        let mut probe = agent
+            .gossip_runtime
+            .as_ref()
+            .expect("runtime")
+            .pubsub()
+            .subscribe(topic.to_string())
+            .await;
+
+        assert_eq!(
+            board.import_tasks_from(&legacy).await.expect("migrate"),
+            2,
+            "first migration copies every legacy task"
+        );
+        assert_eq!(
+            board.import_tasks_from(&legacy).await.expect("re-run"),
+            0,
+            "a second migration is a no-op"
+        );
+        let mut migrated: Vec<_> = board
+            .list_tasks()
+            .await
+            .expect("board tasks")
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        migrated.sort_by_key(|id| *id.as_bytes());
+        legacy_ids.sort_by_key(|id| *id.as_bytes());
+        assert_eq!(
+            migrated, legacy_ids,
+            "stable ids: one entry per legacy task"
+        );
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), probe.recv())
+            .await
+            .expect("migration delta published")
+            .expect("probe open");
+        assert!(crate::crdt::sealed::decode_sealed_task_record(&msg.payload).is_some());
+        for title in TITLES {
+            assert!(
+                !msg.payload
+                    .windows(title.len())
+                    .any(|w| w == title.as_bytes()),
+                "plaintext title {title} on the new board's wire"
+            );
+        }
 
         agent.shutdown().await;
     }
@@ -26751,8 +29708,21 @@ fn verified_identity_origin_message(sender: &identity::AgentKeypair) -> gossip::
 async fn direct_origin_identity_ingest_populates_authenticated_binding() {
     let sender = identity::AgentKeypair::generate().expect("sender keygen");
     let machine = identity::MachineKeypair::generate().expect("machine keygen");
-    let now = 1_000;
-    let announcement = signed_identity_announcement_fixture(sender.agent_id(), &machine, now);
+    let now = Agent::unix_timestamp_secs();
+    let expiry = now + 3600;
+    let owner = identity::UserKeypair::generate().expect("owner keygen");
+    let cert = identity::AgentCertificate::issue_with_expiry(&owner, &sender, Some(expiry))
+        .expect("issue certificate");
+    let mut announcement = signed_identity_announcement_fixture(sender.agent_id(), &machine, now);
+    announcement.user_id = Some(cert.user_id().expect("certificate user"));
+    announcement.agent_certificate = Some(cert);
+    announcement.machine_signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        machine.secret_key(),
+        &bincode::serialize(&announcement.to_unsigned()).expect("serialize announcement"),
+    )
+    .expect("sign announcement")
+    .as_bytes()
+    .to_vec();
     announcement.verify().expect("valid machine announcement");
     let message = verified_identity_origin_message(&sender);
     let bindings = std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -26766,6 +29736,14 @@ async fn direct_origin_identity_ingest_populates_authenticated_binding() {
     assert_eq!(
         dm_inbox::authenticated_machine_binding_for_testing(&bindings, &sender.agent_id()).await,
         Some(machine.machine_id())
+    );
+    assert_eq!(
+        dm_inbox::authenticated_machine_binding_evidence(&bindings, &sender.agent_id())
+            .await
+            .expect("retained evidence")
+            .cert_not_after,
+        Some(expiry),
+        "verified announcement must retain its signed certificate expiry",
     );
 }
 
@@ -28258,3 +31236,9 @@ mod asymmetric_capability_convergence_tests;
 
 #[cfg(test)]
 mod legacy_bus_interop_tests;
+
+#[cfg(test)]
+mod d08_tests;
+
+#[cfg(test)]
+mod issue1099_tests;

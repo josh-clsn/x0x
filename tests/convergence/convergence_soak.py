@@ -224,6 +224,7 @@ class Node:
         peers = ", ".join(f'"127.0.0.1:{p}"' for p in bootstrap_quic_ports)
         self.config_path.write_text(
             f'instance_name = "{self.name}"\n'
+            'network_id = "x0x.prod"\n'
             f'data_dir = "{self.data_dir}"\n'
             # Legacy daemons do not honor X0X_HOME; keep named identities
             # under the disposable node root on every supported version.

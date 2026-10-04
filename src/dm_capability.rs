@@ -167,6 +167,29 @@ struct CapabilityAdvertV1Wire {
 }
 
 impl CapabilityAdvert {
+    /// Exact evidence decoder, preserving the historical inline and frozen
+    /// base layouts while refusing unrecognised or trailing extension bytes.
+    pub(crate) fn decode_evidence(
+        bytes: &[u8],
+    ) -> Result<(Self, Option<RegistryTrailer>), postcard::Error> {
+        if let Ok((base, tail)) = postcard::take_from_bytes::<CapabilityAdvertV1Wire>(bytes) {
+            if tail.is_empty() || tail.starts_with(REGISTRY_TRAILER_MAGIC) {
+                let advert = Self::from_postcard(&postcard::to_stdvec(&base)?)?;
+                let trailer = if tail.is_empty() {
+                    None
+                } else {
+                    RegistryTrailer::from_advert(bytes)?
+                };
+                return Ok((advert, trailer));
+            }
+        }
+        let (advert, rest) = postcard::take_from_bytes::<Self>(bytes)?;
+        if !rest.is_empty() {
+            return Err(postcard::Error::DeserializeBadEncoding);
+        }
+        Ok((advert, None))
+    }
+
     /// Two-stage postcard decode for the #437 `digest_support`
     /// transition: the v2 shape (caps may carry `digest_support`) first,
     /// then the byte-exact v1 legacy shape, lifted with
@@ -193,10 +216,48 @@ impl CapabilityAdvert {
                     max_envelope_bytes: v1.capabilities.max_envelope_bytes,
                     kem_public_key: v1.capabilities.kem_public_key,
                     digest_support: false,
+                    application_registry: Default::default(),
                 },
                 signature: v1.signature,
             })
         })
+    }
+}
+
+/// Optional trailing field on a frozen capability advert (ADR 0093).
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct RegistryTrailer {
+    pub registry: crate::dm::CapabilityRegistry,
+    pub signature: Vec<u8>,
+}
+
+pub(crate) const REGISTRY_TRAILER_MAGIC: &[u8] = b"X0CR";
+
+impl RegistryTrailer {
+    /// Bind the registry to exactly this base announcement, including its
+    /// agent, machine, timestamp and KEM material. Legacy signature stays intact.
+    pub fn signed_bytes(&self, advert: &CapabilityAdvert) -> Result<Vec<u8>, postcard::Error> {
+        let mut bytes = b"x0x-capability-registry-v1\0".to_vec();
+        bytes.extend_from_slice(&advert.signed_bytes()?);
+        bytes.extend_from_slice(&self.registry.version.to_be_bytes());
+        bytes.extend_from_slice(&self.registry.bits.to_be_bytes());
+        Ok(bytes)
+    }
+
+    pub fn from_advert(bytes: &[u8]) -> Result<Option<Self>, postcard::Error> {
+        // Only the frozen base can carry this extension. Historical inline
+        // digest adverts remain readable but carry no application bits.
+        let Ok((_, tail)) = postcard::take_from_bytes::<CapabilityAdvertV1Wire>(bytes) else {
+            return Ok(None);
+        };
+        let Some(tail) = tail.strip_prefix(REGISTRY_TRAILER_MAGIC) else {
+            return Ok(None);
+        };
+        let (trailer, rest) = postcard::take_from_bytes(tail)?;
+        if !rest.is_empty() {
+            return Err(postcard::Error::DeserializeBadEncoding);
+        }
+        Ok(Some(trailer))
     }
 }
 
@@ -255,6 +316,10 @@ impl DigestSupportExtension {
 /// Senders consult this cache before each `send_direct` call to determine
 /// whether the recipient supports the gossip DM inbox path.
 pub struct CapabilityStore {
+    /// ADR 0089 verified source wire bodies, paired by the runtime worker.
+    pub evidence_wire: std::sync::Arc<crate::peer_evidence::VerifiedWireCapture>,
+    /// ADR 0089 runtime authority; never inserted into capability bits.
+    pub evidence: std::sync::Arc<crate::peer_evidence::EvidenceRuntime>,
     inner: Mutex<CapabilityStoreInner>,
     ttl: Duration,
     /// Adverts and digest extensions the service skipped without an
@@ -282,6 +347,9 @@ struct CachedDigestExt {
 }
 
 struct CachedAdvert {
+    // Order card KEM refreshes independently of the verified advert lifetime.
+    card_created_at_unix_ms: Option<u64>,
+    verified_advert: bool,
     capabilities: DmCapabilities,
     machine_id: [u8; 32],
     expires_at: Instant,
@@ -316,6 +384,8 @@ impl CapabilityStore {
             inner: Mutex::new(CapabilityStoreInner::default()),
             ttl: Duration::from_secs(ADVERT_CACHE_TTL_SECS),
             prefiltered_stale_adverts: AtomicU64::new(0),
+            evidence_wire: Default::default(),
+            evidence: Default::default(),
         }
     }
 
@@ -326,6 +396,8 @@ impl CapabilityStore {
             inner: Mutex::new(CapabilityStoreInner::default()),
             ttl,
             prefiltered_stale_adverts: AtomicU64::new(0),
+            evidence_wire: Default::default(),
+            evidence: Default::default(),
         }
     }
 
@@ -333,6 +405,56 @@ impl CapabilityStore {
     pub fn lookup(&self, agent_id: &AgentId) -> Option<DmCapabilities> {
         self.lookup_binding(agent_id)
             .map(|binding| binding.capabilities)
+    }
+
+    /// Hold typed payloads only when a current verified advert lacks support.
+    /// Unknown, expired and card-only state preserves existing send behaviour.
+    pub fn require_payload_capability(
+        &self,
+        recipient: &AgentId,
+        payload: &[u8],
+    ) -> Result<(), crate::dm::DmError> {
+        let Ok(inner) = self.inner.lock() else {
+            return Ok(());
+        };
+        if let Some(entry) = inner.adverts.get(recipient.as_bytes()) {
+            if entry.verified_advert
+                && entry.machine_id != [0; 32]
+                && Instant::now() <= entry.expires_at
+            {
+                return entry
+                    .capabilities
+                    .application_registry
+                    .require_payload(payload);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the newest CURRENT VERIFIED advert signed by `machine`
+    /// supports `bit` (ADR 0089 S5 / ADR 0093 bit 2).
+    ///
+    /// `Some(false)` — a current verified advert that lacks the bit —
+    /// lets callers skip evidence Hello/Lookup to that machine.
+    /// `None` (unknown: no current verified advert for the machine,
+    /// or only card-only/expired state) keeps the ADR 0093 rule: send
+    /// once and let the peer's behaviour decide.
+    pub fn machine_registry_supports(&self, machine: &MachineId, bit: u64) -> Option<bool> {
+        let Ok(inner) = self.inner.lock() else {
+            return None;
+        };
+        let now = Instant::now();
+        inner
+            .adverts
+            .values()
+            .filter(|entry| {
+                entry.verified_advert
+                    && entry.machine_id == machine.0
+                    && entry.machine_id != [0; 32]
+                    && now <= entry.expires_at
+            })
+            .max_by_key(|entry| entry.created_at_unix_ms)
+            .map(|entry| entry.capabilities.application_registry.supports(bit))
     }
 
     /// Look up a peer's capability together with the machine that signed it.
@@ -477,6 +599,8 @@ impl CapabilityStore {
         inner.adverts.insert(
             *agent_id.as_bytes(),
             CachedAdvert {
+                card_created_at_unix_ms: None,
+                verified_advert: true,
                 capabilities,
                 machine_id: *machine_id.as_bytes(),
                 expires_at,
@@ -545,6 +669,10 @@ impl CapabilityStore {
     /// lowering a live binding, which would make strict sends fail until the
     /// next mesh refresh.
     ///
+    /// A current verified advert from the same machine retains its runtime
+    /// capabilities and signed lifetime; a newer card refreshes only KEM material.
+    /// Cards never authorize application bits or extend an advert's lifetime.
+    ///
     /// Returns `true` when the card material was inserted.
     pub fn insert_from_card(
         &self,
@@ -575,12 +703,13 @@ impl CapabilityStore {
         // on-demand mode never emits).
         let mut capabilities = capabilities;
         capabilities.digest_support = false;
+        capabilities.application_registry = Default::default();
         if let Some(ext) = fresh_digest_ext(&inner.digest_exts, agent_id.as_bytes(), now) {
             if ext.machine_id == *machine_id.as_bytes() {
                 capabilities.digest_support = ext.digest_support;
             }
         }
-        if let Some(existing) = inner.adverts.get(agent_id.as_bytes()) {
+        if let Some(existing) = inner.adverts.get_mut(agent_id.as_bytes()) {
             if created_at_unix_ms < existing.created_at_unix_ms {
                 return false;
             }
@@ -588,6 +717,22 @@ impl CapabilityStore {
                 && existing.capabilities.max_protocol_version > capabilities.max_protocol_version
             {
                 return false;
+            }
+            if now <= existing.expires_at
+                && existing.verified_advert
+                && existing.machine_id == *machine_id.as_bytes()
+            {
+                let material_timestamp = existing
+                    .card_created_at_unix_ms
+                    .unwrap_or(existing.created_at_unix_ms);
+                if created_at_unix_ms <= material_timestamp {
+                    // An ambiguous card must never erase verified evidence.
+                    return false;
+                }
+                existing.capabilities.kem_public_key = capabilities.kem_public_key;
+                existing.capabilities.kem_algorithm = capabilities.kem_algorithm;
+                existing.card_created_at_unix_ms = Some(created_at_unix_ms);
+                return true;
             }
             if created_at_unix_ms == existing.created_at_unix_ms {
                 let material_is_identical = existing.machine_id == *machine_id.as_bytes()
@@ -607,6 +752,8 @@ impl CapabilityStore {
         inner.adverts.insert(
             *agent_id.as_bytes(),
             CachedAdvert {
+                card_created_at_unix_ms: Some(created_at_unix_ms),
+                verified_advert: false,
                 capabilities,
                 machine_id: *machine_id.as_bytes(),
                 expires_at,
@@ -1373,6 +1520,8 @@ mod digest_diagnostic_tests {
 
     fn base(expires_at: Instant, digest_support: bool) -> CachedAdvert {
         CachedAdvert {
+            card_created_at_unix_ms: None,
+            verified_advert: true,
             capabilities: DmCapabilities {
                 digest_support,
                 ..DmCapabilities::pending()
@@ -1539,5 +1688,63 @@ mod digest_diagnostic_tests {
         assert!(view["rows"][0]["base_advert"].is_null());
         assert_eq!(view["rows"][0]["fresh_forward_downgrade_baseline"], false);
         assert_eq!(store.digest_diagnostic_snapshot(now, None).rows.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod s5_bit2_tests {
+    use super::*;
+    use crate::dm::CapabilityRegistry;
+
+    fn caps_with(bits: u64) -> crate::dm::DmCapabilities {
+        let mut caps = crate::dm::DmCapabilities::v1_gossip_ready(vec![42; 1184]);
+        caps.application_registry = CapabilityRegistry { version: 1, bits };
+        caps
+    }
+
+    #[test]
+    fn current_registry_advertises_peer_evidence_v1() {
+        let registry = CapabilityRegistry::current();
+        assert!(registry.supports(CapabilityRegistry::PEER_EVIDENCE_V1));
+        assert!(registry.supports(CapabilityRegistry::SHARE_GRANT_V1));
+        assert!(registry.supports(CapabilityRegistry::PREDECESSOR_OFFER_V1));
+    }
+
+    #[test]
+    fn machine_registry_supports_distinguishes_known_lacking_from_unknown() {
+        let store = CapabilityStore::new();
+        let machine = MachineId([7; 32]);
+        let agent = AgentId([9; 32]);
+        // Unknown: no advert at all — ADR 0093 says still send.
+        assert_eq!(
+            store.machine_registry_supports(&machine, CapabilityRegistry::PEER_EVIDENCE_V1),
+            None
+        );
+        // A current verified advert WITHOUT bit 2 — skip the Hello/Lookup.
+        let now = crate::dm_capability::now_unix_ms();
+        store.insert(agent, machine, caps_with(0), now);
+        assert_eq!(
+            store.machine_registry_supports(&machine, CapabilityRegistry::PEER_EVIDENCE_V1),
+            Some(false)
+        );
+        // ... and one WITH bit 2 sends.
+        store.insert(
+            agent,
+            machine,
+            caps_with(CapabilityRegistry::PEER_EVIDENCE_V1),
+            now + 1,
+        );
+        assert_eq!(
+            store.machine_registry_supports(&machine, CapabilityRegistry::PEER_EVIDENCE_V1),
+            Some(true)
+        );
+        // Other machines stay unknown.
+        assert_eq!(
+            store.machine_registry_supports(
+                &MachineId([8; 32]),
+                CapabilityRegistry::PEER_EVIDENCE_V1
+            ),
+            None
+        );
     }
 }

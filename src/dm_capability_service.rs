@@ -158,7 +158,7 @@ pub(crate) fn ingest_verified_capability_advert(
     if pubsub_sender == self_agent_id {
         return false;
     }
-    let advert = match CapabilityAdvert::from_postcard(&message.payload) {
+    let mut advert = match CapabilityAdvert::from_postcard(&message.payload) {
         Ok(advert) => advert,
         Err(_) => return false,
     };
@@ -180,12 +180,48 @@ pub(crate) fn ingest_verified_capability_advert(
     if !verify_advert_signature(&advert, sender_pubkey) {
         return false;
     }
-    store.insert(
+    match crate::dm_capability::RegistryTrailer::from_advert(&message.payload) {
+        Ok(Some(trailer)) => {
+            let Ok(bytes) = trailer.signed_bytes(&advert) else {
+                return false;
+            };
+            let Ok(key) = ant_quic::MlDsaPublicKey::from_bytes(sender_pubkey) else {
+                return false;
+            };
+            let Ok(signature) = ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(
+                &trailer.signature,
+            ) else {
+                return false;
+            };
+            if ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(&key, &bytes, &signature)
+                .is_err()
+            {
+                return false;
+            }
+            advert.capabilities.application_registry = trailer.registry;
+        }
+        Ok(None) => {}
+        Err(_) => return false,
+    }
+    let inserted = store.insert(
         AgentId(advert.agent_id),
         MachineId(advert.machine_id),
         advert.capabilities,
         advert.created_at_unix_ms,
-    )
+    );
+    if inserted {
+        store
+            .evidence
+            .observe_advert(&message.payload, sender_pubkey);
+        store.evidence_wire.capture(
+            AgentId(advert.agent_id),
+            false,
+            &message.payload,
+            advert.created_at_unix_ms,
+            now_unix_ms(),
+        );
+    }
+    inserted
 }
 
 /// Verify and ingest one digest extension using the same authenticated
@@ -825,7 +861,8 @@ pub fn advert_is_publishable(caps: &DmCapabilities) -> bool {
 /// Mixed-window note: a pre-#448 build's v2-shaped advert (true bit
 /// inline) is still DECODED and verified by new peers via
 /// [`CapabilityAdvert::from_postcard`]; this function merely never
-/// produces that shape.
+/// produces that shape. ADR 0093 appends a separately signed registry
+/// trailer after the frozen base; legacy `from_bytes` readers ignore it.
 pub fn build_signed_advert(
     signing: &SigningContext,
     self_agent_id: AgentId,
@@ -850,8 +887,22 @@ pub fn build_signed_advert(
         .signed_bytes()
         .map_err(|e| NetworkError::SerializationError(format!("advert sign-bytes: {e}")))?;
     advert.signature = signing.sign(&signed_bytes)?;
-    postcard::to_stdvec(&advert)
-        .map_err(|e| NetworkError::SerializationError(format!("advert encode: {e}")))
+    let mut bytes = postcard::to_stdvec(&advert)
+        .map_err(|e| NetworkError::SerializationError(format!("advert encode: {e}")))?;
+    let mut trailer = crate::dm_capability::RegistryTrailer {
+        registry: advert.capabilities.application_registry,
+        signature: Vec::new(),
+    };
+    trailer.signature =
+        signing.sign(&trailer.signed_bytes(&advert).map_err(|e| {
+            NetworkError::SerializationError(format!("registry sign-bytes: {e}"))
+        })?)?;
+    bytes.extend_from_slice(crate::dm_capability::REGISTRY_TRAILER_MAGIC);
+    bytes.extend_from_slice(
+        &postcard::to_stdvec(&trailer)
+            .map_err(|e| NetworkError::SerializationError(format!("registry encode: {e}")))?,
+    );
+    Ok(bytes)
 }
 
 /// Build the signed `digest_support` extension record for the same
