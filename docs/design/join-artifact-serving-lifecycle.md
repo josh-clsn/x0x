@@ -329,6 +329,23 @@ A class-K share whose exchange ends `recipient_undiscovered` is resent after 1 s
 | Restart-cold recipient resolution, class K and class R | Fixed: bounded resolution from verified sources (`Agent::await_pinned_recipient_machine`); a typed error inside the exchange deadline | `b869d1e`, `4e28f26` | `s8a_r7_owner_restart_class_k_share_lands_when_discovery_arrives_within_the_bound`, `s8a_r7_owner_restart_welcome_chunk_lands_on_the_requesters_attested_binding`; controls `s8a_r7_a_machine_learned_during_the_wait_is_refused_at_the_seam_when_revoked`, `s8a_r7_an_unresolved_recipient_ends_in_a_typed_error_within_the_bound` |
 | Class-K resend pacing after an undiscovered exchange | Fixed: 1 s resend with no backoff | `b869d1e`, `4e28f26` | `s8a_r7_class_k_share_resends_promptly_after_an_undiscovered_exchange` |
 
+**Round 7b (Codex review of `e645ce2..a3c85dd`: changes required).**
+
+- **Provenance (P2-1).** The pinned path now resolves a binding: a machine plus the verified source that names it. One rule, `select_pinned_binding`, applies to the bounded resolution, the re-check after repair and the seam. The rule follows the receive path:
+  1. Live authority: the newer of the discovery-cache entry and the ADR-0021 attestation, with its certificate expiry. An expired live binding resolves nothing.
+  2. The DM registry.
+  3. Peer evidence.
+
+  Repair and redial only try to connect that machine. A redial that connects another machine is not used. After repair, the binding must still name the machine. The seam re-selects with `try_*` reads, including a new non-blocking evidence check, and contention refuses. `resolve_raw_quic_target` serves the general path only again, with unchanged behaviour behind the transport seam (`RawQuicTransport`). The strict stand-in now runs the production target selection over a scripted transport.
+- **Bound (P2-2).** The resolution deadline starts at entry and bounds every source read and lock wait. Expiry is `recipient_undiscovered`.
+- **Pacing test (P3).** It now waits for the first exchange to END `recipient_undiscovered`, then requires a second exchange within 3 s. The behaviour was already right, so the test passes on the red commit. With the resend arm disabled it fails, in debug and in release.
+
+| Item | Status | Red, then fix | Evidence |
+|---|---|---|---|
+| P2-1: a redial or a binding change escaped the binding check | Fixed | `e74621d` (seam, no behaviour change), `45e9ab3`, `887434d` | `s8a_r7b_a_redial_off_the_current_binding_writes_nothing`, `s8a_r7b_a_binding_that_changes_before_the_seam_is_refused_at_the_seam` (moved; certificate expired) |
+| P2-2: a held source lock escaped the resolution bound | Fixed | `45e9ab3`, `887434d` | `s8a_r7b_a_held_source_lock_ends_in_the_typed_error_within_the_bound` (discovery cache; authenticated bindings) |
+| P3: the pacing test did not prove a resend | Test fixed | `45e9ab3` | `s8a_r7_class_k_share_resends_promptly_after_an_undiscovered_exchange` (fails with the resend arm disabled) |
+
 Still open for g10: the pinned path needs a direct connection to the resolved machine. If the requester reached the owner only through the gossip inbox, and repair or redial cannot dial it, the exchange still fails (`err_not_connected`), and the joiner's retry or the share's backoff carries the delivery. That is G10.
 
 Still outstanding for merge: the G10 evidence (e2e Home joins, survivor rekeys, mixed-version delivery on raw-only), from Root's ephemeral-testnet gate.
