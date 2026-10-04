@@ -349,7 +349,7 @@ A class-K share whose exchange ends `recipient_undiscovered` is resent after 1 s
 **Round 7c (Codex re-review of `a3c85dd..dc1eb49`: changes required).**
 
 - **Announcement bindings apart from routing state (NEW 1).** The discovery cache's `machine_id` is routing state: the connector reconciles it to any connected machine and keeps the old announcement time. So the pinned rule no longer reads it. A new announced-binding store records each peer's latest verified identity announcement, with its certificate expiry. It is written at announcement ingest only, never by routing. Live authority is the newer of that announcement and the ADR-0021 attestation. The pinned redial dials only the bound machine, on hints that name it, and never runs the general connector.
-- **One deadline through revalidation (NEW 2).** One absolute deadline covers resolution, the B/P checks and the post-repair binding re-read. A lock held past it is `recipient_undiscovered`. A free lock may still be taken within a 100 ms grace.
+- **One deadline through revalidation (NEW 2).** One absolute deadline covers resolution, the B/P checks and the post-repair binding re-read. A lock held past it is `recipient_undiscovered`. Round 7d removed the per-check grace: a read that does not have to wait still completes after the deadline, because `timeout_at` polls the read before its timer.
 - **Non-blocking evidence policy (NEW 3).** `EvidencePolicy::try_relation` and `try_revoked` reach owner enrollment, share grants and the group slot with `try_*` reads only. Contention reports busy, so the seam refuses and the resolver re-polls. The blocking receive-path check is unchanged.
 
 | Item | Status | Red, then fix | Evidence |
@@ -357,6 +357,20 @@ A class-K share whose exchange ends `recipient_undiscovered` is resent after 1 s
 | NEW 1: the production redial promoted stale routing state into pinned authority | Fixed | `7a88e6a` (redial over the transport seam, no behaviour change), `f9f67ac`, `db0d47b` | `s8a_r7c_stale_routing_state_never_becomes_pinned_authority`. It replaces `s8a_r7b_a_redial_off_the_current_binding_writes_nothing`, whose scripted redial result never reproduced the mutation. |
 | NEW 2: post-repair reads escaped the bound | Fixed | `f9f67ac`, `db0d47b` | `s8a_r7c_a_source_lock_held_after_resolution_ends_typed_within_the_bound` |
 | NEW 3: the non-blocking evidence check blocked in policy evaluation | Fixed | `f9f67ac`, `db0d47b` | `peer_evidence::tests::r7c_try_usable_agent_reports_busy_while_the_grant_store_is_held` |
+
+**Round 7d (Codex review of `dc1eb49..d528d28`: changes required).**
+
+- **Certificate-expiry provenance (NEW 1).** The announced binding is recorded after the announcement is merged into the discovery cache. It takes that entry's digest-coupled certificate expiry. A known expiry survives a same-digest blob miss and is cleared when the digest changes. When verified blob hydration attaches the certificate, it also updates the binding of the same announcement.
+- **Only gated ingest writes authority (NEW 2).** `find_agent`'s shard lookup skips the listener's timestamp, freshness, trust, revocation and pairing gates. It no longer writes the announced-binding store.
+- **Test seam (NEW 3).** `insert_discovered_agent_for_testing` writes the announced-binding store in test builds only.
+- **Deadline.** The single deadline is exact, with no per-check grace.
+
+| Item | Status | Red, then fix | Evidence |
+|---|---|---|---|
+| NEW 1: the announced binding lost, or never learned, the certificate expiry | Fixed | `0c4879b` (ingest and hydration seam, no behaviour change), `e7a8f89`, `97d91ff` | `r7d_announced_binding_learns_expiry_when_the_certificate_blob_lands`, `r7d_announced_binding_keeps_known_expiry_across_a_same_digest_blob_miss` |
+| NEW 2: `find_agent` wrote authority without the ingest gates | Fixed (the write is removed) | `97d91ff` | Inspection: `find_agent` needs the gossip runtime, so no in-process test can drive it |
+| NEW 3: an unchecked test helper wrote authority in production builds | Fixed (`#[cfg(test)]`) | `97d91ff` | Inspection: compile-time gate |
+| The held-cache control no longer held a resolver lock | Test fixed: it now holds the announced-binding store | `e7a8f89` | `s8a_r7b_a_held_source_lock_ends_in_the_typed_error_within_the_bound` |
 
 Still open for g10: the pinned path needs a direct connection to the resolved machine. If the requester reached the owner only through the gossip inbox, and repair or redial cannot dial it, the exchange still fails (`err_not_connected`), and the joiner's retry or the share's backoff carries the delivery. That is G10.
 
