@@ -7,18 +7,19 @@
 - **Reviewers:** Claude (cross-model r1, r2)
 - **Slice:** Slice S8 (b) of [ADR 0088](./0088-group-liveness-contract.md).
 - **Supersedes:** none upon acceptance. ADR 0088's supersession table assigns no supersession to S8 (b).
-- **Amends:** ADR 0016 §6, widened to repair rekeys alongside S4’s revocation amendment (D88, §3); and ADR 0088 §2, by one named entry (§6). Both take effect when this ADR is Accepted.
+- **Amends:** ADR 0016 §6, widened to repair rekeys alongside S4’s revocation amendment (D88, §3); ADR 0088 §2, by one named entry (§6, confirmed by D118); and ADR 0085 rule 4, for S8(b)'s own sidecar files only (D120, §5). Each takes effect when this ADR is Accepted.
 - **Superseded by:** none
 - **Goal served:** **R3** (all my machines connected) and the shared-places core.
-- **Related:** [#1150](https://github.com/saorsa-labs/x0x/issues/1150), [#1149](https://github.com/saorsa-labs/x0x/issues/1149), [#1146](https://github.com/saorsa-labs/x0x/issues/1146), [#1191](https://github.com/saorsa-labs/x0x/issues/1191), [#1164](https://github.com/saorsa-labs/x0x/issues/1164); ADR 0106, 0107, 0085, 0087, 0089 and 0093; S2 = ADR 0108, S4 = ADR 0110, S3 = ADR 0109, S5 = ADR 0111, S6 = ADR 0112.
+- **Related:** [#1150](https://github.com/saorsa-labs/x0x/issues/1150), [#1149](https://github.com/saorsa-labs/x0x/issues/1149), [#1146](https://github.com/saorsa-labs/x0x/issues/1146), [#1191](https://github.com/saorsa-labs/x0x/issues/1191), [#1164](https://github.com/saorsa-labs/x0x/issues/1164); ADR 0106, 0107, 0085, 0087, 0089 and 0093; S2 = ADR 0108 (its `JoinPendingNotice`, D117), S4 = ADR 0110, S3 = ADR 0109 and S5 = ADR 0111 (their beyond-retention states route to §7), S6 = ADR 0112.
 
 **Decision in brief.** Separate local join confirmation from the signed roster. Serve a usable staged Welcome first.
-If staging is lost, a designated admin replaces a never-confirmed seat's TreeKEM leaf without a new invite, but only on recorded never-confirmed evidence that it verifies itself (D86). Which evidence qualifies is still open and blocks Accept.
+If staging is lost, a designated admin replaces a never-confirmed seat's TreeKEM leaf without a new invite, but only on an admission-time marker that any admin can verify (D86, D136).
+A **confirmed** member behind every holder's retention gets the same replacement through the **retention re-Welcome** (§7, D119). Two vouchers from its last verified roster, or the owner, anchor it.
 A Home repair carries a repair mandate signed by the owner device or by a promoted admin (D87).
-Both are new acceptance rules with their own security argument (0088 L4); D39 and 0088 alone did not authorize them.
+These are new acceptance rules with their own security argument (0088 L4); D39 and 0088 alone did not authorize them.
 Confirmed Active replays remain no-ops. The #1191 fix ships with the full slice, not ahead of it (D91).
 
-The [public rulings digest](../design/x0x-direction.md) records the rulings this ADR cites: D16, D34, D37–D55, D60, D63–D65, D81, D84–D92 and D97.
+The [public rulings digest](../design/x0x-direction.md) records the rulings this ADR cites: D16, D34, D37–D55, D60, D63–D65, D81, D84–D92, D97, D117–D120, D122 and D136–D138.
 D63 binds S8(b) to 0114 and permits drafting it now as Proposed. It does not move S8(b) into the first acceptance batch.
 "S8" in 0088's order means S8(a), ADR 0107 (D65). S8(b) is accepted **after S4**, as Accepted ADR 0107 requires and D88 confirms; S5 does not wait for 0114.
 D60 requires current recipient eligibility and the current secret epoch for every class-K delivery or resend still under x0x's control.
@@ -60,13 +61,14 @@ ADR 0094 forbids format-upgrade writes before host commit, **including lazy rewr
 
 ## Considered Options
 
-1. **Staged-first service, then designated leaf replacement** (chosen). Closes staging loss for seats with verifiable never-confirmed evidence, under D86's and D87's new acceptance rules; the evidence rule is open question 3.
+1. **Staged-first service, then designated leaf replacement** (chosen). Closes staging loss for seats with verifiable never-confirmed evidence, under D86's and D87's new acceptance rules; D136 fixes the evidence.
 2. **Persist every result and Welcome indefinitely.** Rejected: retained key material, stale epochs and original-sealer dependence; D54 chooses S5, not an authority catch-up log.
 3. **Re-add on every Active replay or signed lost-key claim.** Rejected: rekey churn and sibling seals. D86 keeps the replacement trigger apart from this: it needs recorded never-confirmed evidence, so a bare signed claim never triggers it.
 4. **Confirm from the invite base or crypto-map presence.** Rejected for new recovery: reproduces #1149. Legacy keyed members keep existing semantics during migration; D84 keeps today's checks toward old authorities only.
 5. **Require the owner or original inviter for every repair.** Rejected by L1. The existing bounded S8(a) staged path still needs the original sealer; D87 rules Home mandate authority.
-6. **Manual remove + re-invite only.** Retained as D43's final exit and the confirmed-key-loss remedy (D85); inadequate as the sole never-confirmed repair path under L1/L2.
+6. **Manual remove + re-invite only.** Retained as D43's final exit and the confirmed-key-loss remedy (D85); inadequate as the sole never-confirmed repair path under L1/L2, and as the sole exit for a confirmed member behind retention (D119).
 7. **Wrap the two legacy JSON maps.** Rejected: breaks released startup and journals. Use an S8(b)-owned sidecar and an inert legacy placeholder instead.
+8. **A named §2 entry for a confirmed member behind retention, with D43's manual exit only.** Rejected by D119, against the recommendation: §7 repairs that member.
 
 ## Decision
 
@@ -84,7 +86,7 @@ The signed roster remains authoritative. Local confirmation lives outside its ha
 | `ConfirmedKeysMissing` | A previously confirmed member has lost usable keys. Expose `confirmed_keys_missing`; never replace its leaf automatically (D85). End the attempt with `Refused(manual_reinvite_required)` and expose D43's remedy (§6). |
 
 A keyed `Unknown` becomes `Confirmed` without rekey after ordinary chain verification, local key/epoch consistency checks and durable migration recording.
-An optional bound confirmation probe can issue its receipt; no receipt is required to preserve the legacy member's existing service.
+After host commit, a keyed member runs one bound confirmation probe per seat generation once a capable admin is reachable. Its verified receipt is the confirmation evidence that §7 needs. No receipt is required to preserve the legacy member's existing service.
 For SignedPublic, verify the current local chain and seat without a crypto check. Never manufacture an old authority receipt.
 A keyless `Unknown` has no recorded never-confirmed evidence, so it never triggers replacement (D86). It ends in `Refused(manual_reinvite_required)`, reason `no_never_confirmed_record`, with D43's remedy (§6).
 After host commit, persist new base-seated attempts as `Unconfirmed` before acknowledging that the attempt started; that acknowledgement is not join completion.
@@ -100,6 +102,19 @@ J then completes under today's checks. A SignedPublic attempt needs no keys. An 
 **Poll deadline (L3, D64).** An attempt that reaches its poll deadline (120 s for TreeKEM) without a terminal ends `TimedOut(<cause>)`, naming its last typed wait. Its local record stays retryable and shows `waiting_for_authority_terminal`.
 A capable authority that reaches a terminal for that attempt after J's deadline, including a typed refusal such as #946's `certificate_evidence_unavailable`, sends it to J through the gated exchange (§2) while J is reachable. Every §4 trigger on J also re-sends the bound request. So a later refusal reaches J.
 
+**Pending cause (D117).** S8(b) defines no pending message of its own. While a capable authority holds an S8(b) attempt without a terminal, it serves ADR 0108's signed, attempt-bound `JoinPendingNotice`: on the join-result poll, and as the interim answer on the gated exchange (§2). It serves it under ADR 0107's guard and D60's eligibility check, exactly as ADR 0108 §8 states. J's `TimedOut` at the poll deadline then carries the notice's cause.
+A node advertises `authority_rewelcome_v1` only if it also sets `join_pending_notice_v1`. S8(b) registers these causes against ADR 0108 §8, and co-owns `authority_catching_up` there:
+
+| Cause | Detail | Meaning and exit |
+|---|---|---|
+| `authority_catching_up` | `revision` | The designated admin re-syncs its head after a restart before it seals (D73). Exit: the head is reached, or S4's fallback |
+| `repair_designated_wait` | none | The attempt waits for the designated admin's window or S4's fallback (D74, D88). Exit: a terminal within the repair bound |
+| `repair_staging_lookup` | none | The designated admin waits for the sealer's staging answer, capped at 10 s (D89) |
+| `repair_backoff` | `count`: seconds until retry | The authority waits out D90's backoff after a failed delivery |
+| `receipt_evidence_pending` | none | An admin fetches a receipt verification record (§2) |
+
+The notice grants nothing, as ADR 0108 §8's L4 states; J never treats it as admission.
+
 Every exit releases only its own attempt ID, including `NotApplicable`, cancellation and superseded polls after group removal.
 Release polls, tasks, inviter pins and control-blob references; retain committed seats and outcomes. Old finalizers cannot release a newer attempt or overwrite confirmation.
 This #1191 bookkeeping fix ships with the full S8(b) slice, not ahead of it (D91). Its W3-H case is committed and shown red on main before the slice's code merges, like every other S8(b) case. An in-process test may supplement it, never replace it. Until the slice ships, #1191's 409 `join_already_pending` stays a tracked defect.
@@ -107,7 +122,7 @@ This #1191 bookkeeping fix ships with the full S8(b) slice, not ahead of it (D91
 ### 2. Authenticated recovery, receipts and transports
 
 Define canonical `AuthorityRewelcomeV1` request, response and receipt messages with separate agent-signature domains for each type.
-Bind group/member IDs, authenticated machine, attempt ID, nonce, original seat-generation commit hash, local revision/hash, requested KeyPackage hash and J's recorded confirmation state for that seat generation (D86).
+Bind group/member IDs, authenticated machine, attempt ID, nonce, original seat-generation commit hash, local revision/hash, requested KeyPackage hash, J's recorded confirmation state for that seat generation (D86) and the request cause: `never_confirmed` (§3) or `beyond_retention` (§7).
 The request includes the member-signed TreeKEM KeyPackage, or identity-bound GSS recipient KEM key, and required identity evidence.
 Re-verify ADR 0089 EvidenceV1 at use. Stored capability bytes are not a current advert; S2/S5 retain certificate-disclosure and carry ownership.
 The response binds the request digest, selected authority, current parent/head hashes and terminal result or typed refusal.
@@ -153,7 +168,7 @@ Reuse S4's **designated window**, **completion bound**, online observation, hand
 D69 sizes S4's window and completion bound from harness p99.9 measurement, and D73 sets its fallback stagger and restart sync wait; their final numbers come with S4's acceptance.
 
 **ADR 0016 §6 amendment (D88).** For an authorized repair replacement, the eligible committer excludes the requesting seat J and any admin without current verified TreeKEM state or required evidence.
-The lowest online eligible active-admin agent ID commits first, designated as S4 designates (D74: from the verified roster, without reachability data). Fallback uses S4's Accepted hand-off, window and restart rules.
+The lowest eligible active-admin agent ID on the verified roster commits first, reachable or not (D74). D122 rules that D74 governs everywhere: "online" in D88 and 0088 §3 reads as "eligible on the roster". The others fall back after S4's window, under S4's Accepted hand-off and restart rules.
 This widens S4's amendment of ADR 0016 §6 from revocation evictions to repair rekeys. Re-read current parent and request generation under the lock before sealing.
 After restart, synchronize the head before serving or fallback. A landed terminal satisfies that generation; competitors must re-read it, not seal siblings.
 Local locks do not form a distributed mutex. Timeout partitions may still race (D40); retain fork evidence/quarantine and manual exit for unanchored forks.
@@ -163,17 +178,21 @@ It bounds every verified-marker hold on a receiver, J's buffered candidate and J
 At most three links (remove, add, role) are buffered, within the existing control-blob byte cap. Each physical exchange, including the sealer lookup, is capped at `min(now + 10 s, artifact deadline)`.
 ADR 0107's poll windows and its 10-minute staging lifetime stay unchanged. The final numbers follow S4's timing ruling (D69).
 
-**Leaf replacement acceptance rule (D86).** A designated admin may replace a seat's leaf without a new invite only on **recorded never-confirmed evidence** for that exact seat generation, which the designated admin verifies itself.
-Absence of a receipt alone is never evidence. J's signed assertion about its own record is not such evidence on its own: no other node can check it, and a receipt-less member from before the upgrade can send the same assertion.
-**Which verifiable evidence satisfies D86 is open question 3, and it blocks Accept. Until David rules, no implementation replaces a leaf without a new invite**; staged-first service (above) and D43's manual exit still apply.
-Every option keeps these necessary conditions:
-- J's S8(b) record shows the attempt for that generation as `Unconfirmed` (or `LegacyAuthorityPending`) since before its start was acknowledged, and never `Confirmed` or `LegacyCompatible`. An honest J sends no never-confirmed request otherwise; its signed request carries that state.
-- The designated admin holds no verified receipt and no `AuthorityReceiptVerifiedV1` record for that generation, locally or through the receipt query (§2).
-- Current entitlement, current admin authority and complete chain validation.
+**Leaf replacement acceptance rule (D86, D136).** A designated admin may replace a never-confirmed seat's leaf without a new invite only on recorded never-confirmed evidence that it verifies itself. D136 rules that this evidence is the **admission-time obligation marker**, with these necessary conditions:
+- the seat's current generation carries a verified `AdmissionReceiptObligationV1` (below);
+- J's S8(b) record shows the attempt for that generation as `Unconfirmed` (or `LegacyAuthorityPending`) since before its start was acknowledged, and never `Confirmed` or `LegacyCompatible`. J's signed request carries that state, although no other node can check it;
+- the designated admin holds no verified receipt and no `AuthorityReceiptVerifiedV1` record for that generation, locally or through the receipt query (§2);
+- current entitlement, current admin authority and complete chain validation.
 
-A seat without verifiable evidence, including every receipt-less seat sealed before the upgrade, ends in `Refused(manual_reinvite_required)`, reason `no_never_confirmed_record`, and uses D43's manual exit (§6).
-**Security (L4):** this is a new acceptance rule. D39 and 0088 say “re-Welcome”, not this removal/add rule. Its evidentiary strength depends on open question 3. Under any option the receipt check refuses a generation an admin has verified as confirmed, and the D90 budget caps any false trigger at two replacement seals per seat without a receipt, then the manual exit.
+Absence of a receipt alone is never evidence, and J's assertion alone is never enough. A seat without a valid marker, including every seat sealed before the upgrade, ends in `Refused(manual_reinvite_required)`, reason `no_never_confirmed_record`, and uses D43's manual exit (§6).
+
+**Admission-time obligation marker (D136).** A capable authority that seals a seat after its host commit, for a joiner whose current verified advert sets `authority_rewelcome_v1`, attaches an additive, serde-defaulted `AdmissionReceiptObligationV1` to the seating event.
+The committing actor signs its canonical, length-delimited transcript with its agent key in the separate `x0x/authority-rewelcome/admission-obligation/v1` domain. It binds group ID, the actor ID, J's agent ID, the seating commit's `state_hash`, `prev_state_hash` and `revision`, and J's committed KeyPackage hash. Like the repair mandate, it lies outside `GroupStateCommit.signable_bytes` and is protected by its own signature (`src/groups/state_commit.rs:476–497`).
+It travels on every chain path: the sealed event log, `member_recovery_history`, 0106 `intervening_events` and S5 holder fetch. Any admin verifies it against the seating commit's `committed_by` actor and that actor's Admin seat at the parent, so it works while the sealer is offline. J finds its own marker by seat generation and KeyPackage hash.
+A stripped, garbled or transplanted marker fails, is ignored and is counted by reason. The seat is then treated as having none, which can only push it to the manual exit. Forging a marker needs the sealer's agent key. A legacy sealer or a legacy joiner gets no marker.
+**Security (L4):** this is a new acceptance rule. D39 and 0088 say “re-Welcome”, not this removal/add rule. The marker proves that a capable authority sealed this exact seat and expects a receipt, and the receipt check refuses any generation an admin has verified as confirmed. D136 accepts the residual: a post-upgrade J that installed its keys and then withheld its receipt can still trigger at most two replacement seals (D90), then the manual exit.
 Replacement never admits a new identity, gives the seat a different role or skips a chain check.
+**Mixed versions:** legacy decoders ignore the additive field, and seats sealed by released binaries carry none.
 
 **Repair mandate (D87).** `RepairMandateV1` uses its own `x0x/owner-axis/repair-mandate/v1` signature domain, never the invite-secret mandate domain.
 Bind owner user ID, group/genesis, authority ID, J, request digest, original and replacement seat generations, requested KeyPackage hash, parent commit hash, expected terminal roster hash, both native epochs, certificate digest, policy hash and exact terminal role.
@@ -202,7 +221,7 @@ Do not gossip the repair pair; initially publish it by targeted pinned direct de
 |---|---|
 | `Member` | Ordinary `MemberAdded` restores Member exactly. |
 | `Admin` | Append ordinary `MemberRoleUpdated(Admin)` within the atomic terminal sequence. |
-| Legacy `Owner` | `Refused(repair_role_not_restorable)` with D43's remedy (§6); Owner is not assignable (`src/groups/member.rs:24–25`). |
+| Legacy `Owner` | `Refused(repair_role_not_restorable)` with D43's remedy (§6, D138); Owner is not assignable (`src/groups/member.rs:24–25`). |
 | `Moderator` or `Guest` | Same typed refusal; current role assignment accepts only Admin/Member. In particular Guest→Member would widen privilege. |
 
 No unsupported role enters preparation; a role changing concurrently invalidates the prepared sequence.
@@ -215,7 +234,7 @@ Until then buffer the candidate sequence within the same persisted bound, grant 
 A genuine removal with an absent or failing marker is applied immediately through ordinary chain validation and cancels the attempt; ignore and count the marker. The commit authorizes removal independently of the marker, including S4 revocation eviction and ban.
 J buffers at most one candidate per attempt: at most three links (remove, add, role) within the existing control-blob byte cap, for at most the repair bound (D89). No unbounded event history.
 Only its terminal Welcome may be installed, without skipping links or adopting across a gap.
-Epochs between the original seat and replacement were **entitled but never installed**. They are not 0088 §2 item 4's never-admitted epochs; catch-up remains subject to current eligibility and S3/S5.
+Epochs between the original seat and replacement were **entitled but never installed**. They are not 0088 §2 item 4's never-admitted epochs; catch-up remains subject to current eligibility and S3/S5. Their ciphertext stays unreadable to J, because D60 lets holders deliver only the current epoch secret (open question 2).
 
 ### 4. All egress, repair budgets and triggers
 
@@ -238,10 +257,11 @@ Before ML-DSA verification, apply cheap frame/binding checks, duplicate digest l
 A dropped request gets an unsigned typed `RateLimited(retry_after)` on the same authenticated exchange, which costs no signature; J shows `waiting_for_rate_limit` until then.
 Maintain a durable per-seat repair budget across nonce changes, attempts, expiries, replacement generations and restarts: at most two automatic replacement seals without a receipt (D90). Reset only after verified completion/receipt, not staging expiry.
 A missing receipt retries the same result first. After a failed replacement delivery, back off 1 minute, then 10 minutes for each later failure (D90); J and the authority show `waiting_for_repair_backoff` with its end time.
-Exhausting the budget returns `Refused(repair_budget_exhausted)` with D43's manual exit (§6). Rate-limit, budget and backoff state all survive restarts. Their retention is the open question in Rulings.
+Exhausting the budget returns `Refused(repair_budget_exhausted)` with D43's manual exit (§6). Rate-limit, budget and backoff state all survive restarts.
+**Retention (D137).** Keep a seat's limiter, budget and backoff record while that seat generation is on the roster and unconfirmed. Delete it when a receipt for that generation is verified, keeping only that generation's `AuthorityReceiptVerifiedV1`. Keep an exhausted budget until an ordinary removal, a ban or a signed group deletion, so restarts, nonces and new attempts cannot reset it; D43's fresh invite then starts a new generation with a new budget. Drop limiter entries for identities that leave the roster. The sidecar holds at most one record per current `(group, member)` and per current `(group, forwarding admin)`, plus pending removals.
 Counters include preverify rate-limit drops, verifies, duplicate/coalesced requests, staged hits/misses, replacements, missing receipts, backoff waits, budget exits, mandate/role refusals, admitted/withheld/purged bytes, deadline resets and persistence writes.
 
-Triggers are explicit: verified request intake; the existing S4 worker after hand-off/fallback deadline; startup sidecar reconciliation after host commit; staging expiry/delivery failure; receipt retry; and a later eligible attempt resuming bounded work.
+Triggers are explicit: verified request intake; the existing S4 worker after hand-off/fallback deadline; startup sidecar reconciliation after host commit; staging expiry/delivery failure; receipt retry; a later eligible attempt resuming bounded work; and a member entering 0109's `readmission_required` or 0111's `catchup_beyond_retention` (§7).
 No separate unbounded recovery loop or authority history is added. S4 worker and startup scan are required, not contradicted by that statement.
 Admin absence exposes `waiting_for_admin` (0088 §2 item 3) and holder absence `waiting_for_holder` (§2 item 8), each naming what it waits for. Restoration of eligibility wakes retained work; cache loss is not an I8 exception.
 
@@ -266,8 +286,25 @@ Keyed `Unknown` and `Confirmed` rows retain their valid legacy membership/keys; 
 Use `<data_dir>/authority-rewelcome.rwstate`, magic **`X0RWS1\0\0`**, followed by a canonical bincode `AuthorityRewelcomeStateV1` body.
 The body has version 1 and bounded records keyed by `(group, member)` containing local state, verified base, generations, attempt/outcome, signed receipt, one repair obligation, budget/backoff and delivery phase.
 A prepared transaction uses `<data_dir>/authority-rewelcome-<transaction_id>.rwjournal`, magic **`X0JRW1\0\0`**, and canonical bincode `AuthorityRewelcomeJournalV1 { version, transaction_id, group, expected_parent, request_digest, old_generation, replacement_generation, signed_sequence, terminal_crypto_snapshot_ref, legacy_raw_map_bytes, sidecar_state, phase }`.
-There is **no released predecessor** for either type. Freeze V1 decoders once released; reject unknown magic/version, corruption or trailing bytes without overwriting files.
+There is **no released predecessor** for either type. Freeze V1 decoders once released. A known magic with a newer version is a downgrade: leave that file byte-identical (ADR 0085 rule 5) and run S8(b) from a memory-only rebuild, never writing that path. Any other unreadable file (unknown magic, failed decode, trailing bytes) is quarantined and rebuilt (D120, below).
 No `PreparedMember` secrets are serialized; use 0107's deterministic identity derivation and existing crypto-snapshot custody. Journal references must bind the snapshot hash and transaction.
+
+**Quarantine and rebuild (D120).** At startup after host commit, an unreadable `.rwstate` or `.rwjournal` is renamed, byte-identical, to `<name>.rwquarantine-<unix_ms>`, a new extension that no binary loads. It is never deleted, truncated or overwritten. Repair operations wait in `sidecar_rebuilding {file, quarantined_as}` until the rebuild ends; legacy service continues.
+**This ADR amends ADR 0085 rule 4 for S8(b)'s own sidecar files only (D120).** Rule 4 leaves an unreadable file untouched and waits for an operator. S8(b) moves the file aside automatically and writes a rebuilt file at the original path. Rule 5 still governs a newer-version file, as above.
+
+| State | Rebuilt from | Safe outcome when no holder has it |
+|---|---|---|
+| Seat generations, roster, admission-time markers, repair markers and mandates | The verified chain, through S5 holder fetch | Not applicable |
+| `AuthorityReceiptVerifiedV1` records | Other admins, through the receipt query (§2) | `receipt_evidence_unavailable`; 0088 §2 item 8 while every holder is offline |
+| Replacement seals without a receipt, per seat | Counted from repair markers on the chain since the seat's last verified receipt, so an exhausted budget stays exhausted (D137) | Not applicable |
+| Rate-limit buckets and backoff timers | Local only | Buckets start with no tokens, so the next request waits one 30 s interval. A seat with an unreceipted replacement on the chain waits the 10-minute backoff |
+| Authority-side repair obligations and delivery phase | Local only | Lost. J's retained request re-creates the obligation on its next §4 trigger. A terminal whose Welcome was lost costs one more replacement seal, within the budget |
+| A prepared `.rwjournal` transaction | Local only | Reconcile against the verified head. If its legacy `.journal` pair committed, the head stands and J's next request is served as above. If not, nothing was published and the transaction is dropped |
+| J's local attempt records | Local only | A keyed row becomes `Unknown` and keeps legacy service. A keyless seated row becomes `Unconfirmed` only if its seat carries a valid marker for J's KeyPackage hash; the receipt query and the D90 budget then bound it, as D136 accepts. Any other keyless row becomes keyless `Unknown`, with `no_never_confirmed_record` |
+| J's unverified receipt; §7 voucher progress | Local only | J's next confirmation probe or request re-derives them |
+
+`sidecar_newer_format {file}` shows while a downgrade-era file runs memory-only; S8(b) rebuilds from holders at each start, so budgets fall back to the chain count above.
+**Security (L4):** the rebuild adds no acceptance rule. Everything it restores is signed or re-verified, and lost local state only moves a seat toward the stricter outcome. **Mixed versions:** no released binary reads either extension.
 
 Never put S8(b) state in `*.journal` or modify `TreeKemNamedPersistJournal`'s positional layout/raw-map body. Never put S8(b) state in Home's `*.hsjournal` namespace either.
 First replay existing `.journal`/`.hsjournal` as today. After host commit, replay S8(b) `.rwjournal` and reconcile other slices' sidecars against the verified head before exposing repair operations.
@@ -290,9 +327,7 @@ Re-upgrade verifies the sidecar, reconciles generation/roster/crypto state, clas
 | New authority → old or unadvertised survivors | Repair returns a typed upgrade refusal before removal. Additive fields remain decodable, but neither half is sealed or delivered to unsupported receivers; never inline Welcome bytes. |
 | New ↔ new | Bound confirmation/receipt, staged-first repair and one terminal per attempt. Stale gaps need S3/S5; new unseated any-admin admission needs S6. |
 
-**Out of scope: a confirmed member behind retention (D97).** D97 treats a member behind every holder's retention as admission, through S8(b) or a later ADR.
-S8(b) replaces only seats with recorded never-confirmed evidence (D86), so it does not repair a **confirmed** member behind retention. That member needs a later ADR.
-Until then it shows S5's typed retention state, and its exit is D43's remedy. This ADR adds no §2 entry for it.
+**Beyond retention (D97, D119).** A confirmed member behind every holder's retention is repaired by the retention re-Welcome (§7).
 
 ### 6. Typed blocks and the named §2 entry (L3, D64)
 
@@ -306,7 +341,7 @@ D64 makes L3 a hard rule for every slice. Every block S8(b) adds or touches ends
 | Confirmed key loss | `Refused(manual_reinvite_required)`, `confirmed_keys_missing` | D43's remedy (D85) |
 | No never-confirmed record | `Refused(manual_reinvite_required)`, `no_never_confirmed_record` | D43's remedy (D86) |
 | Receiver without a current advert | `Refused(repair_receiver_upgrade_required)`, naming those members | Adverts appear, or D43's remedy (D87) |
-| Role that cannot be restored | `Refused(repair_role_not_restorable)` | D43's remedy (open question) |
+| Role that cannot be restored | `Refused(repair_role_not_restorable)` | D43's remedy (D138) |
 | Pre-verify rate limit | `RateLimited(retry_after)`; J shows `waiting_for_rate_limit` | The retry time (D90) |
 | Failed replacement delivery | `waiting_for_repair_backoff`, with its end time | The end time (D90) |
 | Repair budget spent | `Refused(repair_budget_exhausted)` | D43's remedy (D90) |
@@ -315,28 +350,78 @@ D64 makes L3 a hard rule for every slice. Every block S8(b) adds or touches ends
 | Receipt evidence missing | `receipt_evidence_unavailable` | The record arrives through the gated exchange or S5; 0088 §2 item 8 while every holder is offline |
 | No admin or no holder online | `waiting_for_admin`, `waiting_for_holder` | 0088 §2 items 3 and 8 |
 | Home activation blocked | `Refused(home_activation_blocked)` | The released-binary controls pass (D81), or D43's remedy |
+| Confirmed member behind retention | `waiting_for_authority_terminal` with cause `beyond_retention`, then `readmission_pending_vouchers {vouchers, asked}` | §7's terminal and its second voucher; 0088 §2 item 8 while every voucher holder is offline |
+| Admin can still serve catch-up | `Refused(catchup_available)` | S5 or S3 catch-up resumes (§7) |
+| No confirmation record | `Refused(manual_reinvite_required)`, `no_confirmation_record` | D43's remedy (open question 1) |
+| No second voucher possible | `Refused(manual_reinvite_required)`, `readmission_uncorroborated` | D43's remedy (open question 1) |
+| Skipped-epoch ciphertext | `history_gap {from_epoch, to_epoch}` | None (open question 2) |
+| Unreadable sidecar | `sidecar_rebuilding`; `sidecar_newer_format` | The rebuild ends (§5) |
 
-**Named §2 amendment.** This ADR amends ADR 0088 §2 with one named entry, ruled by David through the options he chose in D81, D84, D85, D86, D87 and D90:
+**Named §2 amendment (D118).** This ADR amends ADR 0088 §2 with one named entry. David ruled its reasons through the options he chose in D81, D84, D85, D86, D87, D90, D136 and D138, and confirmed the entry in D118:
 
-- **S8(b) manual-exit repair.** Automatic repair or base-seated completion of a seat may end in a typed terminal refusal whose exit is D43's remedy, for exactly these reasons: `confirmed_keys_missing` (D85); `no_never_confirmed_record` (D86); `repair_budget_exhausted` (D90); `repair_receiver_upgrade_required` (D87); `TimedOut(authority_upgrade_required)` for an encrypted keyless attempt with no capable authority (D84); and `home_activation_blocked` (D81).
+- **S8(b) manual-exit repair.** Automatic repair or base-seated completion of a seat may end in a typed terminal refusal whose exit is D43's remedy, for exactly these reasons: `confirmed_keys_missing` (D85); `no_never_confirmed_record` (D86, D136); `repair_budget_exhausted` (D90); `repair_receiver_upgrade_required` (D87); `TimedOut(authority_upgrade_required)` for an encrypted keyless attempt with no capable authority (D84); `home_activation_blocked` (D81); and `repair_role_not_restorable` (D138).
 - **Exit:** D43's remedy. An admin removes the member while it is online; the member restarts and redeems a fresh invite. That is ordinary admission, which completes under L1. The two upgrade reasons also clear by themselves when the missing adverts appear, and the retained record then retries.
-- In L3's terms this is a waiting entry: the refusal is typed and visible, and it names the act it waits for. 0088 is Accepted and is not edited; the entry takes effect when this ADR is Accepted. `repair_role_not_restorable` is not in it until David rules (open question).
+- A **confirmed** member behind every holder's retention is no longer in the D43-only class: §7 repairs it (D119). §7's own residual reasons, `no_confirmation_record` and `readmission_uncorroborated`, join this entry only if David confirms them (open question 1).
+- In L3's terms this is a waiting entry: the refusal is typed and visible, and it names the act it waits for. 0088 is Accepted and is not edited; the entry takes effect when this ADR is Accepted.
+
+### 7. Retention re-Welcome for confirmed members (D119)
+
+**Name.** The **retention re-Welcome** is S8(b)'s repair for a confirmed member behind every holder's retention. ADR 0109's `readmission_required {cause: base_beyond_retention}` and ADR 0111's `catchup_beyond_retention` route to it by this name.
+D97 treats the case as admission, and D119 puts it in S8(b), against the recommendation. It reuses §2's exchange, §3's atomic replacement, marker, mandate and role table, and §4's egress and budget. Only its trigger, its evidence and the member's acceptance rule are new.
+
+**Trigger.** Member M enters one of the two states above. M sends a signed `AuthorityRewelcomeV1` request with cause `beyond_retention`, its last verified head (`revision`, `state_hash`) and a fresh KeyPackage, through §2's fan-out. Retries follow §4's triggers and D90's limits.
+
+**Evidence.** The designated admin (D74, D88, D122) checks all of these itself:
+1. **Seat:** M is Active on its current verified roster, with a current machine binding, and is not banned, revoked, withdrawn or quarantined. An OwnerCertified M needs a valid certificate, as in §4.
+2. **Confirmation:** a verified receipt or `AuthorityReceiptVerifiedV1` exists for M's current seat generation, held locally or fetched by the receipt query. If none exists: `Refused(manual_reinvite_required)`, reason `no_confirmation_record`.
+3. **Keys:** the admin sends M a fresh nonce sealed to M's leaf public key in its own current tree (for GSS, to M's identity-bound recipient KEM key). M returns the nonce in a signed reply on the same exchange. A failure is confirmed key loss: `confirmed_keys_missing` (D85).
+4. **Beyond retention:** the admin's own retained log lacks the commit after M's claimed base, and M's current seat was seated before the admin's `oldest_held_revision`, since no base can be older than M's own seating. Otherwise the admin answers `Refused(catchup_available)` and serves S5 or S3 catch-up. No rekey follows.
+
+A SignedPublic M holds no keys. The admin skips check 3, seals nothing, and returns a signed terminal head for M to adopt under the voucher rule below.
+
+**Rekey.** When all four checks pass, the designated admin runs §3's atomic replacement unchanged. It removes M's old leaf, adds the requested KeyPackage at the next epoch and restores M's role. It carries the removal marker, the Home repair mandate (D87) and §3's receiver floor, and survivors apply it under §3's verified-marker rules. The terminal response binds M's request digest, the terminal head and its roster projection hash.
+
+**M's acceptance rule.** M cannot link the terminal head to its own last verified head; that is why it is behind retention. So M accepts the terminal as **admission**, not catch-up. It installs fresh group state at the terminal head, as a new joiner does, and never splices that head into the chain it held.
+It does so only when the terminal has **two vouchers**: two distinct identities on M's last verified roster, other than M, that attest to the same terminal head.
+- The signer counts as a voucher if it held an Admin seat on that roster.
+- A holder counts when its S5 head answer (`group_head_v1`, ADR 0111), over a pinned direct exchange, equals the terminal head or chains forward from it. M checks that forward chain on a cloned state before it commits anything.
+- In an owner-certified group, an owner-device `RepairMandateV1`, signed by the owner USER key that M already verified, is enough on its own. The promoted-admin form is not, because M cannot check the signer's current Admin seat.
+
+While M waits for a second voucher, it shows `readmission_pending_vouchers {vouchers, asked}`. While every holder M can ask is offline, that wait is 0088 §2 item 8.
+If M's last verified roster has no second identity that could vouch, and there is no owner anchor, M ends in `Refused(manual_reinvite_required)`, reason `readmission_uncorroborated`. A holder head that conflicts with the terminal is fork evidence: M installs nothing and enters `ForkQuarantined`.
+On acceptance M installs the terminal Welcome, persists and sends its receipt (§2), and resumes ordinary S5 catch-up from the terminal head. It keeps keys only for epochs it already installed.
+
+**Catch-up path.** After installation M is an ordinary member at the terminal head. Later commits come through S5's walk, and current store state, such as KV images (D94), comes from S5 holders. Ciphertext from the epochs M skipped stays unreadable: D60 lets holders deliver only the current epoch secret (open question 2).
+
+**Abuse budget.** D90 and D137 apply per seat, unchanged: one pre-verify request per `(group, member)` per 30 s (burst two), the same allowance per forwarding admin, at most two replacement seals without a receipt and then D43's manual exit, and backoff of 1 then 10 minutes. Check 4 caps truthful repeats: once M is re-seated, it cannot claim beyond retention again until retention moves past its new seat. M's voucher queries use S5's requester limits (D98).
+
+**Security (L4).** This is a new acceptance rule on both sides.
+- The admin side admits no new identity: M's seat is already Active on the admin's verified roster. Checks 1 to 3 keep out removed, banned, key-lost and unconfirmed seats, so §3's D136 rule still governs never-confirmed seats. The rekey is §3's, with its marker, mandate, receiver floor and budget.
+- On M's side, the rule relaxes the TreeKEM adoption exclusion for this one case: M adopts a head it cannot link to its own last verified head. It does so only as admission. It discards the old state, and two vouchers from its last verified roster, or the owner, must agree. A single removed former admin cannot fork M alone. The residual: two colluding identities from M's last verified roster can still mislead M, and later fork evidence still quarantines it.
+- Egress uses §4's admitted path under ADR 0107's guard and D60. The voucher head queries use S5's serving guard (ADR 0111 §5).
+
+**Mixed versions.** All of this sits under `authority_rewelcome_v1`; there is no new bit. A released M sends nothing, and its 0109 or 0111 state names D43's exit. Against legacy admins, M shows `authority_upgrade_required`. A legacy survivor triggers `repair_receiver_upgrade_required` (§3). A holder without S5's head query cannot vouch. Vouchers count only with current verified, machine-bound adverts.
+
+**Harness.** W3-H case `s8b_retention_rewelcome` (Validation). §7's code also waits for S3's and S5's states and S5's head query on main.
 
 ## Consequences
 
 ### Positive
 
 - Local status distinguishes a real seat, an installed join and missing keys without wedging keyed legacy members.
-- Eligible staging-loss repair has a durable bounded exit under D86's and D87's acceptance rules, once open question 3 fixes the evidence.
+- Eligible staging-loss repair has a durable bounded exit under D86's, D136's and D87's acceptance rules.
+- A confirmed member behind every holder's retention has an automatic exit (§7, D119).
 - Legacy stores stay parseable on downgrade; S8(b) owns its new persisted state.
 - Every block in this slice is typed and names its cause (D64).
 
 ### Negative / Trade-offs
 
 - Replacement rotates TreeKEM and may need a role commit, atomic receiver support and new Home mandate validation.
-- Receipt-less seats from before the upgrade cannot prove that installation never happened, so they keep the manual exit (D86). Confirmed key loss keeps it too (D85): an explicit L1 gap, recorded as §6's named §2 entry.
+- Receipt-less seats from before the upgrade cannot prove that installation never happened, so they keep the manual exit (D86, D136). Confirmed key loss keeps it too (D85): an explicit L1 gap, recorded as §6's named §2 entry.
 - `LegacyCompatible` keeps today's checks, and today's exposure, toward legacy authorities (D84).
 - Users keep hitting #1191's 409 until the full slice ships (D91).
+- The retention re-Welcome rekeys the group and relaxes the TreeKEM adoption exclusion for one case, bounded by two vouchers or the owner (§7).
+- The sidecar rebuild loses local-only state; §5 lists each safe outcome (D120).
 - Direct-only delivery must prove Home/mixed-version liveness; partial-transaction downgrade needs explicit evidence.
 
 ### Neutral / Operational
@@ -344,12 +429,12 @@ D64 makes L3 a hard rule for every slice. Every block S8(b) adds or touches ends
 - 0088's order is contract → S2 and **S8(a)/0107** → S4 and S3 → S5 → S6 → S7 (D65). **S8(b) is accepted after S4** (D88), not in the first batch; S5 does not wait for it.
 - S2's certificate rule is a prerequisite for Home replacement code.
 - Governed code requires this ADR Proposed on main, David's acceptance, W3-H red evidence and one `named_groups.rs` landing lane.
-- Repair code also waits for Accepted/implemented S4 scheduling, S2 certificates, applicable S3/S5 recovery, and the #1190 admitted egress path on main. These gates also hold the #1191 fix, which ships with the slice (D91).
+- Repair code also waits for Accepted/implemented S4 scheduling, S2 certificates, applicable S3/S5 recovery, and the #1190 admitted egress path on main. These gates also hold the #1191 fix, which ships with the slice (D91). §7's code also waits for S3's and S5's states and S5's head query on main.
 
 ## Validation
 
 W3-H (#1164) does not yet exist. These are required specifications, **not completed tests**; recommend a dedicated tracking issue for these S8(b) cases.
-Cases that expect leaf replacement assume the evidence rule David selects in open question 3; under candidate (a), the seat must have been sealed by a capable authority after its host commit.
+Cases that expect leaf replacement need a seat sealed by a capable authority after its host commit, so that it carries the admission-time marker (D136).
 Commit every red case and demonstrate it red on **main with S8(a)/#1190 merged** before S8(b) code merges. In-process tests supplement, never replace D16/D54.
 Record full main SHA, #1190 merge SHA/ancestry, released artifact hashes, harness commit, schedule seed, public API transcript and exact red assertion per variant.
 Current main is `3f09dda021e74c70ac3210f810193fadd43b74bc`; it does not contain `e645ce2` and is **not the eligible baseline**. No post-#1190 main SHA can yet be honestly pinned.
@@ -366,9 +451,12 @@ Run only in the isolated loopback Linux namespace. All cases use a deterministic
 | `s8b_staged_replacement_race` **control**: S original sealer, A designated admin, J | API join J through S and retain matching staging; fan J's recovery request to both S/A, delivering it to S first. A issues the bound lookup. Hold S's signed staged answer until after the 10 s lookup cap (D89); let A select and persist replacement, then release the old artifact before and after J's replacement result in separate schedules. Also deliver staging to A before the deadline, lose A's terminal ACK and retry. | Baseline has no S8(b) replacement; this is a new-path race control. Fixed: fan-out alone makes S emit no artifact to J; a late lookup answer cannot become a competing terminal or install the old leaf. One replacement terminal, one installed leaf, usable keys and two-way encrypted traffic. Staged-first variant retries the same terminal, seals no replacement and spends no replacement budget. |
 | `s8b_1149_current_confirmation`: A, J | Admit J and mint base-seated invite; withhold add/ban from J. Ban J via API, redeem stale invite. Run no-row and carry variants in TreeKEM/GSS/SignedPublic. Repeat removal, agent/machine revocation, certificate expiry/verdict change and withdrawal. | No-row: baseline reports Active without a current bound authority decision (encrypted variants also lack usable keys). Carry: baseline ends typed `Refused`/`TimedOut`; assert **absence of a current request-bound authority refusal**, rather than unsafe keyed Active. Fixed: current bound terminal refusal, no keys/secure access, all variants. |
 | `s8b_1191_attempt_exit`: A, J | Timeout J without carry, redeem base-seated invite, remove J on A, deliver removal, API re-invite on same running J. Schedule old finalizer after newer attempt starts. | Baseline POST join returns 409 `join_already_pending`. Fixed: new attempt starts; `NotApplicable`, superseded, cancellation and terminal cleanup cannot erase it. This case gates the slice's merge like every other case (D91); an in-process test may supplement it, never replace it. |
-| `s8b_legacy_authority_compat`: A admin on released v0.46.1 (repeat on v0.45.0), J candidate | Create a SignedPublic group and a TreeKEM group on A via API; admit J, then mint invites whose base already seats J. Restart J on the candidate after simulated host commit and redeem. In the TreeKEM no-row variant drop every Welcome to J. Advance the deterministic clock past the poll deadline. Then upgrade A to the candidate after host commit and fire J's retained record. | SignedPublic is a **control**: the rejoin completes on baseline and must still complete, now shown as `authority_confirmation: legacy_compatible`, with two-way signed traffic. TreeKEM no-row is **red**: baseline reports Active without usable keys (#1149). Fixed: `TimedOut(authority_upgrade_required)` at the deadline, no keyless Active, a retryable record; after A upgrades, a bounded typed terminal. A seat sealed by the released binary is replaced only if it meets open question 3's rule; under candidate (a) it has no marker and ends `no_never_confirmed_record` with D43's remedy. A `LegacyCompatible` J never counts as `Confirmed`, a receipt or never-confirmed evidence. |
-| `s8b_never_confirmed_evidence` **control**: A, D admins, J | (1) Seal J's seat on released v0.46.1, drop its Welcome, then upgrade all three after host commit. (2) On the candidate, confirm J, let A verify its receipt, then delete J's keys through a fault hook. (3) Inject a J-signed never-confirmed request for (2)'s generation, delivered to D. (4) Confirm J but drop its receipt before any admin verifies it, delete its keys, and inject repeated false requests across restarts. (5) Inject a J-signed never-confirmed assertion for (1)'s pre-upgrade seat, delivered to D. | Control for D86's new rule, not a claimed baseline red. Fixed: (1) `Refused(manual_reinvite_required)`, `no_never_confirmed_record`, nothing sealed; D43's remedy then completes. (2) `confirmed_keys_missing`, no replacement. (3) D refuses after the receipt query; nothing sealed. (4) At most two replacement seals, then `repair_budget_exhausted`, across restarts. (5) Depends on open question 3: under (a), D refuses `no_never_confirmed_record` and seals nothing; under (b), at most two seals, then `repair_budget_exhausted`. |
+| `s8b_legacy_authority_compat`: A admin on released v0.46.1 (repeat on v0.45.0), J candidate | Create a SignedPublic group and a TreeKEM group on A via API; admit J, then mint invites whose base already seats J. Restart J on the candidate after simulated host commit and redeem. In the TreeKEM no-row variant drop every Welcome to J. Advance the deterministic clock past the poll deadline. Then upgrade A to the candidate after host commit and fire J's retained record. | SignedPublic is a **control**: the rejoin completes on baseline and must still complete, now shown as `authority_confirmation: legacy_compatible`, with two-way signed traffic. TreeKEM no-row is **red**: baseline reports Active without usable keys (#1149). Fixed: `TimedOut(authority_upgrade_required)` at the deadline, no keyless Active, a retryable record; after A upgrades, a bounded typed terminal. A seat sealed by the released binary has no admission-time marker, so it ends `no_never_confirmed_record` with D43's remedy (D136). A `LegacyCompatible` J never counts as `Confirmed`, a receipt or never-confirmed evidence. |
+| `s8b_never_confirmed_evidence` **control**: A, D admins, J | (1) Seal J's seat on released v0.46.1, drop its Welcome, then upgrade all three after host commit. (2) On the candidate, confirm J, let A verify its receipt, then delete J's keys through a fault hook. (3) Inject a J-signed never-confirmed request for (2)'s generation, delivered to D. (4) Confirm J but drop its receipt before any admin verifies it, delete its keys, and inject repeated false requests across restarts. (5) Inject a J-signed never-confirmed assertion for (1)'s pre-upgrade seat, delivered to D. | Control for D86's and D136's rule, not a claimed baseline red. Fixed: (1) `Refused(manual_reinvite_required)`, `no_never_confirmed_record`, nothing sealed; D43's remedy then completes. (2) `confirmed_keys_missing`, no replacement. (3) D refuses after the receipt query; nothing sealed. (4) At most two replacement seals, then `repair_budget_exhausted`, across restarts. (5) D refuses `no_never_confirmed_record` and seals nothing (D136). |
 | `s8b_poll_deadline_typed`: A candidate authority, J | API join J through A; hold A's terminal past J's 120 s TreeKEM poll deadline. Make the certificate fetch fail so A stages #946's `certificate_evidence_unavailable` at its 10-minute deadline. Deliver nothing else; make no manual retry. | **Red:** on baseline J's poll ends and J never sees A's later refusal. Fixed: J shows `TimedOut(waiting_for_authority_terminal)`, then the retained typed wait, then A's pushed typed refusal, with no manual retry (D64). |
+| `s8b_admission_marker_tamper` **control** (D136): A sealer, D designated admin, H relay, J | Seat J on the candidate, with its marker, and drop its Welcome; take A offline. H strips the marker, garbles it, or transplants another seat's valid marker onto J's seating event, on each chain path in turn. | New-path control. Fixed: D verifies the genuine marker with A offline and replaces J's leaf once. Every stripped, garbled or transplanted marker fails, is counted, and ends `no_never_confirmed_record`; nothing is sealed. |
+| `s8b_retention_rewelcome` (D119): A designated admin and B holder, both with a commit-log cap of 4 set by test configuration; M candidate member; X former admin in one variant | Create a TreeKEM group on A via API, admit B and M, confirm M and verify its receipt. Hold every frame to and from M, and drive six membership commits on A via API. Release M; its S5 walk ends `catchup_beyond_retention`. Variants: (1) B offline until M shows `readmission_pending_vouchers`, then B returns; (2) a group of only A and M; (3) a Home whose owner device O is the designated admin, with B offline; (4) M's keys deleted through a fault hook; (5) M claims an old base while A still retains its next commit; (6) X, removed while M was held, sends M a forged terminal; (7) M is a released-binary keyed fixture that fell behind before any confirmation probe; (8) B runs released v0.46.1. | **Red** for the main path: baseline M stays in `catchup_beyond_retention` with only D43's exit. Fixed: one replacement seal; M installs at the terminal head on the vouchers of A and B, sends its receipt and exchanges encrypted traffic with B at the current epoch. Controls: (1) a typed wait, then completion; (2) `readmission_uncorroborated`; (3) completion on the owner mandate; (4) `confirmed_keys_missing`, no seal; (5) `catchup_available`, no seal; (6) M installs nothing, and B's conflicting head yields `ForkQuarantined`; (7) `no_confirmation_record`; (8) `repair_receiver_upgrade_required` naming B, before removal. |
+| `s8b_sidecar_quarantine_rebuild` **control** (D120): A, D admins, J | Through APIs build: J confirmed, with its receipt verified by D; a second seat with two unreceipted replacement seals on the chain; a keyless seat with a valid marker. Stop A and corrupt its `.rwstate` (flipped bytes, truncation, trailing bytes); separately write a known magic with a newer version. Repeat on J's sidecar and on a pending `.rwjournal`. Restart and drive the public APIs. | New-path control. Fixed: the corrupt file stays byte-identical under its quarantine name; `sidecar_rebuilding` shows, then clears; D's verification record is fetched again; the second seat still ends `repair_budget_exhausted`; J's keyless marked seat re-derives `Unconfirmed`, and an unmarked one ends `no_never_confirmed_record`. The newer-version file stays byte-identical, A runs memory-only with `sidecar_newer_format`, and a re-upgrade restores the file. |
 | `s8b_1146_refusal_order` **control**: A, B, J | While J pending, API add B; deliver B's signed add before J's consumed-invite refusal, restart J, redeem fresh addressed invite. Deliver genuine ban/removal/quarantine in separate negative controls. | Post-#1148/#1190 baseline may already recover genuine unseated J; preserve that behaviour and typed consumed-invite refusal. Banned/removed/quarantined rows never clear. Still-seated staging loss belongs to the #1150 red case. |
 | `s8b_keyed_unknown_upgrade` **control**: A, B | Create released keyed TreeKEM/GSS/SignedPublic fixtures through APIs, restart candidate after simulated host commit with no receipt sidecar, call info/send/secure APIs and confirmation probe; restart again. | Existing keyed members stay usable and migrate Unknown→Confirmed with **zero** new membership commits/epochs. No pre-host-commit sidecar write. Deliberately missing keys become typed Unconfirmed/ConfirmedKeysMissing, never keyed Active. |
 
@@ -379,7 +467,7 @@ Every case asserts the typed state at each block it reaches, including the poll 
 Lost receipt/ACK retries no rekey. Confirmed Active/duplicate replay seals nothing. Failed clone/prepare/persist leaves original usable state. Atomic receiver verification preserves both roster and native epoch only within the verified-marker pending bound; its terminal fallback enforces removal or fork quarantine.
 Egress covers every producer listed in §4, copies/chunks, every physical resend, deadlines, quiesce races, fair admission under floods, revocation/expiry at the seam and survivor epoch moves.
 Retain all 0106 carry/preflight/bounds/stale-attempt and 0107 carry/no-carry/certificate/current-roster controls.
-Force post-handoff sibling races; preserve quarantine rather than silent adoption. All eight 0088 §2 controls remain: revoked/banned, invalid certificate, no admin, never-admitted epochs, signed deletion, post-removal catch-up, unanchored fork and all evidence holders offline.
+Force post-handoff sibling races; preserve quarantine rather than silent adoption. All eight 0088 §2 controls remain: revoked/banned, invalid certificate, no admin, never-admitted epochs, signed deletion, post-removal catch-up, unanchored fork and all evidence holders offline. The S8(b) manual-exit entry that D118 confirms gets a case for each reason, in the evidence, retention, budget, mixed-version, Home and role cases above.
 Mixed versions use released **v0.45.0 and v0.46.1**, add **v0.46.2 once shipped**, both directions and legacy survivors. Test SignedPublic rejoin compatibility, typed bounded upgrade exit, absent/expired/offline advert gating, additive repair-field decoding and terminal native convergence.
 Storage uses released raw-map fixtures with provenance/hashes, both legacy files and existing embedded-journal bytes; unknown/corrupt/trailing new bodies remain intact.
 Test every crash cut and downgrade with pending/committed transactions: old daemon starts, sees J non-member/no secrets, never half-seats J; re-upgrade reconciles without duplicate rekey or obsolete head overwrite.
@@ -390,36 +478,46 @@ The live harness must prove durable confirmation and bidirectional encrypted tra
 
 ## Rulings and open questions
 
-**Still blocks David's Accept:** (1) S4, ADR 0110, Accepted first (D88), with D69's measured window and completion bound, which give the repair bound its final numbers (D89); (2) the retention proposal below (D90); (3) the unrestorable-role question below; (4) the never-confirmed evidence question below (D86).
+**Still blocks David's Accept:** (1) S4, ADR 0110, Accepted first (D88), with D69's measured window and completion bound, which give the repair bound its final numbers (D89); (2) S2, ADR 0108, Accepted with its `JoinPendingNotice` (D117), which §1 reuses; (3) open questions 1 and 2 below.
 
 David ruled Q1–Q10 on 2026-10-04 (D64, D65, D81, D84–D92, D97):
 
 - **Q1, old-authority compatibility:** `LegacyCompatible` completion under today's checks, visibly marked as lacking new confirmation; encrypted keyless attempts end in a bounded typed timeout (D84). §1 states it as the one named exception, with its L4 argument.
 - **Q2, confirmed key loss:** the manual exit is enough. Keep `Refused(manual_reinvite_required)` and D43's remedy (D85). This explicit L1 gap is part of §6's named §2 entry.
-- **Q3, leaf replacement trigger:** only with recorded never-confirmed evidence; receipt-less older seats use the manual exit (D86). J's signed assertion about its own record cannot be checked by any other node, so which evidence satisfies D86 stays open (question 3 below) and blocks Accept.
+- **Q3, leaf replacement trigger:** only with recorded never-confirmed evidence; receipt-less older seats use the manual exit (D86). D136 later fixed the evidence as the admission-time marker.
 - **Q4, Home repair mandate:** the owner-device form and the promoted-admin form (D87). The capability floor stays an explicit L1 limit in mixed groups (§3, §6).
-- **Q5, scheduling:** widen ADR 0016 §6 to repair rekeys; fallback uses S4's Accepted rules; 0114 is accepted after S4 (D88). "Lowest online eligible admin" is designated as S4 designates under D74.
+- **Q5, scheduling:** widen ADR 0016 §6 to repair rekeys; fallback uses S4's Accepted rules; 0114 is accepted after S4 (D88). D122 later confirmed that D74 governs designation.
 - **Q6, bounds:** S4's final window and completion bound plus 120 s; ADR 0107's poll windows and 10-minute staging lifetime unchanged; at most three buffered links within existing byte caps; a 10 s exchange cap that also bounds the sealer lookup (D89). The final numbers follow S4's timing ruling (D69), which waits for harness numbers.
-- **Q7, abuse budget:** the recommended rates, budget and backoff, all surviving restarts (D90). Retention stays open below.
+- **Q7, abuse budget:** the recommended rates, budget and backoff, all surviving restarts (D90). D137 later fixed retention.
 - **Q8, #1191:** ships with the full S8(b) slice, not early (D91, against the recommendation). Its W3-H case comes first, as for the rest of the slice.
 - **Q9, receipt MAC:** domain-separated BLAKE3 `derive_key` and keyed MAC, as specified (D92).
 - **Q10, G7:** L3 is a hard rule for every slice, including the poll and upgrade or backoff waits (D64). §6 lists this slice's typed blocks.
 - **Order:** "S8" in 0088's order means S8(a), ADR 0107. 0114 follows S4, and S5 does not wait for 0114 (D65).
 - **Home placeholder:** Home activation is lifted only behind the released-binary controls; any failed control blocks it (D81, §5).
-- **Behind retention:** D97 treats a member behind every holder's retention as admission, through S8(b) or a later ADR. S8(b) repairs only never-confirmed seats (D86), so a **confirmed** member behind retention needs a later ADR (§5).
+- **Behind retention:** D97 treats a member behind every holder's retention as admission, through S8(b) or a later ADR. D119 later widened S8(b) to repair a confirmed member (§7).
+
+David ruled round 2 on 2026-10-04 (D117–D120, D122, D136–D138):
+
+- **Pending cause notice:** reuse ADR 0108's `JoinPendingNotice` (D117). §1 registers S8(b)'s causes and serves the notice under ADR 0107's guard.
+- **Named §2 additions:** all four confirmed, including the S8(b) manual-exit repair entry (D118, §6).
+- **Confirmed member behind retention:** widen S8(b) now (D119, against the recommendation). §7 defines the **retention re-Welcome**, the stable name that ADR 0109 and ADR 0111 cite.
+- **Unreadable sidecar:** automatic quarantine and rebuild (D120, against the recommendation). §5 states what is rebuilt, what is lost and each safe outcome, and amends ADR 0085 rule 4 for S8(b)'s own files.
+- **Lowest roster admin:** D74 governs everywhere; "online" in D88 and 0088 §3 reads as "eligible on the roster" (D122, §3).
+- **Never-confirmed evidence:** the admission-time marker, now normative in §3 (D136). It closes round 1's evidence question.
+- **Budget record retention:** the proposal, accepted (D137, §4). It closes round 1's retention question.
+- **Unrestorable roles:** part of the S8(b) manual-exit entry (D138, §6). It closes round 1's role question.
 
 Still open for David:
 
-1. **Retention of budget records (D90 asks the authors to propose).** Proposal: keep a seat's rate-limit, budget and backoff record while that seat generation is on the roster and unconfirmed. Delete it when a receipt for that generation is verified, keeping only that generation's `AuthorityReceiptVerifiedV1`. Keep an exhausted budget until an ordinary removal, a ban or a signed group deletion, so restarts, nonces and new attempts cannot reset it; D43's fresh invite then starts a new generation with a new budget. Drop limiter entries for identities that leave the roster. The sidecar then holds at most one record per current `(group, member)` and per current `(group, forwarding admin)`, plus pending removals. Needs David's ruling.
-2. **Unrestorable roles.** `Refused(repair_role_not_restorable)` (legacy Owner, Moderator, Guest) leaves only D43's exit, and no ruling covers it, so as written it is a refusal outside 0088 §2. Proposal: add it to §6's named §2 entry, because Owner is not assignable and Guest→Member would widen privilege. Needs David's ruling.
-3. **Verifiable never-confirmed evidence (D86).** D86 requires a record that the seat was never confirmed. J's signed assertion about its own record cannot be checked by any other node, and a receipt-less member from before the upgrade can send the same assertion. Options:
-   - (a) **Admission-time obligation marker** (recommended candidate). When a capable authority seals a seat for a capable joiner after its host commit, it attaches an additive, serde-defaulted `AdmissionReceiptObligationV1` to the seating event. The committing actor signs it with its agent key in its own `x0x/authority-rewelcome/admission-obligation/v1` domain, binding group ID, J, the seating commit's `state_hash`, `prev_state_hash` and `revision`, J's committed KeyPackage hash, J's attempt ID and the actor ID. It travels on every chain path, as the repair mandate does. Any admin verifies it against the seating commit's `committed_by` actor and that actor's Admin seat at the parent, so it works while the sealer is offline. Evidence is then a verified marker for the current seat generation plus §3's necessary conditions. A seat with no valid marker, which includes every seat from before the upgrade, uses the manual exit; stripping or garbling a marker can only push a seat to the manual exit. Residual: a post-upgrade J that installed and then withheld its receipt can still trigger at most two replacement seals (D90). Cost: one more additive signed field, its carriage on every catch-up path, and strip, garble and transplant controls like the removal marker's.
-   - (b) **Accept J's assertion, bounded by D90.** Cost: a receipt-less member from before the upgrade gets up to two rekeys per seat before the manual exit. That is the weakness of D86's rejected option (b).
+1. **§7's voucher rule and residual reasons (D119).** D119 chose the design, but no ruling covers its anchor or the two residuals whose only exit is D43's remedy:
+   - `no_confirmation_record`: a legacy confirmed member that fell behind retention before any capable admin ran its confirmation probe;
+   - `readmission_uncorroborated`: a member whose last verified roster has no second identity that could vouch, in a group with no owner anchor.
 
-   Needs David's ruling; blocks Accept. If David selects (a), it is written as full normative text, with its harness controls, before Accept.
+   Proposal: confirm the two-voucher rule and add both reasons to the S8(b) manual-exit entry. The alternative is to accept one admin voucher from M's last verified roster. That closes the second residual, but then a single removed former admin could fork M. Needs David's ruling; blocks Accept.
+2. **Skipped epochs (D60 and L2).** A member re-seated by §3 or §7 cannot decrypt ciphertext from the epochs between its old seat and its new one. Holders cannot help, because D60 lets them deliver only the current epoch secret. Those epochs were entitled, so 0088 §2 item 4 (never admitted) does not cover them, and no other entry does. Proposal: a named §2 entry, "skipped-epoch ciphertext", typed `history_gap {from_epoch, to_epoch}`, with no exit; current store state still arrives through S5. Needs David's ruling; blocks Accept.
 
 ## Notes for AI-assisted work
 
 Only David Irvine marks this ADR Accepted. Claude's cross-model r1 requested changes; r2 reported APPROVE-WITH-NITS with the final decision-text corrections addressed here.
-Claude recorded David's 2026-10-04 rulings at his instruction; the Status stays Proposed. This revision still requires David's acceptance.
+Claude recorded David's 2026-10-04 rulings, rounds 1 and 2, at his instruction; the Status stays Proposed. This revision still requires David's acceptance.
 Accepted ADRs 0088, 0094, 0106 and 0107 remain unchanged. No governed implementation is claimed by this documentation revision. The implementing PR will update API/CLI documentation and polling behaviour under the code gates above.
