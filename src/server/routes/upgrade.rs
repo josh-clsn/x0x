@@ -1430,10 +1430,6 @@ mod tests {
     /// and skipped until the next fallback poll.
     #[tokio::test(start_paused = true)]
     async fn startup_check_applies_after_start_rate_window_ages_out() {
-        // systemd's INVOCATION_ID is what makes this process a
-        // systemd-signalled daemon for the real signal sampler.
-        std::env::set_var("INVOCATION_ID", SEAM_INVOCATION_ID);
-
         // Activation entered at monotonic 1 s. The first readback observes
         // monotonic 3 s (2 s into the 10 s window — fresh activation);
         // the retry's observes monotonic 15 s (14 s in — the window has
@@ -1474,8 +1470,10 @@ mod tests {
         });
 
         let data_dir = tempfile::TempDir::new().unwrap();
-        let mut config = DaemonConfig::default();
-        config.data_dir = data_dir.path().to_path_buf();
+        let config = DaemonConfig {
+            data_dir: data_dir.path().to_path_buf(),
+            ..Default::default()
+        };
         let (runtime, _shutdown_tx) = e2e_startup_runtime(data_dir.path());
 
         let before = tokio::time::Instant::now();
@@ -1510,7 +1508,6 @@ mod tests {
     /// not touch it.
     #[tokio::test(start_paused = true)]
     async fn startup_check_applies_immediately_when_start_limit_interval_is_zero() {
-        std::env::set_var("INVOCATION_ID", SEAM_INVOCATION_ID);
         let _readback = restart::systemd_readback_seam::install(one_call_scenario("0", "5"));
         let attempts = Arc::new(AtomicU64::new(0));
         let hook_attempts = Arc::clone(&attempts);
@@ -1528,8 +1525,10 @@ mod tests {
             gossip_payload: Vec::new(),
         });
         let data_dir = tempfile::TempDir::new().unwrap();
-        let mut config = DaemonConfig::default();
-        config.data_dir = data_dir.path().to_path_buf();
+        let config = DaemonConfig {
+            data_dir: data_dir.path().to_path_buf(),
+            ..Default::default()
+        };
         let (runtime, _shutdown_tx) = e2e_startup_runtime(data_dir.path());
         let before = tokio::time::Instant::now();
         let result = run_startup_update_check(&config, None, Some(runtime)).await;
@@ -1553,7 +1552,6 @@ mod tests {
     /// systemd.service): same contract as interval 0.
     #[tokio::test(start_paused = true)]
     async fn startup_check_applies_immediately_when_start_limit_burst_is_zero() {
-        std::env::set_var("INVOCATION_ID", SEAM_INVOCATION_ID);
         let _readback = restart::systemd_readback_seam::install(one_call_scenario("10s", "0"));
         let attempts = Arc::new(AtomicU64::new(0));
         let hook_attempts = Arc::clone(&attempts);
@@ -1571,8 +1569,10 @@ mod tests {
             gossip_payload: Vec::new(),
         });
         let data_dir = tempfile::TempDir::new().unwrap();
-        let mut config = DaemonConfig::default();
-        config.data_dir = data_dir.path().to_path_buf();
+        let config = DaemonConfig {
+            data_dir: data_dir.path().to_path_buf(),
+            ..Default::default()
+        };
         let (runtime, _shutdown_tx) = e2e_startup_runtime(data_dir.path());
         let before = tokio::time::Instant::now();
         let result = run_startup_update_check(&config, None, Some(runtime)).await;

@@ -102,8 +102,16 @@ pub struct SupervisionSignals {
 impl SupervisionSignals {
     /// Sample the real process environment.
     pub fn sample() -> Self {
+        // #1196 r2: an installed readback scenario stands in for systemd's
+        // INVOCATION_ID, so tests never mutate the process environment.
+        #[cfg(test)]
+        let seam_invocation_id = systemd_readback_seam::invocation_id_present();
+        #[cfg(not(test))]
+        let seam_invocation_id: Option<bool> = None;
         Self {
-            invocation_id: std::env::var_os("INVOCATION_ID").is_some_and(|v| !v.is_empty()),
+            invocation_id: seam_invocation_id.unwrap_or_else(|| {
+                std::env::var_os("INVOCATION_ID").is_some_and(|v| !v.is_empty())
+            }),
             x0x_supervised: std::env::var(SUPERVISED_ENV_VAR).as_deref() == Ok("1"),
             parent_comm: parent_comm(),
             stdin_is_tty: stdin_is_tty(),
@@ -1940,9 +1948,10 @@ pub(crate) mod systemd_readback_seam {
         /// This process's cgroup, naming the unit under test (fixture:
         /// `0::/system.slice/x0xd.service`).
         pub cgroup: String,
-        /// The `INVOCATION_ID` the environment reports, when set. Tests
-        /// that also set the real env var must keep the two identical —
-        /// the readback cross-checks them like production does.
+        /// The `INVOCATION_ID` the process reports, when set. While the
+        /// scenario is installed it stands in for the real environment
+        /// variable (`SupervisionSignals::sample`), so tests never call
+        /// `std::env::set_var`.
         pub invocation_id: Option<String>,
         /// Per-call show output + monotonic clock.
         pub calls: Vec<ReadbackCall>,
@@ -1977,6 +1986,19 @@ pub(crate) mod systemd_readback_seam {
             next_call: 0,
         });
         Guard { _private: () }
+    }
+
+    /// Whether an installed scenario reports an `INVOCATION_ID` (`Some`), or
+    /// `None` when no scenario is installed (use the real environment).
+    pub(crate) fn invocation_id_present() -> Option<bool> {
+        let slot = INSTALLED.lock().ok()?;
+        slot.as_ref().map(|installed| {
+            installed
+                .scenario
+                .invocation_id
+                .as_deref()
+                .is_some_and(|v| !v.is_empty())
+        })
     }
 
     /// The readback verdict for the n-th call of an installed scenario, or
