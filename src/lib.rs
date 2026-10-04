@@ -31466,13 +31466,15 @@ async fn r7d_announced_binding_keeps_known_expiry_across_a_same_digest_blob_miss
     );
 }
 
-/// WHY (x0x #1150 r7e, Codex NEW 1): ingest and hydration race. An ingest
-/// of a V3 announcement whose certificate blob is not yet cached computes
-/// its inputs, then the verified blob lands and hydration runs to
-/// completion, then the ingest writes its binding. The landed expiry must
-/// survive, so a late ingest write must never record a stale "no expiry".
-/// The interleaving is forced with the test-only barrier before the
-/// ingest's store write.
+/// WHY (x0x #1150 r7e, r7f; Codex NEW 1): ingest and hydration race. An
+/// ingest of a V3 announcement whose certificate blob is not yet cached is
+/// parked between its two writes (the discovery merge and the
+/// announced-binding store write, in either order) by the test-only
+/// barrier. The verified blob lands, hydration runs to completion, and
+/// other inserts evict the blob from the 256-entry cache. Only then is the
+/// ingest released. The landed expiry must survive: correctness may not
+/// depend on the blob surviving for a second lookup. Whenever discovery
+/// holds the certificate, the announced binding must hold its expiry.
 #[tokio::test]
 async fn r7e_a_certificate_landing_mid_ingest_keeps_its_expiry() {
     let user_kp = identity::UserKeypair::from_seed(&[0x6a; 32]).expect("owner kp");
@@ -31535,15 +31537,44 @@ async fn r7e_a_certificate_landing_mid_ingest_keeps_its_expiry() {
         &joiner_id,
     )
     .await;
+    // r7f: other verified inserts evict the landed blob before the ingest
+    // resumes.
+    for i in 0..announce_blob::BLOB_CACHE_MAX_ENTRIES as u64 {
+        blob_cache
+            .insert_verified(announce_blob::CachedBlob {
+                digest: blake3::hash(&i.to_le_bytes()).into(),
+                user_id: None,
+                agent_certificate: None,
+                payload_version: 1,
+                fetched_at_unix: 1,
+            })
+            .await;
+    }
+    assert!(
+        blob_cache.get(&digest).await.is_none(),
+        "precondition: the landed blob was evicted"
+    );
     gate.release.add_permits(1);
     ingest.await.expect("ingest task");
     announced_record_barrier::disarm(&joiner_id);
+    let stored = announced
+        .read()
+        .await
+        .peek(&joiner_id)
+        .and_then(|b| b.cert_not_after);
+    let discovered = cache
+        .read()
+        .await
+        .get(&joiner_id)
+        .and_then(|entry| entry.agent_certificate.as_ref().map(|c| c.not_after()));
+    if let Some(discovered) = discovered {
+        assert_eq!(
+            stored, discovered,
+            "discovery holds the landed certificate but the announced binding lost its expiry"
+        );
+    }
     assert_eq!(
-        announced
-            .read()
-            .await
-            .peek(&joiner_id)
-            .and_then(|b| b.cert_not_after),
+        stored,
         Some(not_after),
         "a late ingest write erased the expiry its racing hydration landed"
     );
