@@ -99,19 +99,22 @@ pub struct SupervisionSignals {
     pub stdin_is_tty: bool,
 }
 
+/// Whether systemd's `INVOCATION_ID` is set. #1196 r2: an installed readback
+/// scenario stands in for it in tests, so tests never mutate the process
+/// environment.
+fn sampled_invocation_id() -> bool {
+    #[cfg(test)]
+    if let Some(present) = systemd_readback_seam::invocation_id_present() {
+        return present;
+    }
+    std::env::var_os("INVOCATION_ID").is_some_and(|v| !v.is_empty())
+}
+
 impl SupervisionSignals {
     /// Sample the real process environment.
     pub fn sample() -> Self {
-        // #1196 r2: an installed readback scenario stands in for systemd's
-        // INVOCATION_ID, so tests never mutate the process environment.
-        #[cfg(test)]
-        let seam_invocation_id = systemd_readback_seam::invocation_id_present();
-        #[cfg(not(test))]
-        let seam_invocation_id: Option<bool> = None;
         Self {
-            invocation_id: seam_invocation_id.unwrap_or_else(|| {
-                std::env::var_os("INVOCATION_ID").is_some_and(|v| !v.is_empty())
-            }),
+            invocation_id: sampled_invocation_id(),
             x0x_supervised: std::env::var(SUPERVISED_ENV_VAR).as_deref() == Ok("1"),
             parent_comm: parent_comm(),
             stdin_is_tty: stdin_is_tty(),
