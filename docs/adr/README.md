@@ -279,8 +279,9 @@ unchanged:
   `connect_acl_refuses_unlisted_peer_stream` says a refused stream's I/O fails
   with "EOF + STOP_SENDING". What actually happens is that the gate drops the
   stream halves (`src/lib.rs` accept loop), so ant-quic resets the stream
-  (`0xA17C0244`). The opener sees a **reset error with zero application
-  bytes**, not a clean EOF. This matches ADR 0020's "refused/reset with zero
+  (`0xA17C0244`). The opener's read fails with **reset code `0xA17C0244`
+  and zero application bytes**, not a clean EOF; its writes fail once the
+  peer's STOP_SENDING arrives. This matches ADR 0020's "refused/reset with zero
   application bytes" and ADR 0022's own decision text; only the validation
   wording was wrong. Found during the #936 tailnet CI work.
 - **Design contradictions.** Three contradictions are not fixed here, because
