@@ -84,20 +84,96 @@ async fn admin_holds_owner_certificate(sim: &Sim, home: &HomeIds) -> Result<(boo
     .await
 }
 
-/// A's discovery entry for O carries the announce `kind` asked for.
-async fn admin_saw_owner_announce(sim: &Sim, kind: OwnerAnnounce) -> Result<bool> {
+/// A's view of O, read the way A's seal reads it (read-only):
+/// - `announced`: the certificate digest O's latest announce committed to
+///   (A's discovery entry). Announce v3 carries only this digest; the
+///   certificate bytes travel in the announce blob, so the discovery entry
+///   itself may stay certificate-less (#447);
+/// - `resolved`: the certificate A's seal-time evidence resolves for O
+///   (`owner_cert_evidence_for_with_digests` with O's seat digest: the
+///   discovery entry, the announce-blob cache by the announced digest, or
+///   the roster digest), when it is coupled to `announced`;
+/// - `status`: O's status in an owner-cert verdict over a CLONE of A's Home
+///   record (the verdict mutates grace state, so never A's own record).
+struct OwnerView {
+    announced: Option<[u8; 32]>,
+    resolved: bool,
+    status: String,
+}
+
+impl OwnerView {
+    fn detail(&self) -> String {
+        format!(
+            "announced digest {}, certificate resolved {}, verdict {}",
+            self.announced.map_or("none".to_string(), hex::encode),
+            self.resolved,
+            self.status
+        )
+    }
+}
+
+async fn admin_view_of_owner(sim: &Sim, home: &HomeIds) -> Result<OwnerView> {
     let admin = sim.state("A")?;
-    let owner = agent_id(&sim.agent_hex("O")?)?;
-    let anonymous = crate::announce_v3::cert_digest(&None, &None);
-    let entry = admin.agent.discovered_agent(owner).await.ok().flatten();
-    Ok(entry.is_some_and(|entry| match kind {
+    let owner_hex = sim.agent_hex("O")?;
+    let owner = agent_id(&owner_hex)?;
+    let announced = admin
+        .agent
+        .discovered_agent(owner)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|entry| entry.cert_digest);
+    let info = {
+        let groups = admin.named_groups.read().await;
+        let (_, info) = crate::server::resolve_group_entry_locked(&groups, &home.gid)
+            .context("A has no entry for the Home")?;
+        info.clone()
+    };
+    let seat_digest = info
+        .members_v2
+        .get(&owner_hex)
+        .and_then(|seat| seat.certificate_digest.clone());
+    let evidence = crate::server::routes::named_groups::owner_cert_evidence_for_with_digests(
+        &admin,
+        &[(owner_hex.clone(), seat_digest)],
+    )
+    .await;
+    let resolved = evidence.cert_for(&owner_hex).is_some_and(|cert| {
+        announced
+            == Some(crate::announce_v3::cert_digest(
+                &cert.user_id().ok(),
+                &Some(cert.clone()),
+            ))
+    });
+    let mut clone = info;
+    let verdict = clone.owner_cert_verdict(&evidence);
+    let status = verdict
+        .per_member
+        .get(&owner_hex)
+        .map_or("absent".to_string(), |status| format!("{status:?}"));
+    Ok(OwnerView {
+        announced,
+        resolved,
+        status,
+    })
+}
+
+/// Whether A's view of O is the one the announce `kind` should produce:
+/// - anonymous: O's latest announce committed to the anonymous digest, and
+///   A's verdict does not seat O as clean (the #1143 precondition);
+/// - consented: O's latest announce committed to the digest of O's actual
+///   certificate, A's seal-time evidence resolves that certificate, and A's
+///   verdict seats O as clean.
+fn view_matches(view: &OwnerView, kind: OwnerAnnounce, consented_digest: [u8; 32]) -> bool {
+    let clean = view.status == "Clean";
+    match kind {
         OwnerAnnounce::Anonymous => {
-            entry.cert_digest == Some(anonymous) && entry.agent_certificate.is_none()
+            view.announced == Some(crate::announce_v3::cert_digest(&None, &None)) && !clean
         }
         OwnerAnnounce::Consented => {
-            entry.agent_certificate.is_some() && entry.cert_digest != Some(anonymous)
+            view.announced == Some(consented_digest) && view.resolved && clean
         }
-    }))
+    }
 }
 
 /// Whether `bytes`, as written on a direct lane, is `joiner`'s join
@@ -154,19 +230,56 @@ async fn scenario(sim: &mut Sim, kind: OwnerAnnounce, receipt: &mut Receipt) -> 
         .api("O", Method::POST, "/announce", Some(announce))
         .await?;
     ensure!(status.is_success(), "O announce: {status} {body}");
-    let seen = sim
-        .until("A ingests O's announce", secs(60), async |s: &Sim| {
-            admin_saw_owner_announce(s, kind).await.unwrap_or(false)
-        })
-        .await
-        .is_ok();
+    // The digest a consented announce commits to: O's own certificate,
+    // under O's user id.
+    let consented_digest = {
+        let o = sim.state("O")?;
+        let cert = o
+            .agent
+            .identity()
+            .agent_certificate()
+            .cloned()
+            .context("O has no agent certificate")?;
+        crate::announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert))
+    };
+    let mut view = None;
+    let mut failure = None;
+    let waited = sim
+        .until(
+            "A's view of O matches O's announce",
+            secs(60),
+            async |s: &Sim| match admin_view_of_owner(s, &home).await {
+                Ok(seen) => {
+                    let matched = view_matches(&seen, kind, consented_digest);
+                    view = Some(seen);
+                    matched
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    true
+                }
+            },
+        )
+        .await;
+    if let Some(error) = failure {
+        return Err(error.context("INFRA: reading A's view of O"));
+    }
+    match &waited {
+        Ok(()) => {}
+        Err(error) if expired(error) => {}
+        Err(_) => return waited.context("waiting for A's view of O"),
+    }
+    let matched = view
+        .as_ref()
+        .is_some_and(|seen| view_matches(seen, kind, consented_digest));
     receipt.evidence(
         match kind {
-            OwnerAnnounce::Anonymous => "a_saw_anonymous_owner_announce",
-            OwnerAnnounce::Consented => "a_saw_consented_owner_announce",
+            OwnerAnnounce::Anonymous => "a_holds_anonymous_owner_evidence",
+            OwnerAnnounce::Consented => "a_resolves_consented_owner_certificate",
         },
-        seen,
-        "",
+        matched,
+        view.as_ref()
+            .map_or("no observation".to_string(), OwnerView::detail),
         at(sim),
     );
 
