@@ -741,9 +741,8 @@ fn secure_write_access(
 }
 
 /// `POST /groups/:id/send` entry admission, in today's order: the raw-id
-/// lookup (404 on a miss — the ADR0066-LOOKUP-WAIVER: no contested
-/// roster is ever served, and widening the route's id semantics is out
-/// of #732's scope) → the withdrawn 409 → the #877
+/// lookup (404 on a miss; the waiver sits at the site, where the
+/// guard reads it) → the withdrawn 409 → the #877
 /// fork-quarantine-for-actor gate (a session bearer without an active
 /// local seat is refused with the bare membership 403 BEFORE any marker
 /// body is built). Everything after — the SignedPublic 400, ban check,
@@ -766,6 +765,10 @@ fn send_admission<'a>(
         &x0x::groups::GroupInfo,
     ) -> Option<(StatusCode, Json<serde_json::Value>)>,
 ) -> Result<(&'a x0x::groups::GroupInfo, GroupAccess), (StatusCode, Json<serde_json::Value>)> {
+    // ADR0066-LOOKUP-WAIVER: the route's own group lookup (404 on a miss, so
+    // no contested roster is ever served); the fork-quarantine gate below
+    // consumes the `info` it found. Widening the route's id semantics is out
+    // of #732's scope — the waiver the inline handler lookup carried pre-S2.
     let Some(info) = groups.get(route_id) else {
         return Err(not_found("group not found"));
     };
@@ -794,6 +797,10 @@ fn secure_endpoint_admission<'a>(
         &x0x::groups::GroupInfo,
     ) -> Option<(StatusCode, Json<serde_json::Value>)>,
 ) -> Result<(&'a x0x::groups::GroupInfo, GroupAccess), (StatusCode, Json<serde_json::Value>)> {
+    // ADR0066-LOOKUP-WAIVER: GSS route lookup: a miss is a 404 before any
+    // gate, so it fails closed, and the gates below consume this same `info`.
+    // Out of #732's scope — the waiver the encrypt/decrypt/reseal handler
+    // lookups carried pre-S2.
     let Some(info) = groups.get(route_id) else {
         return Err(not_found("group not found"));
     };
