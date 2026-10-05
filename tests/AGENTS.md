@@ -22,6 +22,39 @@ The report contains assertion labels, status codes, store identifiers and
 content hashes, never bearer tokens or page bytes. Success here does not cover
 legacy migration or browser/GUI rendering.
 
+## Survivor rekey testnet acceptance (#1216)
+
+`e2e_vps_survivor_rekey.py` checks the rekey after a member is removed or
+banned, on a GSS (MlsEncrypted, legacy plane) group and a TreeKEM
+(`private_secure`) group. It needs at least five `--nodes`: the first removes
+and bans, the second-last is removed, the last is banned, and the rest
+survive. `--variant plain` and `--variant restart` (default: both) each build
+fresh groups. In `restart` the remover's `x0xd-testnet.service` restarts
+10-20 s before each removal, so that variant needs `--allow-service-restart`.
+
+A case passes only if every survivor decrypts a message sealed after the
+removal (rekey latency recorded per survivor), the target never decrypts it
+during a further `--watch-secs` window (D60), survivors' rosters drop the
+target, GSS refuses to re-seal the secret to it, and a banned target's re-join
+is never seated. Key readiness is proven by decrypting, never by roster state
+(#1214). Each node's live version is recorded and, when the eph
+`testnet-hosts.json` sits next to the tokens file, checked against the binary
+deployed to that node. Nothing assumes one binary (#1208).
+
+```bash
+python3 -B tests/e2e_vps_survivor_rekey.py --network test \
+  --tokens-file "${X0X_TESTNET_TOKENS_FILE:?source testnet-hosts.env after deploy}" \
+  --nodes nyc sfo helsinki nuremberg singapore \
+  --variant plain --variant restart --allow-service-restart \
+  --report /absolute/path/rekey.json
+```
+
+On an ephemeral run, use `$E fixture --run ID rekey --receipts DIR` once the
+testnet-ephemeral skill registers `rekey`. The report holds labels, status
+codes, response classes, epochs, latencies and per-node versions, never
+tokens, ciphertexts, invites or log text. Pure-python tests:
+`test_e2e_vps_survivor_rekey.py`. Details: `TEST_SUITE_GUIDE.md` §7f.
+
 ## Integration Test Organization
 
 33 integration test files in `tests/` (curated core subset; the directory holds more):

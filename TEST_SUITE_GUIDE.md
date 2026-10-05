@@ -695,6 +695,88 @@ the canonical "did I break the protocol" first-line test.
 
 ---
 
+## 7f. Survivor Rekey After Remove/Ban — `e2e_vps_survivor_rekey.py`
+
+**Path:** `tests/e2e_vps_survivor_rekey.py` (pure-python tests:
+`tests/test_e2e_vps_survivor_rekey.py`)
+
+Testnet-only acceptance for #1216 (G10 condition 2 of #1190). After a member
+is removed or banned, every survivor must get the new epoch and the removed
+member must get nothing. It runs on one GSS group (MlsEncrypted, legacy plane)
+and one TreeKEM group (`private_secure`), opening one SSH tunnel per node.
+
+### Roles and variants
+
+`--nodes` takes at least five labels. The first is the remover (the group
+creator), the second-last is removed, the last is banned, and the rest
+survive. Each group therefore has five or more members at the removal and
+four or more at the ban.
+
+| Variant | What changes |
+|---|---|
+| `plain` | No restart |
+| `restart` | The remover's `x0xd-testnet.service` restarts 10–20 s before each removal (`--restart-lead-secs`, default 15). Needs `--allow-service-restart`; restored in `finally` |
+
+Each variant builds fresh groups for each plane (`--plane gss|treekem`,
+default both). Every joiner must decrypt a message sealed after its join before
+the next step (#1214: readiness is proven by decrypting, not by roster state).
+
+### Checks per case (remove, then ban)
+
+1. Key barrier: every member, including the target, decrypts a fresh message.
+2. The remover removes or bans the target, then seals a message at an advanced
+   secret epoch.
+3. Every survivor decrypts it: the class-K share on GSS, the commit on
+   TreeKEM. The latency from the removal is recorded per survivor.
+4. The target never decrypts it, during convergence and for `--watch-secs`
+   more (default 40 s, which covers the share resend and withheld re-checks;
+   D60). On GSS its local secret epoch must stay below the new one.
+5. Survivors' rosters drop the target. On GSS the remover refuses to re-seal
+   the secret to it. After a ban, the target's re-join with an invite minted
+   before the ban is never seated and gains no key.
+6. A final message decrypts on every survivor and not on the target.
+
+Evidence labels start with `<variant>/<plane>/<action>`, for example
+`restart/treekem/ban: sfo rekeyed and decrypts the post-ban message` or
+`plain/gss/remove: no post-remove key reaches nuremberg during the watch (D60)`.
+Each report case records `rekey_latency_s`, `slowest_survivor`, probe-class
+counts, epochs, the restart lead and every role's version. The remover's
+journal is scanned read-only for `err_recipient_undiscovered` (count and
+`waited_ms`). No tokens, ciphertexts, invites or log text are written.
+
+### Running
+
+```bash
+# Direct (always pass an explicit testnet tokens path):
+python3 -B tests/e2e_vps_survivor_rekey.py --network test \
+  --tokens-file "${X0X_TESTNET_TOKENS_FILE:?source testnet-hosts.env after deploy}" \
+  --nodes nyc sfo helsinki nuremberg singapore \
+  --variant plain --variant restart --allow-service-restart \
+  --report /absolute/path/rekey.json
+
+# Ephemeral testnet, once the testnet-ephemeral skill registers `rekey`
+# (restart-bearing, so run it last in a batch):
+$E fixture --run ID rekey --receipts "$R" --attempt a1 [--rotate K]
+```
+
+Other flags: `--rekey-timeout` (120 s), `--rejoin-watch-secs` (30 s),
+`--poll-timeout` (120 s), `--hosts-json`, `--expect-mixed`,
+`--no-journal-scan`. Expect roughly 20–30 minutes for both variants.
+
+### Mixed-version arm
+
+Nothing assumes one binary (#1208). Deploy the arm with a per-node map, for
+example `$E deploy --run ID --binary <v0.46.3 x0xd> --binary-map
+sfo=<v0.46.2 x0xd>,helsinki=<v0.46.2 x0xd> ...`, then run the fixture; use
+`--rotate K` to put the other version in the remover's seat. The harness reads
+`testnet-hosts.json` next to the tokens file (or `--hosts-json`). It refuses a
+hosts file whose addresses differ from the tokens file, checks each node's live
+`/health` version against the binary deployed to that node, and records
+per-node sha256s. For a direct run, `--expect-mixed` also requires two or more
+distinct deployed binaries among `--nodes`.
+
+---
+
 ## 9. Live Network Test — `e2e_live_network.sh`
 
 **Path:** `tests/e2e_live_network.sh`
