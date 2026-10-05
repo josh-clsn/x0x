@@ -772,7 +772,6 @@ fn secure_write_access(
         level,
         stable_id: info.stable_group_id().to_string(),
         acting_hex: acting_principal_hex(actor, local_agent_hex),
-        home_or_owner_certified: is_home_or_owner_certified(info),
     }
 }
 
@@ -999,14 +998,15 @@ pub(in crate::server) fn admit_live_group_route<'a>(
     Ok(info)
 }
 
-/// The Home/owner-certified durable-fence INPUT (issue #446's central
-/// fence, `home_mutation_requires_durable`): a group carrying Home
-/// metadata OR an OwnerCertified-capable admission axis is an owner act
-/// to mutate, whatever its current policy axes. This is the snapshot
-/// flag the extractor exposes; the fence itself — the actor test and
-/// its typed 403 — keeps its entry position in the mutating handlers
-/// (before body parse where it stood), so no S3 core runs it.
-fn is_home_or_owner_certified(info: &x0x::groups::GroupInfo) -> bool {
+/// The Home/owner-certified durable-fence predicate (issue #446's
+/// central fence, `home_mutation_requires_durable`): a group carrying
+/// Home metadata OR an OwnerCertified-capable admission axis is an
+/// owner act to mutate, whatever its current policy axes. The ONE
+/// definition — the fence itself (the actor test and its typed 403,
+/// called by that shared helper at every mutating handler's entry)
+/// keeps its entry position in the handlers (before body parse where
+/// it stood), so no S3 core runs it.
+pub(in crate::server) fn is_home_or_owner_certified(info: &x0x::groups::GroupInfo) -> bool {
     info.home.is_some() || info.policy.admission.owner_certified_user_id().is_some()
 }
 
@@ -1016,9 +1016,8 @@ fn is_home_or_owner_certified(info: &x0x::groups::GroupInfo) -> bool {
 /// the stable group id the route's `:id` resolved to (the DECODED
 /// `:id` when the messages route falls through for a group unknown
 /// locally — the public-cache fail-open that predates this module),
-/// the ACTING PRINCIPAL's hex (S2) — the identity the handler's ban/
-/// policy gates evaluate — and (S3) the Home/owner-certified fence
-/// flag.
+/// and the ACTING PRINCIPAL's hex (S2) — the identity the handler's
+/// ban/policy gates evaluate.
 ///
 /// This is the extractor's admission snapshot, not the final word:
 /// handlers that re-read group data for their body re-run the pure core
@@ -1028,7 +1027,6 @@ pub(in crate::server) struct GroupAccess {
     level: AccessLevel,
     stable_id: String,
     acting_hex: String,
-    home_or_owner_certified: bool,
 }
 
 impl GroupAccess {
@@ -1055,18 +1053,6 @@ impl GroupAccess {
     /// for riders — the subject of the handler-side ban/policy gates.
     pub(in crate::server) fn acting_hex(&self) -> &str {
         &self.acting_hex
-    }
-
-    /// Whether the admitted group is Home/owner-certified — the durable
-    /// fence input (issue #446). No production reader yet: every S3
-    /// mutation route keeps `home_mutation_requires_durable` at entry
-    /// (its position is load-bearing — before body parse, before the
-    /// durability gates), so no handler consumes the extractor's
-    /// snapshot of it. The first extractor-wired mutation route reads
-    /// it; until then this mirrors `level`'s allow.
-    #[allow(dead_code)]
-    pub(in crate::server) fn home_or_owner_certified(&self) -> bool {
-        self.home_or_owner_certified
     }
 }
 
@@ -1128,7 +1114,6 @@ async fn admit_members_route(
         level,
         stable_id: info.stable_group_id().to_string(),
         acting_hex: acting_principal_hex(actor, &local_hex),
-        home_or_owner_certified: is_home_or_owner_certified(info),
     })
 }
 
@@ -1148,15 +1133,12 @@ async fn admit_messages_route(state: &AppState, id: &str) -> Result<GroupAccess,
                 // Actor-less surface: the local daemon's seat is the
                 // policy subject.
                 acting_hex: local_hex.clone(),
-                home_or_owner_certified: is_home_or_owner_certified(info),
             })
         }
         None => Ok(GroupAccess {
             level: AccessLevel::PublicRead,
             stable_id: id.to_string(),
             acting_hex: local_hex,
-            // Unknown group: nothing to fence.
-            home_or_owner_certified: false,
         }),
     }
 }
@@ -1172,7 +1154,6 @@ async fn admit_state_route(state: &AppState, id: &str) -> Result<GroupAccess, Re
         stable_id: info.stable_group_id().to_string(),
         // Actor-less public projection: the local daemon is the subject.
         acting_hex: hex::encode(state.agent.agent_id().as_bytes()),
-        home_or_owner_certified: is_home_or_owner_certified(info),
     })
 }
 
@@ -1190,7 +1171,6 @@ async fn admit_state_commits_route(state: &AppState, id: &str) -> Result<GroupAc
         // Actor-less retained history: the local daemon's seat is the
         // membership subject.
         acting_hex: local_hex,
-        home_or_owner_certified: is_home_or_owner_certified(info),
     })
 }
 
@@ -1211,7 +1191,6 @@ async fn admit_join_requests_route(state: &AppState, id: &str) -> Result<GroupAc
         stable_id: info.stable_group_id().to_string(),
         // Actor-less seat gate: the local daemon is the subject.
         acting_hex: local_hex,
-        home_or_owner_certified: is_home_or_owner_certified(info),
     })
 }
 

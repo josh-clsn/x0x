@@ -24128,10 +24128,9 @@ async fn home_mutation_requires_durable(
         .await
         .get(group_id)
         // r1 (design A1b): the fence keys on the POLICY OWNER AXIS —
-        // any OwnerCertified-capable group is an owner act to mutate.
-        .is_some_and(|info| {
-            info.home.is_some() || info.policy.admission.owner_certified_user_id().is_some()
-        });
+        // any OwnerCertified-capable group is an owner act to mutate
+        // (shared predicate; one definition with the S3 cores).
+        .is_some_and(group_access::is_home_or_owner_certified);
     if is_home && !actor.is_durable_owner() {
         return Some(api_error(
             StatusCode::FORBIDDEN,
