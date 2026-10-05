@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.46.3] - 2026-10-05
+
+### Fixed
+
+- **A Home device stuck after a timed-out join recovers (#1150, ADR 0107).**
+  A device that sealed but never confirmed its join re-arms when it redeems a
+  fresh invite from the admin who sealed it within the staging window. It
+  re-fetches its original join result and Welcome, then installs its keys.
+  Join artifacts are served only to a recipient that is currently Active, not
+  banned and holds a valid certificate on the current roster. The check is made
+  at every send, including blobs, chunks and Welcome frames, and removal, ban
+  and revocation purge staged artifacts.
+- **Group key shares and Welcomes are delivered promptly after an owner restart
+  (#1213).** Class-K shares and join artifacts now resolve the recipient
+  through bounded, verified-source lookup and go out on the single
+  admission-checked raw path. In a real-network check, shares arrived in
+  0.09–0.13 s (14/14) and Welcomes in about 1.3 s; before the fix a share
+  could be lost (409 at 120 s) or a Welcome could take 86 s.
+- Every delivery or resend of a group key share requires current recipient
+  eligibility and the current secret epoch (D60).
+
 ## [v0.46.2] - 2026-10-04
 
 ### Fixed
