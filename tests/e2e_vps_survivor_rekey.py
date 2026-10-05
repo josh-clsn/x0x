@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Testnet survivor-rekey fixture (#1216): remove and ban, survivors decrypt, the target cannot.
+"""Testnet survivor-rekey fixture (#1216): remove and ban, survivors decrypt, excluded members cannot.
 
 For each selected variant (``plain``, ``restart``) and secure plane (``gss``: an
 MlsEncrypted public-directory group on the legacy GSS plane; ``treekem``: a
@@ -7,7 +7,8 @@ MlsEncrypted public-directory group on the legacy GSS plane; ``treekem``: a
 every ``--nodes`` label, then runs two cases on it:
 
 * remove: the remover (the group creator, ``--nodes[0]``) removes ``--nodes[-2]``;
-* ban:    the remover bans ``--nodes[-1]``.
+* ban:    the remover bans ``--nodes[-1]``. The member removed earlier is an
+  excluded node of this case too, so a ban rotation that reaches it is caught.
 
 At least five nodes are required, so each group has five or more members at the
 removal and four or more at the ban. Each case:
@@ -21,31 +22,48 @@ removal and four or more at the ban. Each case:
    secret epoch;
 4. every survivor decrypts that message: the class-K share on GSS, the commit on
    TreeKEM. The rekey latency from the removal is recorded per survivor;
-5. the target never decrypts it, while the survivors converge and for a further
-   ``--watch-secs`` that covers the share resend and the withheld re-checks
-   (D60: no later share or Welcome reaches it). On GSS the target's reported
-   local secret epoch must stay below the post-removal epoch;
+5. no excluded node decrypts it, while the survivors converge and for a further
+   ``--watch-secs`` that covers the share resend and the withheld re-checks;
 6. every survivor's roster stops listing the target as active;
-7. GSS: the remover refuses to re-seal the current secret to the target. Ban: the
-   target re-joins with an invite minted before the ban, is never seated and
-   gains no key;
-8. a final message sealed after all of that decrypts on every survivor and not
-   on the target.
+7. GSS: the remover answers the explicit recipient-ineligible refusal when asked
+   to re-seal the current secret to the target. Ban: the target re-joins with an
+   invite minted before the ban; the join outcome is checked, it is never seated
+   and it gains no key;
+8. a final message sealed after all of that decrypts on every survivor and on no
+   excluded node.
+
+Verdicts. A check passes, fails, or is INCONCLUSIVE. Transport errors, timeouts,
+HTTP 5xx, unexpected responses and invalid roster reads never count as an
+exclusion or a refusal: they make the check (and its case) inconclusive.
+
+Evidence classes for "an excluded node holds no post-removal key" (D60):
+
+* ``key``: the node's decrypt reached its key material (GSS no secret, epoch
+  mismatch with its local epoch, or AEAD failure; TreeKEM group not loaded or
+  decrypt failure) on the last probe of the watch window;
+* ``journal``: GSS only. The node's own journal, which logs every KEM-sealed
+  share it installs at info level, shows no install for this group in the case
+  window, and the window does hold info-level lines;
+* ``limited``: neither is available. A removed member's daemon answers
+  ``not a member`` before it consults any key material, and TreeKEM logs no
+  info-level key install. The check is NOT claimed: it is listed under
+  ``limitations`` in the report, not under ``assertions``.
 
 Mixed versions: nothing assumes one binary. Each node's live ``/health`` version
-is recorded per node and per case role. When the eph hosts file is available
-(``--hosts-json``, or ``testnet-hosts.json`` next to ``--tokens-file``), it must
-name the same address per label as the tokens file, each node's live version is
-checked against the binary deployed to THAT node, and per-node sha256s are
-recorded. ``--expect-mixed`` also requires two or more distinct deployed
-binaries among the selected nodes.
+and the sha256 of its running x0xd (``/proc/<MainPID>/exe`` over SSH) are
+recorded per node and per case role. When the eph hosts file is available
+(``--hosts-json``, or ``testnet-hosts.json`` next to ``--tokens-file``), every
+selected node must have a valid deployed sha256 and version there, its address
+must match the tokens file, and its live version and live sha256 must equal what
+was deployed to THAT node. ``--expect-mixed`` also requires two or more distinct
+verified running binaries among the selected nodes.
 
 Only ``x0xd-testnet.service`` is ever addressed. Restarts need
 ``--allow-service-restart`` and every restarted unit is restored in ``finally``.
-The remover's journal is scanned read-only after each case for
-``recipient_undiscovered`` and share resends (counts and ``waited_ms`` only).
-The report holds labels, status codes, response classes, epochs, timings and
-hashes; never tokens, ciphertexts, invites, envelopes, log lines or bodies.
+Journals are read-only grep counts (recipient_undiscovered, share installs) and
+the report never holds log lines. The report holds labels, status codes,
+response classes, epochs, timings and hashes; never tokens, ciphertexts,
+invites, envelopes, log lines or bodies.
 """
 from __future__ import annotations
 
@@ -58,13 +76,14 @@ import json
 import math
 import os
 import re
+import shlex
 import subprocess
 import time
 import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from e2e_tunnel import TunnelHandle, start_ssh_tunnel, stop_ssh_tunnel
 from e2e_vps_groups import NODES_DEFAULT, load_tokens
@@ -78,6 +97,15 @@ VARIANTS = ("plain", "restart")
 ACTIONS = ("remove", "ban")
 MIN_NODES = 5
 RESTART_LEAD_BOUNDS = (10.0, 20.0)
+# CLI bounds (seconds). The watch minimum covers the share resend (+8 s) and one
+# withheld re-check (15 s) with margin.
+DURATION_BOUNDS = {
+    "--poll-timeout": (10.0, 3600.0),
+    "--rekey-timeout": (10.0, 3600.0),
+    "--watch-secs": (30.0, 3600.0),
+    "--rejoin-watch-secs": (10.0, 3600.0),
+    "--restart-lead-secs": RESTART_LEAD_BOUNDS,
+}
 # Membership operations await their own publish and can outlast the default 20 s.
 ACT_TIMEOUT_SECS = 60.0
 HOSTS_JSON_NAME = "testnet-hosts.json"
@@ -92,14 +120,25 @@ GSS_POLICY = {
     "read_access": "members_only",
     "write_access": "members_only",
 }
-# Any 200 from the target's decrypt means it held a usable key: a leak.
+# Decrypt response classes for an EXCLUDED node.
+# leak: a 200 means it held a usable key.
 LEAK_CLASSES = frozenset({"decrypted", "wrong_plaintext"})
+# key: the daemon passed the membership gate and consulted its key material.
+KEY_EVIDENCE_CLASSES = frozenset({"no_secret", "epoch_mismatch", "decrypt_failed",
+                                  "treekem_not_loaded", "treekem_decrypt_failed"})
+# gate: a typed refusal before any key material is consulted.
+GATE_CLASSES = frozenset({"not_member", "group_not_found", "fork_quarantined", "forbidden"})
+# Everything else (transport errors, 5xx, unexpected 4xx) is an error: no evidence.
+RESEAL_REFUSALS = frozenset({"recipient_not_member", "recipient_not_active"})
 JOIN_STATES = frozenset({"active", "pending_authority_commit", "idle", "timed_out"})
+JOIN_STATUS_STATES = frozenset({"pending_authority_commit", "idle"})
+JOIN_REFUSAL_STATUSES = frozenset({403, 404, 409})
 JOIN_OUTCOMES = frozenset({"refused", "timed_out"})
 JOIN_OUTCOME_REASONS = frozenset({
     "invite_secret_unknown", "invite_secret_consumed", "invite_role_exceeds_cap",
     "invite_event_before_creation", "invite_expired", "invite_not_addressed",
     "banned", "member_banned"})
+LOCAL_UNSEATED_STATES = frozenset({"pending_authority_commit", "pending", "not_member"})
 # Journal markers counted on the remover after each case. The first two are
 # warn-level (visible at the eph RUST_LOG=info); the share-resend lines are
 # debug-level and are counted only when debug logging is enabled.
@@ -109,16 +148,27 @@ JOURNAL_PATTERNS = (
     ("share_resend_undiscovered", "secure share recipient not yet discovered"),
     ("share_write_retry", "secure share write failed"),
 )
+# The GSS share receive arm logs every install at info level, with the group's
+# stable id: "Phase D.2: stored new group shared secret (epoch N) via KEM-sealed envelope".
+SHARE_INSTALL_MARKER = "stored new group shared secret"
+SHARE_INSTALL_RE = re.compile(r"stored new group shared secret \(epoch (\d+)\)")
+INFO_LINES_RE = re.compile(r"^x0x-rekey-info-lines=(\d+)\s*$", re.MULTILINE)
 WAITED_MS_RE = re.compile(r"waited_ms[\"']?\s*[=:]\s*(\d+)")
 SSH_BASE = ("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
             "-o", "ControlMaster=no", "-o", "ControlPath=none")
 JOURNAL_SCRIPT = r'''set -u
-since=$(( $(date +%s) - $1 ))
+since=$(( $(date +%s) - $1 )); shift
+args=()
+for needle in "$@"; do args+=(-e "$needle"); done
 journalctl -u ''' + SERVICE + r''' --since "@$since" -o cat --no-pager 2>/dev/null \
-  | grep -F -e err_recipient_undiscovered -e 'failed to fetch TreeKEM Welcome blob' \
-      -e 'secure share recipient not yet discovered' -e 'secure share write failed' \
-  | head -n 20000
+  | grep -F "${args[@]}" | head -n 20000
+printf 'x0x-rekey-info-lines=%s\n' "$(journalctl -u ''' + SERVICE + r''' --since "@$since" -o cat --no-pager 2>/dev/null | grep -c -F INFO || true)"
 exit 0
+'''
+LIVE_SHA_SCRIPT = r'''set -eu
+pid=$(systemctl show -p MainPID --value ''' + SERVICE + r''')
+[ "${pid:-0}" -gt 0 ]
+sha256sum "/proc/$pid/exe"
 '''
 
 
@@ -134,6 +184,19 @@ def normalize_version(value: Any) -> Optional[str]:
         return None
     match = VERSION_RE.search(value)
     return match.group(1) if match else None
+
+
+def bounded_seconds(flag: str, low: float, high: float) -> Callable[[str], float]:
+    """argparse type: a finite number of seconds within [low, high]."""
+    def parse(text: str) -> float:
+        try:
+            value = float(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{flag} must be a number of seconds") from None
+        if not math.isfinite(value) or not low <= value <= high:
+            raise argparse.ArgumentTypeError(f"{flag} must be a finite number of seconds within {low:g}-{high:g}")
+        return value
+    return parse
 
 
 def assign_roles(nodes: List[str]) -> Dict[str, Any]:
@@ -159,7 +222,8 @@ def resolve_hosts_json(explicit: Optional[str], tokens_file: str) -> Tuple[Optio
 def node_binary_map(doc: Any, endpoints: Dict[str, str]) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
     """Per-node deployed binary from an eph hosts document. Never one value for all nodes.
 
-    Problems name labels only, never addresses.
+    Every selected node needs a valid sha256 and a parseable version; anything
+    missing or malformed is a problem. Problems name labels only, never addresses.
     """
     if not isinstance(doc, dict) or doc.get("schema_version") != 1 or doc.get("kind") != "x0x-testnet-hosts":
         return {}, ["hosts file is not an x0x-testnet-hosts schema 1 document"]
@@ -183,9 +247,45 @@ def node_binary_map(doc: Any, endpoints: Dict[str, str]) -> Tuple[Dict[str, Dict
             problems.append(f"hosts file address for {label} differs from the tokens file")
             continue
         sha = host.get("daemon_sha256")
-        out[label] = {"daemon_sha256": sha if isinstance(sha, str) and SHA256_HEX.fullmatch(sha) else None,
-                      "deployed_version": normalize_version(host.get("daemon_version"))}
+        if not isinstance(sha, str) or not SHA256_HEX.fullmatch(sha):
+            problems.append(f"hosts file has no valid daemon_sha256 for {label}")
+            continue
+        version = normalize_version(host.get("daemon_version"))
+        if version is None:
+            problems.append(f"hosts file has no parseable daemon_version for {label}")
+            continue
+        out[label] = {"daemon_sha256": sha, "deployed_version": version}
     return out, problems
+
+
+def binary_checks(node_binaries: Dict[str, Dict[str, Any]], live_versions: Dict[str, Optional[str]],
+                  live_shas: Dict[str, Optional[str]]) -> List[Tuple[str, str, Dict[str, Any]]]:
+    """(node, verdict, facts): the live version AND the running sha256 must equal what
+    was deployed to that node. A missing live reading is inconclusive, never a pass."""
+    results = []
+    for node, deployed in sorted(node_binaries.items()):
+        live_version, live_sha = live_versions.get(node), live_shas.get(node)
+        facts = {"node": node, "live_version": live_version, "deployed_version": deployed["deployed_version"],
+                 "live_sha256": live_sha, "deployed_sha256": deployed["daemon_sha256"]}
+        if live_version is None or live_sha is None:
+            verdict = "inconclusive"
+        elif live_version == deployed["deployed_version"] and live_sha == deployed["daemon_sha256"]:
+            verdict = "pass"
+        else:
+            verdict = "fail"
+        results.append((node, verdict, facts))
+    return results
+
+
+def mixed_check(node_binaries: Dict[str, Dict[str, Any]], live_shas: Dict[str, Optional[str]]) -> Tuple[str, Dict[str, Any]]:
+    """--expect-mixed: two or more distinct RUNNING binaries, each matching its deploy record."""
+    verified = {node: live_shas.get(node) for node in node_binaries
+                if live_shas.get(node) is not None and live_shas.get(node) == node_binaries[node]["daemon_sha256"]}
+    facts = {"verified_nodes": len(verified), "selected_nodes": len(node_binaries),
+             "distinct_running_binaries": len(set(verified.values()))}
+    if len(verified) != len(node_binaries):
+        return "inconclusive", facts
+    return ("pass" if len(set(verified.values())) >= 2 else "fail"), facts
 
 
 def plane_of_encrypt(body: Any) -> Optional[str]:
@@ -257,6 +357,23 @@ def classify_decrypt(status: Optional[int], body: Any, expected_b64: str) -> Tup
     return "http_other", None
 
 
+def exclusion_kind(cls: str) -> str:
+    """leak | key | gate | error for an excluded node's decrypt class."""
+    if cls in LEAK_CLASSES:
+        return "leak"
+    if cls in KEY_EVIDENCE_CLASSES:
+        return "key"
+    if cls in GATE_CLASSES:
+        return "gate"
+    return "error"
+
+
+def single_probe_verdict(cls: str) -> Tuple[str, str]:
+    """One excluded-node probe: (verdict, evidence kind)."""
+    kind = exclusion_kind(cls)
+    return ("fail" if kind == "leak" else "inconclusive" if kind == "error" else "pass"), kind
+
+
 def classify_reseal(status: Optional[int], body: Any) -> str:
     """`POST /groups/:id/secure/reseal` outcome. A 200 carries a sealed secret: never stored."""
     body = body if isinstance(body, dict) else {}
@@ -273,22 +390,75 @@ def classify_reseal(status: Optional[int], body: Any) -> str:
     return "http_other" if status is not None else "transport_error"
 
 
+def reseal_verdict(cls: str) -> str:
+    """Only the explicit recipient-ineligible refusals count as a refusal."""
+    if cls in RESEAL_REFUSALS:
+        return "pass"
+    return "fail" if cls == "sealed" else "inconclusive"
+
+
 def classify_join_attempt(status: Optional[int], body: Any) -> Dict[str, Any]:
     body = body if isinstance(body, dict) else {}
     state = body.get("join_state")
+    already = body.get("already_joined")
     return {"status": status,
-            "join_state": state if state in JOIN_STATES else ("other" if state is not None else None)}
+            "join_state": state if state in JOIN_STATES else ("other" if state is not None else None),
+            "already_joined": already if isinstance(already, bool) else None}
 
 
-def classify_join_outcome(status: Optional[int], body: Any) -> Dict[str, Any]:
-    """`GET /groups/:id/join-status`: allow-listed outcome and reason only."""
+def classify_join_status(status: Optional[int], body: Any) -> Dict[str, Any]:
+    """`GET /groups/:id/join-status`: allow-listed fields and whether the read is valid.
+
+    Valid: 200 with a known join_state, or 404 (the local stub is gone; #477 puts any
+    terminal outcome in the body).
+    """
     body = body if isinstance(body, dict) else {}
     last = body.get("last_join_outcome")
     last = last if isinstance(last, dict) else {}
-    outcome, reason = last.get("outcome"), last.get("reason")
+    outcome, reason, state = last.get("outcome"), last.get("reason"), body.get("join_state")
     return {"status": status,
+            "join_state": state if state in JOIN_STATUS_STATES else ("other" if state is not None else None),
             "outcome": outcome if outcome in JOIN_OUTCOMES else ("other" if outcome is not None else None),
-            "reason": reason if reason in JOIN_OUTCOME_REASONS else ("other" if reason is not None else None)}
+            "reason": reason if reason in JOIN_OUTCOME_REASONS else ("other" if reason is not None else None),
+            "valid": (status == 200 and state in JOIN_STATUS_STATES) or status == 404}
+
+
+def classify_local_membership(status: Optional[int], body: Any) -> str:
+    """The node's own `GET /groups/:id`: seat | unseated | invalid."""
+    if status in (403, 404):
+        return "unseated"
+    if status == 200 and isinstance(body, dict):
+        state = body.get("membership_state")
+        if state == "active":
+            return "seat"
+        if state in LOCAL_UNSEATED_STATES:
+            return "unseated"
+    return "invalid"
+
+
+def rejoin_verdict(attempt: Dict[str, Any], roster_reads: Sequence[Optional[bool]], local: str,
+                   join_status: Dict[str, Any]) -> Tuple[str, str]:
+    """A banned member's re-join: (verdict, reason). Failed requests and invalid reads are
+    inconclusive, never 'not seated'."""
+    status = attempt.get("status")
+    accepted = isinstance(status, int) and 200 <= status < 300
+    if any(read is True for read in roster_reads):
+        return "fail", "seated_on_remover_roster"
+    if local == "seat":
+        return "fail", "target_reports_active"
+    if accepted and (attempt.get("join_state") == "active" or attempt.get("already_joined") is True):
+        return "fail", "join_reported_active"
+    if not (accepted or status in JOIN_REFUSAL_STATUSES):
+        return "inconclusive", "join_request_error"
+    if not roster_reads or any(read is None for read in roster_reads):
+        return "inconclusive", "invalid_roster_read"
+    if local != "unseated":
+        return "inconclusive", "invalid_local_read"
+    if not join_status.get("valid"):
+        return "inconclusive", "invalid_join_status"
+    if status in JOIN_REFUSAL_STATUSES or join_status.get("outcome") == "refused":
+        return "pass", "refused"
+    return "pass", "unseated"
 
 
 def member_is_active(status: Optional[int], body: Any, agent_id: str) -> Optional[bool]:
@@ -300,12 +470,17 @@ def member_is_active(status: Optional[int], body: Any, agent_id: str) -> Optiona
 
 
 def restart_lead_ok(lead_seconds: float, bounds: Tuple[float, float] = RESTART_LEAD_BOUNDS) -> bool:
-    return bounds[0] <= lead_seconds <= bounds[1]
+    return math.isfinite(lead_seconds) and bounds[0] <= lead_seconds <= bounds[1]
 
 
 def restart_observed(uptime_after: Any, since_restart_seconds: float) -> bool:
     """The daemon answering after the restart started no earlier than the restart."""
     return type(uptime_after) is int and uptime_after <= since_restart_seconds + 5
+
+
+def parse_info_lines(text: str) -> Optional[int]:
+    match = INFO_LINES_RE.search(text)
+    return int(match.group(1)) if match else None
 
 
 def parse_journal_matches(text: str) -> Dict[str, Any]:
@@ -321,7 +496,31 @@ def parse_journal_matches(text: str) -> Dict[str, Any]:
                     if match:
                         waited.append(int(match.group(1)))
     return {"counts": counts, "recipient_undiscovered_waited_ms": waited[:200],
-            "recipient_undiscovered_waited_ms_max": max(waited) if waited else None}
+            "recipient_undiscovered_waited_ms_max": max(waited) if waited else None,
+            "info_lines": parse_info_lines(text)}
+
+
+def parse_share_installs(text: str, stable_gid: str) -> Dict[str, Any]:
+    """GSS share installs on one node: epochs attributed to this group, and installs
+    that cannot be attributed (no group id on the line). No line text."""
+    attributed: List[int] = []
+    unattributed = 0
+    for line in text.splitlines():
+        if SHARE_INSTALL_MARKER not in line:
+            continue
+        match = SHARE_INSTALL_RE.search(line)
+        if stable_gid and stable_gid in line and match:
+            attributed.append(int(match.group(1)))
+        else:
+            unattributed += 1
+    return {"attributed_epochs": attributed[:200],
+            "attributed_max_epoch": max(attributed) if attributed else None,
+            "unattributed": unattributed, "info_lines": parse_info_lines(text)}
+
+
+def parse_sha256sum(text: str) -> Optional[str]:
+    token = text.strip().split()[0] if text.strip() else ""
+    return token if SHA256_HEX.fullmatch(token) else None
 
 
 def safe_error_class(error: BaseException) -> str:
@@ -329,32 +528,110 @@ def safe_error_class(error: BaseException) -> str:
 
 
 @dataclass
+class ExclusionObservation:
+    """Every decrypt probe of one excluded node for one message."""
+    probes: int = 0
+    classes: Dict[str, int] = field(default_factory=dict)
+    local_epochs: List[int] = field(default_factory=list)
+    leaked: bool = False
+    errors: int = 0
+    key_probes: int = 0
+    gate_probes: int = 0
+    last_class: Optional[str] = None
+    last_at: Optional[float] = None
+
+    def observe(self, at: float, cls: str, epoch: Optional[int]) -> None:
+        self.probes += 1
+        self.last_class, self.last_at = cls, at
+        self.classes[cls] = self.classes.get(cls, 0) + 1
+        kind = exclusion_kind(cls)
+        if kind == "leak":
+            self.leaked = True
+        elif kind == "error":
+            self.errors += 1
+        elif kind == "gate":
+            self.gate_probes += 1
+        else:
+            self.key_probes += 1
+            if cls == "epoch_mismatch" and epoch is not None:
+                self.local_epochs.append(epoch)
+
+    def max_local_epoch(self) -> Optional[int]:
+        return max(self.local_epochs) if self.local_epochs else None
+
+    def summary(self, started: float) -> Dict[str, Any]:
+        return {"probes": self.probes, "classes": dict(self.classes), "errors": self.errors,
+                "key_probes": self.key_probes, "gate_probes": self.gate_probes,
+                "last_class": self.last_class, "max_local_epoch": self.max_local_epoch(),
+                "leaked": self.leaked,
+                "observed_until_s": round(self.last_at - started, 3) if self.last_at is not None else None}
+
+
+def exclusion_verdict(obs: ExclusionObservation) -> Tuple[str, str]:
+    """'The node cannot decrypt the message': (verdict, evidence). Errors and an
+    unobserved node are inconclusive; only typed refusals or key failures pass."""
+    if obs.leaked:
+        return "fail", "leak"
+    if obs.probes == 0:
+        return "inconclusive", "unobserved"
+    if obs.errors:
+        return "inconclusive", "error_responses"
+    return "pass", ("key" if obs.key_probes else "gate")
+
+
+def d60_verdict(obs: ExclusionObservation, post_epoch: int,
+                journal: Optional[Dict[str, Any]]) -> Tuple[str, str]:
+    """'No post-removal key reaches the node': (verdict, evidence class).
+
+    verdict is pass | fail | inconclusive | limited. 'limited' means the API and
+    the journal give no key evidence: the check is not claimed.
+    """
+    if obs.leaked:
+        return "fail", "leak"
+    if obs.probes == 0:
+        return "inconclusive", "unobserved"
+    if obs.errors:
+        return "inconclusive", "error_responses"
+    max_local = obs.max_local_epoch()
+    if max_local is not None and max_local >= post_epoch:
+        return "fail", "local_epoch_reached"
+    usable = (journal is not None and "error_class" not in journal
+              and isinstance(journal.get("info_lines"), int) and journal["info_lines"] > 0)
+    if usable and journal["attributed_max_epoch"] is not None and journal["attributed_max_epoch"] >= post_epoch:
+        return "fail", "journal_install"
+    # Keys only arrive: a key-material answer on the LAST probe covers the window.
+    if obs.last_class in KEY_EVIDENCE_CLASSES:
+        return "pass", "key"
+    if usable and journal["unattributed"] == 0:
+        return "pass", "journal"
+    return "limited", "membership_gate"
+
+
+@dataclass
 class RekeyTracker:
-    """Probe outcomes for one post-removal message: survivors until they decrypt, the target always."""
+    """Probe outcomes for one post-removal message: survivors until they decrypt,
+    every excluded node (the target, and earlier removed members) always."""
     survivors: Tuple[str, ...]
-    target: str
+    excluded: Tuple[str, ...]
     started: float
     first_success: Dict[str, float] = field(default_factory=dict)
     survivor_epochs: Dict[str, Optional[int]] = field(default_factory=dict)
     survivor_classes: Dict[str, Dict[str, int]] = field(default_factory=dict)
-    target_classes: Dict[str, int] = field(default_factory=dict)
-    target_local_epochs: List[int] = field(default_factory=list)
-    target_leaked: bool = False
-    target_probes: int = 0
-    last_target_probe_at: Optional[float] = None
+    exclusions: Dict[str, ExclusionObservation] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        overlap = set(self.survivors) & set(self.excluded)
+        if overlap:
+            raise ValueError(f"nodes both survive and are excluded: {sorted(overlap)}")
+        for node in self.excluded:
+            self.exclusions.setdefault(node, ExclusionObservation())
 
     def observe(self, node: str, at: float, cls: str, epoch: Optional[int]) -> None:
-        if node == self.target:
-            self.target_probes += 1
-            self.last_target_probe_at = at
-            self.target_classes[cls] = self.target_classes.get(cls, 0) + 1
-            if cls in LEAK_CLASSES:
-                self.target_leaked = True
-            elif cls == "epoch_mismatch" and epoch is not None:
-                self.target_local_epochs.append(epoch)
+        if node in self.exclusions:
+            self.exclusions[node].observe(at, cls, epoch)
             return
         if node not in self.survivors:
-            raise ValueError(f"{node} is neither a survivor nor the target")
+            raise ValueError(f"{node} is neither a survivor nor excluded")
         if node in self.first_success:
             return
         counts = self.survivor_classes.setdefault(node, {})
@@ -366,8 +643,8 @@ class RekeyTracker:
     def pending(self) -> List[str]:
         return [node for node in self.survivors if node not in self.first_success]
 
-    def target_max_local_epoch(self) -> Optional[int]:
-        return max(self.target_local_epochs) if self.target_local_epochs else None
+    def leaked(self) -> bool:
+        return any(obs.leaked for obs in self.exclusions.values())
 
     def summary(self) -> Dict[str, Any]:
         latencies = dict(self.first_success)
@@ -379,12 +656,7 @@ class RekeyTracker:
             "unconverged": self.pending(),
             "survivor_epochs": dict(self.survivor_epochs),
             "survivor_probe_classes": {k: dict(v) for k, v in self.survivor_classes.items()},
-            "target_probe_classes": dict(self.target_classes),
-            "target_probes": self.target_probes,
-            "target_max_local_epoch": self.target_max_local_epoch(),
-            "target_leaked": self.target_leaked,
-            "target_observed_until_s": (round(self.last_target_probe_at - self.started, 3)
-                                        if self.last_target_probe_at is not None else None),
+            "excluded": {node: obs.summary(self.started) for node, obs in self.exclusions.items()},
         }
 
 
@@ -410,20 +682,47 @@ class RekeyApi(Api):
             return error.code, payload if isinstance(payload, dict) else {}
 
 
+def ssh_read(address: str, script: str, args: Sequence[str], timeout: float) -> Tuple[Optional[str], Dict[str, Any]]:
+    """Run a read-only script on the node; (stdout or None, error facts)."""
+    remote = shlex.join(["bash", "-s", "--", *args])
+    try:
+        result = subprocess.run([*SSH_BASE, f"root@{address}", remote], input=script.encode(),
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=timeout, check=False)
+    except Exception as error:
+        return None, {"error_class": safe_error_class(error)}
+    if result.returncode != 0:
+        return None, {"error_class": "ssh_failed", "returncode": result.returncode}
+    return result.stdout.decode("utf-8", errors="replace"), {}
+
+
 def scan_journal(address: str, window_seconds: float, timeout: float = 45.0) -> Dict[str, Any]:
     """Read-only count of the JOURNAL_PATTERNS markers in the unit's last window."""
     window = max(1, int(math.ceil(window_seconds)))
-    try:
-        result = subprocess.run([*SSH_BASE, f"root@{address}", "bash", "-s", "--", str(window)],
-                                input=JOURNAL_SCRIPT.encode(), stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, timeout=timeout, check=False)
-    except Exception as error:
-        return {"window_seconds": window, "error_class": safe_error_class(error)}
-    if result.returncode != 0:
-        return {"window_seconds": window, "error_class": "ssh_failed", "returncode": result.returncode}
-    parsed = parse_journal_matches(result.stdout.decode("utf-8", errors="replace"))
+    text, error = ssh_read(address, JOURNAL_SCRIPT, [str(window), *(needle for _, needle in JOURNAL_PATTERNS)],
+                           timeout)
+    if text is None:
+        return {"window_seconds": window, **error}
+    parsed = parse_journal_matches(text)
     parsed["window_seconds"] = window
     return parsed
+
+
+def scan_share_installs(address: str, window_seconds: float, stable_gid: str,
+                        timeout: float = 45.0) -> Dict[str, Any]:
+    """Read-only: GSS share installs logged by the node in the last window."""
+    window = max(1, int(math.ceil(window_seconds)))
+    text, error = ssh_read(address, JOURNAL_SCRIPT, [str(window), SHARE_INSTALL_MARKER], timeout)
+    if text is None:
+        return {"window_seconds": window, **error}
+    parsed = parse_share_installs(text, stable_gid)
+    parsed["window_seconds"] = window
+    return parsed
+
+
+def read_live_sha(address: str, timeout: float = 30.0) -> Optional[str]:
+    """sha256 of the RUNNING x0xd (/proc/<MainPID>/exe), or None."""
+    text, _error = ssh_read(address, LIVE_SHA_SCRIPT, [], timeout)
+    return parse_sha256sum(text) if text is not None else None
 
 
 # --------------------------------------------------------------------------- evidence
@@ -431,15 +730,47 @@ def scan_journal(address: str, window_seconds: float, timeout: float = 45.0) -> 
 @dataclass
 class RekeyEvidence(Evidence):
     cases: List[Dict[str, Any]] = field(default_factory=list)
+    limitations: List[Dict[str, Any]] = field(default_factory=list)
 
     def soft_check(self, label: str, condition: bool, **facts: Any) -> bool:
         """Record a check without raising, so sibling checks still run."""
         self.assertions.append({"label": label, "passed": bool(condition), **facts})
         return bool(condition)
 
+    def verdict_row(self, label: str, verdict: str, **facts: Any) -> str:
+        """pass | fail | inconclusive, recorded without raising. Inconclusive is a failed row
+        that says so: it never counts as a pass."""
+        if verdict not in ("pass", "fail", "inconclusive"):
+            raise ValueError(f"unknown verdict {verdict}")
+        row: Dict[str, Any] = {"label": label, "passed": verdict == "pass", **facts}
+        if verdict == "inconclusive":
+            row["verdict"] = "inconclusive"
+        self.assertions.append(row)
+        return verdict
+
+    def verdict(self) -> str:
+        failed = [row for row in self.assertions if not row["passed"]]
+        if not failed:
+            return "pass"
+        return "inconclusive" if all(row.get("verdict") == "inconclusive" for row in failed) else "fail"
+
     def report(self) -> Dict[str, Any]:
-        return {"scenario": "survivor_rekey", "cases": self.cases, "polls": self.polls,
-                "assertions": self.assertions}
+        return {"scenario": "survivor_rekey", "verdict": self.verdict(), "cases": self.cases,
+                "limitations": self.limitations, "polls": self.polls, "assertions": self.assertions}
+
+
+def rows_outcome(rows: List[Dict[str, Any]], completed: bool) -> str:
+    failed = [row for row in rows if not row["passed"]]
+    if any(row.get("verdict") != "inconclusive" for row in failed):
+        return "failed"
+    if failed:
+        return "inconclusive"
+    return "passed" if completed else "failed"
+
+
+def require_all_pass(case: str, verdicts: Sequence[str]) -> None:
+    if any(verdict != "pass" for verdict in verdicts):
+        raise AssertionError(f"{case}: checks did not pass")
 
 
 # --------------------------------------------------------------------------- scenario
@@ -452,8 +783,16 @@ class RekeyScenario(PrivateScenario):
                  restart_lead_secs: float = 15, probe_period: float = 1.0,
                  versions: Optional[Dict[str, Optional[str]]] = None,
                  journal_scan: Optional[Callable[[str, float], Dict[str, Any]]] = None,
+                 share_install_scan: Optional[Callable[[str, float, str], Dict[str, Any]]] = None,
+                 binary_sha: Optional[Callable[[str], Optional[str]]] = None,
                  clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep) -> None:
+        for name, value in (("timeout", timeout), ("rekey_timeout", rekey_timeout), ("watch_secs", watch_secs),
+                            ("rejoin_watch_secs", rejoin_watch_secs), ("restart_lead_secs", restart_lead_secs)):
+            if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be a finite positive number of seconds")
+        if not math.isfinite(probe_period) or probe_period < 0:
+            raise ValueError("probe_period must be finite and not negative")
         super().__init__(clients, evidence, timeout)
         self.e: RekeyEvidence = evidence
         self.rekey_timeout, self.watch_secs = rekey_timeout, watch_secs
@@ -461,6 +800,8 @@ class RekeyScenario(PrivateScenario):
         self.probe_period = probe_period
         self.versions: Dict[str, Optional[str]] = dict(versions or {})
         self.journal_scan = journal_scan
+        self.share_install_scan = share_install_scan
+        self.binary_sha = binary_sha
         self.now, self.sleep = clock, sleep
         self._aids: Dict[str, str] = {}
 
@@ -470,6 +811,15 @@ class RekeyScenario(PrivateScenario):
         if node not in self._aids:
             self._aids[node] = self.c[node].agent_id()
         return self._aids[node]
+
+    def safe_request(self, node: str, method: str, path: str,
+                     body: Optional[Dict[str, Any]] = None) -> Tuple[Optional[int], Dict[str, Any]]:
+        """A request whose transport failure is a None status, never an exception."""
+        try:
+            status, payload = self.c[node].request(method, path, body)
+        except Exception:
+            return None, {}
+        return status, payload if isinstance(payload, dict) else {}
 
     def seal(self, label: str, sealer: str, gid: str, plane: str) -> Tuple[Dict[str, Any], str]:
         """Seal a fresh random message; returns (decrypt body, expected payload_b64)."""
@@ -531,7 +881,8 @@ class RekeyScenario(PrivateScenario):
 
     # -- group setup --------------------------------------------------------
 
-    def create_group(self, block: str, plane: str, owner: str) -> str:
+    def create_group(self, block: str, plane: str, owner: str) -> Tuple[str, Optional[str]]:
+        """(map-key group id, stable group id or None)."""
         name = f"rekey-{plane}-{uuid.uuid4().hex[:10]}"
         request = ({"name": name, "policy": GSS_POLICY} if plane == "gss"
                    else {"name": name, "preset": "private_secure"})
@@ -544,7 +895,10 @@ class RekeyScenario(PrivateScenario):
         self.e.check(f"{block}: group policy is MlsEncrypted on the {plane} path",
                      policy.get("confidentiality") == "mls_encrypted" and hidden == (plane == "treekem"),
                      confidentiality=policy.get("confidentiality"), discoverability=policy.get("discoverability"))
-        return gid
+        # The stable id attributes share-install journal lines to this group.
+        sstatus, state = self.safe_request(owner, "GET", f"/groups/{enc(gid)}/state")
+        stable = state.get("group_id") if sstatus == 200 else None
+        return gid, (stable if isinstance(stable, str) and SHA256_HEX.fullmatch(stable) else None)
 
     def join_member(self, block: str, plane: str, owner: str, member: str, gid: str) -> None:
         invite = self.mint_invite(f"{block}: invite for {member}", owner, gid)
@@ -569,8 +923,9 @@ class RekeyScenario(PrivateScenario):
 
     def restart_before_act(self, case: str, remover: str,
                            restart_fn: Callable[[str], None]) -> Tuple[float, Dict[str, Any]]:
-        status, before = self.c[remover].request("GET", "/health")
+        status, before = self.safe_request(remover, "GET", "/health")
         aid_before = self.aid(remover)
+        sha_before = self.binary_sha(remover) if self.binary_sha is not None else None
         restart_fn(remover)
         restarted_at = self.now()
         poll(f"{case}: remover health after restart", 60,
@@ -578,16 +933,24 @@ class RekeyScenario(PrivateScenario):
              lambda got: got[0] == 200 and got[1].get("ok") is True,
              lambda facts, _last: self.e.record_poll(facts, operation="health", node=remover))
         healthy_s = round(self.now() - restarted_at, 3)
-        status_after, after = self.c[remover].request("GET", "/health")
+        status_after, after = self.safe_request(remover, "GET", "/health")
         aid_after = self.c[remover].agent_id()
+        sha_after = self.binary_sha(remover) if self.binary_sha is not None else None
         version_after = normalize_version(after.get("version")) if status_after == 200 else None
         uptime_after = after.get("uptime_secs") if status_after == 200 else None
         facts = {"health_after_restart_s": healthy_s,
                  "uptime_before_s": before.get("uptime_secs") if status == 200 else None,
-                 "uptime_after_s": uptime_after, "version_after": version_after}
+                 "uptime_after_s": uptime_after, "version_after": version_after,
+                 "binary_sha256_before": sha_before, "binary_sha256_after": sha_after}
         self.e.check(f"{case}: remover restarted and kept its identity",
                      aid_after == aid_before and restart_observed(uptime_after, self.now() - restarted_at),
                      node=remover, **facts)
+        if self.binary_sha is not None:
+            verdict = ("inconclusive" if sha_before is None or sha_after is None
+                       else "pass" if sha_before == sha_after else "fail")
+            require_all_pass(case, [self.e.verdict_row(f"{case}: remover runs the same binary after the restart",
+                                                       verdict, node=remover, binary_sha256_before=sha_before,
+                                                       binary_sha256_after=sha_after)])
         if version_after is not None:
             self.versions[remover] = version_after
         return restarted_at, facts
@@ -633,66 +996,123 @@ class RekeyScenario(PrivateScenario):
             self.sleep(rest)
 
     def converge(self, gid: str, sealed: Dict[str, Any], expected: str, survivors: List[str],
-                 target: str, acted_at: float) -> RekeyTracker:
-        """Round-robin: every pending survivor and the target each round, then the target alone."""
-        tracker = RekeyTracker(tuple(survivors), target, acted_at)
+                 excluded: List[str], acted_at: float) -> RekeyTracker:
+        """Round-robin: every pending survivor and every excluded node each round, then
+        the excluded nodes alone for the watch window."""
+        tracker = RekeyTracker(tuple(survivors), tuple(excluded), acted_at)
         deadline = acted_at + self.rekey_timeout
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(survivors) + 1) as pool:
-            while tracker.pending() and self.now() < deadline and not tracker.target_leaked:
-                self._probe_round(pool, tracker, [*tracker.pending(), target], gid, sealed, expected)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(survivors) + len(excluded)) as pool:
+            while tracker.pending() and self.now() < deadline and not tracker.leaked():
+                self._probe_round(pool, tracker, [*tracker.pending(), *excluded], gid, sealed, expected)
             watch_until = self.now() + self.watch_secs
-            while self.now() < watch_until and not tracker.target_leaked:
-                self._probe_round(pool, tracker, [target], gid, sealed, expected)
+            while self.now() < watch_until and not tracker.leaked():
+                self._probe_round(pool, tracker, list(excluded), gid, sealed, expected)
         return tracker
+
+    def share_witness(self, plane: str, node: str, window: float,
+                      stable_gid: Optional[str]) -> Optional[Dict[str, Any]]:
+        if plane != "gss" or self.share_install_scan is None or stable_gid is None:
+            return None
+        try:
+            return self.share_install_scan(node, window, stable_gid)
+        except Exception as error:
+            return {"error_class": safe_error_class(error)}
+
+    def exclusion_checks(self, case: str, plane: str, action: str, target: str, tracker: RekeyTracker,
+                         post_epoch: int, act_started: float, stable_gid: Optional[str],
+                         record: Dict[str, Any]) -> List[str]:
+        verdicts: List[str] = []
+        witnesses: Dict[str, Any] = {}
+        evidence: Dict[str, Any] = {}
+        for node, obs in tracker.exclusions.items():
+            role = "target" if node == target else "departed"
+            verdict, kind = exclusion_verdict(obs)
+            verdicts.append(self.e.verdict_row(
+                f"{case}: {node} cannot decrypt the post-{action} message", verdict, node=node, role=role,
+                evidence_class=kind, probe_classes=dict(obs.classes)))
+            witness = self.share_witness(plane, node, self.now() - act_started + 2, stable_gid)
+            if witness is not None:
+                witnesses[node] = witness
+            d60, d60_class = d60_verdict(obs, post_epoch, witness)
+            evidence[node] = {"decrypt": kind, "d60": d60_class, "d60_verdict": d60}
+            label = f"{case}: no post-{action} key reaches {node} during the watch (D60)"
+            facts = {"node": node, "role": role, "evidence_class": d60_class, "watch_seconds": self.watch_secs,
+                     "observed_until_seconds": obs.summary(tracker.started)["observed_until_s"],
+                     "last_class": obs.last_class, "max_local_epoch": obs.max_local_epoch(),
+                     "post_epoch": post_epoch}
+            if d60 == "limited":
+                # Not claimed: the membership gate answers before key material and no
+                # key-install witness exists for this plane or node.
+                reason = ("membership gate answers before key material; TreeKEM logs no key install"
+                          if plane == "treekem" else
+                          "membership gate answers before key material; no usable share-install journal witness")
+                self.e.limitations.append({"case": case, "check": label, "reason": reason, "plane": plane,
+                                           **facts, "evidence_class": "limited"})
+            else:
+                verdicts.append(self.e.verdict_row(label, d60, **facts))
+        record["share_install_witness"] = witnesses
+        record["exclusion_evidence"] = evidence
+        return verdicts
 
     def banned_rejoin(self, case: str, plane: str, remover: str, target: str, gid: str,
                       invite: str) -> Dict[str, Any]:
         """The banned target re-joins with an invite minted before the ban."""
-        try:
-            status, body = self.c[target].request("POST", "/groups/join", {"invite": invite})
-        except Exception as error:
-            status, body = None, {"transport_error_class": safe_error_class(error)}
+        status, body = self.safe_request(target, "POST", "/groups/join", {"invite": invite})
         attempt = classify_join_attempt(status, body)
         sealed, payload = self.seal(f"{case}: remover seals post-rejoin-attempt message", remover, gid, plane)
         target_aid = self.aid(target)
-        seated = leaked = False
-        classes: Dict[str, int] = {}
+        obs = ExclusionObservation()
+        roster_reads: List[Optional[bool]] = []
         deadline = self.now() + self.rejoin_watch_secs
-        while self.now() < deadline and not (seated or leaked):
-            rstatus, roster = self.c[remover].request("GET", f"/groups/{enc(gid)}/members")
-            seated = member_is_active(rstatus, roster, target_aid) is True
-            _status, cls, _epoch = self.decrypt(target, gid, sealed, payload)
-            classes[cls] = classes.get(cls, 0) + 1
-            leaked = cls in LEAK_CLASSES
+        while self.now() < deadline:
+            rstatus, roster = self.safe_request(remover, "GET", f"/groups/{enc(gid)}/members")
+            read = member_is_active(rstatus, roster, target_aid)
+            roster_reads.append(read)
+            _status, cls, epoch = self.decrypt(target, gid, sealed, payload)
+            obs.observe(self.now(), cls, epoch)
+            if read is True or obs.leaked:
+                break
             self.sleep(self.probe_period)
-        try:
-            ostatus, obody = self.c[target].request("GET", f"/groups/{enc(gid)}/join-status")
-        except Exception:
-            ostatus, obody = None, {}
-        outcome = classify_join_outcome(ostatus, obody)
-        result = {"attempt": attempt, "join_status": outcome, "probe_classes": classes,
-                  "watch_seconds": self.rejoin_watch_secs}
-        self.e.soft_check(f"{case}: banned {target} re-join is never seated", not seated,
-                          node=target, attempt=attempt, join_status=outcome)
-        self.e.soft_check(f"{case}: banned {target} gains no key from the re-join attempt", not leaked,
-                          node=target, probe_classes=classes)
-        if seated or leaked:
-            raise AssertionError(f"{case}: banned re-join check failed")
+        join_status = classify_join_status(*self.safe_request(target, "GET", f"/groups/{enc(gid)}/join-status"))
+        local = classify_local_membership(*self.safe_request(target, "GET", f"/groups/{enc(gid)}"))
+        seat_verdict, seat_reason = rejoin_verdict(attempt, roster_reads, local, join_status)
+        key_verdict, key_kind = exclusion_verdict(obs)
+        reads = {"total": len(roster_reads), "invalid": sum(1 for r in roster_reads if r is None),
+                 "active": sum(1 for r in roster_reads if r is True)}
+        result = {"attempt": attempt, "join_status": join_status, "local_membership": local,
+                  "roster_reads": reads, "probe_classes": dict(obs.classes),
+                  "watch_seconds": self.rejoin_watch_secs, "seat_verdict": seat_verdict,
+                  "seat_reason": seat_reason, "key_verdict": key_verdict}
+        verdicts = [
+            self.e.verdict_row(f"{case}: banned {target} re-join is never seated", seat_verdict, node=target,
+                               reason=seat_reason, attempt=attempt, join_status=join_status,
+                               local_membership=local, roster_reads=reads),
+            self.e.verdict_row(f"{case}: banned {target} gains no key from the re-join attempt", key_verdict,
+                               node=target, evidence_class=key_kind, probe_classes=dict(obs.classes)),
+        ]
+        require_all_pass(f"{case}: banned re-join", verdicts)
         return result
 
     def run_case(self, block: str, variant: str, plane: str, action: str, gid: str, remover: str,
-                 target: str, survivors: List[str], restart_fn: Optional[Callable[[str], None]]) -> None:
+                 target: str, survivors: List[str], restart_fn: Optional[Callable[[str], None]],
+                 departed: Sequence[str] = (), stable_gid: Optional[str] = None) -> None:
         case = f"{block}/{action}"
         case_started = self.now()
+        first_row = len(self.e.assertions)
+        excluded = [target, *departed]
+        completed = False
         record: Dict[str, Any] = {
             "case": case, "variant": variant, "plane": plane, "action": action,
-            "group_id": safe_identifier(gid), "remover": remover, "target": target,
-            "survivors": list(survivors), "started_utc": utc_now(), "outcome": "failed",
+            "group_id": safe_identifier(gid), "stable_group_id": stable_gid, "remover": remover,
+            "target": target, "departed": list(departed), "survivors": list(survivors),
+            "started_utc": utc_now(), "outcome": "failed",
             "versions": {"remover": self.versions.get(remover), "target": self.versions.get(target),
+                         "departed": {node: self.versions.get(node) for node in departed},
                          "survivors": {node: self.versions.get(node) for node in survivors}},
         }
         self.e.cases.append(record)
-        print(f"[rekey] {case}: remover={remover} target={target} survivors={','.join(survivors)}", flush=True)
+        print(f"[rekey] {case}: remover={remover} target={target} survivors={','.join(survivors)}"
+              f"{' departed=' + ','.join(departed) if departed else ''}", flush=True)
         try:
             self.e.check(f"{case}: group has at least four members before the {action}",
                          len(survivors) + 2 >= 4, members=len(survivors) + 2)
@@ -724,53 +1144,42 @@ class RekeyScenario(PrivateScenario):
                          status == 200 and body.get("ok") is not False, status=status,
                          seconds=record["act"]["seconds"])
 
-            sealed, payload, attempts = self.seal_after(case, action, plane, remover, gid, record["epoch_before"])
+            sealed, payload, _attempts = self.seal_after(case, action, plane, remover, gid, record["epoch_before"])
             post_epoch = sealed["secret_epoch"]
             record["epoch_after"] = post_epoch
             record["seal_after_seconds"] = round(self.now() - acted_at, 3)
 
-            tracker = self.converge(gid, sealed, payload, survivors, target, acted_at)
+            tracker = self.converge(gid, sealed, payload, survivors, excluded, acted_at)
             summary = tracker.summary()
             record["rekey"] = summary
-            print(f"[rekey] {case}: latency_s={summary['rekey_latency_s']} "
-                  f"unconverged={summary['unconverged']} target={summary['target_probe_classes']}", flush=True)
-            ok = True
+            print(f"[rekey] {case}: latency_s={summary['rekey_latency_s']} unconverged={summary['unconverged']}",
+                  flush=True)
+            verdicts: List[str] = []
             for node in survivors:
                 latency = tracker.first_success.get(node)
                 epoch = tracker.survivor_epochs.get(node)
-                ok &= self.e.soft_check(
+                verdicts.append(self.e.verdict_row(
                     f"{case}: {node} rekeyed and decrypts the post-{action} message",
-                    latency is not None and (epoch is None or epoch >= post_epoch),
+                    "pass" if latency is not None and (epoch is None or epoch >= post_epoch) else "fail",
                     node=node, latency_seconds=latency, secret_epoch=epoch, post_epoch=post_epoch,
                     probe_classes=summary["survivor_probe_classes"].get(node, {}),
-                    version=self.versions.get(node))
-            ok &= self.e.soft_check(
-                f"{case}: {target} cannot decrypt the post-{action} message", not tracker.target_leaked,
-                node=target, probe_classes=summary["target_probe_classes"])
-            max_local = tracker.target_max_local_epoch()
-            ok &= self.e.soft_check(
-                f"{case}: no post-{action} key reaches {target} during the watch (D60)",
-                not tracker.target_leaked and (max_local is None or max_local < post_epoch),
-                node=target, watch_seconds=self.watch_secs,
-                observed_until_seconds=summary["target_observed_until_s"],
-                target_max_local_epoch=max_local, post_epoch=post_epoch)
-            if not ok:
-                raise AssertionError(f"{case}: rekey checks failed")
+                    version=self.versions.get(node)))
+            verdicts += self.exclusion_checks(case, plane, action, target, tracker, post_epoch, act_started,
+                                              stable_gid, record)
+            require_all_pass(case, verdicts)
 
             for node in [remover, *survivors]:
                 self.await_not_active(f"{case}: {node} roster no longer lists {target} as active",
                                       node, gid, target_aid)
 
             if plane == "gss":
-                try:
-                    rstatus, rbody = self.c[remover].request(
-                        "POST", f"/groups/{enc(gid)}/secure/reseal", {"recipient": target_aid})
-                except Exception:
-                    rstatus, rbody = None, {}
+                rstatus, rbody = self.safe_request(remover, "POST", f"/groups/{enc(gid)}/secure/reseal",
+                                                   {"recipient": target_aid})
                 reseal = classify_reseal(rstatus, rbody)
                 record["reseal"] = {"status": rstatus, "response_class": reseal}
-                self.e.check(f"{case}: remover refuses to seal the current secret to {target}",
-                             reseal != "sealed", status=rstatus, response_class=reseal)
+                require_all_pass(case, [self.e.verdict_row(
+                    f"{case}: remover refuses to seal the current secret to {target} (recipient ineligible)",
+                    reseal_verdict(reseal), status=rstatus, response_class=reseal)])
 
             if pre_ban_invite is not None:
                 record["rejoin"] = self.banned_rejoin(case, plane, remover, target, gid, pre_ban_invite)
@@ -779,11 +1188,17 @@ class RekeyScenario(PrivateScenario):
             for node in survivors:
                 self.await_decrypt(f"{case}: {node} decrypts the final message", node, gid, final,
                                    final_payload, phase="final")
-            _status, cls, _epoch = self.decrypt(target, gid, final, final_payload)
-            self.e.check(f"{case}: {target} cannot decrypt the final message", cls not in LEAK_CLASSES,
-                         node=target, response_class=cls)
-            record["outcome"] = "passed"
+            final_verdicts = []
+            for node in excluded:
+                _status, cls, _epoch = self.decrypt(node, gid, final, final_payload)
+                verdict, kind = single_probe_verdict(cls)
+                final_verdicts.append(self.e.verdict_row(
+                    f"{case}: {node} cannot decrypt the final message", verdict, node=node,
+                    response_class=cls, evidence_class=kind))
+            require_all_pass(case, final_verdicts)
+            completed = True
         finally:
+            record["outcome"] = rows_outcome(self.e.assertions[first_row:], completed)
             record["finished_utc"] = utc_now()
             record["seconds"] = round(self.now() - case_started, 3)
             if self.journal_scan is not None:
@@ -798,17 +1213,20 @@ class RekeyScenario(PrivateScenario):
         remover = roles["remover"]
         joiners = [*roles["survivors"], roles["remove_target"], roles["ban_target"]]
         print(f"[rekey] {block}: creating group, {len(joiners)} joiners", flush=True)
-        gid = self.create_group(block, plane, remover)
+        gid, stable_gid = self.create_group(block, plane, remover)
         for member in joiners:
             self.join_member(block, plane, remover, member, gid)
         members = [remover, *joiners]
+        departed: List[str] = []
         targets = {"remove": roles["remove_target"], "ban": roles["ban_target"]}
         for action in ACTIONS:
             target = targets[action]
             survivors = [node for node in members if node not in (remover, target)]
             self.run_case(block, variant, plane, action, gid, remover, target, survivors,
-                          restart_fn if variant == "restart" else None)
+                          restart_fn if variant == "restart" else None, departed=list(departed),
+                          stable_gid=stable_gid)
             members.remove(target)
+            departed.append(target)
 
 
 # --------------------------------------------------------------------------- main
@@ -825,13 +1243,15 @@ def build_parser() -> argparse.ArgumentParser:
                         help="repeatable; default: plain then restart")
     parser.add_argument("--plane", action="append", choices=PLANES, help="repeatable; default: gss then treekem")
     parser.add_argument("--local-port-base", type=int, default=23900)
-    parser.add_argument("--poll-timeout", type=float, default=120)
-    parser.add_argument("--rekey-timeout", type=float, default=120)
-    parser.add_argument("--watch-secs", type=float, default=40)
-    parser.add_argument("--rejoin-watch-secs", type=float, default=30)
-    parser.add_argument("--restart-lead-secs", type=float, default=15)
+    defaults = {"--poll-timeout": 120.0, "--rekey-timeout": 120.0, "--watch-secs": 40.0,
+                "--rejoin-watch-secs": 30.0, "--restart-lead-secs": 15.0}
+    for flag, default in defaults.items():
+        low, high = DURATION_BOUNDS[flag]
+        parser.add_argument(flag, type=bounded_seconds(flag, low, high), default=default,
+                            help=f"seconds, {low:g}-{high:g} (default {default:g})")
     parser.add_argument("--expect-mixed", action="store_true",
-                        help="require two or more distinct deployed binaries among --nodes (needs the hosts file)")
+                        help="require two or more distinct verified running binaries among --nodes "
+                             "(needs the hosts file)")
     parser.add_argument("--allow-service-restart", action="store_true")
     parser.add_argument("--no-journal-scan", action="store_true")
     parser.add_argument("--report", required=True)
@@ -850,8 +1270,6 @@ def parse_and_validate(argv: Optional[List[str]] = None) -> argparse.Namespace:
             parser.error(f"each --{name} may be selected only once")
     if "restart" in args.variant and not args.allow_service_restart:
         parser.error("the restart variant requires --allow-service-restart")
-    if not restart_lead_ok(args.restart_lead_secs):
-        parser.error("--restart-lead-secs must be within 10-20 s")
     try:
         args.roles = assign_roles(args.nodes)
     except ValueError as error:
@@ -879,7 +1297,7 @@ def parse_and_validate(argv: Optional[List[str]] = None) -> argparse.Namespace:
         args.hosts_json_sha256 = hashlib.sha256(raw).hexdigest()
         args.node_binaries, problems = node_binary_map(doc, args.endpoints)
         if problems:
-            parser.error("hosts file does not describe these nodes: " + "; ".join(problems))
+            parser.error("hosts file does not describe these nodes completely: " + "; ".join(problems))
     if args.expect_mixed and not args.node_binaries:
         parser.error("--expect-mixed needs the eph hosts file")
     return args
@@ -896,6 +1314,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     custody = ServiceCustody(args.endpoints)
     succeeded = False
     live_versions: Dict[str, Optional[str]] = {}
+    live_shas: Dict[str, Optional[str]] = {}
     journal_totals: Dict[str, Any] = {}
 
     def await_health(node: str) -> None:
@@ -904,9 +1323,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             raise RuntimeError(f"no owned API client available to verify {node} health")
         poll(f"{node} health", 60, lambda: client.request("GET", "/health"),
              lambda result: result[0] == 200 and result[1].get("ok") is True)
-
-    def journal(node: str, window: float) -> Dict[str, Any]:
-        return scan_journal(args.endpoints[node], window)
 
     try:
         for index, node in enumerate(args.nodes):
@@ -922,23 +1338,26 @@ def main(argv: Optional[List[str]] = None) -> int:
         for node in args.nodes:
             status, body = clients[node].request("GET", "/health")
             live_versions[node] = normalize_version(body.get("version")) if status == 200 else None
+            live_shas[node] = read_live_sha(args.endpoints[node])
         evidence.check("live version recorded for every node", all(live_versions.values()),
                        versions=dict(live_versions))
-        for node, deployed in args.node_binaries.items():
-            evidence.check(f"{node} live version matches the binary deployed to it",
-                           deployed["deployed_version"] in (None, live_versions.get(node)),
-                           live_version=live_versions.get(node), deployed_version=deployed["deployed_version"],
-                           daemon_sha256=deployed["daemon_sha256"])
+        metadata = [evidence.verdict_row(f"{node} runs the version and binary deployed to it", verdict, **facts)
+                    for node, verdict, facts in binary_checks(args.node_binaries, live_versions, live_shas)]
         if args.expect_mixed:
-            shas = {entry["daemon_sha256"] for entry in args.node_binaries.values() if entry["daemon_sha256"]}
-            evidence.check("selected nodes run two or more distinct binaries", len(shas) >= 2,
-                           distinct_binaries=len(shas))
+            verdict, facts = mixed_check(args.node_binaries, live_shas)
+            metadata.append(evidence.verdict_row("selected nodes run two or more distinct verified binaries",
+                                                 verdict, **facts))
+        require_all_pass("node metadata", metadata)
 
         scenario = RekeyScenario(
             clients, evidence, args.poll_timeout, rekey_timeout=args.rekey_timeout,
             watch_secs=args.watch_secs, rejoin_watch_secs=args.rejoin_watch_secs,
             restart_lead_secs=args.restart_lead_secs, versions=live_versions,
-            journal_scan=None if args.no_journal_scan else journal)
+            journal_scan=None if args.no_journal_scan else lambda node, window: scan_journal(
+                args.endpoints[node], window),
+            share_install_scan=None if args.no_journal_scan else lambda node, window, gid: scan_share_installs(
+                args.endpoints[node], window, gid),
+            binary_sha=lambda node: read_live_sha(args.endpoints[node]))
 
         def restart(node: str) -> None:
             custody.restart(node)
@@ -971,7 +1390,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 evidence.assertions.append({"label": f"cleanup: {type(error).__name__}", "passed": False})
                 succeeded = False
         report = evidence.report()
-        shas = sorted({entry["daemon_sha256"] for entry in args.node_binaries.values() if entry["daemon_sha256"]})
+        running = sorted({sha for sha in live_shas.values() if sha})
         report.update({
             "issue": 1216, "started_utc": started_utc, "finished_utc": utc_now(),
             "roles": roles, "variants": args.variant, "planes": args.plane,
@@ -979,12 +1398,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "watch_secs": args.watch_secs, "rejoin_watch_secs": args.rejoin_watch_secs,
                          "restart_lead_secs": args.restart_lead_secs, "expect_mixed": args.expect_mixed},
             "hosts_json_source": args.hosts_json_source, "hosts_json_sha256": args.hosts_json_sha256,
-            "node_versions": {node: {"live_version": live_versions.get(node),
+            "node_versions": {node: {"live_version": live_versions.get(node), "live_sha256": live_shas.get(node),
                                      **args.node_binaries.get(node, {"daemon_sha256": None,
                                                                      "deployed_version": None})}
                               for node in args.nodes},
-            "distinct_binaries": shas,
-            "mixed_binaries": len(shas) > 1 or len({v for v in live_versions.values() if v}) > 1,
+            "running_binaries": running,
+            "mixed_binaries": len(running) > 1 or len({v for v in live_versions.values() if v}) > 1,
             "journal_totals": journal_totals,
         })
         try:
@@ -992,10 +1411,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 json.dump(report, output, indent=2)
         except Exception:
             succeeded = False
-    passed = succeeded and bool(evidence.cases) and all(item["passed"] for item in evidence.assertions)
-    print(f"[rekey] {'PASS' if passed else 'FAIL'}: {sum(1 for a in evidence.assertions if a['passed'])}/"
-          f"{len(evidence.assertions)} assertions, {len(evidence.cases)} cases", flush=True)
-    return 0 if passed else 1
+    verdict = evidence.verdict() if succeeded and evidence.cases else "fail"
+    print(f"[rekey] {verdict.upper()}: {sum(1 for a in evidence.assertions if a['passed'])}/"
+          f"{len(evidence.assertions)} assertions, {len(evidence.cases)} cases, "
+          f"{len(evidence.limitations)} unclaimed (limited evidence)", flush=True)
+    return 0 if verdict == "pass" else 1
 
 
 if __name__ == "__main__":

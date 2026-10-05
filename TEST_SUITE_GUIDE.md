@@ -728,21 +728,47 @@ the next step (#1214: readiness is proven by decrypting, not by roster state).
    secret epoch.
 3. Every survivor decrypts it: the class-K share on GSS, the commit on
    TreeKEM. The latency from the removal is recorded per survivor.
-4. The target never decrypts it, during convergence and for `--watch-secs`
-   more (default 40 s, which covers the share resend and withheld re-checks;
-   D60). On GSS its local secret epoch must stay below the new one.
-5. Survivors' rosters drop the target. On GSS the remover refuses to re-seal
-   the secret to it. After a ban, the target's re-join with an invite minted
-   before the ban is never seated and gains no key.
-6. A final message decrypts on every survivor and not on the target.
+4. No excluded node decrypts it, during convergence and for `--watch-secs`
+   more (default 40 s, minimum 30 s, which covers the share resend and a
+   withheld re-check). The excluded nodes are the target and, in the ban case,
+   the member removed earlier, so a ban rotation that reaches it is caught.
+5. Survivors' rosters drop the target. On GSS the remover must answer the
+   explicit recipient-ineligible refusal (404 `recipient is not a member` or
+   409 `recipient_not_active`) when asked to re-seal the secret to it. After a
+   ban, the target re-joins with an invite minted before the ban: the join
+   response, the remover's roster, the target's own membership state and its
+   join-status must all show it unseated, and it gains no key.
+6. A final message decrypts on every survivor and on no excluded node.
+
+### Verdicts and evidence classes
+
+Every check is pass, fail or **INCONCLUSIVE**. Transport errors, timeouts,
+5xx, unexpected responses and invalid roster or status reads never count as an
+exclusion or a refusal; they make the check and its case inconclusive. The
+report has a top-level `verdict` and an outcome per case.
+
+The D60 check "no post-removal key reaches the node" is claimed only with key
+evidence:
+
+| Class | Meaning |
+|---|---|
+| `key` | The node's last decrypt answer came from its key material (GSS no secret, epoch mismatch with its local epoch, or AEAD failure; TreeKEM group not loaded or decrypt failure) |
+| `journal` | GSS only: the node's own journal, which logs every KEM-sealed share it installs, shows no install for this group in the case window and does hold info-level lines |
+| `limited` | Neither exists. A removed member's daemon answers `not a member` before it consults any key, and TreeKEM logs no key install. The check is not claimed: it goes to `limitations`, not `assertions` |
+
+In practice a removed TreeKEM member is `limited`; a banned member gives `key`
+evidence on both planes; a removed GSS member gives `journal` evidence unless
+`--no-journal-scan` is set.
 
 Evidence labels start with `<variant>/<plane>/<action>`, for example
 `restart/treekem/ban: sfo rekeyed and decrypts the post-ban message` or
-`plain/gss/remove: no post-remove key reaches nuremberg during the watch (D60)`.
-Each report case records `rekey_latency_s`, `slowest_survivor`, probe-class
-counts, epochs, the restart lead and every role's version. The remover's
-journal is scanned read-only for `err_recipient_undiscovered` (count and
-`waited_ms`). No tokens, ciphertexts, invites or log text are written.
+`plain/gss/ban: no post-ban key reaches singapore during the watch (D60)`.
+Each report case records `rekey_latency_s`, `slowest_survivor`, per-node probe
+classes for every excluded node, epochs, the restart lead, the remover's binary
+before and after the restart, and every role's version. Journals are read-only
+grep counts: `err_recipient_undiscovered` (count and `waited_ms`) on the
+remover, share installs on GSS excluded nodes. No tokens, ciphertexts, invites
+or log text are written.
 
 ### Running
 
@@ -761,7 +787,9 @@ $E fixture --run ID rekey --receipts "$R" --attempt a1 [--rotate K]
 
 Other flags: `--rekey-timeout` (120 s), `--rejoin-watch-secs` (30 s),
 `--poll-timeout` (120 s), `--hosts-json`, `--expect-mixed`,
-`--no-journal-scan`. Expect roughly 20–30 minutes for both variants.
+`--no-journal-scan`. Every duration must be a finite number of seconds within
+its bounds (watch ≥ 30, rejoin watch ≥ 10, timeouts ≥ 10, all ≤ 3600; restart
+lead 10–20). Expect roughly 20–30 minutes for both variants.
 
 ### Mixed-version arm
 
@@ -770,10 +798,12 @@ example `$E deploy --run ID --binary <v0.46.3 x0xd> --binary-map
 sfo=<v0.46.2 x0xd>,helsinki=<v0.46.2 x0xd> ...`, then run the fixture; use
 `--rotate K` to put the other version in the remover's seat. The harness reads
 `testnet-hosts.json` next to the tokens file (or `--hosts-json`). It refuses a
-hosts file whose addresses differ from the tokens file, checks each node's live
-`/health` version against the binary deployed to that node, and records
-per-node sha256s. For a direct run, `--expect-mixed` also requires two or more
-distinct deployed binaries among `--nodes`.
+hosts file whose addresses differ from the tokens file or that lacks a valid
+sha256 and version for any selected node. Over SSH it reads the sha256 of each
+node's running x0xd (`/proc/<MainPID>/exe`); each node's live `/health` version
+and running sha256 must equal what was deployed to that node, and an unreadable
+value is inconclusive. For a direct run, `--expect-mixed` also requires two or
+more distinct verified running binaries among `--nodes`.
 
 ---
 

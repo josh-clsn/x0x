@@ -2,6 +2,7 @@
 import base64
 import hashlib
 import json
+import math
 import os
 import tempfile
 import threading
@@ -13,6 +14,8 @@ from e2e_vps_kv import PollTimeout
 
 LABELS = ["nyc", "sfo", "helsinki", "nuremberg", "singapore"]
 GID = "f" * 64
+STABLE = "e" * 64
+CLEAN_JOURNAL = {"attributed_epochs": [], "attributed_max_epoch": None, "unattributed": 0, "info_lines": 12}
 
 
 class FakeClock:
@@ -29,10 +32,14 @@ class FakeClock:
 
 
 class FakeNet:
-    """One group on one secure plane, shared by every fake daemon."""
+    """One group on one secure plane, shared by every fake daemon.
 
-    def __init__(self, plane, labels, *, lag=None, leak_to=None, withhold_join_key=(),
-                 reseal_leaks=False, seat_banned=False, on_health=None):
+    `override(net, label, method, path, body)` may return a (status, body) response,
+    raise, or return None to fall through to the normal behaviour.
+    """
+
+    def __init__(self, plane, labels, *, lag=None, leak_to=None, leak_to_on_ban=None, withhold_join_key=(),
+                 reseal_leaks=False, seat_banned=False, on_health=None, override=None):
         self.plane, self.labels, self.lock = plane, list(labels), threading.Lock()
         self.epoch = 0
         self.state = {label: None for label in labels}
@@ -40,8 +47,11 @@ class FakeNet:
         self.agents = {label: hashlib.sha256(label.encode()).hexdigest() for label in labels}
         self.by_agent = {aid: label for label, aid in self.agents.items()}
         self.lag, self.pending = dict(lag or {}), {}
-        self.leak_to, self.withhold_join_key = leak_to, set(withhold_join_key)
+        self.leak_to, self.leak_to_on_ban = leak_to, leak_to_on_ban
+        self.bypass = set([leak_to] if leak_to else [])
+        self.withhold_join_key = set(withhold_join_key)
         self.reseal_leaks, self.seat_banned, self.on_health = reseal_leaks, seat_banned, on_health
+        self.override, self.flags = override, set()
         self.messages, self.uptime, self.restarts = {}, {label: 1000 for label in labels}, []
         self.secrets = set()  # strings that must never reach a report
 
@@ -52,7 +62,7 @@ class FakeNet:
         self.uptime[label] = 0
         self.restarts.append(label)
 
-    def _rotate(self, exclude):
+    def _rotate(self, exclude, leak=None):
         self.epoch += 1
         owner = self.labels[0]
         self.have[owner] = self.epoch
@@ -64,8 +74,10 @@ class FakeNet:
                 self.have[label] = self.epoch
             else:
                 self.pending[label] = (delay, self.epoch)
-        if self.leak_to is not None:
-            self.have[self.leak_to] = self.epoch
+        for leaked in (self.leak_to, leak):
+            if leaked is not None:
+                self.have[leaked] = self.epoch
+                self.bypass.add(leaked)
 
     def _tick(self, label):
         if label in self.pending:
@@ -77,6 +89,10 @@ class FakeNet:
                 self.pending[label] = (remaining - 1, epoch)
 
     def handle(self, label, method, path, body):
+        if self.override is not None:
+            response = self.override(self, label, method, path, body)
+            if response is not None:
+                return response
         g = f"/groups/{GID}"
         if method == "GET" and path == "/agent":
             return 200, {"agent_id": self.agents[label]}
@@ -89,6 +105,8 @@ class FakeNet:
             policy = (dict(h.GSS_POLICY) if self.plane == "gss"
                       else {"discoverability": "hidden", "confidentiality": "mls_encrypted"})
             return 201, {"ok": True, "group_id": GID, "policy": policy}
+        if method == "GET" and path == f"{g}/state":
+            return 200, {"ok": True, "group_id": STABLE, "mls_group_id": GID}
         if method == "POST" and path == f"{g}/invite":
             link = f"x0x://invite/fake-{uuid.uuid4().hex}"
             self.secrets.add(link)
@@ -97,7 +115,8 @@ class FakeNet:
             if self.state[label] == "banned":
                 if self.seat_banned:
                     self.state[label], self.have[label] = "active", self.epoch
-                return 200, {"ok": True, "group_id": GID, "join_state": "pending_authority_commit"}
+                return 200, {"ok": True, "group_id": GID, "join_state": "pending_authority_commit",
+                             "already_joined": False}
             self.state[label] = "active"
             if self.plane == "treekem":  # the add commit moves every member to a new epoch
                 self.epoch += 1
@@ -112,6 +131,8 @@ class FakeNet:
         if method == "GET" and path == g:
             if self.state[label] == "active":
                 return 200, {"group_id": GID, "membership_state": "active"}
+            if self.state[label] in ("removed", "banned"):
+                return 200, {"group_id": GID, "membership_state": "not_member"}
             return 404, {"error": "group not found"}
         if method == "GET" and path == f"{g}/join-status":
             return 200, {"join_state": "idle", "last_join_outcome": {"outcome": "refused", "reason": "banned"}}
@@ -128,7 +149,7 @@ class FakeNet:
                          "secure_plane": "treekem"}
         if method == "POST" and path == f"{g}/secure/decrypt":
             self._tick(label)
-            if self.state[label] not in ("active", "banned") and label != self.leak_to:
+            if self.state[label] not in ("active", "banned") and label not in self.bypass:
                 return 403, {"ok": False, "error": "not a member"}
             epoch, payload = self.messages[body["ciphertext_b64"]]
             have = self.have[label]
@@ -152,7 +173,7 @@ class FakeNet:
         if method == "POST" and path.startswith(f"{g}/ban/"):
             target = self.by_agent[path.rsplit("/", 1)[1]]
             self.state[target] = "banned"
-            self._rotate(exclude=(target,))
+            self._rotate(exclude=(target,), leak=self.leak_to_on_ban)
             return 200, {"ok": True, "revision": 9}
         if method == "POST" and path == f"{g}/secure/reseal":
             target = self.by_agent[body["recipient"]]
@@ -160,7 +181,8 @@ class FakeNet:
                 self.secrets.add("SECRET-ENVELOPE")
                 return 200, {"ok": True, "envelope_b64": "SECRET-ENVELOPE"}
             if self.state[target] == "banned":
-                return 409, {"ok": False, "error": "recipient is not active", "reason": "recipient_not_active"}
+                return 409, {"ok": False, "error": "recipient is not an active member",
+                             "reason": "recipient_not_active"}
             return 404, {"ok": False, "error": "recipient is not a member"}
         return 500, {"error": f"unhandled {method} {path}"}
 
@@ -177,24 +199,42 @@ class FakeNode:
             return self.net.handle(self.label, method, path, body)
 
 
-def scenario(plane, poll_timeout=0.5, **net_kwargs):
+def scenario(plane, poll_timeout=0.5, share_installs=None, binary_sha="a" * 64, **net_kwargs):
+    """share_installs: None (clean witness), False (no journal scan), or callable(net, node, gid)."""
     net = FakeNet(plane, LABELS, **net_kwargs)
     clock = FakeClock()
     scans = []
 
     def journal(node, window):
         scans.append((node, window))
-        return {"counts": {"recipient_undiscovered": 0}, "window_seconds": int(window)}
+        return {"counts": {"recipient_undiscovered": 0}, "window_seconds": int(window), "info_lines": 3}
+
+    def installs(node, window, gid):
+        if callable(share_installs):
+            return share_installs(net, node, gid)
+        return dict(CLEAN_JOURNAL)
 
     s = h.RekeyScenario({label: net.node(label) for label in LABELS}, h.RekeyEvidence(), poll_timeout,
                         rekey_timeout=30, watch_secs=10, rejoin_watch_secs=5, restart_lead_secs=15,
                         probe_period=1.0, versions={label: "0.46.3" for label in LABELS},
-                        journal_scan=journal, clock=clock.now, sleep=clock.sleep)
+                        journal_scan=journal, share_install_scan=None if share_installs is False else installs,
+                        binary_sha=(lambda node: binary_sha), clock=clock.now, sleep=clock.sleep)
     return s, net, clock, scans
 
 
 def failed_labels(s):
     return [row["label"] for row in s.e.assertions if not row["passed"]]
+
+
+def row(s, label):
+    return next(r for r in s.e.assertions if r["label"] == label)
+
+
+def obs_of(*classes, epochs=None):
+    obs = h.ExclusionObservation()
+    for index, cls in enumerate(classes):
+        obs.observe(100.0 + index, cls, (epochs or {}).get(index))
+    return obs
 
 
 class PureHelperTests(unittest.TestCase):
@@ -228,49 +268,39 @@ class PureHelperTests(unittest.TestCase):
         self.assertIsNone(h.sealed_from_encrypt({"ok": False, "ciphertext_b64": "Y3Q=", "secret_epoch": 3}))
         self.assertIsNone(h.sealed_from_encrypt({"ciphertext_b64": "Y3Q=", "secret_epoch": True}))
 
-    def test_classify_decrypt(self):
+    def test_classify_decrypt_and_exclusion_kind(self):
         want = "cGF5bG9hZA=="
         cases = [
-            ((200, {"ok": True, "payload_b64": want, "secret_epoch": 4}), ("decrypted", 4)),
-            ((200, {"ok": True, "payload_b64": "b3RoZXI=", "secret_epoch": 4}), ("wrong_plaintext", 4)),
-            ((409, {"error": "epoch mismatch — re-share required", "local_epoch": 3}), ("epoch_mismatch", 3)),
-            ((409, {"error": "x", "reason": "fork_quarantined"}), ("fork_quarantined", None)),
-            ((409, {"error": "other"}), ("conflict", None)),
-            ((424, {"error": "no shared secret available"}), ("no_secret", None)),
+            ((200, {"ok": True, "payload_b64": want, "secret_epoch": 4}), ("decrypted", 4), "leak"),
+            ((200, {"ok": True, "payload_b64": "b3RoZXI=", "secret_epoch": 4}), ("wrong_plaintext", 4), "leak"),
+            ((409, {"error": "epoch mismatch — re-share required", "local_epoch": 3}), ("epoch_mismatch", 3), "key"),
+            ((424, {"error": "no shared secret available"}), ("no_secret", None), "key"),
             ((424, {"error": "TreeKEM group not loaded — restart or re-share required"}),
-             ("treekem_not_loaded", None)),
-            ((424, {"error": "else"}), ("failed_dependency", None)),
-            ((403, {"error": "not a member"}), ("not_member", None)),
-            ((403, {"error": "decryption failed"}), ("decrypt_failed", None)),
-            ((403, {"error": "x", "reason": "fork_quarantined"}), ("fork_quarantined", None)),
-            ((403, {"error": "rider"}), ("forbidden", None)),
-            ((400, {"error": "treekem decrypt failed: bad"}), ("treekem_decrypt_failed", None)),
-            ((400, {"error": "invalid base64 nonce"}), ("bad_request", None)),
-            ((404, {"error": "group not found"}), ("group_not_found", None)),
-            ((500, {"error": "boom"}), ("http_other", None)),
-            ((409, ["not", "a", "dict"]), ("conflict", None)),
+             ("treekem_not_loaded", None), "key"),
+            ((403, {"error": "decryption failed"}), ("decrypt_failed", None), "key"),
+            ((400, {"error": "treekem decrypt failed: bad"}), ("treekem_decrypt_failed", None), "key"),
+            ((403, {"error": "not a member"}), ("not_member", None), "gate"),
+            ((404, {"error": "group not found"}), ("group_not_found", None), "gate"),
+            ((409, {"error": "x", "reason": "fork_quarantined"}), ("fork_quarantined", None), "gate"),
+            ((403, {"error": "x", "reason": "fork_quarantined"}), ("fork_quarantined", None), "gate"),
+            ((403, {"error": "rider"}), ("forbidden", None), "gate"),
+            ((409, {"error": "other"}), ("conflict", None), "error"),
+            ((424, {"error": "else"}), ("failed_dependency", None), "error"),
+            ((400, {"error": "invalid base64 nonce"}), ("bad_request", None), "error"),
+            ((500, {"error": "boom"}), ("http_other", None), "error"),
+            ((None, {}), ("http_other", None), "error"),
+            ((409, ["not", "a", "dict"]), ("conflict", None), "error"),
         ]
-        for (status, body), expected in cases:
+        for (status, body), expected, kind in cases:
             with self.subTest(status=status, body=body):
                 self.assertEqual(h.classify_decrypt(status, body, want), expected)
-
-    def test_classify_reseal_and_join(self):
-        self.assertEqual(h.classify_reseal(200, {"envelope_b64": "S"}), "sealed")
-        self.assertEqual(h.classify_reseal(404, {"error": "recipient is not a member"}), "recipient_not_member")
-        self.assertEqual(h.classify_reseal(409, {"reason": "recipient_not_active"}), "recipient_not_active")
-        self.assertEqual(h.classify_reseal(403, {}), "forbidden")
-        self.assertEqual(h.classify_reseal(500, {}), "http_other")
-        self.assertEqual(h.classify_reseal(None, {}), "transport_error")
-        self.assertEqual(h.classify_join_attempt(200, {"join_state": "pending_authority_commit"}),
-                         {"status": 200, "join_state": "pending_authority_commit"})
-        self.assertEqual(h.classify_join_attempt(409, {"join_state": "<script>"}),
-                         {"status": 409, "join_state": "other"})
-        self.assertEqual(h.classify_join_outcome(200, {"last_join_outcome": {"outcome": "refused",
-                                                                             "reason": "banned"}}),
-                         {"status": 200, "outcome": "refused", "reason": "banned"})
-        self.assertEqual(h.classify_join_outcome(404, {"last_join_outcome": {"outcome": "x", "reason": "free text"}}),
-                         {"status": 404, "outcome": "other", "reason": "other"})
-        self.assertEqual(h.classify_join_outcome(200, {}), {"status": 200, "outcome": None, "reason": None})
+                self.assertEqual(h.exclusion_kind(expected[0]), kind)
+        self.assertEqual(h.exclusion_kind("transport:TimeoutError"), "error")
+        self.assertEqual(h.single_probe_verdict("not_member"), ("pass", "gate"))
+        self.assertEqual(h.single_probe_verdict("epoch_mismatch"), ("pass", "key"))
+        self.assertEqual(h.single_probe_verdict("decrypted"), ("fail", "leak"))
+        self.assertEqual(h.single_probe_verdict("http_other"), ("inconclusive", "error"))
+        self.assertEqual(h.single_probe_verdict("transport:URLError"), ("inconclusive", "error"))
 
     def test_member_is_active(self):
         roster = {"members": [{"agent_id": "a", "state": "Active"}, {"agent_id": "b", "state": "banned"}]}
@@ -278,6 +308,7 @@ class PureHelperTests(unittest.TestCase):
         self.assertFalse(h.member_is_active(200, roster, "b"))
         self.assertFalse(h.member_is_active(200, roster, "c"))
         self.assertIsNone(h.member_is_active(500, roster, "a"))
+        self.assertIsNone(h.member_is_active(None, {}, "a"))
         self.assertIsNone(h.member_is_active(200, {"members": None}, "a"))
 
     def test_restart_bounds(self):
@@ -285,6 +316,7 @@ class PureHelperTests(unittest.TestCase):
         self.assertTrue(h.restart_lead_ok(20.0))
         self.assertFalse(h.restart_lead_ok(9.99))
         self.assertFalse(h.restart_lead_ok(20.01))
+        self.assertFalse(h.restart_lead_ok(float("nan")))
         self.assertTrue(h.restart_observed(3, 4.0))
         self.assertFalse(h.restart_observed(500, 4.0))
         self.assertFalse(h.restart_observed(None, 4.0))
@@ -299,20 +331,41 @@ class PureHelperTests(unittest.TestCase):
             "DEBUG secure share recipient not yet discovered; resending: recipient_undiscovered",
             "DEBUG secure share write failed; retrying: timeout",
             "INFO unrelated line",
+            "x0x-rekey-info-lines=42",
         ])
         parsed = h.parse_journal_matches(text)
         self.assertEqual(parsed["counts"], {"recipient_undiscovered": 2, "welcome_fetch_failed": 1,
                                             "share_resend_undiscovered": 1, "share_write_retry": 1})
         self.assertEqual(parsed["recipient_undiscovered_waited_ms"], [1500, 20])
         self.assertEqual(parsed["recipient_undiscovered_waited_ms_max"], 1500)
+        self.assertEqual(parsed["info_lines"], 42)
         self.assertNotIn("deadbeef", json.dumps(parsed))
-        self.assertEqual(h.parse_journal_matches("")["recipient_undiscovered_waited_ms_max"], None)
+        self.assertIsNone(h.parse_journal_matches("")["info_lines"])
+
+    def test_parse_share_installs_attributes_by_stable_id(self):
+        text = "\n".join([
+            f"INFO x0x: Phase D.2: stored new group shared secret (epoch 4) via KEM-sealed envelope "
+            f"group_id={STABLE} secret_epoch=4",
+            '{"level":"INFO","fields":{"message":"Phase D.2: stored new group shared secret (epoch 6) '
+            f'via KEM-sealed envelope","group_id":"{STABLE}","secret_epoch":6}}}}',
+            "INFO x0x: Phase D.2: stored new group shared secret (epoch 9) via KEM-sealed envelope "
+            f"group_id={'d' * 64} secret_epoch=9",
+            "x0x-rekey-info-lines=7",
+        ])
+        parsed = h.parse_share_installs(text, STABLE)
+        self.assertEqual(parsed, {"attributed_epochs": [4, 6], "attributed_max_epoch": 6,
+                                  "unattributed": 1, "info_lines": 7})
+        self.assertNotIn(STABLE, json.dumps(parsed))
+        self.assertEqual(h.parse_sha256sum(f"{'a' * 64}  /proc/12/exe\n"), "a" * 64)
+        self.assertIsNone(h.parse_sha256sum("garbage /proc/12/exe"))
+        self.assertIsNone(h.parse_sha256sum(""))
 
     def test_rekey_tracker(self):
-        tracker = h.RekeyTracker(("sfo", "helsinki"), "nuremberg", started=100.0)
+        tracker = h.RekeyTracker(("sfo", "helsinki"), ("nuremberg", "sydney"), started=100.0)
         tracker.observe("sfo", 100.5, "epoch_mismatch", 3)
         tracker.observe("helsinki", 100.6, "decrypted", 4)
         tracker.observe("nuremberg", 100.6, "epoch_mismatch", 3)
+        tracker.observe("sydney", 100.6, "not_member", None)
         self.assertEqual(tracker.pending(), ["sfo"])
         tracker.observe("sfo", 102.25, "decrypted", 4)
         tracker.observe("sfo", 103.0, "epoch_mismatch", 3)  # ignored after success
@@ -322,17 +375,128 @@ class PureHelperTests(unittest.TestCase):
         self.assertEqual(summary["slowest_survivor"], "sfo")
         self.assertEqual(summary["rekey_latency_max_s"], 2.25)
         self.assertEqual(summary["survivor_probe_classes"]["sfo"], {"epoch_mismatch": 1, "decrypted": 1})
-        self.assertEqual(summary["target_probe_classes"], {"epoch_mismatch": 1, "not_member": 1})
-        self.assertEqual(summary["target_max_local_epoch"], 3)
-        self.assertFalse(summary["target_leaked"])
-        self.assertEqual(summary["target_observed_until_s"], 4.0)
-        tracker.observe("nuremberg", 105.0, "wrong_plaintext", 4)
-        self.assertTrue(tracker.target_leaked)
+        nuremberg = summary["excluded"]["nuremberg"]
+        self.assertEqual(nuremberg["classes"], {"epoch_mismatch": 1, "not_member": 1})
+        self.assertEqual((nuremberg["key_probes"], nuremberg["gate_probes"], nuremberg["errors"]), (1, 1, 0))
+        self.assertEqual(nuremberg["max_local_epoch"], 3)
+        self.assertEqual(nuremberg["last_class"], "not_member")
+        self.assertEqual(nuremberg["observed_until_s"], 4.0)
+        self.assertFalse(tracker.leaked())
+        tracker.observe("sydney", 105.0, "wrong_plaintext", 4)
+        self.assertTrue(tracker.leaked())
         with self.assertRaises(ValueError):
-            tracker.observe("sydney", 105.0, "decrypted", 4)
+            tracker.observe("tokyo", 105.0, "decrypted", 4)
+        with self.assertRaises(ValueError):
+            h.RekeyTracker(("sfo",), ("sfo",), started=0.0)
+
+
+class ExclusionVerdictTests(unittest.TestCase):
+    """Review items 1 and 2: errors are never exclusion; D60 is claimed only with key evidence."""
+
+    def test_exclusion_verdict(self):
+        self.assertEqual(h.exclusion_verdict(obs_of()), ("inconclusive", "unobserved"))
+        self.assertEqual(h.exclusion_verdict(obs_of("not_member", "not_member")), ("pass", "gate"))
+        self.assertEqual(h.exclusion_verdict(obs_of("not_member", "epoch_mismatch")), ("pass", "key"))
+        self.assertEqual(h.exclusion_verdict(obs_of("not_member", "http_other")), ("inconclusive", "error_responses"))
+        self.assertEqual(h.exclusion_verdict(obs_of("transport:TimeoutError")), ("inconclusive", "error_responses"))
+        self.assertEqual(h.exclusion_verdict(obs_of("http_other", "decrypted")), ("fail", "leak"))
+
+    def test_d60_needs_key_evidence_or_a_usable_journal(self):
+        gate = obs_of("not_member", "not_member")
+        self.assertEqual(h.d60_verdict(gate, 5, None), ("limited", "membership_gate"))
+        self.assertEqual(h.d60_verdict(gate, 5, dict(CLEAN_JOURNAL)), ("pass", "journal"))
+        for journal in ({**CLEAN_JOURNAL, "info_lines": 0}, {**CLEAN_JOURNAL, "info_lines": None},
+                        {"error_class": "ssh_failed"}, {**CLEAN_JOURNAL, "unattributed": 1}):
+            with self.subTest(journal=journal):
+                self.assertEqual(h.d60_verdict(gate, 5, journal), ("limited", "membership_gate"))
+        installed = {**CLEAN_JOURNAL, "attributed_epochs": [5], "attributed_max_epoch": 5}
+        self.assertEqual(h.d60_verdict(gate, 5, installed), ("fail", "journal_install"))
+        older = {**CLEAN_JOURNAL, "attributed_epochs": [4], "attributed_max_epoch": 4}
+        self.assertEqual(h.d60_verdict(gate, 5, older), ("pass", "journal"))
+        # Key material consulted on the last probe covers the window.
+        self.assertEqual(h.d60_verdict(obs_of("not_member", "epoch_mismatch", epochs={1: 4}), 5, None),
+                         ("pass", "key"))
+        # Key evidence early, gate late: the end of the window is not covered.
+        self.assertEqual(h.d60_verdict(obs_of("epoch_mismatch", "not_member", epochs={0: 4}), 5, None),
+                         ("limited", "membership_gate"))
+        self.assertEqual(h.d60_verdict(obs_of("epoch_mismatch", epochs={0: 5}), 5, None),
+                         ("fail", "local_epoch_reached"))
+        self.assertEqual(h.d60_verdict(obs_of("decrypted"), 5, None), ("fail", "leak"))
+        self.assertEqual(h.d60_verdict(obs_of("not_member", "http_other"), 5, dict(CLEAN_JOURNAL)),
+                         ("inconclusive", "error_responses"))
+        self.assertEqual(h.d60_verdict(obs_of(), 5, dict(CLEAN_JOURNAL)), ("inconclusive", "unobserved"))
+
+
+class RefusalVerdictTests(unittest.TestCase):
+    """Review items 3 and 4."""
+
+    def test_reseal_needs_the_explicit_ineligible_refusal(self):
+        self.assertEqual(h.classify_reseal(200, {"envelope_b64": "S"}), "sealed")
+        self.assertEqual(h.classify_reseal(404, {"error": "recipient is not a member"}), "recipient_not_member")
+        self.assertEqual(h.classify_reseal(404, {"error": "group not found"}), "http_other")
+        self.assertEqual(h.classify_reseal(409, {"reason": "recipient_not_active"}), "recipient_not_active")
+        self.assertEqual(h.classify_reseal(409, {"error": "group is withdrawn"}), "http_other")
+        self.assertEqual(h.classify_reseal(403, {}), "forbidden")
+        self.assertEqual(h.classify_reseal(500, {}), "http_other")
+        self.assertEqual(h.classify_reseal(None, {}), "transport_error")
+        self.assertEqual(h.reseal_verdict("recipient_not_member"), "pass")
+        self.assertEqual(h.reseal_verdict("recipient_not_active"), "pass")
+        self.assertEqual(h.reseal_verdict("sealed"), "fail")
+        for cls in ("http_other", "transport_error", "forbidden", "failed_dependency"):
+            self.assertEqual(h.reseal_verdict(cls), "inconclusive")
+
+    def test_join_classifiers(self):
+        self.assertEqual(h.classify_join_attempt(200, {"join_state": "pending_authority_commit",
+                                                       "already_joined": False}),
+                         {"status": 200, "join_state": "pending_authority_commit", "already_joined": False})
+        self.assertEqual(h.classify_join_attempt(409, {"join_state": "<script>", "already_joined": "yes"}),
+                         {"status": 409, "join_state": "other", "already_joined": None})
+        self.assertEqual(h.classify_join_status(200, {"join_state": "idle", "last_join_outcome": {
+            "outcome": "refused", "reason": "banned"}}),
+            {"status": 200, "join_state": "idle", "outcome": "refused", "reason": "banned", "valid": True})
+        self.assertEqual(h.classify_join_status(404, {"last_join_outcome": {"outcome": "x", "reason": "free text"}}),
+                         {"status": 404, "join_state": None, "outcome": "other", "reason": "other", "valid": True})
+        self.assertFalse(h.classify_join_status(500, {})["valid"])
+        self.assertFalse(h.classify_join_status(None, {})["valid"])
+        self.assertFalse(h.classify_join_status(200, {"join_state": "weird"})["valid"])
+        self.assertEqual(h.classify_local_membership(200, {"membership_state": "active"}), "seat")
+        self.assertEqual(h.classify_local_membership(200, {"membership_state": "not_member"}), "unseated")
+        self.assertEqual(h.classify_local_membership(404, {}), "unseated")
+        self.assertEqual(h.classify_local_membership(200, {}), "invalid")
+        self.assertEqual(h.classify_local_membership(500, {}), "invalid")
+        self.assertEqual(h.classify_local_membership(None, {}), "invalid")
+
+    def test_rejoin_verdict(self):
+        pending = {"status": 200, "join_state": "pending_authority_commit", "already_joined": False}
+        refused = {"status": 409, "join_state": None, "already_joined": None}
+        status_ok = {"valid": True, "outcome": None}
+        status_refused = {"valid": True, "outcome": "refused"}
+        self.assertEqual(h.rejoin_verdict(pending, [False, False], "unseated", status_ok), ("pass", "unseated"))
+        self.assertEqual(h.rejoin_verdict(pending, [False], "unseated", status_refused), ("pass", "refused"))
+        self.assertEqual(h.rejoin_verdict(refused, [False], "unseated", status_ok), ("pass", "refused"))
+        self.assertEqual(h.rejoin_verdict(pending, [False, True], "unseated", status_ok),
+                         ("fail", "seated_on_remover_roster"))
+        self.assertEqual(h.rejoin_verdict(pending, [False], "seat", status_ok), ("fail", "target_reports_active"))
+        self.assertEqual(h.rejoin_verdict({**pending, "join_state": "active"}, [False], "unseated", status_ok),
+                         ("fail", "join_reported_active"))
+        self.assertEqual(h.rejoin_verdict({**pending, "already_joined": True}, [False], "unseated", status_ok),
+                         ("fail", "join_reported_active"))
+        for attempt in ({"status": None}, {"status": 500}, {"status": 400}, {"status": 302}):
+            with self.subTest(attempt=attempt):
+                self.assertEqual(h.rejoin_verdict(attempt, [False], "unseated", status_ok),
+                                 ("inconclusive", "join_request_error"))
+        self.assertEqual(h.rejoin_verdict(pending, [False, None], "unseated", status_ok),
+                         ("inconclusive", "invalid_roster_read"))
+        self.assertEqual(h.rejoin_verdict(pending, [], "unseated", status_ok), ("inconclusive", "invalid_roster_read"))
+        self.assertEqual(h.rejoin_verdict(pending, [False], "invalid", status_ok),
+                         ("inconclusive", "invalid_local_read"))
+        self.assertEqual(h.rejoin_verdict(pending, [False], "unseated", {"valid": False}),
+                         ("inconclusive", "invalid_join_status"))
 
 
 class HostsFileTests(unittest.TestCase):
+    """Review item 5: complete, valid per-node metadata; live verification."""
+
     def doc(self, **override):
         hosts = [{"label": label, "public_ipv4": f"203.0.113.{i + 1}",
                   "daemon_sha256": ("a" if i % 2 else "b") * 64,
@@ -352,6 +516,17 @@ class HostsFileTests(unittest.TestCase):
         self.assertEqual(mapped["sfo"], {"daemon_sha256": "a" * 64, "deployed_version": "0.46.3"})
         self.assertEqual(len({entry["daemon_sha256"] for entry in mapped.values()}), 2)
 
+    def test_missing_or_malformed_metadata_is_a_problem(self):
+        for key, value in (("daemon_sha256", ""), ("daemon_sha256", "A" * 64), ("daemon_sha256", None),
+                           ("daemon_version", ""), ("daemon_version", "x0xd"), ("daemon_version", None)):
+            with self.subTest(key=key, value=value):
+                doc = self.doc()
+                doc["hosts"][1][key] = value
+                mapped, problems = h.node_binary_map(doc, self.endpoints())
+                self.assertNotIn("sfo", mapped)
+                self.assertEqual(len(problems), 1)
+                self.assertIn("sfo", problems[0])
+
     def test_problems_name_labels_not_addresses(self):
         endpoints = self.endpoints()
         endpoints["sfo"] = "198.51.100.9"
@@ -365,6 +540,30 @@ class HostsFileTests(unittest.TestCase):
         dup = self.doc()
         dup["hosts"].append(dict(dup["hosts"][0]))
         self.assertIn("hosts file lists nyc twice", h.node_binary_map(dup, self.endpoints())[1])
+
+    def test_live_version_and_running_binary_must_match_each_node(self):
+        mapped, _ = h.node_binary_map(self.doc(), self.endpoints())
+        versions = {node: entry["deployed_version"] for node, entry in mapped.items()}
+        shas = {node: entry["daemon_sha256"] for node, entry in mapped.items()}
+        self.assertEqual({v for _, v, _ in h.binary_checks(mapped, versions, shas)}, {"pass"})
+        verdicts = dict((node, v) for node, v, _ in h.binary_checks(
+            mapped, {**versions, "nyc": "0.46.3"}, {**shas, "sfo": "c" * 64, "helsinki": None}))
+        self.assertEqual(verdicts["nyc"], "fail")          # version differs from its own deploy
+        self.assertEqual(verdicts["sfo"], "fail")          # running binary differs
+        self.assertEqual(verdicts["helsinki"], "inconclusive")  # unreadable, never a pass
+        verdicts = dict((node, v) for node, v, _ in h.binary_checks(mapped, {**versions, "nuremberg": None}, shas))
+        self.assertEqual(verdicts["nuremberg"], "inconclusive")
+        self.assertEqual(h.binary_checks({}, {}, {}), [])
+
+    def test_expect_mixed_needs_verified_running_binaries(self):
+        mapped, _ = h.node_binary_map(self.doc(), self.endpoints())
+        shas = {node: entry["daemon_sha256"] for node, entry in mapped.items()}
+        self.assertEqual(h.mixed_check(mapped, shas)[0], "pass")
+        self.assertEqual(h.mixed_check(mapped, {**shas, "sfo": None})[0], "inconclusive")
+        self.assertEqual(h.mixed_check(mapped, {**shas, "sfo": "c" * 64})[0], "inconclusive")
+        same = {node: {"daemon_sha256": "a" * 64, "deployed_version": "0.46.3"} for node in LABELS}
+        verdict, facts = h.mixed_check(same, {node: "a" * 64 for node in LABELS})
+        self.assertEqual((verdict, facts["distinct_running_binaries"]), ("fail", 1))
 
     def test_resolve_hosts_json(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -391,6 +590,14 @@ class ArgumentTests(unittest.TestCase):
     def argv(self, *extra):
         return ["--network", "test", "--tokens-file", self.tokens, "--report", "/dev/null", *extra]
 
+    def write_hosts(self, mutate=None):
+        hosts = [{"label": label, "public_ipv4": f"203.0.113.{i + 1}", "daemon_sha256": str(i % 2) * 64,
+                  "daemon_version": "x0xd 0.46.3"} for i, label in enumerate(LABELS + ["sydney"])]
+        if mutate:
+            mutate(hosts)
+        with open(os.path.join(self.tmp.name, "testnet-hosts.json"), "w") as handle:
+            json.dump({"schema_version": 1, "kind": "x0x-testnet-hosts", "hosts": hosts}, handle)
+
     def test_eph_table_argv_parses(self):
         args = h.parse_and_validate(self.argv("--nodes", *LABELS, "--variant", "plain", "--variant", "restart",
                                               "--allow-service-restart"))
@@ -399,6 +606,7 @@ class ArgumentTests(unittest.TestCase):
         self.assertEqual(args.roles["remover"], "nyc")
         self.assertEqual(args.hosts_json_source, "absent")
         self.assertEqual(args.node_binaries, {})
+        self.assertEqual((args.watch_secs, args.rejoin_watch_secs, args.restart_lead_secs), (40.0, 30.0, 15.0))
 
     def test_defaults_run_both_variants_and_need_restart_permission(self):
         with self.assertRaises(SystemExit):
@@ -416,29 +624,56 @@ class ArgumentTests(unittest.TestCase):
             with self.subTest(extra=extra), self.assertRaises(SystemExit):
                 h.parse_and_validate(self.argv(*extra))
 
-    def test_sibling_hosts_file_is_validated_and_mapped(self):
-        hosts = [{"label": label, "public_ipv4": f"203.0.113.{i + 1}", "daemon_sha256": str(i % 2) * 64,
-                  "daemon_version": "x0xd 0.46.3"} for i, label in enumerate(LABELS + ["sydney"])]
-        path = os.path.join(self.tmp.name, "testnet-hosts.json")
-        with open(path, "w") as handle:
-            json.dump({"schema_version": 1, "kind": "x0x-testnet-hosts", "hosts": hosts}, handle)
+    def test_durations_must_be_finite_and_above_their_minimums(self):
+        """Review item 7."""
+        bad = {"--watch-secs": ("0", "-1", "nan", "inf", "-inf", "29.9", "abc", "3601"),
+               "--rejoin-watch-secs": ("0", "-5", "nan", "9"),
+               "--rekey-timeout": ("0", "nan", "inf", "9"),
+               "--poll-timeout": ("-1", "nan", "5"),
+               "--restart-lead-secs": ("nan", "inf", "9.9", "20.5")}
+        for flag, values in bad.items():
+            for value in values:
+                with self.subTest(flag=flag, value=value), self.assertRaises(SystemExit):
+                    h.parse_and_validate(self.argv("--variant", "plain", flag, value))
+        args = h.parse_and_validate(self.argv("--variant", "plain", "--watch-secs", "30", "--rejoin-watch-secs", "10",
+                                              "--rekey-timeout", "10", "--poll-timeout", "10",
+                                              "--restart-lead-secs", "20"))
+        self.assertEqual((args.watch_secs, args.rejoin_watch_secs, args.restart_lead_secs), (30.0, 10.0, 20.0))
+        clients = {label: object() for label in LABELS}
+        for kwargs in ({"watch_secs": float("nan")}, {"watch_secs": 0}, {"rejoin_watch_secs": -1},
+                       {"rekey_timeout": float("inf")}, {"probe_period": float("nan")}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                h.RekeyScenario(clients, h.RekeyEvidence(), 1.0, **kwargs)
+        with self.assertRaises(ValueError):
+            h.RekeyScenario(clients, h.RekeyEvidence(), float("nan"))
+
+    def test_sibling_hosts_file_must_be_complete(self):
+        self.write_hosts()
         args = h.parse_and_validate(self.argv("--variant", "plain", "--expect-mixed"))
         self.assertEqual(args.hosts_json_source, "sibling")
         self.assertEqual(len(args.hosts_json_sha256), 64)
         self.assertEqual(set(args.node_binaries), set(LABELS))
-        hosts[1]["public_ipv4"] = "198.51.100.1"
-        with open(path, "w") as handle:
-            json.dump({"schema_version": 1, "kind": "x0x-testnet-hosts", "hosts": hosts}, handle)
-        with self.assertRaises(SystemExit):
-            h.parse_and_validate(self.argv("--variant", "plain"))
+        for mutate in (lambda hosts: hosts[1].update(public_ipv4="198.51.100.1"),
+                       lambda hosts: hosts[2].update(daemon_sha256=""),
+                       lambda hosts: hosts[3].update(daemon_version="unknown"),
+                       lambda hosts: hosts[4].pop("daemon_version")):
+            self.write_hosts(mutate)
+            with self.assertRaises(SystemExit):
+                h.parse_and_validate(self.argv("--variant", "plain"))
 
 
 class ScenarioTests(unittest.TestCase):
-    def run_block(self, plane, variant="plain", **net_kwargs):
-        s, net, clock, scans = scenario(plane, **net_kwargs)
+    def run_block(self, plane, variant="plain", **kwargs):
+        s, net, clock, scans = scenario(plane, **kwargs)
         restart = net.restart if variant == "restart" else None
         s.run_block(variant, plane, h.assign_roles(LABELS), restart)
         return s, net, clock, scans
+
+    def run_failing_block(self, plane, expected=AssertionError, **kwargs):
+        s, net, _clock, _scans = scenario(plane, **kwargs)
+        with self.assertRaises(expected):
+            s.run_block("plain", plane, h.assign_roles(LABELS), None)
+        return s, net
 
     def test_block_passes_on_both_planes_and_variants(self):
         for plane in h.PLANES:
@@ -446,47 +681,212 @@ class ScenarioTests(unittest.TestCase):
                 with self.subTest(plane=plane, variant=variant):
                     s, net, _clock, scans = self.run_block(plane, variant, lag={"sfo": 3})
                     self.assertEqual(failed_labels(s), [])
+                    self.assertEqual(s.e.verdict(), "pass")
                     self.assertEqual([c["case"] for c in s.e.cases],
                                      [f"{variant}/{plane}/remove", f"{variant}/{plane}/ban"])
                     remove, ban = s.e.cases
                     self.assertEqual(remove["survivors"], ["sfo", "helsinki", "singapore"])
                     self.assertEqual(ban["survivors"], ["sfo", "helsinki"])
+                    self.assertEqual((remove["departed"], ban["departed"]), ([], ["nuremberg"]))
                     for case in s.e.cases:
                         self.assertEqual(case["outcome"], "passed")
+                        self.assertEqual(case["stable_group_id"], STABLE)
                         self.assertGreater(case["epoch_after"], case["epoch_before"])
                         self.assertEqual(case["rekey"]["rekey_latency_s"]["sfo"], 2.0)
                         self.assertEqual(case["rekey"]["slowest_survivor"], "sfo")
                         self.assertEqual(case["rekey"]["unconverged"], [])
-                        self.assertFalse(case["rekey"]["target_leaked"])
-                        self.assertGreaterEqual(case["rekey"]["target_probes"], 10)
                         self.assertEqual(case["versions"]["survivors"]["sfo"], "0.46.3")
                         self.assertIn("journal_remover", case)
+                        for obs in case["rekey"]["excluded"].values():
+                            self.assertGreaterEqual(obs["probes"], 10)
+                            self.assertEqual(obs["errors"], 0)
                         if variant == "restart":
                             self.assertEqual(case["restart"]["lead_seconds"], 15.0)
                         else:
                             self.assertIsNone(case["restart"])
                         self.assertEqual("reseal" in case, plane == "gss")
-                    self.assertEqual("rejoin" in ban, True)
+                    # Review item 6: the earlier removed member is probed during the ban.
+                    self.assertEqual(set(ban["rekey"]["excluded"]), {"singapore", "nuremberg"})
+                    self.assertEqual(ban["exclusion_evidence"]["singapore"]["d60"], "key")
+                    self.assertEqual(ban["rejoin"]["seat_reason"], "refused")
                     self.assertNotIn("rejoin", remove)
                     self.assertEqual(net.restarts, ["nyc", "nyc"] if variant == "restart" else [])
                     self.assertEqual([node for node, _ in scans], ["nyc", "nyc"])
+                    limited = sorted((lim["case"], lim["node"]) for lim in s.e.limitations)
+                    labels = [r["label"] for r in s.e.assertions]
                     if plane == "gss":
                         self.assertEqual(remove["reseal"]["response_class"], "recipient_not_member")
                         self.assertEqual(ban["reseal"]["response_class"], "recipient_not_active")
-                        self.assertEqual(ban["rekey"]["target_max_local_epoch"], ban["epoch_before"])
-                    labels = [row["label"] for row in s.e.assertions]
+                        self.assertEqual(ban["rekey"]["excluded"]["singapore"]["max_local_epoch"],
+                                         ban["epoch_before"])
+                        self.assertEqual(remove["exclusion_evidence"]["nuremberg"]["d60"], "journal")
+                        self.assertEqual(limited, [])
+                    else:
+                        # Item 1: a removed TreeKEM member answers the membership gate and has no
+                        # install witness, so its D60 is listed as limited and never claimed.
+                        self.assertEqual(limited, [(f"{variant}/treekem/ban", "nuremberg"),
+                                                   (f"{variant}/treekem/remove", "nuremberg")])
+                        self.assertNotIn(f"{variant}/treekem/remove: no post-remove key reaches nuremberg "
+                                         f"during the watch (D60)", labels)
+                        self.assertTrue(all(lim["evidence_class"] == "limited" for lim in s.e.limitations))
                     self.assertIn(f"{variant}/{plane}: helsinki key installed after join "
                                   f"(decrypts post-join message)", labels)
                     self.assertIn(f"{variant}/{plane}/ban: no post-ban key reaches singapore during the watch (D60)",
                                   labels)
+                    self.assertIn(f"{variant}/{plane}/ban: nuremberg cannot decrypt the post-ban message", labels)
                     report = json.dumps(s.e.report())
                     for secret in net.secrets:
                         self.assertNotIn(secret, report)
 
+    # --- item 1: D60 needs key evidence --------------------------------------
+
+    def test_gss_removed_member_without_journal_witness_is_limited(self):
+        s, *_ = self.run_block("gss", share_installs=False)
+        self.assertEqual(failed_labels(s), [])
+        self.assertEqual(sorted((lim["case"], lim["node"]) for lim in s.e.limitations),
+                         [("plain/gss/ban", "nuremberg"), ("plain/gss/remove", "nuremberg")])
+        self.assertNotIn("plain/gss/remove: no post-remove key reaches nuremberg during the watch (D60)",
+                         [r["label"] for r in s.e.assertions])
+
+    def test_gss_share_install_on_removed_member_fails_d60(self):
+        def installs(net, node, gid):
+            leaked = node == "nuremberg" and net.state["nuremberg"] == "removed"
+            return {**CLEAN_JOURNAL, "attributed_epochs": [net.epoch] if leaked else [],
+                    "attributed_max_epoch": net.epoch if leaked else None}
+        s, _net = self.run_failing_block("gss", share_installs=installs)
+        failing = row(s, "plain/gss/remove: no post-remove key reaches nuremberg during the watch (D60)")
+        self.assertFalse(failing["passed"])
+        self.assertEqual(failing["evidence_class"], "journal_install")
+        self.assertNotIn("verdict", failing)
+        self.assertEqual(s.e.verdict(), "fail")
+
+    # --- item 2: an erroring excluded node is inconclusive ---------------------
+
+    def test_target_server_errors_make_the_case_inconclusive(self):
+        def errors(net, label, method, path, body):
+            if label == "nuremberg" and path.endswith("/secure/decrypt") and net.state["nuremberg"] == "removed":
+                return 500, {"error": "boom"}
+            return None
+        s, _net = self.run_failing_block("gss", override=errors)
+        decrypt = row(s, "plain/gss/remove: nuremberg cannot decrypt the post-remove message")
+        d60 = row(s, "plain/gss/remove: no post-remove key reaches nuremberg during the watch (D60)")
+        for result in (decrypt, d60):
+            self.assertFalse(result["passed"])
+            self.assertEqual(result["verdict"], "inconclusive")
+        self.assertEqual(s.e.cases[0]["outcome"], "inconclusive")
+        self.assertEqual(s.e.verdict(), "inconclusive")
+
+    def test_target_transport_errors_make_the_case_inconclusive(self):
+        def offline(net, label, method, path, body):
+            if label == "nuremberg" and path.endswith("/secure/decrypt") and net.state["nuremberg"] == "removed":
+                raise TimeoutError("offline")
+            return None
+        s, _net = self.run_failing_block("treekem", override=offline)
+        decrypt = row(s, "plain/treekem/remove: nuremberg cannot decrypt the post-remove message")
+        self.assertEqual((decrypt["passed"], decrypt["verdict"]), (False, "inconclusive"))
+        self.assertEqual(list(decrypt["probe_classes"]), ["transport:TimeoutError"])
+        self.assertEqual(s.e.cases[0]["outcome"], "inconclusive")
+
+    def test_final_probe_error_is_inconclusive(self):
+        def final_errors(net, label, method, path, body):
+            if path.endswith("/secure/reseal"):
+                net.flags.add("after_reseal")
+            if label == "nuremberg" and path.endswith("/secure/decrypt") and "after_reseal" in net.flags:
+                return 503, {"error": "unavailable"}
+            return None
+        s, _net = self.run_failing_block("gss", override=final_errors)
+        final = row(s, "plain/gss/remove: nuremberg cannot decrypt the final message")
+        self.assertEqual((final["passed"], final["verdict"], final["response_class"]),
+                         (False, "inconclusive", "http_other"))
+        self.assertEqual(s.e.cases[0]["outcome"], "inconclusive")
+
+    # --- item 3: reseal needs the explicit refusal ----------------------------
+
+    def test_reseal_server_error_or_transport_error_is_inconclusive(self):
+        for name, response in (("http500", (500, {"error": "boom"})), ("transport", ConnectionError("down"))):
+            with self.subTest(name=name):
+                def reseal(net, label, method, path, body, response=response):
+                    if path.endswith("/secure/reseal"):
+                        if isinstance(response, Exception):
+                            raise response
+                        return response
+                    return None
+                s, _net = self.run_failing_block("gss", override=reseal)
+                result = row(s, "plain/gss/remove: remover refuses to seal the current secret to nuremberg "
+                                "(recipient ineligible)")
+                self.assertEqual((result["passed"], result["verdict"]), (False, "inconclusive"))
+                self.assertEqual(s.e.cases[0]["outcome"], "inconclusive")
+
+    def test_reseal_to_removed_member_fails_and_envelope_never_recorded(self):
+        s, _net = self.run_failing_block("gss", reseal_leaks=True)
+        self.assertEqual(failed_labels(s), ["plain/gss/remove: remover refuses to seal the current secret to "
+                                            "nuremberg (recipient ineligible)"])
+        self.assertEqual(s.e.verdict(), "fail")
+        self.assertNotIn("SECRET-ENVELOPE", json.dumps(s.e.report()))
+
+    # --- item 4: the banned re-join outcome is asserted ------------------------
+
+    def test_rejoin_request_failure_is_inconclusive(self):
+        def join_fails(net, label, method, path, body):
+            if label == "singapore" and path == "/groups/join" and net.state["singapore"] == "banned":
+                raise ConnectionError("down")
+            return None
+        s, _net = self.run_failing_block("treekem", override=join_fails)
+        result = row(s, "plain/treekem/ban: banned singapore re-join is never seated")
+        self.assertEqual((result["passed"], result["verdict"], result["reason"]),
+                         (False, "inconclusive", "join_request_error"))
+        self.assertEqual(s.e.cases[1]["outcome"], "inconclusive")
+
+    def test_invalid_roster_reads_during_rejoin_are_inconclusive(self):
+        def roster_fails(net, label, method, path, body):
+            if label == "singapore" and path == "/groups/join" and net.state["singapore"] == "banned":
+                net.flags.add("rejoin")
+            if label == "nyc" and path.endswith("/members") and method == "GET" and "rejoin" in net.flags:
+                return 500, {"error": "boom"}
+            return None
+        s, _net = self.run_failing_block("gss", override=roster_fails)
+        result = row(s, "plain/gss/ban: banned singapore re-join is never seated")
+        self.assertEqual((result["passed"], result["verdict"], result["reason"]),
+                         (False, "inconclusive", "invalid_roster_read"))
+        self.assertGreater(result["roster_reads"]["invalid"], 0)
+
+    def test_invalid_join_status_is_inconclusive(self):
+        def status_fails(net, label, method, path, body):
+            if label == "singapore" and path.endswith("/join-status"):
+                return 500, {}
+            return None
+        s, _net = self.run_failing_block("gss", override=status_fails)
+        result = row(s, "plain/gss/ban: banned singapore re-join is never seated")
+        self.assertEqual((result["verdict"], result["reason"]), ("inconclusive", "invalid_join_status"))
+
+    def test_seated_banned_member_fails_the_rejoin_check(self):
+        s, _net = self.run_failing_block("treekem", seat_banned=True)
+        result = row(s, "plain/treekem/ban: banned singapore re-join is never seated")
+        self.assertFalse(result["passed"])
+        self.assertNotIn("verdict", result)
+        self.assertEqual(s.e.cases[1]["outcome"], "failed")
+
+    # --- item 6: the earlier removed member is probed during the ban ------------
+
+    def test_ban_rotation_reaching_the_removed_member_is_caught_by_decrypt(self):
+        s, _net = self.run_failing_block("gss", leak_to_on_ban="nuremberg")
+        self.assertIn("plain/gss/ban: nuremberg cannot decrypt the post-ban message", failed_labels(s))
+        self.assertEqual(s.e.cases[0]["outcome"], "passed")
+        self.assertEqual(s.e.cases[1]["outcome"], "failed")
+
+    def test_ban_rotation_reaching_the_removed_member_is_caught_by_journal(self):
+        def installs(net, node, gid):
+            leaked = node == "nuremberg" and net.state["singapore"] == "banned"
+            return {**CLEAN_JOURNAL, "attributed_epochs": [net.epoch] if leaked else [],
+                    "attributed_max_epoch": net.epoch if leaked else None}
+        s, _net = self.run_failing_block("gss", share_installs=installs)
+        self.assertEqual(failed_labels(s),
+                         ["plain/gss/ban: no post-ban key reaches nuremberg during the watch (D60)"])
+
+    # --- earlier behaviour ---------------------------------------------------
+
     def test_leak_to_removed_member_fails_the_d60_checks(self):
-        s, *_ = scenario("gss", leak_to="nuremberg")
-        with self.assertRaises(AssertionError):
-            s.run_block("plain", "gss", h.assign_roles(LABELS), None)
+        s, _net = self.run_failing_block("gss", leak_to="nuremberg")
         self.assertEqual(failed_labels(s), [
             "plain/gss/remove: nuremberg cannot decrypt the post-remove message",
             "plain/gss/remove: no post-remove key reaches nuremberg during the watch (D60)"])
@@ -494,42 +894,38 @@ class ScenarioTests(unittest.TestCase):
         self.assertIn("journal_remover", s.e.cases[0])
 
     def test_survivor_that_never_rekeys_fails_but_target_is_still_watched(self):
-        s, *_ = scenario("treekem", lag={"helsinki": 10 ** 6})
-        with self.assertRaises(AssertionError):
-            s.run_block("plain", "treekem", h.assign_roles(LABELS), None)
+        s, _net = self.run_failing_block("treekem", lag={"helsinki": 10 ** 6})
         self.assertEqual(failed_labels(s),
                          ["plain/treekem/remove: helsinki rekeyed and decrypts the post-remove message"])
         rekey = s.e.cases[0]["rekey"]
         self.assertEqual(rekey["unconverged"], ["helsinki"])
-        self.assertGreaterEqual(rekey["target_observed_until_s"], 30.0)
+        self.assertGreaterEqual(rekey["excluded"]["nuremberg"]["observed_until_s"], 30.0)
 
     def test_join_readiness_needs_the_key_not_the_roster(self):
-        s, *_ = scenario("treekem", poll_timeout=0.05, withhold_join_key=("helsinki",))
-        with self.assertRaises(PollTimeout):
-            s.run_block("plain", "treekem", h.assign_roles(LABELS), None)
-        row = s.e.assertions[-1]
-        self.assertEqual(row["label"], "plain/treekem: helsinki key installed after join (decrypts post-join message)")
-        self.assertFalse(row["passed"])
-        self.assertIn("poll_timeout", row)
+        s, _net = self.run_failing_block("treekem", expected=PollTimeout, poll_timeout=0.05,
+                                         withhold_join_key=("helsinki",))
+        last = s.e.assertions[-1]
+        self.assertEqual(last["label"], "plain/treekem: helsinki key installed after join (decrypts post-join message)")
+        self.assertFalse(last["passed"])
+        self.assertIn("poll_timeout", last)
         # The roster-and-local-active barrier itself was satisfied: only the key proof failed.
         self.assertTrue(any(p.get("label") == "plain/treekem: helsinki on owner roster and locally active"
                             and p.get("outcome") == "accepted" for p in s.e.polls))
 
-    def test_reseal_to_removed_member_fails_and_envelope_never_recorded(self):
-        s, net, *_ = scenario("gss", reseal_leaks=True)
+    def test_restart_with_a_changed_binary_fails(self):
+        shas = iter(["a" * 64, "b" * 64])
+        s, net, *_ = scenario("gss")
+        s.binary_sha = lambda node: next(shas)
         with self.assertRaises(AssertionError):
-            s.run_block("plain", "gss", h.assign_roles(LABELS), None)
-        self.assertEqual(failed_labels(s),
-                         ["plain/gss/remove: remover refuses to seal the current secret to nuremberg"])
-        self.assertNotIn("SECRET-ENVELOPE", json.dumps(s.e.report()))
+            s.run_block("restart", "gss", h.assign_roles(LABELS), net.restart)
+        self.assertEqual(failed_labels(s), ["restart/gss/remove: remover runs the same binary after the restart"])
 
-    def test_seated_banned_member_fails_the_rejoin_check(self):
-        s, *_ = scenario("treekem", seat_banned=True)
+    def test_restart_with_an_unreadable_binary_is_inconclusive(self):
+        s, net, *_ = scenario("gss", binary_sha=None)
         with self.assertRaises(AssertionError):
-            s.run_block("plain", "treekem", h.assign_roles(LABELS), None)
-        failed = failed_labels(s)
-        self.assertIn("plain/treekem/ban: banned singapore re-join is never seated", failed)
-        self.assertEqual(s.e.cases[1]["outcome"], "failed")
+            s.run_block("restart", "gss", h.assign_roles(LABELS), net.restart)
+        result = row(s, "restart/gss/remove: remover runs the same binary after the restart")
+        self.assertEqual((result["passed"], result["verdict"]), (False, "inconclusive"))
 
     def test_slow_restart_is_inconclusive(self):
         holder = {}
@@ -543,10 +939,33 @@ class ScenarioTests(unittest.TestCase):
         holder.update(net=net, clock=clock)
         with self.assertRaises(AssertionError):
             s.run_block("restart", "gss", h.assign_roles(LABELS), net.restart)
-        row = next(r for r in s.e.assertions if not r["passed"])
-        self.assertEqual(row["label"], "restart/gss/remove: remove starts 10-20 s after the remover restart")
-        self.assertEqual(row["verdict"], "inconclusive")
-        self.assertEqual(row["lead_seconds"], 25.0)
+        failing = next(r for r in s.e.assertions if not r["passed"])
+        self.assertEqual(failing["label"], "restart/gss/remove: remove starts 10-20 s after the remover restart")
+        self.assertEqual(failing["verdict"], "inconclusive")
+        self.assertEqual(failing["lead_seconds"], 25.0)
+        self.assertEqual(s.e.cases[0]["outcome"], "inconclusive")
+
+
+class EvidenceTests(unittest.TestCase):
+    def test_verdict_rows_and_outcomes(self):
+        e = h.RekeyEvidence()
+        self.assertEqual(e.verdict_row("a", "pass"), "pass")
+        self.assertEqual(e.verdict(), "pass")
+        e.verdict_row("b", "inconclusive")
+        self.assertEqual(e.assertions[-1], {"label": "b", "passed": False, "verdict": "inconclusive"})
+        self.assertEqual(e.verdict(), "inconclusive")
+        self.assertEqual(h.rows_outcome(e.assertions, True), "inconclusive")
+        e.verdict_row("c", "fail")
+        self.assertEqual(e.verdict(), "fail")
+        self.assertEqual(h.rows_outcome(e.assertions, True), "failed")
+        self.assertEqual(h.rows_outcome([{"label": "x", "passed": True}], False), "failed")
+        with self.assertRaises(ValueError):
+            e.verdict_row("d", "limited")
+        self.assertIn("limitations", e.report())
+        with self.assertRaises(AssertionError):
+            h.require_all_pass("case", ["pass", "inconclusive"])
+        h.require_all_pass("case", ["pass", "pass"])
+        self.assertTrue(math.isfinite(h.DURATION_BOUNDS["--watch-secs"][0]))
 
 
 if __name__ == "__main__":

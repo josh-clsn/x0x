@@ -33,13 +33,19 @@ fresh groups. In `restart` the remover's `x0xd-testnet.service` restarts
 10-20 s before each removal, so that variant needs `--allow-service-restart`.
 
 A case passes only if every survivor decrypts a message sealed after the
-removal (rekey latency recorded per survivor), the target never decrypts it
-during a further `--watch-secs` window (D60), survivors' rosters drop the
-target, GSS refuses to re-seal the secret to it, and a banned target's re-join
-is never seated. Key readiness is proven by decrypting, never by roster state
-(#1214). Each node's live version is recorded and, when the eph
-`testnet-hosts.json` sits next to the tokens file, checked against the binary
-deployed to that node. Nothing assumes one binary (#1208).
+removal (rekey latency recorded per survivor), no excluded node decrypts it
+during a further `--watch-secs` window (the target, and in the ban case the
+member removed earlier), survivors' rosters drop the target, GSS answers the
+explicit recipient-ineligible refusal to a re-seal, and a banned target's
+re-join is never seated. Transport errors, 5xx and invalid reads make a check
+INCONCLUSIVE, never a pass. The D60 "no later key" check is claimed only with
+key evidence (a decrypt answer from the node's key material, or for GSS the
+node's own share-install journal); a removed member that answers the
+membership gate first is listed under `limitations` instead. Key readiness is
+proven by decrypting, never by roster state (#1214). Nothing assumes one binary
+(#1208): each node's live version and running sha256 are recorded and, with
+the eph `testnet-hosts.json` next to the tokens file, must equal what was
+deployed to that node.
 
 ```bash
 python3 -B tests/e2e_vps_survivor_rekey.py --network test \
