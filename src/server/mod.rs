@@ -23,8 +23,8 @@ mod rider_auth;
 mod routes;
 mod sse;
 mod state;
-// W3-H (#1164): deterministic simulation harness (test builds only).
-#[cfg(test)]
+// W3-H (#1164): deterministic simulation harness (test builds only:
+// `#![cfg(test)]` inside the module).
 mod w3h;
 mod ws;
 

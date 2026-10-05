@@ -26,6 +26,8 @@
 //! - The fabric never reads the wall clock; all times are tokio virtual
 //!   time since the fabric started.
 
+#![cfg(test)]
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
@@ -108,6 +110,29 @@ pub(crate) struct Write {
     pub(crate) bytes: Arc<[u8]>,
 }
 
+/// Why the transport refused a send outright.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RefusalReason {
+    /// No live link between the pair.
+    NoLink,
+    /// A pinned send named a connection generation that is no longer the
+    /// live one (refused before admission, so no bytes were produced).
+    GenerationSuperseded,
+    /// A dial to a known node that is offline or partitioned away.
+    Unreachable,
+}
+
+/// A send the transport refused, with the bytes when there were any.
+#[derive(Clone, Debug)]
+pub(crate) struct Refusal {
+    pub(crate) src: Key,
+    pub(crate) dst: Key,
+    pub(crate) class: Option<LaneClass>,
+    pub(crate) at: Duration,
+    pub(crate) reason: RefusalReason,
+    pub(crate) bytes: Option<Arc<[u8]>>,
+}
+
 /// A fault decision for one write, made at send time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Fault {
@@ -163,11 +188,11 @@ enum TraceEvent {
         seq: u64,
         fate: Fate,
     },
+    /// A send the transport refused (no live link, or a pinned generation
+    /// that is no longer current). `index` points into `refused` (bytes
+    /// retained); admission refusals have no bytes yet.
     Refused {
-        src: Key,
-        dst: Key,
-        class: LaneClass,
-        at: Duration,
+        index: usize,
     },
     Publish {
         node: Key,
@@ -242,6 +267,7 @@ struct FabricState {
     rules: Vec<FaultRule>,
     lanes: BTreeMap<LaneKey, LaneState>,
     writes: Vec<Write>,
+    refused: Vec<Refusal>,
     trace: Vec<TraceEvent>,
     next_generation: u64,
 }
@@ -304,6 +330,7 @@ impl SimFabric {
                 rules: Vec::new(),
                 lanes: BTreeMap::new(),
                 writes: Vec::new(),
+                refused: Vec::new(),
                 trace: Vec::new(),
                 next_generation: 1,
             }),
@@ -512,21 +539,30 @@ impl SimFabric {
                     };
                     fates.insert((name, *seq), text);
                 }
-                TraceEvent::Refused {
-                    src,
-                    dst,
-                    class,
-                    at,
-                } => {
-                    refusals
-                        .entry(Self::name(&state, src))
-                        .or_default()
-                        .push(format!(
-                            "->{} {}@{}us",
-                            Self::name(&state, dst),
-                            class.name(),
-                            micros(*at)
-                        ));
+                TraceEvent::Refused { index } => {
+                    if let Some(refusal) = state.refused.get(*index) {
+                        let class = refusal.class.map_or("connect".to_string(), LaneClass::name);
+                        let payload =
+                            refusal
+                                .bytes
+                                .as_ref()
+                                .map_or("no-bytes".to_string(), |bytes| {
+                                    format!(
+                                        "len={} b3={}",
+                                        bytes.len(),
+                                        &blake3::hash(bytes).to_hex()[..16]
+                                    )
+                                });
+                        refusals
+                            .entry(Self::name(&state, &refusal.src))
+                            .or_default()
+                            .push(format!(
+                                "->{} {class}@{}us {:?} {payload}",
+                                Self::name(&state, &refusal.dst),
+                                micros(refusal.at),
+                                refusal.reason,
+                            ));
+                    }
                 }
                 TraceEvent::Publish {
                     node,
@@ -705,6 +741,19 @@ impl SimFabric {
             && state.nodes.get(&to).is_some_and(|s| s.online)
             && !state.partitions.contains(&pair(from, to));
         if !reachable || from == to {
+            if from != to {
+                Self::refuse_locked(
+                    &mut state,
+                    Refusal {
+                        src: from,
+                        dst: to,
+                        class: None,
+                        at,
+                        reason: RefusalReason::Unreachable,
+                        bytes: None,
+                    },
+                );
+            }
             return Err(NodeError::Connection(format!("sim: {addr} unreachable")));
         }
         let key = pair(from, to);
@@ -785,12 +834,22 @@ impl SimFabric {
         let Some((link_generation, ordinal)) =
             live.filter(|(current, _)| generation.is_none_or(|wanted| wanted == *current))
         else {
-            state.trace.push(TraceEvent::Refused {
-                src: from,
-                dst: to,
-                class,
-                at,
-            });
+            let reason = if live.is_some() {
+                RefusalReason::GenerationSuperseded
+            } else {
+                RefusalReason::NoLink
+            };
+            Self::refuse_locked(
+                &mut state,
+                Refusal {
+                    src: from,
+                    dst: to,
+                    class: Some(class),
+                    at,
+                    reason,
+                    bytes: Some(Arc::from(bytes)),
+                },
+            );
             return Err(not_connected(&PeerId(to)));
         };
         let lane = LaneKey {
@@ -869,6 +928,68 @@ impl SimFabric {
         drop(state);
         self.wake.notify_one();
         Ok(())
+    }
+
+    fn refuse_locked(state: &mut FabricState, refusal: Refusal) {
+        let index = state.refused.len();
+        state.refused.push(refusal);
+        state.trace.push(TraceEvent::Refused { index });
+    }
+
+    /// A pinned send refused before admission: its generation is no longer
+    /// the pair's live connection, so no bytes were produced.
+    fn refuse_admission(&self, from: Key, to: Key) {
+        let at = self.now();
+        let mut state = self.lock();
+        Self::refuse_locked(
+            &mut state,
+            Refusal {
+                src: from,
+                dst: to,
+                class: None,
+                at,
+                reason: RefusalReason::GenerationSuperseded,
+                bytes: None,
+            },
+        );
+    }
+
+    /// Sends refused from `src` at or after `since` (any destination).
+    pub(crate) fn refused_since(&self, src: &PeerId, since: Duration) -> Vec<Refusal> {
+        self.lock()
+            .refused
+            .iter()
+            .filter(|refusal| refusal.src == src.0 && refusal.at >= since)
+            .cloned()
+            .collect()
+    }
+
+    /// Writes from `src` (any destination, any lane) delivered at or after
+    /// `since`, as `(dst, class, seq)`.
+    pub(crate) fn delivered_from_since(
+        &self,
+        src: &PeerId,
+        since: Duration,
+    ) -> Vec<(Key, LaneClass, u64)> {
+        let state = self.lock();
+        let written: BTreeSet<(LaneKey, u64)> = state
+            .writes
+            .iter()
+            .filter(|write| write.lane.src == src.0 && write.at >= since)
+            .map(|write| (write.lane, write.seq))
+            .collect();
+        state
+            .trace
+            .iter()
+            .filter_map(|event| match event {
+                TraceEvent::Fate {
+                    lane,
+                    seq,
+                    fate: Fate::Delivered { .. },
+                } if written.contains(&(*lane, *seq)) => Some((lane.dst, lane.class, *seq)),
+                _ => None,
+            })
+            .collect()
     }
 
     fn lane_rank(&self, lane: &LaneKey) -> u64 {
@@ -1139,6 +1260,7 @@ impl SimLink {
         F: FnOnce(u64) -> Result<B, EndpointError> + Send,
     {
         if self.current_connection_generation(peer_id) != Some(generation) {
+            self.fabric.refuse_admission(self.me.0, peer_id.0);
             return Err(NodeError::Connection("sim: generation superseded".into()));
         }
         let bytes = admit(generation).map_err(NodeError::Endpoint)?;
@@ -1306,12 +1428,12 @@ mod fabric_tests {
         let trace = fabric.canonical_trace();
         assert_eq!(trace.matches("LinkClosed").count(), 5, "{trace}");
         assert!(a.send(&key(2), &[DM, 9]).is_err());
+        let trace = fabric.canonical_trace();
         assert!(
-            fabric
-                .canonical_trace()
-                .contains("[refusals]\nA\n  ->B direct@"),
-            "a refused send is recorded"
+            trace.contains("[refusals]\nA\n  ->B direct@") && trace.contains("NoLink len=2 b3="),
+            "a refused send is recorded with its payload: {trace}"
         );
+        assert_eq!(fabric.refused_since(&key(1), Duration::ZERO).len(), 1);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

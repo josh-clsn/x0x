@@ -2,31 +2,40 @@
 //!
 //! - `w3h_clock_gate_*`: virtual time does not move outside a barrier.
 //! - `w3h_s1_control_*`: three real daemons, public API only, over the
-//!   fabric. The positive control must converge; the negative control
-//!   (joiner offline) must not.
+//!   fabric. The positive control must converge AND deliver group data; the
+//!   negative control (joiner offline) must fail for exactly the intended
+//!   reason, with every authority read succeeding.
+//!
+//! The group shape is the live fixture's `private_secure` path
+//! (`tests/e2e_vps_private_kv.py` `run_private`): create with the preset,
+//! join by invite, open the same `wiki` store on every member, write on
+//! the owner, read on the joiners.
 //!
 //! Daemon controls run only in the Linux isolated namespace (CI `w3h`
 //! profile); they are compile-checked elsewhere.
 
+#![cfg(test)]
+
 use super::*;
 use anyhow::ensure;
+use base64::Engine as _;
 use serde_json::json;
 
-async fn members(sim: &Sim, label: &str, group: &str) -> Option<Vec<String>> {
+const BASE64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+/// The members `label` lists for `group`; `Err` when the read itself fails
+/// (non-2xx, or no `members` array).
+async fn members(sim: &Sim, label: &str, group: &str) -> Result<Vec<String>> {
     let (status, info) = sim
         .request(label, Method::GET, &format!("/groups/{group}"), None)
-        .await
-        .ok()?;
-    if !status.is_success() {
-        return None;
-    }
-    Some(
-        info["members"]
-            .as_array()?
-            .iter()
-            .filter_map(|member| member["agent_id"].as_str().map(str::to_string))
-            .collect(),
-    )
+        .await?;
+    ensure!(status.is_success(), "{label} GET /groups/{group}: {status}");
+    Ok(info["members"]
+        .as_array()
+        .context("no members array")?
+        .iter()
+        .filter_map(|member| member["agent_id"].as_str().map(str::to_string))
+        .collect())
 }
 
 async fn mesh(sim: &Sim, labels: &[&str]) -> Result<()> {
@@ -47,7 +56,7 @@ async fn create_group(sim: &Sim, owner: &str) -> Result<String> {
             owner,
             Method::POST,
             "/groups",
-            Some(json!({"name": "w3h control", "display_name": owner})),
+            Some(json!({"name": "w3h control", "display_name": owner, "preset": "private_secure"})),
         )
         .await?;
     ensure!(
@@ -76,8 +85,49 @@ async fn invite(sim: &Sim, inviter: &str, group: &str) -> Result<String> {
         .to_string())
 }
 
+async fn join(sim: &Sim, joiner: &str, link: &str) -> Result<()> {
+    let (status, joined) = sim
+        .api(
+            joiner,
+            Method::POST,
+            "/groups/join",
+            Some(json!({"invite": link, "display_name": joiner})),
+        )
+        .await?;
+    ensure!(
+        status.is_success() && joined["ok"] != false,
+        "{joiner} join: {status} {joined}"
+    );
+    Ok(())
+}
+
+async fn open_store(sim: &Sim, label: &str, group: &str) -> Result<String> {
+    let (status, store) = sim
+        .api(
+            label,
+            Method::POST,
+            &format!("/groups/{group}/stores"),
+            Some(json!({"name": "wiki"})),
+        )
+        .await?;
+    ensure!(status.is_success(), "{label} open store: {status} {store}");
+    Ok(store["id"].as_str().context("store id")?.to_string())
+}
+
+async fn read_value(sim: &Sim, label: &str, store: &str, key: &str) -> Option<String> {
+    let (status, body) = sim
+        .request(label, Method::GET, &format!("/stores/{store}/{key}"), None)
+        .await
+        .ok()?;
+    if !status.is_success() {
+        return None;
+    }
+    let bytes = BASE64.decode(body["value"].as_str()?).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn w3h_clock_gate_holds_virtual_time_outside_barriers() {
+async fn w3h_clock_gate_holds_virtual_time_outside_barriers() -> Result<()> {
     let start = tokio::time::Instant::now();
     let gate = ClockGate::close();
     let sleeper = tokio::spawn(async { tokio::time::sleep(Duration::from_secs(10)).await });
@@ -88,18 +138,16 @@ async fn w3h_clock_gate_holds_virtual_time_outside_barriers() {
         std::thread::sleep(std::time::Duration::from_millis(300));
         let _ = tx.send(());
     });
-    rx.await.expect("real-time wake");
-    assert_eq!(
-        tokio::time::Instant::now(),
-        start,
-        "virtual time must not move while the gate is closed"
+    rx.await?;
+    ensure!(
+        tokio::time::Instant::now() == start,
+        "virtual time moved while the gate was closed"
     );
-    assert!(!sleeper.is_finished());
+    ensure!(!sleeper.is_finished(), "a 10 s timer fired while gated");
     gate.open().await;
-    sleeper
-        .await
-        .expect("sleeper completes once the gate opens");
-    assert!(tokio::time::Instant::now() >= start + Duration::from_secs(10));
+    sleeper.await?;
+    ensure!(tokio::time::Instant::now() >= start + Duration::from_secs(10));
+    Ok(())
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -118,18 +166,7 @@ async fn w3h_s1_control_group_invite_join_over_public_api() -> Result<()> {
     let group = create_group(&sim, "A").await?;
     for joiner in ["B", "C"] {
         let link = invite(&sim, "A", &group).await?;
-        let (status, joined) = sim
-            .api(
-                joiner,
-                Method::POST,
-                "/groups/join",
-                Some(json!({"invite": link, "display_name": joiner})),
-            )
-            .await?;
-        ensure!(
-            status.is_success() && joined["ok"] == true,
-            "{joiner} join: {status} {joined}"
-        );
+        join(&sim, joiner, &link).await?;
     }
     let want = [
         sim.agent_hex("A")?,
@@ -139,10 +176,34 @@ async fn w3h_s1_control_group_invite_join_over_public_api() -> Result<()> {
     sim.until("A lists A, B and C", secs(180), async |s: &Sim| {
         members(s, "A", &group)
             .await
-            .is_some_and(|listed| want.iter().all(|id| listed.contains(id)))
+            .is_ok_and(|listed| want.iter().all(|id| listed.contains(id)))
     })
     .await?;
     sim.fabric().mark("checkpoint: membership converged on A");
+
+    // Data-plane delivery: one write on A reaches B and C through the
+    // group store (the same store id on every member).
+    let store = open_store(&sim, "A", &group).await?;
+    for member in ["B", "C"] {
+        let theirs = open_store(&sim, member, &group).await?;
+        ensure!(theirs == store, "{member} opened a different store id");
+    }
+    let (status, put) = sim
+        .api(
+            "A",
+            Method::PUT,
+            &format!("/stores/{store}/w3h-control"),
+            Some(json!({"value": BASE64.encode("delivered"), "content_type": "text/plain"})),
+        )
+        .await?;
+    ensure!(status.is_success(), "A put: {status} {put}");
+    sim.until("B and C read A's write", secs(120), async |s: &Sim| {
+        read_value(s, "B", &store, "w3h-control").await.as_deref() == Some("delivered")
+            && read_value(s, "C", &store, "w3h-control").await.as_deref() == Some("delivered")
+    })
+    .await?;
+    sim.fabric()
+        .mark("checkpoint: group data delivered to B and C");
     sim.finish().await?;
     Ok(())
 }
@@ -162,37 +223,54 @@ async fn w3h_s1_negative_control_offline_joiner_is_not_admitted() -> Result<()> 
     mesh(&sim, &["A", "B", "C"]).await?;
     let group = create_group(&sim, "A").await?;
     let link = invite(&sim, "A", &group).await?;
+    let c_peer = sim.peer("C")?;
+    let offline_at = sim.fabric().now();
     sim.set_online("C", false)?;
-    // C's local join call may succeed (it is queued) or fail; either way
-    // the authority must never seat it while C is unreachable.
-    let _ = sim
-        .api(
-            "C",
-            Method::POST,
-            "/groups/join",
-            Some(json!({"invite": link, "display_name": "C"})),
-        )
-        .await;
+    // The join is a valid local attempt: C accepts it and queues the
+    // request (the handler's only refusals are local durability/signing).
+    join(&sim, "C", &link).await?;
     let c = sim.agent_hex("C")?;
+    let mut read_failures = 0usize;
+    let mut reads = 0usize;
     let admitted = sim
         .until("A lists C (must not happen)", secs(60), async |s: &Sim| {
-            members(s, "A", &group)
-                .await
-                .is_some_and(|listed| listed.contains(&c))
+            reads += 1;
+            match members(s, "A", &group).await {
+                Ok(listed) => listed.contains(&c),
+                Err(_) => {
+                    read_failures += 1;
+                    false
+                }
+            }
         })
         .await;
     ensure!(admitted.is_err(), "an offline joiner was admitted");
-    // Read A's view at the frozen instant after the barrier closed.
+    ensure!(
+        reads > 0 && read_failures == 0,
+        "A's roster reads must succeed for the whole window ({read_failures} of {reads} failed)"
+    );
+    // A's view at the frozen instant after the barrier closed.
     let listed = sim
         .at_instant("A members after the barrier", members(&sim, "A", &group))
-        .await?
-        .unwrap_or_default();
-    ensure!(!listed.contains(&c), "C is not listed: {listed:?}");
-    let trace = sim.fabric().canonical_trace();
+        .await??;
+    ensure!(!listed.contains(&c), "C is listed: {listed:?}");
+    // The intended refusal: the transport refused C's attempts (dials or
+    // sends) and nothing C wrote after going offline was delivered.
+    let refused = sim.fabric().refused_since(&c_peer, offline_at);
+    let delivered = sim.fabric().delivered_from_since(&c_peer, offline_at);
     ensure!(
-        trace.contains("C\n  attached inc=0") && trace.contains("offline@"),
-        "the offline fault is in the trace"
+        !refused.is_empty(),
+        "C's join produced no transport refusal; the window did not exercise the fault"
     );
+    ensure!(
+        delivered.is_empty(),
+        "{} frames from C were delivered while it was offline",
+        delivered.len()
+    );
+    sim.fabric().mark(format!(
+        "checkpoint: C refused {} times, 0 frames delivered",
+        refused.len()
+    ));
     sim.finish().await?;
     Ok(())
 }

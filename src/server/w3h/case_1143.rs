@@ -26,6 +26,8 @@
 //! - `w3h_red_1143_promoted_admin_admits_with_owner_offline` (ignored until
 //!   ADR 0108 S2): the desired behaviour; S2 removes the `#[ignore]`.
 
+#![cfg(test)]
+
 use super::home::{membership_state, roster, HomeIds};
 use super::receipt::{Receipt, Verdict};
 use super::*;

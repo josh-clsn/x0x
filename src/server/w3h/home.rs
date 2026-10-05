@@ -18,6 +18,8 @@
 //! stop/restart, so S2 needs no restart support. Nothing here injects
 //! discovered certificate bytes (ADR 0108 Validation).
 
+#![cfg(test)]
+
 use super::*;
 use crate::identity::{AgentCertificate, AgentKeypair, MachineKeypair, UserKeypair};
 use anyhow::ensure;

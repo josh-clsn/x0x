@@ -19,6 +19,8 @@
 //! `$W3H_TRACE_DIR/<case>-<pid>.receipt.json`, where
 //! `scripts/ci/w3h-trace-check.py` checks it.
 
+#![cfg(test)]
+
 use serde::Serialize;
 
 /// The schema id written into every receipt.

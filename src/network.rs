@@ -30,8 +30,8 @@ pub use self::churn::ChurnSnapshot;
 mod link;
 use self::link::LinkNode;
 // W3-H (#1164): deterministic in-memory transport for the simulation
-// harness. Test builds only; production `NetworkNode`s always run on QUIC.
-#[cfg(test)]
+// harness. Test builds only (`#![cfg(test)]` inside the file); production
+// `NetworkNode`s always run on QUIC.
 pub(crate) mod sim;
 
 use ant_quic::{bootstrap_cache::PeerCapabilities, Node, NodeConfig, TransportAddr};

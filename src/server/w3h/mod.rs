@@ -20,6 +20,7 @@
 //! trace and prints `W3H-TRACE case=… seed=… entropy=… digest=…`; the CI
 //! gate requires one digest per case across 20 reruns.
 
+#![cfg(test)]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 mod case_1143;
@@ -56,32 +57,70 @@ struct Shim {
     set_wall_offset_ns: unsafe extern "C" fn(u64),
 }
 
+/// Why the shim is not controlling this process (recorded in the trace).
+const SHIM_NOT_LOADED: &str = "shim not preloaded";
+
 impl Shim {
-    #[cfg(unix)]
-    fn detect() -> Option<Self> {
-        // SAFETY: `dlsym` with RTLD_DEFAULT and a NUL-terminated name has
-        // no preconditions; a non-null result for this exported symbol is
-        // the shim's `void w3h_shim_set_wall_offset_ns(uint64_t)`.
-        let symbol =
-            unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"w3h_shim_set_wall_offset_ns".as_ptr()) };
-        if symbol.is_null() {
-            return None;
+    /// The shim, if it is preloaded, active (it requires `W3H_SHIM_ACTIVE=1`
+    /// and `W3H_ENTROPY_SEED`), and demonstrably intercepting both entropy
+    /// paths: `rand::rngs::OsRng` (getrandom 0.2 → `syscall(SYS_getrandom)`)
+    /// and libc `getrandom()` (std, getrandom 0.3/0.4). Otherwise the reason.
+    #[cfg(target_os = "linux")]
+    fn detect() -> std::result::Result<Self, String> {
+        use rand::RngCore as _;
+        // SAFETY: `dlsym` with RTLD_DEFAULT and NUL-terminated names has no
+        // preconditions; null means "not found".
+        let (set_wall, active, calls) = unsafe {
+            (
+                libc::dlsym(libc::RTLD_DEFAULT, c"w3h_shim_set_wall_offset_ns".as_ptr()),
+                libc::dlsym(libc::RTLD_DEFAULT, c"w3h_shim_active".as_ptr()),
+                libc::dlsym(libc::RTLD_DEFAULT, c"w3h_shim_entropy_calls".as_ptr()),
+            )
+        };
+        if set_wall.is_null() || active.is_null() || calls.is_null() {
+            return Err(SHIM_NOT_LOADED.to_string());
         }
-        // SAFETY: the symbol is the shim's setter with exactly this C ABI
-        // signature (`scripts/w3h/w3h_shim.c`).
-        let set_wall_offset_ns =
-            unsafe { std::mem::transmute::<*mut libc::c_void, unsafe extern "C" fn(u64)>(symbol) };
-        Some(Self { set_wall_offset_ns })
+        // SAFETY: these are the shim's exported functions with exactly these
+        // C ABI signatures (`scripts/w3h/w3h_shim.c`).
+        let (set_wall_offset_ns, active, calls) = unsafe {
+            (
+                std::mem::transmute::<*mut libc::c_void, unsafe extern "C" fn(u64)>(set_wall),
+                std::mem::transmute::<*mut libc::c_void, unsafe extern "C" fn() -> libc::c_int>(
+                    active,
+                ),
+                std::mem::transmute::<*mut libc::c_void, unsafe extern "C" fn() -> libc::c_ulong>(
+                    calls,
+                ),
+            )
+        };
+        // SAFETY: plain reads of the shim's atomics.
+        if unsafe { active() } != 1 {
+            return Err("shim preloaded but inactive (W3H_SHIM_ACTIVE / W3H_ENTROPY_SEED)".into());
+        }
+        // SAFETY: as above.
+        let before = unsafe { calls() };
+        let _ = rand::rngs::OsRng.next_u64();
+        let mut probe = [0u8; 8];
+        // SAFETY: the buffer is valid for its length.
+        let got = unsafe { libc::getrandom(probe.as_mut_ptr().cast(), probe.len(), 0) };
+        // SAFETY: as above.
+        let after = unsafe { calls() };
+        if got != 8 || after < before.saturating_add(2) {
+            return Err(format!(
+                "shim active but an entropy path bypassed it (calls {before} -> {after})"
+            ));
+        }
+        Ok(Self { set_wall_offset_ns })
     }
 
-    #[cfg(not(unix))]
-    fn detect() -> Option<Self> {
-        None
+    #[cfg(not(target_os = "linux"))]
+    fn detect() -> std::result::Result<Self, String> {
+        Err(SHIM_NOT_LOADED.to_string())
     }
 
     fn set_wall(self, offset: Duration) {
         let nanos = u64::try_from(offset.as_nanos()).unwrap_or(u64::MAX);
-        // SAFETY: the shim's setter only stores an atomic.
+        // SAFETY: the shim's setter only stores atomics.
         unsafe { (self.set_wall_offset_ns)(nanos) }
     }
 }
@@ -232,10 +271,13 @@ impl Sim {
         let fabric = SimFabric::new(seed);
         let plane = format!("w3h-{seed:x}");
         sim::register(&plane, &fabric);
-        let shim = Shim::detect();
-        if let Some(shim) = shim {
-            shim.set_wall(Duration::ZERO);
-        }
+        let (shim, entropy) = match Shim::detect() {
+            Ok(shim) => {
+                shim.set_wall(Duration::ZERO);
+                (Some(shim), "controlled".to_string())
+            }
+            Err(reason) => (None, format!("uncontrolled ({reason})")),
+        };
         let logs = Arc::new(Mutex::new(Vec::new()));
         // Thread-local: the scenario runs on one current-thread runtime, so
         // every daemon task emits on this thread.
@@ -260,14 +302,7 @@ impl Sim {
             root: tempfile::tempdir()?,
             _log_guard: log_guard,
         };
-        sim.fabric.mark(format!(
-            "case {case} entropy={}",
-            if shim.is_some() {
-                "controlled"
-            } else {
-                "uncontrolled"
-            }
-        ));
+        sim.fabric.mark(format!("case {case} entropy={entropy}"));
         Ok(sim)
     }
 
@@ -528,7 +563,53 @@ impl Sim {
 
     /// Record the canonical trace: print the digest line, write the trace
     /// file when `W3H_TRACE_DIR` is set, then stop every daemon.
+    /// Stop every daemon (in label order, each inside a named barrier),
+    /// verify the teardown, THEN finalise the canonical trace: print the
+    /// digest line and write the trace file when `W3H_TRACE_DIR` is set.
+    /// A barrier timeout or a supervisor error fails the run (after the
+    /// trace is written).
     pub(crate) async fn finish(mut self) -> Result<String> {
+        let handles: Vec<(String, ServerHandle)> = self
+            .nodes
+            .values_mut()
+            .filter_map(|node| {
+                node.router = None;
+                node.handle
+                    .take()
+                    .map(|handle| (node.label.clone(), handle))
+            })
+            .collect();
+        let mut teardown_errors = Vec::new();
+        for (label, handle) in handles {
+            match self
+                .within(
+                    &format!("stop {label}"),
+                    START_BUDGET,
+                    handle.shutdown_and_wait(),
+                )
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => teardown_errors.push(format!("{label}: shutdown: {error:#}")),
+                Err(error) => teardown_errors.push(format!("{label}: {error:#}")),
+            }
+        }
+        for node in self.nodes.values() {
+            // A leaked holder of the daemon state is reported, not failed:
+            // the supervisor already drained (`shutdown_and_wait` returned
+            // Ok) and the count of stray holders is scheduling-dependent.
+            if node.state.upgrade().is_some() {
+                eprintln!(
+                    "W3H-WARN {}: daemon state outlived its shutdown",
+                    node.label
+                );
+            }
+        }
+        self.fabric.mark(if teardown_errors.is_empty() {
+            "teardown verified".to_string()
+        } else {
+            format!("teardown failed: {}", teardown_errors.join("; "))
+        });
         let trace = self.fabric.canonical_trace();
         let digest = blake3::hash(trace.as_bytes()).to_hex().to_string();
         let entropy = if self.shim.is_some() {
@@ -547,24 +628,8 @@ impl Sim {
                 let _ = std::fs::write(file, &trace);
             }
         }
-        let handles: Vec<(String, ServerHandle)> = self
-            .nodes
-            .values_mut()
-            .filter_map(|node| {
-                node.router = None;
-                node.handle
-                    .take()
-                    .map(|handle| (node.label.clone(), handle))
-            })
-            .collect();
-        for (label, handle) in handles {
-            let _ = self
-                .within(
-                    &format!("stop {label}"),
-                    START_BUDGET,
-                    handle.shutdown_and_wait(),
-                )
-                .await;
+        if !teardown_errors.is_empty() {
+            bail!("teardown failed: {}", teardown_errors.join("; "));
         }
         Ok(digest)
     }
