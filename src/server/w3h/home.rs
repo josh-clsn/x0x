@@ -50,39 +50,44 @@ async fn home_state(sim: &Sim, label: &str) -> Option<Value> {
     ok_status(status).then_some(body)
 }
 
-/// `members` rows of `gid` as seen by `label`, as (agent id, role).
-pub(crate) async fn roster(sim: &Sim, label: &str, gid: &str) -> Option<Vec<(String, String)>> {
-    let (status, body) = sim
-        .request(label, Method::GET, &format!("/groups/{gid}/members"), None)
-        .await
-        .ok()?;
-    if !ok_status(status) {
-        return None;
-    }
-    Some(
-        body["members"]
-            .as_array()?
-            .iter()
-            .filter_map(|row| {
-                Some((
-                    row["agent_id"].as_str()?.to_string(),
-                    row["role"].as_str().unwrap_or_default().to_string(),
-                ))
-            })
-            .collect(),
-    )
+/// `members` rows of `gid` as seen by `label`, as (agent id, role). A
+/// failed request, a non-2xx status or a malformed body is an error, never
+/// an empty roster.
+pub(crate) async fn roster(sim: &Sim, label: &str, gid: &str) -> Result<Vec<(String, String)>> {
+    let path = format!("/groups/{gid}/members");
+    let (status, body) = sim.request(label, Method::GET, &path, None).await?;
+    ensure!(ok_status(status), "{label} GET {path}: {status} {body}");
+    body["members"]
+        .as_array()
+        .with_context(|| format!("{label} GET {path}: no members array: {body}"))?
+        .iter()
+        .map(|row| {
+            Ok((
+                row["agent_id"]
+                    .as_str()
+                    .with_context(|| format!("{label} GET {path}: row without agent_id: {row}"))?
+                    .to_string(),
+                row["role"].as_str().unwrap_or_default().to_string(),
+            ))
+        })
+        .collect()
 }
 
-/// `membership_state` of `gid` on `label` (`active`, `pending_authority_commit`, …).
-pub(crate) async fn membership_state(sim: &Sim, label: &str, gid: &str) -> Option<String> {
-    let (status, body) = sim
-        .request(label, Method::GET, &format!("/groups/{gid}"), None)
-        .await
-        .ok()?;
-    if !ok_status(status) || body["group_id"].as_str() != Some(gid) {
-        return None;
+/// `membership_state` of `gid` on `label` (`active`,
+/// `pending_authority_commit`, …); `None` when `label` has no such group
+/// (404). Any other failure is an error.
+pub(crate) async fn membership_state(sim: &Sim, label: &str, gid: &str) -> Result<Option<String>> {
+    let path = format!("/groups/{gid}");
+    let (status, body) = sim.request(label, Method::GET, &path, None).await?;
+    if status == StatusCode::NOT_FOUND {
+        return Ok(None);
     }
-    body["membership_state"].as_str().map(str::to_string)
+    ensure!(ok_status(status), "{label} GET {path}: {status} {body}");
+    ensure!(
+        body["group_id"].as_str() == Some(gid),
+        "{label} GET {path}: wrong group: {body}"
+    );
+    Ok(body["membership_state"].as_str().map(str::to_string))
 }
 
 impl Sim {
@@ -303,19 +308,30 @@ impl Sim {
         .await?;
         let member_hex = self.agent_hex(member)?;
         let gid = home.gid.clone();
+        let what = format!("{member} Home seat ready on {authority} and locally");
+        // "Not admitted" is a verdict only when every roster and state read
+        // completed and succeeded; a failed or hanging read is INFRA.
+        let mut seen = Observations::default();
         let ready = self
-            .until(
-                &format!("{member} Home seat ready on {authority} and locally"),
-                budget,
-                async |s: &Sim| {
-                    let listed = roster(s, authority, &gid)
-                        .await
-                        .is_some_and(|rows| rows.iter().any(|(id, _)| *id == member_hex));
-                    listed && membership_state(s, member, &gid).await.as_deref() == Some("active")
-                },
-            )
+            .until(&what, budget, async |s: &Sim| {
+                let Some(rows) = seen.observe(roster(s, authority, &gid)).await else {
+                    return true;
+                };
+                if !rows.iter().any(|(id, _)| *id == member_hex) {
+                    return false;
+                }
+                let Some(state) = seen.observe(membership_state(s, member, &gid)).await else {
+                    return true;
+                };
+                state.as_deref() == Some("active")
+            })
             .await;
-        Ok(ready.is_ok())
+        match ready {
+            Ok(()) if !seen.failed() => Ok(true),
+            Ok(()) => seen.verify(&what).map(|()| false),
+            Err(error) if expired(&error) => seen.verify(&what).map(|()| false),
+            Err(error) => Err(error),
+        }
     }
 
     /// The owner promotes `member` to admin; every observer sees the role.
@@ -342,7 +358,7 @@ impl Sim {
                 &format!("{observer} sees {member} as admin"),
                 SETUP_BUDGET,
                 async |s: &Sim| {
-                    roster(s, observer, &gid).await.is_some_and(|rows| {
+                    roster(s, observer, &gid).await.is_ok_and(|rows| {
                         rows.iter()
                             .any(|(id, role)| *id == member_hex && role == "admin")
                     })

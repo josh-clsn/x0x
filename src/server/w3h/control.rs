@@ -308,25 +308,24 @@ async fn w3h_s1_negative_control_offline_joiner_is_not_admitted() -> Result<()> 
     // request (the handler's only refusals are local durability/signing).
     join(&sim, "C", &link).await?;
     let c = sim.agent_hex("C")?;
-    let mut read_failures = 0usize;
-    let mut reads = 0usize;
-    let admitted = sim
-        .until("A lists C (must not happen)", secs(60), async |s: &Sim| {
-            reads += 1;
-            match members(s, "A", &group).await {
-                Ok(listed) => listed.contains(&c),
-                Err(_) => {
-                    read_failures += 1;
-                    false
-                }
+    let what = "A lists C (must not happen)";
+    // Only an expired budget with every read completed and successful is
+    // "not admitted"; a failed or cut-off read is INFRA.
+    let mut seen = Observations::default();
+    let waited = sim
+        .until(what, secs(60), async |s: &Sim| {
+            match seen.observe(members(s, "A", &group)).await {
+                Some(listed) => listed.contains(&c),
+                None => true,
             }
         })
         .await;
-    ensure!(admitted.is_err(), "an offline joiner was admitted");
-    ensure!(
-        reads > 0 && read_failures == 0,
-        "A's roster reads must succeed for the whole window ({read_failures} of {reads} failed)"
-    );
+    seen.verify(what)?;
+    match waited {
+        Ok(()) => bail!("an offline joiner was admitted"),
+        Err(error) if expired(&error) => {}
+        Err(error) => return Err(error),
+    }
     // A's view at the frozen instant after the barrier closed.
     let listed = sim
         .at_instant("A members after the barrier", members(&sim, "A", &group))
@@ -380,30 +379,137 @@ fn answered_streams(
         .collect()
 }
 
+/// Whether `observer` holds `subject`'s network-verified evidence: the
+/// pairing capture (unrelated peers) or the relationship store. Both are
+/// written only after the evidence verified (`evidence_wire::ingest_hello`).
+fn holds_verified_evidence(sim: &Sim, observer: &str, subject: &str) -> Result<bool> {
+    let state = sim.state(observer)?;
+    let agent = sim.state(subject)?.agent.agent_id();
+    let now = crate::dm_capability::now_unix_ms();
+    let captured = state
+        .agent
+        .capability_store
+        .evidence_wire
+        .get(agent, true, now)
+        .is_some();
+    let stored = state
+        .agent
+        .peer_evidence()
+        .store()
+        .is_some_and(|store| store.usable_agent(agent, now).is_some());
+    Ok(captured || stored)
+}
+
+/// EvidenceV1 exchanges the initiator completed, as `opener<-acceptor kind`:
+/// the reply is exactly one whole frame (`kind`, u32 length, body), a HELLO
+/// or a well-formed ACK (`Option<[u8; 32]>`), and the opener now holds the
+/// acceptor's network-verified evidence. For a HELLO reply the acceptor
+/// must not have opened an EvidenceV1 stream of its own to the opener, so
+/// that evidence can only have come from the reply.
+fn completed_evidence_exchanges(sim: &Sim, labels: &[&str]) -> Result<Vec<String>> {
+    use crate::network::sim::LaneClass;
+    const EVIDENCE_V1: u8 = 0x06;
+    // `evidence_wire.rs` message kinds.
+    const HELLO: u8 = 1;
+    const ACK: u8 = 5;
+    let mut peers = Vec::new();
+    for label in labels {
+        peers.push((sim.peer(label)?.0, *label));
+    }
+    let label_of = |key| peers.iter().find(|(peer, _)| *peer == key).map(|(_, l)| *l);
+    let writes = sim.fabric().writes();
+    let opened: Vec<_> = writes
+        .iter()
+        .filter(|w| {
+            matches!(w.lane.class, LaneClass::Stream(_))
+                && w.seq == 0
+                && w.bytes.first() == Some(&EVIDENCE_V1)
+        })
+        .map(|w| w.lane)
+        .collect();
+    let mut done = Vec::new();
+    for lane in &opened {
+        let mut replies: Vec<_> = writes
+            .iter()
+            .filter(|w| {
+                w.lane.src == lane.dst && w.lane.dst == lane.src && w.lane.class == lane.class
+            })
+            .collect();
+        replies.sort_by_key(|w| w.seq);
+        let reply: Vec<u8> = replies
+            .iter()
+            .flat_map(|w| w.bytes.iter().copied())
+            .collect();
+        let Some((&kind, rest)) = reply.split_first() else {
+            continue;
+        };
+        let Some((len, body)) = rest.split_first_chunk::<4>() else {
+            continue;
+        };
+        if usize::try_from(u32::from_be_bytes(*len)).ok() != Some(body.len()) {
+            continue;
+        }
+        let well_formed = match kind {
+            HELLO => !opened
+                .iter()
+                .any(|other| other.src == lane.dst && other.dst == lane.src),
+            // bincode (fixint) `Option<[u8; 32]>`: `[0]` or `[1, 32 bytes]`.
+            ACK => body == [0] || (body.len() == 33 && body.first() == Some(&1)),
+            _ => false,
+        };
+        let (Some(opener), Some(acceptor)) = (label_of(lane.src), label_of(lane.dst)) else {
+            continue;
+        };
+        if well_formed && holds_verified_evidence(sim, opener, acceptor)? {
+            let name = if kind == HELLO { "HELLO" } else { "ACK" };
+            done.push(format!("{opener}<-{acceptor} {name}"));
+        }
+    }
+    Ok(done)
+}
+
 /// S4 control: every simulated connection runs the real peer-evidence
-/// hello (`EvidenceV1`) over a simulated byte stream, and it is answered.
+/// hello (`EvidenceV1`) over a simulated byte stream, and the initiator
+/// completes it: a whole HELLO or ACK reply, and verified evidence of the
+/// responder held afterwards.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon controls run in the Linux isolated namespace only"
 )]
 async fn w3h_s4_control_evidence_hello_over_sim_streams() -> Result<()> {
-    const EVIDENCE_V1: u8 = 0x06;
+    let labels = ["A", "B"];
     let sim = Sim::start(
         "w3h_s4_control_evidence_hello_over_sim_streams",
         0x5400_0001,
-        &["A", "B"],
+        &labels,
     )
     .await?;
-    mesh(&sim, &["A", "B"]).await?;
+    mesh(&sim, &labels).await?;
+    let mut done = Vec::new();
+    let mut failure = None;
     sim.until(
-        "an EvidenceV1 hello is answered",
+        "an EvidenceV1 exchange completes",
         secs(60),
-        async |s: &Sim| !answered_streams(s, EVIDENCE_V1).is_empty(),
+        async |s: &Sim| match completed_evidence_exchanges(s, &labels) {
+            Ok(found) => {
+                done = found;
+                !done.is_empty()
+            }
+            Err(error) => {
+                failure = Some(error);
+                true
+            }
+        },
     )
     .await?;
-    sim.fabric()
-        .mark("checkpoint: EvidenceV1 hello answered over a sim stream");
+    if let Some(error) = failure {
+        return Err(error.context("INFRA: reading evidence state"));
+    }
+    sim.fabric().mark(format!(
+        "checkpoint: EvidenceV1 completed over sim streams: {}",
+        done.join(", ")
+    ));
     sim.finish().await?;
     Ok(())
 }

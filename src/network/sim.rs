@@ -130,6 +130,9 @@ pub(crate) enum RefusalReason {
     Unreachable,
     /// A write on a stream that was already reset (or whose reader left).
     StreamReset,
+    /// Bytes already in a stream that its reader had not read when the
+    /// stream was reset. As with QUIC RESET_STREAM, they are discarded.
+    ResetDiscarded,
 }
 
 /// A send the transport refused, with the bytes when there were any.
@@ -426,30 +429,34 @@ impl SimFabric {
     }
 
     /// Writes from `src` to `dst` made at or after `since` that were
-    /// delivered (any lane), as `(class, seq)`.
-    pub(crate) fn delivered_since(
+    /// delivered, each with its delivery time.
+    pub(crate) fn delivered_writes_since(
         &self,
         src: &PeerId,
         dst: &PeerId,
         since: Duration,
-    ) -> Vec<(LaneClass, u64)> {
+    ) -> Vec<(Write, Duration)> {
         let state = self.lock();
-        let written: BTreeSet<(LaneKey, u64)> = state
-            .writes
-            .iter()
-            .filter(|write| write.lane.src == src.0 && write.lane.dst == dst.0 && write.at >= since)
-            .map(|write| (write.lane, write.seq))
-            .collect();
-        state
+        let delivered: BTreeMap<(LaneKey, u64), Duration> = state
             .trace
             .iter()
             .filter_map(|event| match event {
                 TraceEvent::Fate {
                     lane,
                     seq,
-                    fate: Fate::Delivered { .. },
-                } if written.contains(&(*lane, *seq)) => Some((lane.class, *seq)),
+                    fate: Fate::Delivered { at },
+                } => Some(((*lane, *seq), *at)),
                 _ => None,
+            })
+            .collect();
+        state
+            .writes
+            .iter()
+            .filter(|write| write.lane.src == src.0 && write.lane.dst == dst.0 && write.at >= since)
+            .filter_map(|write| {
+                delivered
+                    .get(&(write.lane, write.seq))
+                    .map(|at| (write.clone(), *at))
             })
             .collect()
     }
@@ -815,10 +822,11 @@ impl SimFabric {
             return;
         };
         link.closed.store(true, Ordering::SeqCst);
-        // Every stream of the closed connection is reset, as with QUIC.
+        // Every stream of the closed connection fails, as with QUIC: bytes
+        // already received stay readable, then reads fail.
         state.open_streams.retain(|(generation, stream)| {
             if *generation == link.generation {
-                stream.reset_both();
+                stream.connection_lost();
                 false
             } else {
                 true
@@ -1140,7 +1148,7 @@ impl SimFabric {
                     .is_ok()
             });
         if !delivered {
-            stream.reset_both();
+            let _ = stream.reset_both();
             return Err(not_connected(&PeerId(to)));
         }
         Ok((opener_send, opener_recv))
@@ -1148,8 +1156,9 @@ impl SimFabric {
 
     /// Record one stream write (bytes kept, as for frames) and decide its
     /// fate: delivered into the stream, or the stream is reset (a `Drop`
-    /// rule, or the connection is gone). `Delay` rules do not apply to
-    /// streams and are recorded as `Pass`.
+    /// rule, or the connection is gone). `Delay` rules are not supported on
+    /// streams: the write is recorded as `Pass` and a `stream Delay
+    /// unsupported` mark is added, so the trace says the rule did not apply.
     fn stream_write(&self, lane: LaneKey, generation: u64, bytes: &[u8]) -> io::Result<()> {
         let at = self.now();
         let mut state = self.lock();
@@ -1184,12 +1193,20 @@ impl SimFabric {
                 break;
             }
         }
-        if let Fault::Delay(_) = fault {
+        let delay_unsupported = matches!(fault, Fault::Delay(_));
+        if delay_unsupported {
             fault = Fault::Pass;
         }
         let index = state.writes.len();
         state.writes.push(write);
         state.trace.push(TraceEvent::Write { index, fault });
+        if delay_unsupported {
+            let text = format!(
+                "stream Delay unsupported: rule {rule_index} on {} #{seq} applied as Pass",
+                Self::lane_name(&state, &lane)
+            );
+            state.trace.push(TraceEvent::Mark { at, text });
+        }
         let fate = if !live {
             Fate::Dropped {
                 at,
@@ -1215,6 +1232,11 @@ impl SimFabric {
 
     /// A write attempted on an already-reset stream: refused, bytes kept.
     fn refuse_stream_write(&self, lane: LaneKey, bytes: &[u8]) {
+        self.refuse_stream_bytes(lane, RefusalReason::StreamReset, bytes);
+    }
+
+    /// Record stream bytes that never reach the reader, with why.
+    fn refuse_stream_bytes(&self, lane: LaneKey, reason: RefusalReason, bytes: &[u8]) {
         let at = self.now();
         let mut state = self.lock();
         Self::refuse_locked(
@@ -1224,7 +1246,7 @@ impl SimFabric {
                 dst: lane.dst,
                 class: Some(lane.class),
                 at,
-                reason: RefusalReason::StreamReset,
+                reason,
                 bytes: Some(Arc::from(bytes)),
             },
         );
@@ -1643,14 +1665,20 @@ impl SimLink {
     }
 }
 
-/// One direction of a simulated stream: bytes in order, EOF on finish,
-/// an error on reset (connection closed, peer dropped its half unfinished,
-/// or a `Drop` fault).
+/// One direction of a simulated stream: bytes in order, EOF on finish.
+/// As with QUIC (ant-quic `Recv::reset` clears its assembler):
+/// - a stream reset (the writer dropped its half unfinished, or a `Drop`
+///   fault) discards the bytes the reader has not read, and every later
+///   read fails;
+/// - a lost connection (the link closed) leaves received bytes readable;
+///   once they are read, the reader sees EOF if the writer had finished,
+///   otherwise an error.
 #[derive(Default)]
 struct Pipe {
     buf: VecDeque<u8>,
     finished: bool,
     reset: bool,
+    lost: bool,
     reader_gone: bool,
     reader_waker: Option<Waker>,
 }
@@ -1676,10 +1704,25 @@ impl StreamPair {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn reset_both(&self) {
+    /// Reset one direction: unread bytes are discarded and returned.
+    fn reset(&self, dir: usize) -> Vec<u8> {
+        let mut pipe = self.pipe(dir);
+        pipe.reset = true;
+        let unread = pipe.buf.drain(..).collect();
+        pipe.wake();
+        unread
+    }
+
+    /// Reset both directions; returns the unread bytes of each.
+    fn reset_both(&self) -> [Vec<u8>; 2] {
+        [self.reset(0), self.reset(1)]
+    }
+
+    /// The connection carrying the stream closed.
+    fn connection_lost(&self) {
         for dir in 0..2 {
             let mut pipe = self.pipe(dir);
-            pipe.reset = true;
+            pipe.lost = true;
             pipe.wake();
         }
     }
@@ -1696,18 +1739,50 @@ pub struct SimSend {
 }
 
 impl SimSend {
-    /// Gracefully end this direction (EOF for the reader).
+    /// Gracefully end this direction (EOF for the reader). As with QUIC
+    /// (`ClosedStream`, mapped to `NotConnected`), finishing twice fails.
     pub(crate) fn finish(&mut self) -> io::Result<()> {
         let mut pipe = self.stream.pipe(self.dir);
-        if pipe.reset {
+        if pipe.reset || pipe.lost {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionReset,
                 "sim: stream reset",
             ));
         }
+        if pipe.finished {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "sim: stream already finished",
+            ));
+        }
         pipe.finished = true;
         pipe.wake();
         Ok(())
+    }
+
+    /// The lane carrying the other direction of this stream.
+    fn reverse_lane(&self) -> LaneKey {
+        LaneKey {
+            src: self.lane.dst,
+            dst: self.lane.src,
+            class: self.lane.class,
+        }
+    }
+
+    /// Record bytes a reset discarded, per direction (index = `dir`).
+    fn record_discarded(&self, unread: [Vec<u8>; 2]) {
+        for (dir, bytes) in unread.iter().enumerate() {
+            if bytes.is_empty() {
+                continue;
+            }
+            let lane = if dir == self.dir {
+                self.lane
+            } else {
+                self.reverse_lane()
+            };
+            self.fabric
+                .refuse_stream_bytes(lane, RefusalReason::ResetDiscarded, bytes);
+        }
     }
 }
 
@@ -1720,7 +1795,7 @@ impl tokio::io::AsyncWrite for SimSend {
         let this = self.get_mut();
         {
             let pipe = this.stream.pipe(this.dir);
-            if pipe.reset || pipe.reader_gone {
+            if pipe.reset || pipe.lost || pipe.reader_gone {
                 drop(pipe);
                 this.fabric.refuse_stream_write(this.lane, buf);
                 return std::task::Poll::Ready(Err(io::Error::new(
@@ -1736,7 +1811,9 @@ impl tokio::io::AsyncWrite for SimSend {
             }
         }
         if let Err(error) = this.fabric.stream_write(this.lane, this.generation, buf) {
-            this.stream.reset_both();
+            // A `Drop` fault (or a gone connection) resets both directions.
+            let unread = this.stream.reset_both();
+            this.record_discarded(unread);
             return std::task::Poll::Ready(Err(error));
         }
         let mut pipe = this.stream.pipe(this.dir);
@@ -1762,11 +1839,18 @@ impl tokio::io::AsyncWrite for SimSend {
 
 impl Drop for SimSend {
     fn drop(&mut self) {
-        // As with QUIC: dropping an unfinished send half resets the stream.
-        let mut pipe = self.stream.pipe(self.dir);
-        if !pipe.finished {
-            pipe.reset = true;
-            pipe.wake();
+        // As with ant-quic: dropping an unfinished send half resets this
+        // direction, and the reader loses the bytes it had not read yet.
+        let unfinished = {
+            let pipe = self.stream.pipe(self.dir);
+            // After a lost connection there is no peer left to reset.
+            !pipe.finished && !pipe.reset && !pipe.lost
+        };
+        if unfinished {
+            let unread = self.stream.reset(self.dir);
+            let mut both = [Vec::new(), Vec::new()];
+            both[self.dir & 1] = unread;
+            self.record_discarded(both);
         }
     }
 }
@@ -1786,20 +1870,26 @@ impl tokio::io::AsyncRead for SimRecv {
     ) -> std::task::Poll<io::Result<()>> {
         let this = self.get_mut();
         let mut pipe = this.stream.pipe(this.dir);
-        if !pipe.buf.is_empty() {
-            let n = buf.remaining().min(pipe.buf.len());
-            let chunk: Vec<u8> = pipe.buf.drain(..n).collect();
-            buf.put_slice(&chunk);
-            return std::task::Poll::Ready(Ok(()));
-        }
         if pipe.reset {
             return std::task::Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::ConnectionReset,
                 "sim: stream reset",
             )));
         }
+        if !pipe.buf.is_empty() {
+            let n = buf.remaining().min(pipe.buf.len());
+            let chunk: Vec<u8> = pipe.buf.drain(..n).collect();
+            buf.put_slice(&chunk);
+            return std::task::Poll::Ready(Ok(()));
+        }
         if pipe.finished {
             return std::task::Poll::Ready(Ok(()));
+        }
+        if pipe.lost {
+            return std::task::Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "sim: connection lost",
+            )));
         }
         pipe.reader_waker = Some(cx.waker().clone());
         std::task::Poll::Pending
@@ -2015,20 +2105,21 @@ mod fabric_tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn w3h_fabric_stream_resets_when_the_link_closes() {
+    async fn w3h_fabric_stream_fails_when_the_link_closes() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let fabric = SimFabric::new(22);
         let (_a, _b, mut a_send, _a_recv, _b_send, mut b_recv) = stream_pair(&fabric).await;
         a_send.write_all(b"before").await.expect("write");
         fabric.set_online(&key(2), false);
         let mut buf = [0u8; 6];
-        // Bytes already delivered stay readable; then the reset surfaces.
+        // As with a lost QUIC connection: bytes already received stay
+        // readable; then the failure surfaces.
         b_recv.read_exact(&mut buf).await.expect("delivered bytes");
         assert_eq!(&buf, b"before");
         let mut more = [0u8; 1];
         assert!(
             b_recv.read_exact(&mut more).await.is_err(),
-            "reader sees the reset"
+            "reader sees the lost connection"
         );
         assert!(
             a_send.write_all(b"after").await.is_err(),
@@ -2056,21 +2147,86 @@ mod fabric_tests {
         });
         let (_a, _b, mut a_send, _a_recv, _b_send, mut b_recv) = stream_pair(&fabric).await;
         a_send.write_all(b"ok").await.expect("first write passes");
-        assert!(
-            a_send.write_all(&[0xff]).await.is_err(),
-            "dropped write resets"
-        );
         let mut buf = [0u8; 2];
         b_recv
             .read_exact(&mut buf)
             .await
-            .expect("earlier bytes delivered");
+            .expect("read before the reset");
+        a_send
+            .write_all(b"unread")
+            .await
+            .expect("second write passes");
+        assert!(
+            a_send.write_all(&[0xff]).await.is_err(),
+            "dropped write resets"
+        );
         let mut more = [0u8; 1];
         assert!(
             b_recv.read_exact(&mut more).await.is_err(),
-            "reader sees the reset"
+            "the reset discards unread bytes, and the reader sees it"
         );
-        assert!(fabric.canonical_trace().contains("Rule(0)"));
+        let trace = fabric.canonical_trace();
+        assert!(trace.contains("Rule(0)"), "{trace}");
+        assert!(trace.contains("ResetDiscarded len=6"), "{trace}");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn w3h_fabric_stream_unfinished_drop_discards_unread_reply() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let fabric = SimFabric::new(25);
+        let (_a, _b, _a_send, mut a_recv, mut b_send, _b_recv) = stream_pair(&fabric).await;
+        // A responder that writes its reply and drops the send half without
+        // finishing it: ant-quic resets the stream and the initiator loses
+        // the reply it had not read yet.
+        b_send.write_all(b"reply").await.expect("reply");
+        drop(b_send);
+        let mut got = Vec::new();
+        assert!(
+            a_recv.read_to_end(&mut got).await.is_err(),
+            "the reset reaches the reader"
+        );
+        assert!(got.is_empty(), "unread reply bytes are discarded: {got:?}");
+        let trace = fabric.canonical_trace();
+        assert!(trace.contains("ResetDiscarded len=5"), "{trace}");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn w3h_fabric_stream_finished_reply_survives_the_drop() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let fabric = SimFabric::new(26);
+        let (_a, _b, _a_send, mut a_recv, mut b_send, _b_recv) = stream_pair(&fabric).await;
+        // The EvidenceV1 / SyncV1 reply path: write, shutdown (finish), drop.
+        b_send.write_all(b"reply").await.expect("reply");
+        b_send.shutdown().await.expect("finish");
+        assert_eq!(
+            b_send.finish().map_err(|error| error.kind()),
+            Err(io::ErrorKind::NotConnected),
+            "a second finish fails, as with QUIC"
+        );
+        drop(b_send);
+        let mut got = Vec::new();
+        a_recv.read_to_end(&mut got).await.expect("reply then EOF");
+        assert_eq!(got, b"reply");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn w3h_fabric_stream_delay_rule_is_marked_unsupported() {
+        use tokio::io::AsyncWriteExt as _;
+        let fabric = SimFabric::new(27);
+        fabric.add_rule(|write| {
+            if matches!(write.lane.class, LaneClass::Stream(_)) {
+                Fault::Delay(Duration::from_millis(5))
+            } else {
+                Fault::Pass
+            }
+        });
+        let (_a, _b, mut a_send, _a_recv, _b_send, _b_recv) = stream_pair(&fabric).await;
+        a_send.write_all(b"x").await.expect("write");
+        let trace = fabric.canonical_trace();
+        assert!(
+            trace.contains("stream Delay unsupported: rule 0 on A->B stream0 #0 applied as Pass"),
+            "{trace}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

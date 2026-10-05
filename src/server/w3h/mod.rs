@@ -38,7 +38,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use tower::ServiceExt;
@@ -292,6 +292,88 @@ async fn gated<F: std::future::Future>(what: &str, fut: F) -> Result<F::Output> 
         biased;
         out = fut => Ok(out),
         _ = rx => bail!("INFRA: '{what}' needed virtual time outside a named barrier"),
+    }
+}
+
+/// A barrier's virtual budget ran out. Distinct from every other barrier
+/// error (an INFRA stall, a failed read), so a wait whose expected outcome
+/// is "never happened" accepts only this error ([`expired`]).
+#[derive(Debug)]
+pub(crate) struct BudgetExceeded {
+    barrier: String,
+    budget: Duration,
+}
+
+impl std::fmt::Display for BudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "barrier '{}' exceeded its {:?} virtual budget",
+            self.barrier, self.budget
+        )
+    }
+}
+
+impl std::error::Error for BudgetExceeded {}
+
+/// Whether a barrier ended because its budget ran out.
+pub(crate) fn expired(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<BudgetExceeded>().is_some()
+}
+
+/// The reads made inside one [`Sim::until`] predicate. A wait whose
+/// expected outcome is "not yet" is only evidence when every read it made
+/// completed and succeeded: a failed read (a broken endpoint) or a read cut
+/// off by the budget (a hang) is INFRA, not "not admitted".
+#[derive(Debug, Default)]
+pub(crate) struct Observations {
+    started: usize,
+    completed: usize,
+    failures: Vec<String>,
+}
+
+impl Observations {
+    /// Await one read; `None` when it failed (recorded).
+    pub(crate) async fn observe<T>(
+        &mut self,
+        read: impl std::future::Future<Output = Result<T>>,
+    ) -> Option<T> {
+        self.started += 1;
+        let outcome = read.await;
+        self.completed += 1;
+        match outcome {
+            Ok(value) => Some(value),
+            Err(error) => {
+                self.failures.push(format!("{error:#}"));
+                None
+            }
+        }
+    }
+
+    /// Whether a read failed (the predicate should stop waiting).
+    pub(crate) fn failed(&self) -> bool {
+        !self.failures.is_empty()
+    }
+
+    /// INFRA unless at least one read completed, none failed and none was
+    /// still running when the wait ended.
+    pub(crate) fn verify(&self, what: &str) -> Result<()> {
+        if let Some(first) = self.failures.first() {
+            bail!(
+                "INFRA: {what}: {} of {} reads failed; first: {first}",
+                self.failures.len(),
+                self.started
+            );
+        }
+        ensure!(
+            self.started == self.completed,
+            "INFRA: {what}: a read was still running when the wait ended \
+             ({} started, {} completed)",
+            self.started,
+            self.completed
+        );
+        ensure!(self.completed > 0, "INFRA: {what}: no read completed");
+        Ok(())
     }
 }
 
@@ -580,7 +662,12 @@ impl Sim {
             if outcome.is_ok() { "done" } else { "timeout" },
             elapsed.as_micros()
         ));
-        outcome.map_err(|_| anyhow!("barrier '{name}' exceeded its {budget:?} virtual budget"))
+        outcome.map_err(|_| {
+            anyhow::Error::new(BudgetExceeded {
+                barrier: name.to_string(),
+                budget,
+            })
+        })
     }
 
     /// A named barrier that polls `done` every 100 virtual ms until it

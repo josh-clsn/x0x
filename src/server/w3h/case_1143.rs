@@ -100,6 +100,26 @@ async fn admin_saw_owner_announce(sim: &Sim, kind: OwnerAnnounce) -> Result<bool
     }))
 }
 
+/// Whether `bytes`, as written on a direct lane, is `joiner`'s join
+/// `fetch_request` for `gid` naming itself as the member: a direct message
+/// (`[stream type][sender agent id (32)][JSON]`) whose sender is the joiner
+/// and whose body is `{"type":"fetch_request","group_id":gid,
+/// "member_agent_id":joiner,…}`.
+fn join_fetch_request(bytes: &[u8], gid: &str, joiner: &AgentId) -> bool {
+    if bytes.get(1..33) != Some(joiner.as_bytes().as_slice()) {
+        return false;
+    }
+    let Some(Ok(body)) = bytes
+        .get(33..)
+        .map(serde_json::from_slice::<serde_json::Value>)
+    else {
+        return false;
+    };
+    body["type"] == "fetch_request"
+        && body["group_id"] == gid
+        && body["member_agent_id"] == hex::encode(joiner.as_bytes())
+}
+
 async fn scenario(sim: &mut Sim, kind: OwnerAnnounce, receipt: &mut Receipt) -> Result<()> {
     let at = |sim: &Sim| sim.fabric().now().as_micros();
     // t0: Home with O, X, A; A promoted.
@@ -156,24 +176,55 @@ async fn scenario(sim: &mut Sim, kind: OwnerAnnounce, receipt: &mut Receipt) -> 
     // t2: J redeems A's invite with O offline.
     let join_from = sim.fabric().now();
     let admitted = sim.join_home("A", "J", &home, &invite, JOIN_BUDGET).await?;
-    let delivered = sim
+    // The request: J's join `fetch_request` for this group, naming J,
+    // delivered to A after the join call.
+    let j_agent = sim.state("J")?.agent.agent_id();
+    let requests: Vec<Duration> = sim
         .fabric()
-        .delivered_since(&sim.peer("J")?, &sim.peer("A")?, join_from);
+        .delivered_writes_since(&sim.peer("J")?, &sim.peer("A")?, join_from)
+        .into_iter()
+        .filter(|(write, _)| {
+            write.lane.class == crate::network::sim::LaneClass::Direct
+                && join_fetch_request(&write.bytes, &home.gid, &j_agent)
+        })
+        .map(|(_, delivered_at)| delivered_at)
+        .collect();
+    let first_request = requests.iter().min().copied();
     receipt.request_delivered(
-        "j_join_request_reached_a",
-        !delivered.is_empty(),
+        "j_join_fetch_request_reached_a",
+        first_request.is_some(),
         format!(
-            "{} frames J->A delivered after the join call",
-            delivered.len()
+            "{} J->A fetch_request messages for this group naming J delivered after the \
+             join call; first at {:?}us",
+            requests.len(),
+            first_request.map(|t| t.as_micros())
         ),
         at(sim),
     );
     if !admitted {
+        // The cause: the seal refusal for THIS group and THIS joiner, naming
+        // exactly [O], logged after J's request reached A. Logs carry no
+        // emitter; A is the only online admin that can seal J's add.
         let owner_hex = sim.agent_hex("O")?;
+        let j_hex = sim.agent_hex("J")?;
+        let j_tokens = [
+            crate::logging::LogHexId::agent(j_hex.as_str()).to_string(),
+            crate::logging::LogHexId::agent(j_hex.to_uppercase().as_str()).to_string(),
+        ];
         let refusal = sim
-            .logs_containing(&[SEAL_REFUSAL, PENDING_CAUSE, &format!("[\"{owner_hex}\"]")])
+            .logs_containing(&[
+                SEAL_REFUSAL,
+                PENDING_CAUSE,
+                &format!("[\"{owner_hex}\"]"),
+                &format!("group {}", home.gid),
+            ])
             .into_iter()
-            .find(|log| log.at >= join_from);
+            .filter(|log| {
+                j_tokens
+                    .iter()
+                    .any(|token| log.text.contains(&format!("member={token}")))
+            })
+            .find(|log| first_request.is_some_and(|first| log.at >= first));
         receipt.cause(
             "OwnerCertMemberPending{members=[O]} from A's seal",
             refusal.as_ref().map(|log| log.text.clone()),
@@ -182,7 +233,7 @@ async fn scenario(sim: &mut Sim, kind: OwnerAnnounce, receipt: &mut Receipt) -> 
         );
         // Context for the receipt reader: what A and J report.
         let a_rows = roster(sim, "A", &home.gid).await.unwrap_or_default();
-        let j_state = membership_state(sim, "J", &home.gid).await;
+        let j_state = membership_state(sim, "J", &home.gid).await.ok().flatten();
         sim.fabric().mark(format!(
             "observed: A lists {} members, J membership_state={j_state:?}",
             a_rows.len()

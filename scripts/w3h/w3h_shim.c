@@ -272,6 +272,18 @@ static void fill(void *buf, size_t len) {
     }
 }
 
+/* Best effort EFAULT for a non-NULL buffer the caller cannot write: let
+ * the kernel try to fill it (it returns EFAULT for an unmapped or
+ * read-only page it reaches). Whatever it wrote is overwritten with the
+ * deterministic stream; errno is preserved unless the buffer faults. */
+static int buffer_faults(void *buf, size_t len) {
+    int saved = errno;
+    long got = w3h_raw_syscall(SYS_getrandom, buf, len, GRND_NONBLOCK);
+    int fault = got < 0 && errno == EFAULT;
+    errno = saved;
+    return fault;
+}
+
 long w3h_getrandom_syscall(void *buf, size_t len, unsigned int flags) {
     if (!atomic_load(&shim_active)) {
         return w3h_raw_syscall(SYS_getrandom, buf, len, flags);
@@ -284,6 +296,9 @@ long w3h_getrandom_syscall(void *buf, size_t len, unsigned int flags) {
         return w3h_syscall_error(EINVAL);
     }
     if (buf == NULL && len > 0) {
+        return w3h_syscall_error(EFAULT);
+    }
+    if (len > 0 && buffer_faults(buf, len)) {
         return w3h_syscall_error(EFAULT);
     }
     if (len > 0) {
@@ -316,7 +331,7 @@ int getentropy(void *buffer, size_t length) {
         }
         return 0;
     }
-    if (buffer == NULL && length > 0) {
+    if ((buffer == NULL && length > 0) || (length > 0 && buffer_faults(buffer, length))) {
         errno = EFAULT;
         return -1;
     }

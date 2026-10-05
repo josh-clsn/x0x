@@ -11,11 +11,15 @@
 //! 4. `cause` — the exact refusal/cause the case names, observed;
 //! 5. `final` — the desired-behaviour assertion, passed or failed.
 //!
-//! The verdict is GREEN when `final` passed; RED only when every earlier
-//! stage is present and true and `final` failed; INFRA otherwise (a setup
-//! error, a panic before the receipt was finished, a harness timeout, a
-//! missing precondition, an unexpected cause). Only RED counts as a red
-//! baseline. The receipt is printed (`W3H-RECEIPT {json}`) and written to
+//! The preconditions are `setup_done`, at least one `evidence` stage with
+//! every `evidence` stage true, and a true `request_delivered`. The verdict
+//! is GREEN when the preconditions hold and `final` passed; RED when the
+//! preconditions hold, every `cause` stage (at least one) is true, and
+//! `final` failed; INFRA otherwise (a setup error, a panic before the
+//! receipt was finished, a harness timeout, a missing or false
+//! precondition, an unexpected cause). A control that passes without its
+//! preconditions proves nothing, so it is INFRA, not GREEN. Only RED counts
+//! as a red baseline. The receipt is printed (`W3H-RECEIPT {json}`) and written to
 //! `$W3H_TRACE_DIR/<case>-<pid>.receipt.json`, where
 //! `scripts/ci/w3h-trace-check.py` checks it.
 
@@ -178,11 +182,6 @@ impl Receipt {
             Stage::Final { passed, .. } => Some(*passed),
             _ => None,
         });
-        match final_passed {
-            Some(true) => return Verdict::Green,
-            None => return Verdict::Infra,
-            Some(false) => {}
-        }
         let setup = self
             .stages
             .iter()
@@ -208,10 +207,11 @@ impl Receipt {
             .stages
             .iter()
             .any(|stage| matches!(stage, Stage::Evidence { .. }));
-        if setup && any_evidence && evidence_ok && delivered && cause {
-            Verdict::Red
-        } else {
-            Verdict::Infra
+        let preconditions = setup && any_evidence && evidence_ok && delivered;
+        match final_passed {
+            Some(true) if preconditions => Verdict::Green,
+            Some(false) if preconditions && cause => Verdict::Red,
+            _ => Verdict::Infra,
         }
     }
 
@@ -275,6 +275,35 @@ mod receipt_tests {
     #[test]
     fn w3h_receipt_final_pass_is_green() {
         assert_eq!(red_shaped().finish("J active", true, 5), Verdict::Green);
+        // The cause stage is RED-specific: a control needs no cause.
+        let mut control = Receipt::new("w3h_case", 1);
+        control.setup_done(1);
+        control.evidence("A saw consented announce", true, "", 2);
+        control.request_delivered("join reached A", true, "", 3);
+        assert_eq!(control.finish("J active", true, 5), Verdict::Green);
+    }
+
+    #[test]
+    fn w3h_receipt_green_requires_every_precondition() {
+        let mut false_evidence = red_shaped();
+        false_evidence.evidence("A holds O's certificate bytes", false, "", 3);
+        assert_eq!(false_evidence.finish("J active", true, 5), Verdict::Infra);
+
+        let mut no_evidence = Receipt::new("w3h_case", 1);
+        no_evidence.setup_done(1);
+        no_evidence.request_delivered("join reached A", true, "", 3);
+        assert_eq!(no_evidence.finish("J active", true, 5), Verdict::Infra);
+
+        let mut undelivered = Receipt::new("w3h_case", 1);
+        undelivered.setup_done(1);
+        undelivered.evidence("holds bytes", true, "", 2);
+        undelivered.request_delivered("join reached A", false, "", 3);
+        assert_eq!(undelivered.finish("J active", true, 5), Verdict::Infra);
+
+        let mut no_setup = Receipt::new("w3h_case", 1);
+        no_setup.evidence("holds bytes", true, "", 2);
+        no_setup.request_delivered("join reached A", true, "", 3);
+        assert_eq!(no_setup.finish("J active", true, 5), Verdict::Infra);
     }
 
     #[test]
