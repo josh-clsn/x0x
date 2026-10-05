@@ -1,7 +1,8 @@
-//! Group-plane access admission — issue #1166 slice S1.
+//! Group-plane access admission — issue #1166 slices S1 (read family)
+//! and S2 (secure-write family).
 //!
-//! One chokepoint owns the answer to "who may enter a group route" for the
-//! group read family. Before this module every handler re-derived that
+//! One chokepoint owns the answer to "who may enter a group route" for
+//! the group plane. Before this module every handler re-derived that
 //! decision inline (durable bypass → rider 403 → session-membership 403,
 //! each with its own hand-rolled body); #821/#870/#877 were all drift
 //! between copies of that logic. The two halves of the design:
@@ -23,15 +24,17 @@
 //!   the router's own `MatchedPath` pattern, so this module never
 //!   re-implements route matching.
 //!
-//! Two S1 routes (`GET /groups/:id`, `GET /groups/:id/delegations`) cannot
-//! take the extractor: regression tests call their handlers directly with
-//! positional extractor arguments (the withdrawn-tombstone test in
+//! Seven classified routes cannot take the extractor: the S1 details and
+//! delegations handlers and all five S2 secure-write handlers are called
+//! DIRECTLY with positional extractor arguments by regression tests that
+//! must not be edited (the withdrawn-tombstone and lost-race tests in
 //! `routes/named_groups.rs`; `routes/named_groups/tests/adr0066_delegations.rs`),
-//! so the handler signatures are pinned. Those handlers call the same
-//! admission cores ([`admit_named_group_details`],
-//! [`admit_group_delegations`]) with the values they already hold under
-//! their own lock; the decision cannot diverge from the extractor path
-//! because both ends run the same function.
+//! so their signatures are pinned. Those handlers call the same admission
+//! cores ([`admit_named_group_details`], [`admit_group_delegations`],
+//! [`admit_group_send`], [`admit_secure_endpoint`],
+//! [`admit_open_envelope`]) with the values they already hold under their
+//! own lock; the decision cannot diverge from the extractor path because
+//! both ends run the same function.
 //!
 //! Admission runs twice where the handler re-reads group data for its
 //! body (`/members`, `/state/commits`): once in the extractor (an early
@@ -41,6 +44,9 @@
 //! no read-check-serve window between two lock takes. `GET
 //! /groups/:id/messages` is the deliberate exception: its unknown-group
 //! fail-open and its stable-id resolution are one snapshot by design.
+//! The S2 secure-write handlers run their core ONCE, under the write
+//! path's own lock take — exactly where the inline gates stood — so the
+//! ADR-0066 epoch capture keeps the same guard.
 //!
 //! Behaviour is preserved (controller condition 3): same status codes,
 //! same bodies, same precedence — 404 (unknown group; plus the withdrawn
@@ -51,33 +57,37 @@
 //! actor keeps axum's `Extension` 500 (unreachable behind the auth
 //! middleware, which always inserts one). Error shapes come from the
 //! shared builders in `crate::server` (`api_error`, `api_error_with_reason`,
-//! `not_found`, `forbidden`, `bad_request`), which is what the inline code
-//! used.
+//! `not_found`, `forbidden`, `bad_request`) or the canonical gate
+//! helpers in `crate::server::routes::named_groups`
+//! (`reject_fork_quarantined_for_actor`,
+//! `reject_unverified_owner_certified_restore`,
+//! `open_envelope_withdrawn_group_conflict`), which is what the inline
+//! code used.
 //!
-//! Later slices (S2 secure-writes, S3 admin/mutations, S4 long tail) add
-//! the remaining levels (`RiderScope`, `Admin`, `PublicWrite`, `JoinSelf`)
-//! and flip `Unmigrated` rows to `Level(..)`; S5 activates the
-//! `clippy.toml` ceiling that forbids the absorbed helpers everywhere
-//! except this module.
+//! Later slices (S3 admin/mutations, S4 long tail) add the remaining
+//! levels (`Admin`, `JoinSelf`) and flip `Unmigrated` rows to
+//! `Level(..)`; S5 activates the `clippy.toml` ceiling that forbids the
+//! absorbed helpers everywhere except this module.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate as x0x;
+use crate::server::rider_auth::ActorContext;
+use crate::server::routes::named_groups::{
+    local_join_membership_state, open_envelope_withdrawn_group_conflict,
+    reject_fork_quarantined_for_actor, reject_unverified_owner_certified_restore,
+};
+use crate::server::state::AppState;
 use axum::extract::{Extension, FromRequestParts, MatchedPath, Path};
 use axum::http::request::Parts;
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
-use crate as x0x;
-use crate::server::rider_auth::ActorContext;
-use crate::server::routes::named_groups::local_join_membership_state;
-use crate::server::state::AppState;
-
 use super::{api_error, api_error_with_reason, bad_request, forbidden, not_found};
 
-// ─────────────────────── access levels (S1 subset) ───────────────────────
-
+// ─────────────────────── access levels (S1–S2) ───────────────────────
 /// The local daemon's qualifying seat state for a session bearer — the
 /// `local_join_membership_state` labels (#447/#458) that EARN something.
 /// Refused labels (`pending`, `not_member`) are refusals, not levels.
@@ -91,8 +101,9 @@ pub(in crate::server) enum MemberState {
     PendingAuthorityCommit,
 }
 
-/// What a request was admitted at. S1 needs three levels; S2–S4 add
-/// `RiderScope`, `Admin`, `PublicWrite` and `JoinSelf`.
+/// What a request was admitted at. S1 needs three levels; S2 adds
+/// `RiderScope` and `PublicWrite` for the secure-write family; S3–S4 add
+/// `Admin` and `JoinSelf`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::server) enum AccessLevel {
     /// The durable API token — full authority, subsumes every other level.
@@ -100,9 +111,20 @@ pub(in crate::server) enum AccessLevel {
     /// A session bearer holding a qualifying local seat. Which seat state
     /// qualifies is the route's admission rule, not the caller's guess.
     Member(MemberState),
+    /// A rider bearer on a write surface (`send`, `secure/encrypt`). The
+    /// level LABELS the actor class — it asserts no verified token grant:
+    /// the ADR-0039 grant/ban/role/delegation ladder runs in the handler
+    /// under its own lock (S2 keeps it there; its per-route order is
+    /// pinned by the rider tests, and `send` checks ban BEFORE the grant
+    /// while `secure/encrypt` checks the grant first).
+    RiderScope,
     /// No actor-based gate; the route serves its public projection (any
-    /// remaining gates are local policy, not principal identity).
+    /// remaining gates are local policy, not principal identity). The
+    /// S2 open-envelope surface is the write-side member of this class.
     PublicRead,
+    /// No actor-based gate on a write surface; remaining gates are local
+    /// policy (the withdrawn-record conflict on `open-envelope`).
+    PublicWrite,
 }
 
 /// An admission decision: the granted level, or the exact rejection
@@ -142,8 +164,10 @@ pub(in crate::server) struct RouteAccess {
 /// (`src/server/mod.rs`) and the endpoint registry
 /// (`crate::api::ENDPOINTS`).
 ///
-/// S1 classifies the read family — `GET /groups/:id`, `/members`,
-/// `/messages`, `/state`, `/state/commits`, `/delegations` — everything
+/// S1 classified the read family — `GET /groups/:id`, `/members`,
+/// `/messages`, `/state`, `/state/commits`, `/delegations`; S2 the
+/// secure-write family — `POST /groups/:id/send`,
+/// `secure/encrypt|decrypt|reseal`, `secure/open-envelope`. Everything
 /// else waits for its slice as [`AccessClass::Unmigrated`].
 pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
     // ── S1 read family: classified ────────────────────────────────────
@@ -180,31 +204,37 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
         path: "/groups/:id/delegations",
         class: AccessClass::Level(AccessLevel::Member(MemberState::Active)),
     },
-    // ── S2 secure-write family: waiting ───────────────────────────────
+    // ── S2 secure-write family: classified ────────────────────────────
+    // Nominal levels take the inventory target's first-named class
+    // ("Member + RiderScope" → Member). The cores assert NO seat and NO
+    // token grant: ban state, write policy, send-as, the member gate and
+    // the ADR-0039 grant/delegation/provenance ladder stay in the
+    // handlers, under their own lock (task rule: those checks keep their
+    // lock and their per-route order).
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/send",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::Member(MemberState::Active)),
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/secure/encrypt",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::Member(MemberState::Active)),
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/secure/decrypt",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::Member(MemberState::Active)),
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/secure/reseal",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::Member(MemberState::Active)),
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/secure/open-envelope",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::PublicWrite),
     },
     // ── S3 admin/mutation family: waiting ─────────────────────────────
     RouteAccess {
@@ -653,12 +683,196 @@ pub(in crate::server) fn admit_public_messages(
     })
 }
 
+// ─────────────────────── admission cores (S2 secure-write) ───────────────
+
+/// The ACTING PRINCIPAL's hex — the identity ban state, roster role and
+/// (for riders) token grants are checked against. The send path's
+/// review-fix-#1 rule: an owner bearer acts as the DAEMON's own agent
+/// (the key that signs), a rider as its SUB-AGENT — so a rider can never
+/// inherit the daemon-admin's privileges. Actor-less local-seat
+/// surfaces (messages, state/commits) evaluate the LOCAL daemon's seat,
+/// which is the same principal for every caller.
+pub(in crate::server) fn acting_principal_hex(
+    actor: &ActorContext,
+    local_agent_hex: &str,
+) -> String {
+    match actor {
+        ActorContext::Owner { .. } => local_agent_hex.to_string(),
+        ActorContext::Rider { sub_agent_id, .. } => sub_agent_id.clone(),
+    }
+}
+
+/// The S2 actor classification shared by `send` and the secure
+/// encrypt/decrypt/reseal endpoints: the level LABELS the actor class
+/// the request entered as (the inventory's "Member + RiderScope"), and
+/// the acting hex names the principal the handler's remaining gates
+/// evaluate. Neither asserts a verified seat or grant — the member
+/// gate, ban state, write policy and the ADR-0039 grant/delegation
+/// ladder keep their per-route order in the handler, under its own
+/// lock.
+// Dead until the S2 handler-migration commit wires the wrappers below;
+// that commit removes this allow.
+#[allow(dead_code)]
+fn secure_write_access(
+    info: &x0x::groups::GroupInfo,
+    actor: &ActorContext,
+    local_agent_hex: &str,
+) -> GroupAccess {
+    let level = match actor {
+        ActorContext::Owner { durable: true } => AccessLevel::OwnerDurable,
+        ActorContext::Owner { durable: false } => AccessLevel::Member(MemberState::Active),
+        ActorContext::Rider { .. } => AccessLevel::RiderScope,
+    };
+    GroupAccess {
+        level,
+        stable_id: info.stable_group_id().to_string(),
+        acting_hex: acting_principal_hex(actor, local_agent_hex),
+    }
+}
+
+/// `POST /groups/:id/send` entry admission, in today's order: the raw-id
+/// lookup (404 on a miss — the ADR0066-LOOKUP-WAIVER: no contested
+/// roster is ever served, and widening the route's id semantics is out
+/// of #732's scope) → the withdrawn 409 → the #877
+/// fork-quarantine-for-actor gate (a session bearer without an active
+/// local seat is refused with the bare membership 403 BEFORE any marker
+/// body is built). Everything after — the SignedPublic 400, ban check,
+/// write policy, send-as authorization and the rider grant/delegation/
+/// provenance ladder — stays in the handler, in its order, under this
+/// same lock.
+///
+/// The fork-quarantine gate is injected because it needs the whole
+/// `AppState` (the agent id for the seat check, the diagnostics
+/// counter); the public wrapper wires the canonical
+/// `reject_fork_quarantined_for_actor`, the unit tests pin its position
+/// in the order with a stub, and the end-to-end #877 contract is pinned
+/// by `routes/named_groups/tests/issue877_error_body_session.rs`.
+// Dead until the S2 handler-migration commit wires the wrapper below;
+// that commit removes this allow.
+#[allow(dead_code)]
+fn send_admission<'a>(
+    groups: &'a HashMap<String, x0x::groups::GroupInfo>,
+    route_id: &str,
+    actor: &ActorContext,
+    local_agent_hex: &str,
+    fork_quarantine: impl FnOnce(
+        &x0x::groups::GroupInfo,
+    ) -> Option<(StatusCode, Json<serde_json::Value>)>,
+) -> Result<(&'a x0x::groups::GroupInfo, GroupAccess), (StatusCode, Json<serde_json::Value>)> {
+    let Some(info) = groups.get(route_id) else {
+        return Err(not_found("group not found"));
+    };
+    // `reject_withdrawn_group`'s body.
+    if info.withdrawn {
+        return Err(api_error(StatusCode::CONFLICT, "group is withdrawn"));
+    }
+    if let Some(resp) = fork_quarantine(info) {
+        return Err(resp);
+    }
+    Ok((info, secure_write_access(info, actor, local_agent_hex)))
+}
+
+/// The entry admission shared by the GSS secure endpoints
+/// (`secure/encrypt`, `secure/decrypt`, `secure/reseal`), in today's
+/// order: raw-id lookup 404 → withdrawn 409 → the ADR-0038
+/// restore-quarantine 409 → the #877 fork-quarantine-for-actor gate.
+/// The member gate (its three per-route shapes), the rider ladder and
+/// the crypto follow in the handler under the same lock; the ADR-0066
+/// epoch capture keeps its position immediately after this admission.
+// Dead until the S2 handler-migration commit wires the wrapper below;
+// that commit removes this allow.
+#[allow(dead_code)]
+fn secure_endpoint_admission<'a>(
+    groups: &'a HashMap<String, x0x::groups::GroupInfo>,
+    route_id: &str,
+    actor: &ActorContext,
+    local_agent_hex: &str,
+    fork_quarantine: impl FnOnce(
+        &x0x::groups::GroupInfo,
+    ) -> Option<(StatusCode, Json<serde_json::Value>)>,
+) -> Result<(&'a x0x::groups::GroupInfo, GroupAccess), (StatusCode, Json<serde_json::Value>)> {
+    let Some(info) = groups.get(route_id) else {
+        return Err(not_found("group not found"));
+    };
+    // `reject_withdrawn_group`'s body.
+    if info.withdrawn {
+        return Err(api_error(StatusCode::CONFLICT, "group is withdrawn"));
+    }
+    if let Some(resp) = reject_unverified_owner_certified_restore(info) {
+        return Err(resp);
+    }
+    if let Some(resp) = fork_quarantine(info) {
+        return Err(resp);
+    }
+    Ok((info, secure_write_access(info, actor, local_agent_hex)))
+}
+
+/// `POST /groups/:id/send` entry admission for the handler (which holds
+/// the named-groups read lock for the whole build+sign critical
+/// section): runs [`send_admission`] with the canonical
+/// fork-quarantine gate. `route_id` is the RAW route `:id` — the same
+/// key the inline gate used for the marker body and the diagnostics
+/// bump.
+// Dead until the S2 handler-migration commit wires the send handler;
+// that commit removes this allow.
+#[allow(dead_code)]
+pub(in crate::server) fn admit_group_send<'a>(
+    state: &AppState,
+    route_id: &str,
+    groups: &'a HashMap<String, x0x::groups::GroupInfo>,
+    actor: &ActorContext,
+    local_agent_hex: &str,
+) -> Result<(&'a x0x::groups::GroupInfo, GroupAccess), (StatusCode, Json<serde_json::Value>)> {
+    send_admission(groups, route_id, actor, local_agent_hex, |info| {
+        reject_fork_quarantined_for_actor(state, route_id, info, actor)
+    })
+}
+
+/// The secure encrypt/decrypt/reseal entry admission for the handlers
+/// (each holds the named-groups read lock): runs
+/// [`secure_endpoint_admission`] with the canonical fork-quarantine
+/// gate. `route_id` is the RAW route `:id`, as above.
+// Dead until the S2 handler-migration commit wires the three secure
+// handlers; that commit removes this allow.
+#[allow(dead_code)]
+pub(in crate::server) fn admit_secure_endpoint<'a>(
+    state: &AppState,
+    route_id: &str,
+    groups: &'a HashMap<String, x0x::groups::GroupInfo>,
+    actor: &ActorContext,
+    local_agent_hex: &str,
+) -> Result<(&'a x0x::groups::GroupInfo, GroupAccess), (StatusCode, Json<serde_json::Value>)> {
+    secure_endpoint_admission(groups, route_id, actor, local_agent_hex, |info| {
+        reject_fork_quarantined_for_actor(state, route_id, info, actor)
+    })
+}
+
+/// `POST /groups/secure/open-envelope` admission: the withdrawn-record
+/// conflict (a withdrawn record with no live same-stable-keyed alias →
+/// 409) on the BODY's `group_id` — this surface never had an actor or
+/// membership gate, and an unknown group fails OPEN to the crypto (the
+/// envelope itself refuses). Body of the conflict comes from the
+/// canonical `open_envelope_withdrawn_group_conflict`.
+// Dead until the S2 handler-migration commit wires the handler; that
+// commit removes this allow.
+#[allow(dead_code)]
+pub(in crate::server) fn admit_open_envelope(
+    groups: &HashMap<String, x0x::groups::GroupInfo>,
+    group_id: &str,
+) -> Admission {
+    if let Some(resp) = open_envelope_withdrawn_group_conflict(groups, group_id) {
+        return Err(resp);
+    }
+    Ok(AccessLevel::PublicWrite)
+}
 // ─────────────────────── extractor ───────────────────────────────────────
 
-/// The admission result handed to a handler: the resolved access level
-/// plus the stable group id the route's `:id` resolved to (the DECODED
+/// The admission result handed to a handler: the resolved access level,
+/// the stable group id the route's `:id` resolved to (the DECODED
 /// `:id` when the messages route falls through for a group unknown
-/// locally — the public-cache fail-open that predates this module).
+/// locally — the public-cache fail-open that predates this module), and
+/// the ACTING PRINCIPAL's hex (S2) — the identity the handler's ban/
+/// policy gates evaluate.
 ///
 /// This is the extractor's admission snapshot, not the final word:
 /// handlers that re-read group data for their body re-run the pure core
@@ -667,15 +881,20 @@ pub(in crate::server) fn admit_public_messages(
 pub(in crate::server) struct GroupAccess {
     level: AccessLevel,
     stable_id: String,
+    // Dead until the S2 handler-migration commit wires the send
+    // handler's ban/policy gates to it; that commit removes this allow.
+    #[allow(dead_code)]
+    acting_hex: String,
 }
 
 impl GroupAccess {
     /// The level this request was admitted at.
-    // S1 handlers are admitted-or-refused and never branch on the level
-    // (the one branch that exists — the #447 stub arm — runs in the
-    // pinned-signature details handler via `admit_named_group_details`).
-    // S2 (rider provenance, secure-write gates) is this accessor's first
-    // reader; delete the allow when it lands.
+    // No production reader yet: S1 handlers are admitted-or-refused and
+    // never branch on the level, and the S2 secure-write handlers match
+    // on the `ActorContext` they already hold (their signatures are
+    // pinned by positional test callers) while consuming only
+    // `acting_hex`. S3+ handlers (extractor-wired) are this accessor's
+    // first readers; delete the allow then.
     #[allow(dead_code)]
     pub(in crate::server) fn level(&self) -> AccessLevel {
         self.level
@@ -684,6 +903,16 @@ impl GroupAccess {
     /// Stable id the route's `:id` resolved to.
     pub(in crate::server) fn stable_id(&self) -> &str {
         &self.stable_id
+    }
+
+    /// The ACTING PRINCIPAL's hex (S2): the local daemon's agent for
+    /// owner bearers and actor-less local-seat surfaces, the sub-agent
+    /// for riders — the subject of the handler-side ban/policy gates.
+    // Dead until the S2 handler-migration commit wires the send
+    // handler; that commit removes this allow.
+    #[allow(dead_code)]
+    pub(in crate::server) fn acting_hex(&self) -> &str {
+        &self.acting_hex
     }
 }
 
@@ -713,11 +942,11 @@ async fn admit_members_route(
     let Some(info) = groups.get(id) else {
         return Err(not_found("group not found").into_response());
     };
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     // Session bearers need the #447/#458 seat label; the other actors are
     // decided without it (the arm they take ignores the label).
     let level = match actor {
         ActorContext::Owner { durable: false } => {
-            let local_hex = hex::encode(state.agent.agent_id().as_bytes());
             let label = local_join_membership_state(state, info, &local_hex).await;
             admit_named_group_members(actor, label)
         }
@@ -727,6 +956,7 @@ async fn admit_members_route(
     Ok(GroupAccess {
         level,
         stable_id: info.stable_group_id().to_string(),
+        acting_hex: acting_principal_hex(actor, &local_hex),
     })
 }
 
@@ -743,11 +973,15 @@ async fn admit_messages_route(state: &AppState, id: &str) -> Result<GroupAccess,
             Ok(GroupAccess {
                 level,
                 stable_id: info.stable_group_id().to_string(),
+                // Actor-less surface: the local daemon's seat is the
+                // policy subject.
+                acting_hex: local_hex.clone(),
             })
         }
         None => Ok(GroupAccess {
             level: AccessLevel::PublicRead,
             stable_id: id.to_string(),
+            acting_hex: local_hex,
         }),
     }
 }
@@ -761,6 +995,8 @@ async fn admit_state_route(state: &AppState, id: &str) -> Result<GroupAccess, Re
     Ok(GroupAccess {
         level: AccessLevel::PublicRead,
         stable_id: info.stable_group_id().to_string(),
+        // Actor-less public projection: the local daemon is the subject.
+        acting_hex: hex::encode(state.agent.agent_id().as_bytes()),
     })
 }
 
@@ -775,6 +1011,9 @@ async fn admit_state_commits_route(state: &AppState, id: &str) -> Result<GroupAc
     Ok(GroupAccess {
         level,
         stable_id: info.stable_group_id().to_string(),
+        // Actor-less retained history: the local daemon's seat is the
+        // membership subject.
+        acting_hex: local_hex,
     })
 }
 
@@ -826,11 +1065,15 @@ impl FromRequestParts<Arc<AppState>> for GroupAccess {
             ("GET", "/groups/:id/state/commits") => {
                 admit_state_commits_route(state.as_ref(), &id).await
             }
-            // `GET /groups/:id` and `/delegations` are classified but
-            // deliberately have no arm: their handlers keep pinned
-            // signatures (tests call them positionally) and run the
-            // cores directly. If a future handler wires this extractor
-            // to one of them, this fails closed instead of guessing.
+            // Seven classified routes deliberately have no arm: the S1
+            // `GET /groups/:id` + `/delegations` and the five S2
+            // secure-write handlers keep pinned signatures (tests call
+            // them positionally) and run the cores directly under their
+            // own lock. If a future handler wires this extractor to one
+            // of them, this fails closed instead of guessing — and note
+            // `send` could not take this extractor anyway without
+            // reordering its body validations (kind/size/thread) after
+            // the entry gates.
             _ => Err(unclassified(&parts.method, parts.uri.path())),
         }
     }
@@ -1095,12 +1338,14 @@ mod tests {
         );
     }
 
-    /// The slice contract: exactly the S1 read family is classified, at
-    /// the inventory's target levels; every other group-plane route is an
-    /// explicit `Unmigrated` row so parity holds without claiming a
-    /// migration that has not happened.
+    /// The slice contract: exactly the S1 read family and the S2
+    /// secure-write family are classified, at the inventory's target
+    /// levels (S2 rows take the target's first-named class — see the
+    /// table comment); every other group-plane route is an explicit
+    /// `Unmigrated` row so parity holds without claiming a migration
+    /// that has not happened.
     #[test]
-    fn s1_read_family_classified_and_the_rest_wait_for_their_slice() {
+    fn s1_and_s2_families_classified_and_the_rest_wait_for_their_slice() {
         let expected: &[(Method, &str, AccessLevel)] = &[
             (
                 Method::GET,
@@ -1124,6 +1369,31 @@ mod tests {
                 "/groups/:id/delegations",
                 AccessLevel::Member(MemberState::Active),
             ),
+            (
+                Method::POST,
+                "/groups/:id/send",
+                AccessLevel::Member(MemberState::Active),
+            ),
+            (
+                Method::POST,
+                "/groups/:id/secure/encrypt",
+                AccessLevel::Member(MemberState::Active),
+            ),
+            (
+                Method::POST,
+                "/groups/:id/secure/decrypt",
+                AccessLevel::Member(MemberState::Active),
+            ),
+            (
+                Method::POST,
+                "/groups/:id/secure/reseal",
+                AccessLevel::Member(MemberState::Active),
+            ),
+            (
+                Method::POST,
+                "/groups/secure/open-envelope",
+                AccessLevel::PublicWrite,
+            ),
         ];
         let classified = GROUP_PLANE_ROUTES
             .iter()
@@ -1132,7 +1402,7 @@ mod tests {
         assert_eq!(
             classified,
             expected.len(),
-            "exactly the S1 read family may be classified"
+            "exactly the S1 read and S2 secure-write families may be classified"
         );
         for (method, path, level) in expected {
             let row = GROUP_PLANE_ROUTES
@@ -1577,6 +1847,219 @@ mod tests {
             "group is withdrawn",
             None,
             // withdrawn outranks the MlsEncrypted arm — today's order.
+        );
+    }
+
+    // ────────────────── S2 secure-write admission ──────────────────
+
+    /// `assert_refusal` for the S2 cores, whose Ok side is the admitted
+    /// `(group, access)` pair rather than a bare level.
+    fn assert_secure_refusal<T>(
+        admission: Result<T, (StatusCode, Json<serde_json::Value>)>,
+        status: StatusCode,
+        error: &str,
+        reason: Option<&str>,
+    ) {
+        match admission {
+            Ok(_) => panic!("expected refusal, admitted"),
+            Err((actual_status, Json(body))) => {
+                assert_eq!(actual_status, status, "{body}");
+                assert_eq!(body["ok"], serde_json::json!(false), "{body}");
+                assert_eq!(body["error"], error, "{body}");
+                match reason {
+                    Some(reason) => assert_eq!(body["reason"], reason, "{body}"),
+                    None => assert!(body.get("reason").is_none(), "{body}"),
+                }
+            }
+        }
+    }
+
+    /// The two #877 gate shapes the stub tests propagate verbatim.
+    fn quarantine_membership_403() -> (StatusCode, Json<serde_json::Value>) {
+        api_error_with_reason(
+            StatusCode::FORBIDDEN,
+            "active local group membership required",
+            "group_membership_required",
+        )
+    }
+
+    fn quarantine_marker_409() -> (StatusCode, Json<serde_json::Value>) {
+        api_error_with_reason(
+            StatusCode::CONFLICT,
+            "fork quarantine active",
+            "fork_quarantined",
+        )
+    }
+
+    /// `POST /groups/:id/send` entry admission: raw-id lookup 404 →
+    /// withdrawn 409 → the #877 gate (whose refusal propagates
+    /// verbatim, membership 403 before marker 409), then the actor
+    /// class + acting principal with NO seat or grant asserted.
+    #[test]
+    fn send_admission_reproduces_the_inline_decisions() {
+        let local_hex = local_agent_hex();
+        let mut groups = HashMap::new();
+
+        // Unknown group: the raw-id lookup 404s before any gate runs.
+        assert_secure_refusal(
+            send_admission(&groups, "missing", &durable(), &local_hex, |_| {
+                panic!("the lookup 404 must fire before the quarantine gate")
+            }),
+            StatusCode::NOT_FOUND,
+            "group not found",
+            None,
+        );
+
+        // Withdrawn shell: the 409 fires before the gate.
+        let mut withdrawn = group_with_local_seat("send");
+        withdrawn.withdrawn = true;
+        groups.insert("send".to_string(), withdrawn);
+        assert_secure_refusal(
+            send_admission(&groups, "send", &session(), &local_hex, |_| {
+                panic!("the withdrawn 409 must fire before the quarantine gate")
+            }),
+            StatusCode::CONFLICT,
+            "group is withdrawn",
+            None,
+        );
+
+        groups.insert("send".to_string(), group_with_local_seat("send"));
+
+        // A gate refusal propagates verbatim — both #877 shapes.
+        assert_secure_refusal(
+            send_admission(&groups, "send", &session(), &local_hex, |_| {
+                Some(quarantine_membership_403())
+            }),
+            StatusCode::FORBIDDEN,
+            "active local group membership required",
+            Some("group_membership_required"),
+        );
+        assert_secure_refusal(
+            send_admission(&groups, "send", &session(), &local_hex, |_| {
+                Some(quarantine_marker_409())
+            }),
+            StatusCode::CONFLICT,
+            "fork quarantine active",
+            Some("fork_quarantined"),
+        );
+
+        // Admission: the actor class plus the acting principal. A
+        // session bearer is labelled Member WITHOUT a seat lookup and a
+        // rider RiderScope WITHOUT a grant lookup — those gates run in
+        // the handler, in their per-route order.
+        let (_, access) = send_admission(&groups, "send", &durable(), &local_hex, |_| None)
+            .expect("durable owner admitted");
+        assert_eq!(access.level(), AccessLevel::OwnerDurable);
+        assert_eq!(access.acting_hex(), local_hex);
+        assert_eq!(access.stable_id(), "send");
+
+        let (_, access) = send_admission(&groups, "send", &session(), &local_hex, |_| None)
+            .expect("session bearer admitted (no seat asserted)");
+        assert_eq!(access.level(), AccessLevel::Member(MemberState::Active));
+        assert_eq!(access.acting_hex(), local_hex);
+
+        let (_, access) = send_admission(&groups, "send", &rider(), &local_hex, |_| None)
+            .expect("rider admitted at RiderScope");
+        assert_eq!(access.level(), AccessLevel::RiderScope);
+        assert_eq!(access.acting_hex(), "aa".repeat(32));
+    }
+
+    /// The secure encrypt/decrypt/reseal entry admission: raw-id lookup
+    /// 404 → withdrawn 409 (outranking the restore quarantine) → the
+    /// ADR-0038 restore-quarantine 409 → the #877 gate; then the same
+    /// actor classification as send.
+    #[test]
+    fn secure_endpoint_admission_reproduces_the_inline_decisions() {
+        let local_hex = local_agent_hex();
+        let mut groups = HashMap::new();
+
+        // Unknown group: the raw-id lookup 404s before any gate runs.
+        assert_secure_refusal(
+            secure_endpoint_admission(&groups, "missing", &durable(), &local_hex, |_| {
+                panic!("the lookup 404 must fire before any gate")
+            }),
+            StatusCode::NOT_FOUND,
+            "group not found",
+            None,
+        );
+
+        // A withdrawn shell answers "group is withdrawn" even when the
+        // restore quarantine is also set — withdrawn is checked first.
+        let mut withdrawn = group_with_local_seat("enc");
+        withdrawn.withdrawn = true;
+        withdrawn.owner_cert_reverify_required = true;
+        groups.insert("enc".to_string(), withdrawn);
+        assert_secure_refusal(
+            secure_endpoint_admission(&groups, "enc", &durable(), &local_hex, |_| {
+                panic!("withdrawn must outrank the restore quarantine")
+            }),
+            StatusCode::CONFLICT,
+            "group is withdrawn",
+            None,
+        );
+
+        // The ADR-0038 restore quarantine fires before the fork gate.
+        let mut restored = group_with_local_seat("enc");
+        restored.owner_cert_reverify_required = true;
+        groups.insert("enc".to_string(), restored);
+        assert_secure_refusal(
+            secure_endpoint_admission(&groups, "enc", &durable(), &local_hex, |_| {
+                panic!("the restore quarantine must fire before the fork gate")
+            }),
+            StatusCode::CONFLICT,
+            "owner-certified group requires state re-verification after restore: \
+             POST /groups/:id/state/seal",
+            None,
+        );
+
+        // Clean group: the gate refusal propagates; admission classifies
+        // exactly like send.
+        groups.insert("enc".to_string(), group_with_local_seat("enc"));
+        assert_secure_refusal(
+            secure_endpoint_admission(&groups, "enc", &session(), &local_hex, |_| {
+                Some(quarantine_membership_403())
+            }),
+            StatusCode::FORBIDDEN,
+            "active local group membership required",
+            Some("group_membership_required"),
+        );
+        let (_, access) = secure_endpoint_admission(&groups, "enc", &rider(), &local_hex, |_| None)
+            .expect("rider admitted at RiderScope");
+        assert_eq!(access.level(), AccessLevel::RiderScope);
+        assert_eq!(access.acting_hex(), "aa".repeat(32));
+    }
+
+    /// `POST /groups/secure/open-envelope`: no actor gate at all — an
+    /// unknown group fails OPEN to the crypto (the envelope itself
+    /// refuses), and only the withdrawn-record conflict (no live keyed
+    /// alias) rejects.
+    #[test]
+    fn open_envelope_admission_reproduces_the_inline_decisions() {
+        let mut groups = HashMap::new();
+        assert_eq!(
+            admit_open_envelope(&groups, "unknown").unwrap(),
+            AccessLevel::PublicWrite,
+            "unknown group fails open to the crypto"
+        );
+
+        let mut withdrawn = fixture_group("oe");
+        withdrawn.withdrawn = true;
+        groups.insert("oe".to_string(), withdrawn);
+        assert_refusal(
+            admit_open_envelope(&groups, "oe"),
+            StatusCode::CONFLICT,
+            "group is withdrawn",
+            None,
+        );
+
+        // A live same-stable-keyed alias lifts the conflict.
+        let mut live = fixture_group("oe");
+        live.shared_secret = Some(vec![0x33; 32]);
+        groups.insert("oe-live".to_string(), live);
+        assert_eq!(
+            admit_open_envelope(&groups, "oe").unwrap(),
+            AccessLevel::PublicWrite,
+            "a live keyed alias keeps the envelope openable"
         );
     }
 }

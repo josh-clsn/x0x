@@ -23513,7 +23513,7 @@ fn reject_withdrawn_group(
 /// seal re-verifies the roster. Secure crypto operations refuse with a
 /// typed, retryable error meanwhile — restored GSS/TreeKEM key material
 /// must not serve a stale membership.
-fn reject_unverified_owner_certified_restore(
+pub(in crate::server) fn reject_unverified_owner_certified_restore(
     info: &x0x::groups::GroupInfo,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
     info.owner_cert_reverify_required.then(|| {
@@ -24044,7 +24044,7 @@ fn active_same_stable_keyed_alias_exists(
         })
 }
 
-fn open_envelope_withdrawn_group_conflict(
+pub(in crate::server) fn open_envelope_withdrawn_group_conflict(
     groups: &HashMap<String, x0x::groups::GroupInfo>,
     group_id: &str,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
