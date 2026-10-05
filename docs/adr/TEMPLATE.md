@@ -10,6 +10,10 @@
 - **Superseded by:** <ADR NNNN or none>
 - **Related:** <issues/PRs/specs>
 
+<!-- Use approximately 80% ASD-STE100 style. See docs/documentation-style.md.
+For new topics, use a fixed A01-A15 slot under docs/adr/consolidated/.
+This legacy template remains for already assigned work during transfer. -->
+
 ## Context
 
 What problem, constraint, or architectural tension forced this decision?

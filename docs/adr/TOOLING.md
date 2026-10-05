@@ -1,5 +1,13 @@
 # ADR Tooling and AI Harness Setup
 
+## Use the 15 slot plan
+
+Read [the consolidation rules](consolidated/README.md) before creating a record.
+Map new decisions to A01 through A15. Do not allocate A16 or use a CLI to start
+another general series. Already assigned numbered ADR work keeps its current
+lane during transfer. The tools below still help inspect the legacy set.
+Use [the writing guide](../documentation-style.md) for new and changed prose.
+
 We use ADRs as engineering memory, not paperwork. They capture *why* a decision was made, what alternatives were rejected, and what consequences we accept.
 
 ## Install `adrs`
@@ -39,7 +47,9 @@ Add this project instruction to every AI coding harness profile (`AGENTS.md`, `C
 
 ```text
 Before changing architecture, protocols, storage formats, crypto, network behaviour, public APIs, data models, or operational invariants, inspect docs/adr/.
-If the change creates or changes an architectural decision, draft or update a Proposed ADR using docs/adr/TEMPLATE.md.
+For a new decision, use a Proposed revision of its A01-A15 slot in docs/adr/consolidated/. Do not create A16.
+Already assigned numbered ADR work uses docs/adr/TEMPLATE.md during transfer. Keep its current gates.
+Use approximately 80% ASD-STE100 style in ADRs, docs and communication with David. Follow docs/documentation-style.md.
 Never edit an Accepted ADR. Create a superseding ADR instead.
 Never mark an ADR Accepted autonomously; that requires human engineering review and debate.
 During review, check ADR correctness, rejected alternatives, evidence, consequences, and immutable-Accepted compliance.

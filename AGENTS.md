@@ -65,8 +65,24 @@ Errors: `IdentityError`, `NetworkError`, `PresenceError` in `error.rs`.
 `--no-hard-coded-bootstrap` (config peers kept), `--relay`, `--check`, `--doctor`.
 Example: `x0xd --name alice --api-port 12701 --no-hard-coded-bootstrap`.
 
+## Documentation and communication
+
+Use approximately 80% ASD-STE100 style in ADRs, docs, PR text, review notes,
+and communication with David. Use short sentences, common words, clear actions
+and consistent terms. Keep necessary technical terms and exact guarantees.
+Do not claim formal compliance. Follow `docs/documentation-style.md`.
+
 ## Architecture decisions (ADRs)
 Before changing architecture, protocols, storage formats, crypto, network
-behaviour, public APIs or operational invariants, check `docs/adr/`. New or
-changed decisions go in a Proposed ADR (`docs/adr/TEMPLATE.md`). Accepted ADRs are
-immutable — supersede them instead — and only a human marks an ADR Accepted.
+behaviour, public APIs or operational invariants, check `docs/adr/` and its
+status overlay. Already assigned numbered ADR work uses `docs/adr/TEMPLATE.md`
+during transfer. New decisions use the fixed slots below. Accepted ADRs are
+immutable. Supersede them instead. Only a human marks an ADR Accepted.
+
+The consolidated direction uses 15 fixed slots, A01 through A15. Read
+`docs/adr/consolidated/README.md` before adding a decision. Do not create A16
+or a new general ADR series. Use a proposed revision of the relevant slot.
+Keep already assigned numbered ADR work on its existing review lane during
+transfer. The old accepted records, overlay, frozen evidence and team gates
+stay in force until the replacement transfer and human acceptance are complete.
+Run `python3 scripts/check-adr-consolidation.py` for the transition checks.

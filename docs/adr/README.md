@@ -1,5 +1,12 @@
 # Architecture Decision Records
 
+## Consolidation review
+
+Read the [15 ADR set](consolidated/README.md) for the direction agreed on
+5 October 2026. Its records remain Proposed replacements while the transfer
+checks are open. This index, its status overlay and accepted records continue
+to govern existing work. New docs follow the [style guide](../documentation-style.md).
+
 This directory contains architecture decision records for x0x.
 
 ## Status overlay (rulings 2026-09-28..30)
