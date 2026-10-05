@@ -22152,42 +22152,41 @@ mod tests {
             );
             let owner = agent.identity().user_keypair().expect("owner key");
             let cert = agent.identity().agent_certificate().expect("agent cert");
-            let record = revocation::RevocationRecord::sign(
-                revocation::RevokedSubject::AgentMachineBinding(revocation::AgentMachineBinding {
-                    agent: agent.agent_id(),
-                    machine: agent.machine_id(),
-                    move_epoch: 1,
-                }),
-                owner.public_key(),
+            let own = agent.agent_id();
+            let machine = agent.machine_id();
+            let placement = key_move::PlacementRecord::sign(
+                own,
+                owner.public_key().as_bytes(),
+                key_move::Placement::Roaming,
+                1,
+                1,
                 owner.secret_key(),
-                Agent::unix_timestamp_secs(),
-                None,
             )
-            .expect("sign binding tombstone");
-            assert!(agent
-                .revocation_set
+            .expect("sign placement");
+            let authority = key_move::PlacementAuthority::cert_issuer(cert).expect("authority");
+            agent
+                .move_state
                 .write()
                 .await
-                .verify_and_insert(record.clone(), Some(cert))
-                .expect("insert binding tombstone"));
+                .cache_placement(placement, authority)
+                .expect("cache placement for revocation epoch");
 
-            // A future refusal to persist is allowed; losing the original
-            // bytes or the in-memory tombstone is not.
-            let refused = agent
-                .apply_and_publish_revocation(record.clone(), Some(cert))
-                .await
-                .expect_err("v2 write refused");
-            assert!(storage::revocation_persistence_is_blocked(&refused));
+            // Drive the real v2 writer on both 6544555 and the fixed tree.
+            // Check byte preservation BEFORE the result: old revoke_binding
+            // returns Ok after replacing the corrupt file with a v2 set.
+            let outcome = agent.revoke_binding(&own, &machine, 1, None).await;
             assert!(agent
                 .revocation_set
                 .read()
                 .await
-                .is_binding_revoked(&agent.agent_id(), &agent.machine_id()));
+                .is_binding_revoked(&own, &machine));
             assert_eq!(
                 tokio::fs::read(&path).await.expect("read original file"),
                 garbage,
                 "persist must leave unreadable revocations-v2.bin byte-identical"
             );
+            let refused = outcome.expect_err("v2 write refused");
+            assert!(storage::revocation_persistence_is_blocked(&refused));
             tokio::fs::write(
                 &path,
                 revocation::RevocationSet::new().to_bytes_v2().unwrap(),
@@ -22195,13 +22194,14 @@ mod tests {
             .await
             .expect("operator repair");
             agent
-                .apply_and_publish_revocation(record, Some(cert))
+                .revoke_binding(&own, &machine, 1, None)
                 .await
                 .expect("repair unblocks v2");
             let restored =
                 revocation::RevocationSet::from_bytes_v2(&tokio::fs::read(&path).await.unwrap())
                     .unwrap();
-            assert!(restored.is_binding_revoked(&agent.agent_id(), &agent.machine_id()));
+            assert!(restored.is_binding_revoked(&own, &machine));
+            agent.shutdown().await;
         }
 
         /// #1116 / ADR 0085 rule 4: startup ignores an unreadable v3 file,

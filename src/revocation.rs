@@ -40,16 +40,16 @@ use crate::identity::{AgentCertificate, AgentId, MachineId, UserId};
 const REVOCATION_MSG_PREFIX: &[u8] = b"x0x-revocation-v1";
 
 /// Magic marker prefixing the on-disk revocation set file.
-const REVOCATIONS_FILE_MAGIC: &[u8; 4] = b"X0XR";
+pub(crate) const REVOCATIONS_FILE_MAGIC: &[u8; 4] = b"X0XR";
 
 /// Magic marker prefixing the ADR-0043 ad-hoc binding-record file
 /// (`revocations-v2.bin`).
-const REVOCATIONS_FILE_MAGIC_V2: &[u8; 4] = b"X0R2";
+pub(crate) const REVOCATIONS_FILE_MAGIC_V2: &[u8; 4] = b"X0R2";
 
 /// Magic marker prefixing the ADR-0070 share-grant revocation file
 /// (`revocations-v3.bin`). A distinct magic (and file) keeps the v1/v2
 /// stores loadable by older daemons after a downgrade.
-const REVOCATIONS_FILE_MAGIC_V3: &[u8; 4] = b"X0R3";
+pub(crate) const REVOCATIONS_FILE_MAGIC_V3: &[u8; 4] = b"X0R3";
 
 /// How long past the revoked grant's own expiry a share-grant revocation is
 /// kept before it may be garbage-collected. A grant is dead at `expiry`
@@ -764,6 +764,8 @@ impl RevocationSet {
         bytes: &[u8],
         magic: &[u8; 4],
     ) -> Result<(), IdentityError> {
+        use bincode::Options;
+
         // Keep the existing decoders' empty-file acceptance.
         if bytes.is_empty() {
             return Ok(());
@@ -771,8 +773,11 @@ impl RevocationSet {
         let body = bytes.strip_prefix(magic).ok_or_else(|| {
             IdentityError::Serialization("revocation file magic mismatch".to_string())
         })?;
-        let _: Vec<PersistedRevocation> =
-            bincode::deserialize(body).map_err(|e| IdentityError::Serialization(e.to_string()))?;
+        let _: Vec<PersistedRevocation> = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .reject_trailing_bytes()
+            .deserialize(body)
+            .map_err(|e| IdentityError::Serialization(e.to_string()))?;
         Ok(())
     }
 
@@ -998,6 +1003,52 @@ fn is_v1_subject(subject: &RevokedSubject) -> bool {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    #[tokio::test]
+    async fn trailing_bytes_block_revocation_overwrite_1116() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = bincode::serialize(&Vec::<PersistedRevocation>::new()).unwrap();
+        for (name, magic, store) in [
+            (
+                "revocations.bin",
+                REVOCATIONS_FILE_MAGIC,
+                crate::storage::RevocationStore::V1,
+            ),
+            (
+                "revocations-v2.bin",
+                REVOCATIONS_FILE_MAGIC_V2,
+                crate::storage::RevocationStore::V2,
+            ),
+            (
+                "revocations-v3.bin",
+                REVOCATIONS_FILE_MAGIC_V3,
+                crate::storage::RevocationStore::V3,
+            ),
+        ] {
+            let mut valid = magic.to_vec();
+            valid.extend_from_slice(&body);
+            assert!(RevocationSet::validate_persisted_bytes(&valid, magic).is_ok());
+            let mut garbage = valid.clone();
+            garbage.extend_from_slice(b"trailing garbage");
+            assert!(RevocationSet::validate_persisted_bytes(&garbage, magic).is_err());
+            let path = dir.path().join(name);
+            tokio::fs::write(&path, &garbage).await.unwrap();
+            let unreadable = crate::storage::read_revocation_store(&path, store, false)
+                .await
+                .expect_err("trailing bytes make the store unreadable");
+            assert!(crate::storage::revocation_persistence_is_blocked(
+                &unreadable
+            ));
+            let outcome = crate::storage::save_private_bytes_to(&path, valid).await;
+            assert_eq!(
+                tokio::fs::read(&path).await.unwrap(),
+                garbage,
+                "persist must preserve a valid body with trailing garbage"
+            );
+            let refused = outcome.expect_err("trailing bytes block overwrite");
+            assert!(crate::storage::revocation_persistence_is_blocked(&refused));
+        }
+    }
 
     #[tokio::test]
     async fn structural_validation_keeps_signature_checks_on_load_1116() {

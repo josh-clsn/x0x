@@ -6,7 +6,9 @@
 
 use crate::error::{IdentityError, Result};
 use crate::identity::{AgentCertificate, AgentKeypair, MachineKeypair, UserKeypair};
-use crate::revocation::RevocationSet;
+use crate::revocation::{
+    RevocationSet, REVOCATIONS_FILE_MAGIC, REVOCATIONS_FILE_MAGIC_V2, REVOCATIONS_FILE_MAGIC_V3,
+};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -859,9 +861,9 @@ impl RevocationStore {
 
     fn validate(self, bytes: &[u8]) -> Result<()> {
         let magic = match self {
-            Self::V1 => b"X0XR",
-            Self::V2 => b"X0R2",
-            Self::V3 => b"X0R3",
+            Self::V1 => REVOCATIONS_FILE_MAGIC,
+            Self::V2 => REVOCATIONS_FILE_MAGIC_V2,
+            Self::V3 => REVOCATIONS_FILE_MAGIC_V3,
         };
         RevocationSet::validate_persisted_bytes(bytes, magic)
     }
@@ -965,6 +967,10 @@ pub(crate) struct RevocationWriteGuard {
 }
 
 async fn lock_revocation_path(path: &Path) -> RevocationWriteGuard {
+    // Path spelling is stable: all in-process revocation writers derive
+    // these filenames from the same identity_dir (or x0x_home_dir fallback).
+    // They do not independently resolve relative paths or symlink aliases,
+    // so load, probe and persist share this key, even before the file exists.
     let lock = {
         let mut states = revocation_store_states().lock().await;
         std::sync::Arc::clone(&states.entry(path.to_path_buf()).or_default().write_lock)
