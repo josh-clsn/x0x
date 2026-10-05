@@ -885,6 +885,41 @@ mod tests {
     use super::*;
     use crate::identity::{AgentKeypair, MachineKeypair};
 
+    /// #1116 / ADR 0085 rule 4: a fail-open load must not authorize
+    /// overwriting an unreadable v1 file on the next ordinary persist.
+    #[tokio::test]
+    async fn unreadable_v1_revocations_survive_persist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(REVOCATION_FILE);
+        let garbage = b"unreadable v1 revocations\x00\xff";
+        tokio::fs::write(&path, garbage)
+            .await
+            .expect("seed garbage");
+
+        let mut set = load_revocation_set(Some(dir.path())).await;
+        assert!(set.is_empty(), "ADR 0018 load remains fail-open");
+        let issuer = AgentKeypair::generate().expect("issuer key");
+        let record = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Agent(issuer.agent_id()),
+            issuer.public_key(),
+            issuer.secret_key(),
+            1_000,
+            None,
+        )
+        .expect("sign self-revocation");
+        assert!(set.verify_and_insert(record, None).expect("insert"));
+
+        // Persistence may refuse the unreadable store; the original bytes
+        // and the newly accepted in-memory revocation must survive either way.
+        let _persist_result = save_revocation_set(&set, Some(dir.path())).await;
+        assert!(set.is_agent_revoked(&issuer.agent_id()));
+        assert_eq!(
+            tokio::fs::read(&path).await.expect("read original file"),
+            garbage,
+            "persist must leave unreadable revocations.bin byte-identical"
+        );
+    }
+
     #[tokio::test]
     async fn test_keypair_serialization_roundtrip() {
         // Test MachineKeypair

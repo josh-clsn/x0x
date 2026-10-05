@@ -21856,6 +21856,129 @@ fn spawn_relay_dm_listener(
 #[cfg(test)]
 mod tests {
 
+    mod unreadable_revocation_files_1116 {
+        use super::*;
+
+        async fn load_agent(dir: &std::path::Path) -> Agent {
+            Agent::builder()
+                .with_machine_key(dir.join("machine.key"))
+                .with_agent_key_path(dir.join("agent.key"))
+                .with_agent_cert_path(dir.join("agent.cert"))
+                .with_identity_dir(dir)
+                .with_contact_store_path(dir.join("contacts.json"))
+                .with_user_key(identity::UserKeypair::generate().expect("owner key"))
+                .with_peer_cache_disabled()
+                .build()
+                .await
+                .expect("fail-open agent load")
+        }
+
+        /// #1116 / ADR 0085 rule 4: the real startup load and move-state
+        /// writer must preserve an unreadable v2 binding-tombstone file.
+        #[tokio::test]
+        async fn unreadable_v2_revocations_survive_persist() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("revocations-v2.bin");
+            let garbage = b"unreadable v2 revocations\x00\xff";
+            tokio::fs::write(&path, garbage)
+                .await
+                .expect("seed garbage");
+
+            let agent = load_agent(dir.path()).await;
+            assert!(
+                agent.revocation_set.read().await.is_empty(),
+                "startup still ignores undecodable v2 records"
+            );
+            let owner = agent.identity().user_keypair().expect("owner key");
+            let cert = agent.identity().agent_certificate().expect("agent cert");
+            let record = revocation::RevocationRecord::sign(
+                revocation::RevokedSubject::AgentMachineBinding(revocation::AgentMachineBinding {
+                    agent: agent.agent_id(),
+                    machine: agent.machine_id(),
+                    move_epoch: 1,
+                }),
+                owner.public_key(),
+                owner.secret_key(),
+                Agent::unix_timestamp_secs(),
+                None,
+            )
+            .expect("sign binding tombstone");
+            assert!(agent
+                .revocation_set
+                .write()
+                .await
+                .verify_and_insert(record, Some(cert))
+                .expect("insert binding tombstone"));
+
+            // A future refusal to persist is allowed; losing the original
+            // bytes or the in-memory tombstone is not.
+            let _persist_result = agent.persist_move_state().await;
+            assert!(agent
+                .revocation_set
+                .read()
+                .await
+                .is_binding_revoked(&agent.agent_id(), &agent.machine_id()));
+            assert_eq!(
+                tokio::fs::read(&path).await.expect("read original file"),
+                garbage,
+                "persist must leave unreadable revocations-v2.bin byte-identical"
+            );
+        }
+
+        /// #1116 / ADR 0085 rule 4: startup ignores an unreadable v3 file,
+        /// but the real gossip ingestion/merge writer must not replace it.
+        #[tokio::test]
+        async fn unreadable_v3_revocations_survive_persist() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join(SHARE_GRANT_REVOCATIONS_FILE);
+            let garbage = b"unreadable v3 revocations\x00\xff";
+            tokio::fs::write(&path, garbage)
+                .await
+                .expect("seed garbage");
+
+            let agent = load_agent(dir.path()).await;
+            assert!(
+                agent.revocation_set.read().await.is_empty(),
+                "startup still ignores undecodable v3 records"
+            );
+            let owner = agent.identity().user_keypair().expect("owner key");
+            let grant_id = [0x11; 32];
+            let record = revocation::RevocationRecord::sign(
+                revocation::RevokedSubject::ShareGrant(revocation::ShareGrantRevocation {
+                    grant_id,
+                    owner: owner.user_id(),
+                    grant_expiry: u64::MAX,
+                }),
+                owner.public_key(),
+                owner.secret_key(),
+                Agent::unix_timestamp_secs(),
+                None,
+            )
+            .expect("sign share-grant revocation");
+            let payload = bincode::serialize(&vec![record]).expect("encode v3 carrier");
+            assert!(
+                ingest_share_grant_revocations(
+                    &agent.owner_trust,
+                    &agent.revocation_set,
+                    Some(dir.path().to_path_buf()),
+                    &payload,
+                )
+                .await,
+                "real v3 ingestion must accept the new revocation"
+            );
+            assert!(agent
+                .revocation_set
+                .read()
+                .await
+                .is_share_grant_revoked(&grant_id, &owner.user_id()));
+            assert_eq!(
+                tokio::fs::read(&path).await.expect("read original file"),
+                garbage,
+                "persist must leave unreadable revocations-v3.bin byte-identical"
+            );
+        }
+    }
+
     /// #1135: a gossip publish that reaches zero eager peers is counted
     /// (`publish_with_fanout` == 0 on a solo node), so
     /// /diagnostics/gossip can distinguish an absent message from a
