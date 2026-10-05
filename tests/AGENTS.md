@@ -37,15 +37,19 @@ removal (rekey latency recorded per survivor), no excluded node decrypts it
 during a further `--watch-secs` window (the target, and in the ban case the
 member removed earlier), survivors' rosters drop the target, GSS answers the
 explicit recipient-ineligible refusal to a re-seal, and a banned target's
-re-join is never seated. Transport errors, 5xx and invalid reads make a check
-INCONCLUSIVE, never a pass. The D60 "no later key" check is claimed only with
-key evidence (a decrypt answer from the node's key material, or for GSS the
-node's own share-install journal); a removed member that answers the
-membership gate first is listed under `limitations` instead. Key readiness is
-proven by decrypting, never by roster state (#1214). Nothing assumes one binary
-(#1208): each node's live version and running sha256 are recorded and, with
-the eph `testnet-hosts.json` next to the tokens file, must equal what was
-deployed to that node.
+re-join is never seated. Only exact typed responses count as an exclusion or a
+refusal; transport errors, 5xx, untyped 4xx, fork quarantine and malformed
+reads make a check INCONCLUSIVE, which stays inconclusive in the report
+`verdict` and the exit code (0 pass, 1 fail, 3 inconclusive). The D60 "no
+later key" check is claimed only with key evidence: the node's last decrypt
+answer came from its key material, and an epoch mismatch must report its local
+epoch. A removed member that answers the membership gate first is listed under
+`limitations` instead. A GSS share-install journal line can only fail the
+check; its absence is never evidence. Journal windows start at each node's own
+clock, read before the action. Key readiness is proven by decrypting, never by
+roster state (#1214). Nothing assumes one binary (#1208): each node's live
+version and running sha256 are recorded and, with the eph `testnet-hosts.json`
+next to the tokens file, must equal what was deployed to that node.
 
 ```bash
 python3 -B tests/e2e_vps_survivor_rekey.py --network test \

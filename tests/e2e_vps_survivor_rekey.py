@@ -32,22 +32,30 @@ removal and four or more at the ban. Each case:
 8. a final message sealed after all of that decrypts on every survivor and on no
    excluded node.
 
-Verdicts. A check passes, fails, or is INCONCLUSIVE. Transport errors, timeouts,
-HTTP 5xx, unexpected responses and invalid roster reads never count as an
-exclusion or a refusal: they make the check (and its case) inconclusive.
+Verdicts. A check passes, fails, or is INCONCLUSIVE, and an inconclusive check
+stays inconclusive in its case, the report ``verdict`` and the exit code
+(0 pass, 1 fail, 3 inconclusive). Transport errors, timeouts, HTTP 5xx, fork
+quarantine, untyped 4xx and invalid or malformed reads never count as an
+exclusion or a refusal. Only exact typed responses do: for an excluded node's
+decrypt, 403 ``not a member`` or 404 ``group not found`` (gate), or a typed
+key-material answer; for a join, a 409 carrying a known refusal code.
 
 Evidence classes for "an excluded node holds no post-removal key" (D60):
 
-* ``key``: the node's decrypt reached its key material (GSS no secret, epoch
-  mismatch with its local epoch, or AEAD failure; TreeKEM group not loaded or
-  decrypt failure) on the last probe of the watch window;
-* ``journal``: GSS only. The node's own journal, which logs every KEM-sealed
-  share it installs at info level, shows no install for this group in the case
-  window, and the window does hold info-level lines;
-* ``limited``: neither is available. A removed member's daemon answers
-  ``not a member`` before it consults any key material, and TreeKEM logs no
-  info-level key install. The check is NOT claimed: it is listed under
-  ``limitations`` in the report, not under ``assertions``.
+* ``key``: the node's LAST decrypt answer came from its key material (GSS no
+  secret, epoch mismatch that reports a local epoch below the new one, or AEAD
+  failure; TreeKEM group not loaded or decrypt failure);
+* ``limited``: no key evidence. A removed member's daemon answers ``not a
+  member`` before it consults any key material, TreeKEM logs no key install,
+  and an epoch mismatch without the local epoch proves nothing. The check is NOT
+  claimed: it is listed under ``limitations`` in the report, not under
+  ``assertions``.
+
+The GSS share-install journal line ("stored new group shared secret (epoch N)")
+can only FAIL the check: a line for this group at the new epoch or later is a
+leak. Its absence is never evidence, because x0xd's non-blocking log writer drops
+lines without a signal and log filters can hide it. Journal windows start at the
+node's own clock, read before the action.
 
 Mixed versions: nothing assumes one binary. Each node's live ``/health`` version
 and the sha256 of its running x0xd (``/proc/<MainPID>/exe`` over SSH) are
@@ -126,13 +134,24 @@ LEAK_CLASSES = frozenset({"decrypted", "wrong_plaintext"})
 # key: the daemon passed the membership gate and consulted its key material.
 KEY_EVIDENCE_CLASSES = frozenset({"no_secret", "epoch_mismatch", "decrypt_failed",
                                   "treekem_not_loaded", "treekem_decrypt_failed"})
-# gate: a typed refusal before any key material is consulted.
-GATE_CLASSES = frozenset({"not_member", "group_not_found", "fork_quarantined", "forbidden"})
-# Everything else (transport errors, 5xx, unexpected 4xx) is an error: no evidence.
+# gate: the two typed membership refusals answered before any key material is
+# consulted (403 "not a member", 404 "group not found"). Nothing else counts.
+GATE_CLASSES = frozenset({"not_member", "group_not_found"})
+# Everything else (transport errors, 5xx, fork quarantine, other 4xx) is an
+# error: no evidence, so the check is inconclusive.
 RESEAL_REFUSALS = frozenset({"recipient_not_member", "recipient_not_active"})
 JOIN_STATES = frozenset({"active", "pending_authority_commit", "idle", "timed_out"})
 JOIN_STATUS_STATES = frozenset({"pending_authority_commit", "idle"})
-JOIN_REFUSAL_STATUSES = frozenset({403, 404, 409})
+# Typed `POST /groups/join` refusals: a 409 whose `error` (or `reason`) is one of
+# these codes (docs/api-reference.md, join_group_via_invite). Untyped 4xx are not
+# refusals.
+JOIN_REFUSAL_CODES = frozenset({
+    "invite_unsigned", "invite_signature_invalid", "invite_malformed", "invite_base_inconsistent",
+    "invite_downgraded", "invite_not_addressed_to_me", "inviter_key_mismatch", "inviter_key_revoked",
+    "invite_owner_countersignature_missing", "invite_owner_countersignature_invalid",
+    "use_home_mode", "pin_requires_home_mode", "home_mode_requires_pin", "owner_mismatch",
+    "join_already_pending", "fork_quarantined"})
+KNOWN_MEMBER_STATES = frozenset({"active", "pending", "removed", "banned"})
 JOIN_OUTCOMES = frozenset({"refused", "timed_out"})
 JOIN_OUTCOME_REASONS = frozenset({
     "invite_secret_unknown", "invite_secret_consumed", "invite_role_exceeds_cap",
@@ -156,8 +175,9 @@ INFO_LINES_RE = re.compile(r"^x0x-rekey-info-lines=(\d+)\s*$", re.MULTILINE)
 WAITED_MS_RE = re.compile(r"waited_ms[\"']?\s*[=:]\s*(\d+)")
 SSH_BASE = ("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
             "-o", "ControlMaster=no", "-o", "ControlPath=none")
+# $1 = the node's OWN clock (unix seconds), read before the action it covers.
 JOURNAL_SCRIPT = r'''set -u
-since=$(( $(date +%s) - $1 )); shift
+since=$1; shift
 args=()
 for needle in "$@"; do args+=(-e "$needle"); done
 journalctl -u ''' + SERVICE + r''' --since "@$since" -o cat --no-pager 2>/dev/null \
@@ -165,6 +185,9 @@ journalctl -u ''' + SERVICE + r''' --since "@$since" -o cat --no-pager 2>/dev/nu
 printf 'x0x-rekey-info-lines=%s\n' "$(journalctl -u ''' + SERVICE + r''' --since "@$since" -o cat --no-pager 2>/dev/null | grep -c -F INFO || true)"
 exit 0
 '''
+REMOTE_CLOCK_SCRIPT = "date +%s\n"
+# Exit codes: inconclusive is distinct from a failure end to end.
+EXIT_PASS, EXIT_FAIL, EXIT_INCONCLUSIVE = 0, 1, 3
 LIVE_SHA_SCRIPT = r'''set -eu
 pid=$(systemctl show -p MainPID --value ''' + SERVICE + r''')
 [ "${pid:-0}" -gt 0 ]
@@ -331,29 +354,31 @@ def classify_decrypt(status: Optional[int], body: Any, expected_b64: str) -> Tup
     if status == 200:
         decrypted = body.get("ok") is not False and body.get("payload_b64") == expected_b64
         return ("decrypted" if decrypted else "wrong_plaintext"), (epoch if type(epoch) is int else None)
-    if reason == "fork_quarantined":
-        return "fork_quarantined", None
-    if status == 409 and error.startswith("epoch mismatch"):
-        local = body.get("local_epoch")
-        return "epoch_mismatch", (local if type(local) is int else None)
-    if status == 424:
+    # Each typed class needs its exact status AND its exact body. A matching
+    # body on any other status, or any other body, is an untyped response.
+    if status == 409:
+        if error.startswith("epoch mismatch") and not reason:
+            local = body.get("local_epoch")
+            return "epoch_mismatch", (local if type(local) is int else None)
+        return ("fork_quarantined" if reason == "fork_quarantined" else "conflict"), None
+    if status == 424 and not reason:
         if error == "no shared secret available":
             return "no_secret", None
         if error.startswith("TreeKEM group not loaded"):
             return "treekem_not_loaded", None
-        return "failed_dependency", None
-    if status == 403:
+    if status == 403 and not reason:
         if error == "not a member":
             return "not_member", None
         if error == "decryption failed":
             return "decrypt_failed", None
-        return "forbidden", None
-    if status == 400:
-        return ("treekem_decrypt_failed" if error.startswith("treekem decrypt failed") else "bad_request"), None
-    if status == 404:
+    if status == 400 and not reason and error.startswith("treekem decrypt failed"):
+        return "treekem_decrypt_failed", None
+    if status == 404 and not reason and error == "group not found":
         return "group_not_found", None
-    if status == 409:
-        return "conflict", None
+    if reason == "fork_quarantined":
+        return "fork_quarantined", None
+    if status in (400, 403, 404, 424):
+        return {400: "bad_request", 403: "forbidden", 404: "not_found_other", 424: "failed_dependency"}[status], None
     return "http_other", None
 
 
@@ -398,12 +423,21 @@ def reseal_verdict(cls: str) -> str:
 
 
 def classify_join_attempt(status: Optional[int], body: Any) -> Dict[str, Any]:
+    """`POST /groups/join`: allow-listed fields only. `refusal_code` is set only for a
+    typed refusal (409 with a known code in `error` or `reason`)."""
     body = body if isinstance(body, dict) else {}
     state = body.get("join_state")
     already = body.get("already_joined")
+    code = None
+    if status == 409:
+        for value in (_text(body, "reason"), _text(body, "error")):
+            if value in JOIN_REFUSAL_CODES:
+                code = value
+                break
     return {"status": status,
             "join_state": state if state in JOIN_STATES else ("other" if state is not None else None),
-            "already_joined": already if isinstance(already, bool) else None}
+            "already_joined": already if isinstance(already, bool) else None,
+            "refusal_code": code}
 
 
 def classify_join_status(status: Optional[int], body: Any) -> Dict[str, Any]:
@@ -442,13 +476,16 @@ def rejoin_verdict(attempt: Dict[str, Any], roster_reads: Sequence[Optional[bool
     inconclusive, never 'not seated'."""
     status = attempt.get("status")
     accepted = isinstance(status, int) and 200 <= status < 300
+    typed_refusal = attempt.get("refusal_code") in JOIN_REFUSAL_CODES
     if any(read is True for read in roster_reads):
         return "fail", "seated_on_remover_roster"
     if local == "seat":
         return "fail", "target_reports_active"
     if accepted and (attempt.get("join_state") == "active" or attempt.get("already_joined") is True):
         return "fail", "join_reported_active"
-    if not (accepted or status in JOIN_REFUSAL_STATUSES):
+    if isinstance(status, int) and 400 <= status < 500 and not typed_refusal:
+        return "inconclusive", "untyped_join_refusal"
+    if not (accepted or typed_refusal):
         return "inconclusive", "join_request_error"
     if not roster_reads or any(read is None for read in roster_reads):
         return "inconclusive", "invalid_roster_read"
@@ -456,17 +493,27 @@ def rejoin_verdict(attempt: Dict[str, Any], roster_reads: Sequence[Optional[bool
         return "inconclusive", "invalid_local_read"
     if not join_status.get("valid"):
         return "inconclusive", "invalid_join_status"
-    if status in JOIN_REFUSAL_STATUSES or join_status.get("outcome") == "refused":
+    if typed_refusal or join_status.get("outcome") == "refused":
         return "pass", "refused"
     return "pass", "unseated"
 
 
 def member_is_active(status: Optional[int], body: Any, agent_id: str) -> Optional[bool]:
-    """None when the roster could not be read."""
+    """None when the roster could not be read or any row is malformed: every row
+    needs a string agent_id and a known string state, so a row missing its state
+    is never read as a valid absence."""
     if status != 200 or not isinstance(body, dict) or not isinstance(body.get("members"), list):
         return None
-    return any(isinstance(row, dict) and row.get("agent_id") == agent_id
-               and str(row.get("state", "")).lower() == "active" for row in body["members"])
+    active = False
+    for row in body["members"]:
+        if not isinstance(row, dict) or not isinstance(row.get("agent_id"), str):
+            return None
+        state = row.get("state")
+        if not isinstance(state, str) or state.lower() not in KNOWN_MEMBER_STATES:
+            return None
+        if row["agent_id"] == agent_id and state.lower() == "active":
+            active = True
+    return active
 
 
 def restart_lead_ok(lead_seconds: float, bounds: Tuple[float, float] = RESTART_LEAD_BOUNDS) -> bool:
@@ -538,11 +585,13 @@ class ExclusionObservation:
     key_probes: int = 0
     gate_probes: int = 0
     last_class: Optional[str] = None
+    last_epoch: Optional[int] = None
     last_at: Optional[float] = None
 
     def observe(self, at: float, cls: str, epoch: Optional[int]) -> None:
         self.probes += 1
         self.last_class, self.last_at = cls, at
+        self.last_epoch = epoch if type(epoch) is int else None
         self.classes[cls] = self.classes.get(cls, 0) + 1
         kind = exclusion_kind(cls)
         if kind == "leak":
@@ -562,7 +611,8 @@ class ExclusionObservation:
     def summary(self, started: float) -> Dict[str, Any]:
         return {"probes": self.probes, "classes": dict(self.classes), "errors": self.errors,
                 "key_probes": self.key_probes, "gate_probes": self.gate_probes,
-                "last_class": self.last_class, "max_local_epoch": self.max_local_epoch(),
+                "last_class": self.last_class, "last_epoch": self.last_epoch,
+                "max_local_epoch": self.max_local_epoch(),
                 "leaked": self.leaked,
                 "observed_until_s": round(self.last_at - started, 3) if self.last_at is not None else None}
 
@@ -583,27 +633,33 @@ def d60_verdict(obs: ExclusionObservation, post_epoch: int,
                 journal: Optional[Dict[str, Any]]) -> Tuple[str, str]:
     """'No post-removal key reaches the node': (verdict, evidence class).
 
-    verdict is pass | fail | inconclusive | limited. 'limited' means the API and
-    the journal give no key evidence: the check is not claimed.
+    verdict is pass | fail | inconclusive | limited. Only key evidence passes: the
+    node's LAST decrypt answer came from its key material, and an epoch mismatch
+    must report the node's local epoch, below the new one. The journal can only
+    FAIL the check (an install line for this group at the new epoch or later is
+    proof). Its silence proves nothing: x0xd's non-blocking log writer drops
+    lines without a signal and log filters can hide the marker. 'limited' means
+    no key evidence exists: the check is not claimed.
     """
     if obs.leaked:
         return "fail", "leak"
+    if (journal is not None and "error_class" not in journal
+            and type(journal.get("attributed_max_epoch")) is int and journal["attributed_max_epoch"] >= post_epoch):
+        return "fail", "journal_install"
+    max_local = obs.max_local_epoch()
+    if max_local is not None and max_local >= post_epoch:
+        return "fail", "local_epoch_reached"
     if obs.probes == 0:
         return "inconclusive", "unobserved"
     if obs.errors:
         return "inconclusive", "error_responses"
-    max_local = obs.max_local_epoch()
-    if max_local is not None and max_local >= post_epoch:
-        return "fail", "local_epoch_reached"
-    usable = (journal is not None and "error_class" not in journal
-              and isinstance(journal.get("info_lines"), int) and journal["info_lines"] > 0)
-    if usable and journal["attributed_max_epoch"] is not None and journal["attributed_max_epoch"] >= post_epoch:
-        return "fail", "journal_install"
     # Keys only arrive: a key-material answer on the LAST probe covers the window.
+    if obs.last_class == "epoch_mismatch":
+        if obs.last_epoch is not None and obs.last_epoch < post_epoch:
+            return "pass", "key"
+        return "limited", "epoch_unreported"
     if obs.last_class in KEY_EVIDENCE_CLASSES:
         return "pass", "key"
-    if usable and journal["unattributed"] == 0:
-        return "pass", "journal"
     return "limited", "membership_gate"
 
 
@@ -695,27 +751,47 @@ def ssh_read(address: str, script: str, args: Sequence[str], timeout: float) -> 
     return result.stdout.decode("utf-8", errors="replace"), {}
 
 
-def scan_journal(address: str, window_seconds: float, timeout: float = 45.0) -> Dict[str, Any]:
-    """Read-only count of the JOURNAL_PATTERNS markers in the unit's last window."""
-    window = max(1, int(math.ceil(window_seconds)))
-    text, error = ssh_read(address, JOURNAL_SCRIPT, [str(window), *(needle for _, needle in JOURNAL_PATTERNS)],
-                           timeout)
+def parse_remote_clock(text: Optional[str]) -> Optional[int]:
+    value = text.strip() if isinstance(text, str) else ""
+    return int(value) if re.fullmatch(r"[0-9]{9,11}", value) else None
+
+
+def read_remote_clock(address: str, timeout: float = 30.0) -> Optional[int]:
+    """The node's own unix clock. Journal windows start here, read BEFORE the action,
+    so SSH delay at scan time can never move the window past the action."""
+    text, _error = ssh_read(address, REMOTE_CLOCK_SCRIPT, [], timeout)
+    return parse_remote_clock(text)
+
+
+def journal_since(since_unix: Optional[int]) -> Optional[str]:
+    """journalctl --since argument: the node clock minus one second of margin."""
+    return str(since_unix - 1) if type(since_unix) is int and since_unix > 1 else None
+
+
+def scan_journal(address: str, since_unix: Optional[int], timeout: float = 45.0) -> Dict[str, Any]:
+    """Read-only count of the JOURNAL_PATTERNS markers since a node-clock instant."""
+    since = journal_since(since_unix)
+    if since is None:
+        return {"error_class": "no_remote_clock"}
+    text, error = ssh_read(address, JOURNAL_SCRIPT, [since, *(needle for _, needle in JOURNAL_PATTERNS)], timeout)
     if text is None:
-        return {"window_seconds": window, **error}
+        return {"since_unix": since_unix, **error}
     parsed = parse_journal_matches(text)
-    parsed["window_seconds"] = window
+    parsed["since_unix"] = since_unix
     return parsed
 
 
-def scan_share_installs(address: str, window_seconds: float, stable_gid: str,
+def scan_share_installs(address: str, since_unix: Optional[int], stable_gid: str,
                         timeout: float = 45.0) -> Dict[str, Any]:
-    """Read-only: GSS share installs logged by the node in the last window."""
-    window = max(1, int(math.ceil(window_seconds)))
-    text, error = ssh_read(address, JOURNAL_SCRIPT, [str(window), SHARE_INSTALL_MARKER], timeout)
+    """Read-only: GSS share installs the node logged since a node-clock instant."""
+    since = journal_since(since_unix)
+    if since is None:
+        return {"error_class": "no_remote_clock"}
+    text, error = ssh_read(address, JOURNAL_SCRIPT, [since, SHARE_INSTALL_MARKER], timeout)
     if text is None:
-        return {"window_seconds": window, **error}
+        return {"since_unix": since_unix, **error}
     parsed = parse_share_installs(text, stable_gid)
-    parsed["window_seconds"] = window
+    parsed["since_unix"] = since_unix
     return parsed
 
 
@@ -768,9 +844,40 @@ def rows_outcome(rows: List[Dict[str, Any]], completed: bool) -> str:
     return "passed" if completed else "failed"
 
 
+class Inconclusive(AssertionError):
+    """A check could not be decided. Handlers record it as inconclusive, never as a failure."""
+
+
 def require_all_pass(case: str, verdicts: Sequence[str]) -> None:
-    if any(verdict != "pass" for verdict in verdicts):
-        raise AssertionError(f"{case}: checks did not pass")
+    """Raise Inconclusive when every non-pass verdict is inconclusive, else AssertionError."""
+    bad = [verdict for verdict in verdicts if verdict != "pass"]
+    if not bad:
+        return
+    if all(verdict == "inconclusive" for verdict in bad):
+        raise Inconclusive(f"{case}: checks were inconclusive")
+    raise AssertionError(f"{case}: checks did not pass")
+
+
+def aborted_row(label: str, error: BaseException) -> Dict[str, Any]:
+    """The row a block or harness handler records for an exception. An Inconclusive
+    stays inconclusive; anything else is a failure. Class only, never str(error)."""
+    row: Dict[str, Any] = {"label": label, "passed": False, "error_class": type(error).__name__}
+    if isinstance(error, Inconclusive):
+        row["verdict"] = "inconclusive"
+    return with_poll_timeout(row, error)
+
+
+def final_verdict(evidence: "RekeyEvidence", completed: bool) -> str:
+    """pass | fail | inconclusive for the report and the CLI. A run with no completed
+    harness or no case cannot pass, but an inconclusive run stays inconclusive."""
+    verdict = evidence.verdict()
+    if verdict == "pass" and not (completed and evidence.cases):
+        return "fail"
+    return verdict
+
+
+def exit_code(verdict: str) -> int:
+    return {"pass": EXIT_PASS, "inconclusive": EXIT_INCONCLUSIVE}.get(verdict, EXIT_FAIL)
 
 
 # --------------------------------------------------------------------------- scenario
@@ -782,8 +889,9 @@ class RekeyScenario(PrivateScenario):
                  rekey_timeout: float = 120, watch_secs: float = 40, rejoin_watch_secs: float = 30,
                  restart_lead_secs: float = 15, probe_period: float = 1.0,
                  versions: Optional[Dict[str, Optional[str]]] = None,
-                 journal_scan: Optional[Callable[[str, float], Dict[str, Any]]] = None,
-                 share_install_scan: Optional[Callable[[str, float, str], Dict[str, Any]]] = None,
+                 journal_scan: Optional[Callable[[str, Optional[int]], Dict[str, Any]]] = None,
+                 share_install_scan: Optional[Callable[[str, Optional[int], str], Dict[str, Any]]] = None,
+                 remote_clock: Optional[Callable[[str], Optional[int]]] = None,
                  binary_sha: Optional[Callable[[str], Optional[str]]] = None,
                  clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep) -> None:
@@ -801,9 +909,20 @@ class RekeyScenario(PrivateScenario):
         self.versions: Dict[str, Optional[str]] = dict(versions or {})
         self.journal_scan = journal_scan
         self.share_install_scan = share_install_scan
+        self.remote_clock = remote_clock
         self.binary_sha = binary_sha
         self.now, self.sleep = clock, sleep
         self._aids: Dict[str, str] = {}
+
+    def node_clock(self, node: str) -> Optional[int]:
+        """The node's own clock, or None. Journal windows start here."""
+        if self.remote_clock is None:
+            return None
+        try:
+            value = self.remote_clock(node)
+        except Exception:
+            return None
+        return value if type(value) is int else None
 
     # -- primitives ---------------------------------------------------------
 
@@ -1009,17 +1128,21 @@ class RekeyScenario(PrivateScenario):
                 self._probe_round(pool, tracker, list(excluded), gid, sealed, expected)
         return tracker
 
-    def share_witness(self, plane: str, node: str, window: float,
+    def share_witness(self, plane: str, node: str, since_unix: Optional[int],
                       stable_gid: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Leak detection only: a GSS install line for this group proves a leak; its
+        absence proves nothing."""
         if plane != "gss" or self.share_install_scan is None or stable_gid is None:
             return None
+        if since_unix is None:
+            return {"error_class": "no_remote_clock"}
         try:
-            return self.share_install_scan(node, window, stable_gid)
+            return self.share_install_scan(node, since_unix, stable_gid)
         except Exception as error:
             return {"error_class": safe_error_class(error)}
 
     def exclusion_checks(self, case: str, plane: str, action: str, target: str, tracker: RekeyTracker,
-                         post_epoch: int, act_started: float, stable_gid: Optional[str],
+                         post_epoch: int, clocks: Dict[str, Optional[int]], stable_gid: Optional[str],
                          record: Dict[str, Any]) -> List[str]:
         verdicts: List[str] = []
         witnesses: Dict[str, Any] = {}
@@ -1030,7 +1153,7 @@ class RekeyScenario(PrivateScenario):
             verdicts.append(self.e.verdict_row(
                 f"{case}: {node} cannot decrypt the post-{action} message", verdict, node=node, role=role,
                 evidence_class=kind, probe_classes=dict(obs.classes)))
-            witness = self.share_witness(plane, node, self.now() - act_started + 2, stable_gid)
+            witness = self.share_witness(plane, node, clocks.get(node), stable_gid)
             if witness is not None:
                 witnesses[node] = witness
             d60, d60_class = d60_verdict(obs, post_epoch, witness)
@@ -1038,16 +1161,19 @@ class RekeyScenario(PrivateScenario):
             label = f"{case}: no post-{action} key reaches {node} during the watch (D60)"
             facts = {"node": node, "role": role, "evidence_class": d60_class, "watch_seconds": self.watch_secs,
                      "observed_until_seconds": obs.summary(tracker.started)["observed_until_s"],
-                     "last_class": obs.last_class, "max_local_epoch": obs.max_local_epoch(),
-                     "post_epoch": post_epoch}
+                     "last_class": obs.last_class, "last_epoch": obs.last_epoch,
+                     "max_local_epoch": obs.max_local_epoch(), "post_epoch": post_epoch}
             if d60 == "limited":
-                # Not claimed: the membership gate answers before key material and no
-                # key-install witness exists for this plane or node.
-                reason = ("membership gate answers before key material; TreeKEM logs no key install"
-                          if plane == "treekem" else
-                          "membership gate answers before key material; no usable share-install journal witness")
+                # Not claimed: no key evidence. A missing install line is not evidence.
+                if d60_class == "epoch_unreported":
+                    reason = "last answer was an epoch mismatch without the node's local epoch"
+                elif plane == "treekem":
+                    reason = "membership gate answers before key material; TreeKEM logs no key install"
+                else:
+                    reason = ("membership gate answers before key material; a missing share-install "
+                              "line proves nothing (non-blocking log writer may drop lines)")
                 self.e.limitations.append({"case": case, "check": label, "reason": reason, "plane": plane,
-                                           **facts, "evidence_class": "limited"})
+                                           **facts, "gate_evidence": d60_class, "evidence_class": "limited"})
             else:
                 verdicts.append(self.e.verdict_row(label, d60, **facts))
         record["share_install_witness"] = witnesses
@@ -1113,11 +1239,19 @@ class RekeyScenario(PrivateScenario):
         self.e.cases.append(record)
         print(f"[rekey] {case}: remover={remover} target={target} survivors={','.join(survivors)}"
               f"{' departed=' + ','.join(departed) if departed else ''}", flush=True)
+        # The remover's journal window starts at its own clock, read before anything runs.
+        clocks: Dict[str, Optional[int]] = {remover: self.node_clock(remover)}
         try:
             self.e.check(f"{case}: group has at least four members before the {action}",
                          len(survivors) + 2 >= 4, members=len(survivors) + 2)
             target_aid = self.aid(target)
             record["epoch_before"] = self.key_barrier(case, plane, remover, gid, [*survivors, target])
+            if plane == "gss" and self.share_install_scan is not None:
+                # Each excluded node's install window starts at ITS clock, read before
+                # the action, so SSH delay at scan time cannot hide an early install.
+                for node in excluded:
+                    clocks[node] = self.node_clock(node)
+            record["node_clocks"] = dict(clocks)
             pre_ban_invite = (self.mint_invite(f"{case}: remover mints an invite before the ban", remover, gid)
                               if action == "ban" else None)
             if restart_fn is not None:
@@ -1128,11 +1262,10 @@ class RekeyScenario(PrivateScenario):
                     self.sleep(wait)
                 lead = round(self.now() - restarted_at, 3)
                 record["restart"]["lead_seconds"] = lead
-                lead_ok = restart_lead_ok(lead)
-                facts: Dict[str, Any] = {"lead_seconds": lead, "bounds": list(RESTART_LEAD_BOUNDS)}
-                if not lead_ok:
-                    facts["verdict"] = "inconclusive"
-                self.e.check(f"{case}: {action} starts 10-20 s after the remover restart", lead_ok, **facts)
+                require_all_pass(case, [self.e.verdict_row(
+                    f"{case}: {action} starts 10-20 s after the remover restart",
+                    "pass" if restart_lead_ok(lead) else "inconclusive",
+                    lead_seconds=lead, bounds=list(RESTART_LEAD_BOUNDS))])
             else:
                 record["restart"] = None
 
@@ -1164,7 +1297,7 @@ class RekeyScenario(PrivateScenario):
                     node=node, latency_seconds=latency, secret_epoch=epoch, post_epoch=post_epoch,
                     probe_classes=summary["survivor_probe_classes"].get(node, {}),
                     version=self.versions.get(node)))
-            verdicts += self.exclusion_checks(case, plane, action, target, tracker, post_epoch, act_started,
+            verdicts += self.exclusion_checks(case, plane, action, target, tracker, post_epoch, clocks,
                                               stable_gid, record)
             require_all_pass(case, verdicts)
 
@@ -1203,7 +1336,7 @@ class RekeyScenario(PrivateScenario):
             record["seconds"] = round(self.now() - case_started, 3)
             if self.journal_scan is not None:
                 try:
-                    record["journal_remover"] = self.journal_scan(remover, self.now() - case_started + 2)
+                    record["journal_remover"] = self.journal_scan(remover, clocks.get(remover))
                 except Exception as error:
                     record["journal_remover"] = {"error_class": safe_error_class(error)}
 
@@ -1307,7 +1440,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parse_and_validate(argv)
     roles: Dict[str, Any] = args.roles
     remover = roles["remover"]
-    started_utc, started = utc_now(), time.monotonic()
+    started_utc = utc_now()
     tunnels: Dict[str, TunnelHandle] = {}
     clients: Dict[str, RekeyApi] = {}
     evidence = RekeyEvidence()
@@ -1315,6 +1448,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     succeeded = False
     live_versions: Dict[str, Optional[str]] = {}
     live_shas: Dict[str, Optional[str]] = {}
+    start_clocks: Dict[str, Optional[int]] = {}
     journal_totals: Dict[str, Any] = {}
 
     def await_health(node: str) -> None:
@@ -1336,13 +1470,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             custody.require_active(remover)
 
         for node in args.nodes:
+            # Each node's own clock, read before any action: the run-wide journal window.
+            start_clocks[node] = read_remote_clock(args.endpoints[node])
             status, body = clients[node].request("GET", "/health")
             live_versions[node] = normalize_version(body.get("version")) if status == 200 else None
             live_shas[node] = read_live_sha(args.endpoints[node])
-        evidence.check("live version recorded for every node", all(live_versions.values()),
-                       versions=dict(live_versions))
-        metadata = [evidence.verdict_row(f"{node} runs the version and binary deployed to it", verdict, **facts)
-                    for node, verdict, facts in binary_checks(args.node_binaries, live_versions, live_shas)]
+        metadata = [evidence.verdict_row("live version recorded for every node",
+                                         "pass" if all(live_versions.values()) else "inconclusive",
+                                         versions=dict(live_versions))]
+        metadata += [evidence.verdict_row(f"{node} runs the version and binary deployed to it", verdict, **facts)
+                     for node, verdict, facts in binary_checks(args.node_binaries, live_versions, live_shas)]
         if args.expect_mixed:
             verdict, facts = mixed_check(args.node_binaries, live_shas)
             metadata.append(evidence.verdict_row("selected nodes run two or more distinct verified binaries",
@@ -1353,10 +1490,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             clients, evidence, args.poll_timeout, rekey_timeout=args.rekey_timeout,
             watch_secs=args.watch_secs, rejoin_watch_secs=args.rejoin_watch_secs,
             restart_lead_secs=args.restart_lead_secs, versions=live_versions,
-            journal_scan=None if args.no_journal_scan else lambda node, window: scan_journal(
-                args.endpoints[node], window),
-            share_install_scan=None if args.no_journal_scan else lambda node, window, gid: scan_share_installs(
-                args.endpoints[node], window, gid),
+            journal_scan=None if args.no_journal_scan else lambda node, since: scan_journal(
+                args.endpoints[node], since),
+            share_install_scan=None if args.no_journal_scan else lambda node, since, gid: scan_share_installs(
+                args.endpoints[node], since, gid),
+            remote_clock=lambda node: read_remote_clock(args.endpoints[node]),
             binary_sha=lambda node: read_live_sha(args.endpoints[node]))
 
         def restart(node: str) -> None:
@@ -1368,21 +1506,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                     scenario.run_block(variant, plane, roles, restart if variant == "restart" else None)
                 except Exception as error:
                     # Class only: str(error) could echo a server body or bearer token.
-                    evidence.assertions.append(with_poll_timeout(
-                        {"label": f"{variant}/{plane}: block aborted", "passed": False,
-                         "error_class": type(error).__name__}, error))
+                    evidence.assertions.append(aborted_row(f"{variant}/{plane}: block aborted", error))
         succeeded = True
     except Exception as error:
-        evidence.assertions.append(with_poll_timeout({"label": "harness", "passed": False,
-                                                      "error_class": type(error).__name__}, error))
+        evidence.assertions.append(aborted_row("harness", error))
     finally:
         for error in custody.restore(await_health):
             evidence.assertions.append({"label": error, "passed": False})
             succeeded = False
         if not args.no_journal_scan:
-            window = time.monotonic() - started + 5
             for node in args.nodes:
-                journal_totals[node] = scan_journal(args.endpoints[node], window)
+                journal_totals[node] = scan_journal(args.endpoints[node], start_clocks.get(node))
         for tunnel in list(tunnels.values()):
             try:
                 stop_ssh_tunnel(tunnel)
@@ -1391,7 +1525,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 succeeded = False
         report = evidence.report()
         running = sorted({sha for sha in live_shas.values() if sha})
+        verdict = final_verdict(evidence, succeeded)
         report.update({
+            "verdict": verdict, "exit_code": exit_code(verdict),
             "issue": 1216, "started_utc": started_utc, "finished_utc": utc_now(),
             "roles": roles, "variants": args.variant, "planes": args.plane,
             "settings": {"poll_timeout": args.poll_timeout, "rekey_timeout": args.rekey_timeout,
@@ -1410,12 +1546,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             with open(args.report, "w", encoding="utf-8") as output:
                 json.dump(report, output, indent=2)
         except Exception:
-            succeeded = False
-    verdict = evidence.verdict() if succeeded and evidence.cases else "fail"
+            verdict = "fail"  # no report, no evidence
     print(f"[rekey] {verdict.upper()}: {sum(1 for a in evidence.assertions if a['passed'])}/"
           f"{len(evidence.assertions)} assertions, {len(evidence.cases)} cases, "
           f"{len(evidence.limitations)} unclaimed (limited evidence)", flush=True)
-    return 0 if verdict == "pass" else 1
+    return exit_code(verdict)
 
 
 if __name__ == "__main__":

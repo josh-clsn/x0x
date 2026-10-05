@@ -736,29 +736,39 @@ the next step (#1214: readiness is proven by decrypting, not by roster state).
    explicit recipient-ineligible refusal (404 `recipient is not a member` or
    409 `recipient_not_active`) when asked to re-seal the secret to it. After a
    ban, the target re-joins with an invite minted before the ban: the join
-   response, the remover's roster, the target's own membership state and its
-   join-status must all show it unseated, and it gains no key.
+   response (accepted-and-unseated, or a 409 with a typed refusal code), every
+   remover roster read, the target's own membership state and its join-status
+   must all show it unseated, and it gains no key.
 6. A final message decrypts on every survivor and on no excluded node.
 
 ### Verdicts and evidence classes
 
-Every check is pass, fail or **INCONCLUSIVE**. Transport errors, timeouts,
-5xx, unexpected responses and invalid roster or status reads never count as an
-exclusion or a refusal; they make the check and its case inconclusive. The
-report has a top-level `verdict` and an outcome per case.
+Every check is pass, fail or **INCONCLUSIVE**, and an inconclusive check stays
+inconclusive in its case, the report's top-level `verdict` and the exit code
+(0 pass, 1 fail, 3 inconclusive). Only exact typed responses count as an
+exclusion or a refusal: for an excluded node's decrypt, 403 `not a member`, 404
+`group not found`, or a typed key-material answer; for the re-join, a 409 with
+a known refusal code. Transport errors, timeouts, 5xx, fork quarantine,
+untyped 4xx and malformed roster or status reads (a row without its `state`,
+for example) make the check and its case inconclusive.
 
 The D60 check "no post-removal key reaches the node" is claimed only with key
 evidence:
 
 | Class | Meaning |
 |---|---|
-| `key` | The node's last decrypt answer came from its key material (GSS no secret, epoch mismatch with its local epoch, or AEAD failure; TreeKEM group not loaded or decrypt failure) |
-| `journal` | GSS only: the node's own journal, which logs every KEM-sealed share it installs, shows no install for this group in the case window and does hold info-level lines |
-| `limited` | Neither exists. A removed member's daemon answers `not a member` before it consults any key, and TreeKEM logs no key install. The check is not claimed: it goes to `limitations`, not `assertions` |
+| `key` | The node's last decrypt answer came from its key material: GSS no secret, AEAD failure, or an epoch mismatch that reports the node's local epoch below the new one; TreeKEM group not loaded or decrypt failure |
+| `limited` | No key evidence. A removed member's daemon answers `not a member` before it consults any key, TreeKEM logs no key install, and an epoch mismatch without the local epoch proves nothing. The check is not claimed: it goes to `limitations`, not `assertions` |
 
-In practice a removed TreeKEM member is `limited`; a banned member gives `key`
-evidence on both planes; a removed GSS member gives `journal` evidence unless
-`--no-journal-scan` is set.
+On GSS each excluded node's journal is also scanned for its share-install line
+("stored new group shared secret (epoch N)"). A line for this group at the new
+epoch or later fails the check. Its absence is never evidence: x0xd's
+non-blocking log writer drops lines without a signal, and log filters can hide
+it. Every journal window starts at the node's own clock, read over SSH before
+the action, so connection delay at scan time cannot hide an early install.
+
+In practice a removed member is `limited` on both planes, and a banned member
+gives `key` evidence on both planes.
 
 Evidence labels start with `<variant>/<plane>/<action>`, for example
 `restart/treekem/ban: sfo rekeyed and decrypts the post-ban message` or

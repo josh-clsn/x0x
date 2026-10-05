@@ -199,25 +199,37 @@ class FakeNode:
             return self.net.handle(self.label, method, path, body)
 
 
-def scenario(plane, poll_timeout=0.5, share_installs=None, binary_sha="a" * 64, **net_kwargs):
-    """share_installs: None (clean witness), False (no journal scan), or callable(net, node, gid)."""
+def scenario(plane, poll_timeout=0.5, share_installs=None, binary_sha="a" * 64, remote_clock=True,
+             **net_kwargs):
+    """share_installs: None (clean scan), False (no journal scan), or callable(net, node, gid).
+
+    The fake node clock is a counter; every reading is logged in net.clock_reads as
+    (node, value, that node's membership state at the time)."""
     net = FakeNet(plane, LABELS, **net_kwargs)
     clock = FakeClock()
     scans = []
+    net.clock_reads, net.install_scans = [], []
 
-    def journal(node, window):
-        scans.append((node, window))
-        return {"counts": {"recipient_undiscovered": 0}, "window_seconds": int(window), "info_lines": 3}
+    def journal(node, since):
+        scans.append((node, since))
+        return {"counts": {"recipient_undiscovered": 0}, "since_unix": since, "info_lines": 3}
 
-    def installs(node, window, gid):
+    def installs(node, since, gid):
+        net.install_scans.append((node, since))
         if callable(share_installs):
             return share_installs(net, node, gid)
         return dict(CLEAN_JOURNAL)
+
+    def node_clock(node):
+        value = 1_800_000_000 + len(net.clock_reads)
+        net.clock_reads.append((node, value, net.state[node]))
+        return value
 
     s = h.RekeyScenario({label: net.node(label) for label in LABELS}, h.RekeyEvidence(), poll_timeout,
                         rekey_timeout=30, watch_secs=10, rejoin_watch_secs=5, restart_lead_secs=15,
                         probe_period=1.0, versions={label: "0.46.3" for label in LABELS},
                         journal_scan=journal, share_install_scan=None if share_installs is False else installs,
+                        remote_clock=node_clock if remote_clock else None,
                         binary_sha=(lambda node: binary_sha), clock=clock.now, sleep=clock.sleep)
     return s, net, clock, scans
 
@@ -281,9 +293,17 @@ class PureHelperTests(unittest.TestCase):
             ((400, {"error": "treekem decrypt failed: bad"}), ("treekem_decrypt_failed", None), "key"),
             ((403, {"error": "not a member"}), ("not_member", None), "gate"),
             ((404, {"error": "group not found"}), ("group_not_found", None), "gate"),
-            ((409, {"error": "x", "reason": "fork_quarantined"}), ("fork_quarantined", None), "gate"),
-            ((403, {"error": "x", "reason": "fork_quarantined"}), ("fork_quarantined", None), "gate"),
-            ((403, {"error": "rider"}), ("forbidden", None), "gate"),
+            # Review r2 item 2: only the exact typed responses count; everything else is an error.
+            ((409, {"error": "x", "reason": "fork_quarantined"}), ("fork_quarantined", None), "error"),
+            ((403, {"error": "x", "reason": "fork_quarantined"}), ("fork_quarantined", None), "error"),
+            ((500, {"error": "x", "reason": "fork_quarantined"}), ("fork_quarantined", None), "error"),
+            ((403, {"error": "rider"}), ("forbidden", None), "error"),
+            ((403, {"error": "not a member", "reason": "group_membership_required"}), ("forbidden", None), "error"),
+            ((404, {"error": "store not found"}), ("not_found_other", None), "error"),
+            ((404, {}), ("not_found_other", None), "error"),
+            ((500, {"error": "not a member"}), ("http_other", None), "error"),
+            ((500, {"error": "epoch mismatch — re-share required", "local_epoch": 3}), ("http_other", None), "error"),
+            ((409, {"error": "epoch mismatch", "local_epoch": 3, "reason": "x"}), ("conflict", None), "error"),
             ((409, {"error": "other"}), ("conflict", None), "error"),
             ((424, {"error": "else"}), ("failed_dependency", None), "error"),
             ((400, {"error": "invalid base64 nonce"}), ("bad_request", None), "error"),
@@ -310,6 +330,13 @@ class PureHelperTests(unittest.TestCase):
         self.assertIsNone(h.member_is_active(500, roster, "a"))
         self.assertIsNone(h.member_is_active(None, {}, "a"))
         self.assertIsNone(h.member_is_active(200, {"members": None}, "a"))
+        # Review r2 item 3: a malformed row makes the whole read invalid, never a valid absence.
+        for rows in ([{"agent_id": "a"}], [{"agent_id": "b", "state": "active"}, {"agent_id": "a"}],
+                     [{"agent_id": "a", "state": None}], [{"agent_id": "a", "state": "weird"}],
+                     [{"state": "active"}], ["a"]):
+            with self.subTest(rows=rows):
+                self.assertIsNone(h.member_is_active(200, {"members": rows}, "a"))
+        self.assertFalse(h.member_is_active(200, {"members": []}, "a"))
 
     def test_restart_bounds(self):
         self.assertTrue(h.restart_lead_ok(10.0))
@@ -401,21 +428,41 @@ class ExclusionVerdictTests(unittest.TestCase):
         self.assertEqual(h.exclusion_verdict(obs_of("transport:TimeoutError")), ("inconclusive", "error_responses"))
         self.assertEqual(h.exclusion_verdict(obs_of("http_other", "decrypted")), ("fail", "leak"))
 
-    def test_d60_needs_key_evidence_or_a_usable_journal(self):
+    def test_d60_needs_key_evidence_and_journal_silence_proves_nothing(self):
         gate = obs_of("not_member", "not_member")
         self.assertEqual(h.d60_verdict(gate, 5, None), ("limited", "membership_gate"))
-        self.assertEqual(h.d60_verdict(gate, 5, dict(CLEAN_JOURNAL)), ("pass", "journal"))
-        for journal in ({**CLEAN_JOURNAL, "info_lines": 0}, {**CLEAN_JOURNAL, "info_lines": None},
-                        {"error_class": "ssh_failed"}, {**CLEAN_JOURNAL, "unattributed": 1}):
+        # Review r2 item 4: an empty install scan is never a pass, whatever else the window holds.
+        for journal in (dict(CLEAN_JOURNAL), {**CLEAN_JOURNAL, "info_lines": 10 ** 6},
+                        {**CLEAN_JOURNAL, "info_lines": 0}, {"error_class": "ssh_failed"},
+                        {**CLEAN_JOURNAL, "unattributed": 1},
+                        {**CLEAN_JOURNAL, "attributed_epochs": [4], "attributed_max_epoch": 4}):
             with self.subTest(journal=journal):
                 self.assertEqual(h.d60_verdict(gate, 5, journal), ("limited", "membership_gate"))
-        installed = {**CLEAN_JOURNAL, "attributed_epochs": [5], "attributed_max_epoch": 5}
+        # The leak direction stays: an install line for this group at the new epoch fails,
+        # even with no other info lines and even when decrypt probes erred.
+        installed = {**CLEAN_JOURNAL, "attributed_epochs": [5], "attributed_max_epoch": 5, "info_lines": 0}
         self.assertEqual(h.d60_verdict(gate, 5, installed), ("fail", "journal_install"))
-        older = {**CLEAN_JOURNAL, "attributed_epochs": [4], "attributed_max_epoch": 4}
-        self.assertEqual(h.d60_verdict(gate, 5, older), ("pass", "journal"))
+        self.assertEqual(h.d60_verdict(obs_of("http_other"), 5, installed), ("fail", "journal_install"))
+        self.assertEqual(h.d60_verdict(obs_of("epoch_mismatch", epochs={0: 4}), 5, installed),
+                         ("fail", "journal_install"))
         # Key material consulted on the last probe covers the window.
         self.assertEqual(h.d60_verdict(obs_of("not_member", "epoch_mismatch", epochs={1: 4}), 5, None),
                          ("pass", "key"))
+        self.assertEqual(h.d60_verdict(obs_of("treekem_decrypt_failed"), 5, None), ("pass", "key"))
+        self.assertEqual(h.d60_verdict(obs_of("no_secret"), 5, None), ("pass", "key"))
+
+    def test_d60_epoch_mismatch_needs_the_local_epoch(self):
+        """Review r2 item 1."""
+        self.assertEqual(h.d60_verdict(obs_of("epoch_mismatch"), 5, None), ("limited", "epoch_unreported"))
+        self.assertEqual(h.d60_verdict(obs_of("epoch_mismatch", "epoch_mismatch", epochs={0: 4}), 5, None),
+                         ("limited", "epoch_unreported"))
+        self.assertEqual(h.d60_verdict(obs_of("epoch_mismatch", epochs={0: 4}), 5, None), ("pass", "key"))
+        obs = obs_of("epoch_mismatch")
+        self.assertIsNone(obs.last_epoch)
+        self.assertEqual(h.classify_decrypt(409, {"error": "epoch mismatch — re-share required"}, "x"),
+                         ("epoch_mismatch", None))
+        self.assertEqual(h.classify_decrypt(409, {"error": "epoch mismatch", "local_epoch": "4"}, "x"),
+                         ("epoch_mismatch", None))
         # Key evidence early, gate late: the end of the window is not covered.
         self.assertEqual(h.d60_verdict(obs_of("epoch_mismatch", "not_member", epochs={0: 4}), 5, None),
                          ("limited", "membership_gate"))
@@ -448,9 +495,18 @@ class RefusalVerdictTests(unittest.TestCase):
     def test_join_classifiers(self):
         self.assertEqual(h.classify_join_attempt(200, {"join_state": "pending_authority_commit",
                                                        "already_joined": False}),
-                         {"status": 200, "join_state": "pending_authority_commit", "already_joined": False})
+                         {"status": 200, "join_state": "pending_authority_commit", "already_joined": False,
+                          "refusal_code": None})
         self.assertEqual(h.classify_join_attempt(409, {"join_state": "<script>", "already_joined": "yes"}),
-                         {"status": 409, "join_state": "other", "already_joined": None})
+                         {"status": 409, "join_state": "other", "already_joined": None, "refusal_code": None})
+        self.assertEqual(h.classify_join_attempt(409, {"error": "join_already_pending"})["refusal_code"],
+                         "join_already_pending")
+        self.assertEqual(h.classify_join_attempt(409, {"error": "x", "reason": "fork_quarantined"})["refusal_code"],
+                         "fork_quarantined")
+        for status, body in ((403, {"error": "join_already_pending"}), (409, {"error": "banned"}),
+                             (409, {"error": "invite free text"}), (500, {"error": "invite_unsigned"})):
+            with self.subTest(status=status, body=body):
+                self.assertIsNone(h.classify_join_attempt(status, body)["refusal_code"])
         self.assertEqual(h.classify_join_status(200, {"join_state": "idle", "last_join_outcome": {
             "outcome": "refused", "reason": "banned"}}),
             {"status": 200, "join_state": "idle", "outcome": "refused", "reason": "banned", "valid": True})
@@ -467,13 +523,19 @@ class RefusalVerdictTests(unittest.TestCase):
         self.assertEqual(h.classify_local_membership(None, {}), "invalid")
 
     def test_rejoin_verdict(self):
-        pending = {"status": 200, "join_state": "pending_authority_commit", "already_joined": False}
-        refused = {"status": 409, "join_state": None, "already_joined": None}
+        pending = {"status": 200, "join_state": "pending_authority_commit", "already_joined": False,
+                   "refusal_code": None}
+        refused = {"status": 409, "join_state": None, "already_joined": None, "refusal_code": "invite_unsigned"}
         status_ok = {"valid": True, "outcome": None}
         status_refused = {"valid": True, "outcome": "refused"}
         self.assertEqual(h.rejoin_verdict(pending, [False, False], "unseated", status_ok), ("pass", "unseated"))
         self.assertEqual(h.rejoin_verdict(pending, [False], "unseated", status_refused), ("pass", "refused"))
         self.assertEqual(h.rejoin_verdict(refused, [False], "unseated", status_ok), ("pass", "refused"))
+        # Review r2 item 3: an untyped 403/404/409 is not a refusal.
+        for status in (403, 404, 409, 422):
+            with self.subTest(untyped=status):
+                self.assertEqual(h.rejoin_verdict({"status": status, "refusal_code": None}, [False], "unseated",
+                                                  status_ok), ("inconclusive", "untyped_join_refusal"))
         self.assertEqual(h.rejoin_verdict(pending, [False, True], "unseated", status_ok),
                          ("fail", "seated_on_remover_roster"))
         self.assertEqual(h.rejoin_verdict(pending, [False], "seat", status_ok), ("fail", "target_reports_active"))
@@ -481,7 +543,7 @@ class RefusalVerdictTests(unittest.TestCase):
                          ("fail", "join_reported_active"))
         self.assertEqual(h.rejoin_verdict({**pending, "already_joined": True}, [False], "unseated", status_ok),
                          ("fail", "join_reported_active"))
-        for attempt in ({"status": None}, {"status": 500}, {"status": 400}, {"status": 302}):
+        for attempt in ({"status": None}, {"status": 500}, {"status": 302}):
             with self.subTest(attempt=attempt):
                 self.assertEqual(h.rejoin_verdict(attempt, [False], "unseated", status_ok),
                                  ("inconclusive", "join_request_error"))
@@ -711,24 +773,29 @@ class ScenarioTests(unittest.TestCase):
                     self.assertEqual(ban["rejoin"]["seat_reason"], "refused")
                     self.assertNotIn("rejoin", remove)
                     self.assertEqual(net.restarts, ["nyc", "nyc"] if variant == "restart" else [])
+                    # The remover's journal window starts at its own clock, read at case start.
                     self.assertEqual([node for node, _ in scans], ["nyc", "nyc"])
+                    self.assertTrue(all(isinstance(since, int) for _, since in scans))
                     limited = sorted((lim["case"], lim["node"]) for lim in s.e.limitations)
                     labels = [r["label"] for r in s.e.assertions]
+                    # A removed member answers the membership gate and journal silence is no
+                    # evidence, so its D60 is listed as limited and never claimed, on both planes.
+                    self.assertEqual(limited, [(f"{variant}/{plane}/ban", "nuremberg"),
+                                               (f"{variant}/{plane}/remove", "nuremberg")])
+                    self.assertNotIn(f"{variant}/{plane}/remove: no post-remove key reaches nuremberg "
+                                     f"during the watch (D60)", labels)
+                    self.assertTrue(all(lim["evidence_class"] == "limited" for lim in s.e.limitations))
+                    self.assertEqual(remove["exclusion_evidence"]["nuremberg"]["d60"], "membership_gate")
                     if plane == "gss":
                         self.assertEqual(remove["reseal"]["response_class"], "recipient_not_member")
                         self.assertEqual(ban["reseal"]["response_class"], "recipient_not_active")
                         self.assertEqual(ban["rekey"]["excluded"]["singapore"]["max_local_epoch"],
                                          ban["epoch_before"])
-                        self.assertEqual(remove["exclusion_evidence"]["nuremberg"]["d60"], "journal")
-                        self.assertEqual(limited, [])
+                        # Leak scans ran for every excluded node, from clocks read before the act.
+                        self.assertEqual(sorted(node for node, _ in net.install_scans),
+                                         ["nuremberg", "nuremberg", "singapore"])
                     else:
-                        # Item 1: a removed TreeKEM member answers the membership gate and has no
-                        # install witness, so its D60 is listed as limited and never claimed.
-                        self.assertEqual(limited, [(f"{variant}/treekem/ban", "nuremberg"),
-                                                   (f"{variant}/treekem/remove", "nuremberg")])
-                        self.assertNotIn(f"{variant}/treekem/remove: no post-remove key reaches nuremberg "
-                                         f"during the watch (D60)", labels)
-                        self.assertTrue(all(lim["evidence_class"] == "limited" for lim in s.e.limitations))
+                        self.assertEqual(net.install_scans, [])
                     self.assertIn(f"{variant}/{plane}: helsinki key installed after join "
                                   f"(decrypts post-join message)", labels)
                     self.assertIn(f"{variant}/{plane}/ban: no post-ban key reaches singapore during the watch (D60)",
@@ -740,13 +807,48 @@ class ScenarioTests(unittest.TestCase):
 
     # --- item 1: D60 needs key evidence --------------------------------------
 
-    def test_gss_removed_member_without_journal_witness_is_limited(self):
-        s, *_ = self.run_block("gss", share_installs=False)
+    def test_gss_removed_member_with_or_without_journal_scan_is_limited(self):
+        for share_installs in (False, None):
+            with self.subTest(share_installs=share_installs):
+                s, *_ = self.run_block("gss", share_installs=share_installs)
+                self.assertEqual(failed_labels(s), [])
+                self.assertEqual(sorted((lim["case"], lim["node"]) for lim in s.e.limitations),
+                                 [("plain/gss/ban", "nuremberg"), ("plain/gss/remove", "nuremberg")])
+                self.assertNotIn("plain/gss/remove: no post-remove key reaches nuremberg during the watch (D60)",
+                                 [r["label"] for r in s.e.assertions])
+
+    def test_epoch_mismatch_without_local_epoch_is_limited_not_claimed(self):
+        """Review r2 item 1, end to end: the banned GSS target answers a typed epoch
+        mismatch that omits its local epoch."""
+        def no_local_epoch(net, label, method, path, body):
+            if label == "singapore" and path.endswith("/secure/decrypt") and net.state["singapore"] == "banned":
+                return 409, {"ok": False, "error": "epoch mismatch — re-share required"}
+            return None
+        s, *_ = self.run_block("gss", override=no_local_epoch)
         self.assertEqual(failed_labels(s), [])
-        self.assertEqual(sorted((lim["case"], lim["node"]) for lim in s.e.limitations),
-                         [("plain/gss/ban", "nuremberg"), ("plain/gss/remove", "nuremberg")])
-        self.assertNotIn("plain/gss/remove: no post-remove key reaches nuremberg during the watch (D60)",
+        limitation = next(lim for lim in s.e.limitations if lim["node"] == "singapore")
+        self.assertEqual((limitation["case"], limitation["gate_evidence"]), ("plain/gss/ban", "epoch_unreported"))
+        self.assertNotIn("plain/gss/ban: no post-ban key reaches singapore during the watch (D60)",
                          [r["label"] for r in s.e.assertions])
+
+    def test_journal_window_starts_at_the_node_clock_read_before_the_action(self):
+        """Review r2 item 5: the install-scan start is each excluded node's own clock,
+        read before the removal, never a duration computed at scan time."""
+        s, net, *_ = self.run_block("gss")
+        reads = {value: (node, state) for node, value, state in net.clock_reads}
+        remove_case = s.e.cases[0]
+        nuremberg_since = remove_case["node_clocks"]["nuremberg"]
+        self.assertEqual(reads[nuremberg_since], ("nuremberg", "active"))  # still a member: before the act
+        self.assertIn(("nuremberg", nuremberg_since), net.install_scans)
+        ban_case = s.e.cases[1]
+        self.assertEqual(reads[ban_case["node_clocks"]["singapore"]], ("singapore", "active"))
+        self.assertEqual(reads[ban_case["node_clocks"]["nyc"]][0], "nyc")
+
+    def test_missing_node_clock_disables_the_leak_scan(self):
+        s, net, *_ = self.run_block("gss", remote_clock=False)
+        self.assertEqual(net.install_scans, [])
+        self.assertEqual(s.e.cases[0]["share_install_witness"]["nuremberg"], {"error_class": "no_remote_clock"})
+        self.assertEqual(failed_labels(s), [])
 
     def test_gss_share_install_on_removed_member_fails_d60(self):
         def installs(net, node, gid):
@@ -786,6 +888,23 @@ class ScenarioTests(unittest.TestCase):
         self.assertEqual((decrypt["passed"], decrypt["verdict"]), (False, "inconclusive"))
         self.assertEqual(list(decrypt["probe_classes"]), ["transport:TimeoutError"])
         self.assertEqual(s.e.cases[0]["outcome"], "inconclusive")
+
+    def test_untyped_or_fork_refusals_from_the_target_are_inconclusive(self):
+        """Review r2 item 2, end to end."""
+        for name, response in (("unrelated 403", (403, {"error": "rider tokens cannot read"})),
+                               ("fork 500", (500, {"error": "x", "reason": "fork_quarantined"})),
+                               ("fork 409", (409, {"error": "x", "reason": "fork_quarantined"})),
+                               ("untyped 404", (404, {"error": "store not found"}))):
+            with self.subTest(name=name):
+                def refuse(net, label, method, path, body, response=response):
+                    if (label == "nuremberg" and path.endswith("/secure/decrypt")
+                            and net.state["nuremberg"] == "removed"):
+                        return response
+                    return None
+                s, _net = self.run_failing_block("treekem", expected=h.Inconclusive, override=refuse)
+                result = row(s, "plain/treekem/remove: nuremberg cannot decrypt the post-remove message")
+                self.assertEqual((result["passed"], result["verdict"]), (False, "inconclusive"))
+                self.assertEqual(s.e.verdict(), "inconclusive")
 
     def test_final_probe_error_is_inconclusive(self):
         def final_errors(net, label, method, path, body):
@@ -849,6 +968,39 @@ class ScenarioTests(unittest.TestCase):
         self.assertEqual((result["passed"], result["verdict"], result["reason"]),
                          (False, "inconclusive", "invalid_roster_read"))
         self.assertGreater(result["roster_reads"]["invalid"], 0)
+
+    def test_untyped_join_refusal_is_inconclusive(self):
+        """Review r2 item 3, end to end."""
+        def untyped(net, label, method, path, body):
+            if label == "singapore" and path == "/groups/join" and net.state["singapore"] == "banned":
+                return 409, {"ok": False, "error": "conflict"}
+            return None
+        s, _net = self.run_failing_block("gss", expected=h.Inconclusive, override=untyped)
+        result = row(s, "plain/gss/ban: banned singapore re-join is never seated")
+        self.assertEqual((result["verdict"], result["reason"]), ("inconclusive", "untyped_join_refusal"))
+
+    def test_typed_join_refusal_passes(self):
+        def typed(net, label, method, path, body):
+            if label == "singapore" and path == "/groups/join" and net.state["singapore"] == "banned":
+                return 409, {"ok": False, "error": "join_already_pending"}
+            return None
+        s, *_ = self.run_block("gss", override=typed)
+        self.assertEqual(failed_labels(s), [])
+        self.assertEqual(s.e.cases[1]["rejoin"]["seat_reason"], "refused")
+        self.assertEqual(s.e.cases[1]["rejoin"]["attempt"]["refusal_code"], "join_already_pending")
+
+    def test_roster_rows_missing_state_during_rejoin_are_inconclusive(self):
+        """Review r2 item 3: a row without its state is an invalid read, not a valid absence."""
+        def stateless(net, label, method, path, body):
+            if label == "singapore" and path == "/groups/join" and net.state["singapore"] == "banned":
+                net.flags.add("rejoin")
+            if label == "nyc" and method == "GET" and path.endswith("/members") and "rejoin" in net.flags:
+                return 200, {"members": [{"agent_id": net.agents[x]} for x in net.labels
+                                         if net.state[x] in ("active", "banned")]}
+            return None
+        s, _net = self.run_failing_block("gss", expected=h.Inconclusive, override=stateless)
+        result = row(s, "plain/gss/ban: banned singapore re-join is never seated")
+        self.assertEqual((result["verdict"], result["reason"]), ("inconclusive", "invalid_roster_read"))
 
     def test_invalid_join_status_is_inconclusive(self):
         def status_fails(net, label, method, path, body):
@@ -962,10 +1114,67 @@ class EvidenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             e.verdict_row("d", "limited")
         self.assertIn("limitations", e.report())
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(h.Inconclusive):
             h.require_all_pass("case", ["pass", "inconclusive"])
+        with self.assertRaises(AssertionError) as raised:
+            h.require_all_pass("case", ["inconclusive", "fail"])
+        self.assertNotIsInstance(raised.exception, h.Inconclusive)
         h.require_all_pass("case", ["pass", "pass"])
         self.assertTrue(math.isfinite(h.DURATION_BOUNDS["--watch-secs"][0]))
+
+    def test_inconclusive_stays_inconclusive_end_to_end(self):
+        """Review r2 item 6: the block handler's row, the report verdict and the exit code."""
+        inconclusive_row = h.aborted_row("plain/gss: block aborted", h.Inconclusive("x"))
+        self.assertEqual(inconclusive_row, {"label": "plain/gss: block aborted", "passed": False,
+                                            "error_class": "Inconclusive", "verdict": "inconclusive"})
+        failure_row = h.aborted_row("plain/gss: block aborted", AssertionError("x"))
+        self.assertNotIn("verdict", failure_row)
+        self.assertEqual(h.exit_code("pass"), 0)
+        self.assertEqual(h.exit_code("fail"), 1)
+        self.assertEqual(h.exit_code("inconclusive"), 3)
+        e = h.RekeyEvidence()
+        self.assertEqual(h.final_verdict(e, True), "fail")  # no case cannot pass
+        e.verdict_row("x", "inconclusive")
+        self.assertEqual(h.final_verdict(e, False), "inconclusive")
+        e.cases.append({"case": "c"})
+        e.assertions.append(failure_row)
+        self.assertEqual(h.final_verdict(e, True), "fail")
+
+    def test_block_handler_keeps_an_inconclusive_case_inconclusive(self):
+        def errors(net, label, method, path, body):
+            if label == "nuremberg" and path.endswith("/secure/decrypt") and net.state["nuremberg"] == "removed":
+                return 502, {}
+            return None
+        s, net, *_ = scenario("gss", override=errors)
+        try:
+            s.run_block("plain", "gss", h.assign_roles(LABELS), None)
+        except Exception as error:  # what main() does with a block's exception
+            s.e.assertions.append(h.aborted_row("plain/gss: block aborted", error))
+        self.assertEqual(s.e.cases[0]["outcome"], "inconclusive")
+        self.assertEqual(s.e.assertions[-1]["verdict"], "inconclusive")
+        self.assertEqual(s.e.verdict(), "inconclusive")
+        self.assertEqual(h.final_verdict(s.e, True), "inconclusive")
+        self.assertEqual(h.exit_code(h.final_verdict(s.e, True)), 3)
+
+    def test_block_handler_keeps_a_failed_case_failed(self):
+        s, *_ = scenario("gss", leak_to="nuremberg")
+        try:
+            s.run_block("plain", "gss", h.assign_roles(LABELS), None)
+        except Exception as error:
+            s.e.assertions.append(h.aborted_row("plain/gss: block aborted", error))
+        self.assertEqual(s.e.verdict(), "fail")
+        self.assertEqual(h.exit_code(h.final_verdict(s.e, True)), 1)
+
+    def test_remote_clock_and_journal_window_helpers(self):
+        self.assertEqual(h.parse_remote_clock("1800000000\n"), 1800000000)
+        for text in ("", "abc", "-5", "12", None, "1800000000 extra"):
+            self.assertIsNone(h.parse_remote_clock(text))
+        self.assertEqual(h.journal_since(1800000000), "1799999999")
+        self.assertIsNone(h.journal_since(None))
+        self.assertIsNone(h.journal_since(True))
+        # Without a node clock no scan runs (and no SSH is attempted).
+        self.assertEqual(h.scan_journal("203.0.113.1", None), {"error_class": "no_remote_clock"})
+        self.assertEqual(h.scan_share_installs("203.0.113.1", None, STABLE), {"error_class": "no_remote_clock"})
 
 
 if __name__ == "__main__":
