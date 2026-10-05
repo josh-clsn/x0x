@@ -24,6 +24,9 @@ mod rider_auth;
 mod routes;
 mod sse;
 mod state;
+// W3-H (#1164): deterministic simulation harness (test builds only:
+// `#![cfg(test)]` inside the module).
+mod w3h;
 mod ws;
 
 // Re-export the public server API surface so `x0x::server::*` paths are
@@ -2636,6 +2639,10 @@ pub async fn serve_with_options(
     // binary installs its own Ctrl-C handler around `ServerHandle::wait`.
     let cancel = tokio_util::sync::CancellationToken::new();
     let supervisor_cancel = cancel.clone();
+    #[cfg(test)]
+    let test_state = Arc::downgrade(&state);
+    #[cfg(test)]
+    let test_router = app.clone();
 
     let task = tokio::spawn(async move {
         // #645: the single-instance guards live HERE, in the supervisor
@@ -2824,6 +2831,10 @@ pub async fn serve_with_options(
         cancel,
         acl_admin,
         task: Some(task),
+        #[cfg(test)]
+        test_state,
+        #[cfg(test)]
+        test_router,
     })
 }
 

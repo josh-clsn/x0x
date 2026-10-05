@@ -25,6 +25,23 @@ test:
 test-verbose:
     python3 scripts/dev/test-isolated.py nextest --all-features --workspace -- --no-capture
 
+# ── W3-H deterministic simulation harness (#1164) ────────────────────────
+# Build the Linux entropy/wall-clock shim the nextest `w3h` profile preloads.
+w3h-shim:
+    mkdir -p target/w3h
+    cc -O2 -Wall -Wextra -Werror -shared -fPIC -o target/w3h/libw3h_shim.so scripts/w3h/w3h_shim.c -ldl
+
+# Run every W3-H case once (isolated namespace; Linux only).
+test-w3h: w3h-shim
+    python3 scripts/dev/test-isolated.py nextest --all-features --lib -- --profile w3h
+
+# W3-H gate (D196): each case 20 times; the same verdict and complete receipts
+# every time. Distinct traces are reported; add --strict-traces to require one.
+test-w3h-gate: w3h-shim
+    rm -rf target/w3h/traces
+    python3 scripts/dev/test-isolated.py nextest --all-features --lib -- --profile w3h --stress-count 20
+    python3 scripts/ci/w3h-trace-check.py target/w3h/traces --runs 20 --require w3h_s1_control_group_invite_join_over_public_api --require w3h_s1_negative_control_offline_joiner_is_not_admitted --require w3h_1143_red_baseline_reproduces_owner_cert_member_pending --require w3h_1143_positive_control_consented_owner_announce_admits --require w3h_s4_control_evidence_hello_over_sim_streams --require w3h_s4_control_owner_sync_over_sim_streams --expect w3h_1143_red_baseline_reproduces_owner_cert_member_pending=RED --expect w3h_1143_positive_control_consented_owner_announce_admits=GREEN
+
 # Full-coverage suite run. nextest is fail-fast by default: the first failure
 # cancels everything still queued, so a single flake can hide up to ~800
 # unexecuted tests (observed 2503/3300 and 2885/3300 partial runs during

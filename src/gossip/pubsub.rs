@@ -2200,6 +2200,12 @@ impl PubSubManager {
             });
         }
 
+        // W3-H (#1164): every remote publish attempt is recorded on the
+        // simulated fabric's trace before mesh fan-out, including attempts
+        // that reach no peer.
+        #[cfg(test)]
+        self.network.sim_note_publish(&topic, &payload);
+
         let (encoded, envelope_bytes) = if let Some(ref ctx) = self.signing {
             let result = version
                 .signing_payload(ctx.agent_id.as_bytes(), topic.as_bytes(), &payload)
