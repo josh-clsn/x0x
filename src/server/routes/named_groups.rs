@@ -16005,18 +16005,22 @@ pub(in crate::server) async fn send_group_public_message(
     // concurrent role changes can't race the check.
     let (msg, direct_recipients, captured_epoch) = {
         let groups = state.named_groups.read().await;
-        // ADR0066-LOOKUP-WAIVER: the route's own group lookup (404 on a miss, so no contested roster is
-        // ever served); the §3 gate two lines down consumes the `info` it found.
-        // Widening the route's id semantics is out of #732's scope.
-        let Some(info) = groups.get(&id) else {
-            return not_found("group not found");
+        // #1166 S2: the entry admission (raw-id lookup 404 with the
+        // ADR0066-LOOKUP-WAIVER — no contested roster is ever served,
+        // and widening the route's id semantics is out of #732's scope;
+        // withdrawn 409; the #877 fork-quarantine-for-actor gate with
+        // its session-seat decision before any marker body) runs in the
+        // group-access core under this same read lock, in today's order.
+        let (info, access) = match crate::server::group_access::admit_group_send(
+            state.as_ref(),
+            &id,
+            &groups,
+            &actor,
+            &local_hex,
+        ) {
+            Ok(admitted) => admitted,
+            Err(resp) => return resp,
         };
-        if let Some(resp) = reject_withdrawn_group(info) {
-            return resp;
-        }
-        if let Some(resp) = reject_fork_quarantined_for_actor(&state, &id, info, &actor) {
-            return resp;
-        }
         // ADR-0066 §1 row 1 / §4 (slice 9): capture the lifecycle epoch token
         // under the SAME read guard as the gate above, so nothing can move
         // between the authorization and the capture. It is re-checked
@@ -16035,24 +16039,19 @@ pub(in crate::server) async fn send_group_public_message(
             return bad_request("group is not SignedPublic — use /groups/:id/secure/encrypt");
         }
         // Review fix #1 (CRITICAL): authorization uses the ACTING
-        // PRINCIPAL's identity. For the owner that is the daemon's own
-        // agent; for a rider it is the SUB-AGENT on whose behalf the
-        // daemon signs — ban state, membership, and role are checked
-        // against the sub-agent, so a rider can never inherit the
+        // PRINCIPAL's identity — ban state, membership, and role are
+        // checked against it, so a rider can never inherit the
         // daemon-admin's privileges and the provenance envelope is the
-        // authorization subject, not decoration.
-        let acting_hex = match &actor {
-            crate::server::rider_auth::ActorContext::Owner { .. } => local_hex.clone(),
-            crate::server::rider_auth::ActorContext::Rider { sub_agent_id, .. } => {
-                sub_agent_id.clone()
-            }
-        };
-        if info.is_banned(&acting_hex) {
+        // authorization subject, not decoration. #1166 S2: the principal
+        // now comes from the admission snapshot (`acting_hex`), which
+        // applies the same owner→daemon-agent / rider→sub-agent rule.
+        let acting_hex = access.acting_hex();
+        if info.is_banned(acting_hex) {
             return forbidden("you are banned");
         }
         // Endpoint-side write-access enforcement. Mirror the ingest
         // validator so we reject locally rather than trust receivers.
-        let caller_role = info.caller_role(&acting_hex);
+        let caller_role = info.caller_role(acting_hex);
         match info.policy.write_access {
             x0x::groups::GroupWriteAccess::MembersOnly => {
                 if caller_role.is_none() {
@@ -23501,7 +23500,10 @@ pub(in crate::server) fn require_admin_or_above(
     }
 }
 
-fn reject_withdrawn_group(
+/// Canonical terminal-withdrawal 409 (`group is withdrawn`) — shared
+/// with the group-access admission cores (`server/group_access.rs`),
+/// which call it instead of copying the body.
+pub(in crate::server) fn reject_withdrawn_group(
     info: &x0x::groups::GroupInfo,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
     info.withdrawn
@@ -23513,7 +23515,7 @@ fn reject_withdrawn_group(
 /// seal re-verifies the roster. Secure crypto operations refuse with a
 /// typed, retryable error meanwhile — restored GSS/TreeKEM key material
 /// must not serve a stale membership.
-fn reject_unverified_owner_certified_restore(
+pub(in crate::server) fn reject_unverified_owner_certified_restore(
     info: &x0x::groups::GroupInfo,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
     info.owner_cert_reverify_required.then(|| {
@@ -24044,7 +24046,7 @@ fn active_same_stable_keyed_alias_exists(
         })
 }
 
-fn open_envelope_withdrawn_group_conflict(
+pub(in crate::server) fn open_envelope_withdrawn_group_conflict(
     groups: &HashMap<String, x0x::groups::GroupInfo>,
     group_id: &str,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
@@ -27132,20 +27134,21 @@ pub(in crate::server) async fn secure_group_encrypt(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
-    // ADR0066-LOOKUP-WAIVER: GSS route lookup: a miss is a 404 before any gate, so it fails closed,
-    // and the §3 gate below consumes this same `info`. Out of #732's scope.
-    let Some(info) = groups.get(&id) else {
-        return not_found("group not found");
+    // #1166 S2: the entry admission (raw-id lookup 404 with the
+    // ADR0066-LOOKUP-WAIVER — a miss is a 404 before any gate, so it
+    // fails closed; withdrawn 409; the ADR-0038 restore-quarantine 409;
+    // the #877 fork-quarantine-for-actor gate) runs in the group-access
+    // core under this same read lock, in today's order.
+    let (info, _access) = match crate::server::group_access::admit_secure_endpoint(
+        state.as_ref(),
+        &id,
+        &groups,
+        &actor,
+        &caller_hex,
+    ) {
+        Ok(admitted) => admitted,
+        Err(resp) => return resp,
     };
-    if let Some(resp) = reject_withdrawn_group(info) {
-        return resp;
-    }
-    if let Some(resp) = reject_unverified_owner_certified_restore(info) {
-        return resp;
-    }
-    if let Some(resp) = reject_fork_quarantined_for_actor(&state, &id, info, &actor) {
-        return resp;
-    }
     // ADR-0066 §1 row 4 / §4 (slice 9): capture under the SAME read guard as
     // the gate. Re-checked immediately before the effect below. The TreeKEM
     // branch of this handler does its own capture and re-check inside
@@ -27382,20 +27385,21 @@ pub(in crate::server) async fn secure_group_decrypt(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
-    // ADR0066-LOOKUP-WAIVER: GSS route lookup: a miss is a 404 before any gate, so it fails closed,
-    // and the §3 gate below consumes this same `info`. Out of #732's scope.
-    let Some(info) = groups.get(&id) else {
-        return not_found("group not found");
+    // #1166 S2: the entry admission (raw-id lookup 404 with the
+    // ADR0066-LOOKUP-WAIVER; withdrawn 409; the ADR-0038
+    // restore-quarantine 409; the #877 fork-quarantine-for-actor gate)
+    // runs in the group-access core under this same read lock, in
+    // today's order.
+    let (info, _access) = match crate::server::group_access::admit_secure_endpoint(
+        state.as_ref(),
+        &id,
+        &groups,
+        &actor,
+        &caller_hex,
+    ) {
+        Ok(admitted) => admitted,
+        Err(resp) => return resp,
     };
-    if let Some(resp) = reject_withdrawn_group(info) {
-        return resp;
-    }
-    if let Some(resp) = reject_unverified_owner_certified_restore(info) {
-        return resp;
-    }
-    if let Some(resp) = reject_fork_quarantined_for_actor(&state, &id, info, &actor) {
-        return resp;
-    }
 
     if !info.has_active_member(&caller_hex) && !info.is_banned(&caller_hex) {
         // Removed/never-member callers can't decrypt.
@@ -27548,23 +27552,24 @@ pub(in crate::server) async fn secure_group_reseal(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
-    // ADR0066-LOOKUP-WAIVER: GSS route lookup: a miss is a 404 before any gate, so it fails closed,
-    // and the §3 gate below consumes this same `info`. Out of #732's scope.
-    let Some(info) = groups.get(&id) else {
-        return not_found("group not found");
+    // #1166 S2: the entry admission (raw-id lookup 404 with the
+    // ADR0066-LOOKUP-WAIVER; withdrawn 409; the ADR-0038
+    // restore-quarantine 409 — round-2 finding 6: this endpoint re-seals
+    // the RESTORED shared secret, so it obeys the same restore
+    // quarantine as encrypt/decrypt, and an evidence-bearing seal lifts
+    // the marker first; the #877 fork-quarantine-for-actor gate) runs
+    // in the group-access core under this same read lock, in today's
+    // order.
+    let (info, _access) = match crate::server::group_access::admit_secure_endpoint(
+        state.as_ref(),
+        &id,
+        &groups,
+        &actor,
+        &caller_hex,
+    ) {
+        Ok(admitted) => admitted,
+        Err(resp) => return resp,
     };
-    if let Some(resp) = reject_withdrawn_group(info) {
-        return resp;
-    }
-    // ADR-0038 round-2 (finding 6): this endpoint re-seals the RESTORED
-    // shared secret — it must obey the same restore quarantine as
-    // encrypt/decrypt; an evidence-bearing seal lifts the marker first.
-    if let Some(resp) = reject_unverified_owner_certified_restore(info) {
-        return resp;
-    }
-    if let Some(resp) = reject_fork_quarantined_for_actor(&state, &id, info, &actor) {
-        return resp;
-    }
     // ADR-0066 §1 row 6 / §4 (slice 9): capture under the SAME read guard as
     // the gate. Re-checked immediately before the sealed envelope is returned.
     //
@@ -27700,9 +27705,14 @@ pub(in crate::server) async fn secure_open_envelope_adversarial(
     State(state): State<Arc<AppState>>,
     Json(req): Json<OpenEnvelopeRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // #1166 S2: the withdrawn-record conflict gate (a withdrawn record
+    // with no live same-stable-keyed alias → 409) runs in the
+    // group-access core under this same read lock. No actor or
+    // membership gate exists on this surface, before or after.
     {
         let groups = state.named_groups.read().await;
-        if let Some(resp) = open_envelope_withdrawn_group_conflict(&groups, &req.group_id) {
+        if let Err(resp) = crate::server::group_access::admit_open_envelope(&groups, &req.group_id)
+        {
             return resp;
         }
     }
