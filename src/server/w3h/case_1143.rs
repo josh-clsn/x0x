@@ -196,8 +196,8 @@ async fn scenario(sim: &mut Sim, kind: OwnerAnnounce, receipt: &mut Receipt) -> 
 async fn run(case: &str, kind: OwnerAnnounce) -> Receipt {
     let mut receipt = Receipt::new(case, SEED);
     receipt.note(
-        "sim has no EvidenceV1 hello yet (no QUIC byte streams until W3-H S4); \
-         owner sync is carried by the harness over an in-memory duplex",
+        "sim byte streams (EvidenceV1 hello, SyncV1 owner sync) are in-memory \
+         pipes with zero latency and no QUIC flow control (W3-H S4)",
     );
     match Sim::empty(case, SEED) {
         Ok(mut sim) => {

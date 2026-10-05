@@ -2520,24 +2520,15 @@ impl OwnerSyncService {
         stream: crate::streams::PeerStream,
         _permit: tokio::sync::OwnedSemaphorePermit,
     ) {
-        let peer = stream.peer();
-        if !self.inbound_admissible(&peer).await {
-            return; // drop => stream reset, fail closed
-        }
-        let (mut send, mut recv) = stream.into_split();
-        self.run_inbound_session(&mut send, &mut recv, &peer).await;
-    }
-
-    /// Whether an inbound session from `peer` may run (an owner key is held
-    /// and `peer` is enrolled and not revoked).
-    async fn inbound_admissible(&self, peer: &MachineId) -> bool {
         let Some(owner_kp) = self.owner_kp() else {
-            return false;
+            return;
         };
+        let local_machine = self.agent.machine_id();
+        let peer = stream.peer();
         if !inbound_session_admissible(
             &self.store,
             &self.agent.revocation_set(),
-            peer,
+            &peer,
             &owner_kp.user_id(),
         )
         .await
@@ -2547,27 +2538,15 @@ impl OwnerSyncService {
                 machine = %hex::encode(peer.0),
                 "refusing SyncV1 stream from non-enrolled or revoked machine"
             );
-            return false;
+            return; // drop => stream reset, fail closed
         }
-        true
-    }
-
-    /// The acceptor's session over an admitted transport, and its status.
-    async fn run_inbound_session<S, R>(&self, send: &mut S, recv: &mut R, peer: &MachineId)
-    where
-        S: tokio::io::AsyncWrite + Unpin,
-        R: tokio::io::AsyncRead + Unpin,
-    {
-        let Some(owner_kp) = self.owner_kp() else {
-            return;
-        };
-        let local_machine = self.agent.machine_id();
+        let (mut send, mut recv) = stream.into_split();
         // #863: publish the local Home pointer BEFORE the version-vector
         // exchange — an empty HomePointer vector must be genuine proof of
         // no local Home, never a timing artifact (see
         // session_with_home_publication).
         let result = self
-            .session_with_home_publication(send, recv, owner_kp, &local_machine, peer)
+            .session_with_home_publication(&mut send, &mut recv, owner_kp, &local_machine, &peer)
             .await;
         match result {
             Ok(summary) => {
@@ -2580,7 +2559,7 @@ impl OwnerSyncService {
                     shipped = summary.shipped,
                     "Tier-1 sync session complete"
                 );
-                self.store.set_session_status(peer, true).await;
+                self.store.set_session_status(&peer, true).await;
             }
             Err(e) => {
                 tracing::warn!(
@@ -2590,58 +2569,9 @@ impl OwnerSyncService {
                     error = %e,
                     "Tier-1 sync session failed (fail closed)"
                 );
-                self.store.set_session_status(peer, false).await;
+                self.store.set_session_status(&peer, false).await;
             }
         }
-    }
-
-    /// W3-H (#1164) test seam: the acceptor side of one session over a
-    /// harness-provided transport (the simulator has no QUIC byte streams
-    /// until slice S4). Same admission and session code as a SyncV1 stream.
-    #[cfg(test)]
-    pub(crate) async fn accept_session_for_testing<S, R>(
-        &self,
-        send: &mut S,
-        recv: &mut R,
-        peer: &MachineId,
-    ) -> bool
-    where
-        S: tokio::io::AsyncWrite + Unpin,
-        R: tokio::io::AsyncRead + Unpin,
-    {
-        if !self.inbound_admissible(peer).await {
-            return false;
-        }
-        self.run_inbound_session(send, recv, peer).await;
-        true
-    }
-
-    /// W3-H (#1164) test seam: the initiator side of one session over a
-    /// harness-provided transport; the same checks and session as
-    /// [`Self::dial_and_sync`] once its stream is open.
-    #[cfg(test)]
-    pub(crate) async fn dial_session_for_testing<S, R>(
-        &self,
-        send: &mut S,
-        recv: &mut R,
-        peer: &MachineId,
-    ) -> Result<SessionSummary, (&'static str, String)>
-    where
-        S: tokio::io::AsyncWrite + Unpin,
-        R: tokio::io::AsyncRead + Unpin,
-    {
-        let owner_kp = self
-            .owner_kp()
-            .ok_or_else(|| ("no_owner_key", "no owner key".to_string()))?;
-        if !self.store.is_enrolled(peer, &owner_kp.user_id()).await {
-            return Err((
-                "not_enrolled",
-                format!("machine {} is not enrolled", hex::encode(peer.0)),
-            ));
-        }
-        let local_machine = self.agent.machine_id();
-        self.dial_session_over(send, recv, owner_kp, &local_machine, peer)
-            .await
     }
 
     /// Dial `machine` and run one session as the initiator. Errors retain a
@@ -2689,23 +2619,6 @@ impl OwnerSyncService {
         };
         let peer = stream.peer();
         let (mut send, mut recv) = stream.into_split();
-        self.dial_session_over(&mut send, &mut recv, owner_kp, &local_machine, &peer)
-            .await
-    }
-
-    /// The initiator's session over an open transport, and its status.
-    async fn dial_session_over<S, R>(
-        &self,
-        send: &mut S,
-        recv: &mut R,
-        owner_kp: &UserKeypair,
-        local_machine: &MachineId,
-        peer: &MachineId,
-    ) -> Result<SessionSummary, (&'static str, String)>
-    where
-        S: tokio::io::AsyncWrite + Unpin,
-        R: tokio::io::AsyncRead + Unpin,
-    {
         let _permit = self
             .session_permits
             .clone()
@@ -2718,9 +2631,9 @@ impl OwnerSyncService {
         // an unpublication-capable view fails the session CLOSED (never
         // an empty HomePointer vector).
         let result = self
-            .session_with_home_publication(send, recv, owner_kp, local_machine, peer)
+            .session_with_home_publication(&mut send, &mut recv, owner_kp, &local_machine, &peer)
             .await;
-        self.store.set_session_status(peer, result.is_ok()).await;
+        self.store.set_session_status(&peer, result.is_ok()).await;
         result.map_err(|e| (e.class(), e.to_string()))
     }
 

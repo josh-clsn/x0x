@@ -29,6 +29,8 @@ use self::churn::ChurnCounters;
 pub use self::churn::ChurnSnapshot;
 mod link;
 use self::link::LinkNode;
+mod stream;
+pub use self::stream::{StreamRecv, StreamSend};
 // W3-H (#1164): deterministic in-memory transport for the simulation
 // harness. Test builds only (`#![cfg(test)]` inside the file); production
 // `NetworkNode`s always run on QUIC.
@@ -4431,7 +4433,7 @@ impl NetworkNode {
     pub(crate) async fn open_bi(
         &self,
         peer_id: &AntPeerId,
-    ) -> NetworkResult<(ant_quic::HighLevelSendStream, ant_quic::HighLevelRecvStream)> {
+    ) -> NetworkResult<(StreamSend, StreamRecv)> {
         let node = self
             .node
             .read()
@@ -4439,9 +4441,7 @@ impl NetworkNode {
             .as_ref()
             .cloned()
             .ok_or_else(|| NetworkError::NodeError("node not initialized".to_string()))?;
-        node.quic()
-            .ok_or_else(|| NetworkError::NodeError("open_bi: no QUIC endpoint".to_string()))?
-            .open_bi(peer_id)
+        node.open_bi(peer_id)
             .await
             .map_err(|e| NetworkError::NodeError(format!("open_bi: {e}")))
     }
@@ -4455,7 +4455,7 @@ impl NetworkNode {
     pub async fn open_bi_raw_for_testing(
         &self,
         peer_id: &AntPeerId,
-    ) -> NetworkResult<(ant_quic::HighLevelSendStream, ant_quic::HighLevelRecvStream)> {
+    ) -> NetworkResult<(StreamSend, StreamRecv)> {
         self.open_bi(peer_id).await
     }
 
@@ -4467,13 +4467,7 @@ impl NetworkNode {
     /// the accept loop never surfaces an internal stream. The identity gate +
     /// protocol handshake run in the Agent's single accept loop, the sole
     /// consumer of this method.
-    pub(crate) async fn accept_bi(
-        &self,
-    ) -> NetworkResult<(
-        AntPeerId,
-        ant_quic::HighLevelSendStream,
-        ant_quic::HighLevelRecvStream,
-    )> {
+    pub(crate) async fn accept_bi(&self) -> NetworkResult<(AntPeerId, StreamSend, StreamRecv)> {
         let node = self
             .node
             .read()
@@ -4481,12 +4475,7 @@ impl NetworkNode {
             .as_ref()
             .cloned()
             .ok_or_else(|| NetworkError::NodeError("node not initialized".to_string()))?;
-        let Some(quic) = node.quic() else {
-            // No byte streams without a QUIC endpoint (W3-H sim): park, so
-            // an accept loop waits instead of spinning on an error.
-            return std::future::pending().await;
-        };
-        quic.accept_bi()
+        node.accept_bi()
             .await
             .map_err(|e| NetworkError::NodeError(format!("accept_bi: {e}")))
     }

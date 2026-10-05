@@ -254,6 +254,44 @@ impl LinkNode {
         }
     }
 
+    pub(crate) async fn open_bi(
+        &self,
+        peer_id: &PeerId,
+    ) -> Result<(super::StreamSend, super::StreamRecv), NodeError> {
+        match self {
+            Self::Quic(node) => {
+                let (send, recv) = node.open_bi(peer_id).await?;
+                Ok(super::stream::from_quic(send, recv))
+            }
+            #[cfg(test)]
+            Self::Sim(link) => {
+                let (send, recv) = link.open_bi(peer_id)?;
+                Ok((super::StreamSend::Sim(send), super::StreamRecv::Sim(recv)))
+            }
+        }
+    }
+
+    pub(crate) async fn accept_bi(
+        &self,
+    ) -> Result<(PeerId, super::StreamSend, super::StreamRecv), NodeError> {
+        match self {
+            Self::Quic(node) => {
+                let (peer, send, recv) = node.accept_bi().await?;
+                let (send, recv) = super::stream::from_quic(send, recv);
+                Ok((peer, send, recv))
+            }
+            #[cfg(test)]
+            Self::Sim(link) => {
+                let (peer, send, recv) = link.accept_bi().await?;
+                Ok((
+                    peer,
+                    super::StreamSend::Sim(send),
+                    super::StreamRecv::Sim(recv),
+                ))
+            }
+        }
+    }
+
     pub(crate) fn current_connection_generation(&self, peer: &PeerId) -> Option<u64> {
         match self {
             Self::Quic(node) => node.current_connection_generation(peer),

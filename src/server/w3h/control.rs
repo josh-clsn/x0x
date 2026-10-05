@@ -352,3 +352,86 @@ async fn w3h_s1_negative_control_offline_joiner_is_not_admitted() -> Result<()> 
     sim.finish().await?;
     Ok(())
 }
+
+/// Streams (by pair and ordinal) whose opener wrote `prefix` first and
+/// whose acceptor wrote a reply: (opener, acceptor) peer ids.
+fn answered_streams(
+    sim: &Sim,
+    prefix: u8,
+) -> Vec<(crate::network::sim::Key, crate::network::sim::Key)> {
+    use crate::network::sim::LaneClass;
+    let writes = sim.fabric().writes();
+    writes
+        .iter()
+        .filter(|w| {
+            matches!(w.lane.class, LaneClass::Stream(_))
+                && w.seq == 0
+                && w.bytes.first() == Some(&prefix)
+        })
+        .filter(|opener| {
+            writes.iter().any(|reply| {
+                reply.lane.class == opener.lane.class
+                    && reply.lane.src == opener.lane.dst
+                    && reply.lane.dst == opener.lane.src
+                    && !reply.bytes.is_empty()
+            })
+        })
+        .map(|w| (w.lane.src, w.lane.dst))
+        .collect()
+}
+
+/// S4 control: every simulated connection runs the real peer-evidence
+/// hello (`EvidenceV1`) over a simulated byte stream, and it is answered.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon controls run in the Linux isolated namespace only"
+)]
+async fn w3h_s4_control_evidence_hello_over_sim_streams() -> Result<()> {
+    const EVIDENCE_V1: u8 = 0x06;
+    let sim = Sim::start(
+        "w3h_s4_control_evidence_hello_over_sim_streams",
+        0x5400_0001,
+        &["A", "B"],
+    )
+    .await?;
+    mesh(&sim, &["A", "B"]).await?;
+    sim.until(
+        "an EvidenceV1 hello is answered",
+        secs(60),
+        async |s: &Sim| !answered_streams(s, EVIDENCE_V1).is_empty(),
+    )
+    .await?;
+    sim.fabric()
+        .mark("checkpoint: EvidenceV1 hello answered over a sim stream");
+    sim.finish().await?;
+    Ok(())
+}
+
+/// S4 control: owner sync (Tier-1, `SyncV1`) runs over simulated byte
+/// streams, dialled by the daemons themselves, and delivers the canonical
+/// Home pointer: a second same-owner device yields to the owner's Home.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon controls run in the Linux isolated namespace only"
+)]
+async fn w3h_s4_control_owner_sync_over_sim_streams() -> Result<()> {
+    const SYNC_V1: u8 = 0x05;
+    let mut sim = Sim::empty("w3h_s4_control_owner_sync_over_sim_streams", 0x5400_0002)?;
+    let owner = crate::identity::UserKeypair::generate()?;
+    let home = sim.start_owner_device("O", &owner).await?;
+    // Waits for X to report `elsewhere` with O's canonical Home id, which
+    // only owner sync can deliver.
+    sim.certify_owner_device("O", "X", &owner, &home).await?;
+    let synced = answered_streams(&sim, SYNC_V1);
+    let (o, x) = (sim.peer("O")?.0, sim.peer("X")?.0);
+    ensure!(
+        synced.iter().any(|pair| *pair == (x, o) || *pair == (o, x)),
+        "no answered SyncV1 stream between X and O"
+    );
+    sim.fabric()
+        .mark("checkpoint: X yielded to O's Home via SyncV1 over sim streams");
+    sim.finish().await?;
+    Ok(())
+}

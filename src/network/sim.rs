@@ -31,9 +31,11 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
+use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::task::Waker;
 use std::time::Duration;
 
 use ant_quic::{
@@ -57,6 +59,8 @@ pub(crate) enum LaneClass {
     PubSub,
     Bulk,
     Other(u8),
+    /// One direction of an application byte-stream (per-pair ordinal).
+    Stream(u32),
 }
 
 impl LaneClass {
@@ -84,6 +88,7 @@ impl LaneClass {
             Self::PubSub => "pubsub".into(),
             Self::Bulk => "bulk".into(),
             Self::Other(byte) => format!("other_{byte:02x}"),
+            Self::Stream(ordinal) => format!("stream{ordinal}"),
         }
     }
 }
@@ -120,6 +125,8 @@ pub(crate) enum RefusalReason {
     GenerationSuperseded,
     /// A dial to a known node that is offline or partitioned away.
     Unreachable,
+    /// A write on a stream that was already reset (or whose reader left).
+    StreamReset,
 }
 
 /// A send the transport refused, with the bytes when there were any.
@@ -204,6 +211,12 @@ enum TraceEvent {
         at: Duration,
         text: String,
     },
+    StreamOpen {
+        opener: Key,
+        acceptor: Key,
+        ordinal: u32,
+        at: Duration,
+    },
 }
 
 /// The connection identity a session token binds to (see
@@ -234,6 +247,7 @@ struct NodeSlot {
     inbound: mpsc::UnboundedSender<(PeerId, u64, Vec<u8>)>,
     accept: mpsc::UnboundedSender<PeerConnection>,
     lifecycle: broadcast::Sender<(PeerId, PeerLifecycleEvent)>,
+    streams: mpsc::UnboundedSender<(PeerId, SimSend, SimRecv)>,
 }
 
 struct LinkState {
@@ -263,6 +277,8 @@ struct FabricState {
     by_addr: BTreeMap<SocketAddr, Key>,
     links: BTreeMap<(Key, Key), LinkState>,
     pair_ordinals: BTreeMap<(Key, Key), u64>,
+    stream_ordinals: BTreeMap<(Key, Key), u32>,
+    open_streams: Vec<(u64, Arc<StreamPair>)>,
     partitions: BTreeSet<(Key, Key)>,
     rules: Vec<FaultRule>,
     lanes: BTreeMap<LaneKey, LaneState>,
@@ -326,6 +342,8 @@ impl SimFabric {
                 by_addr: BTreeMap::new(),
                 links: BTreeMap::new(),
                 pair_ordinals: BTreeMap::new(),
+                stream_ordinals: BTreeMap::new(),
+                open_streams: Vec::new(),
                 partitions: BTreeSet::new(),
                 rules: Vec::new(),
                 lanes: BTreeMap::new(),
@@ -632,6 +650,23 @@ impl SimFabric {
                         ));
                 }
                 TraceEvent::Mark { at, text } => marks.push(format!("@{}us {text}", micros(*at))),
+                TraceEvent::StreamOpen {
+                    opener,
+                    acceptor,
+                    ordinal,
+                    at,
+                } => {
+                    let (na, nb) = (Self::name(&state, opener), Self::name(&state, acceptor));
+                    let key = if na <= nb {
+                        format!("{na}~{nb}")
+                    } else {
+                        format!("{nb}~{na}")
+                    };
+                    links
+                        .entry(key)
+                        .or_default()
+                        .push(format!("stream{ordinal} {na}->{nb} open@{}us", micros(*at)));
+                }
             }
         }
         let mut out = String::new();
@@ -671,6 +706,7 @@ impl SimFabric {
         let at = self.now();
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let (accept_tx, accept_rx) = mpsc::unbounded_channel();
+        let (streams_tx, streams_rx) = mpsc::unbounded_channel();
         let (lifecycle, _) = broadcast::channel(1024);
         let mut state = self.lock();
         let incarnation = state
@@ -687,6 +723,7 @@ impl SimFabric {
                 incarnation,
                 inbound: inbound_tx,
                 accept: accept_tx,
+                streams: streams_tx,
                 lifecycle: lifecycle.clone(),
             },
         );
@@ -701,6 +738,7 @@ impl SimFabric {
             me: peer,
             inbound: tokio::sync::Mutex::new(inbound_rx),
             accept: tokio::sync::Mutex::new(accept_rx),
+            streams: tokio::sync::Mutex::new(streams_rx),
             lifecycle,
         })
     }
@@ -732,6 +770,15 @@ impl SimFabric {
             return;
         };
         link.closed.store(true, Ordering::SeqCst);
+        // Every stream of the closed connection is reset, as with QUIC.
+        state.open_streams.retain(|(generation, stream)| {
+            if *generation == link.generation {
+                stream.reset_both();
+                false
+            } else {
+                true
+            }
+        });
         state.trace.push(TraceEvent::Link {
             a: key.0,
             b: key.1,
@@ -982,6 +1029,162 @@ impl SimFabric {
         Ok(())
     }
 
+    /// Open a bi-directional stream `from` → `to` on their live connection;
+    /// the acceptor's halves are queued for its `accept_bi`.
+    fn open_stream(self: &Arc<Self>, from: Key, to: Key) -> Result<(SimSend, SimRecv), NodeError> {
+        let at = self.now();
+        let mut state = self.lock();
+        let key = pair(from, to);
+        let Some(generation) = state.links.get(&key).map(|link| link.generation) else {
+            Self::refuse_locked(
+                &mut state,
+                Refusal {
+                    src: from,
+                    dst: to,
+                    class: None,
+                    at,
+                    reason: RefusalReason::NoLink,
+                    bytes: None,
+                },
+            );
+            return Err(not_connected(&PeerId(to)));
+        };
+        let ordinal = {
+            let next = state.stream_ordinals.entry(key).or_insert(0);
+            let ordinal = *next;
+            *next = next.saturating_add(1);
+            ordinal
+        };
+        let stream = Arc::new(StreamPair::default());
+        state.open_streams.push((generation, Arc::clone(&stream)));
+        state.trace.push(TraceEvent::StreamOpen {
+            opener: from,
+            acceptor: to,
+            ordinal,
+            at,
+        });
+        let half = |writer: Key, reader: Key, dir: usize| {
+            (
+                SimSend {
+                    fabric: Arc::clone(self),
+                    stream: Arc::clone(&stream),
+                    dir,
+                    lane: LaneKey {
+                        src: writer,
+                        dst: reader,
+                        class: LaneClass::Stream(ordinal),
+                    },
+                    generation,
+                },
+                SimRecv {
+                    stream: Arc::clone(&stream),
+                    dir: 1 - dir,
+                },
+            )
+        };
+        // Direction 0 carries opener → acceptor bytes, direction 1 the reply.
+        let (opener_send, opener_recv) = half(from, to, 0);
+        let (acceptor_send, acceptor_recv) = half(to, from, 1);
+        let delivered = state
+            .nodes
+            .get(&to)
+            .filter(|slot| slot.online)
+            .is_some_and(|slot| {
+                slot.streams
+                    .send((PeerId(from), acceptor_send, acceptor_recv))
+                    .is_ok()
+            });
+        if !delivered {
+            stream.reset_both();
+            return Err(not_connected(&PeerId(to)));
+        }
+        Ok((opener_send, opener_recv))
+    }
+
+    /// Record one stream write (bytes kept, as for frames) and decide its
+    /// fate: delivered into the stream, or the stream is reset (a `Drop`
+    /// rule, or the connection is gone). `Delay` rules do not apply to
+    /// streams and are recorded as `Pass`.
+    fn stream_write(&self, lane: LaneKey, generation: u64, bytes: &[u8]) -> io::Result<()> {
+        let at = self.now();
+        let mut state = self.lock();
+        let live = state
+            .links
+            .get(&pair(lane.src, lane.dst))
+            .is_some_and(|link| link.generation == generation);
+        let seq = {
+            let lane_state = state.lanes.entry(lane).or_default();
+            let seq = lane_state.next_seq;
+            lane_state.next_seq = seq.saturating_add(1);
+            seq
+        };
+        let ordinal = state
+            .links
+            .get(&pair(lane.src, lane.dst))
+            .map_or(0, |link| link.ordinal);
+        let write = Write {
+            lane,
+            seq,
+            pair_ordinal: ordinal,
+            at,
+            bytes: Arc::from(bytes),
+        };
+        let mut fault = Fault::Pass;
+        let mut rule_index = 0;
+        for (index, rule) in state.rules.iter().enumerate() {
+            let decision = rule(&write);
+            if decision != Fault::Pass {
+                fault = decision;
+                rule_index = index;
+                break;
+            }
+        }
+        if let Fault::Delay(_) = fault {
+            fault = Fault::Pass;
+        }
+        let index = state.writes.len();
+        state.writes.push(write);
+        state.trace.push(TraceEvent::Write { index, fault });
+        let fate = if !live {
+            Fate::Dropped {
+                at,
+                reason: DropReason::LinkClosed,
+            }
+        } else if fault == Fault::Drop {
+            Fate::Dropped {
+                at,
+                reason: DropReason::Rule(rule_index),
+            }
+        } else {
+            Fate::Delivered { at }
+        };
+        state.trace.push(TraceEvent::Fate { lane, seq, fate });
+        match fate {
+            Fate::Delivered { .. } => Ok(()),
+            Fate::Dropped { .. } => Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "sim: stream reset",
+            )),
+        }
+    }
+
+    /// A write attempted on an already-reset stream: refused, bytes kept.
+    fn refuse_stream_write(&self, lane: LaneKey, bytes: &[u8]) {
+        let at = self.now();
+        let mut state = self.lock();
+        Self::refuse_locked(
+            &mut state,
+            Refusal {
+                src: lane.src,
+                dst: lane.dst,
+                class: Some(lane.class),
+                at,
+                reason: RefusalReason::StreamReset,
+                bytes: Some(Arc::from(bytes)),
+            },
+        );
+    }
+
     fn refuse_locked(state: &mut FabricState, refusal: Refusal) {
         let index = state.refused.len();
         state.refused.push(refusal);
@@ -1185,6 +1388,7 @@ pub(crate) struct SimLink {
     me: PeerId,
     inbound: tokio::sync::Mutex<mpsc::UnboundedReceiver<(PeerId, u64, Vec<u8>)>>,
     accept: tokio::sync::Mutex<mpsc::UnboundedReceiver<PeerConnection>>,
+    streams: tokio::sync::Mutex<mpsc::UnboundedReceiver<(PeerId, SimSend, SimRecv)>>,
     lifecycle: broadcast::Sender<(PeerId, PeerLifecycleEvent)>,
 }
 
@@ -1251,6 +1455,19 @@ impl SimLink {
             .nodes
             .get(&self.me.0)
             .is_some_and(|slot| slot.online)
+    }
+
+    pub(crate) fn open_bi(&self, peer_id: &PeerId) -> Result<(SimSend, SimRecv), NodeError> {
+        self.fabric.open_stream(self.me.0, peer_id.0)
+    }
+
+    pub(crate) async fn accept_bi(&self) -> Result<(PeerId, SimSend, SimRecv), NodeError> {
+        self.streams
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or(NodeError::ShuttingDown)
     }
 
     pub(crate) async fn accept(&self) -> Option<PeerConnection> {
@@ -1381,6 +1598,176 @@ impl SimLink {
     }
 }
 
+/// One direction of a simulated stream: bytes in order, EOF on finish,
+/// an error on reset (connection closed, peer dropped its half unfinished,
+/// or a `Drop` fault).
+#[derive(Default)]
+struct Pipe {
+    buf: VecDeque<u8>,
+    finished: bool,
+    reset: bool,
+    reader_gone: bool,
+    reader_waker: Option<Waker>,
+}
+
+impl Pipe {
+    fn wake(&mut self) {
+        if let Some(waker) = self.reader_waker.take() {
+            waker.wake();
+        }
+    }
+}
+
+/// Both directions of one simulated stream.
+#[derive(Default)]
+pub(crate) struct StreamPair {
+    dirs: [Mutex<Pipe>; 2],
+}
+
+impl StreamPair {
+    fn pipe(&self, dir: usize) -> std::sync::MutexGuard<'_, Pipe> {
+        self.dirs[dir & 1]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn reset_both(&self) {
+        for dir in 0..2 {
+            let mut pipe = self.pipe(dir);
+            pipe.reset = true;
+            pipe.wake();
+        }
+    }
+}
+
+/// The write half of a simulated stream (the `Sim` arm of
+/// [`super::StreamSend`] in test builds).
+pub struct SimSend {
+    fabric: Arc<SimFabric>,
+    stream: Arc<StreamPair>,
+    dir: usize,
+    lane: LaneKey,
+    generation: u64,
+}
+
+impl SimSend {
+    /// Gracefully end this direction (EOF for the reader).
+    pub(crate) fn finish(&mut self) -> io::Result<()> {
+        let mut pipe = self.stream.pipe(self.dir);
+        if pipe.reset {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "sim: stream reset",
+            ));
+        }
+        pipe.finished = true;
+        pipe.wake();
+        Ok(())
+    }
+}
+
+impl tokio::io::AsyncWrite for SimSend {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        {
+            let pipe = this.stream.pipe(this.dir);
+            if pipe.reset || pipe.reader_gone {
+                drop(pipe);
+                this.fabric.refuse_stream_write(this.lane, buf);
+                return std::task::Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "sim: stream reset",
+                )));
+            }
+            if pipe.finished {
+                return std::task::Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "sim: write after finish",
+                )));
+            }
+        }
+        if let Err(error) = this.fabric.stream_write(this.lane, this.generation, buf) {
+            this.stream.reset_both();
+            return std::task::Poll::Ready(Err(error));
+        }
+        let mut pipe = this.stream.pipe(this.dir);
+        pipe.buf.extend(buf.iter().copied());
+        pipe.wake();
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(self.get_mut().finish())
+    }
+}
+
+impl Drop for SimSend {
+    fn drop(&mut self) {
+        // As with QUIC: dropping an unfinished send half resets the stream.
+        let mut pipe = self.stream.pipe(self.dir);
+        if !pipe.finished {
+            pipe.reset = true;
+            pipe.wake();
+        }
+    }
+}
+
+/// The read half of a simulated stream (the `Sim` arm of
+/// [`super::StreamRecv`] in test builds).
+pub struct SimRecv {
+    stream: Arc<StreamPair>,
+    dir: usize,
+}
+
+impl tokio::io::AsyncRead for SimRecv {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let mut pipe = this.stream.pipe(this.dir);
+        if !pipe.buf.is_empty() {
+            let n = buf.remaining().min(pipe.buf.len());
+            let chunk: Vec<u8> = pipe.buf.drain(..n).collect();
+            buf.put_slice(&chunk);
+            return std::task::Poll::Ready(Ok(()));
+        }
+        if pipe.reset {
+            return std::task::Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "sim: stream reset",
+            )));
+        }
+        if pipe.finished {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        pipe.reader_waker = Some(cx.waker().clone());
+        std::task::Poll::Pending
+    }
+}
+
+impl Drop for SimRecv {
+    fn drop(&mut self) {
+        // As with QUIC STOP_SENDING: the writer's next write fails.
+        self.stream.pipe(self.dir).reader_gone = true;
+    }
+}
+
 type Registry = Mutex<Vec<(String, Weak<SimFabric>)>>;
 
 fn registry() -> &'static Registry {
@@ -1507,6 +1894,126 @@ mod fabric_tests {
         assert_eq!(writes.len(), 3, "the dropped write is still captured");
         assert_eq!(&*writes[1].bytes, &[DM, 1]);
         assert!(fabric.canonical_trace().contains("dropped@"));
+    }
+
+    async fn stream_pair(
+        fabric: &Arc<SimFabric>,
+    ) -> (
+        Arc<SimLink>,
+        Arc<SimLink>,
+        SimSend,
+        SimRecv,
+        SimSend,
+        SimRecv,
+    ) {
+        let (a, b) = two_links(fabric).await;
+        let (a_send, a_recv) = a.open_bi(&key(2)).expect("open");
+        let (peer, b_send, b_recv) = tokio::time::timeout(Duration::from_secs(1), b.accept_bi())
+            .await
+            .expect("accepted in time")
+            .expect("accept");
+        assert_eq!(peer, key(1), "the acceptor learns the opener");
+        (a, b, a_send, a_recv, b_send, b_recv)
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn w3h_fabric_stream_open_accept_eof_and_reply() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let fabric = SimFabric::new(21);
+        let (_a, _b, mut a_send, mut a_recv, mut b_send, mut b_recv) = stream_pair(&fabric).await;
+        a_send.write_all(&[0x06, 1, 2, 3]).await.expect("write");
+        a_send.finish().expect("finish");
+        let mut got = Vec::new();
+        b_recv.read_to_end(&mut got).await.expect("read to EOF");
+        assert_eq!(got, vec![0x06, 1, 2, 3], "bytes in order, then EOF");
+        b_send.write_all(b"reply").await.expect("reply");
+        b_send.shutdown().await.expect("shutdown");
+        let mut reply = Vec::new();
+        a_recv.read_to_end(&mut reply).await.expect("reply EOF");
+        assert_eq!(reply, b"reply");
+        assert!(
+            a_send.write_all(b"x").await.is_err(),
+            "no write after finish"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn w3h_fabric_stream_resets_when_the_link_closes() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let fabric = SimFabric::new(22);
+        let (_a, _b, mut a_send, _a_recv, _b_send, mut b_recv) = stream_pair(&fabric).await;
+        a_send.write_all(b"before").await.expect("write");
+        fabric.set_online(&key(2), false);
+        let mut buf = [0u8; 6];
+        // Bytes already delivered stay readable; then the reset surfaces.
+        b_recv.read_exact(&mut buf).await.expect("delivered bytes");
+        assert_eq!(&buf, b"before");
+        let mut more = [0u8; 1];
+        assert!(
+            b_recv.read_exact(&mut more).await.is_err(),
+            "reader sees the reset"
+        );
+        assert!(
+            a_send.write_all(b"after").await.is_err(),
+            "writer sees the reset"
+        );
+        let trace = fabric.canonical_trace();
+        assert!(
+            trace.contains("StreamReset len=5"),
+            "the post-close write is recorded with its bytes: {trace}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn w3h_fabric_stream_drop_fault_resets_the_stream() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let fabric = SimFabric::new(23);
+        fabric.add_rule(|write| {
+            if matches!(write.lane.class, LaneClass::Stream(_))
+                && write.bytes.first() == Some(&0xff)
+            {
+                Fault::Drop
+            } else {
+                Fault::Pass
+            }
+        });
+        let (_a, _b, mut a_send, _a_recv, _b_send, mut b_recv) = stream_pair(&fabric).await;
+        a_send.write_all(b"ok").await.expect("first write passes");
+        assert!(
+            a_send.write_all(&[0xff]).await.is_err(),
+            "dropped write resets"
+        );
+        let mut buf = [0u8; 2];
+        b_recv
+            .read_exact(&mut buf)
+            .await
+            .expect("earlier bytes delivered");
+        let mut more = [0u8; 1];
+        assert!(
+            b_recv.read_exact(&mut more).await.is_err(),
+            "reader sees the reset"
+        );
+        assert!(fabric.canonical_trace().contains("Rule(0)"));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn w3h_fabric_stream_writes_are_traced_with_bytes() {
+        use tokio::io::AsyncWriteExt as _;
+        let fabric = SimFabric::new(24);
+        let (_a, _b, mut a_send, _a_recv, mut b_send, _b_recv) = stream_pair(&fabric).await;
+        a_send.write_all(&[0x05, 0xaa]).await.expect("write");
+        b_send.write_all(&[0xbb]).await.expect("reply");
+        let trace = fabric.canonical_trace();
+        assert!(trace.contains("stream0 A->B open@"), "{trace}");
+        assert!(trace.contains("A->B stream0\n  #0 conn0 w@"), "{trace}");
+        assert!(trace.contains("B->A stream0\n  #0 conn0 w@"), "{trace}");
+        let dump = fabric.payload_dump(1 << 20);
+        assert!(dump.windows(2).any(|w| w == [0x05, 0xaa]));
+        assert!(String::from_utf8_lossy(&dump).contains("W A->B stream0 #0"));
+        let writes = fabric.writes();
+        assert!(writes
+            .iter()
+            .any(|w| w.lane.class == LaneClass::Stream(0) && *w.bytes == [0xbb]));
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

@@ -16174,8 +16174,8 @@ impl Agent {
         evidence: std::sync::Arc<peer_evidence::EvidenceRuntime>,
         admission: streams::InboundAdmission,
         machine_id: identity::MachineId,
-        send: ant_quic::HighLevelSendStream,
-        mut recv: ant_quic::HighLevelRecvStream,
+        send: network::StreamSend,
+        mut recv: network::StreamRecv,
     ) {
         let protocol = match tokio::time::timeout(
             streams::PREFIX_READ_TIMEOUT,
