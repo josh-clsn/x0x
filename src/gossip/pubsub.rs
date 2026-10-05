@@ -3483,8 +3483,64 @@ fn verify_signature(
     verified
 }
 
+/// Wire fixtures for crate tests outside this module (#1114 SSE/WS proofs).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// An unsigned inner V1 payload — the #1114 attack shape.
+    pub(crate) fn unsigned_inner_v1(topic: &str, payload: &Bytes) -> Bytes {
+        encode_v1(topic, payload).expect("encode inner v1")
+    }
+
+    /// A verified inner V2 payload signed by `ctx`, as production emits.
+    pub(crate) fn signed_inner_v2(ctx: &SigningContext, topic: &str, payload: &Bytes) -> Bytes {
+        let signing_payload =
+            build_signing_payload(ctx.agent_id.as_bytes(), topic.as_bytes(), payload);
+        let signature = ctx.sign(&signing_payload).expect("sign inner v2");
+        encode_signed(
+            SignedVersion::V2,
+            &ctx.agent_id,
+            &ctx.public_key_bytes,
+            &signature,
+            topic,
+            payload,
+        )
+        .expect("encode inner v2")
+    }
+
+    /// A valid outer PlumTree V2 EAGER frame (payload hash sealed, header
+    /// signed by a fresh ML-DSA key) carrying `inner`. sg's RejectV1 policy
+    /// accepts it, so whatever `inner` holds reaches `decode_for_delivery`.
+    pub(crate) fn outer_v2_frame(topic: TopicId, inner: Bytes, msg_id: [u8; 32]) -> Bytes {
+        let signing_key = saorsa_gossip_identity::MlDsaKeyPair::generate().expect("ml-dsa key");
+        let mut header = MessageHeader {
+            version: 1,
+            payload_hash: None,
+            topic,
+            msg_id,
+            kind: MessageKind::Eager,
+            hop: 0,
+            ttl: 10,
+        };
+        header.seal_payload_hash(Some(inner.as_ref()));
+        let header_bytes = postcard::to_stdvec(&header).expect("header serialize");
+        let signature = signing_key.sign(&header_bytes).expect("sign header");
+        let frame = saorsa_gossip_pubsub::GossipMessage {
+            header,
+            payload: Some(inner),
+            signature,
+            public_key: signing_key.public_key().to_vec(),
+        };
+        postcard::to_stdvec(&frame)
+            .expect("gossip frame serialize")
+            .into()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::signed_inner_v2;
     use super::*;
     use crate::identity::AgentKeypair;
     use crate::network::NetworkConfig;
@@ -7885,11 +7941,21 @@ mod tests {
         payload: Bytes,
         version_v2: bool,
     ) -> Bytes {
+        signed_outer_frame_with_id(signing_key, topic, payload, version_v2, [7u8; 32])
+    }
+
+    fn signed_outer_frame_with_id(
+        signing_key: &saorsa_gossip_identity::MlDsaKeyPair,
+        topic: TopicId,
+        payload: Bytes,
+        version_v2: bool,
+        msg_id: [u8; 32],
+    ) -> Bytes {
         let mut header = MessageHeader {
             version: 1,
             payload_hash: None,
             topic,
-            msg_id: [7u8; 32],
+            msg_id,
             kind: MessageKind::Eager,
             hop: 0,
             ttl: 10,
@@ -8103,6 +8169,139 @@ mod tests {
                 "{reason} must refuse valid outer V1"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #1114 (charter I3): unsigned inner V1 never reaches a subscriber
+    // -----------------------------------------------------------------------
+
+    /// WHY (#1114): sg's RejectV1 guards only the OUTER PlumTree frame. A peer
+    /// with a valid machine key can wrap an unsigned inner V1 payload in a
+    /// valid outer V2 frame; it decoded with `sender = None`, so the inner
+    /// signature, RevocationSet and Blocked checks were all skipped and the
+    /// payload reached the SDK `Subscription` (and from it SSE/WS). The
+    /// signed V2 frame sent right after it is the positive control: the same
+    /// path still delivers, so the FIRST delivered message must be the
+    /// signed one, and nothing else may follow.
+    #[tokio::test]
+    async fn issue1114_signed_outer_frame_with_unsigned_inner_v1_is_not_delivered() {
+        let manager = PubSubManager::new(test_node().await, None).expect("manager");
+        let topic = "issue1114-inner-v1";
+        let topic_id = TopicId::from_entity(topic.as_bytes());
+        let mut sub = manager.subscribe(topic.to_string()).await;
+        let outer_key = outer_signing_key();
+        let from = PeerId::new([0x14; 32]);
+
+        let unsigned = encode_v1(topic, &Bytes::from("unsigned-v1")).expect("inner v1");
+        manager
+            .handle_incoming(
+                from,
+                None,
+                signed_outer_frame_with_id(&outer_key, topic_id, unsigned, true, [0x11; 32]),
+            )
+            .await;
+
+        let author = SigningContext::from_keypair(&AgentKeypair::generate().expect("keygen"));
+        let signed = signed_inner_v2(&author, topic, &Bytes::from("signed-v2"));
+        manager
+            .handle_incoming(
+                from,
+                None,
+                signed_outer_frame_with_id(&outer_key, topic_id, signed, true, [0x12; 32]),
+            )
+            .await;
+
+        let first = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("the signed control frame must be delivered")
+            .expect("subscription open");
+        assert_eq!(
+            first.payload,
+            Bytes::from("signed-v2"),
+            "#1114: an unsigned inner V1 payload must never reach a subscriber"
+        );
+        assert_eq!(first.sender, Some(author.agent_id));
+        assert!(first.verified);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), sub.recv())
+                .await
+                .ok()
+                .flatten()
+                .is_none(),
+            "#1114: nothing after the signed control may be delivered"
+        );
+    }
+
+    /// WHY (#1114): a revoked or Blocked agent must not get through by
+    /// downgrading to unsigned V1. Its signed V2 is dropped by the
+    /// RevocationSet and ContactStore checks, but both checks key off
+    /// `sender`, which V1 does not carry — so the same topic and payload
+    /// re-sent as V1 skipped them. Unsigned is never deliverable, with or
+    /// without identity stores attached.
+    #[tokio::test]
+    async fn issue1114_revoked_or_blocked_sender_cannot_downgrade_to_unsigned_v1() {
+        let topic = "issue1114-downgrade";
+        let payload = Bytes::from("from-a-closed-identity");
+
+        let revoked = AgentKeypair::generate().expect("keygen");
+        let revoked_ctx = SigningContext::from_keypair(&revoked);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let record = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Agent(revoked_ctx.agent_id),
+            revoked.public_key(),
+            revoked.secret_key(),
+            now,
+            None,
+        )
+        .expect("sign revocation");
+        let mut set = crate::revocation::RevocationSet::new();
+        set.verify_and_insert(record, None)
+            .expect("self-revocation verifies without a cert");
+        let rev_set = Arc::new(RwLock::new(set));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocked_ctx = SigningContext::from_keypair(&AgentKeypair::generate().expect("keygen"));
+        let mut store = ContactStore::new(dir.path().join("contacts.json"));
+        store.set_trust(&blocked_ctx.agent_id, TrustLevel::Blocked);
+        let contacts = Arc::new(RwLock::new(store));
+
+        // Controls: each closed identity's signed V2 is already dropped.
+        assert!(
+            decode_for_delivery(
+                signed_inner_v2(&revoked_ctx, topic, &payload),
+                Some(&contacts),
+                Some(&rev_set),
+            )
+            .await
+            .is_none(),
+            "control: a revoked sender's signed V2 is dropped"
+        );
+        assert!(
+            decode_for_delivery(
+                signed_inner_v2(&blocked_ctx, topic, &payload),
+                Some(&contacts),
+                Some(&rev_set),
+            )
+            .await
+            .is_none(),
+            "control: a Blocked sender's signed V2 is dropped"
+        );
+
+        // The downgrade: the same topic and payload as unsigned V1.
+        let unsigned = encode_v1(topic, &payload).expect("inner v1");
+        assert!(
+            decode_for_delivery(unsigned.clone(), Some(&contacts), Some(&rev_set))
+                .await
+                .is_none(),
+            "#1114: unsigned V1 must not bypass the RevocationSet and Blocked checks"
+        );
+        assert!(
+            decode_for_delivery(unsigned, None, None).await.is_none(),
+            "#1114: unsigned V1 is never deliverable, even with no identity stores"
+        );
     }
 
     /// saorsa-gossip 0.5.77 (x0x #613 / #611 / #336): a local publish whose
