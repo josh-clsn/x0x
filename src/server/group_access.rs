@@ -1,5 +1,5 @@
-//! Group-plane access admission — issue #1166 slices S1 (read family)
-//! and S2 (secure-write family).
+//! Group-plane access admission — issue #1166 slices S1 (read family),
+//! S2 (secure-write family) and S3 (admin/mutation family).
 //!
 //! One chokepoint owns the answer to "who may enter a group route" for
 //! the group plane. Before this module every handler re-derived that
@@ -24,17 +24,23 @@
 //!   the router's own `MatchedPath` pattern, so this module never
 //!   re-implements route matching.
 //!
-//! Seven classified routes cannot take the extractor: the S1 details and
-//! delegations handlers and all five S2 secure-write handlers are called
-//! DIRECTLY with positional extractor arguments by regression tests that
-//! must not be edited (the withdrawn-tombstone and lost-race tests in
-//! `routes/named_groups.rs`; `routes/named_groups/tests/adr0066_delegations.rs`),
-//! so their signatures are pinned. Those handlers call the same admission
-//! cores ([`admit_named_group_details`], [`admit_group_delegations`],
-//! [`admit_group_send`], [`admit_secure_endpoint`],
-//! [`admit_open_envelope`]) with the values they already hold under their
-//! own lock; the decision cannot diverge from the extractor path because
-//! both ends run the same function.
+//! Most classified routes cannot take the extractor: the S1 details and
+//! delegations handlers, all five S2 secure-write handlers and the S3
+//! mutation family are called DIRECTLY with positional extractor
+//! arguments by regression tests that must not be edited (the
+//! withdrawn-tombstone and lost-race tests in `routes/named_groups.rs`;
+//! `routes/named_groups/tests/adr0066_delegations.rs`), or would have
+//! their rejection PRECEDENCE reordered by an extractor argument that
+//! necessarily runs before the body-consuming one (a malformed Json
+//! body must keep answering 400 before any 404/403 admission), or run
+//! gates the handler places before its lookup (the directory-durability
+//! 503 on the request routes). Those handlers call the same admission
+//! cores with the values they already hold under their own lock; the
+//! decision cannot diverge from the extractor path because both ends
+//! run the same function. `GET /groups/:id/requests` is the S3
+//! exception: no body argument, no durability-first ordering and no
+//! positional callers — its handler takes the extractor and re-runs
+//! the core under its own lock (the `/members` pattern).
 //!
 //! Admission runs twice where the handler re-reads group data for its
 //! body (`/members`, `/state/commits`): once in the extractor (an early
@@ -44,9 +50,9 @@
 //! no read-check-serve window between two lock takes. `GET
 //! /groups/:id/messages` is the deliberate exception: its unknown-group
 //! fail-open and its stable-id resolution are one snapshot by design.
-//! The S2 secure-write handlers run their core ONCE, under the write
-//! path's own lock take — exactly where the inline gates stood — so the
-//! ADR-0066 epoch capture keeps the same guard.
+//! The S2 secure-write and S3 mutation handlers run their core ONCE,
+//! under the write path's own lock take — exactly where the inline
+//! gates stood — so the ADR-0066 epoch capture keeps the same guard.
 //!
 //! Behaviour is preserved (controller condition 3): same status codes,
 //! same bodies, same precedence — 404 (unknown group; plus the withdrawn
@@ -64,10 +70,9 @@
 //! `open_envelope_withdrawn_group_conflict`, `reject_withdrawn_group`),
 //! which is what the inline code used.
 //!
-//! Later slices (S3 admin/mutations, S4 long tail) add the remaining
-//! levels (`Admin`, `JoinSelf`) and flip `Unmigrated` rows to
-//! `Level(..)`; S5 activates the `clippy.toml` ceiling that forbids the
-//! absorbed helpers everywhere except this module.
+//! Later slices (S4 long tail) classify the remaining routes; S5
+//! activates the `clippy.toml` ceiling that forbids the absorbed
+//! helpers everywhere except this module.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -77,7 +82,7 @@ use crate::server::rider_auth::ActorContext;
 use crate::server::routes::named_groups::{
     local_join_membership_state, open_envelope_withdrawn_group_conflict,
     reject_fork_quarantined_for_actor, reject_unverified_owner_certified_restore,
-    reject_withdrawn_group,
+    reject_withdrawn_group, require_admin_or_above,
 };
 use crate::server::state::AppState;
 use axum::extract::{Extension, FromRequestParts, MatchedPath, Path};
@@ -104,7 +109,8 @@ pub(in crate::server) enum MemberState {
 
 /// What a request was admitted at. S1 needs three levels; S2 adds
 /// `SessionBearer`, `RiderScope` and `PublicWrite` for the
-/// secure-write family; S3–S4 add `Admin` and `JoinSelf`.
+/// secure-write family; S3 adds `Admin` and `JoinSelf` for the
+/// admin/mutation family; S4 classifies the long tail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::server) enum AccessLevel {
     /// The durable API token — full authority, subsumes every other level.
@@ -128,6 +134,21 @@ pub(in crate::server) enum AccessLevel {
     /// pinned by the rider tests, and `send` checks ban BEFORE the grant
     /// while `secure/encrypt` checks the grant first).
     RiderScope,
+    /// The local daemon's roster seat is Admin-or-higher — exactly
+    /// today's `require_admin_or_above`
+    /// (`caller_role(local_agent_hex).at_least(GroupRole::Admin)`). The
+    /// seat evaluated is the DAEMON's, never the bearer's class: a
+    /// durable-owner bearer without an admin seat is still refused
+    /// (`membership_handlers_reject_non_admin_local_caller` pins it),
+    /// and the bearer's class re-enters only through the Home durable
+    /// fence the handlers keep at entry. Honest label, not an actor
+    /// authority claim.
+    Admin,
+    /// The self-directed surface whose subject IS the local daemon:
+    /// `DELETE /groups/:id` (leave) admits when the daemon itself holds
+    /// an ACTIVE seat, any role — the #446 round-5 gate. The bearer
+    /// class is never consulted.
+    JoinSelf,
     /// No actor-based gate; the route serves its public projection (any
     /// remaining gates are local policy, not principal identity).
     PublicRead,
@@ -177,8 +198,10 @@ pub(in crate::server) struct RouteAccess {
 /// S1 classified the read family — `GET /groups/:id`, `/members`,
 /// `/messages`, `/state`, `/state/commits`, `/delegations`; S2 the
 /// secure-write family — `POST /groups/:id/send`,
-/// `secure/encrypt|decrypt|reseal`, `secure/open-envelope`. Everything
-/// else waits for its slice as [`AccessClass::Unmigrated`].
+/// `secure/encrypt|decrypt|reseal`, `secure/open-envelope`; S3 the
+/// admin/mutation family (see its section comment for the honest
+/// labels). Everything else waits for its slice as
+/// [`AccessClass::Unmigrated`].
 pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
     // ── S1 read family: classified ────────────────────────────────────
     // `/groups/:id` additionally serves the pending_authority_commit stub
@@ -247,91 +270,103 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
         path: "/groups/secure/open-envelope",
         class: AccessClass::Level(AccessLevel::PublicWrite),
     },
-    // ── S3 admin/mutation family: waiting ─────────────────────────────
+    // ── S3 admin/mutation family: classified ──────────────────────────
+    // `Admin` is today's `require_admin_or_above`: the LOCAL DAEMON's
+    // roster seat at Admin+, never the bearer's class (a durable owner
+    // without an admin seat is refused — the authority test pins it);
+    // the bearer matters only through the Home durable fence the
+    // handlers keep at entry. The requests LISTING carries the same
+    // seat gate but NO withdrawn check (today's shape — a withdrawn
+    // shell's requests stay listable). Issue #1228's no-actor family is
+    // classified at its REAL level, not the inventory's target:
+    // display-name and request create/cancel have no actor gate at all
+    // (PublicWrite — their data gates are the handler's, keyed on the
+    // local daemon), and leave is the daemon's own active seat
+    // (JoinSelf). Tightening any of these is a separate reviewed PR.
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/invite",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::Admin),
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/members",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::Admin),
     },
     RouteAccess {
         method: Method::DELETE,
         path: "/groups/:id/members/:agent_id",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::Admin),
     },
     RouteAccess {
         method: Method::PATCH,
         path: "/groups/:id/members/:agent_id/role",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::Admin),
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/ban/:agent_id",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::Admin),
     },
     RouteAccess {
         method: Method::DELETE,
         path: "/groups/:id/ban/:agent_id",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::Admin),
     },
     RouteAccess {
         method: Method::PATCH,
         path: "/groups/:id",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::Admin),
     },
     RouteAccess {
         method: Method::PATCH,
         path: "/groups/:id/policy",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::Admin),
     },
     RouteAccess {
         method: Method::PUT,
         path: "/groups/:id/display-name",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::PublicWrite),
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/state/seal",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::Admin),
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/state/withdraw",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::Admin),
     },
     RouteAccess {
         method: Method::DELETE,
         path: "/groups/:id",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::JoinSelf),
     },
     RouteAccess {
         method: Method::GET,
         path: "/groups/:id/requests",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::Admin),
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/requests",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::PublicWrite),
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/requests/:request_id/approve",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::Admin),
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/requests/:request_id/reject",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::Admin),
     },
     RouteAccess {
         method: Method::DELETE,
         path: "/groups/:id/requests/:request_id",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::PublicWrite),
     },
     // ── S4 long tail: waiting ─────────────────────────────────────────
     RouteAccess {
@@ -865,14 +900,124 @@ pub(in crate::server) fn admit_open_envelope(
     }
     Ok(AccessLevel::PublicWrite)
 }
+
+// ─────────────────────── admission cores (S3 admin/mutation) ─────────────
+
+/// The Admin-family gate pair, in today's order: the local daemon's
+/// seat at Admin+ (`require_admin_or_above`'s "admin role required"
+/// 403) THEN the withdrawn 409. Given the already-borrowed group, for
+/// the two sites that hold `info` through a lookup of their own —
+/// `PATCH …/members/:agent_id/role` (whose target-entry checks come
+/// FIRST today) and `approve_join_request`'s write-lock block.
+pub(in crate::server) fn admin_route_gate(
+    info: &x0x::groups::GroupInfo,
+    local_agent_hex: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    require_admin_or_above(info, local_agent_hex)?;
+    if let Some(resp) = reject_withdrawn_group(info) {
+        return Err(resp);
+    }
+    Ok(())
+}
+
+/// Entry admission for the admin-mutated group routes (invite, member
+/// add/remove/role, ban/unban, PATCH, policy, seal, request
+/// approve/reject), in today's order: raw-id lookup 404 →
+/// [`admin_route_gate`]. The Home durable fence the handlers run at
+/// ENTRY (before the membership lock, before body parse where it
+/// stood) is deliberately NOT here — see [`is_home_or_owner_certified`].
+pub(in crate::server) fn admit_admin_group_route<'a>(
+    groups: &'a HashMap<String, x0x::groups::GroupInfo>,
+    route_id: &str,
+    local_agent_hex: &str,
+) -> Result<&'a x0x::groups::GroupInfo, (StatusCode, Json<serde_json::Value>)> {
+    let Some(info) = groups.get(route_id) else {
+        return Err(not_found("group not found"));
+    };
+    admin_route_gate(info, local_agent_hex)?;
+    Ok(info)
+}
+
+/// `GET /groups/:id/requests`: raw-id lookup 404 → the admin seat
+/// gate — and NO withdrawn check, today's shape exactly (a withdrawn
+/// shell's request list stays readable for its admins). Tightening
+/// that belongs to a reviewed change, not this slice.
+pub(in crate::server) fn admit_join_request_listing<'a>(
+    groups: &'a HashMap<String, x0x::groups::GroupInfo>,
+    route_id: &str,
+    local_agent_hex: &str,
+) -> Result<&'a x0x::groups::GroupInfo, (StatusCode, Json<serde_json::Value>)> {
+    let Some(info) = groups.get(route_id) else {
+        return Err(not_found("group not found"));
+    };
+    require_admin_or_above(info, local_agent_hex)?;
+    Ok(info)
+}
+
+/// `DELETE /groups/:id` (leave): raw-id lookup 404 → withdrawn 409 →
+/// the local ACTIVE-seat gate (any role — member self-leave is this
+/// surface's purpose; the admin gate guards the shared
+/// terminal-withdrawal routing instead, where the sole-member leave
+/// path waives it by design).
+pub(in crate::server) fn admit_self_leave<'a>(
+    groups: &'a HashMap<String, x0x::groups::GroupInfo>,
+    route_id: &str,
+    local_agent_hex: &str,
+) -> Result<&'a x0x::groups::GroupInfo, (StatusCode, Json<serde_json::Value>)> {
+    let Some(info) = groups.get(route_id) else {
+        return Err(not_found("group not found"));
+    };
+    if let Some(resp) = reject_withdrawn_group(info) {
+        return Err(resp);
+    }
+    if info.caller_role(local_agent_hex).is_none() {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "leaving a group requires active membership in it",
+        ));
+    }
+    Ok(info)
+}
+
+/// Entry admission for issue #1228's no-actor family — `PUT
+/// /groups/:id/display-name`, request create and request cancel: raw-id
+/// lookup 404 → withdrawn 409. No actor, no seat, no role; the routes'
+/// remaining gates are data checks keyed on the local daemon's identity
+/// (request ownership, admission policy, the display-name write itself)
+/// and stay in the handlers, in their per-route order.
+pub(in crate::server) fn admit_live_group_route<'a>(
+    groups: &'a HashMap<String, x0x::groups::GroupInfo>,
+    route_id: &str,
+) -> Result<&'a x0x::groups::GroupInfo, (StatusCode, Json<serde_json::Value>)> {
+    let Some(info) = groups.get(route_id) else {
+        return Err(not_found("group not found"));
+    };
+    if let Some(resp) = reject_withdrawn_group(info) {
+        return Err(resp);
+    }
+    Ok(info)
+}
+
+/// The Home/owner-certified durable-fence predicate (issue #446's
+/// central fence, `home_mutation_requires_durable`): a group carrying
+/// Home metadata OR an OwnerCertified-capable admission axis is an
+/// owner act to mutate, whatever its current policy axes. The ONE
+/// definition — the fence itself (the actor test and its typed 403,
+/// called by that shared helper at every mutating handler's entry)
+/// keeps its entry position in the handlers (before body parse where
+/// it stood), so no S3 core runs it.
+pub(in crate::server) fn is_home_or_owner_certified(info: &x0x::groups::GroupInfo) -> bool {
+    info.home.is_some() || info.policy.admission.owner_certified_user_id().is_some()
+}
+
 // ─────────────────────── extractor ───────────────────────────────────────
 
 /// The admission result handed to a handler: the resolved access level,
 /// the stable group id the route's `:id` resolved to (the DECODED
 /// `:id` when the messages route falls through for a group unknown
-/// locally — the public-cache fail-open that predates this module), and
-/// the ACTING PRINCIPAL's hex (S2) — the identity the handler's ban/
-/// policy gates evaluate.
+/// locally — the public-cache fail-open that predates this module),
+/// and the ACTING PRINCIPAL's hex (S2) — the identity the handler's
+/// ban/policy gates evaluate.
 ///
 /// This is the extractor's admission snapshot, not the final word:
 /// handlers that re-read group data for their body re-run the pure core
@@ -886,12 +1031,13 @@ pub(in crate::server) struct GroupAccess {
 
 impl GroupAccess {
     /// The level this request was admitted at.
-    // No production reader yet: S1 handlers are admitted-or-refused and
-    // never branch on the level, and the S2 secure-write handlers match
-    // on the `ActorContext` they already hold (their signatures are
-    // pinned by positional test callers) while consuming only
-    // `acting_hex`. S3+ handlers (extractor-wired) are this accessor's
-    // first readers; delete the allow then.
+    // No production reader yet: every extractor-wired handler so far
+    // (S1 reads, the S3 requests listing) is admitted-or-refused and
+    // re-runs its core under its own lock; the S2 secure-write and S3
+    // mutation handlers match on the `ActorContext` they already hold
+    // (pinned signatures) and consume only `acting_hex`. The classified
+    // level is pinned by the table + tests; the first handler that
+    // branches on it deletes this allow.
     #[allow(dead_code)]
     pub(in crate::server) fn level(&self) -> AccessLevel {
         self.level
@@ -924,11 +1070,11 @@ fn unclassified(method: &Method, path: &str) -> Response {
 }
 
 /// Fail closed when a CLASSIFIED row cannot be served by this
-/// extractor: the seven pinned-signature routes run their admission
-/// cores directly and never take [`GroupAccess`], and a classified row
-/// without a `:id` parameter (open-envelope) is not extractor-shaped.
-/// Wiring bugs, not public capabilities — the text names the wiring,
-/// not the classification.
+/// extractor: most classified routes run their admission cores
+/// directly under their own lock and never take [`GroupAccess`], and a
+/// classified row without a `:id` parameter (open-envelope) is not
+/// extractor-shaped. Wiring bugs, not public capabilities — the text
+/// names the wiring, not the classification.
 fn extractor_not_wired(method: &Method, path: &str) -> Response {
     (
         StatusCode::FORBIDDEN,
@@ -1028,6 +1174,26 @@ async fn admit_state_commits_route(state: &AppState, id: &str) -> Result<GroupAc
     })
 }
 
+/// `GET /groups/:id/requests` — the one S3 route that takes the
+/// extractor: no body argument to keep first, no directory-durability
+/// gate before the lookup, and no actor argument ever (the seat gate
+/// evaluates the local daemon, not the bearer — the route never read
+/// the actor and still does not). The handler re-runs
+/// [`admit_join_request_listing`] under its own lock before serving
+/// (the `/members` pattern, r2/P2-1).
+async fn admit_join_requests_route(state: &AppState, id: &str) -> Result<GroupAccess, Response> {
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let groups = state.named_groups.read().await;
+    let info =
+        admit_join_request_listing(&groups, id, &local_hex).map_err(IntoResponse::into_response)?;
+    Ok(GroupAccess {
+        level: AccessLevel::Admin,
+        stable_id: info.stable_group_id().to_string(),
+        // Actor-less seat gate: the local daemon is the subject.
+        acting_hex: local_hex,
+    })
+}
+
 #[async_trait::async_trait]
 impl FromRequestParts<Arc<AppState>> for GroupAccess {
     type Rejection = Response;
@@ -1076,15 +1242,20 @@ impl FromRequestParts<Arc<AppState>> for GroupAccess {
             ("GET", "/groups/:id/state/commits") => {
                 admit_state_commits_route(state.as_ref(), &id).await
             }
-            // Seven classified routes deliberately have no arm: the S1
-            // `GET /groups/:id` + `/delegations` and the five S2
-            // secure-write handlers keep pinned signatures (tests call
-            // them positionally) and run the cores directly under their
-            // own lock. If a future handler wires this extractor to one
-            // of them, this fails closed instead of guessing — and note
-            // `send` could not take this extractor anyway without
-            // reordering its body validations (kind/size/thread) after
-            // the entry gates.
+            ("GET", "/groups/:id/requests") => admit_join_requests_route(state.as_ref(), &id).await,
+            // Classified routes deliberately left without an arm: the
+            // S1 `GET /groups/:id` + `/delegations`, the five S2
+            // secure-write handlers and the S3 mutation family all run
+            // their cores directly under their own lock — their
+            // signatures are pinned by positional test callers, or an
+            // extractor argument would reorder rejection precedence
+            // (body-parse 400s, the request routes' durability 503 and
+            // side-effect orderings all precede the gates today). If a
+            // future handler wires this extractor to one of them, this
+            // fails closed instead of guessing — and note `send` could
+            // not take this extractor anyway without reordering its
+            // body validations (kind/size/thread) after the entry
+            // gates.
             _ => Err(extractor_not_wired(&parts.method, parts.uri.path())),
         }
     }
@@ -1349,15 +1520,15 @@ mod tests {
         );
     }
 
-    /// The slice contract: exactly the S1 read family and the S2
-    /// secure-write family are classified, at honest levels (the S2
-    /// rows label the bearer class — SessionBearer/RiderScope —
-    /// because the cores verify no seat; see the table comment); every
-    /// other group-plane route is an explicit `Unmigrated` row so
-    /// parity holds without claiming a migration that has not
-    /// happened.
+    /// The slice contract: exactly the S1 read, S2 secure-write and S3
+    /// admin/mutation families are classified, at honest levels (the
+    /// S2 rows label the bearer class — SessionBearer/RiderScope —
+    /// because the cores verify no seat; the S3 rows label the seat /
+    /// no-actor reality — see the table comments); every other
+    /// group-plane route is an explicit `Unmigrated` row so parity
+    /// holds without claiming a migration that has not happened.
     #[test]
-    fn s1_and_s2_families_classified_and_the_rest_wait_for_their_slice() {
+    fn s1_s2_and_s3_families_classified_and_the_rest_wait_for_their_slice() {
         let expected: &[(Method, &str, AccessLevel)] = &[
             (
                 Method::GET,
@@ -1402,6 +1573,63 @@ mod tests {
                 "/groups/secure/open-envelope",
                 AccessLevel::PublicWrite,
             ),
+            (Method::POST, "/groups/:id/invite", AccessLevel::Admin),
+            (Method::POST, "/groups/:id/members", AccessLevel::Admin),
+            (
+                Method::DELETE,
+                "/groups/:id/members/:agent_id",
+                AccessLevel::Admin,
+            ),
+            (
+                Method::PATCH,
+                "/groups/:id/members/:agent_id/role",
+                AccessLevel::Admin,
+            ),
+            (
+                Method::POST,
+                "/groups/:id/ban/:agent_id",
+                AccessLevel::Admin,
+            ),
+            (
+                Method::DELETE,
+                "/groups/:id/ban/:agent_id",
+                AccessLevel::Admin,
+            ),
+            (Method::PATCH, "/groups/:id", AccessLevel::Admin),
+            (Method::PATCH, "/groups/:id/policy", AccessLevel::Admin),
+            (
+                Method::PUT,
+                "/groups/:id/display-name",
+                AccessLevel::PublicWrite,
+            ),
+            (Method::POST, "/groups/:id/state/seal", AccessLevel::Admin),
+            (
+                Method::POST,
+                "/groups/:id/state/withdraw",
+                AccessLevel::Admin,
+            ),
+            (Method::DELETE, "/groups/:id", AccessLevel::JoinSelf),
+            (Method::GET, "/groups/:id/requests", AccessLevel::Admin),
+            (
+                Method::POST,
+                "/groups/:id/requests",
+                AccessLevel::PublicWrite,
+            ),
+            (
+                Method::POST,
+                "/groups/:id/requests/:request_id/approve",
+                AccessLevel::Admin,
+            ),
+            (
+                Method::POST,
+                "/groups/:id/requests/:request_id/reject",
+                AccessLevel::Admin,
+            ),
+            (
+                Method::DELETE,
+                "/groups/:id/requests/:request_id",
+                AccessLevel::PublicWrite,
+            ),
         ];
         let classified = GROUP_PLANE_ROUTES
             .iter()
@@ -1410,7 +1638,7 @@ mod tests {
         assert_eq!(
             classified,
             expected.len(),
-            "exactly the S1 read and S2 secure-write families may be classified"
+            "exactly the S1 read, S2 secure-write and S3 admin/mutation families may be classified"
         );
         for (method, path, level) in expected {
             let row = GROUP_PLANE_ROUTES
@@ -2070,5 +2298,220 @@ mod tests {
             AccessLevel::PublicWrite,
             "a live keyed alias keeps the envelope openable"
         );
+    }
+
+    // ────────────────── S3 admin/mutation admission ──────────────────
+
+    fn group_with_admin_seat(id: &str) -> x0x::groups::GroupInfo {
+        let mut info = fixture_group(id);
+        info.add_member(local_agent_hex(), x0x::groups::GroupRole::Admin, None, None);
+        info
+    }
+
+    /// The admin-family entry admission (invite, member
+    /// add/remove/role, ban/unban, PATCH, policy, seal, request
+    /// approve/reject): raw-id lookup 404 → the local seat gate → the
+    /// withdrawn 409, in that order. The seat gate is the DAEMON's —
+    /// `membership_handlers_reject_non_admin_local_caller` pins a
+    /// durable-owner bearer faring no better than a session here, so
+    /// no actor appears in this core at all.
+    #[test]
+    fn admin_mutation_admission_reproduces_the_inline_decisions() {
+        let local_hex = local_agent_hex();
+        let mut groups = HashMap::new();
+
+        // Unknown group: the raw-id lookup 404s before any gate.
+        assert_secure_refusal(
+            admit_admin_group_route(&groups, "missing", &local_hex),
+            StatusCode::NOT_FOUND,
+            "group not found",
+            None,
+        );
+
+        // Plain-member seat (or none): today's "admin role required".
+        groups.insert("adm".to_string(), group_with_local_seat("adm"));
+        assert_secure_refusal(
+            admit_admin_group_route(&groups, "adm", &local_hex),
+            StatusCode::FORBIDDEN,
+            "admin role required",
+            None,
+        );
+        groups.insert("bare".to_string(), fixture_group("bare"));
+        assert_secure_refusal(
+            admit_admin_group_route(&groups, "bare", &local_hex),
+            StatusCode::FORBIDDEN,
+            "admin role required",
+            None,
+        );
+
+        // Withdrawn: the 409 — but only after the seat gate (a
+        // withdrawn group with a plain-member caller answers the 403).
+        let mut withdrawn_member = group_with_local_seat("wm");
+        withdrawn_member.withdrawn = true;
+        groups.insert("wm".to_string(), withdrawn_member);
+        assert_secure_refusal(
+            admit_admin_group_route(&groups, "wm", &local_hex),
+            StatusCode::FORBIDDEN,
+            "admin role required",
+            None,
+        );
+        let mut withdrawn_admin = group_with_admin_seat("adm");
+        withdrawn_admin.withdrawn = true;
+        groups.insert("adm".to_string(), withdrawn_admin);
+        assert_secure_refusal(
+            admit_admin_group_route(&groups, "adm", &local_hex),
+            StatusCode::CONFLICT,
+            "group is withdrawn",
+            None,
+        );
+
+        // Admin seat, live group: admitted, yielding the group itself.
+        groups.insert("adm".to_string(), group_with_admin_seat("adm"));
+        let info = admit_admin_group_route(&groups, "adm", &local_hex).expect("admin admitted");
+        assert_eq!(info.mls_group_id, "adm");
+    }
+
+    /// The gate pair the role and approve sites hold an `info` for:
+    /// seat 403 before withdrawn 409, exactly the inline order.
+    #[test]
+    fn admin_route_gate_reproduces_the_role_and_approve_pair() {
+        let local_hex = local_agent_hex();
+
+        assert_secure_refusal(
+            admin_route_gate(&group_with_local_seat("g"), &local_hex),
+            StatusCode::FORBIDDEN,
+            "admin role required",
+            None,
+        );
+        let mut withdrawn = group_with_local_seat("g");
+        withdrawn.withdrawn = true;
+        assert_secure_refusal(
+            admin_route_gate(&withdrawn, &local_hex),
+            StatusCode::FORBIDDEN,
+            "admin role required",
+            // The seat gate outranks the withdrawn 409 — the case that
+            // distinguishes this pair's order.
+            None,
+        );
+        let mut withdrawn_admin = group_with_admin_seat("g");
+        withdrawn_admin.withdrawn = true;
+        assert_secure_refusal(
+            admin_route_gate(&withdrawn_admin, &local_hex),
+            StatusCode::CONFLICT,
+            "group is withdrawn",
+            None,
+        );
+        assert!(admin_route_gate(&group_with_admin_seat("g"), &local_hex).is_ok());
+    }
+
+    /// `GET /groups/:id/requests`: lookup 404 → the seat gate — and
+    /// NO withdrawn arm. A withdrawn shell's request list stays
+    /// readable for its admins today; pin that so a future tightening
+    /// is a deliberate change, not a silent one.
+    #[test]
+    fn join_request_listing_admission_reproduces_the_inline_decisions() {
+        let local_hex = local_agent_hex();
+        let mut groups = HashMap::new();
+
+        assert_secure_refusal(
+            admit_join_request_listing(&groups, "missing", &local_hex),
+            StatusCode::NOT_FOUND,
+            "group not found",
+            None,
+        );
+        groups.insert("req".to_string(), group_with_local_seat("req"));
+        assert_secure_refusal(
+            admit_join_request_listing(&groups, "req", &local_hex),
+            StatusCode::FORBIDDEN,
+            "admin role required",
+            None,
+        );
+        groups.insert("req".to_string(), group_with_admin_seat("req"));
+        assert!(
+            admit_join_request_listing(&groups, "req", &local_hex).is_ok(),
+            "admin seat lists the requests"
+        );
+        let mut withdrawn = group_with_admin_seat("req");
+        withdrawn.withdrawn = true;
+        groups.insert("req".to_string(), withdrawn);
+        assert!(
+            admit_join_request_listing(&groups, "req", &local_hex).is_ok(),
+            "NO withdrawn check on the listing — today's shape"
+        );
+    }
+
+    /// `DELETE /groups/:id` (leave): lookup 404 → withdrawn 409 → the
+    /// ACTIVE-seat gate. Any active role qualifies; a banned seat does
+    /// not (`caller_role` filters on `is_active`).
+    #[test]
+    fn self_leave_admission_reproduces_the_inline_decisions() {
+        let local_hex = local_agent_hex();
+        let mut groups = HashMap::new();
+
+        assert_secure_refusal(
+            admit_self_leave(&groups, "missing", &local_hex),
+            StatusCode::NOT_FOUND,
+            "group not found",
+            None,
+        );
+
+        let mut withdrawn = group_with_local_seat("lv");
+        withdrawn.withdrawn = true;
+        groups.insert("lv".to_string(), withdrawn);
+        assert_secure_refusal(
+            admit_self_leave(&groups, "lv", &local_hex),
+            StatusCode::CONFLICT,
+            "group is withdrawn",
+            None,
+        );
+
+        groups.insert("lv".to_string(), fixture_group("lv"));
+        assert_secure_refusal(
+            admit_self_leave(&groups, "lv", &local_hex),
+            StatusCode::FORBIDDEN,
+            "leaving a group requires active membership in it",
+            None,
+        );
+
+        let mut banned_seat = group_with_local_seat("lv");
+        banned_seat.ban_member(&local_agent_hex(), None);
+        groups.insert("lv".to_string(), banned_seat);
+        assert_secure_refusal(
+            admit_self_leave(&groups, "lv", &local_hex),
+            StatusCode::FORBIDDEN,
+            "leaving a group requires active membership in it",
+            None,
+        );
+
+        // Any ACTIVE role qualifies — member AND admin alike.
+        groups.insert("lv".to_string(), group_with_local_seat("lv"));
+        assert!(admit_self_leave(&groups, "lv", &local_hex).is_ok());
+        groups.insert("lv".to_string(), group_with_admin_seat("lv"));
+        assert!(admit_self_leave(&groups, "lv", &local_hex).is_ok());
+    }
+
+    /// #1228's no-actor family (display-name, request create/cancel):
+    /// lookup 404 → withdrawn 409, nothing else — no seat, no role,
+    /// no actor.
+    #[test]
+    fn live_group_admission_reproduces_the_inline_decisions() {
+        let mut groups = HashMap::new();
+        assert_secure_refusal(
+            admit_live_group_route(&groups, "missing"),
+            StatusCode::NOT_FOUND,
+            "group not found",
+            None,
+        );
+        let mut withdrawn = fixture_group("live");
+        withdrawn.withdrawn = true;
+        groups.insert("live".to_string(), withdrawn);
+        assert_secure_refusal(
+            admit_live_group_route(&groups, "live"),
+            StatusCode::CONFLICT,
+            "group is withdrawn",
+            None,
+        );
+        groups.insert("live".to_string(), fixture_group("live"));
+        assert!(admit_live_group_route(&groups, "live").is_ok());
     }
 }
