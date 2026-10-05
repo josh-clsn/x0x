@@ -49,12 +49,6 @@ enum OwnerAnnounce {
     Consented,
 }
 
-fn agent_id(hex_id: &str) -> Result<AgentId> {
-    let bytes = <[u8; 32]>::try_from(hex::decode(hex_id)?)
-        .map_err(|_| anyhow!("agent id is not 32 bytes"))?;
-    Ok(AgentId(bytes))
-}
-
 /// A holds O's certificate bytes on O's seat, and they match the seat's
 /// committed digest.
 async fn admin_holds_owner_certificate(sim: &Sim, home: &HomeIds) -> Result<(bool, String)> {
@@ -84,30 +78,66 @@ async fn admin_holds_owner_certificate(sim: &Sim, home: &HomeIds) -> Result<(boo
     .await
 }
 
-/// A's view of O, read the way A's seal reads it (read-only):
-/// - `announced`: the certificate digest O's latest announce committed to
-///   (A's discovery entry). Announce v3 carries only this digest; the
-///   certificate bytes travel in the announce blob, so the discovery entry
-///   itself may stay certificate-less (#447);
-/// - `resolved`: the certificate A's seal-time evidence resolves for O
-///   (`owner_cert_evidence_for_with_digests` with O's seat digest: the
-///   discovery entry, the announce-blob cache by the announced digest, or
-///   the roster digest), when it is coupled to `announced`;
-/// - `status`: O's status in an owner-cert verdict over a CLONE of A's Home
-///   record (the verdict mutates grace state, so never A's own record).
+/// A's view of O, computed exactly as A's seal computes it, read-only:
+/// the same evidence builder with the same inputs as
+/// `owner_cert_seal_evidence` (every active member and the local agent,
+/// each with its seat digest, through `owner_cert_evidence_for_with_digests`),
+/// and the same verdict (`GroupInfo::owner_cert_verdict`, run on a CLONE of
+/// A's Home record because it updates grace state). O's verdict is `Clean`
+/// when the resolved certificate passes the owner check, or when the seat's
+/// embedded certificate passes it and is not stale; stale means O's latest
+/// announced digest differs from the embedded certificate's digest.
+///
+/// All digests here are announce digests: `blake3(bincode((user_id,
+/// certificate)))` (`announce_v3::cert_digest`), never the roster seat
+/// digest (`blake3(certificate bytes)`).
 struct OwnerView {
+    /// O's latest announced digest as A's seal evidence holds it.
     announced: Option<[u8; 32]>,
-    resolved: bool,
+    /// The digest O's consented announce commits to: O's own user id and
+    /// agent certificate, as `build_identity_announcement` takes them.
+    published: [u8; 32],
+    /// The certificate the seal evidence resolves for O: (digest, passes).
+    resolved: Option<([u8; 32], bool)>,
+    /// A's seat certificate for O: (digest, passes).
+    embedded: Option<([u8; 32], bool)>,
+    /// O's status in the verdict.
     status: String,
 }
 
 impl OwnerView {
+    fn stale(&self) -> bool {
+        matches!((self.embedded, self.announced), (Some((digest, _)), Some(announced)) if digest != announced)
+    }
+
+    /// Which certificate made the verdict `Clean`, per the verdict's own
+    /// rule, with its digest.
+    fn clean_by(&self) -> Option<(&'static str, [u8; 32])> {
+        match (self.resolved, self.embedded) {
+            (Some((digest, true)), _) => Some(("resolved", digest)),
+            (_, Some((digest, true))) if !self.stale() => Some(("seat", digest)),
+            _ => None,
+        }
+    }
+
     fn detail(&self) -> String {
+        let hex8 = |digest: [u8; 32]| hex::encode(&digest[..8]);
+        let cert = |cert: Option<([u8; 32], bool)>| {
+            cert.map_or("none".to_string(), |(digest, ok)| {
+                format!("{} owner_check={ok}", hex8(digest))
+            })
+        };
         format!(
-            "announced digest {}, certificate resolved {}, verdict {}",
-            self.announced.map_or("none".to_string(), hex::encode),
-            self.resolved,
-            self.status
+            "announced {}; O publishes {}; anonymous {}; resolved {}; seat {} stale={}; \
+             verdict {} via {}",
+            self.announced.map_or("none".to_string(), hex8),
+            hex8(self.published),
+            hex8(crate::announce_v3::anonymous_cert_digest()),
+            cert(self.resolved),
+            cert(self.embedded),
+            self.stale(),
+            self.status,
+            self.clean_by().map_or("none", |(by, _)| by),
         )
     }
 }
@@ -115,63 +145,93 @@ impl OwnerView {
 async fn admin_view_of_owner(sim: &Sim, home: &HomeIds) -> Result<OwnerView> {
     let admin = sim.state("A")?;
     let owner_hex = sim.agent_hex("O")?;
-    let owner = agent_id(&owner_hex)?;
-    let announced = admin
-        .agent
-        .discovered_agent(owner)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|entry| entry.cert_digest);
+    let published = {
+        let o = sim.state("O")?;
+        crate::announce_v3::cert_digest(&o.agent.user_id(), &o.agent.agent_certificate().cloned())
+    };
     let info = {
         let groups = admin.named_groups.read().await;
         let (_, info) = crate::server::resolve_group_entry_locked(&groups, &home.gid)
             .context("A has no entry for the Home")?;
         info.clone()
     };
-    let seat_digest = info
-        .members_v2
-        .get(&owner_hex)
-        .and_then(|seat| seat.certificate_digest.clone());
+    let owner = *info
+        .policy
+        .admission
+        .owner_certified_user_id()
+        .context("the Home is not owner-certified")?;
+    // `owner_cert_seal_evidence`: every active member and the local agent,
+    // each with its seat digest.
+    let local_hex = hex::encode(admin.agent.agent_id().as_bytes());
+    let mut agents: Vec<String> = info.active_members().map(|m| m.agent_id.clone()).collect();
+    if !agents.iter().any(|a| a.eq_ignore_ascii_case(&local_hex)) {
+        agents.push(local_hex);
+    }
+    let with_digests: Vec<(String, Option<String>)> = agents
+        .into_iter()
+        .map(|agent| {
+            let digest = info
+                .members_v2
+                .get(&agent)
+                .and_then(|seat| seat.certificate_digest.clone());
+            (agent, digest)
+        })
+        .collect();
     let evidence = crate::server::routes::named_groups::owner_cert_evidence_for_with_digests(
         &admin,
-        &[(owner_hex.clone(), seat_digest)],
+        &with_digests,
     )
     .await;
-    let resolved = evidence.cert_for(&owner_hex).is_some_and(|cert| {
-        announced
-            == Some(crate::announce_v3::cert_digest(
-                &cert.user_id().ok(),
-                &Some(cert.clone()),
-            ))
-    });
+    let now = evidence.now_unix();
+    let assess = |cert: &crate::identity::AgentCertificate| {
+        (
+            crate::announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone())),
+            crate::groups::owner_cert::verify_cert_against_owner(
+                &owner, &owner_hex, cert, false, now,
+            )
+            .is_ok(),
+        )
+    };
+    let resolved = evidence.cert_for(&owner_hex).map(assess);
+    let embedded = info
+        .members_v2
+        .get(&owner_hex)
+        .and_then(|seat| seat.certificate.as_ref())
+        .map(assess);
     let mut clone = info;
-    let verdict = clone.owner_cert_verdict(&evidence);
-    let status = verdict
+    let status = clone
+        .owner_cert_verdict(&evidence)
         .per_member
         .get(&owner_hex)
         .map_or("absent".to_string(), |status| format!("{status:?}"));
     Ok(OwnerView {
-        announced,
+        announced: evidence.digest_for(&owner_hex),
+        published,
         resolved,
+        embedded,
         status,
     })
 }
 
 /// Whether A's view of O is the one the announce `kind` should produce:
-/// - anonymous: O's latest announce committed to the anonymous digest, and
-///   A's verdict does not seat O as clean (the #1143 precondition);
-/// - consented: O's latest announce committed to the digest of O's actual
-///   certificate, A's seal-time evidence resolves that certificate, and A's
-///   verdict seats O as clean.
-fn view_matches(view: &OwnerView, kind: OwnerAnnounce, consented_digest: [u8; 32]) -> bool {
+/// - anonymous: O's latest announced digest at A is the anonymous one and
+///   the verdict does not seat O as clean (the #1143 precondition);
+/// - consented: O's latest announced digest at A is the digest O's
+///   consented announce publishes (not the anonymous one), the verdict
+///   seats O as clean, and the certificate that made it clean commits to
+///   that same digest.
+fn view_matches(view: &OwnerView, kind: OwnerAnnounce) -> bool {
+    let anonymous = crate::announce_v3::anonymous_cert_digest();
     let clean = view.status == "Clean";
     match kind {
-        OwnerAnnounce::Anonymous => {
-            view.announced == Some(crate::announce_v3::cert_digest(&None, &None)) && !clean
-        }
+        OwnerAnnounce::Anonymous => view.announced == Some(anonymous) && !clean,
         OwnerAnnounce::Consented => {
-            view.announced == Some(consented_digest) && view.resolved && clean
+            view.published != anonymous
+                && view.announced == Some(view.published)
+                && clean
+                && view
+                    .clean_by()
+                    .is_some_and(|(_, digest)| Some(digest) == view.announced)
         }
     }
 }
@@ -230,18 +290,6 @@ async fn scenario(sim: &mut Sim, kind: OwnerAnnounce, receipt: &mut Receipt) -> 
         .api("O", Method::POST, "/announce", Some(announce))
         .await?;
     ensure!(status.is_success(), "O announce: {status} {body}");
-    // The digest a consented announce commits to: O's own certificate,
-    // under O's user id.
-    let consented_digest = {
-        let o = sim.state("O")?;
-        let cert = o
-            .agent
-            .identity()
-            .agent_certificate()
-            .cloned()
-            .context("O has no agent certificate")?;
-        crate::announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert))
-    };
     let mut view = None;
     let mut failure = None;
     let waited = sim
@@ -250,7 +298,7 @@ async fn scenario(sim: &mut Sim, kind: OwnerAnnounce, receipt: &mut Receipt) -> 
             secs(60),
             async |s: &Sim| match admin_view_of_owner(s, &home).await {
                 Ok(seen) => {
-                    let matched = view_matches(&seen, kind, consented_digest);
+                    let matched = view_matches(&seen, kind);
                     view = Some(seen);
                     matched
                 }
@@ -269,9 +317,7 @@ async fn scenario(sim: &mut Sim, kind: OwnerAnnounce, receipt: &mut Receipt) -> 
         Err(error) if expired(error) => {}
         Err(_) => return waited.context("waiting for A's view of O"),
     }
-    let matched = view
-        .as_ref()
-        .is_some_and(|seen| view_matches(seen, kind, consented_digest));
+    let matched = view.as_ref().is_some_and(|seen| view_matches(seen, kind));
     receipt.evidence(
         match kind {
             OwnerAnnounce::Anonymous => "a_holds_anonymous_owner_evidence",
