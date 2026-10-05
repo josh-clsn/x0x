@@ -133,6 +133,10 @@ pub(crate) struct AuthenticatedMachineBinding {
     pub(crate) machine_id: MachineId,
     pub(crate) announced_at: u64,
     pub(crate) cert_not_after: Option<u64>,
+    /// x0x #1150 (r7e): the certificate digest the recorded announcement
+    /// committed to, in the announced-binding store; `cert_not_after` is that
+    /// certificate's expiry. Always `None` in the authenticated-binding store.
+    pub(crate) cert_digest: Option<[u8; 32]>,
     last_used: (std::time::Instant, u64),
 }
 
@@ -203,6 +207,77 @@ impl AuthenticatedMachineBindingCache {
         announced_at: u64,
         cert_not_after: Option<u64>,
     ) {
+        let cert_digest = self.entries.get(&agent_id).and_then(|b| b.cert_digest);
+        self.upsert_binding(
+            agent_id,
+            machine_id,
+            announced_at,
+            cert_digest,
+            cert_not_after,
+        );
+    }
+
+    /// x0x #1150 (r7e): the announced-binding store's write for one verified
+    /// identity announcement (`cert_digest` is the digest it committed to,
+    /// `cert_not_after` the expiry of an inline or already-landed
+    /// certificate). The expiry stays coupled to its digest here, whether
+    /// or not the discovery entry survives:
+    /// - a certificate's known expiry is recorded with its digest;
+    /// - an unchanged digest without a certificate keeps the known expiry;
+    /// - a different (verified, signed) digest clears it until its
+    ///   certificate lands ([`Self::record_certificate_landed`]);
+    /// - a digest-less legacy announcement keeps what is known.
+    ///
+    /// An older announcement never rolls the binding back.
+    pub(crate) fn record_announcement(
+        &mut self,
+        agent_id: AgentId,
+        machine_id: MachineId,
+        announced_at: u64,
+        cert_digest: Option<[u8; 32]>,
+        cert_not_after: Option<u64>,
+    ) {
+        let existing = self.entries.get(&agent_id).copied();
+        let known_digest = existing.and_then(|b| b.cert_digest);
+        let (digest, not_after) = match (cert_digest, cert_not_after) {
+            (digest, Some(not_after)) => (digest.or(known_digest), Some(not_after)),
+            (Some(digest), None) if known_digest == Some(digest) => {
+                (Some(digest), existing.and_then(|b| b.cert_not_after))
+            }
+            (Some(digest), None) => (Some(digest), None),
+            (None, None) => (known_digest, existing.and_then(|b| b.cert_not_after)),
+        };
+        self.upsert_binding(agent_id, machine_id, announced_at, digest, not_after);
+    }
+
+    /// x0x #1150 (r7e): a verified certificate blob for `digest` landed for
+    /// `agent_id`. The binding whose announcement committed to that digest
+    /// learns the certificate's expiry. The update is keyed on the digest
+    /// only, not on the discovery entry (which may be gone). A binding for
+    /// another digest is untouched. Returns whether it updated.
+    pub(crate) fn record_certificate_landed(
+        &mut self,
+        agent_id: &AgentId,
+        digest: [u8; 32],
+        cert_not_after: Option<u64>,
+    ) -> bool {
+        match self.entries.get_mut(agent_id) {
+            Some(binding) if binding.cert_digest == Some(digest) => {
+                binding.cert_not_after = cert_not_after;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn upsert_binding(
+        &mut self,
+        agent_id: AgentId,
+        machine_id: MachineId,
+        announced_at: u64,
+        cert_digest: Option<[u8; 32]>,
+        cert_not_after: Option<u64>,
+    ) {
         let tick = self.next_tick();
         if let Some(mut existing) = self.entries.get(&agent_id).copied() {
             self.recency
@@ -214,6 +289,7 @@ impl AuthenticatedMachineBindingCache {
                 existing.machine_id = machine_id;
                 existing.announced_at = announced_at;
                 existing.cert_not_after = cert_not_after;
+                existing.cert_digest = cert_digest;
             }
             self.entries.insert(agent_id, existing);
             self.recency.insert((tick.0, tick.1, agent_id.0));
@@ -245,10 +321,17 @@ impl AuthenticatedMachineBindingCache {
                 machine_id,
                 announced_at,
                 cert_not_after,
+                cert_digest,
                 last_used: tick,
             },
         );
         self.recency.insert((tick.0, tick.1, agent_id.0));
+    }
+
+    /// The retained binding for `agent_id`, without touching its recency
+    /// (x0x #1150 r7b: the pinned send's point-of-use reads).
+    pub(crate) fn peek(&self, agent_id: &AgentId) -> Option<AuthenticatedMachineBinding> {
+        self.entries.get(agent_id).copied()
     }
 
     fn resolve(&mut self, agent_id: &AgentId) -> Option<MachineId> {

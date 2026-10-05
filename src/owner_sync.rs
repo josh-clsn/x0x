@@ -1126,6 +1126,29 @@ impl OwnerSyncStore {
             .is_some_and(|e| e.verify_owner(owner).is_ok() && e.is_current_at(now_unix_ms()))
     }
 
+    /// [`Self::evidence_enrolled`] without ever blocking (x0x #1150 r7c,
+    /// synchronous seams): `None` while either lock is held.
+    pub(crate) fn try_evidence_enrolled(
+        &self,
+        machine: &MachineId,
+        owner: &UserId,
+        now: u64,
+    ) -> Option<bool> {
+        let Ok(devices) = self.devices.try_read() else {
+            return None;
+        };
+        let Ok(verified) = self.evidence_owners.try_read() else {
+            return None;
+        };
+        Some(
+            verified.get(&machine.0).is_some_and(|(u, record)| {
+                u == owner && devices.get(&machine.0).is_some_and(|e| e == record)
+            }) && devices
+                .get(&machine.0)
+                .is_some_and(|e| e.is_current_at(now)),
+        )
+    }
+
     /// Current enrollment for evidence policy, with zero signature checks.
     /// A writer in flight fails closed. The verification index is changed
     /// under the devices write lock, so deletion/rollback is immediately seen.

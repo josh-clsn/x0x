@@ -348,6 +348,27 @@ pub trait EvidencePolicy: Send + Sync {
     /// Checks agent, machine and binding revocations. The certificate user is
     /// available to policies with a user revocation subject; RuntimePolicy has none.
     fn revoked(&self, agent: AgentId, machine: MachineId, user: Option<UserId>) -> bool;
+    /// [`Self::relation`] for synchronous admission seams (x0x #1150 r7c):
+    /// `None` while a policy read would block. Never waits on a lock.
+    fn try_relation(
+        &self,
+        agent: AgentId,
+        machine: MachineId,
+        cert: Option<&AgentCertificate>,
+        now_ms: u64,
+    ) -> Option<u8> {
+        Some(self.relation(agent, machine, cert, now_ms))
+    }
+    /// [`Self::revoked`] for synchronous admission seams (x0x #1150 r7c):
+    /// `None` while the revocation read would block. Never waits on a lock.
+    fn try_revoked(
+        &self,
+        agent: AgentId,
+        machine: MachineId,
+        user: Option<UserId>,
+    ) -> Option<bool> {
+        Some(self.revoked(agent, machine, user))
+    }
     /// Used to protect watermarks even when their record is absent.
     fn contains_agent(&self, agent: AgentId, now_ms: u64) -> bool;
 }
@@ -640,8 +661,32 @@ impl PeerEvidenceStore {
         machine: MachineId,
         now: u64,
     ) -> std::result::Result<Arc<EvidenceView>, &'static str> {
+        self.check_usable_with(agent, machine, now, true)
+    }
+    /// The state lock, taken blocking, or without blocking (`STORE_BUSY`
+    /// on contention) for synchronous seams.
+    fn state_for_check(
+        &self,
+        blocking: bool,
+    ) -> std::result::Result<std::sync::MutexGuard<'_, State>, &'static str> {
+        if blocking {
+            return self.state.lock().map_err(|_| "store_lock");
+        }
+        match self.state.try_lock() {
+            Ok(state) => Ok(state),
+            Err(std::sync::TryLockError::WouldBlock) => Err(STORE_BUSY),
+            Err(std::sync::TryLockError::Poisoned(_)) => Err("store_lock"),
+        }
+    }
+    fn check_usable_with(
+        &self,
+        agent: AgentId,
+        machine: MachineId,
+        now: u64,
+        blocking: bool,
+    ) -> std::result::Result<Arc<EvidenceView>, &'static str> {
         let view = {
-            let state = self.state.lock().map_err(|_| "store_lock")?;
+            let state = self.state_for_check(blocking)?;
             if state.suspended.contains(&agent) {
                 return Err("suspended_or_superseded");
             }
@@ -656,11 +701,19 @@ impl PeerEvidenceStore {
         if !current(&view, now, self.max_age) {
             return Err("age_or_certificate_expiry");
         }
-        if !allowed(&*self.policy, &view, now) {
-            return Err("relationship_or_revocation");
+        if blocking {
+            if !allowed(&*self.policy, &view, now) {
+                return Err("relationship_or_revocation");
+            }
+        } else {
+            match try_allowed(&*self.policy, &view, now) {
+                Some(true) => {}
+                Some(false) => return Err("relationship_or_revocation"),
+                None => return Err(STORE_BUSY),
+            }
         }
         {
-            let mut state = self.state.lock().map_err(|_| "store_lock")?;
+            let mut state = self.state_for_check(blocking)?;
             // A move/removal may have raced the policy calls. Never return the
             // old authority if it was suspended or replaced in the meantime.
             if state.suspended.contains(&agent)
@@ -696,6 +749,29 @@ impl PeerEvidenceStore {
             .announcement
             .machine_id;
         self.usable(agent, machine, now)
+    }
+    /// [`Self::usable_agent`] without blocking on the store lock, for
+    /// synchronous admission seams and bounded waits (x0x #1150 r7b): the
+    /// same point-of-use authority check, or `Err(())` while the lock is
+    /// contended. Diagnostic counters are not updated.
+    pub(crate) fn try_usable_agent(
+        &self,
+        agent: AgentId,
+        now: u64,
+    ) -> std::result::Result<Option<Arc<EvidenceView>>, ()> {
+        let machine = match self.state.try_lock() {
+            Ok(state) => match state.verified.get(&agent) {
+                Some(view) => view.announcement.machine_id,
+                None => return Ok(None),
+            },
+            Err(std::sync::TryLockError::WouldBlock) => return Err(()),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Ok(None),
+        };
+        match self.check_usable_with(agent, machine, now, false) {
+            Ok(view) => Ok(Some(view)),
+            Err(STORE_BUSY) => Err(()),
+            Err(_) => Ok(None),
+        }
     }
     /// Indexed candidates only; never substitutes for `usable` checks.
     pub(crate) fn agents_on_machine(&self, machine: MachineId, limit: usize) -> Vec<AgentId> {
@@ -1263,6 +1339,17 @@ fn allowed(policy: &dyn EvidencePolicy, view: &EvidenceView, now: u64) -> bool {
             view.certificate.as_ref().and_then(|c| c.user_id().ok()),
         )
 }
+/// [`allowed`] without ever blocking (x0x #1150 r7c): `None` while a policy
+/// read would block.
+fn try_allowed(policy: &dyn EvidencePolicy, view: &EvidenceView, now: u64) -> Option<bool> {
+    let a = view.announcement.agent_id;
+    let m = view.announcement.machine_id;
+    if policy.try_relation(a, m, view.certificate.as_ref(), now)? == 0 {
+        return Some(false);
+    }
+    let user = view.certificate.as_ref().and_then(|c| c.user_id().ok());
+    Some(!policy.try_revoked(a, m, user)?)
+}
 fn disqualified(
     watermarks: &HashMap<AgentId, MoveWatermarkV1>,
     a: AgentId,
@@ -1437,6 +1524,9 @@ impl VerifiedWireCapture {
     }
 }
 
+/// The reason a non-blocking point-of-use check could not take the store lock.
+const STORE_BUSY: &str = "store_busy";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1559,6 +1649,52 @@ mod tests {
             PeerEvidenceStore::open(dir.path(), EvidenceConfig::default(), p.clone(), NOW).unwrap();
         (dir, p, store)
     }
+    /// WHY (x0x #1150 r7c, Codex NEW 3): the non-blocking point-of-use
+    /// check is the pinned seam's and the bounded resolution's. Its policy
+    /// evaluation (RuntimePolicy, through owner trust into the share-grant
+    /// store) must never wait on a held policy lock: while a writer holds
+    /// the grant store it reports busy, and it never blocks.
+    #[test]
+    fn r7c_try_usable_agent_reports_busy_while_the_grant_store_is_held() {
+        let p = Peer::new();
+        let dir = tempfile::tempdir().unwrap();
+        let local = AgentKeypair::generate().unwrap().agent_id();
+        let grants = Arc::new(crate::share_grant::ShareGrantStore::in_memory(local, None));
+        let owner = crate::owner_trust::OwnerTrust::new(None, Default::default());
+        owner.install_share_grant_store(Arc::clone(&grants));
+        let revoked = Arc::new(tokio::sync::RwLock::new(
+            crate::revocation::RevocationSet::new(),
+        ));
+        let policy = Arc::new(RuntimePolicy::new(local, owner, revoked));
+        policy.set_groups(Arc::new(|_| Some(true)));
+        let store = Arc::new(
+            PeerEvidenceStore::open(dir.path(), EvidenceConfig::default(), policy, NOW).unwrap(),
+        );
+        store
+            .ingest(p.record(NOW, NOW), IngestSource::Hello, NOW)
+            .unwrap();
+        assert!(
+            store
+                .try_usable_agent(p.a(), NOW)
+                .is_ok_and(|view| view.is_some()),
+            "control: usable while no policy lock is held"
+        );
+        let held = grants.hold_state_for_testing();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let checker = Arc::clone(&store);
+        let agent = p.a();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(checker.try_usable_agent(agent, NOW));
+        });
+        let outcome = rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        let _ = worker.join();
+        assert!(
+            matches!(outcome, Ok(Err(()))),
+            "the non-blocking check waited on (or ignored) a held policy lock: {outcome:?}"
+        );
+    }
+
     #[test]
     fn cached_views_do_zero_verifies_on_use_and_maintenance() {
         let p = Peer::new();

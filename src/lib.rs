@@ -241,6 +241,286 @@ pub use direct::{DirectMessage, DirectMessageReceiver, DirectMessaging};
 // Import Membership trait for HyParView join() method
 use saorsa_gossip_membership::Membership as _;
 
+/// x0x #1150: a raw-QUIC send target after resolution, repair and the B/P
+/// pairing checks (see `Agent::resolve_raw_quic_target`).
+struct RawQuicTarget {
+    machine_id: identity::MachineId,
+    ant_peer_id: ant_quic::PeerId,
+    machine_prefix: String,
+    resolution: &'static str,
+}
+
+/// x0x #1150 (g10-1190a): the verified source that names a pinned
+/// recipient's machine (see [`select_pinned_binding`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinnedMachineSource {
+    Announcement,
+    DmRegistry,
+    AuthenticatedBinding,
+    PeerEvidence,
+}
+
+/// x0x #1150 (r7b): a pinned recipient's machine and the verified source
+/// that names it. The provenance is kept apart from the target's
+/// diagnostic label, so repair or redial can never re-label a machine past
+/// its binding checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PinnedBinding {
+    machine: identity::MachineId,
+    source: PinnedMachineSource,
+}
+
+/// x0x #1150 (g10-1190a, r7b, r7c): the one rule for which verified binding
+/// names a pinned recipient's machine. The bounded resolution, the re-check
+/// after repair and the seam all apply it, to async or `try_*` reads of the
+/// same sources.
+///
+/// Live authority comes first, as on the receive path (#1088, #1098). It is
+/// the newer of two bindings: the recipient's latest verified identity
+/// announcement (`announced`, from the announced-binding store, which
+/// routing never writes) and its ADR-0021 authenticated machine binding
+/// (`attested`, an origin attestation or a direct-origin announcement). The
+/// certificate expiry carried with it applies. A known live binding is
+/// never overridden: if it is expired, nothing resolves. With no live
+/// binding, the DM registry (a machine a verified frame came from) names
+/// the machine, then peer evidence (`evidence`, its own point-of-use
+/// check). The discovery cache's `machine_id` is routing state, which the
+/// connector reconciles to any connected machine. It is never authority
+/// here (r7c).
+fn select_pinned_binding(
+    announced: Option<dm_inbox::AuthenticatedMachineBinding>,
+    attested: Option<dm_inbox::AuthenticatedMachineBinding>,
+    registry: Option<identity::MachineId>,
+    evidence: impl FnOnce() -> Option<identity::MachineId>,
+    now_secs: u64,
+) -> Option<PinnedBinding> {
+    let announced = announced.filter(|binding| binding.machine_id.0 != [0u8; 32]);
+    let live = match attested {
+        Some(binding)
+            if announced.is_none_or(|announced| binding.announced_at > announced.announced_at) =>
+        {
+            Some((
+                binding.machine_id,
+                binding
+                    .cert_not_after
+                    .or_else(|| announced.and_then(|announced| announced.cert_not_after)),
+                PinnedMachineSource::AuthenticatedBinding,
+            ))
+        }
+        _ => announced.map(|announced| {
+            (
+                announced.machine_id,
+                announced.cert_not_after,
+                PinnedMachineSource::Announcement,
+            )
+        }),
+    };
+    if let Some((machine, not_after, source)) = live {
+        return (!identity::is_expired(not_after, now_secs))
+            .then_some(PinnedBinding { machine, source });
+    }
+    if let Some(machine) = registry {
+        return Some(PinnedBinding {
+            machine,
+            source: PinnedMachineSource::DmRegistry,
+        });
+    }
+    evidence().map(|machine| PinnedBinding {
+        machine,
+        source: PinnedMachineSource::PeerEvidence,
+    })
+}
+
+impl PinnedMachineSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Announcement => "announcement",
+            Self::DmRegistry => "dm_registry",
+            Self::AuthenticatedBinding => "authenticated_binding",
+            Self::PeerEvidence => "peer_evidence",
+        }
+    }
+}
+
+/// x0x #1150 (g10-1190a): how often a pinned send's bounded wait re-reads
+/// the verified sources of its recipient's machine.
+const PINNED_RESOLUTION_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// x0x #1150 (r7b): the transport operations raw-QUIC target resolution
+/// uses (connection state, send-readiness repair, discovery redial).
+/// Production always uses the network; test builds can script them, so the
+/// production resolution logic runs in process without a network.
+enum RawQuicTransport<'a> {
+    Network(&'a std::sync::Arc<network::NetworkNode>),
+    #[cfg(test)]
+    Scripted(std::sync::Arc<PinnedTransportScript>),
+}
+
+impl RawQuicTransport<'_> {
+    async fn is_connected(&self, peer: &ant_quic::PeerId) -> bool {
+        match self {
+            Self::Network(network) => network.is_connected(peer).await,
+            #[cfg(test)]
+            Self::Scripted(script) => script.is_connected(peer),
+        }
+    }
+
+    async fn ensure_peer_send_ready(&self, peer: &ant_quic::PeerId) -> error::NetworkResult<()> {
+        match self {
+            Self::Network(network) => network.ensure_peer_send_ready(peer).await,
+            #[cfg(test)]
+            Self::Scripted(script) => script.repair(peer).await,
+        }
+    }
+
+    /// x0x #1150 (r7c): dial exactly `machine`, using only address hints
+    /// that name it ([`Agent::pinned_redial_hints`]). Reports whether that
+    /// machine is now connected. It never runs the general connector, which
+    /// reconciles routing state to whatever machine is connected.
+    async fn pinned_redial(
+        &self,
+        agent: &Agent,
+        agent_id: &identity::AgentId,
+        machine: identity::MachineId,
+    ) -> bool {
+        let peer = ant_quic::PeerId(machine.0);
+        match self {
+            Self::Network(network) => {
+                let addrs = agent.pinned_redial_hints(
+                    agent_id,
+                    machine,
+                    allow_local_discovery_addresses(network.config()),
+                );
+                if addrs.is_empty() {
+                    return false;
+                }
+                matches!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        network.connect_peer_with_addrs(peer, addrs),
+                    )
+                    .await,
+                    Ok(Ok((_, connected))) if connected == peer
+                )
+            }
+            #[cfg(test)]
+            Self::Scripted(script) => {
+                let _ = agent.pinned_redial_hints(agent_id, machine, true);
+                script.pinned_dial(&peer)
+            }
+        }
+    }
+
+    async fn redial(
+        &self,
+        agent: &Agent,
+        agent_id: &identity::AgentId,
+    ) -> Option<identity::MachineId> {
+        // Scripted too: the production redial over the script's connection
+        // state (r7c).
+        agent
+            .redial_direct_machine_from_discovery(agent_id, self)
+            .await
+    }
+}
+
+/// x0x #1150 (r7b, r7c): a scripted connection state for the strict
+/// in-process pinned stand-in. The default reports every machine
+/// connected. Test builds only.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct PinnedTransportScript {
+    only_listed_connected: bool,
+    repair_connects: bool,
+    repair_delay: std::time::Duration,
+    connected: std::sync::Mutex<std::collections::HashSet<identity::MachineId>>,
+}
+
+#[cfg(test)]
+impl PinnedTransportScript {
+    /// Only `machines` are connected. The send-readiness repair connects
+    /// the machine it repairs when `repair_connects`. The discovery redial
+    /// is the production one, over this connection state.
+    pub(crate) fn connected_only(machines: &[identity::MachineId], repair_connects: bool) -> Self {
+        Self {
+            only_listed_connected: true,
+            repair_connects,
+            repair_delay: std::time::Duration::ZERO,
+            connected: std::sync::Mutex::new(machines.iter().copied().collect()),
+        }
+    }
+
+    /// The send-readiness repair takes `delay` before it reports.
+    pub(crate) fn with_repair_delay(mut self, delay: std::time::Duration) -> Self {
+        self.repair_delay = delay;
+        self
+    }
+
+    fn is_connected(&self, peer: &ant_quic::PeerId) -> bool {
+        !self.only_listed_connected
+            || self
+                .connected
+                .lock()
+                .is_ok_and(|connected| connected.contains(&identity::MachineId(peer.0)))
+    }
+
+    /// The pinned dial reaches the bound machine when `repair_connects` (the
+    /// machine is reachable at all).
+    fn pinned_dial(&self, peer: &ant_quic::PeerId) -> bool {
+        if self.repair_connects {
+            if let Ok(mut connected) = self.connected.lock() {
+                connected.insert(identity::MachineId(peer.0));
+            }
+        }
+        self.repair_connects
+    }
+
+    async fn repair(&self, peer: &ant_quic::PeerId) -> error::NetworkResult<()> {
+        tokio::time::sleep(self.repair_delay).await;
+        if !self.repair_connects {
+            return Err(error::NetworkError::ConnectionFailed(
+                "scripted repair failed".to_string(),
+            ));
+        }
+        if let Ok(mut connected) = self.connected.lock() {
+            connected.insert(identity::MachineId(peer.0));
+        }
+        Ok(())
+    }
+}
+
+/// x0x #1150 (r7b): per-agent transport scripts for the strict stand-in.
+#[cfg(test)]
+static PINNED_STANDIN_TRANSPORT: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<identity::AgentId, std::sync::Arc<PinnedTransportScript>>,
+    >,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+fn pinned_standin_transport(agent: &identity::AgentId) -> std::sync::Arc<PinnedTransportScript> {
+    PINNED_STANDIN_TRANSPORT
+        .lock()
+        .ok()
+        .and_then(|scripts| scripts.get(agent).cloned())
+        .unwrap_or_default()
+}
+
+/// x0x #1150 (g10-1190a): agents whose in-process pinned stand-in resolves
+/// the recipient's machine strictly, as the real path does (see
+/// `Agent::set_pinned_standin_strict_resolution_for_testing`).
+#[cfg(test)]
+static PINNED_STANDIN_STRICT: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<identity::AgentId>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+fn pinned_standin_is_strict(agent: &identity::AgentId) -> bool {
+    PINNED_STANDIN_STRICT
+        .lock()
+        .is_ok_and(|agents| agents.contains(agent))
+}
+
 /// The core agent that participates in the x0x gossip network.
 ///
 /// Each agent is a peer — there is no client/server distinction.
@@ -309,6 +589,15 @@ pub struct Agent {
     /// to the observable claimed-machine fallback until a verified announcement
     /// repopulates the binding. Protocol-level closure is tracked in issue #213.
     authenticated_machine_bindings: dm_inbox::AuthenticatedMachineBindings,
+    /// x0x #1150 (r7c): the agent→machine binding of each peer's latest
+    /// VERIFIED identity announcement (direct or rebroadcast), with its
+    /// certificate expiry. It is recorded at announcement ingest only.
+    /// Routing never writes it, unlike the discovery cache, whose
+    /// `machine_id` the connector reconciles to whatever machine is
+    /// connected. The pinned recovery-response path takes its live
+    /// authority from here. A bounded in-memory LRU, like
+    /// `authenticated_machine_bindings`.
+    announced_machine_bindings: dm_inbox::AuthenticatedMachineBindings,
     /// Cache of discovered machine endpoints from machine announcements and
     /// agent→machine identity links.
     machine_discovery_cache: std::sync::Arc<
@@ -2567,6 +2856,7 @@ async fn patch_discovery_entry_when_blob_lands(
     cache: &std::sync::Arc<
         tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
     >,
+    announced: &dm_inbox::AuthenticatedMachineBindings,
     blob_cache: &std::sync::Arc<announce_blob::AnnounceBlobCache>,
     cert_events: &tokio::sync::broadcast::Sender<VerifiedCertificate>,
     digest: &[u8; 32],
@@ -2588,8 +2878,15 @@ async fn patch_discovery_entry_when_blob_lands(
             );
             return;
         }
-        let mut cache = cache.write().await;
-        if let Some(entry) = cache.get_mut(agent_id) {
+        // x0x #1150 (r7g): the announced-binding store is taken FIRST and
+        // held until the binding carries the landed expiry, so no pinned
+        // reader (the resolver waits, the seam's try_read refuses) sees the
+        // binding while discovery publishes the certificate without its
+        // expiry. Lock order: the announced-binding store, then discovery.
+        // No path takes them the other way round.
+        let mut store = announced.write().await;
+        let mut discovery = cache.write().await;
+        if let Some(entry) = discovery.get_mut(agent_id) {
             // FRESHNESS GATE (review r2, #447): the entry's LATEST announce
             // must still commit to the digest this fetch resolved. Between
             // the fetch being triggered and landing, a newer announce can
@@ -2603,9 +2900,7 @@ async fn patch_discovery_entry_when_blob_lands(
                     current_digest = ?entry.cert_digest.map(hex::encode),
                     "announce blob landed for a superseded digest; not patching (#447 r2)"
                 );
-                return;
-            }
-            if entry.agent_certificate.is_none() {
+            } else if entry.agent_certificate.is_none() {
                 entry.user_id = blob.user_id;
                 entry.cert_not_after = cert.not_after();
                 entry.agent_certificate = Some(cert.clone());
@@ -2618,6 +2913,20 @@ async fn patch_discovery_entry_when_blob_lands(
                 publish_verified_certificate(cert_events, *agent_id, cert);
             }
         }
+        drop(discovery);
+        #[cfg(test)]
+        announced_record_barrier::park(agent_id, announced_record_barrier::HYDRATION_PUBLISH).await;
+        // x0x #1150 (r7d-r7g): still under the store lock taken above, the
+        // binding whose announcement committed to THIS digest learns the
+        // landed expiry. The update is keyed on the digest, whatever the
+        // discovery entry's state. Ingest registers its binding (and digest)
+        // in the store BEFORE it publishes its discovery merge
+        // (`cache_verified_announcement`). So if this hydration patched the
+        // discovery entry, the binding with this digest already existed and
+        // is updated here, before the store lock is released. Nothing
+        // depends on the blob surviving for a later lookup.
+        store.record_certificate_landed(agent_id, *digest, cert.not_after());
+        drop(store);
         return;
     }
 }
@@ -2763,6 +3072,157 @@ async fn upsert_discovered_machine(
 /// failing reconnect attempts.
 fn observed_address_is_dialable(address: &std::net::SocketAddr) -> bool {
     !address.ip().is_unspecified() && address.port() != 0
+}
+
+/// x0x #1150 (r7c, r7d, r7e): record a verified identity announcement's
+/// agent→machine binding in the announced-binding store, apart from the
+/// discovery cache's mutable routing `machine_id`. Only a signed, non-zero
+/// machine is recorded, and an older announcement never rolls a binding
+/// back.
+///
+/// The store keeps the certificate expiry coupled to the digest the
+/// announcement committed to
+/// ([`dm_inbox::AuthenticatedMachineBindingCache::record_announcement`]),
+/// whether or not the discovery entry survives. The write runs under the
+/// store's write lock, which also serialises it with blob hydration's
+/// conditional update ([`patch_discovery_entry_when_blob_lands`]). Ingest
+/// runs it BEFORE publishing its discovery merge, and hydration updates
+/// the store AFTER patching discovery, so a landed certificate's expiry
+/// always reaches the binding (r7f). As a best-effort extra (nothing
+/// depends on it), a certificate-less announcement also takes the expiry
+/// of a verified blob for its digest that is still cached.
+async fn record_announced_machine_binding(
+    bindings: &dm_inbox::AuthenticatedMachineBindings,
+    blob_cache: Option<&std::sync::Arc<announce_blob::AnnounceBlobCache>>,
+    agent_id: identity::AgentId,
+    machine_id: identity::MachineId,
+    announced_at: u64,
+    cert_digest: Option<[u8; 32]>,
+    inline_not_after: Option<u64>,
+) {
+    if machine_id.0 == [0u8; 32] {
+        return;
+    }
+    let mut store = bindings.write().await;
+    let landed_not_after = match (inline_not_after, cert_digest, blob_cache) {
+        (None, Some(digest), Some(blob_cache)) => blob_cache.get(&digest).await.and_then(|blob| {
+            blob.agent_certificate
+                .as_ref()
+                .filter(|cert| {
+                    cert.agent_id().is_ok_and(|id| id == agent_id)
+                        && cert.user_id().ok() == blob.user_id
+                })
+                .and_then(identity::AgentCertificate::not_after)
+        }),
+        _ => None,
+    };
+    store.record_announcement(
+        agent_id,
+        machine_id,
+        announced_at,
+        cert_digest,
+        inline_not_after.or(landed_not_after),
+    );
+}
+
+/// x0x #1150 (r7e, r7f, r7g): test-only barriers keyed by (agent, point).
+/// The points are `INGEST_BETWEEN_WRITES` (between an ingest's
+/// announced-binding store registration and its discovery merge) and
+/// `HYDRATION_PUBLISH` (in blob hydration, after the discovery patch and
+/// before the binding's expiry update). Unarmed points pass straight
+/// through.
+#[cfg(test)]
+pub(crate) mod announced_record_barrier {
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    pub(crate) const INGEST_BETWEEN_WRITES: &str = "ingest_between_writes";
+    pub(crate) const HYDRATION_PUBLISH: &str = "hydration_publish";
+
+    pub(crate) struct Gate {
+        /// One permit each time a task parks here.
+        pub(crate) reached: tokio::sync::Semaphore,
+        /// One permit releases one parked task.
+        pub(crate) release: tokio::sync::Semaphore,
+    }
+
+    type Key = (crate::identity::AgentId, &'static str);
+
+    static GATES: LazyLock<Mutex<HashMap<Key, Arc<Gate>>>> = LazyLock::new(Default::default);
+
+    pub(crate) fn arm(agent: crate::identity::AgentId, point: &'static str) -> Arc<Gate> {
+        let gate = Arc::new(Gate {
+            reached: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        if let Ok(mut gates) = GATES.lock() {
+            gates.insert((agent, point), Arc::clone(&gate));
+        }
+        gate
+    }
+
+    pub(crate) fn disarm(agent: &crate::identity::AgentId, point: &'static str) {
+        if let Ok(mut gates) = GATES.lock() {
+            gates.remove(&(*agent, point));
+        }
+    }
+
+    pub(crate) async fn park(agent: &crate::identity::AgentId, point: &'static str) {
+        let gate = GATES
+            .lock()
+            .ok()
+            .and_then(|gates| gates.get(&(*agent, point)).cloned());
+        if let Some(gate) = gate {
+            gate.reached.add_permits(1);
+            if let Ok(permit) = gate.release.acquire().await {
+                permit.forget();
+            }
+        }
+    }
+}
+
+/// The identity listener's cache step for one announcement that passed its
+/// signature, timestamp, trust, revocation, pairing and freshness gates:
+/// the machine cache, the announced-binding store (x0x #1150 r7c) and the
+/// discovery cache.
+async fn cache_verified_announcement(
+    machine_cache: &std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<identity::MachineId, DiscoveredMachine>>,
+    >,
+    announced: &dm_inbox::AuthenticatedMachineBindings,
+    blob_cache: Option<&std::sync::Arc<announce_blob::AnnounceBlobCache>>,
+    cache: &std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+    >,
+    cert_events: &tokio::sync::broadcast::Sender<VerifiedCertificate>,
+    discovered_agent: DiscoveredAgent,
+) {
+    upsert_discovered_machine_from_agent(machine_cache, &discovered_agent).await;
+    let (agent_id, machine_id, announced_at, cert_digest, inline_not_after) = (
+        discovered_agent.agent_id,
+        discovered_agent.machine_id,
+        discovered_agent.announced_at,
+        discovered_agent.cert_digest,
+        discovered_agent.cert_not_after,
+    );
+    // x0x #1150 (r7f): the store registration (binding and digest) comes
+    // BEFORE the discovery merge is published, so a blob hydration that
+    // patches the merged entry always finds the matching binding
+    // (`patch_discovery_entry_when_blob_lands`).
+    record_announced_machine_binding(
+        announced,
+        blob_cache,
+        agent_id,
+        machine_id,
+        announced_at,
+        cert_digest,
+        inline_not_after,
+    )
+    .await;
+    #[cfg(test)]
+    announced_record_barrier::park(&agent_id, announced_record_barrier::INGEST_BETWEEN_WRITES)
+        .await;
+    upsert_discovered_agent(cache, cert_events, discovered_agent).await;
 }
 
 async fn upsert_discovered_machine_from_agent(
@@ -7552,7 +8012,7 @@ impl Agent {
     async fn connected_direct_machine(
         &self,
         agent_id: &identity::AgentId,
-        network: &network::NetworkNode,
+        transport: &RawQuicTransport<'_>,
     ) -> Option<identity::MachineId> {
         let cached_machine_id = {
             let cache = self.identity_discovery_cache.read().await;
@@ -7562,14 +8022,20 @@ impl Agent {
                 .filter(|machine_id| machine_id.0 != [0_u8; 32])
         };
         if let Some(machine_id) = cached_machine_id {
-            if network.is_connected(&ant_quic::PeerId(machine_id.0)).await {
+            if transport
+                .is_connected(&ant_quic::PeerId(machine_id.0))
+                .await
+            {
                 return Some(machine_id);
             }
         }
 
         let registry_machine_id = self.direct_messaging.get_machine_id(agent_id).await;
         if let Some(machine_id) = registry_machine_id {
-            if network.is_connected(&ant_quic::PeerId(machine_id.0)).await {
+            if transport
+                .is_connected(&ant_quic::PeerId(machine_id.0))
+                .await
+            {
                 if cached_machine_id != Some(machine_id) {
                     let mut cache = self.identity_discovery_cache.write().await;
                     if let Some(entry) = cache.get_mut(agent_id) {
@@ -7585,7 +8051,7 @@ impl Agent {
                 .peer_evidence()
                 .usable_agent(*agent_id, dm_capability::now_unix_ms())
             {
-                if network
+                if transport
                     .is_connected(&ant_quic::PeerId(view.announcement.machine_id.0))
                     .await
                 {
@@ -7602,7 +8068,7 @@ impl Agent {
     async fn redial_direct_machine_from_discovery(
         &self,
         agent_id: &identity::AgentId,
-        network: &network::NetworkNode,
+        transport: &RawQuicTransport<'_>,
     ) -> Option<identity::MachineId> {
         if let Err(error) = self.connect_to_agent(agent_id).await {
             tracing::debug!(
@@ -7615,7 +8081,7 @@ impl Agent {
             return None;
         }
 
-        self.connected_direct_machine(agent_id, network).await
+        self.connected_direct_machine(agent_id, transport).await
     }
 
     /// Legacy raw-QUIC direct-send path. Internal fallback only.
@@ -7691,35 +8157,656 @@ impl Agent {
         }
     }
 
-    async fn send_direct_raw_quic(
+    /// x0x #1150 (ADR 0107; lifecycle note section 2.7): send one
+    /// recovery-response frame to `to` in ONE physical exchange on x0x's
+    /// own raw-QUIC path. It never uses the gossip inbox or a relay, never
+    /// waits for an ACK-v2 receive acknowledgement (whose internal retry
+    /// and the X0X-0053 reissue would write again without admission), and
+    /// never retries: the caller's protocol owns every resend, and each one
+    /// runs both admission phases again.
+    ///
+    /// The recipient's machine comes from a verified binding only (see
+    /// [`Self::await_pinned_recipient_binding`]). When none names it yet, as
+    /// on a daemon that has just restarted, the send waits up to
+    /// `resolve_within` for one to learn it, holding no lock, then fails
+    /// with the typed, retryable [`dm::DmError::RecipientUndiscovered`]
+    /// before any admission runs (g10-1190a). The write goes only to the
+    /// machine that binding names: repair and redial cannot move it, and the
+    /// binding is re-checked after repair and at the seam (r7b,
+    /// [`Self::resolve_pinned_target`]).
+    ///
+    /// `admission` runs in two phases. Its async pre-phase runs after
+    /// machine resolution, repair or redial and the B/P pairing checks; it
+    /// is advisory and returns the synchronous seam check bound to its
+    /// snapshot. The seam check runs once inside ant-quic's
+    /// `send_on_generation_with_admission`, after `open_uni` and
+    /// immediately before `write_all`, together with this agent's own
+    /// agent, machine and pairing revocation checks. Any refusal, or lock
+    /// contention at the seam, writes nothing. The caller bounds the whole
+    /// call with its exchange deadline, and `resolve_within` must leave
+    /// part of that deadline for the exchange itself.
+    pub(crate) async fn send_direct_pinned_admitted(
         &self,
-        agent_id: &identity::AgentId,
+        to: &identity::AgentId,
         payload: &[u8],
-        receive_ack_timeout: Option<std::time::Duration>,
-        prefer_newest_grace: std::time::Duration,
-    ) -> error::NetworkResult<dm::DmPath> {
-        let send_start = std::time::Instant::now();
-        let agent_prefix = network::hex_prefix(&agent_id.0, 4);
-        let self_prefix = network::hex_prefix(&self.identity.agent_id().0, 4);
-        let bytes = payload.len();
-        let digest = direct::dm_payload_digest_hex(payload);
-        let target_path_label = if receive_ack_timeout.is_some() {
-            "raw_quic_acked"
-        } else {
-            "raw_quic"
-        };
+        admission: &dm::ArtifactAdmission,
+        resolve_within: std::time::Duration,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        // ADR-0043 signing gate: the same egress refusal the general path
+        // applies before any envelope or transport work.
+        if !self.signing_gate_allows(&self.identity.agent_id()).await {
+            self.direct_messaging.record_outgoing_failed(*to);
+            return Err(dm::DmError::EnvelopeConstruction(
+                "signing refused: this machine is not the agent's custodian (ADR-0043 signing gate)"
+                    .to_string(),
+            ));
+        }
+        if *to == self.identity.agent_id() {
+            return Err(dm::DmError::NoConnectivity(
+                "a pinned recovery-response send is never self-addressed".to_string(),
+            ));
+        }
+        // G14: a logical DM send like any other. No phi "likely offline"
+        // short-circuit: these sends answer the recipient's own fetch, and a
+        // stale suspicion must not suppress the recovery.
+        self.direct_messaging.record_outgoing_started(*to, None);
+        let result = self
+            .send_direct_pinned_admitted_inner(to, payload, admission, resolve_within)
+            .await;
+        match &result {
+            Ok(_) => self
+                .direct_messaging
+                .record_outgoing_succeeded(*to, dm::DmPath::RawQuic),
+            Err(_) => self.direct_messaging.record_outgoing_failed(*to),
+        }
+        result
+    }
 
-        let network = self.network.as_ref().ok_or_else(|| {
+    async fn send_direct_pinned_admitted_inner(
+        &self,
+        to: &identity::AgentId,
+        payload: &[u8],
+        admission: &dm::ArtifactAdmission,
+        resolve_within: std::time::Duration,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        #[cfg(test)]
+        if self.network.is_none() {
+            return self
+                .pinned_admission_standin(to, admission, resolve_within)
+                .await;
+        }
+        let send_start = std::time::Instant::now();
+        let network = self
+            .network
+            .as_ref()
+            .ok_or_else(|| dm::DmError::NoConnectivity("network not initialized".to_string()))?;
+        // g10-1190a, r7b: a verified binding names the machine (bounded),
+        // and the target stays on the machine that binding names.
+        let deadline = tokio::time::Instant::now() + resolve_within;
+        let binding = self.await_pinned_recipient_binding(to, deadline).await?;
+        let target = self
+            .resolve_pinned_target(
+                to,
+                binding,
+                &RawQuicTransport::Network(network),
+                send_start,
+                deadline,
+            )
+            .await?;
+        let Some(seam) = admission().await else {
+            return Err(dm::DmError::NoConnectivity(
+                dm::PINNED_ADMISSION_REFUSED.to_string(),
+            ));
+        };
+        // A refusal AT THE SEAM is reported as an admission refusal (a
+        // retryable withhold for the caller), not as a transport failure.
+        let refused_at_seam = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seam = {
+            let refused_at_seam = std::sync::Arc::clone(&refused_at_seam);
+            let checks = self.pinned_admission_seam(*to, target.machine_id, true, seam);
+            move || {
+                let admitted = checks();
+                if !admitted {
+                    refused_at_seam.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                admitted
+            }
+        };
+        let sent = network
+            .send_direct_pinned(
+                &target.ant_peer_id,
+                &self.identity.agent_id().0,
+                payload,
+                seam,
+            )
+            .await;
+        if refused_at_seam.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(dm::DmError::NoConnectivity(
+                dm::PINNED_ADMISSION_REFUSED.to_string(),
+            ));
+        }
+        sent.map_err(Self::map_raw_quic_dm_error)?;
+        tracing::debug!(
+            target: "dm.trace",
+            stage = "pinned_exchange_written",
+            recipient = %hex::encode(to.as_bytes()),
+            machine_prefix = %crate::logging::LogHexId::new("machine", &target.machine_prefix),
+            resolution = target.resolution,
+            bytes = payload.len(),
+            dur_ms = send_start.elapsed().as_millis() as u64,
+        );
+        Ok(dm_send::raw_quic_receipt_for_path(dm::DmPath::RawQuic))
+    }
+
+    /// The seam check for a pinned send to `(agent, machine)`: this agent's
+    /// own revocation (agent AND resolved machine) and ADR-0043 B/P pairing
+    /// checks, then (with `check_binding`, r7b) that the recipient's verified
+    /// binding still names `machine`, then the caller's. Synchronous;
+    /// contention refuses.
+    fn pinned_admission_seam(
+        &self,
+        agent: identity::AgentId,
+        machine: identity::MachineId,
+        check_binding: bool,
+        caller: dm::SeamAdmission,
+    ) -> impl FnOnce() -> bool + Send + 'static {
+        let revocation = std::sync::Arc::clone(&self.revocation_set);
+        let moves = std::sync::Arc::clone(&self.move_state);
+        let binding = check_binding.then(|| self.pinned_binding_seam_check(agent, machine));
+        move || {
+            let admitted = {
+                let Ok(revoked) = revocation.try_read() else {
+                    return false;
+                };
+                if revoked.is_agent_revoked(&agent) || revoked.is_machine_revoked(&machine) {
+                    return false;
+                }
+                let Ok(placements) = moves.try_read() else {
+                    return false;
+                };
+                key_move::enforce_pairing(&revoked, placements.placement_view(), &agent, &machine)
+                    .is_none()
+            };
+            admitted && binding.is_none_or(|still_names| still_names()) && caller()
+        }
+    }
+
+    /// In-process stand-in for the pinned transport (an agent built
+    /// without a network): resolve the machine the way the real path's
+    /// lookups would (no connect), run both admission phases exactly where
+    /// the transport runs them, and report the outcome through a marker
+    /// error. Test builds only.
+    #[cfg(test)]
+    async fn pinned_admission_standin(
+        &self,
+        to: &identity::AgentId,
+        admission: &dm::ArtifactAdmission,
+        resolve_within: std::time::Duration,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        let strict = pinned_standin_is_strict(&self.identity.agent_id());
+        let machine = if strict {
+            // The real path's resolution and target selection (repair,
+            // redial, binding and B/P checks), shared code, over a scripted
+            // transport (r7b).
+            let deadline = tokio::time::Instant::now() + resolve_within;
+            let binding = self.await_pinned_recipient_binding(to, deadline).await?;
+            let transport =
+                RawQuicTransport::Scripted(pinned_standin_transport(&self.identity.agent_id()));
+            let target = self
+                .resolve_pinned_target(to, binding, &transport, std::time::Instant::now(), deadline)
+                .await?;
+            Some(target.machine_id)
+        } else {
+            let cached = self
+                .identity_discovery_cache
+                .read()
+                .await
+                .get(to)
+                .map(|d| d.machine_id)
+                .filter(|m| m.0 != [0u8; 32]);
+            match cached {
+                Some(machine) => Some(machine),
+                None => self.direct_messaging.get_machine_id(to).await,
+            }
+        };
+        let refused = || {
+            Err(dm::DmError::NoConnectivity(
+                dm::PINNED_ADMISSION_REFUSED.to_string(),
+            ))
+        };
+        if let Some(machine) = machine {
+            if self.recipient_pairing_denied(to, &machine).await.is_some() {
+                return refused();
+            }
+        }
+        let Some(seam) = admission().await else {
+            return refused();
+        };
+        let admitted = match machine {
+            Some(machine) => self.pinned_admission_seam(*to, machine, strict, seam)(),
+            None => {
+                let agent_clear = self
+                    .revocation_set
+                    .try_read()
+                    .is_ok_and(|revoked| !revoked.is_agent_revoked(to));
+                agent_clear && seam()
+            }
+        };
+        if admitted {
+            Err(dm::DmError::NoConnectivity(
+                dm::PINNED_STANDIN_ADMITTED.to_string(),
+            ))
+        } else {
+            refused()
+        }
+    }
+
+    /// Test seam (x0x #1150, g10-1190a): make this agent's in-process
+    /// pinned stand-in resolve the recipient's machine as the real path
+    /// does, and fail where the real path fails, instead of admitting an
+    /// unresolved recipient on its agent alone. Test builds only.
+    #[cfg(test)]
+    pub(crate) fn set_pinned_standin_strict_resolution_for_testing(&self, strict: bool) {
+        if let Ok(mut agents) = PINNED_STANDIN_STRICT.lock() {
+            if strict {
+                agents.insert(self.identity.agent_id());
+            } else {
+                agents.remove(&self.identity.agent_id());
+            }
+        }
+    }
+
+    /// Test seam (x0x #1150, r7h): whether this agent's pinned stand-in is
+    /// strict. Test builds only.
+    #[cfg(test)]
+    pub(crate) fn pinned_standin_strict_for_testing(&self) -> bool {
+        pinned_standin_is_strict(&self.identity.agent_id())
+    }
+
+    /// Test seam (x0x #1150, r7b): the transport the strict stand-in's
+    /// target selection sees (connection state, repair, redial). Without a
+    /// script every machine reports connected. Test builds only.
+    #[cfg(test)]
+    pub(crate) fn script_pinned_standin_transport_for_testing(
+        &self,
+        script: PinnedTransportScript,
+    ) {
+        if let Ok(mut scripts) = PINNED_STANDIN_TRANSPORT.lock() {
+            scripts.insert(self.identity.agent_id(), std::sync::Arc::new(script));
+        }
+    }
+
+    /// x0x #1150 (g10-1190a, r7b, r7c): the pinned recipient's binding from
+    /// ONE read of its verified sources, under [`select_pinned_binding`]'s
+    /// rule. Each source is read where it is used and copied nowhere. The
+    /// stores are async locks the caller bounds; the peer-evidence check is
+    /// the non-blocking one, so a contended store or policy reads as unknown.
+    async fn pinned_binding_now(&self, to: &identity::AgentId) -> Option<PinnedBinding> {
+        let announced = self.announced_machine_bindings.read().await.peek(to);
+        let attested = self.authenticated_machine_bindings.read().await.peek(to);
+        let registry = self.direct_messaging.get_machine_id(to).await;
+        let now_ms = dm_capability::now_unix_ms();
+        select_pinned_binding(
+            announced,
+            attested,
+            registry,
+            || {
+                self.peer_evidence()
+                    .try_usable_agent(*to, now_ms)
+                    .ok()
+                    .flatten()
+                    .map(|view| view.announcement.machine_id)
+            },
+            now_ms / 1000,
+        )
+    }
+
+    /// x0x #1150 (r7c): the typed, retryable refusal of a pinned send whose
+    /// verified-binding sources stayed locked past its resolution bound.
+    fn pinned_bound_expired(stage: &str) -> dm::DmError {
+        dm::DmError::RecipientUndiscovered(format!(
+            "the recipient's binding sources stayed locked past the resolution bound ({stage})"
+        ))
+    }
+
+    /// x0x #1150 (r7c, r7d): `read`, whose lock waits all end at the one
+    /// absolute `deadline` shared by the resolution and every re-check.
+    /// There is no per-check grace. `timeout_at` polls the read before its
+    /// timer, so a read that does not have to wait still completes after the
+    /// deadline. A read that would wait is refused at it.
+    async fn pinned_bounded<T>(
+        deadline: tokio::time::Instant,
+        stage: &str,
+        read: impl std::future::Future<Output = T>,
+    ) -> Result<T, dm::DmError> {
+        tokio::time::timeout_at(deadline, read)
+            .await
+            .map_err(|_| Self::pinned_bound_expired(stage))
+    }
+
+    /// x0x #1150 (ADR 0107, g10-1190a, r7b, r7c): resolve a pinned
+    /// recipient's binding by `deadline`.
+    ///
+    /// A daemon that has just restarted has a cold discovery cache, DM
+    /// registry and peer evidence, and the gossip fallback that used to hide
+    /// that is gone (single admission, no hidden resend). So: read the
+    /// verified sources ([`Self::pinned_binding_now`]). While none names the
+    /// recipient, let the evidence store finish loading, ask once for the
+    /// recipient's relationship evidence (an EvidenceV1 Lookup over
+    /// connected peers), and re-read the sources until one learns the
+    /// recipient (an identity announcement, an attested DM, the Lookup's
+    /// answer). `deadline` is absolute and bounds everything here, including
+    /// each lock wait. [`Self::resolve_pinned_target`] carries the same
+    /// deadline through its re-checks. It holds no lock between reads,
+    /// writes nothing and runs before any admission. An unresolved recipient,
+    /// or one whose sources stay locked past the deadline, is the typed,
+    /// retryable [`dm::DmError::RecipientUndiscovered`]: the caller's own
+    /// protocol resends, and every resend is admitted afresh.
+    async fn await_pinned_recipient_binding(
+        &self,
+        to: &identity::AgentId,
+        deadline: tokio::time::Instant,
+    ) -> Result<PinnedBinding, dm::DmError> {
+        let started = tokio::time::Instant::now();
+        let resolution = async {
+            if let Some(binding) = self.pinned_binding_now(to).await {
+                return Some(binding);
+            }
+            let evidence = self.peer_evidence();
+            let lookup = async {
+                if evidence.wait(0).await {
+                    evidence.lookup(*to, None).await;
+                }
+            };
+            tokio::pin!(lookup);
+            let mut lookup_done = false;
+            loop {
+                tokio::select! {
+                    () = &mut lookup, if !lookup_done => lookup_done = true,
+                    () = tokio::time::sleep(PINNED_RESOLUTION_POLL) => {}
+                    () = self.shutdown_token.cancelled() => return None,
+                }
+                if let Some(binding) = self.pinned_binding_now(to).await {
+                    return Some(binding);
+                }
+            }
+        };
+        let waited_ms = || started.elapsed().as_millis() as u64;
+        match tokio::time::timeout_at(deadline, resolution).await {
+            Ok(Some(binding)) => {
+                tracing::debug!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    agent_prefix = %network::hex_prefix(&to.0, 4),
+                    source = binding.source.label(),
+                    waited_ms = waited_ms(),
+                    "pinned recipient resolved"
+                );
+                Ok(binding)
+            }
+            Ok(None) | Err(_) => {
+                let waited_ms = waited_ms();
+                tracing::warn!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    agent_prefix = %crate::logging::LogHexId::agent(&network::hex_prefix(&to.0, 4)),
+                    outcome = "err_recipient_undiscovered",
+                    waited_ms,
+                    "pinned send: no verified source named the recipient's machine within the bound; the caller resends"
+                );
+                Err(dm::DmError::RecipientUndiscovered(format!(
+                    "no verified machine for the recipient after {waited_ms} ms \
+                     (announcement, authenticated binding, DM registry, peer evidence)"
+                )))
+            }
+        }
+    }
+
+    /// x0x #1150 (r7c): address hints for dialling exactly `machine` for
+    /// `to`: the discovery entry's addresses only while that entry names
+    /// `machine`, and the usable peer-evidence announcement's only while it
+    /// names `machine`. Both reads are non-blocking (contention: no hints from
+    /// that source). Nothing is written.
+    fn pinned_redial_hints(
+        &self,
+        to: &identity::AgentId,
+        machine: identity::MachineId,
+        allow_local_scope: bool,
+    ) -> Vec<std::net::SocketAddr> {
+        let mut hints = Vec::new();
+        if let Ok(cache) = self.identity_discovery_cache.try_read() {
+            if let Some(entry) = cache.get(to).filter(|entry| entry.machine_id == machine) {
+                hints.extend(entry.addresses.iter().copied());
+            }
+        }
+        if let Ok(Some(view)) = self
+            .peer_evidence()
+            .try_usable_agent(*to, dm_capability::now_unix_ms())
+        {
+            if view.announcement.machine_id == machine {
+                hints.extend(view.announcement.addresses.iter().copied());
+            }
+        }
+        filter_discovery_announcement_addrs(hints, allow_local_scope)
+    }
+
+    /// x0x #1150 (r7b, r7c): the connected target for a pinned send to the
+    /// machine `binding` names.
+    ///
+    /// Provenance is kept apart from the diagnostic label. Repair and the
+    /// pinned redial try to connect only THAT machine: the redial dials it
+    /// on hints that name it ([`Self::pinned_redial_hints`]), and it never
+    /// runs the general connector, which reconciles routing state to
+    /// whatever machine is connected. After repair, the binding is re-read
+    /// where it is used ([`Self::pinned_binding_now`], certificate expiry
+    /// included) and must still name that machine. The seam checks it once
+    /// more ([`Self::pinned_admission_seam`]). The ADR-0043 B/P checks run
+    /// before and after. Every lock wait here is bounded by the absolute
+    /// `deadline` of the resolution ([`Self::pinned_bounded`]), and expiry is
+    /// the typed, retryable `RecipientUndiscovered`. The lifecycle-block
+    /// handling is the shared raw path's.
+    async fn resolve_pinned_target(
+        &self,
+        to: &identity::AgentId,
+        binding: PinnedBinding,
+        transport: &RawQuicTransport<'_>,
+        send_start: std::time::Instant,
+        deadline: tokio::time::Instant,
+    ) -> Result<RawQuicTarget, dm::DmError> {
+        let agent_prefix = network::hex_prefix(&to.0, 4);
+        let machine_id = binding.machine;
+        let ant_peer_id = ant_quic::PeerId(machine_id.0);
+        let machine_prefix = network::hex_prefix(&machine_id.0, 4);
+        let mut resolution = binding.source.label();
+        let pairing_denied = |stage: &'static str| async move {
+            Self::pinned_bounded(
+                deadline,
+                stage,
+                self.recipient_pairing_denied(to, &machine_id),
+            )
+            .await
+        };
+        if let Some(denial) = pairing_denied("pairing").await? {
+            tracing::info!(
+                target: "x0x::direct",
+                stage = "send",
+                agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                outcome = "drop_pairing",
+                reason = ?denial,
+                "pinned send refused: recipient pairing denied (ADR-0043 B/P)"
+            );
+            return Err(Self::map_raw_quic_dm_error(
+                error::NetworkError::PeerNotVerified { agent_id: to.0 },
+            ));
+        }
+        let mut connected = transport.is_connected(&ant_peer_id).await;
+        let mut repair_outcome: Option<&'static str> = None;
+        if !connected {
+            const REPAIR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+            let outcome = match tokio::time::timeout(
+                REPAIR_TIMEOUT,
+                transport.ensure_peer_send_ready(&ant_peer_id),
+            )
+            .await
+            {
+                Ok(Ok(())) => "repaired",
+                Ok(Err(_)) => "repair_failed",
+                Err(_) => "repair_timeout",
+            };
+            repair_outcome = Some(outcome);
+            connected = transport.is_connected(&ant_peer_id).await;
+            if !connected && transport.pinned_redial(self, to, machine_id).await {
+                connected = true;
+                resolution = "pinned_redial";
+            }
+        }
+        // r7b/r7c: the binding is re-read where it is used, after any
+        // repair, inside the resolution bound.
+        let current =
+            Self::pinned_bounded(deadline, "revalidation", self.pinned_binding_now(to)).await?;
+        if current.map(|b| b.machine) != Some(machine_id) {
+            tracing::info!(
+                target: "x0x::direct",
+                stage = "send",
+                agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                machine_prefix = %crate::logging::LogHexId::new("machine", &machine_prefix),
+                resolution,
+                outcome = "drop_binding_changed",
+                "pinned send: the recipient's verified binding no longer names this machine"
+            );
+            return Err(Self::map_raw_quic_dm_error(
+                error::NetworkError::AgentNotFound(to.0),
+            ));
+        }
+        if let Some(denial) = pairing_denied("pairing after repair").await? {
+            tracing::info!(
+                target: "x0x::direct",
+                agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                machine_prefix = %crate::logging::LogHexId::new("machine", &machine_prefix),
+                resolution,
+                outcome = "drop_pairing_post_resolution",
+                reason = ?denial,
+                "pinned send refused after repair: recipient pairing denied (ADR-0043 B/P)"
+            );
+            return Err(Self::map_raw_quic_dm_error(
+                error::NetworkError::PeerNotVerified { agent_id: to.0 },
+            ));
+        }
+        if connected {
+            if let Some(reason) = self.direct_messaging.lifecycle_block_reason(&machine_id) {
+                tracing::warn!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                    machine_prefix = %crate::logging::LogHexId::new("machine", &machine_prefix),
+                    resolution,
+                    ?repair_outcome,
+                    reason = %reason,
+                    "ignoring stale lifecycle block because ant-quic reports a live connection"
+                );
+                self.direct_messaging
+                    .record_lifecycle_established(machine_id, None);
+            }
+        } else {
+            if let Some(reason) = self.direct_messaging.lifecycle_block_reason(&machine_id) {
+                tracing::warn!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                    machine_prefix = %crate::logging::LogHexId::new("machine", &machine_prefix),
+                    resolution,
+                    ?repair_outcome,
+                    outcome = "err_peer_disconnected",
+                    reason = %reason,
+                    dur_ms = send_start.elapsed().as_millis() as u64,
+                    "lifecycle watcher says peer is disconnected"
+                );
+                return Err(Self::map_raw_quic_dm_error(
+                    error::NetworkError::ConnectionFailed(format!("peer disconnected: {reason}")),
+                ));
+            }
             tracing::warn!(
                 target: "x0x::direct",
                 stage = "send",
                 agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
-                outcome = "err_no_network",
-                "network not initialised"
+                machine_prefix = %crate::logging::LogHexId::new("machine", &machine_prefix),
+                resolution,
+                ?repair_outcome,
+                outcome = "err_not_connected",
+                dur_ms = send_start.elapsed().as_millis() as u64,
+                "pinned send: the bound machine is not connected after repair"
             );
-            error::NetworkError::NodeCreation("network not initialized".to_string())
-        })?;
+            return Err(Self::map_raw_quic_dm_error(
+                error::NetworkError::AgentNotConnected(to.0),
+            ));
+        }
+        Ok(RawQuicTarget {
+            machine_id,
+            ant_peer_id,
+            machine_prefix,
+            resolution,
+        })
+    }
 
+    /// x0x #1150 (r7b, r7c): the seam's binding check: the recipient's
+    /// verified binding, re-selected without blocking
+    /// ([`select_pinned_binding`] over `try_*` reads, and the non-blocking
+    /// evidence check whose policy reads are non-blocking too), still names
+    /// `machine`. Contention refuses.
+    fn pinned_binding_seam_check(
+        &self,
+        agent: identity::AgentId,
+        machine: identity::MachineId,
+    ) -> impl FnOnce() -> bool + Send + 'static {
+        let announced = std::sync::Arc::clone(&self.announced_machine_bindings);
+        let attested = std::sync::Arc::clone(&self.authenticated_machine_bindings);
+        let registry = std::sync::Arc::clone(&self.direct_messaging);
+        let evidence = std::sync::Arc::clone(self.peer_evidence());
+        move || {
+            let now_ms = dm_capability::now_unix_ms();
+            let Ok(announced) = announced.try_read() else {
+                return false;
+            };
+            let Ok(attested) = attested.try_read() else {
+                return false;
+            };
+            let Some(registry) = registry.try_machine_id(&agent) else {
+                return false;
+            };
+            let mut evidence_busy = false;
+            let selected = select_pinned_binding(
+                announced.peek(&agent),
+                attested.peek(&agent),
+                registry,
+                || match evidence.try_usable_agent(agent, now_ms) {
+                    Ok(view) => view.map(|view| view.announcement.machine_id),
+                    Err(()) => {
+                        evidence_busy = true;
+                        None
+                    }
+                },
+                now_ms / 1000,
+            );
+            !evidence_busy && selected.is_some_and(|binding| binding.machine == machine)
+        }
+    }
+
+    /// Resolve `agent_id` to a connected machine for a raw-QUIC send:
+    /// discovery cache, DM registry or peer evidence, any send-readiness
+    /// repair or discovery redial, and the ADR-0043 B/P pairing check before
+    /// AND after resolution. Shared by the general raw path and the x0x
+    /// #1150 pinned single-exchange path.
+    ///
+    /// `transport` supplies connection state, repair and redial (r7b). The
+    /// pinned path resolves its target with [`Self::resolve_pinned_target`].
+    async fn resolve_raw_quic_target(
+        &self,
+        agent_id: &identity::AgentId,
+        transport: &RawQuicTransport<'_>,
+        agent_prefix: &str,
+        bytes: usize,
+        send_start: std::time::Instant,
+    ) -> error::NetworkResult<RawQuicTarget> {
         // Resolve the best known machine_id, preferring a machine that is
         // actually connected right now. Discovery cache entries can lag behind
         // the direct-messaging registry when an inbound connection is accepted
@@ -7744,10 +8831,10 @@ impl Agent {
             None
         };
         let (mut machine_id, mut resolution) = match (cached_machine_id, registry_machine_id) {
-            (Some(id), _) if network.is_connected(&ant_quic::PeerId(id.0)).await => {
+            (Some(id), _) if transport.is_connected(&ant_quic::PeerId(id.0)).await => {
                 (id, "cached_connected")
             }
-            (_, Some(id)) if network.is_connected(&ant_quic::PeerId(id.0)).await => {
+            (_, Some(id)) if transport.is_connected(&ant_quic::PeerId(id.0)).await => {
                 if cached_machine_id != Some(id) {
                     let mut cache = self.identity_discovery_cache.write().await;
                     if let Some(entry) = cache.get_mut(agent_id) {
@@ -7818,7 +8905,7 @@ impl Agent {
         // until a raw probe/send path observes the live connection.
         let mut ant_peer_id = ant_quic::PeerId(machine_id.0);
         let mut machine_prefix = network::hex_prefix(&machine_id.0, 4);
-        let mut connected = network.is_connected(&ant_peer_id).await;
+        let mut connected = transport.is_connected(&ant_peer_id).await;
 
         // X0X-0033: when machine_id is known (resolved from cache or registry)
         // but ant-quic isn't currently connected, the X0X-0031 send-readiness
@@ -7833,7 +8920,7 @@ impl Agent {
             const REPAIR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
             let outcome = match tokio::time::timeout(
                 REPAIR_TIMEOUT,
-                network.ensure_peer_send_ready(&ant_peer_id),
+                transport.ensure_peer_send_ready(&ant_peer_id),
             )
             .await
             {
@@ -7851,17 +8938,14 @@ impl Agent {
                 outcome,
                 "send-readiness repair on disconnected peer"
             );
-            connected = network.is_connected(&ant_peer_id).await;
+            connected = transport.is_connected(&ant_peer_id).await;
 
             // Presence/discovery and transport readiness are deliberately
             // separate. If the fast bootstrap-cache repair cannot recover a
             // known machine, use the discovery card's current addresses in
             // the same logical send instead of returning AgentNotConnected.
             if !connected {
-                if let Some(redialed_machine_id) = self
-                    .redial_direct_machine_from_discovery(agent_id, network)
-                    .await
-                {
+                if let Some(redialed_machine_id) = transport.redial(self, agent_id).await {
                     machine_id = redialed_machine_id;
                     ant_peer_id = ant_quic::PeerId(machine_id.0);
                     machine_prefix = network::hex_prefix(&machine_id.0, 4);
@@ -7957,6 +9041,58 @@ impl Agent {
             );
             return Err(error::NetworkError::AgentNotConnected(agent_id.0));
         }
+
+        Ok(RawQuicTarget {
+            machine_id,
+            ant_peer_id,
+            machine_prefix,
+            resolution,
+        })
+    }
+
+    async fn send_direct_raw_quic(
+        &self,
+        agent_id: &identity::AgentId,
+        payload: &[u8],
+        receive_ack_timeout: Option<std::time::Duration>,
+        prefer_newest_grace: std::time::Duration,
+    ) -> error::NetworkResult<dm::DmPath> {
+        let send_start = std::time::Instant::now();
+        let agent_prefix = network::hex_prefix(&agent_id.0, 4);
+        let self_prefix = network::hex_prefix(&self.identity.agent_id().0, 4);
+        let bytes = payload.len();
+        let digest = direct::dm_payload_digest_hex(payload);
+        let target_path_label = if receive_ack_timeout.is_some() {
+            "raw_quic_acked"
+        } else {
+            "raw_quic"
+        };
+
+        let network = self.network.as_ref().ok_or_else(|| {
+            tracing::warn!(
+                target: "x0x::direct",
+                stage = "send",
+                agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                outcome = "err_no_network",
+                "network not initialised"
+            );
+            error::NetworkError::NodeCreation("network not initialized".to_string())
+        })?;
+
+        let RawQuicTarget {
+            machine_id,
+            ant_peer_id,
+            machine_prefix,
+            resolution,
+        } = self
+            .resolve_raw_quic_target(
+                agent_id,
+                &RawQuicTransport::Network(network),
+                &agent_prefix,
+                bytes,
+                send_start,
+            )
+            .await?;
 
         tracing::debug!(
             target: "dm.trace",
@@ -8430,6 +9566,15 @@ impl Agent {
         &self,
     ) -> dm_inbox::AuthenticatedMachineBindings {
         std::sync::Arc::clone(&self.authenticated_machine_bindings)
+    }
+
+    /// Test seam (x0x #1150 r7d): the announced-binding store. Test builds
+    /// only.
+    #[cfg(test)]
+    pub(crate) fn announced_machine_bindings_for_testing(
+        &self,
+    ) -> dm_inbox::AuthenticatedMachineBindings {
+        std::sync::Arc::clone(&self.announced_machine_bindings)
     }
 
     /// Test seam for #1088: record an authenticated machine binding the
@@ -9334,6 +10479,7 @@ impl Agent {
         let cert_events = std::sync::Arc::clone(&self.verified_cert_tx);
         let authenticated_machine_bindings =
             std::sync::Arc::clone(&self.authenticated_machine_bindings);
+        let announced_machine_bindings = std::sync::Arc::clone(&self.announced_machine_bindings);
         let machine_cache = std::sync::Arc::clone(&self.machine_discovery_cache);
         let user_cache = std::sync::Arc::clone(&self.user_discovery_cache);
         let bootstrap_cache = self.bootstrap_cache.clone();
@@ -10074,6 +11220,8 @@ impl Agent {
                                 // lands (bounded: the fetch itself gives up
                                 // after BLOB_FETCH_TIMEOUT_SECS).
                                 let watch_cache = std::sync::Arc::clone(&cache);
+                                let watch_announced =
+                                    std::sync::Arc::clone(&announced_machine_bindings);
                                 let watch_blob_cache =
                                     std::sync::Arc::clone(&announce_blob_cache);
                                 let watch_cert_events = std::sync::Arc::clone(&cert_events);
@@ -10082,6 +11230,7 @@ impl Agent {
                                 tokio::spawn(async move {
                                     patch_discovery_entry_when_blob_lands(
                                         &watch_cache,
+                                        &watch_announced,
                                         &watch_blob_cache,
                                         &watch_cert_events,
                                         &watch_digest,
@@ -10338,8 +11487,15 @@ impl Agent {
                     now,
                     cache_freshness_ttl_secs,
                 ) {
-                    upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent).await;
-                    upsert_discovered_agent(&cache, &cert_events, discovered_agent).await;
+                    cache_verified_announcement(
+                        &machine_cache,
+                        &announced_machine_bindings,
+                        Some(&announce_blob_cache),
+                        &cache,
+                        &cert_events,
+                        discovered_agent,
+                    )
+                    .await;
                 } else {
                     tracing::debug!(
                         target: "x0x::discovery",
@@ -13273,6 +14429,12 @@ impl Agent {
                             };
                             upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent)
                                 .await;
+                            // x0x #1150 (r7d): no announced-binding write
+                            // here. This lookup skips the listener's
+                            // timestamp, freshness, trust, revocation and
+                            // pairing gates, so only the gated listener
+                            // ingest (`cache_verified_announcement`) records
+                            // pinned authority.
                             upsert_discovered_agent(&cache, &self.verified_cert_tx, discovered_agent).await;
                             return Ok(Some(addrs));
                         }
@@ -15521,11 +16683,27 @@ impl Agent {
     pub async fn insert_discovered_agent_for_testing(&self, agent: DiscoveredAgent) {
         let agent_id = agent.agent_id;
         let machine_id = agent.machine_id;
+        #[cfg(test)]
+        let (announced_at, cert_digest, inline_not_after) =
+            (agent.announced_at, agent.cert_digest, agent.cert_not_after);
         upsert_discovered_machine_from_agent(&self.machine_discovery_cache, &agent).await;
         upsert_discovered_agent(
             &self.identity_discovery_cache,
             &self.verified_cert_tx,
             agent,
+        )
+        .await;
+        // x0x #1150 (r7d): pinned authority comes from gated announcement
+        // ingest only. This unchecked seam writes it in test builds only.
+        #[cfg(test)]
+        record_announced_machine_binding(
+            &self.announced_machine_bindings,
+            None,
+            agent_id,
+            machine_id,
+            announced_at,
+            cert_digest,
+            inline_not_after,
         )
         .await;
 
@@ -17223,6 +18401,9 @@ impl AgentBuilder {
             machine_kem,
             identity_discovery_cache,
             authenticated_machine_bindings,
+            announced_machine_bindings: std::sync::Arc::new(tokio::sync::RwLock::new(
+                dm_inbox::AuthenticatedMachineBindingCache::default(),
+            )),
             machine_discovery_cache: std::sync::Arc::new(tokio::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
@@ -30061,6 +31242,7 @@ async fn patch_discovery_entry_when_blob_lands_merges_verified_pair() {
 
     patch_discovery_entry_when_blob_lands(
         &cache,
+        &Default::default(),
         &blob_cache,
         &cert_events,
         &digest,
@@ -30110,6 +31292,7 @@ async fn patch_discovery_entry_when_blob_lands_merges_verified_pair() {
         .await;
     patch_discovery_entry_when_blob_lands(
         &cache,
+        &Default::default(),
         &blob_cache,
         &cert_events,
         &other_digest,
@@ -30175,6 +31358,7 @@ async fn patch_discovery_entry_rejects_superseded_digest_fetch() {
 
     patch_discovery_entry_when_blob_lands(
         &cache,
+        &Default::default(),
         &blob_cache,
         &cert_events,
         &d1,
@@ -30195,6 +31379,418 @@ async fn patch_discovery_entry_rejects_superseded_digest_fetch() {
         entry.cert_digest,
         Some(d2),
         "#447 r2: the entry keeps its CURRENT announce digest"
+    );
+}
+
+/// WHY (x0x #1150 r7d, Codex NEW 1): a V3 announcement whose certificate
+/// blob was not yet cached records only the digest, with no expiry. When
+/// the verified blob lands, the announced binding (the pinned path's live
+/// authority) must learn the certificate's expiry, as the discovery entry
+/// does. Then a certificate that has since expired is refused.
+#[tokio::test]
+async fn r7d_announced_binding_learns_expiry_when_the_certificate_blob_lands() {
+    let user_kp = identity::UserKeypair::from_seed(&[0x5d; 32]).expect("owner kp");
+    let joiner = identity::AgentKeypair::generate().expect("joiner kp");
+    let not_after = Agent::unix_timestamp_secs() + 600;
+    let cert = identity::AgentCertificate::issue_with_expiry(&user_kp, &joiner, Some(not_after))
+        .expect("joiner cert");
+    let digest = announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()));
+    let cache = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let machine_cache =
+        std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let announced: dm_inbox::AuthenticatedMachineBindings = Default::default();
+    let cert_events = test_cert_events();
+    let mut entry = discovered_agent_fixture(0x5d, 100, &[], None);
+    entry.agent_id = joiner.agent_id();
+    entry.cert_digest = Some(digest);
+    cache_verified_announcement(
+        &machine_cache,
+        &announced,
+        None,
+        &cache,
+        &cert_events,
+        entry,
+    )
+    .await;
+    let blob_cache = std::sync::Arc::new(announce_blob::AnnounceBlobCache::new(None));
+    blob_cache
+        .insert_verified(announce_blob::CachedBlob {
+            digest,
+            user_id: cert.user_id().ok(),
+            agent_certificate: Some(cert),
+            payload_version: 1,
+            fetched_at_unix: 1,
+        })
+        .await;
+    patch_discovery_entry_when_blob_lands(
+        &cache,
+        &announced,
+        &blob_cache,
+        &cert_events,
+        &digest,
+        &joiner.agent_id(),
+    )
+    .await;
+    let binding = announced.read().await.peek(&joiner.agent_id());
+    assert_eq!(
+        binding.and_then(|b| b.cert_not_after),
+        Some(not_after),
+        "the announced binding never learned the landed certificate's expiry"
+    );
+    assert!(
+        select_pinned_binding(
+            binding,
+            None,
+            None,
+            || None,
+            not_after + identity::EXPIRY_CLOCK_SKEW_SECS + 1
+        )
+        .is_none(),
+        "an expired announced binding still resolved"
+    );
+}
+
+/// WHY (x0x #1150 r7d, Codex NEW 1): a later announcement that commits to
+/// the SAME certificate digest, but whose blob is not cached here (no
+/// inline certificate, so no expiry), must not erase the expiry already
+/// known for that unchanged evidence. The discovery entry keeps it; so must
+/// the announced binding.
+#[tokio::test]
+async fn r7d_announced_binding_keeps_known_expiry_across_a_same_digest_blob_miss() {
+    let user_kp = identity::UserKeypair::from_seed(&[0x5e; 32]).expect("owner kp");
+    let joiner = identity::AgentKeypair::generate().expect("joiner kp");
+    let not_after = Agent::unix_timestamp_secs() + 600;
+    let cert = identity::AgentCertificate::issue_with_expiry(&user_kp, &joiner, Some(not_after))
+        .expect("joiner cert");
+    let digest = announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()));
+    let cache = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let machine_cache =
+        std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let announced: dm_inbox::AuthenticatedMachineBindings = Default::default();
+    let cert_events = test_cert_events();
+    let mut first = discovered_agent_fixture(0x5e, 100, &[], cert.user_id().ok());
+    first.agent_id = joiner.agent_id();
+    first.cert_not_after = cert.not_after();
+    first.agent_certificate = Some(cert);
+    first.cert_digest = Some(digest);
+    cache_verified_announcement(
+        &machine_cache,
+        &announced,
+        None,
+        &cache,
+        &cert_events,
+        first,
+    )
+    .await;
+    let mut miss = discovered_agent_fixture(0x5e, 200, &[], None);
+    miss.agent_id = joiner.agent_id();
+    miss.cert_digest = Some(digest);
+    cache_verified_announcement(&machine_cache, &announced, None, &cache, &cert_events, miss).await;
+    assert_eq!(
+        announced
+            .read()
+            .await
+            .peek(&joiner.agent_id())
+            .and_then(|b| b.cert_not_after),
+        Some(not_after),
+        "a same-digest blob miss erased the known expiry"
+    );
+}
+
+/// WHY (x0x #1150 r7e, r7f; Codex NEW 1): ingest and hydration race. An
+/// ingest of a V3 announcement whose certificate blob is not yet cached is
+/// parked between its two writes (the discovery merge and the
+/// announced-binding store write, in either order) by the test-only
+/// barrier. The verified blob lands, hydration runs to completion, and
+/// other inserts evict the blob from the 256-entry cache. Only then is the
+/// ingest released. The landed expiry must survive: correctness may not
+/// depend on the blob surviving for a second lookup. Whenever discovery
+/// holds the certificate, the announced binding must hold its expiry.
+#[tokio::test]
+async fn r7e_a_certificate_landing_mid_ingest_keeps_its_expiry() {
+    let user_kp = identity::UserKeypair::from_seed(&[0x6a; 32]).expect("owner kp");
+    let joiner = identity::AgentKeypair::generate().expect("joiner kp");
+    let joiner_id = joiner.agent_id();
+    let not_after = Agent::unix_timestamp_secs() + 600;
+    let cert = identity::AgentCertificate::issue_with_expiry(&user_kp, &joiner, Some(not_after))
+        .expect("joiner cert");
+    let digest = announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()));
+    let cache = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let machine_cache =
+        std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let announced: dm_inbox::AuthenticatedMachineBindings = Default::default();
+    let cert_events = test_cert_events();
+    let blob_cache = std::sync::Arc::new(announce_blob::AnnounceBlobCache::new(None));
+    let mut entry = discovered_agent_fixture(0x6a, 100, &[], None);
+    entry.agent_id = joiner_id;
+    entry.cert_digest = Some(digest);
+    let gate =
+        announced_record_barrier::arm(joiner_id, announced_record_barrier::INGEST_BETWEEN_WRITES);
+    let ingest = {
+        let (machine_cache, announced, blob_cache, cache, cert_events) = (
+            std::sync::Arc::clone(&machine_cache),
+            std::sync::Arc::clone(&announced),
+            std::sync::Arc::clone(&blob_cache),
+            std::sync::Arc::clone(&cache),
+            cert_events.clone(),
+        );
+        tokio::spawn(async move {
+            cache_verified_announcement(
+                &machine_cache,
+                &announced,
+                Some(&blob_cache),
+                &cache,
+                &cert_events,
+                entry,
+            )
+            .await;
+        })
+    };
+    let parked = tokio::time::timeout(std::time::Duration::from_secs(5), gate.reached.acquire())
+        .await
+        .expect("the ingest reached its store write")
+        .expect("barrier open");
+    parked.forget();
+    blob_cache
+        .insert_verified(announce_blob::CachedBlob {
+            digest,
+            user_id: cert.user_id().ok(),
+            agent_certificate: Some(cert),
+            payload_version: 1,
+            fetched_at_unix: 1,
+        })
+        .await;
+    patch_discovery_entry_when_blob_lands(
+        &cache,
+        &announced,
+        &blob_cache,
+        &cert_events,
+        &digest,
+        &joiner_id,
+    )
+    .await;
+    // r7f: other verified inserts evict the landed blob before the ingest
+    // resumes.
+    for i in 0..announce_blob::BLOB_CACHE_MAX_ENTRIES as u64 {
+        blob_cache
+            .insert_verified(announce_blob::CachedBlob {
+                digest: blake3::hash(&i.to_le_bytes()).into(),
+                user_id: None,
+                agent_certificate: None,
+                payload_version: 1,
+                fetched_at_unix: 1,
+            })
+            .await;
+    }
+    assert!(
+        blob_cache.get(&digest).await.is_none(),
+        "precondition: the landed blob was evicted"
+    );
+    gate.release.add_permits(1);
+    ingest.await.expect("ingest task");
+    announced_record_barrier::disarm(&joiner_id, announced_record_barrier::INGEST_BETWEEN_WRITES);
+    let stored = announced
+        .read()
+        .await
+        .peek(&joiner_id)
+        .and_then(|b| b.cert_not_after);
+    let discovered = cache
+        .read()
+        .await
+        .get(&joiner_id)
+        .and_then(|entry| entry.agent_certificate.as_ref().map(|c| c.not_after()));
+    if let Some(discovered) = discovered {
+        assert_eq!(
+            stored, discovered,
+            "discovery holds the landed certificate but the announced binding lost its expiry"
+        );
+    }
+    assert_eq!(
+        stored,
+        Some(not_after),
+        "a late ingest write erased the expiry its racing hydration landed"
+    );
+}
+
+/// WHY (x0x #1150 r7g, Codex r7f): a certificate is never published before
+/// its expiry. Blob verification checks the signature, not the expiry, so
+/// an already-expired certificate can land. Hydration is parked at the
+/// moment the certificate is published (after its discovery patch, before
+/// the binding's expiry update). At that moment, a pinned read of the
+/// announced-binding store, the non-blocking read the seam makes, must not
+/// accept the binding: either the expiry is already there, or the store is
+/// held and the seam refuses.
+#[tokio::test]
+async fn r7g_a_landed_certificate_is_never_published_before_its_expiry() {
+    let user_kp = identity::UserKeypair::from_seed(&[0x6c; 32]).expect("owner kp");
+    let joiner = identity::AgentKeypair::generate().expect("joiner kp");
+    let joiner_id = joiner.agent_id();
+    let now = Agent::unix_timestamp_secs();
+    let expired = now - 86_400;
+    let cert = identity::AgentCertificate::issue_with_expiry(&user_kp, &joiner, Some(expired))
+        .expect("joiner cert");
+    let digest = announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()));
+    let cache = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let machine_cache =
+        std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let announced: dm_inbox::AuthenticatedMachineBindings = Default::default();
+    let cert_events = test_cert_events();
+    let blob_cache = std::sync::Arc::new(announce_blob::AnnounceBlobCache::new(None));
+    let mut entry = discovered_agent_fixture(0x6c, now, &[], None);
+    entry.agent_id = joiner_id;
+    entry.cert_digest = Some(digest);
+    cache_verified_announcement(
+        &machine_cache,
+        &announced,
+        None,
+        &cache,
+        &cert_events,
+        entry,
+    )
+    .await;
+    blob_cache
+        .insert_verified(announce_blob::CachedBlob {
+            digest,
+            user_id: cert.user_id().ok(),
+            agent_certificate: Some(cert),
+            payload_version: 1,
+            fetched_at_unix: 1,
+        })
+        .await;
+    let gate =
+        announced_record_barrier::arm(joiner_id, announced_record_barrier::HYDRATION_PUBLISH);
+    let hydration = {
+        let (cache, announced, blob_cache, cert_events) = (
+            std::sync::Arc::clone(&cache),
+            std::sync::Arc::clone(&announced),
+            std::sync::Arc::clone(&blob_cache),
+            cert_events.clone(),
+        );
+        tokio::spawn(async move {
+            patch_discovery_entry_when_blob_lands(
+                &cache,
+                &announced,
+                &blob_cache,
+                &cert_events,
+                &digest,
+                &joiner_id,
+            )
+            .await;
+        })
+    };
+    let parked = tokio::time::timeout(std::time::Duration::from_secs(10), gate.reached.acquire())
+        .await
+        .expect("hydration reached the publication point")
+        .expect("barrier open");
+    parked.forget();
+    // The seam's read: try_read the store; contention refuses.
+    let seam_accepts = match announced.try_read() {
+        Ok(store) => {
+            select_pinned_binding(store.peek(&joiner_id), None, None, || None, now).is_some()
+        }
+        Err(_) => false,
+    };
+    let published = cache.try_read().ok().and_then(|discovery| {
+        discovery
+            .get(&joiner_id)
+            .map(|e| e.agent_certificate.is_some())
+    });
+    gate.release.add_permits(1);
+    hydration.await.expect("hydration task");
+    announced_record_barrier::disarm(&joiner_id, announced_record_barrier::HYDRATION_PUBLISH);
+    assert!(
+        !seam_accepts,
+        "the seam accepted the binding while discovery held its expired certificate \
+         (discovery published: {published:?})"
+    );
+    assert!(
+        select_pinned_binding(
+            announced.read().await.peek(&joiner_id),
+            None,
+            None,
+            || None,
+            now
+        )
+        .is_none(),
+        "after hydration the expired certificate's binding still resolves"
+    );
+}
+
+/// WHY (x0x #1150 r7e, Codex NEW 2): the announced binding keeps the
+/// certificate expiry for an unchanged digest whether or not the discovery
+/// entry survives. After the entry is evicted (TTL or the cache cap), a
+/// same-digest V3 blob miss must not erase the known expiry. A verified
+/// digest change does clear it.
+#[tokio::test]
+async fn r7e_discovery_eviction_never_erases_a_retained_expiry() {
+    let user_kp = identity::UserKeypair::from_seed(&[0x6b; 32]).expect("owner kp");
+    let joiner = identity::AgentKeypair::generate().expect("joiner kp");
+    let joiner_id = joiner.agent_id();
+    let not_after = Agent::unix_timestamp_secs() + 600;
+    let cert = identity::AgentCertificate::issue_with_expiry(&user_kp, &joiner, Some(not_after))
+        .expect("joiner cert");
+    let digest = announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()));
+    let cache = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let machine_cache =
+        std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let announced: dm_inbox::AuthenticatedMachineBindings = Default::default();
+    let cert_events = test_cert_events();
+    let ingest = |at: u64, digest: [u8; 32], cert: Option<identity::AgentCertificate>| {
+        let mut entry = discovered_agent_fixture(0x6b, at, &[], None);
+        entry.agent_id = joiner_id;
+        entry.cert_digest = Some(digest);
+        entry.cert_not_after = cert
+            .as_ref()
+            .and_then(identity::AgentCertificate::not_after);
+        entry.user_id = cert.as_ref().and_then(|c| c.user_id().ok());
+        entry.agent_certificate = cert;
+        entry
+    };
+    let expiry = || async {
+        announced
+            .read()
+            .await
+            .peek(&joiner_id)
+            .and_then(|b| b.cert_not_after)
+    };
+    cache_verified_announcement(
+        &machine_cache,
+        &announced,
+        None,
+        &cache,
+        &cert_events,
+        ingest(100, digest, Some(cert)),
+    )
+    .await;
+    assert_eq!(expiry().await, Some(not_after), "control: inline expiry");
+    cache.write().await.remove(&joiner_id);
+    cache_verified_announcement(
+        &machine_cache,
+        &announced,
+        None,
+        &cache,
+        &cert_events,
+        ingest(200, digest, None),
+    )
+    .await;
+    assert_eq!(
+        expiry().await,
+        Some(not_after),
+        "a same-digest blob miss after discovery eviction erased the retained expiry"
+    );
+    cache_verified_announcement(
+        &machine_cache,
+        &announced,
+        None,
+        &cache,
+        &cert_events,
+        ingest(300, [0x77; 32], None),
+    )
+    .await;
+    assert_eq!(
+        expiry().await,
+        None,
+        "control: a verified digest change clears the expiry"
     );
 }
 
