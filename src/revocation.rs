@@ -758,6 +758,24 @@ impl RevocationSet {
             .collect()
     }
 
+    /// Validate the persisted layout without verifying record signatures.
+    /// Load/merge callers still use the authority-verifying decoders.
+    pub(crate) fn validate_persisted_bytes(
+        bytes: &[u8],
+        magic: &[u8; 4],
+    ) -> Result<(), IdentityError> {
+        // Keep the existing decoders' empty-file acceptance.
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let body = bytes.strip_prefix(magic).ok_or_else(|| {
+            IdentityError::Serialization("revocation file magic mismatch".to_string())
+        })?;
+        let _: Vec<PersistedRevocation> =
+            bincode::deserialize(body).map_err(|e| IdentityError::Serialization(e.to_string()))?;
+        Ok(())
+    }
+
     /// Encode the V1 set for on-disk persistence: `X0XR` magic + bincode of
     /// the legacy-subject (`Agent`/`Machine`) record list, each record
     /// carrying the certificate that authorizes it. Binding tombstones
@@ -980,6 +998,55 @@ fn is_v1_subject(subject: &RevokedSubject) -> bool {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    #[tokio::test]
+    async fn structural_validation_keeps_signature_checks_on_load_1116() {
+        let issuer = crate::identity::AgentKeypair::generate().unwrap();
+        let mut record = RevocationRecord::sign(
+            RevokedSubject::Agent(issuer.agent_id()),
+            issuer.public_key(),
+            issuer.secret_key(),
+            1_000,
+            None,
+        )
+        .unwrap();
+        record.signature[0] ^= 0xff;
+        let persisted = vec![PersistedRevocation {
+            record,
+            subject_cert: None,
+        }];
+        let body = bincode::serialize(&persisted).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        for (name, magic) in [
+            ("revocations.bin", REVOCATIONS_FILE_MAGIC),
+            ("revocations-v2.bin", REVOCATIONS_FILE_MAGIC_V2),
+            ("revocations-v3.bin", REVOCATIONS_FILE_MAGIC_V3),
+        ] {
+            let mut bytes = magic.to_vec();
+            bytes.extend_from_slice(&body);
+            assert!(RevocationSet::validate_persisted_bytes(&bytes, magic).is_ok());
+            let loaded = match name {
+                "revocations.bin" => RevocationSet::from_bytes(&bytes),
+                "revocations-v2.bin" => RevocationSet::from_bytes_v2(&bytes),
+                _ => RevocationSet::from_bytes_v3(&bytes),
+            }
+            .unwrap();
+            assert!(
+                loaded.is_empty(),
+                "invalid authority still rejected on load"
+            );
+            let path = dir.path().join(name);
+            tokio::fs::write(&path, &bytes).await.unwrap();
+            crate::storage::save_private_bytes_to(&path, bytes.clone())
+                .await
+                .unwrap();
+            assert_eq!(tokio::fs::read(&path).await.unwrap(), bytes);
+            let mut malformed = magic.to_vec();
+            malformed.push(1);
+            assert!(RevocationSet::validate_persisted_bytes(&malformed, magic).is_err());
+            assert!(RevocationSet::validate_persisted_bytes(b"X0RX", magic).is_err());
+        }
+    }
 
     mod revocation_cadence {
         use super::super::*;

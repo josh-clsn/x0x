@@ -321,9 +321,27 @@ async fn write_private_file(path: &Path, bytes: Vec<u8>) -> Result<()> {
 /// Returns an error if the directory cannot be created, the write, the
 /// file sync, the rename, or the parent-directory sync fails.
 pub async fn write_private_bytes_durable(path: &Path, bytes: Vec<u8>) -> Result<()> {
+    let guard = revocation_write_guard(path).await?;
+    write_private_bytes_durable_guarded(path, bytes, guard).await
+}
+
+/// V3's read/merge already validated the file and holds its write guard.
+/// Consume that guard through fsync rather than reading the file twice.
+pub(crate) async fn write_revocation_bytes_durable(
+    bytes: Vec<u8>,
+    guard: RevocationWriteGuard,
+) -> Result<()> {
+    let path = guard.path.clone();
+    write_private_bytes_durable_guarded(&path, bytes, Some(guard)).await
+}
+
+async fn write_private_bytes_durable_guarded(
+    path: &Path,
+    bytes: Vec<u8>,
+    _revocation_guard: Option<RevocationWriteGuard>,
+) -> Result<()> {
     use tokio::io::AsyncWriteExt;
 
-    let _revocation_guard = revocation_write_guard(path).await?;
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -804,7 +822,7 @@ pub async fn load_agent_certificate_from<P: AsRef<Path>>(path: P) -> Result<Agen
 ///
 /// When `identity_dir` is provided (multi-instance daemons), the file is
 /// stored there instead of the global `~/.x0x/` directory.
-fn revocation_path(identity_dir: Option<&Path>) -> Option<std::path::PathBuf> {
+pub(crate) fn revocation_path(identity_dir: Option<&Path>) -> Option<std::path::PathBuf> {
     match identity_dir {
         Some(dir) => Some(dir.join(REVOCATION_FILE)),
         // Issue #456: honor X0X_HOME (tests relocate this; never the real
@@ -839,6 +857,15 @@ impl RevocationStore {
         }
     }
 
+    fn validate(self, bytes: &[u8]) -> Result<()> {
+        let magic = match self {
+            Self::V1 => b"X0XR",
+            Self::V2 => b"X0R2",
+            Self::V3 => b"X0R3",
+        };
+        RevocationSet::validate_persisted_bytes(bytes, magic)
+    }
+
     fn decode(self, bytes: &[u8]) -> Result<RevocationSet> {
         match self {
             Self::V1 => RevocationSet::from_bytes(bytes),
@@ -864,6 +891,7 @@ pub(crate) fn revocation_persistence_is_blocked(error: &IdentityError) -> bool {
 
 #[derive(Default)]
 struct RevocationStoreState {
+    write_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     unreadable: Option<String>,
     last_persist_warning: Option<std::time::Instant>,
 }
@@ -882,14 +910,14 @@ fn revocation_store_states() -> &'static tokio::sync::Mutex<RevocationStoreState
 async fn read_revocation_store_locked(
     path: &Path,
     store: RevocationStore,
-    states: &mut RevocationStoreStates,
     persist_attempt: bool,
-) -> Result<Option<RevocationSet>> {
+) -> Result<Option<Vec<u8>>> {
     let result = match fs::read(path).await {
-        Ok(bytes) => store.decode(&bytes).map(Some),
+        Ok(bytes) => store.validate(&bytes).map(|()| Some(bytes)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(IdentityError::Storage(e)),
     };
+    let mut states = revocation_store_states().lock().await;
     let state = states.entry(path.to_path_buf()).or_default();
     match result {
         Ok(set) => {
@@ -929,28 +957,67 @@ async fn read_revocation_store_locked(
     }
 }
 
-/// Load-only callers keep their fail-open fallback. The v3 merge writer
-/// calls this under its existing file lock and propagates the typed refusal.
+/// Serialization is per store path. The global map mutex only protects
+/// warning state/lock lookup, never disk I/O or record signature checks.
+pub(crate) struct RevocationWriteGuard {
+    path: std::path::PathBuf,
+    _lock: tokio::sync::OwnedMutexGuard<()>,
+}
+
+async fn lock_revocation_path(path: &Path) -> RevocationWriteGuard {
+    let lock = {
+        let mut states = revocation_store_states().lock().await;
+        std::sync::Arc::clone(&states.entry(path.to_path_buf()).or_default().write_lock)
+    };
+    RevocationWriteGuard {
+        path: path.to_path_buf(),
+        _lock: lock.lock_owned().await,
+    }
+}
+
+/// Load-only callers keep their fail-open fallback and verify authority
+/// after releasing storage serialization.
 pub(crate) async fn read_revocation_store(
     path: &Path,
     store: RevocationStore,
     persist_attempt: bool,
 ) -> Result<Option<RevocationSet>> {
-    let mut states = revocation_store_states().lock().await;
-    read_revocation_store_locked(path, store, &mut states, persist_attempt).await
+    let bytes = {
+        let _guard = lock_revocation_path(path).await;
+        read_revocation_store_locked(path, store, persist_attempt).await?
+    };
+    bytes.map(|bytes| store.decode(&bytes)).transpose()
+}
+
+/// V3 merge keeps this guard through the final durable write, and reads
+/// only once under its OS lock. Signature verification happens without
+/// holding the global bookkeeping mutex.
+pub(crate) async fn read_revocation_store_for_write(
+    path: &Path,
+    store: RevocationStore,
+) -> Result<(Option<RevocationSet>, RevocationWriteGuard)> {
+    let guard = lock_revocation_path(path).await;
+    let bytes = read_revocation_store_locked(path, store, true).await?;
+    let set = bytes.map(|bytes| store.decode(&bytes)).transpose()?;
+    Ok((set, guard))
+}
+
+/// Check an unchanged store for a rate-limited blocked-store warning.
+pub(crate) async fn probe_revocation_store(path: &Path, store: RevocationStore) -> Result<()> {
+    let _guard = lock_revocation_path(path).await;
+    read_revocation_store_locked(path, store, true).await?;
+    Ok(())
 }
 
 /// Both atomic writers use this guard, covering ordinary, pre-encoded and
-/// generic saves. It stays held from re-validation through rename/fsync.
-async fn revocation_write_guard(
-    path: &Path,
-) -> Result<Option<tokio::sync::MutexGuard<'static, RevocationStoreStates>>> {
+/// generic saves. It stays held from structural validation through fsync.
+async fn revocation_write_guard(path: &Path) -> Result<Option<RevocationWriteGuard>> {
     let Some(store) = RevocationStore::at_path(path) else {
         return Ok(None);
     };
-    let mut states = revocation_store_states().lock().await;
-    read_revocation_store_locked(path, store, &mut states, true).await?;
-    Ok(Some(states))
+    let guard = lock_revocation_path(path).await;
+    read_revocation_store_locked(path, store, true).await?;
+    Ok(Some(guard))
 }
 
 /// Load the local revocation set from disk.
@@ -1199,7 +1266,7 @@ mod tests {
                 .await
                 .get_mut(&path)
                 .unwrap()
-                .last_persist_warning = Some(first - std::time::Duration::from_secs(31));
+                .last_persist_warning = first.checked_sub(std::time::Duration::from_secs(31));
             assert!(save_private_bytes_to(&path, bytes.clone()).await.is_err());
             assert!(
                 revocation_store_states().lock().await[&path]
