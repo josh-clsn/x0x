@@ -1,10 +1,11 @@
 # The 15 ADR set
 
-David agreed this direction and requested a PR on 5 October 2026. This set
-captures that agreement for team review. Start with A01, A04, A07 and A15.
+The 15-slot direction is confirmed by David (D198), as is the approximately
+80% ASD-STE100 writing target. This set records that direction for team review.
+Start with A01, A04, A07 and A15.
 
 The 15 records are **Proposed replacements**. Their transfer checks remain
-open. Agreement on the direction does not declare every unresolved detail
+open. Confirmation of the direction does not declare every unresolved detail
 accepted or every feature shipped. The existing accepted ADRs, status overlay,
 frozen evidence and active issue gates still govern implementation.
 
@@ -31,21 +32,22 @@ frozen evidence and active issue gates still govern implementation.
 ## Keep no more than 15 current ADRs
 
 1. Use only A01 through A15 for the consolidated set. Do not create A16.
-2. Keep one selected current revision per slot. A proposed successor uses
-   the same ID and a new revision number. It is not an extra current decision.
-3. Preserve accepted revisions as exact historical records. Never rewrite
+2. Preserve accepted revisions as exact historical records. Never rewrite
    an accepted record to make room for a new decision.
-4. Keep wire layouts, full state machines and detailed test plans in linked
+3. Keep wire layouts, full state machines and detailed test plans in linked
    specifications. A specification cannot change an accepted guarantee.
-5. Target 500 to 1,000 words in each ADR. Review a record above 1,500 words.
-6. Use the [documentation style guide](../../documentation-style.md), including
+4. Target 500 to 1,000 words in each ADR. Review a record above 1,500 words.
+5. Use the [documentation style guide](../../documentation-style.md), including
    the approximately 80% ASD-STE100 style target.
 
 The limit applies to current decisions after transfer. Archived records and
-past accepted revisions do not count. The existing numbered series remains
-in place during transfer, because current teams depend on its rules and paths.
-Keep already assigned ADR work in that series on its existing review lane.
-Map new work to one of the 15 slots. Do not start another general ADR series.
+past accepted revisions do not count. During transfer, new or changed
+decisions use the numbered ADR series only, through ADR 0087 (D199). Slot
+revisions are drafts until David accepts the transfer. Keep reserved numbers
+0090/0091 (D18), 0097 (D20), 0098 (D35), and 0084–0105 (D63).
+Slices 0109–0114 continue to acceptance as numbered ADRs. Map their rulings
+to the slots without changing that decision path. The transition check does
+not yet support multiple revision files per slot; see [coverage gaps](../TOOLING.md#transition-check-coverage).
 
 ## Transfer before activation
 

@@ -4,11 +4,11 @@
 - **Revision:** 1
 - **Date:** 2026-10-05
 - **Decision owner:** David Irvine
-- **Direction:** Agreed by David on 2026-10-05 for this team review.
+- **Direction:** Confirmed by David (D198) on 2026-10-05 for this team review.
 - **Replacement activation:** Pending the transfer and acceptance checks in A15.
 - **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
 
-These are the agreed review drafts. Formal replacement acceptance remains pending.
+These drafts remain Proposed until David accepts the transfer (D198, D199).
 Use the [index and transition rules](README.md) to interpret their status.
 
 Group encryption must follow committed membership. A roster change alone does not prove that a departed member can no longer decrypt later traffic.
@@ -45,7 +45,12 @@ Coordinate membership state, key state and their durable records. On restart, co
 
 Future-epoch content may be held under defined size and time limits while the required state arrives. Report expiry and recovery failure. Do not silently present such content as applied.
 
-Use the approved designated-first and fallback rules for concurrent exclusion work. Timing values require evidence from the simulation harness. This draft does not invent shorter timeout values.
+D34 rules automatic revocation eviction and rekeying within a bound. D40
+specifies designated-first, with fallback after the bound; D74 refines the
+selection to the lowest roster admin, without reachability data. ADR 0110
+remains **Proposed**: the ruling does not accept its full protocol. D69/D73
+require harness measurements for its timing values. This draft does not
+choose new bounds or waive numbered acceptance.
 
 [A08](A08-r01-groups-home-membership-and-repair.md) defines valid group-state and fork recovery. A09 must not bypass that authority to obtain keys faster.
 
@@ -84,6 +89,9 @@ Test old and new peers across activation. Check both confidentiality and progres
 Complete the legacy exit criteria and exact exclusion bounds. Reconcile the new record with the accepted and proposed membership rules before acceptance.
 
 ## Existing decision records
+
+Read the [design direction and rulings digest](../../design/x0x-direction.md)
+and the [rulings transfer map](TRANSFER.md#rulings) with these records.
 
 These records are the primary sources for this draft. This mapping does not complete the clause by clause transfer required by A15.
 

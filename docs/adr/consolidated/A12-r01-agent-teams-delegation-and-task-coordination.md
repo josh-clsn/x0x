@@ -4,11 +4,11 @@
 - **Revision:** 1
 - **Date:** 2026-10-05
 - **Decision owner:** David Irvine
-- **Direction:** Agreed by David on 2026-10-05 for this team review.
+- **Direction:** Confirmed by David (D198) on 2026-10-05 for this team review.
 - **Replacement activation:** Pending the transfer and acceptance checks in A15.
 - **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
 
-These are the agreed review drafts. Formal replacement acceptance remains pending.
+These drafts remain Proposed until David accepts the transfer (D198, D199).
 Use the [index and transition rules](README.md) to interpret their status.
 
 Agents can share work through groups, messages, task lists and limited delegation. Coordination state must not be mistaken for exclusive authority to perform an external action.
@@ -47,7 +47,10 @@ The receiving adapter applies [A04](A04-r01-agent-attachment-and-inbound-events.
 
 A handoff must identify the work, relevant data, current state and authority being offered. Report consumer acceptance separately from transfer of task ownership.
 
-Signed task-ownership transfer was deferred from the earlier delegation work. This draft does not silently restore that protocol.
+Accepted ADR 0040 stands, as confirmed by D200: the task-list CRDT gains an
+explicit `owner_agent` field; transfers are signed by the current owner.
+Claiming no longer implies ownership. This is the accepted decision, separate
+from implementation progress.
 
 Keep reply loops, repeated delegation and fan-out bounded. Expiry and refusal must remain visible to the sender.
 
@@ -69,19 +72,29 @@ Putting all task semantics in x0xd would make every workflow a core protocol con
 
 ## Current implementation
 
-Task CRDTs, signed provenance, structured mentions and bounded delegation exist. Exclusive execution and signed ownership transfer are not general shipped guarantees.
+Task CRDTs, signed provenance, structured mentions and bounded delegation
+exist in the source snapshot. Complete `owner_agent` and signed-transfer
+implementation is not established by this review; its release evidence
+remains to be checked. This does not defer or change ADR 0040's decision.
+Exclusive execution is not a general shipped guarantee.
 
 ## Validation
 
 Run two disconnected claimants and verify honest local results and later convergence. Confirm that the external effect rule prevents harmful duplicates where required.
 
-Test expired, revoked and over-broad delegation. Verify that a mention cannot increase permissions.
+Test expired, revoked and over-broad delegation. Verify that a mention cannot
+increase permissions. For ADR 0040, reject a transfer signed by anyone other
+than the current owner; preserve `owner_agent` and the signed transfer across
+restart. Report that evidence separately from CRDT claim convergence.
 
 ## Matters to settle
 
 Choose the first agent-team workflow used for acceptance. State its execution rule explicitly before calling the workflow safe for irreversible work.
 
 ## Existing decision records
+
+Read the [design direction and rulings digest](../../design/x0x-direction.md)
+and the [rulings transfer map](TRANSFER.md#rulings) with these records.
 
 These records are the primary sources for this draft. This mapping does not complete the clause by clause transfer required by A15.
 

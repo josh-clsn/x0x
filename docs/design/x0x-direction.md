@@ -1,7 +1,7 @@
 # x0x design direction and rulings digest
 
 - **Status:** maintained digest, not an ADR. It records the design rulings
-  David Irvine made from 2026-09-28 to 2026-10-05 (decisions D01–D195 and the
+  David Irvine made from 2026-09-28 to 2026-10-05 (decisions D01–D200 and the
   efficiency decisions E-D1–E-D17).
 - **Updated:** 2026-10-05.
 - **Relationship to ADRs:** ADRs remain the decision records, and only David
@@ -114,7 +114,7 @@ wave that fixes each is in section 7.
 | I12 | **Resource bounds.** A daemon never fills its host's disk, spends a user's uplink as infrastructure, or grows queues without bound, and every bound is visible. |
 | I13 | **Plane isolation.** A test or named daemon never joins production by accident. |
 
-## 5. Decisions D01–D195
+## 5. Decisions D01–D200
 
 Status key: **implemented** = in effect on `main` (code, configuration or an
 Accepted ADR); **ruled** = decided by David, work outstanding or ongoing;
@@ -321,6 +321,11 @@ and D29 (an ADR 0089 slice pulled into v0.46).
 | D193 | ADR 0094: local checks block commit; a host that had a send-ready peer must reach one and keep it through the stable interval (a miss is Interrupted). | Ruled (2026-10-05) |
 | D194 | ADR 0094: keep the last committed binary pair as recovery material; refuse staging below 1 GiB free. | Ruled (2026-10-05) |
 | D195 | ADR 0094: SKILL.md installs only after the verified candidate's health holds; the prior guide is kept and restored in recovery. | Ruled (2026-10-05) |
+| D196 | W3-H is verdict-stable: all 20 CI reruns give the same verdict with complete structured receipts (setup, evidence, delivered request, exact cause for RED; every precondition for GREEN). Byte-identical canonical traces are reported but non-blocking; ordering and entropy work continues. This satisfies D181 and supersedes the old identical-trace criterion. | Ruled (2026-10-05) |
+| D197 | EvidenceV1 admission for relationship peers (same group roster, same owner, grant counterparty) needs not-Blocked trust; Unknown is allowed, Blocked is refused, and the evidence must verify. This matches ADR 0089 decision 2. | Ruled (2026-10-05) |
+| D198 | The 100 numbered ADRs consolidate into 15 replacement slots A01–A15. The direction and approximately 80% ASD-STE100 target for ADRs, docs and PR text are confirmed by David; drafts stay Proposed until he accepts the transfer. Keep technical terms; no claim of formal compliance. | Ruled (2026-10-05); transfer Pending |
+| D199 | During transfer, new or changed decisions use the numbered ADR series only (ADR 0087). Slot revisions are drafts. Reserved numbers stand: 0090/0091 (D18), 0097 (D20), 0098 (D35), 0084–0105 (D63). Slices 0109–0114 continue to numbered acceptance. | Ruled (2026-10-05) |
+| D200 | Accepted ADR 0040 stands: task-list CRDT `owner_agent`, with transfers signed by the current owner. A12 states that decision and reports implementation separately; the decision is not deferred. | Ruled (2026-10-05) |
 | COMMS | Use plain controlled language (about 80% toward ASD-STE100), fixed decision templates and one release contact; record and share each ruling, check live GitHub before requesting approval, keep the release dashboard current and include diagrams in briefs. Trial explainer videos after promotion. | Ruled; adopted 2026-10-02 |
 
 ## 6. Efficiency decisions E-D1–E-D17 (Track E)

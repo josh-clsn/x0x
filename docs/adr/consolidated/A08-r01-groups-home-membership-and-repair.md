@@ -4,11 +4,11 @@
 - **Revision:** 1
 - **Date:** 2026-10-05
 - **Decision owner:** David Irvine
-- **Direction:** Agreed by David on 2026-10-05 for this team review.
+- **Direction:** Confirmed by David (D198) on 2026-10-05 for this team review.
 - **Replacement activation:** Pending the transfer and acceptance checks in A15.
 - **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
 
-These are the agreed review drafts. Formal replacement acceptance remains pending.
+These drafts remain Proposed until David accepts the transfer (D198, D199).
 Use the [index and transition rules](README.md) to interpret their status.
 
 A group defines who can act and which shared state is valid. Home is a private group for one owner. Group operation must not depend on an unnecessary fixed device.
@@ -71,11 +71,27 @@ Allowing every admin to act immediately improves local progress but can create c
 
 The group foundation exists. The full liveness contract, scoped certificate work, any-holder repair, any-admin redemption and explicit Home transition span accepted and proposed old records. They are not one completed feature.
 
-The active simulation and group lanes retain their existing order and gates.
+D63 keeps separate numbered slice acceptance in this order:
+**S2 & S8 → S4 & S3 → S5 → S6 → S7**. D65 clarifies that S8 here means
+S8(a); S8(b) also waits for S4. The bindings are S1=0106, S2=0108, S3=0109,
+S4=0110, S5=0111, S6=0112, S7=0113, S8(a)=0107, and S8(b)=0114.
+D57 accepted 0107; D58 accepted 0088 with its conditional supersessions;
+D178 accepted 0108. Those acceptances do not waive the slice-code harness gate.
+Slices 0109–0114 continue through numbered acceptance (D199).
 
 ## Validation
 
-Reproduce failures before changing the mechanism. Exercise owner-offline admission, cold evidence, delayed and reordered messages, concurrent admins, restart and retention gaps.
+D16/D54 require each failure to be reproduced first in the W3-H harness
+(#1164), shown red on main in CI (D181), before its ADR 0088 slice code or
+group/Home liveness fix merges. Standalone in-process red tests do not count.
+D55's exception applies only to #1150 (a).
+
+D196 sets the W3-H harness gate verbatim:
+
+> A harness case lands (and satisfies harness-first, D181) when all 20 CI reruns give the same verdict with complete structured receipts (setup, evidence, delivered request, exact cause for RED; every precondition for GREEN). Byte-identical canonical traces across reruns are reported but non-blocking; determinism work (same-instant ordering, per-task entropy) continues as a follow-up.
+
+Exercise owner-offline admission, cold evidence, delayed and reordered messages,
+concurrent admins, restart and retention gaps.
 
 Every test must verify both progress and refusal. A group that repairs itself must still reject a revoked participant.
 
@@ -84,6 +100,9 @@ Every test must verify both progress and refusal. A group that repairs itself mu
 Complete the clause transfer from old ADRs 0088 and 0106–0114. Keep their unresolved decisions open. This short ADR must not silently choose a different fork, invite or recovery protocol.
 
 ## Existing decision records
+
+Read the [design direction and rulings digest](../../design/x0x-direction.md)
+and the [rulings transfer map](TRANSFER.md#rulings) with these records.
 
 These records are the primary sources for this draft. This mapping does not complete the clause by clause transfer required by A15.
 

@@ -4,11 +4,11 @@
 - **Revision:** 1
 - **Date:** 2026-10-05
 - **Decision owner:** David Irvine
-- **Direction:** Agreed by David on 2026-10-05 for this team review.
+- **Direction:** Confirmed by David (D198) on 2026-10-05 for this team review.
 - **Replacement activation:** Pending the transfer and acceptance checks in A15.
 - **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
 
-These are the agreed review drafts. Formal replacement acceptance remains pending.
+These drafts remain Proposed until David accepts the transfer (D198, D199).
 Use the [index and transition rules](README.md) to interpret their status.
 
 x0x will use its identities, permissions and connectivity for voice and video between people and agents. Media delivery has different timing needs from durable work messages.
@@ -78,6 +78,9 @@ Measure call setup, latency, quality and resource use. Confirm capture stops cor
 David must explicitly change the current priority before new media implementation starts. Then select the first supported platforms, codecs, topology and participant limit.
 
 ## Existing decision records
+
+Read the [design direction and rulings digest](../../design/x0x-direction.md)
+and the [rulings transfer map](TRANSFER.md#rulings) with these records.
 
 These records are the primary sources for this draft. This mapping does not complete the clause by clause transfer required by A15.
 

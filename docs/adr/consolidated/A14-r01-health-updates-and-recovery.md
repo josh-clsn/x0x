@@ -4,11 +4,11 @@
 - **Revision:** 1
 - **Date:** 2026-10-05
 - **Decision owner:** David Irvine
-- **Direction:** Agreed by David on 2026-10-05 for this team review.
+- **Direction:** Confirmed by David (D198) on 2026-10-05 for this team review.
 - **Replacement activation:** Pending the transfer and acceptance checks in A15.
 - **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
 
-These are the agreed review drafts. Formal replacement acceptance remains pending.
+These drafts remain Proposed until David accepts the transfer (D198, D199).
 Use the [index and transition rules](README.md) to interpret their status.
 
 x0x must remain recoverable when an update fails. Agents can help maintain a node, but update safety must also work when no agent is available.
@@ -79,9 +79,18 @@ Verify recovery with shared binaries and retained data. Record the exact build, 
 
 ## Matters to settle
 
-Keep the current M2 work and release authority intact. Set rollout and health policy only through their reviewed specifications and owner decisions.
+Keep the current M2 work and release authority intact. D182–D195 in the
+[design rulings digest](../../design/x0x-direction.md#5-decisions-d01d200)
+resolve ADR 0094's open values: manifest clock skew, rollout windows and bypass,
+the prerelease ban, probe and boot limits, fault classes, retries, holds,
+health checks, recovery material and SKILL.md timing. These rulings govern
+M2 code; they neither rewrite immutable ADR 0094 nor prove implementation.
+Preserve each ruling in the [transfer map](TRANSFER.md#rulings).
 
 ## Existing decision records
+
+Read the [design direction and rulings digest](../../design/x0x-direction.md)
+and the [rulings transfer map](TRANSFER.md#rulings) with these records.
 
 These records are the primary sources for this draft. This mapping does not complete the clause by clause transfer required by A15.
 

@@ -4,11 +4,11 @@
 - **Revision:** 1
 - **Date:** 2026-10-05
 - **Decision owner:** David Irvine
-- **Direction:** Agreed by David on 2026-10-05 for this team review.
+- **Direction:** Confirmed by David (D198) on 2026-10-05 for this team review.
 - **Replacement activation:** Pending the transfer and acceptance checks in A15.
 - **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
 
-These are the agreed review drafts. Formal replacement acceptance remains pending.
+These drafts remain Proposed until David accepts the transfer (D198, D199).
 Use the [index and transition rules](README.md) to interpret their status.
 
 x0x grants access through verified authority and limited permissions. Possession of a network connection, a message, or an agent name does not grant authority.
@@ -22,6 +22,11 @@ The current system has contact trust, owner trust, group roles, grants, local to
 We will use one authority model, with shared checks for each protected operation. Each decision must identify the caller, requested action, target, applicable scope and verified evidence.
 
 Authority checks will use evidence carried with the request and trusted persisted state. Discovery and cached hints can help obtain evidence. They cannot replace it.
+
+D197 confirms ADR 0089 decision 2 for EvidenceV1 admission: relationship peers
+(same group roster, same owner, or grant counterparty) may send at Unknown
+trust. Not-Blocked suffices for admission; Blocked remains refused, and the
+evidence must still verify. This does not grant the sender service authority.
 
 Owner trust applies only when the certificate, machine binding, enrollment and current revocation checks required for that operation succeed.
 
@@ -72,6 +77,9 @@ Tests must preserve denials when evidence is absent, damaged, stale or revoked. 
 The supporting specification must state revocation lifetimes, enforcement bounds and recovery exits. These limits must fit current group-recovery and update-compatibility work.
 
 ## Existing decision records
+
+Read the [design direction and rulings digest](../../design/x0x-direction.md)
+and the [rulings transfer map](TRANSFER.md#rulings) with these records.
 
 These records are the primary sources for this draft. This mapping does not complete the clause by clause transfer required by A15.
 

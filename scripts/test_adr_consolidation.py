@@ -61,6 +61,56 @@ class ConsolidationTests(unittest.TestCase):
         path.write_text(path.read_text().replace("**Status:** Proposed", "**Status:** Accepted"))
         self.assert_rejected("replacement status must remain Proposed")
 
+    def test_status_annotations_use_the_leading_lifecycle_token(self):
+        path = self.directory / self.index["slots"][0]["path"]
+        original = path.read_text()
+        for status in ("Proposed (transfer pending)", "**Proposed** review pending", "Proposed; review pending"):
+            with self.subTest(status=status):
+                path.write_text(original.replace("**Status:** Proposed", f"**Status:** {status}"))
+                self.assertEqual(CHECK.validate(self.root), [])
+        for status in ("Accepted (record)", "Accepted (Proposed replacement)", "ProposedElsewhere"):
+            with self.subTest(status=status):
+                path.write_text(original.replace("**Status:** Proposed", f"**Status:** {status}"))
+                self.assert_rejected("replacement status must remain Proposed")
+
+    def test_missing_or_duplicate_status_cannot_bypass_the_lock(self):
+        path = self.directory / self.index["slots"][0]["path"]
+        original = path.read_text()
+        for replacement in ("", "- **Status:** Proposed\n- **Status:** Accepted"):
+            with self.subTest(replacement=replacement):
+                path.write_text(original.replace("- **Status:** Proposed", replacement))
+                self.assert_rejected("replacement status must remain Proposed")
+
+    def test_title_must_match_the_index(self):
+        self.index["slots"][0]["title"] = "Different title"
+        self.save_index()
+        self.assert_rejected("title must match the selected slot")
+
+    def test_every_required_section_must_be_present(self):
+        path = self.directory / self.index["slots"][0]["path"]
+        original = path.read_text()
+        for section in sorted(CHECK.REQUIRED_SECTIONS):
+            with self.subTest(section=section):
+                path.write_text(original.replace(f"## {section}\n", "## Other\n"))
+                self.assert_rejected(f"missing ## {section}")
+
+    def test_selected_record_cannot_be_a_symlink(self):
+        path = self.directory / self.index["slots"][0]["path"]
+        target = self.root / "external.md"
+        path.rename(target)
+        path.symlink_to(target)
+        self.assert_rejected("records must be regular files, not links")
+
+    def test_revision_must_match_the_record_path(self):
+        self.index["slots"][0]["revision"] = 2
+        self.save_index()
+        self.assert_rejected("use its own Axx-rNN-title.md file and matching revision")
+
+    def test_slot_identity_must_match_the_record_path(self):
+        self.index["slots"][0]["path"] = self.index["slots"][1]["path"]
+        self.save_index()
+        self.assert_rejected("use its own Axx-rNN-title.md file and matching revision")
+
     def test_phase_flag_alone_cannot_activate_the_new_set(self):
         self.index["phase"] = "active"
         self.save_index()

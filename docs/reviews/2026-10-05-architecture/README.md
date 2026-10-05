@@ -12,7 +12,7 @@ inbox as well as permission to send.
   and open it in a browser to use its interactive tables. GitHub shows source.
 - [Documentation inventory](documentation-inventory.json), with the source
   file list and all 100 ADR mappings.
-- [The 15 agreed review drafts](../../adr/consolidated/README.md).
+- [The 15 Proposed review drafts](../../adr/consolidated/README.md).
 - [Documentation and communication style](../../documentation-style.md).
 
 The review used source commit
@@ -26,16 +26,18 @@ group encryption, shared data, connectivity, media and update security. It is
 a dated comparison, not a claim that x0x leads every field. The full review
 contains the source links and the limits of each comparison.
 
-## Agreed direction
+## Confirmed direction
 
-David agreed the 15-topic plan and requested this PR. A04 and A07 make reliable
+The 15-slot direction is confirmed by David (D198). A04 and A07 make reliable
 agent delivery explicit: scoped live events, replay after restart, durable
 consumer acknowledgment, and separate delivery and task-completion results.
 Adapters connect those events to ACP sessions or hosted model APIs.
 
-A15 limits the consolidated set to 15 current slots. Future changes use new
-revisions of those slots. The approximately 80% ASD-STE100 style target applies
-to ADRs, documentation and communication with David.
+A15 proposes a limit of 15 current slots after transfer. During transfer,
+new or changed decisions use the numbered ADR series only (D199, ADR 0087).
+Slot revisions remain drafts until David accepts the transfer. The approximately
+80% ASD-STE100 style target is confirmed by David (D198) for ADRs, documentation
+and PR text; it also applies to communication with David.
 
 This PR captures the direction and the review drafts. It does not activate
 replacement rules before their transfer checks pass. It does not move or edit

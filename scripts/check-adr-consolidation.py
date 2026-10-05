@@ -18,6 +18,11 @@ SUPPORT_FILES = {"README.md", "TRANSFER.md", "index.json"}
 REQUIRED_SECTIONS = {"Context", "Decision", "Consequences", "Validation"}
 
 
+def status_token(status: str) -> str:
+    """Read the leading lifecycle word, as adr-governance.py does."""
+    return status.split()[0].strip("*").rstrip(".,;:") if status.split() else status
+
+
 def validate(root: Path) -> list[str]:
     directory = root / "docs/adr/consolidated"
     errors: list[str] = []
@@ -44,7 +49,7 @@ def validate(root: Path) -> list[str]:
             continue
         identity = slot.get("id")
         if not isinstance(identity, str) or identity not in SLOTS:
-            errors.append(f"Unknown ADR slot {identity!r}; do not create A16 or another series.")
+            errors.append(f"Unknown ADR slot {identity!r}; do not create A16 or a second consolidated series.")
             continue
         if identity in seen:
             errors.append(f"Duplicate current slot {identity}.")
@@ -70,7 +75,7 @@ def validate(root: Path) -> list[str]:
         if not isinstance(title, str) or not text.startswith(f"# {identity} {title}\n"):
             errors.append(f"{name}: title must match the selected slot.")
         statuses = re.findall(r"^- \*\*Status:\*\* (.+)$", text, re.MULTILINE)
-        if statuses != ["Proposed"]:
+        if [status_token(status) for status in statuses] != ["Proposed"]:
             errors.append(f"{name}: replacement status must remain Proposed until transfer and acceptance controls are complete.")
         for section in sorted(REQUIRED_SECTIONS):
             if not re.search(rf"^## {section}$", text, re.MULTILINE):

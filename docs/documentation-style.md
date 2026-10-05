@@ -1,7 +1,7 @@
 # Documentation and communication style
 
 Use approximately 80% ASD-STE100 style in x0x ADRs, other documentation, and
-communication with David. This is the agreed writing target. Do not claim
+communication with David. David confirmed this writing target in D198. Do not claim
 formal ASD-STE100 compliance or invent a compliance percentage.
 
 ## Write for people and machines

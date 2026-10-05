@@ -4,11 +4,11 @@
 - **Revision:** 1
 - **Date:** 2026-10-05
 - **Decision owner:** David Irvine
-- **Direction:** Agreed by David on 2026-10-05 for this team review.
-- **Replacement activation:** Pending the transfer and acceptance checks in A15.
+- **Direction:** Confirmed by David (D198) on 2026-10-05 for this team review.
+- **Replacement activation:** Pending the [transfer review](TRANSFER.md) and the Acceptance checks below.
 - **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
 
-These are the agreed review drafts. Formal replacement acceptance remains pending.
+These drafts remain Proposed until David accepts the transfer (D198, D199).
 Use the [index and transition rules](README.md) to interpret their status.
 
 x0x will have no more than 15 current ADR slots. The new set must preserve important decisions and evidence while making the current architecture easier to read.
@@ -23,13 +23,19 @@ Current CI protects accepted ADR text and associated frozen evidence. Code, test
 
 Use stable current IDs [A01](A01-r01-purpose-and-product-limits.md)–A15. Archived records and previous accepted revisions do not count towards the limit.
 
-Each current slot has a clear subject. A change to that subject uses a proposed new revision, such as [A07](A07-r01-messages-receipts-history-and-retry.md) revision 2. David accepts the replacement. The earlier accepted revision remains unchanged in the archive.
+During transfer, new or changed decisions use the numbered ADR series only,
+through ADR 0087 (D199). Slot revisions are drafts until David accepts the
+transfer. Reserved numbers and slices keep the [numbered decision path](README.md).
 
-A current-version index selects one accepted revision per active slot. Proposed revisions remain visibly Proposed. An agent cannot accept them or create A16.
+After transfer and revision-aware gate support, the proposed model selects
+one accepted revision per active slot. A successor uses that slot's next
+revision; David accepts it, and the earlier accepted text remains unchanged.
+The present gate supports one Proposed draft per slot. An agent cannot accept
+it or create A16.
 
 Target 500–1,000 words per ADR. Review records above 1,500 words. Keep the key guarantees, alternatives and consequences in the decision record.
 
-Supporting specifications contain wire layouts, complete state machines, schemas and test detail. They may evolve only within the accepted guarantees. A material authority or compatibility change requires a new accepted revision.
+Supporting specifications contain wire layouts, complete state machines, schemas and test detail. They may evolve only within the accepted guarantees. A material authority or compatibility change needs an accepted decision; during transfer it uses the numbered series (D199).
 
 ## Language
 
@@ -49,13 +55,34 @@ Update governance CI before changing the governed layout. The new checks must pr
 
 ## Compatibility
 
-Version persisted and wire formats. Refuse malformed or unsupported data with a clear result. Do not silently replace unreadable authority state with an empty permissive state.
+Version persisted and wire formats. Refuse malformed or unsupported data with
+a clear result. Do not replace unreadable authority state with empty permissive
+state. Retain ADR 0085 rule 2: every released binary layout stays readable
+through a frozen copy of that release's serde shape, never the live type.
+Consume each body exactly; trailing bytes are an error. Allow a fallback
+only when at most one candidate layout can consume the body exactly.
 
 Gate incompatible behavior on verified capability evidence. Unknown capability is not proof of support.
 
 Document upgrade and downgrade limits. Test state produced by a real supported older release. Preserve retained data when a downgrade cannot read it.
 
 Release builds must use the tested dependency graph and lockfile. A source-level test result does not establish that a different published binary passed.
+
+## Repository and release governance
+
+ADR 0087 remains in force, including these rules:
+
+- Only David promotes releases. Agents change release tags or approve a
+  release environment deployment only on his instruction for that action.
+- David merges release-workflow changes (`release.yml`,
+  `publish-promoted-release.yml`, and `sign-skill.yml`).
+- An ADR-governed change has a Proposed ADR on main before its code merges
+  to any branch. Wire, network-protocol and qualifying dependency changes
+  also need an Accepted ADR before their code merges to main. ADR 0087 rule 8
+  defines qualifying dependency changes; routine unchanged-behavior refreshes
+  remain outside that definition.
+- An after-the-fact record of shipped behavior uses `Accepted (record)` and
+  names the accepting ruling. It does not waive the ADR-before-code rule.
 
 ## Validation
 
@@ -85,11 +112,14 @@ Publish one short current capability guide. Update the repository instructions a
 
 ## Matters to settle
 
-David agreed the 15-slot direction and asked for this PR on 5 October 2026. Complete the transfer review and acceptance controls before declaring the old set historical rather than governing.
+The 15-slot direction is confirmed by David (D198) on 5 October 2026. Complete the transfer review and acceptance controls before declaring the old set historical rather than governing.
 
 ## Existing decision records
 
-These records are the primary sources for this draft. This mapping does not complete the clause by clause transfer required by A15.
+Read the [design direction and rulings digest](../../design/x0x-direction.md)
+and the [rulings transfer map](TRANSFER.md#rulings) with these records.
+
+These are the primary sources. Their clause-level transfer remains open under Acceptance above.
 
 [ADR 0025 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0025-required-gates-prove-observation-completeness.md) · [ADR 0063 Rejected](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0063-signed-kv-legacy-gossip-compatibility-adoption-boundary.md) · [ADR 0085 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0085-persisted-binary-formats-are-versioned.md) · [ADR 0087 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0087-repository-and-release-governance.md) · [ADR 0093 Accepted](https://github.com/saorsa-labs/x0x/blob/eacf68591dffcb6f949e2a12bc6f05cfb6e8d481/docs/adr/0093-capability-advert-registry.md)
 

@@ -67,22 +67,21 @@ Example: `x0xd --name alice --api-port 12701 --no-hard-coded-bootstrap`.
 
 ## Documentation and communication
 
-Use approximately 80% ASD-STE100 style in ADRs, docs, PR text, review notes,
-and communication with David. Use short sentences, common words, clear actions
-and consistent terms. Keep necessary technical terms and exact guarantees.
-Do not claim formal compliance. Follow `docs/documentation-style.md`.
+The documentation and communication style is in `docs/documentation-style.md`.
 
 ## Architecture decisions (ADRs)
 Before changing architecture, protocols, storage formats, crypto, network
 behaviour, public APIs or operational invariants, check `docs/adr/` and its
-status overlay. Already assigned numbered ADR work uses `docs/adr/TEMPLATE.md`
-during transfer. New decisions use the fixed slots below. Accepted ADRs are
-immutable. Supersede them instead. Only a human marks an ADR Accepted.
+status overlay. During transfer, new or changed decisions use the numbered
+ADR series only, through `docs/adr/TEMPLATE.md` and the ADR 0087 process
+(D199). Accepted ADRs are immutable. Supersede them instead. Only David marks
+an ADR Accepted.
 
-The consolidated direction uses 15 fixed slots, A01 through A15. Read
-`docs/adr/consolidated/README.md` before adding a decision. Do not create A16
-or a new general ADR series. Use a proposed revision of the relevant slot.
-Keep already assigned numbered ADR work on its existing review lane during
-transfer. The old accepted records, overlay, frozen evidence and team gates
-stay in force until the replacement transfer and human acceptance are complete.
+The 15-slot direction, A01 through A15, is confirmed by David (D198).
+Slot revisions are drafts until David accepts the transfer (D199). Read
+`docs/adr/consolidated/README.md` for the transfer rules. Do not create A16
+or a second consolidated series. Reserved numbered ADRs remain reserved:
+0090/0091 (D18), 0097 (D20), 0098 (D35), and 0084–0105 (D63).
+Slices 0109–0114 continue to acceptance as numbered ADRs. The accepted
+records, overlay, frozen evidence and team gates remain in force.
 Run `python3 scripts/check-adr-consolidation.py` for the transition checks.
