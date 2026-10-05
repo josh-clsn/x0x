@@ -21898,7 +21898,7 @@ mod tests {
     mod unreadable_revocation_files_1116 {
         use super::*;
 
-        async fn load_agent(dir: &std::path::Path) -> Agent {
+        fn agent_builder(dir: &std::path::Path) -> AgentBuilder {
             Agent::builder()
                 .with_machine_key(dir.join("machine.key"))
                 .with_agent_key_path(dir.join("agent.key"))
@@ -21907,9 +21907,21 @@ mod tests {
                 .with_contact_store_path(dir.join("contacts.json"))
                 .with_user_key(identity::UserKeypair::generate().expect("owner key"))
                 .with_peer_cache_disabled()
+        }
+
+        async fn load_agent(dir: &std::path::Path) -> Agent {
+            agent_builder(dir)
                 .build()
                 .await
                 .expect("fail-open agent load")
+        }
+
+        async fn load_agent_with_gossip(dir: &std::path::Path) -> Agent {
+            agent_builder(dir)
+                .with_network_config(loopback_network_config())
+                .build()
+                .await
+                .expect("fail-open agent load with loopback gossip")
         }
 
         /// A local durability refusal must still enforce, evict and hand
@@ -21926,26 +21938,14 @@ mod tests {
                     .await
                     .unwrap();
             }
-            let agent = Agent::builder()
-                .with_machine_key(dir.path().join("machine.key"))
-                .with_agent_key_path(dir.path().join("agent.key"))
-                .with_agent_cert_path(dir.path().join("agent.cert"))
-                .with_identity_dir(dir.path())
-                .with_contact_store_path(dir.path().join("contacts.json"))
-                .with_user_key(identity::UserKeypair::generate().unwrap())
-                .with_peer_cache_disabled()
-                .with_network_config(network::NetworkConfig {
-                    bind_addr: Some("127.0.0.1:0".parse().unwrap()),
-                    bootstrap_nodes: vec![],
-                    mdns_enabled: false,
-                    ..network::NetworkConfig::default()
-                })
-                .build()
-                .await
-                .unwrap();
+            let agent = load_agent_with_gossip(dir.path()).await;
             let owner = agent.identity.user_keypair().unwrap();
             let cert = agent.identity.agent_certificate().unwrap();
-            let pubsub = agent.gossip_runtime.as_ref().unwrap().pubsub();
+            let pubsub = agent
+                .gossip_runtime
+                .as_ref()
+                .expect("loopback network config initializes gossip")
+                .pubsub();
             let subjects = [
                 (
                     revocation::RevokedSubject::Agent(agent.agent_id()),
@@ -22017,7 +22017,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("revocations.bin");
             tokio::fs::write(&path, b"unreadable v1").await.unwrap();
-            let agent = load_agent(dir.path()).await;
+            let agent = load_agent_with_gossip(dir.path()).await;
             let owner = agent.identity.user_keypair().unwrap();
             let cert = agent.identity.agent_certificate().unwrap();
             let subjects = [
@@ -22040,9 +22040,13 @@ mod tests {
                     REVOCATION_V3_TOPIC,
                 ),
             ];
-            let pubsub = agent.gossip_runtime.as_ref().unwrap().pubsub();
+            let pubsub = agent
+                .gossip_runtime
+                .as_ref()
+                .expect("loopback network config initializes gossip")
+                .pubsub();
             for (subject, topic) in subjects {
-                let _subscription = pubsub.subscribe(topic.to_string()).await;
+                let mut subscription = pubsub.subscribe(topic.to_string()).await;
                 let before = pubsub.stats().publish_total;
                 let record = revocation::RevocationRecord::sign(
                     subject.clone(),
@@ -22072,6 +22076,19 @@ mod tests {
                 }
                 assert!(agent.revocation_set.read().await.contains_hash(&hash));
                 assert_eq!(pubsub.stats().publish_total, before + 1);
+                let message = tokio::time::timeout(
+                    std::time::Duration::from_secs(5 * u64::from(test_time_multiplier())),
+                    subscription.recv(),
+                )
+                .await
+                .expect("revocation must reach its own local topic subscription")
+                .expect("topic subscription remains open");
+                assert_eq!(message.topic, topic);
+                let published: Vec<revocation::RevocationRecord> =
+                    bincode::deserialize(&message.payload)
+                        .expect("decode revocation topic payload");
+                assert_eq!(published.len(), 1, "only this topic's subject is published");
+                assert_eq!(published[0].record_hash(), hash);
                 let (name, restored) = match subject {
                     revocation::RevokedSubject::AgentMachineBinding(_) => {
                         let name = "revocations-v2.bin";

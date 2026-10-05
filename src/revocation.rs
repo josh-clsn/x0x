@@ -1052,39 +1052,73 @@ mod tests {
 
     #[tokio::test]
     async fn structural_validation_keeps_signature_checks_on_load_1116() {
-        let issuer = crate::identity::AgentKeypair::generate().unwrap();
-        let mut record = RevocationRecord::sign(
-            RevokedSubject::Agent(issuer.agent_id()),
-            issuer.public_key(),
-            issuer.secret_key(),
-            1_000,
-            None,
-        )
-        .unwrap();
-        record.signature[0] ^= 0xff;
-        let persisted = vec![PersistedRevocation {
-            record,
-            subject_cert: None,
-        }];
-        let body = bincode::serialize(&persisted).unwrap();
+        let owner = crate::identity::UserKeypair::generate().unwrap();
+        let agent = crate::identity::AgentKeypair::generate().unwrap();
+        let cert = AgentCertificate::issue(&owner, &agent).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        for (name, magic) in [
-            ("revocations.bin", REVOCATIONS_FILE_MAGIC),
-            ("revocations-v2.bin", REVOCATIONS_FILE_MAGIC_V2),
-            ("revocations-v3.bin", REVOCATIONS_FILE_MAGIC_V3),
+        for (name, magic, subject, subject_cert) in [
+            (
+                "revocations.bin",
+                REVOCATIONS_FILE_MAGIC,
+                RevokedSubject::Agent(agent.agent_id()),
+                Some(cert.clone()),
+            ),
+            (
+                "revocations-v2.bin",
+                REVOCATIONS_FILE_MAGIC_V2,
+                RevokedSubject::AgentMachineBinding(AgentMachineBinding {
+                    agent: agent.agent_id(),
+                    machine: crate::identity::MachineId([0x55; 32]),
+                    move_epoch: 1,
+                }),
+                Some(cert.clone()),
+            ),
+            (
+                "revocations-v3.bin",
+                REVOCATIONS_FILE_MAGIC_V3,
+                RevokedSubject::ShareGrant(ShareGrantRevocation {
+                    grant_id: [0x66; 32],
+                    owner: owner.user_id(),
+                    grant_expiry: u64::MAX,
+                }),
+                None,
+            ),
         ] {
-            let mut bytes = magic.to_vec();
-            bytes.extend_from_slice(&body);
-            assert!(RevocationSet::validate_persisted_bytes(&bytes, magic).is_ok());
-            let loaded = match name {
-                "revocations.bin" => RevocationSet::from_bytes(&bytes),
-                "revocations-v2.bin" => RevocationSet::from_bytes_v2(&bytes),
-                _ => RevocationSet::from_bytes_v3(&bytes),
-            }
+            let decode = |bytes: &[u8]| match name {
+                "revocations.bin" => RevocationSet::from_bytes(bytes),
+                "revocations-v2.bin" => RevocationSet::from_bytes_v2(bytes),
+                _ => RevocationSet::from_bytes_v3(bytes),
+            };
+            let record = RevocationRecord::sign(
+                subject,
+                owner.public_key(),
+                owner.secret_key(),
+                1_000,
+                None,
+            )
             .unwrap();
+            let hash = record.record_hash();
+            let mut persisted = vec![PersistedRevocation {
+                record,
+                subject_cert,
+            }];
+            let mut valid = magic.to_vec();
+            valid.extend_from_slice(&bincode::serialize(&persisted).unwrap());
+            assert!(RevocationSet::validate_persisted_bytes(&valid, magic).is_ok());
+            assert!(
+                decode(&valid).unwrap().contains_hash(&hash),
+                "valid subject and authority must load from {name}"
+            );
+            // A native v3 subject is essential: a v1 Agent subject would
+            // be filtered out before v3's signature check, hiding a defect.
+            persisted[0].record.signature[0] ^= 0xff;
+            let mut bytes = magic.to_vec();
+            bytes.extend_from_slice(&bincode::serialize(&persisted).unwrap());
+            assert!(RevocationSet::validate_persisted_bytes(&bytes, magic).is_ok());
+            let loaded = decode(&bytes).unwrap();
             assert!(
                 loaded.is_empty(),
-                "invalid authority still rejected on load"
+                "invalid signature still rejected on load from {name}"
             );
             let path = dir.path().join(name);
             tokio::fs::write(&path, &bytes).await.unwrap();
