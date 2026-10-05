@@ -103,6 +103,7 @@ async fn admin_saw_owner_announce(sim: &Sim, kind: OwnerAnnounce) -> Result<bool
 async fn scenario(sim: &mut Sim, kind: OwnerAnnounce, receipt: &mut Receipt) -> Result<()> {
     let at = |sim: &Sim| sim.fabric().now().as_micros();
     // t0: Home with O, X, A; A promoted.
+    // Before any daemon starts, like the node keys (`Sim::empty`).
     let owner = UserKeypair::generate()?;
     let home = sim.start_owner_device("O", &owner).await?;
     for device in ["X", "A", "J"] {
@@ -199,7 +200,7 @@ async fn run(case: &str, kind: OwnerAnnounce) -> Receipt {
         "sim byte streams (EvidenceV1 hello, SyncV1 owner sync) are in-memory \
          pipes with zero latency and no QUIC flow control (W3-H S4)",
     );
-    match Sim::empty(case, SEED) {
+    match Sim::empty(case, SEED, &["O", "X", "A", "J"]) {
         Ok(mut sim) => {
             if let Err(error) = scenario(&mut sim, kind, &mut receipt).await {
                 receipt.infra(format!("{error:#}"), sim.fabric().now().as_micros());

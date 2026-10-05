@@ -6,8 +6,12 @@ Every W3-H case writes its canonical trace to `<dir>/<case>-<pid>.trace`
 for every case:
 
 - exactly N traces (`--runs N`);
-- every trace byte-identical (one canonical digest);
+- every digested trace byte-identical (one canonical digest);
 - the trace recorded `entropy=controlled` (the preload shim was active).
+
+A trace file is the digested canonical trace (everything up to the
+`teardown begins` mark), then an `APPENDIX` line and the teardown events.
+Only the digested part is compared; a teardown error fails the test itself.
 
 `--require CASE` names cases that must be present. On a mismatch it prints
 the first divergent line of the canonical trace.
@@ -26,13 +30,22 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+# Must match `TRACE_APPENDIX` in src/server/w3h/mod.rs.
+APPENDIX = '# --- appendix: teardown (not digested) ---'
+
+
+def digested(text):
+    """The part of a trace file the gate compares (before the appendix)."""
+    head, marker, _appendix = text.partition(f'\n{APPENDIX}\n')
+    return f'{head}\n' if marker else text
+
 
 def load(directory):
     cases = defaultdict(list)
     for path in sorted(Path(directory).glob('*.trace')):
         case, _, _pid = path.stem.rpartition('-')
         if case:
-            cases[case].append((path.name, path.read_text()))
+            cases[case].append((path.name, digested(path.read_text())))
     return cases
 
 

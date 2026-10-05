@@ -418,7 +418,12 @@ async fn w3h_s4_control_evidence_hello_over_sim_streams() -> Result<()> {
 )]
 async fn w3h_s4_control_owner_sync_over_sim_streams() -> Result<()> {
     const SYNC_V1: u8 = 0x05;
-    let mut sim = Sim::empty("w3h_s4_control_owner_sync_over_sim_streams", 0x5400_0002)?;
+    let mut sim = Sim::empty(
+        "w3h_s4_control_owner_sync_over_sim_streams",
+        0x5400_0002,
+        &["O", "X"],
+    )?;
+    // Before any daemon starts, like the node keys (`Sim::empty`).
     let owner = crate::identity::UserKeypair::generate()?;
     let home = sim.start_owner_device("O", &owner).await?;
     // Waits for X to report `elsewhere` with O's canonical Home id, which

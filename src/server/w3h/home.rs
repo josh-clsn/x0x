@@ -24,7 +24,7 @@
 #![cfg(test)]
 
 use super::*;
-use crate::identity::{AgentCertificate, AgentKeypair, MachineKeypair, UserKeypair};
+use crate::identity::{AgentCertificate, UserKeypair};
 use anyhow::ensure;
 use base64::Engine as _;
 use serde_json::{json, Value};
@@ -109,8 +109,7 @@ impl Sim {
         label: &str,
         owner: &UserKeypair,
     ) -> Result<HomeIds> {
-        let machine = MachineKeypair::generate()?;
-        let agent = AgentKeypair::generate()?;
+        let (machine, agent) = self.take_keys(label)?;
         let cert = AgentCertificate::issue(owner, &agent)?;
         self.start_node_with(
             label,
@@ -156,8 +155,7 @@ impl Sim {
         owner: &UserKeypair,
         home: &HomeIds,
     ) -> Result<()> {
-        let machine = MachineKeypair::generate()?;
-        let agent = AgentKeypair::generate()?;
+        let (machine, agent) = self.take_keys(label)?;
         let agent_hex = hex::encode(agent.agent_id().as_bytes());
         let machine_hex = hex::encode(machine.machine_id().0);
         let issued = self

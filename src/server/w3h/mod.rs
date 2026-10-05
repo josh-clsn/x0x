@@ -17,8 +17,13 @@
 //! millisecond inside barriers, and all OS entropy is seeded.
 //!
 //! Determinism (plan §3a): [`Sim::finish`] renders the fabric's canonical
-//! trace and prints `W3H-TRACE case=… seed=… entropy=… digest=…`; the CI
-//! gate requires one digest per case across 20 reruns.
+//! trace up to the `teardown begins` mark and prints
+//! `W3H-TRACE case=… seed=… entropy=… digest=…`; the CI gate requires one
+//! digest per case across 20 reruns. Teardown is recorded in a trace
+//! appendix that is not digested; a teardown error still fails the run.
+//! Every node's machine and agent keys are generated on the test thread
+//! before any daemon starts ([`Sim::empty`]), so the entropy a daemon
+//! draws can never shift a later node's identity.
 
 #![cfg(test)]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -40,13 +45,17 @@ use tower::ServiceExt;
 
 use super::state::AppState;
 use super::{serve_with_options, DaemonConfig, ServeOptions, ServerHandle};
+use crate::identity::{AgentKeypair, MachineKeypair};
 use crate::network::sim::{self, SimFabric};
 
 /// Virtual-time budget for one API call (including any network round
 /// trips it waits on).
 const API_BUDGET: Duration = Duration::from_secs(60);
 /// Upper bound for one run's raw payload dump.
-const PAYLOAD_DUMP_CAP: usize = 256 * 1024 * 1024;
+const PAYLOAD_DUMP_CAP: usize = 32 * 1024 * 1024;
+/// Separates the digested trace from the teardown appendix in a `.trace`
+/// file (`scripts/ci/w3h-trace-check.py` compares only what precedes it).
+const TRACE_APPENDIX: &str = "# --- appendix: teardown (not digested) ---";
 /// Virtual-time budget for a daemon to start.
 const START_BUDGET: Duration = Duration::from_secs(120);
 /// Real-time limit for an await made while the clock gate is closed. A
@@ -257,6 +266,8 @@ pub(crate) struct Sim {
     gate: Mutex<Option<ClockGate>>,
     shim: Option<Shim>,
     logs: Arc<Mutex<Vec<CapturedLog>>>,
+    /// Keys generated before any daemon started, not yet used by a node.
+    keys: BTreeMap<String, (MachineKeypair, AgentKeypair)>,
     root: tempfile::TempDir,
     // Last: the capture stays installed until every daemon has stopped.
     _log_guard: tracing::subscriber::DefaultGuard,
@@ -284,11 +295,33 @@ async fn gated<F: std::future::Future>(what: &str, fut: F) -> Result<F::Output> 
     }
 }
 
+/// Whether this run of `case` writes a payload dump: the first run that
+/// finishes (it records its digest in `<case>.first-digest`) and the first
+/// run whose digest differs from it (`<case>.divergent-digest`). Later runs
+/// write none, so a stress run keeps at most two dumps per case.
+fn dump_this_run(dir: &std::path::Path, case: &str, digest: &str) -> bool {
+    use std::io::Write as _;
+    let claim = |name: String| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join(name))
+            .and_then(|mut file| file.write_all(digest.as_bytes()))
+            .is_ok()
+    };
+    if claim(format!("{case}.first-digest")) {
+        return true;
+    }
+    let first =
+        std::fs::read_to_string(dir.join(format!("{case}.first-digest"))).unwrap_or_default();
+    first.trim() != digest && claim(format!("{case}.divergent-digest"))
+}
+
 impl Sim {
     /// Start one daemon per label, in order, on a fresh fabric seeded by
     /// `seed`. Node 0 is every other node's bootstrap peer.
     pub(crate) async fn start(case: &str, seed: u64, labels: &[&str]) -> Result<Self> {
-        let mut sim = Self::empty(case, seed)?;
+        let mut sim = Self::empty(case, seed, labels)?;
         for label in labels {
             sim.start_node_with(label, Provision::default()).await?;
         }
@@ -296,7 +329,12 @@ impl Sim {
     }
 
     /// A fabric, clock gate and WARN-log capture with no daemons yet.
-    pub(crate) fn empty(case: &str, seed: u64) -> Result<Self> {
+    /// `labels` names every node the case will start: their machine and
+    /// agent keys are generated here, on the test thread, before any daemon
+    /// runs. Daemons draw entropy on the test thread too (one current-thread
+    /// runtime), so a key generated after a daemon starts would depend on
+    /// how many draws that daemon's tasks happened to make first.
+    pub(crate) fn empty(case: &str, seed: u64, labels: &[&str]) -> Result<Self> {
         use tracing_subscriber::layer::SubscriberExt as _;
         use tracing_subscriber::Layer as _;
         let fabric = SimFabric::new(seed);
@@ -309,6 +347,13 @@ impl Sim {
             }
             Err(reason) => (None, format!("uncontrolled ({reason})")),
         };
+        let mut keys = BTreeMap::new();
+        for label in labels {
+            let pair = (MachineKeypair::generate()?, AgentKeypair::generate()?);
+            if keys.insert((*label).to_string(), pair).is_some() {
+                bail!("node label {label} declared twice");
+            }
+        }
         let logs = Arc::new(Mutex::new(Vec::new()));
         // Thread-local: the scenario runs on one current-thread runtime, so
         // every daemon task emits on this thread.
@@ -330,6 +375,7 @@ impl Sim {
             gate: Mutex::new(Some(ClockGate::close())),
             shim,
             logs,
+            keys,
             root: tempfile::tempdir()?,
             _log_guard: log_guard,
         };
@@ -346,6 +392,17 @@ impl Sim {
             .filter(|log| needles.iter().all(|needle| log.text.contains(needle)))
             .cloned()
             .collect()
+    }
+
+    /// The pre-generated machine and agent keys of `label` (see
+    /// [`Self::empty`]). Each label's keys can be taken once.
+    pub(crate) fn take_keys(&mut self, label: &str) -> Result<(MachineKeypair, AgentKeypair)> {
+        self.keys.remove(label).ok_or_else(|| {
+            anyhow!(
+                "no pre-generated keys for {label}: declare every node label to \
+                 Sim::empty / Sim::start, and start each node once"
+            )
+        })
     }
 
     fn daemon_config(&self, label: &str, index: usize) -> Result<DaemonConfig> {
@@ -370,12 +427,23 @@ impl Sim {
     }
 
     /// Write `provision` into the node's identity directory, then start its
-    /// daemon. The first node started is every later node's bootstrap peer.
+    /// daemon. A provision without machine and agent keys gets the label's
+    /// pre-generated ones. The first node started is every later node's
+    /// bootstrap peer.
     pub(crate) async fn start_node_with(
         &mut self,
         label: &str,
-        provision: Provision,
+        mut provision: Provision,
     ) -> Result<()> {
+        if provision.machine_key.is_none() || provision.agent_key.is_none() {
+            let (machine, agent) = self.take_keys(label)?;
+            if provision.machine_key.is_none() {
+                provision.machine_key = Some(crate::storage::serialize_machine_keypair(&machine)?);
+            }
+            if provision.agent_key.is_none() {
+                provision.agent_key = Some(crate::storage::serialize_agent_keypair(&agent)?);
+            }
+        }
         let index = self.nodes.len();
         let config = self.daemon_config(label, index)?;
         let identity = config
@@ -599,14 +667,17 @@ impl Sim {
         gated(what, fut).await
     }
 
-    /// Record the canonical trace: print the digest line, write the trace
-    /// file when `W3H_TRACE_DIR` is set, then stop every daemon.
-    /// Stop every daemon (in label order, each inside a named barrier),
-    /// verify the teardown, THEN finalise the canonical trace: print the
-    /// digest line and write the trace file when `W3H_TRACE_DIR` is set.
-    /// A barrier timeout or a supervisor error fails the run (after the
-    /// trace is written).
+    /// Mark `teardown begins`, stop every daemon (in label order, each
+    /// inside a named barrier) and verify the teardown. Then print the
+    /// digest of the canonical trace up to that mark and, when
+    /// `W3H_TRACE_DIR` is set, write `<case>-<pid>.trace` (the digested
+    /// trace, then the teardown as a non-digested appendix) and
+    /// `<case>-<pid>.entropy` (per-thread draw counts). Teardown runs on
+    /// real OS threads as well as the runtime, so its timing is not part of
+    /// the digest; a barrier timeout or a supervisor error still fails the
+    /// run (after the trace is written).
     pub(crate) async fn finish(mut self) -> Result<String> {
+        let cut = self.fabric.cut("teardown begins");
         let handles: Vec<(String, ServerHandle)> = self
             .nodes
             .values_mut()
@@ -648,7 +719,7 @@ impl Sim {
         } else {
             format!("teardown failed: {}", teardown_errors.join("; "))
         });
-        let trace = self.fabric.canonical_trace();
+        let trace = self.fabric.canonical_trace_until(cut);
         let digest = blake3::hash(trace.as_bytes()).to_hex().to_string();
         let entropy = if self.shim.is_some() {
             "controlled"
@@ -659,14 +730,26 @@ impl Sim {
             "W3H-TRACE case={} seed={:#x} entropy={entropy} digest={digest}",
             self.case, self.seed
         );
+        let stats = self.shim.map(Shim::thread_stats);
         if let Ok(dir) = std::env::var("W3H_TRACE_DIR") {
             let dir = std::path::PathBuf::from(dir);
             if std::fs::create_dir_all(&dir).is_ok() {
                 let stem = format!("{}-{}", self.case, std::process::id());
-                let _ = std::fs::write(dir.join(format!("{stem}.trace")), &trace);
+                let file = format!(
+                    "{trace}{TRACE_APPENDIX}\n{}",
+                    self.fabric.trace_appendix(cut)
+                );
+                let _ = std::fs::write(dir.join(format!("{stem}.trace")), file);
+                if let Some(stats) = &stats {
+                    let _ = std::fs::write(dir.join(format!("{stem}.entropy")), stats);
+                }
                 // Raw payloads (test identities only) are written only when
-                // the CI gate job asks for them (nextest `w3h-gate` profile).
-                if std::env::var("W3H_DUMP_PAYLOADS").as_deref() == Ok("1") {
+                // the CI gate job asks for them (nextest `w3h-gate` profile),
+                // and only for the first run of a case and the first run
+                // whose digest differs from it.
+                if std::env::var("W3H_DUMP_PAYLOADS").as_deref() == Ok("1")
+                    && dump_this_run(&dir, &self.case, &digest)
+                {
                     let _ = std::fs::write(
                         dir.join(format!("{stem}.payloads")),
                         self.fabric.payload_dump(PAYLOAD_DUMP_CAP),
@@ -674,10 +757,8 @@ impl Sim {
                 }
             }
         }
-        if let Some(shim) = self.shim {
-            for line in shim.thread_stats().lines() {
-                eprintln!("W3H-ENTROPY {} {line}", self.case);
-            }
+        for line in stats.iter().flat_map(|stats| stats.lines()) {
+            eprintln!("W3H-ENTROPY {} {line}", self.case);
         }
         if !teardown_errors.is_empty() {
             bail!("teardown failed: {}", teardown_errors.join("; "));

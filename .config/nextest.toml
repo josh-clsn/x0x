@@ -40,8 +40,10 @@ default-filter = 'test(/(^|::)w3h_/)'
 slow-timeout = { period = "60s", terminate-after = 5 }
 
 # The CI `W3-H harness` gate job only: the same as `w3h`, plus raw payload
-# dumps (`<case>-<pid>.payloads`, test identities only) next to the traces.
-# No other job or recipe uses this profile.
+# dumps (`<case>-<pid>.payloads`, test identities only; the first run of
+# each case and the first run whose digest differs from it) next to the
+# traces, and the output of passing tests (`W3H-TRACE`, `W3H-ENTROPY`,
+# receipts) in the log. No other job or recipe uses this profile.
 [scripts.wrapper.w3h-sim-dump]
 command = 'env RUST_MIN_STACK=16777216 X0X_HOME=/tmp/x0x-nextest-home HOME=/tmp/x0x-nextest-home LD_PRELOAD=target/w3h/libw3h_shim.so W3H_SHIM_ACTIVE=1 W3H_ENTROPY_SEED=0x1164 W3H_TRACE_DIR=target/w3h/traces W3H_DUMP_PAYLOADS=1'
 
@@ -52,6 +54,7 @@ run-wrapper = 'w3h-sim-dump'
 [profile.w3h-gate]
 default-filter = 'test(/(^|::)w3h_/)'
 slow-timeout = { period = "60s", terminate-after = 5 }
+success-output = "final"
 [profile.default]
 # Network integration tests need longer timeouts for QUIC handshakes
 # and gossip propagation on macOS

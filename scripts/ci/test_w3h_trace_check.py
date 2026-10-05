@@ -32,6 +32,22 @@ class TraceCheckTest(unittest.TestCase):
             self.assertIn('first divergence', problems[0])
             self.assertIn('@5us', problems[0])
 
+    def test_appendix_is_not_compared(self):
+        with tempfile.TemporaryDirectory() as d:
+            for pid, stop in enumerate(('@9us', '@12us')):
+                self.write(d, f'w3h_case-{pid}.trace',
+                           f'{TRACE}{CHECK.APPENDIX}\n  {stop} teardown verified\n')
+            self.assertEqual(CHECK.check(d, 2, ['w3h_case']), [])
+
+    def test_divergence_before_the_appendix_still_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            tail = f'{CHECK.APPENDIX}\n  @9us teardown verified\n'
+            self.write(d, 'w3h_case-1.trace', TRACE + tail)
+            self.write(d, 'w3h_case-2.trace', TRACE.replace('@0us', '@5us') + tail)
+            problems = CHECK.check(d, 2, [])
+            self.assertEqual(len(problems), 1)
+            self.assertIn('@5us', problems[0])
+
     def test_wrong_run_count_fails(self):
         with tempfile.TemporaryDirectory() as d:
             self.write(d, 'w3h_case-1.trace', TRACE)

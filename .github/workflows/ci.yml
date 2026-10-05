@@ -448,8 +448,9 @@ jobs:
           --expect w3h_1143_red_baseline_reproduces_owner_cert_member_pending=RED
           --expect w3h_1143_positive_control_consented_owner_announce_admits=GREEN
 
-      # Traces, receipts and raw payload dumps (test identities only; the
-      # `w3h-gate` profile is the only producer of payload dumps).
+      # Traces, receipts, per-thread entropy stats and raw payload dumps
+      # (test identities only; the `w3h-gate` profile is the only producer
+      # of payload dumps, at most two per case, each capped at 32 MiB).
       - name: Upload W3-H traces
         if: always()
         uses: actions/upload-artifact@v5

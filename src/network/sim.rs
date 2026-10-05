@@ -22,7 +22,10 @@
 //!   mesh fan-out, and refused sends (no live link) are recorded too.
 //! - **Canonical form (3a).** [`SimFabric::canonical_trace`] renders the
 //!   trace grouped per node, pair, lane and destination, in a fixed order,
-//!   so the digest compares executions, not just outcomes.
+//!   so the digest compares executions, not just outcomes. A harness can
+//!   [`SimFabric::cut`] the trace: [`SimFabric::canonical_trace_until`]
+//!   renders the events before the cut (the digested part) and
+//!   [`SimFabric::trace_appendix`] the events after it.
 //! - The fabric never reads the wall clock; all times are tokio virtual
 //!   time since the fabric started.
 
@@ -525,12 +528,46 @@ impl SimFabric {
         )
     }
 
+    /// Record `text` as a mark and return the trace position just after it,
+    /// for [`Self::canonical_trace_until`] and [`Self::trace_appendix`].
+    pub(crate) fn cut(&self, text: impl Into<String>) -> usize {
+        let at = self.now();
+        let mut state = self.lock();
+        state.trace.push(TraceEvent::Mark {
+            at,
+            text: text.into(),
+        });
+        state.trace.len()
+    }
+
     /// The canonical semantic trace: grouped per node, pair, lane and
     /// destination in a fixed order, so two executions compare equal only
     /// if every node wrote the same bytes on the same lanes at the same
     /// virtual times, with the same fates.
     pub(crate) fn canonical_trace(&self) -> String {
         let state = self.lock();
+        self.render(&state, &state.trace, "canonical trace")
+    }
+
+    /// The canonical trace of the events recorded before `cut` (from
+    /// [`Self::cut`]). A write whose fate is recorded after the cut renders
+    /// as `in-flight`.
+    pub(crate) fn canonical_trace_until(&self, cut: usize) -> String {
+        let state = self.lock();
+        let end = cut.min(state.trace.len());
+        self.render(&state, &state.trace[..end], "canonical trace")
+    }
+
+    /// The events recorded at or after `cut`, rendered like the canonical
+    /// trace. A fate whose write precedes the cut is listed under its lane
+    /// as `#<seq> (written before the cut) -> <fate>`.
+    pub(crate) fn trace_appendix(&self, cut: usize) -> String {
+        let state = self.lock();
+        let start = cut.min(state.trace.len());
+        self.render(&state, &state.trace[start..], "trace appendix")
+    }
+
+    fn render(&self, state: &FabricState, events: &[TraceEvent], title: &str) -> String {
         let mut nodes: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut links: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut lanes: BTreeMap<String, BTreeMap<u64, String>> = BTreeMap::new();
@@ -539,7 +576,7 @@ impl SimFabric {
         let mut refusals: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut publishes: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut marks: Vec<String> = Vec::new();
-        for event in &state.trace {
+        for event in events {
             match event {
                 TraceEvent::Node { node, at, kind } => {
                     let what = match kind {
@@ -551,7 +588,7 @@ impl SimFabric {
                         NodeEventKind::Detached => "detached".to_string(),
                     };
                     nodes
-                        .entry(Self::name(&state, node))
+                        .entry(Self::name(state, node))
                         .or_default()
                         .push(format!("{what}@{}us", micros(*at)));
                 }
@@ -562,7 +599,7 @@ impl SimFabric {
                     at,
                     open,
                 } => {
-                    let (na, nb) = (Self::name(&state, a), Self::name(&state, b));
+                    let (na, nb) = (Self::name(state, a), Self::name(state, b));
                     let key = if na <= nb {
                         format!("{na}~{nb}")
                     } else {
@@ -578,7 +615,7 @@ impl SimFabric {
                     if let Some(write) = state.writes.get(*index) {
                         let digest = blake3::hash(&write.bytes).to_hex();
                         lanes
-                            .entry(Self::lane_name(&state, &write.lane))
+                            .entry(Self::lane_name(state, &write.lane))
                             .or_default()
                             .insert(
                                 write.seq,
@@ -594,11 +631,11 @@ impl SimFabric {
                     }
                 }
                 TraceEvent::Fate { lane, seq, fate } => {
-                    let name = Self::lane_name(&state, lane);
+                    let name = Self::lane_name(state, lane);
                     let text = match fate {
                         Fate::Delivered { at } => {
                             deliveries
-                                .entry(Self::name(&state, &lane.dst))
+                                .entry(Self::name(state, &lane.dst))
                                 .or_default()
                                 .push(format!("{name} #{seq}@{}us", micros(*at)));
                             format!("delivered@{}us", micros(*at))
@@ -624,11 +661,11 @@ impl SimFabric {
                                     )
                                 });
                         refusals
-                            .entry(Self::name(&state, &refusal.src))
+                            .entry(Self::name(state, &refusal.src))
                             .or_default()
                             .push(format!(
                                 "->{} {class}@{}us {:?} {payload}",
-                                Self::name(&state, &refusal.dst),
+                                Self::name(state, &refusal.dst),
                                 micros(refusal.at),
                                 refusal.reason,
                             ));
@@ -641,7 +678,7 @@ impl SimFabric {
                     digest,
                 } => {
                     publishes
-                        .entry(Self::name(&state, node))
+                        .entry(Self::name(state, node))
                         .or_default()
                         .push(format!(
                             "@{}us topic={topic} b3={}",
@@ -656,7 +693,7 @@ impl SimFabric {
                     ordinal,
                     at,
                 } => {
-                    let (na, nb) = (Self::name(&state, opener), Self::name(&state, acceptor));
+                    let (na, nb) = (Self::name(state, opener), Self::name(state, acceptor));
                     let key = if na <= nb {
                         format!("{na}~{nb}")
                     } else {
@@ -669,8 +706,16 @@ impl SimFabric {
                 }
             }
         }
+        // Fates of writes outside `events` (an appendix after a cut).
+        for (lane, seq) in fates.keys() {
+            lanes
+                .entry(lane.clone())
+                .or_default()
+                .entry(*seq)
+                .or_insert_with(|| format!("#{seq} (written before the cut)"));
+        }
         let mut out = String::new();
-        let _ = writeln!(out, "# w3h canonical trace v1 seed={:#x}", self.seed);
+        let _ = writeln!(out, "# w3h {title} v1 seed={:#x}", self.seed);
         let section = |out: &mut String, title: &str, map: &BTreeMap<String, Vec<String>>| {
             let _ = writeln!(out, "[{title}]");
             for (key, items) in map {
@@ -1854,6 +1899,38 @@ mod fabric_tests {
         }
         let order: Vec<u8> = drain(&b, 32).await.iter().map(|bytes| bytes[1]).collect();
         assert_eq!(order, (0..32u8).collect::<Vec<_>>());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn w3h_fabric_cut_splits_the_digested_trace_from_the_appendix() {
+        let fabric = SimFabric::new(11);
+        let (a, b) = two_links(&fabric).await;
+        a.send(&key(2), &[DM, 1]).expect("send before the cut");
+        let cut = fabric.cut("teardown begins");
+        drain(&b, 1).await;
+        a.send(&key(2), &[DM, 2]).expect("send after the cut");
+        drain(&b, 1).await;
+        fabric.mark("teardown verified");
+
+        let digested = fabric.canonical_trace_until(cut);
+        assert!(digested.starts_with("# w3h canonical trace v1"));
+        assert!(digested.contains("teardown begins"));
+        assert!(!digested.contains("teardown verified"));
+        // Written before the cut, delivered after it.
+        assert!(digested.contains("#0 conn0") && digested.contains("-> in-flight"));
+        assert!(!digested.contains("#1 conn0"));
+
+        let appendix = fabric.trace_appendix(cut);
+        assert!(appendix.starts_with("# w3h trace appendix v1"));
+        assert!(appendix.contains("#0 (written before the cut) -> delivered@"));
+        assert!(appendix.contains("#1 conn0"));
+        assert!(appendix.contains("teardown verified"));
+        assert!(!appendix.contains("teardown begins"));
+
+        // The uncut trace is unchanged: every write with its final fate.
+        let full = fabric.canonical_trace();
+        assert!(!full.contains("in-flight") && !full.contains("written before the cut"));
+        assert_eq!(fabric.canonical_trace_until(usize::MAX), full);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
