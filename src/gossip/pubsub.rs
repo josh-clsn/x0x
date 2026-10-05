@@ -7695,6 +7695,49 @@ mod tests {
         );
     }
 
+    /// Control for the test above (#1114 review P3): before #1114 the two
+    /// duplicate publishes were byte-identical unsigned V1, so that test also
+    /// pinned sg's local path for an IDENTICAL envelope (same msg_id). Signed
+    /// publishes now differ, so this hands the SAME signed envelope bytes to
+    /// PlumTree twice — exactly what `publish` does after signing — and
+    /// asserts both are still delivered locally: replay detection must not
+    /// suppress a local duplicate.
+    #[tokio::test]
+    async fn test_local_identical_signed_envelope_is_delivered_twice() {
+        let node = test_node().await;
+        let ctx = Arc::new(SigningContext::from_keypair(
+            &AgentKeypair::generate().expect("keygen"),
+        ));
+        let manager = PubSubManager::new(node, Some(Arc::clone(&ctx))).expect("manager");
+        let topic = "dedup-identical";
+        let topic_id = TopicId::from_entity(topic.as_bytes());
+        let mut sub = manager.subscribe(topic.to_string()).await;
+
+        let envelope = signed_inner_v2(&ctx, topic, &Bytes::from("hello"));
+        for attempt in ["publish 1", "publish 2 (identical envelope, intentional)"] {
+            manager
+                .plumtree
+                .publish_with_fanout(topic_id, envelope.clone())
+                .await
+                .expect(attempt);
+        }
+
+        for which in ["first", "second"] {
+            let msg = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+                .await
+                .unwrap_or_else(|_| panic!("{which} identical envelope must be delivered"))
+                .expect("subscription open");
+            assert_eq!(msg.payload, Bytes::from("hello"), "{which}");
+            assert_eq!(msg.sender, Some(ctx.agent_id), "{which}");
+            assert!(msg.verified, "{which}");
+            assert_eq!(
+                msg.raw_envelope.as_ref(),
+                Some(&envelope),
+                "{which}: the delivered envelope is the identical bytes"
+            );
+        }
+    }
+
     #[tokio::test]
     #[ignore = "stress: publishes 100k messages to prove slow-subscriber isolation"]
     async fn test_slow_subscriber_isolated_at_100k_messages() {
