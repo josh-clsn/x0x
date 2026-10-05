@@ -144,13 +144,14 @@ JOIN_STATES = frozenset({"active", "pending_authority_commit", "idle", "timed_ou
 JOIN_STATUS_STATES = frozenset({"pending_authority_commit", "idle"})
 # Typed `POST /groups/join` refusals: a 409 whose `error` (or `reason`) is one of
 # these codes (docs/api-reference.md, join_group_via_invite). Untyped 4xx are not
-# refusals.
+# refusals. Fork quarantine is deliberately absent: it is inconclusive everywhere,
+# because it refuses for the group's state, not for the joiner.
 JOIN_REFUSAL_CODES = frozenset({
     "invite_unsigned", "invite_signature_invalid", "invite_malformed", "invite_base_inconsistent",
     "invite_downgraded", "invite_not_addressed_to_me", "inviter_key_mismatch", "inviter_key_revoked",
     "invite_owner_countersignature_missing", "invite_owner_countersignature_invalid",
     "use_home_mode", "pin_requires_home_mode", "home_mode_requires_pin", "owner_mismatch",
-    "join_already_pending", "fork_quarantined"})
+    "join_already_pending"})
 KNOWN_MEMBER_STATES = frozenset({"active", "pending", "removed", "banned"})
 JOIN_OUTCOMES = frozenset({"refused", "timed_out"})
 JOIN_OUTCOME_REASONS = frozenset({

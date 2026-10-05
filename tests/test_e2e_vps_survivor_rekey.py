@@ -501,9 +501,11 @@ class RefusalVerdictTests(unittest.TestCase):
                          {"status": 409, "join_state": "other", "already_joined": None, "refusal_code": None})
         self.assertEqual(h.classify_join_attempt(409, {"error": "join_already_pending"})["refusal_code"],
                          "join_already_pending")
-        self.assertEqual(h.classify_join_attempt(409, {"error": "x", "reason": "fork_quarantined"})["refusal_code"],
-                         "fork_quarantined")
-        for status, body in ((403, {"error": "join_already_pending"}), (409, {"error": "banned"}),
+        # Review r3: a fork quarantine is never a join refusal (inconclusive everywhere).
+        self.assertNotIn("fork_quarantined", h.JOIN_REFUSAL_CODES)
+        for status, body in ((409, {"error": "x", "reason": "fork_quarantined"}),
+                             (409, {"error": "fork_quarantined"}),
+                             (403, {"error": "join_already_pending"}), (409, {"error": "banned"}),
                              (409, {"error": "invite free text"}), (500, {"error": "invite_unsigned"})):
             with self.subTest(status=status, body=body):
                 self.assertIsNone(h.classify_join_attempt(status, body)["refusal_code"])
@@ -978,6 +980,24 @@ class ScenarioTests(unittest.TestCase):
         s, _net = self.run_failing_block("gss", expected=h.Inconclusive, override=untyped)
         result = row(s, "plain/gss/ban: banned singapore re-join is never seated")
         self.assertEqual((result["verdict"], result["reason"]), ("inconclusive", "untyped_join_refusal"))
+
+    def test_fork_quarantined_rejoin_is_inconclusive_not_a_pass(self):
+        """Review r3: a typed fork-quarantine 409 on the banned re-join must not pass."""
+        for body in ({"ok": False, "error": "group is fork-quarantined", "reason": "fork_quarantined"},
+                     {"ok": False, "error": "fork_quarantined"}):
+            with self.subTest(body=body):
+                def quarantined(net, label, method, path, request, body=body):
+                    if label == "singapore" and path == "/groups/join" and net.state["singapore"] == "banned":
+                        return 409, body
+                    return None
+                s, _net = self.run_failing_block("gss", expected=h.Inconclusive, override=quarantined)
+                result = row(s, "plain/gss/ban: banned singapore re-join is never seated")
+                self.assertEqual((result["passed"], result["verdict"], result["reason"]),
+                                 (False, "inconclusive", "untyped_join_refusal"))
+                self.assertIsNone(result["attempt"]["refusal_code"])
+                s.e.assertions.append(h.aborted_row("plain/gss: block aborted", h.Inconclusive("x")))
+                self.assertEqual(h.final_verdict(s.e, True), "inconclusive")
+                self.assertEqual(h.exit_code(h.final_verdict(s.e, True)), 3)
 
     def test_typed_join_refusal_passes(self):
         def typed(net, label, method, path, body):
