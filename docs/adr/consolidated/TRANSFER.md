@@ -123,7 +123,7 @@ David accepts the transfer. See A08 for the exact D196 gate and D63 order.
 
 | Ruling | Topic to retain | Destination slots | Transfer status |
 |---|---|---|---|
-| D01 | Released-layout reads and intact fail-closed downgrade | [A10](A10-r01-shared-data-files-and-synchronization.md), [A15](A15-r01-compatibility-validation-and-decision-rules.md) | Pending |
+| D01 | Released-layout reads and intact fail-closed downgrade | [A15](A15-r01-compatibility-validation-and-decision-rules.md) | Pending |
 | D03 | Canary, restart rehearsal and prerelease ban | [A14](A14-r01-health-updates-and-recovery.md), [A15](A15-r01-compatibility-validation-and-decision-rules.md) | Pending |
 | D04 | Tracked lock and tested release graph | [A14](A14-r01-health-updates-and-recovery.md), [A15](A15-r01-compatibility-validation-and-decision-rules.md) | Pending |
 | D05 | Human release and signing approval | [A14](A14-r01-health-updates-and-recovery.md), [A15](A15-r01-compatibility-validation-and-decision-rules.md) | Pending |
@@ -131,6 +131,7 @@ David accepts the transfer. See A08 for the exact D196 gate and D63 order.
 | D08 | Verified grant capability evidence | [A03](A03-r01-trust-permissions-sharing-and-revocation.md), [A15](A15-r01-compatibility-validation-and-decision-rules.md) | Pending |
 | D09 | Known limitations, downgrade and experimental calls | [A13](A13-r01-voice-and-video.md), [A15](A15-r01-compatibility-validation-and-decision-rules.md) | Pending |
 | D11 | Historical Home rule accepted as a record | [A08](A08-r01-groups-home-membership-and-repair.md), [A15](A15-r01-compatibility-validation-and-decision-rules.md) | Pending |
+| D13 | Invites stop past 20 Active+Banned members; #646 is a product limit, not parked; fix in W4 | [A08](A08-r01-groups-home-membership-and-repair.md) | Pending |
 | D14 | Testnet isolation | [A15](A15-r01-compatibility-validation-and-decision-rules.md) | Pending |
 | D15 | PR checks, protected main and release tags; no bot identity | [A15](A15-r01-compatibility-validation-and-decision-rules.md) | Pending |
 | D16 | Offline-admin liveness, explicit Home and harness-first | [A08](A08-r01-groups-home-membership-and-repair.md), [A15](A15-r01-compatibility-validation-and-decision-rules.md) | Pending |
@@ -154,6 +155,7 @@ David accepts the transfer. See A08 for the exact D196 gate and D63 order.
 | D36 | Team/scratch-store order, protected fanout and tracked findings | [A06](A06-r01-gossip-relay-roles-and-resource-limits.md), [A10](A10-r01-shared-data-files-and-synchronization.md), [A12](A12-r01-agent-teams-delegation-and-task-coordination.md), [A15](A15-r01-compatibility-validation-and-decision-rules.md) | Pending |
 | D37 | Separate numbered liveness slices and acceptance | [A08](A08-r01-groups-home-membership-and-repair.md), [A15](A15-r01-compatibility-validation-and-decision-rules.md) | Pending |
 | D38 | Home-scoped owner certificate; public anonymity | [A02](A02-r01-identity-keys-and-device-enrollment.md), [A08](A08-r01-groups-home-membership-and-repair.md) | Pending |
+| D39(A) | Revised ruling: known limitation for v0.46, workaround verified first; joiner re-arm and authority re-Welcome in v0.46.x | [A08](A08-r01-groups-home-membership-and-repair.md) | Pending |
 | D40 | Designated-first refinement of D34 revocation eviction | [A08](A08-r01-groups-home-membership-and-repair.md), [A09](A09-r01-group-encryption-and-key-changes.md) | Pending |
 | D41 | Attestation repairs only the receiving node | [A08](A08-r01-groups-home-membership-and-repair.md) | Pending |
 | D42 | Adopt Home in place; user retires duplicates | [A08](A08-r01-groups-home-membership-and-repair.md) | Pending |
@@ -162,7 +164,7 @@ David accepts the transfer. See A08 for the exact D196 gate and D63 order.
 | D57 | 0107 accepted as written; code conforms | [A08](A08-r01-groups-home-membership-and-repair.md) | Pending |
 | D58 | 0088/0094/0095/0096 accepted; conditional supersessions remain | [A01](A01-r01-purpose-and-product-limits.md), [A08](A08-r01-groups-home-membership-and-repair.md), [A14](A14-r01-health-updates-and-recovery.md), [A15](A15-r01-compatibility-validation-and-decision-rules.md) | Pending |
 | D60 | Current recipient eligibility and secret epoch on every resend | [A03](A03-r01-trust-permissions-sharing-and-revocation.md), [A08](A08-r01-groups-home-membership-and-repair.md), [A09](A09-r01-group-encryption-and-key-changes.md) | Pending |
-| D63 | Numbered slice bindings and acceptance order; 0084–0105 reserved | [A03](A03-r01-trust-permissions-sharing-and-revocation.md), [A06](A06-r01-gossip-relay-roles-and-resource-limits.md), [A08](A08-r01-groups-home-membership-and-repair.md), [A09](A09-r01-group-encryption-and-key-changes.md), [A10](A10-r01-shared-data-files-and-synchronization.md), [A15](A15-r01-compatibility-validation-and-decision-rules.md) | Pending |
+| D63 | Numbered slice bindings and acceptance order; 0084–0105 reserved; ADR 0080 capability-gated single-record push clause belongs in [A03](A03-r01-trust-permissions-sharing-and-revocation.md) | [A08](A08-r01-groups-home-membership-and-repair.md), [A06](A06-r01-gossip-relay-roles-and-resource-limits.md), [A09](A09-r01-group-encryption-and-key-changes.md), [A10](A10-r01-shared-data-files-and-synchronization.md), [A15](A15-r01-compatibility-validation-and-decision-rules.md) | Pending |
 | D64 | Typed refusals and waits for every slice | [A08](A08-r01-groups-home-membership-and-repair.md), [A09](A09-r01-group-encryption-and-key-changes.md) | Pending |
 | D65 | S8 in the acceptance order means S8(a) | [A08](A08-r01-groups-home-membership-and-repair.md) | Pending |
 | D66–D68 | Home certificate delivery and disclosure limits | [A02](A02-r01-identity-keys-and-device-enrollment.md), [A08](A08-r01-groups-home-membership-and-repair.md) | Pending |
@@ -177,7 +179,7 @@ David accepts the transfer. See A08 for the exact D196 gate and D63 order.
 | D99–D105 | Any-admin invite admission and activation | [A08](A08-r01-groups-home-membership-and-repair.md) | Pending |
 | D106–D107 | Home setup and old-binary limitations | [A08](A08-r01-groups-home-membership-and-repair.md) | Pending |
 | D108–D114 | Revocation push, horizon, capabilities and review hold | [A03](A03-r01-trust-permissions-sharing-and-revocation.md), [A15](A15-r01-compatibility-validation-and-decision-rules.md) | Pending |
-| D117–D125 | Slice-wide limits, authority, recovery and disclosure exceptions | [A02](A02-r01-identity-keys-and-device-enrollment.md), [A08](A08-r01-groups-home-membership-and-repair.md), [A09](A09-r01-group-encryption-and-key-changes.md) | Pending |
+| D117–D125 | Slice-wide limits, authority, recovery and disclosure exceptions | [A08](A08-r01-groups-home-membership-and-repair.md), [A09](A09-r01-group-encryption-and-key-changes.md) | Pending |
 | D126–D129 | Eviction recovery, expiry and rebinding | [A08](A08-r01-groups-home-membership-and-repair.md), [A09](A09-r01-group-encryption-and-key-changes.md) | Pending |
 | D130–D133 | Invite fork prevention, bounds and disclosure | [A08](A08-r01-groups-home-membership-and-repair.md) | Pending |
 | D134–D135 | Home setup exception and certificate rebinding | [A08](A08-r01-groups-home-membership-and-repair.md), [A09](A09-r01-group-encryption-and-key-changes.md) | Pending |
