@@ -66,10 +66,14 @@ class TraceCheckTest(unittest.TestCase):
             self.write(d, 'w3h_case-1.trace', TRACE.replace('controlled', 'uncontrolled'))
             self.assertTrue(any('not controlled' in p for p in CHECK.check(d, 1, [])))
 
+    def test_empty_directory_fails_without_requirements(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(CHECK.main([d, '--runs', '20']), 1)
+            self.assertTrue(any('nothing was checked' in p for p in CHECK.check(d, 20, [])))
+
     def test_missing_required_case_fails(self):
         with tempfile.TemporaryDirectory() as d:
-            self.assertEqual(CHECK.check(d, 1, ['w3h_missing']),
-                             ['w3h_missing: no trace written'])
+            self.assertIn('w3h_missing: no trace written', CHECK.check(d, 1, ['w3h_missing']))
 
     def receipt(self, d, pid, verdict, stages=None, case='w3h_red', ok=True):
         import json

@@ -6,6 +6,7 @@ Every W3-H case writes its canonical trace to `<case>-<pid>.trace` (see
 to `<case>-<pid>.receipt.json` (schema `w3h.receipt/1`). After a
 `--stress-count N` run, this script requires, for every case:
 
+- at least one trace in the directory, so a run can never pass vacuously;
 - exactly N traces (`--runs N`): every rerun finished and wrote its trace;
 - the trace recorded `entropy=controlled` (the preload shim was active).
 
@@ -77,6 +78,8 @@ def check(directory, runs, required, strict_traces=False):
     report (blocking only with `strict_traces`)."""
     problems = []
     cases = load(directory)
+    if not cases:
+        problems.append(f'no traces in {directory}: nothing was checked')
     for case in required:
         if case not in cases:
             problems.append(f'{case}: no trace written')

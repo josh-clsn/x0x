@@ -400,33 +400,40 @@ fn holds_verified_evidence(sim: &Sim, observer: &str, subject: &str) -> Result<b
     Ok(captured || stored)
 }
 
-/// Completed EvidenceV1 exchanges opened at or after `since`, as
-/// `opener->acceptor REPLY`. The reply must be exactly one whole frame
-/// (`kind`, u32 length, body), and the side that ingested a Hello must hold
-/// the other side's network-verified evidence afterwards:
-/// - a HELLO reply carries the acceptor's evidence, so the opener must hold
-///   it, and the acceptor must not have opened an EvidenceV1 stream of its
-///   own to the opener (then only the reply can have provided it);
-/// - an ACK reply (bincode `Option<[u8; 32]>`, the acceptor's view of the
-///   opener's certificate) follows the acceptor ingesting the opener's
-///   Hello, so the acceptor must hold the opener's evidence.
-fn completed_evidence_exchanges(
-    sim: &Sim,
-    labels: &[&str],
-    since: Duration,
-) -> Result<Vec<String>> {
-    use crate::network::sim::LaneClass;
+/// One EvidenceV1 stream as the fabric recorded it: who opened it, the
+/// request and reply frames (each `kind`, u32 length, body), and when the
+/// opener read the reply to its FIN.
+struct EvidenceStream {
+    opener: crate::network::sim::Key,
+    acceptor: crate::network::sim::Key,
+    opened_at: Duration,
+    request: Option<(u8, Vec<u8>)>,
+    reply: Option<(u8, Vec<u8>)>,
+    reply_fin_read: Option<Duration>,
+}
+
+/// Exactly one whole frame (`kind`, u32 length, body), or `None`.
+fn one_frame(bytes: &[u8]) -> Option<(u8, Vec<u8>)> {
+    let (&kind, rest) = bytes.split_first()?;
+    let (len, body) = rest.split_first_chunk::<4>()?;
+    (usize::try_from(u32::from_be_bytes(*len)).ok() == Some(body.len()))
+        .then(|| (kind, body.to_vec()))
+}
+
+/// Every EvidenceV1 stream opened at or after `since`.
+fn evidence_streams(sim: &Sim, since: Duration) -> Vec<EvidenceStream> {
+    use crate::network::sim::{LaneClass, LaneKey};
     const EVIDENCE_V1: u8 = 0x06;
-    // `evidence_wire.rs` message kinds.
-    const HELLO: u8 = 1;
-    const ACK: u8 = 5;
-    let mut peers = Vec::new();
-    for label in labels {
-        peers.push((sim.peer(label)?.0, *label));
-    }
-    let label_of = |key| peers.iter().find(|(peer, _)| *peer == key).map(|(_, l)| *l);
     let writes = sim.fabric().writes();
-    let opened: Vec<_> = writes
+    let lane_bytes = |lane: LaneKey| {
+        let mut on_lane: Vec<_> = writes.iter().filter(|w| w.lane == lane).collect();
+        on_lane.sort_by_key(|w| w.seq);
+        on_lane
+            .iter()
+            .flat_map(|w| w.bytes.iter().copied())
+            .collect::<Vec<u8>>()
+    };
+    writes
         .iter()
         .filter(|w| {
             matches!(w.lane.class, LaneClass::Stream(_))
@@ -434,59 +441,130 @@ fn completed_evidence_exchanges(
                 && w.at >= since
                 && w.bytes.first() == Some(&EVIDENCE_V1)
         })
-        .map(|w| w.lane)
-        .collect();
+        .map(|open| {
+            let reverse = LaneKey {
+                src: open.lane.dst,
+                dst: open.lane.src,
+                class: open.lane.class,
+            };
+            let request = lane_bytes(open.lane);
+            EvidenceStream {
+                opener: open.lane.src,
+                acceptor: open.lane.dst,
+                opened_at: open.at,
+                request: request.get(1..).and_then(one_frame),
+                reply: one_frame(&lane_bytes(reverse)),
+                reply_fin_read: sim.fabric().fin_read_at(&reverse),
+            }
+        })
+        .collect()
+}
+
+/// The announce digest of `label`'s own certificate pair, if it has a
+/// certificate: what an ACK's `have_certificate` must equal for the node to
+/// skip its CERTIFICATE follow-up (`mint_hello`).
+fn own_certificate_digest(sim: &Sim, label: &str) -> Result<Option<[u8; 32]>> {
+    let state = sim.state(label)?;
+    let pair = state
+        .agent
+        .own_cert_pair
+        .read()
+        .map_err(|_| anyhow!("{label}: certificate pair lock poisoned"))?;
+    Ok(pair
+        .1
+        .is_some()
+        .then(|| crate::announce_v3::cert_digest(&pair.0, &pair.1)))
+}
+
+/// EvidenceV1 exchanges opened at or after `since` that the INITIATOR
+/// completed, as `opener->acceptor …`. Every counted reply is one whole
+/// frame that the opener read to its FIN, and the opener's resulting state
+/// shows it accepted the reply:
+/// - HELLO request, HELLO reply: the opener holds the acceptor's verified
+///   evidence, and the acceptor opened no EvidenceV1 stream of its own to
+///   the opener (so only the reply can have provided it);
+/// - HELLO request, ACK reply whose `have_certificate` (bincode
+///   `Option<[u8; 32]>`) differs from the opener's own certificate digest:
+///   the opener acted on the decoded ACK by opening a CERTIFICATE exchange
+///   to the acceptor afterwards, and that exchange completed too (an empty
+///   ACK, read to FIN), which is the opener's only success outcome
+///   (`send_certificate_if_missing`).
+///
+/// An ACK that leaves the opener nothing to send changes no opener state,
+/// so it proves nothing about the opener and is not counted.
+fn completed_evidence_exchanges(
+    sim: &Sim,
+    labels: &[&str],
+    since: Duration,
+) -> Result<Vec<String>> {
+    // `evidence_wire.rs` message kinds.
+    const HELLO: u8 = 1;
+    const CERTIFICATE: u8 = 3;
+    const ACK: u8 = 5;
+    let mut peers = Vec::new();
+    for label in labels {
+        peers.push((sim.peer(label)?.0, *label));
+    }
+    let label_of = |key| peers.iter().find(|(peer, _)| *peer == key).map(|(_, l)| *l);
+    let streams = evidence_streams(sim, since);
     let mut done = Vec::new();
-    for lane in &opened {
-        let mut replies: Vec<_> = writes
-            .iter()
-            .filter(|w| {
-                w.lane.src == lane.dst && w.lane.dst == lane.src && w.lane.class == lane.class
-            })
-            .collect();
-        replies.sort_by_key(|w| w.seq);
-        let reply: Vec<u8> = replies
-            .iter()
-            .flat_map(|w| w.bytes.iter().copied())
-            .collect();
-        let Some((&kind, rest)) = reply.split_first() else {
+    for stream in &streams {
+        let (Some(opener), Some(acceptor)) = (label_of(stream.opener), label_of(stream.acceptor))
+        else {
             continue;
         };
-        let Some((len, body)) = rest.split_first_chunk::<4>() else {
+        let (Some((HELLO, _)), Some((reply_kind, reply)), Some(read_at)) =
+            (&stream.request, &stream.reply, stream.reply_fin_read)
+        else {
             continue;
         };
-        if usize::try_from(u32::from_be_bytes(*len)).ok() != Some(body.len()) {
-            continue;
-        }
-        let (Some(opener), Some(acceptor)) = (label_of(lane.src), label_of(lane.dst)) else {
-            continue;
-        };
-        let completed = match kind {
+        match *reply_kind {
             HELLO => {
-                !opened
-                    .iter()
-                    .any(|other| other.src == lane.dst && other.dst == lane.src)
-                    && holds_verified_evidence(sim, opener, acceptor)?
+                let reverse_stream = streams.iter().any(|other| {
+                    other.opener == stream.acceptor && other.acceptor == stream.opener
+                });
+                if !reverse_stream && holds_verified_evidence(sim, opener, acceptor)? {
+                    done.push(format!("{opener}->{acceptor} HELLO/HELLO"));
+                }
             }
-            // bincode (fixint) `Option<[u8; 32]>`: `[0]` or `[1, 32 bytes]`.
             ACK => {
-                (body == [0] || (body.len() == 33 && body.first() == Some(&1)))
-                    && holds_verified_evidence(sim, acceptor, opener)?
+                let have = match reply.as_slice() {
+                    [0] => None,
+                    [1, digest @ ..] => match <[u8; 32]>::try_from(digest) {
+                        Ok(digest) => Some(digest),
+                        Err(_) => continue,
+                    },
+                    _ => continue,
+                };
+                let Some(own) = own_certificate_digest(sim, opener)? else {
+                    continue;
+                };
+                if have == Some(own) {
+                    continue;
+                }
+                let followed = streams.iter().any(|follow| {
+                    follow.opener == stream.opener
+                        && follow.acceptor == stream.acceptor
+                        && follow.opened_at >= read_at
+                        && matches!(&follow.request, Some((CERTIFICATE, _)))
+                        && matches!(&follow.reply, Some((ACK, body)) if body.is_empty())
+                        && follow.reply_fin_read.is_some()
+                });
+                if followed {
+                    done.push(format!(
+                        "{opener}->{acceptor} HELLO/ACK then CERTIFICATE/ACK"
+                    ));
+                }
             }
-            _ => false,
-        };
-        if completed {
-            let name = if kind == HELLO { "HELLO" } else { "ACK" };
-            done.push(format!("{opener}->{acceptor} {name}"));
+            _ => {}
         }
     }
     Ok(done)
 }
 
 /// S4 control: the peer-evidence hello (`EvidenceV1`) runs over simulated
-/// byte streams between relationship peers and completes: a whole HELLO or
-/// ACK reply, and the ingesting side holds the other side's verified
-/// evidence afterwards.
+/// byte streams between relationship peers, and the initiator completes it
+/// (see [`completed_evidence_exchanges`]).
 ///
 /// The topology matters (be1a8db CI: two strangers never exchanged any).
 /// A Hello is sent only to a relationship peer: an enrolled machine, a

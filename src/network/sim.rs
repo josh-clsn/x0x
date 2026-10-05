@@ -223,6 +223,11 @@ enum TraceEvent {
         ordinal: u32,
         at: Duration,
     },
+    /// The reader of `lane` (one direction of a stream) read to its FIN.
+    StreamFinRead {
+        lane: LaneKey,
+        at: Duration,
+    },
 }
 
 /// The connection identity a session token binds to (see
@@ -535,6 +540,22 @@ impl SimFabric {
         )
     }
 
+    fn note_fin_read(&self, lane: LaneKey) {
+        let at = self.now();
+        self.lock()
+            .trace
+            .push(TraceEvent::StreamFinRead { lane, at });
+    }
+
+    /// When the reader of `lane` (one direction of a stream) read to its
+    /// FIN, if it did.
+    pub(crate) fn fin_read_at(&self, lane: &LaneKey) -> Option<Duration> {
+        self.lock().trace.iter().find_map(|event| match event {
+            TraceEvent::StreamFinRead { lane: read, at } if read == lane => Some(*at),
+            _ => None,
+        })
+    }
+
     /// Record `text` as a mark and return the trace position just after it,
     /// for [`Self::canonical_trace_until`] and [`Self::trace_appendix`].
     pub(crate) fn cut(&self, text: impl Into<String>) -> usize {
@@ -710,6 +731,19 @@ impl SimFabric {
                         .entry(key)
                         .or_default()
                         .push(format!("stream{ordinal} {na}->{nb} open@{}us", micros(*at)));
+                }
+                TraceEvent::StreamFinRead { lane, at } => {
+                    let (na, nb) = (Self::name(state, &lane.src), Self::name(state, &lane.dst));
+                    let key = if na <= nb {
+                        format!("{na}~{nb}")
+                    } else {
+                        format!("{nb}~{na}")
+                    };
+                    links.entry(key).or_default().push(format!(
+                        "{} {na}->{nb} fin-read@{}us",
+                        lane.class.name(),
+                        micros(*at)
+                    ));
                 }
             }
         }
@@ -1130,8 +1164,15 @@ impl SimFabric {
                     generation,
                 },
                 SimRecv {
+                    fabric: Arc::clone(self),
                     stream: Arc::clone(&stream),
                     dir: 1 - dir,
+                    lane: LaneKey {
+                        src: reader,
+                        dst: writer,
+                        class: LaneClass::Stream(ordinal),
+                    },
+                    fin_traced: false,
                 },
             )
         };
@@ -1856,10 +1897,15 @@ impl Drop for SimSend {
 }
 
 /// The read half of a simulated stream (the `Sim` arm of
-/// [`super::StreamRecv`] in test builds).
+/// [`super::StreamRecv`] in test builds). Reading to the writer's FIN is
+/// traced once (`fin-read`), so a case can tell that a reply was consumed.
 pub struct SimRecv {
+    fabric: Arc<SimFabric>,
     stream: Arc<StreamPair>,
     dir: usize,
+    /// The lane this half reads (the other side's writes).
+    lane: LaneKey,
+    fin_traced: bool,
 }
 
 impl tokio::io::AsyncRead for SimRecv {
@@ -1883,6 +1929,11 @@ impl tokio::io::AsyncRead for SimRecv {
             return std::task::Poll::Ready(Ok(()));
         }
         if pipe.finished {
+            drop(pipe);
+            if !this.fin_traced {
+                this.fin_traced = true;
+                this.fabric.note_fin_read(this.lane);
+            }
             return std::task::Poll::Ready(Ok(()));
         }
         if pipe.lost {
@@ -2188,6 +2239,12 @@ mod fabric_tests {
         assert!(got.is_empty(), "unread reply bytes are discarded: {got:?}");
         let trace = fabric.canonical_trace();
         assert!(trace.contains("ResetDiscarded len=5"), "{trace}");
+        let reply_lane = LaneKey {
+            src: key(2).0,
+            dst: key(1).0,
+            class: LaneClass::Stream(0),
+        };
+        assert_eq!(fabric.fin_read_at(&reply_lane), None, "no FIN was read");
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -2207,6 +2264,16 @@ mod fabric_tests {
         let mut got = Vec::new();
         a_recv.read_to_end(&mut got).await.expect("reply then EOF");
         assert_eq!(got, b"reply");
+        let reply_lane = LaneKey {
+            src: key(2).0,
+            dst: key(1).0,
+            class: LaneClass::Stream(0),
+        };
+        assert!(
+            fabric.fin_read_at(&reply_lane).is_some(),
+            "the FIN read is traced"
+        );
+        assert!(fabric.canonical_trace().contains("stream0 B->A fin-read@"));
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

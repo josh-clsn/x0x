@@ -272,14 +272,35 @@ static void fill(void *buf, size_t len) {
     }
 }
 
-/* Best effort EFAULT for a non-NULL buffer the caller cannot write: let
- * the kernel try to fill it (it returns EFAULT for an unmapped or
- * read-only page it reaches). Whatever it wrote is overwritten with the
- * deterministic stream; errno is preserved unless the buffer faults. */
+/* EFAULT for a non-NULL buffer the caller cannot write: let the kernel
+ * write the WHOLE range first. getrandom(2) returns a short count when it
+ * faults part-way (or for very large requests), so the probe continues from
+ * the returned offset until the range is covered or the kernel reports
+ * EFAULT. Whatever it wrote is then overwritten with the deterministic
+ * stream; errno is preserved unless the buffer faults. Best effort, and
+ * documented as such: when the kernel cannot serve the probe at all
+ * (EAGAIN before its pool is ready, or ENOSYS) the range is not validated
+ * and the fill proceeds, as a real getrandom would block or fail instead. */
 static int buffer_faults(void *buf, size_t len) {
     int saved = errno;
-    long got = w3h_raw_syscall(SYS_getrandom, buf, len, GRND_NONBLOCK);
-    int fault = got < 0 && errno == EFAULT;
+    unsigned char *at = (unsigned char *)buf;
+    size_t left = len;
+    int fault = 0;
+    while (left > 0) {
+        long got = w3h_raw_syscall(SYS_getrandom, at, left, GRND_NONBLOCK);
+        if (got < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            fault = errno == EFAULT;
+            break;
+        }
+        if (got == 0) {
+            break;
+        }
+        at += got;
+        left -= (size_t)got;
+    }
     errno = saved;
     return fault;
 }

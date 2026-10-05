@@ -31,6 +31,7 @@
 use super::home::{membership_state, roster, HomeIds};
 use super::receipt::{Receipt, Verdict};
 use super::*;
+use crate::groups::owner_cert::MemberCertStatus;
 use crate::identity::{AgentId, UserKeypair};
 use anyhow::ensure;
 use serde_json::json;
@@ -101,8 +102,8 @@ struct OwnerView {
     resolved: Option<([u8; 32], bool)>,
     /// A's seat certificate for O: (digest, passes).
     embedded: Option<([u8; 32], bool)>,
-    /// O's status in the verdict.
-    status: String,
+    /// O's status in the verdict (`None`: O is not an active member).
+    status: Option<MemberCertStatus>,
 }
 
 impl OwnerView {
@@ -136,7 +137,9 @@ impl OwnerView {
             cert(self.resolved),
             cert(self.embedded),
             self.stale(),
-            self.status,
+            self.status
+                .as_ref()
+                .map_or("absent".to_string(), |status| format!("{status:?}")),
             self.clean_by().map_or("none", |(by, _)| by),
         )
     }
@@ -203,7 +206,7 @@ async fn admin_view_of_owner(sim: &Sim, home: &HomeIds) -> Result<OwnerView> {
         .owner_cert_verdict(&evidence)
         .per_member
         .get(&owner_hex)
-        .map_or("absent".to_string(), |status| format!("{status:?}"));
+        .cloned();
     Ok(OwnerView {
         announced: evidence.digest_for(&owner_hex),
         published,
@@ -214,21 +217,30 @@ async fn admin_view_of_owner(sim: &Sim, home: &HomeIds) -> Result<OwnerView> {
 }
 
 /// Whether A's view of O is the one the announce `kind` should produce:
-/// - anonymous: O's latest announced digest at A is the anonymous one and
-///   the verdict does not seat O as clean (the #1143 precondition);
+/// - anonymous (#1143's own state, exclusively): O's latest announced
+///   digest at A is the anonymous one; A's seat for O embeds a certificate
+///   that passes the owner check, but it is stale against that anonymous
+///   digest; and the verdict is the typed `InGrace`. A digest-only seat
+///   (`DigestPending`) would make the seal refuse with the same
+///   `OwnerCertMemberPending [O]` (the seal lists both), so it must not
+///   count here;
 /// - consented: O's latest announced digest at A is the digest O's
 ///   consented announce publishes (not the anonymous one), the verdict
 ///   seats O as clean, and the certificate that made it clean commits to
 ///   that same digest.
 fn view_matches(view: &OwnerView, kind: OwnerAnnounce) -> bool {
     let anonymous = crate::announce_v3::anonymous_cert_digest();
-    let clean = view.status == "Clean";
     match kind {
-        OwnerAnnounce::Anonymous => view.announced == Some(anonymous) && !clean,
+        OwnerAnnounce::Anonymous => {
+            view.announced == Some(anonymous)
+                && matches!(view.embedded, Some((_, true)))
+                && view.stale()
+                && matches!(view.status, Some(MemberCertStatus::InGrace { .. }))
+        }
         OwnerAnnounce::Consented => {
             view.published != anonymous
                 && view.announced == Some(view.published)
-                && clean
+                && matches!(view.status, Some(MemberCertStatus::Clean))
                 && view
                     .clean_by()
                     .is_some_and(|(_, digest)| Some(digest) == view.announced)
