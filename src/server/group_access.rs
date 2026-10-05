@@ -1087,7 +1087,6 @@ pub(in crate::server) fn is_home_or_owner_certified(info: &x0x::groups::GroupInf
 /// the body is byte-identical (`forbidden`). Runs at the inline
 /// check's position: after the plane/binding resolution's lock block,
 /// on the resolved `binding.stable_group_id`.
-#[allow(dead_code)] // wired by the S4 handler-migration commit
 pub(in crate::server) fn admit_group_store_route(
     actor: &ActorContext,
     stable_group_id: &str,
@@ -1112,7 +1111,6 @@ pub(in crate::server) fn admit_group_store_route(
 /// pins the observable contract (a GRANTED rider still gets this 403).
 /// Runs at the inline pair's position: inside the named-groups lock
 /// block, after `find_store_group` and the canonical-id 400.
-#[allow(dead_code)] // wired by the S4 handler-migration commit
 pub(in crate::server) fn admit_legacy_import_route(actor: &ActorContext) -> Admission {
     match actor {
         ActorContext::Owner { durable: true } => Ok(AccessLevel::OwnerDurable),
