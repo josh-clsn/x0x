@@ -42,6 +42,7 @@ use super::public_group_bootstrap_outbox::{
 };
 use crate as x0x;
 use crate::groups::aad::secure_share_aad;
+use crate::server::group_access::{self, AccessLevel, MemberState};
 use anyhow::{Context, Result};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
@@ -15106,27 +15107,24 @@ pub(in crate::server) async fn get_named_group(
             local_join_membership_state(state.as_ref(), &info, &local_agent_hex).await;
         (info, state_label)
     };
-    if !actor.is_durable_owner() {
-        if !matches!(actor, crate::server::rider_auth::ActorContext::Owner { .. }) {
-            return forbidden("rider tokens cannot read named-group details");
-        }
-        if membership_state == "pending_authority_commit" {
-            return (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "ok": true,
-                    "group_id": info.mls_group_id,
-                    "membership_state": "pending_authority_commit",
-                })),
-            );
-        }
-        if membership_state != "active" {
-            return api_error_with_reason(
-                StatusCode::FORBIDDEN,
-                "active local group membership required",
-                "group_membership_required",
-            );
-        }
+    // #1166 S1: admission moved to the group-access chokepoint. This
+    // handler keeps its (State, Path, Extension) signature — the
+    // withdrawn-tombstone regression test calls it directly with
+    // positional extractor arguments — so it runs the shared decision
+    // core with the seat label it already resolved under the lock.
+    let level = match group_access::admit_named_group_details(&actor, membership_state) {
+        Ok(level) => level,
+        Err(resp) => return resp,
+    };
+    if level == AccessLevel::Member(MemberState::PendingAuthorityCommit) {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "group_id": info.mls_group_id,
+                "membership_state": "pending_authority_commit",
+            })),
+        );
     }
     // #447: an operator reading the group is a natural moment to sweep
     // retained owner-cert-pending joins whose evidence may have landed.
@@ -15407,28 +15405,19 @@ pub(in crate::server) async fn local_join_membership_state(
 }
 
 /// GET /groups/:id/members — list local named-group members.
+///
+/// #1166 S1: admission (unknown-group 404, rider 403, session seat gate —
+/// a pending seat of either kind refuses) lives in the `GroupAccess`
+/// extractor; the handler re-takes the read lock for its body projection.
 pub(in crate::server) async fn get_named_group_members(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
+    _access: crate::server::group_access::GroupAccess,
 ) -> impl IntoResponse {
     let groups = state.named_groups.read().await;
     let Some(info) = groups.get(&id) else {
         return not_found("group not found");
     };
-    if !actor.is_durable_owner() {
-        if !matches!(actor, crate::server::rider_auth::ActorContext::Owner { .. }) {
-            return forbidden("rider tokens cannot read named-group members");
-        }
-        let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
-        if local_join_membership_state(state.as_ref(), info, &local_agent_hex).await != "active" {
-            return api_error_with_reason(
-                StatusCode::FORBIDDEN,
-                "active local group membership required",
-                "group_membership_required",
-            );
-        }
-    }
     let members = named_group_member_values(info);
     (
         StatusCode::OK,
@@ -16329,44 +16318,16 @@ pub(in crate::server) struct GetMessagesQuery {
 pub(in crate::server) async fn get_group_public_messages(
     State(state): State<Arc<AppState>>,
     Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
-    Path(id): Path<String>,
     Query(query): Query<GetMessagesQuery>,
+    access: crate::server::group_access::GroupAccess,
 ) -> impl IntoResponse {
-    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
-    // Resolve the stable_group_id — the public-message cache and topic
-    // are keyed on it, while the URL `:id` is typically the
-    // mls_group_id for a locally-owned group.
-    let (read_access, confidentiality, is_member, stable_id) = {
-        let groups = state.named_groups.read().await;
-        if let Some(info) = groups.get(&id) {
-            if let Some(resp) = reject_withdrawn_group(info) {
-                return resp;
-            }
-            (
-                info.policy.read_access,
-                info.policy.confidentiality,
-                info.has_active_member(&local_hex),
-                info.stable_group_id().to_string(),
-            )
-        } else {
-            // Unknown locally — fall through to cache lookup by the
-            // supplied id; this supports non-members reading a
-            // discovered Public group whose mls_group_id == stable.
-            drop(groups);
-            (
-                x0x::groups::GroupReadAccess::Public,
-                x0x::groups::GroupConfidentiality::SignedPublic,
-                false,
-                id.clone(),
-            )
-        }
-    };
-    if confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted {
-        return bad_request("MlsEncrypted groups do not publish a plaintext message history");
-    }
-    if read_access == x0x::groups::GroupReadAccess::MembersOnly && !is_member {
-        return forbidden("members-only read policy");
-    }
+    // #1166 S1: the admission gates (withdrawn 409, MlsEncrypted 400,
+    // members-only 403) and the stable-id resolution — including the
+    // unknown-group fail-open to the public cache, where the supplied
+    // `:id` doubles as the stable id — moved into the `GroupAccess`
+    // extractor. The actor stays: the ADR-0066 §3a annotation below is
+    // actor-scoped and must not drift from `GET /history`.
+    let stable_id = access.stable_id().to_string();
 
     // Ensure the listener is live on the stable-id topic.
     spawn_public_message_listener(Arc::clone(&state), stable_id.clone()).await;
@@ -21668,6 +21629,9 @@ async fn remove_treekem_named_group_member(
 pub(in crate::server) async fn get_group_state(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    // #1166 S1: the unknown-group 404 lives in the `GroupAccess`
+    // extractor; this surface never had an actor check.
+    _access: crate::server::group_access::GroupAccess,
 ) -> impl IntoResponse {
     let groups = state.named_groups.read().await;
     let Some(info) = groups.get(&id) else {
@@ -21728,6 +21692,9 @@ pub(in crate::server) async fn get_group_state_commits(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Query(q): Query<StateCommitsQuery>,
+    // #1166 S1: the live-member gate (withdrawn shells exempt — see the
+    // doc comment above) lives in the `GroupAccess` extractor.
+    _access: crate::server::group_access::GroupAccess,
 ) -> (StatusCode, Json<serde_json::Value>) {
     const STATE_COMMITS_DEFAULT_LIMIT: usize = 100;
     const STATE_COMMITS_MAX_LIMIT: usize = 500;
@@ -21741,17 +21708,9 @@ pub(in crate::server) async fn get_group_state_commits(
         return not_found("group not found");
     };
 
-    // Live groups gate retained roster projections to active members. A
-    // withdrawn local shell is intentionally keyless but still keeps #111
-    // audit history after terminal delete, so keep that history
-    // readable from the local daemon after terminality.
-    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
-    if !info.withdrawn && !info.has_active_member(&local_agent_hex) {
-        return api_error(
-            StatusCode::FORBIDDEN,
-            "members only: retained state-commit history is member content",
-        );
-    }
+    // The live-member gate (withdrawn shells exempt) lives in the
+    // `GroupAccess` extractor (#1166 S1); the roster read below is a
+    // body projection under this handler's own lock.
 
     let matched = info
         .commit_log

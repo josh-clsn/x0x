@@ -45,12 +45,6 @@
 //! `clippy.toml` ceiling that forbids the absorbed helpers everywhere
 //! except this module.
 
-// Slice S1 lands in two commits: this module first (no handler wiring),
-// then the handler migration. Until the migration commit takes the
-// admission entry points into the handlers, the non-test consumers are
-// absent and the module would trip dead-code lints.
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use axum::extract::FromRequestParts;
