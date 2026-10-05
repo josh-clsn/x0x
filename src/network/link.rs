@@ -237,6 +237,23 @@ impl LinkNode {
         }
     }
 
+    /// The live backend connection behind `peer`'s current generation, for
+    /// the authenticated-session registry.
+    pub(super) fn session_connection(&self, peer: &PeerId) -> Option<super::SessionConnection> {
+        match self {
+            Self::Quic(node) => node
+                .inner_endpoint()
+                .get_quic_connection(peer)
+                .ok()
+                .flatten()
+                .map(super::SessionConnection::Quic),
+            #[cfg(test)]
+            Self::Sim(link) => link
+                .session_connection(peer)
+                .map(super::SessionConnection::Sim),
+        }
+    }
+
     pub(crate) fn current_connection_generation(&self, peer: &PeerId) -> Option<u64> {
         match self {
             Self::Quic(node) => node.current_connection_generation(peer),

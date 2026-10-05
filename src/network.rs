@@ -120,10 +120,39 @@ struct GossipPayload {
 /// aliased by a replacement connection for the same peer: a new connection
 /// has a different stable id and therefore must mint a new token.
 struct SessionEntry {
-    connection: ant_quic::high_level::Connection,
+    connection: SessionConnection,
     ant_generation: u64,
     token: AuthenticatedSession,
     last_used: Instant,
+}
+
+/// The backend connection a session token is bound to: the live QUIC
+/// connection in production, or a W3-H simulated link generation in test
+/// builds. The registry rules (reuse while the same live connection is
+/// current, mint on replacement, evict closed then LRU) are identical for
+/// both.
+enum SessionConnection {
+    Quic(ant_quic::high_level::Connection),
+    #[cfg(test)]
+    Sim(sim::SimConnection),
+}
+
+impl SessionConnection {
+    fn stable_id(&self) -> usize {
+        match self {
+            Self::Quic(connection) => connection.stable_id(),
+            #[cfg(test)]
+            Self::Sim(connection) => connection.stable_id(),
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        match self {
+            Self::Quic(connection) => connection.close_reason().is_some(),
+            #[cfg(test)]
+            Self::Sim(connection) => connection.is_closed(),
+        }
+    }
 }
 
 /// Bounded per-peer registry of live authenticated sessions.
@@ -2042,6 +2071,10 @@ pub struct NetworkNode {
     /// Test-only: capture PubSub `send_to_peer` payloads (recording transport).
     #[cfg(test)]
     pubsub_send_capture: Arc<Mutex<Vec<bytes::Bytes>>>,
+    /// W3-H (#1164): the simulated link this node runs on, if any, so the
+    /// pub-sub publish funnel can record attempts before mesh fan-out.
+    #[cfg(test)]
+    sim_link: Option<Arc<sim::SimLink>>,
 }
 
 #[derive(Clone, Debug)]
@@ -2171,20 +2204,6 @@ impl NetworkNode {
             &public_key,
             &secret_key,
         )?));
-        // W3-H (#1164): a test-build node whose plane has a registered
-        // simulation fabric runs on it instead of binding a QUIC socket.
-        #[cfg(test)]
-        if let Some(link) = sim::claim(&config, expected_peer_id) {
-            return Ok(Self::assemble(
-                config,
-                LinkNode::Sim(link),
-                expected_peer_id,
-                transport_signing_key,
-                None,
-            )
-            .await);
-        }
-
         let mut builder = NodeConfig::builder()
             // Mitigation, not a correctness fix: give ant-quic's bounded
             // app-facing recv queue enough headroom to match x0x's forwarding
@@ -2268,6 +2287,20 @@ impl NetworkNode {
             builder = builder.mdns_namespace(id.clone());
         }
 
+        // W3-H (#1164): a test-build node whose plane has a registered
+        // simulation fabric runs on it instead of binding a QUIC socket.
+        #[cfg(test)]
+        if let Some(link) = sim::claim(&config, expected_peer_id) {
+            return Ok(Self::assemble(
+                config,
+                LinkNode::Sim(link),
+                expected_peer_id,
+                transport_signing_key,
+                None,
+            )
+            .await);
+        }
+
         let node = Node::with_config(builder.build()).await.map_err(|e| {
             NetworkError::NodeCreation(format!("Failed to create ant-quic node: {}", e))
         })?;
@@ -2303,6 +2336,11 @@ impl NetworkNode {
         transport_signing_key: TransportSigningKey,
         bootstrap_cache: Option<Arc<ant_quic::BootstrapCache>>,
     ) -> Self {
+        #[cfg(test)]
+        let sim_link = match &node {
+            LinkNode::Sim(link) => Some(Arc::clone(link)),
+            LinkNode::Quic(_) => None,
+        };
         let (event_sender, _event_receiver) = broadcast::channel(32);
         // Inbound gossip buffers are split by stream type so PubSub back-pressure
         // cannot block Bulk presence beacons or Membership/SWIM control traffic.
@@ -2364,6 +2402,8 @@ impl NetworkNode {
             shutdown_failure_for_test: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             pubsub_send_capture: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            sim_link,
         };
 
         let receiver = network_node.spawn_receiver();
@@ -2398,6 +2438,15 @@ impl NetworkNode {
         }
 
         network_node
+    }
+
+    /// W3-H (#1164): record a pub-sub publish attempt on the simulated
+    /// fabric's trace before any mesh fan-out (no-op on QUIC).
+    #[cfg(test)]
+    pub(crate) fn sim_note_publish(&self, topic: &str, payload: &[u8]) {
+        if let Some(link) = &self.sim_link {
+            link.note_publish(topic, payload);
+        }
     }
 
     /// Get the configuration for this node.
@@ -2690,25 +2739,8 @@ impl NetworkNode {
         if ant_generation == STALE_GENERATION_SENTINEL {
             return None;
         }
-        // W3-H (#1164): a simulated link's generations are fabric-unique and
-        // never reused, so the generation itself is the session token.
-        #[cfg(test)]
-        if let LinkNode::Sim(_) = node {
-            return Some((
-                ant_generation,
-                AuthenticatedSession {
-                    peer: ant_to_gossip_peer_id(ant_peer),
-                    generation: ant_generation,
-                },
-            ));
-        }
-        let connection = node
-            .quic()?
-            .inner_endpoint()
-            .get_quic_connection(ant_peer)
-            .ok()
-            .flatten()?;
-        if connection.close_reason().is_some()
+        let connection = node.session_connection(ant_peer)?;
+        if connection.is_closed()
             || node.current_connection_generation(ant_peer) != Some(ant_generation)
         {
             return None;
@@ -2725,7 +2757,7 @@ impl NetworkNode {
         let next = sessions.next.checked_add(1)?;
         sessions
             .peers
-            .retain(|_, entry| entry.connection.close_reason().is_none());
+            .retain(|_, entry| !entry.connection.is_closed());
         if sessions.peers.len() >= max_peers && !sessions.peers.contains_key(ant_peer) {
             let oldest = sessions
                 .peers

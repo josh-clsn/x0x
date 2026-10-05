@@ -1,26 +1,36 @@
 //! W3-H (#1164) deterministic simulation fabric. Test builds only.
 //!
 //! A [`SimFabric`] stands in for the network between several in-process
-//! x0x nodes. Each node's [`super::NetworkNode`] runs on a [`SimLink`]
-//! (see [`super::link::LinkNode::Sim`]) instead of an ant-quic endpoint, so
-//! everything above the transport — the receive pump, plane hello, sessions,
-//! gossip runtime, direct messages and the daemon's listeners — is the
-//! production code.
+//! x0x daemons. Each node's [`super::NetworkNode`] runs on a [`SimLink`]
+//! (the `Sim` arm of [`super::link::LinkNode`]) instead of an ant-quic
+//! endpoint, so everything above the transport — the receive pump, plane
+//! hello, session registry, gossip runtime, direct messages and the daemon's
+//! listeners — is production code.
 //!
-//! Determinism rules (phase-1 spike; see
-//! `.planning/team-2026-10-05/w3h-plan.md`):
-//! - Time is tokio virtual time (`start_paused`); the fabric never reads the
-//!   wall clock.
-//! - A frame's delivery instant and its tie-break are functions of
-//!   `(seed, src, dst, per-link sequence)` only, never of the global order
-//!   in which tasks happened to emit frames. One pump task delivers frames
-//!   in `(due, tie-break)` order.
-//! - Accept-style calls park instead of failing fast, so an idle simulated
-//!   node never busy-loops and virtual time can auto-advance.
+//! Contracts (`.planning/team-2026-10-05/w3h-plan.md` §3):
+//! - **Ordering (3e).** ant-quic opens one uni stream per send, so it
+//!   guarantees no order between messages. The fabric deliberately models a
+//!   stronger, documented order: strict FIFO within a lane
+//!   `(src, dst, stream-type class)`. Between lane heads due at the same
+//!   instant, the choice is a fixed seeded rank per lane, never the global
+//!   order in which tasks happened to emit.
+//! - **Trace (3d).** Every write is recorded when it is handed to the
+//!   transport — immutable payload bytes, virtual write time, lane,
+//!   sequence and connection — before any fault rule runs. Its fate
+//!   (delivered, or dropped and why, including frames discarded when a
+//!   link closes) is a separate event. Publish attempts are recorded before
+//!   mesh fan-out, and refused sends (no live link) are recorded too.
+//! - **Canonical form (3a).** [`SimFabric::canonical_trace`] renders the
+//!   trace grouped per node, pair, lane and destination, in a fixed order,
+//!   so the digest compares executions, not just outcomes.
+//! - The fabric never reads the wall clock; all times are tokio virtual
+//!   time since the fabric started.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -28,24 +38,77 @@ use ant_quic::{
     ConnectionCloseReason, EndpointError, NodeError, PeerConnection, PeerId, PeerLifecycleEvent,
     Side, TransportAddr, TraversalMethod,
 };
+use saorsa_gossip_transport::GossipStreamType;
 use tokio::sync::{broadcast, mpsc, oneshot, Notify};
 use tokio::time::Instant;
 
-type Key = [u8; 32];
+/// A node's transport identity (its machine id / ant-quic peer id).
+pub(crate) type Key = [u8; 32];
 
-/// What the fabric knows about one frame: enough for fault predicates and
-/// the trace, never the frame's meaning (scenario predicates decode bytes).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct FrameMeta {
-    pub(crate) src: Key,
-    pub(crate) dst: Key,
-    pub(crate) generation: u64,
-    pub(crate) link_seq: u64,
-    pub(crate) stream_type: u8,
-    pub(crate) len: usize,
+/// The ordered lane a frame travels on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum LaneClass {
+    Direct,
+    RelayedDm,
+    PlaneHello,
+    Membership,
+    PubSub,
+    Bulk,
+    Other(u8),
 }
 
-/// A fault decision for one frame, made at send time.
+impl LaneClass {
+    fn of(bytes: &[u8]) -> Self {
+        match bytes.first().copied() {
+            Some(super::DIRECT_MESSAGE_STREAM_TYPE) => Self::Direct,
+            Some(super::RELAYED_DM_STREAM_TYPE) => Self::RelayedDm,
+            Some(super::PLANE_HELLO_STREAM_TYPE) => Self::PlaneHello,
+            Some(byte) => match GossipStreamType::from_byte(byte) {
+                Some(GossipStreamType::Membership) => Self::Membership,
+                Some(GossipStreamType::PubSub) => Self::PubSub,
+                Some(GossipStreamType::Bulk) => Self::Bulk,
+                None => Self::Other(byte),
+            },
+            None => Self::Other(0),
+        }
+    }
+
+    fn name(self) -> String {
+        match self {
+            Self::Direct => "direct".into(),
+            Self::RelayedDm => "relayed_dm".into(),
+            Self::PlaneHello => "plane_hello".into(),
+            Self::Membership => "membership".into(),
+            Self::PubSub => "pubsub".into(),
+            Self::Bulk => "bulk".into(),
+            Self::Other(byte) => format!("other_{byte:02x}"),
+        }
+    }
+}
+
+/// `(src, dst, class)`: frames on one lane are delivered in write order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct LaneKey {
+    pub(crate) src: Key,
+    pub(crate) dst: Key,
+    pub(crate) class: LaneClass,
+}
+
+/// One write, captured when the bytes were handed to the transport, before
+/// any fault rule ran.
+#[derive(Clone, Debug)]
+pub(crate) struct Write {
+    pub(crate) lane: LaneKey,
+    /// Position on its lane, from 0.
+    pub(crate) seq: u64,
+    /// Which connection of this node pair carried it (0 = first).
+    pub(crate) pair_ordinal: u64,
+    /// Virtual time since the fabric started.
+    pub(crate) at: Duration,
+    pub(crate) bytes: Arc<[u8]>,
+}
+
+/// A fault decision for one write, made at send time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Fault {
     Pass,
@@ -53,18 +116,91 @@ pub(crate) enum Fault {
     Delay(Duration),
 }
 
-type FaultRule = Box<dyn Fn(&FrameMeta, &[u8]) -> Fault + Send + Sync>;
-
-/// One fabric-level event, in the order the fabric decided it.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum TraceEvent {
-    Attached { node: Key },
-    Online { node: Key, online: bool },
-    Connected { a: Key, b: Key, generation: u64 },
-    Closed { a: Key, b: Key, generation: u64 },
-    Dropped(FrameMeta),
-    Delivered(FrameMeta),
+/// Why a write was not delivered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DropReason {
+    /// A fault rule (by index) dropped it.
+    Rule(usize),
+    /// Its connection closed while it was in flight.
+    LinkClosed,
+    /// The destination was offline at its delivery instant.
+    DestinationOffline,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fate {
+    Delivered { at: Duration },
+    Dropped { at: Duration, reason: DropReason },
+}
+
+#[derive(Clone, Debug)]
+enum NodeEventKind {
+    Attached { incarnation: u64 },
+    Online(bool),
+    Detached,
+}
+
+#[derive(Clone, Debug)]
+enum TraceEvent {
+    Node {
+        node: Key,
+        at: Duration,
+        kind: NodeEventKind,
+    },
+    Link {
+        a: Key,
+        b: Key,
+        ordinal: u64,
+        at: Duration,
+        open: bool,
+    },
+    Write {
+        index: usize,
+        fault: Fault,
+    },
+    Fate {
+        lane: LaneKey,
+        seq: u64,
+        fate: Fate,
+    },
+    Refused {
+        src: Key,
+        dst: Key,
+        class: LaneClass,
+        at: Duration,
+    },
+    Publish {
+        node: Key,
+        at: Duration,
+        topic: String,
+        digest: [u8; 32],
+    },
+    Mark {
+        at: Duration,
+        text: String,
+    },
+}
+
+/// The connection identity a session token binds to (see
+/// `NetworkNode::current_session_for_peer`). Each simulated connection has
+/// a fabric-unique generation and its own closed flag.
+#[derive(Clone, Debug)]
+pub(crate) struct SimConnection {
+    generation: u64,
+    closed: Arc<AtomicBool>,
+}
+
+impl SimConnection {
+    pub(crate) fn stable_id(&self) -> usize {
+        usize::try_from(self.generation).unwrap_or(usize::MAX)
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+}
+
+type FaultRule = Box<dyn Fn(&Write) -> Fault + Send + Sync>;
 
 struct NodeSlot {
     addr: SocketAddr,
@@ -77,33 +213,45 @@ struct NodeSlot {
 
 struct LinkState {
     generation: u64,
-    next_seq: BTreeMap<Key, u64>,
-    last_due: BTreeMap<Key, Instant>,
+    ordinal: u64,
+    closed: Arc<AtomicBool>,
 }
 
-struct Pending {
-    meta: FrameMeta,
-    bytes: Vec<u8>,
+struct Queued {
+    seq: u64,
+    due: Instant,
+    generation: u64,
+    bytes: Arc<[u8]>,
     delivered: Option<oneshot::Sender<()>>,
+}
+
+#[derive(Default)]
+struct LaneState {
+    next_seq: u64,
+    last_due: Option<Instant>,
+    queue: VecDeque<Queued>,
 }
 
 struct FabricState {
     nodes: BTreeMap<Key, NodeSlot>,
+    labels: BTreeMap<Key, String>,
     by_addr: BTreeMap<SocketAddr, Key>,
     links: BTreeMap<(Key, Key), LinkState>,
+    pair_ordinals: BTreeMap<(Key, Key), u64>,
     partitions: BTreeSet<(Key, Key)>,
     rules: Vec<FaultRule>,
-    queue: BTreeMap<(Instant, u64, u64), Pending>,
+    lanes: BTreeMap<LaneKey, LaneState>,
+    writes: Vec<Write>,
     trace: Vec<TraceEvent>,
     next_generation: u64,
-    next_unique: u64,
 }
 
 /// The shared in-memory network for one simulated scenario.
 pub(crate) struct SimFabric {
     seed: u64,
+    start: Instant,
     base_latency: Duration,
-    jitter_ms: u64,
+    jitter_us: u64,
     state: Mutex<FabricState>,
     wake: Notify,
 }
@@ -133,28 +281,36 @@ fn not_connected(peer: &PeerId) -> NodeError {
     ))
 }
 
+fn micros(at: Duration) -> u128 {
+    at.as_micros()
+}
+
 impl SimFabric {
-    /// A fabric whose every scheduling choice derives from `seed`.
+    /// A fabric whose every scheduling choice derives from `seed`. Must be
+    /// called inside the scenario's (paused, current-thread) runtime.
     pub(crate) fn new(seed: u64) -> Arc<Self> {
         let fabric = Arc::new(Self {
             seed,
-            base_latency: Duration::from_millis(5),
-            jitter_ms: 5,
+            start: Instant::now(),
+            base_latency: Duration::from_millis(2),
+            jitter_us: 3_000,
             state: Mutex::new(FabricState {
                 nodes: BTreeMap::new(),
+                labels: BTreeMap::new(),
                 by_addr: BTreeMap::new(),
                 links: BTreeMap::new(),
+                pair_ordinals: BTreeMap::new(),
                 partitions: BTreeSet::new(),
                 rules: Vec::new(),
-                queue: BTreeMap::new(),
+                lanes: BTreeMap::new(),
+                writes: Vec::new(),
                 trace: Vec::new(),
                 next_generation: 1,
-                next_unique: 0,
             }),
             wake: Notify::new(),
         });
         let pump = Arc::clone(&fabric);
-        tokio::spawn(async move { Self::run_pump(pump).await });
+        tokio::spawn(async move { pump.run_pump().await });
         fabric
     }
 
@@ -164,61 +320,247 @@ impl SimFabric {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Add a fault rule; rules are consulted in insertion order and the
+    /// Virtual time since the fabric started.
+    pub(crate) fn now(&self) -> Duration {
+        Instant::now().saturating_duration_since(self.start)
+    }
+
+    /// Name a node for the canonical trace.
+    pub(crate) fn label(&self, node: &PeerId, name: &str) {
+        self.lock().labels.insert(node.0, name.to_string());
+    }
+
+    /// Add a fault rule. Rules are consulted in insertion order and the
     /// first non-`Pass` decision wins.
-    pub(crate) fn add_rule(
-        &self,
-        rule: impl Fn(&FrameMeta, &[u8]) -> Fault + Send + Sync + 'static,
-    ) {
+    pub(crate) fn add_rule(&self, rule: impl Fn(&Write) -> Fault + Send + Sync + 'static) {
         self.lock().rules.push(Box::new(rule));
     }
 
     /// Take a node off the network (crash or power-off), or bring it back.
-    /// Going offline closes every link and discards frames in flight.
+    /// Going offline closes every link; frames in flight are dropped with
+    /// [`DropReason::LinkClosed`].
     pub(crate) fn set_online(&self, node: &PeerId, online: bool) {
+        let at = self.now();
         let mut state = self.lock();
         if let Some(slot) = state.nodes.get_mut(&node.0) {
             slot.online = online;
         }
-        state.trace.push(TraceEvent::Online {
+        state.trace.push(TraceEvent::Node {
             node: node.0,
-            online,
+            at,
+            kind: NodeEventKind::Online(online),
         });
         if !online {
-            Self::close_all_locked(&mut state, node.0, ConnectionCloseReason::PeerShutdown);
+            Self::close_all_locked(&mut state, node.0, ConnectionCloseReason::PeerShutdown, at);
         }
     }
 
     /// Partition `a` from `b` (closing any live link) or heal it.
     pub(crate) fn set_partitioned(&self, a: &PeerId, b: &PeerId, partitioned: bool) {
+        let at = self.now();
         let mut state = self.lock();
         let key = pair(a.0, b.0);
         if partitioned {
             state.partitions.insert(key);
-            Self::close_link_locked(&mut state, key, ConnectionCloseReason::LifecycleCleanup);
+            Self::close_link_locked(&mut state, key, ConnectionCloseReason::LifecycleCleanup, at);
         } else {
             state.partitions.remove(&key);
         }
     }
 
-    /// A stable digest of the fabric trace so far.
-    pub(crate) fn trace_digest(&self) -> u64 {
+    /// Record a harness event (barrier, receipt, fault step) in the trace.
+    pub(crate) fn mark(&self, text: impl Into<String>) {
+        let at = self.now();
+        self.lock().trace.push(TraceEvent::Mark {
+            at,
+            text: text.into(),
+        });
+    }
+
+    /// Every write so far, in the order the fabric accepted them.
+    pub(crate) fn writes(&self) -> Vec<Write> {
+        self.lock().writes.clone()
+    }
+
+    fn name(state: &FabricState, node: &Key) -> String {
+        state
+            .labels
+            .get(node)
+            .cloned()
+            .unwrap_or_else(|| hex::encode(&node[..4]))
+    }
+
+    fn lane_name(state: &FabricState, lane: &LaneKey) -> String {
+        format!(
+            "{}->{} {}",
+            Self::name(state, &lane.src),
+            Self::name(state, &lane.dst),
+            lane.class.name()
+        )
+    }
+
+    /// The canonical semantic trace: grouped per node, pair, lane and
+    /// destination in a fixed order, so two executions compare equal only
+    /// if every node wrote the same bytes on the same lanes at the same
+    /// virtual times, with the same fates.
+    pub(crate) fn canonical_trace(&self) -> String {
         let state = self.lock();
-        let mut hasher = std::hash::DefaultHasher::new();
-        state.trace.hash(&mut hasher);
-        hasher.finish()
+        let mut nodes: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut links: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut lanes: BTreeMap<String, BTreeMap<u64, String>> = BTreeMap::new();
+        let mut fates: BTreeMap<(String, u64), String> = BTreeMap::new();
+        let mut deliveries: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut refusals: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut publishes: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut marks: Vec<String> = Vec::new();
+        for event in &state.trace {
+            match event {
+                TraceEvent::Node { node, at, kind } => {
+                    let what = match kind {
+                        NodeEventKind::Attached { incarnation } => {
+                            format!("attached inc={incarnation}")
+                        }
+                        NodeEventKind::Online(true) => "online".to_string(),
+                        NodeEventKind::Online(false) => "offline".to_string(),
+                        NodeEventKind::Detached => "detached".to_string(),
+                    };
+                    nodes
+                        .entry(Self::name(&state, node))
+                        .or_default()
+                        .push(format!("{what}@{}us", micros(*at)));
+                }
+                TraceEvent::Link {
+                    a,
+                    b,
+                    ordinal,
+                    at,
+                    open,
+                } => {
+                    let (na, nb) = (Self::name(&state, a), Self::name(&state, b));
+                    let key = if na <= nb {
+                        format!("{na}~{nb}")
+                    } else {
+                        format!("{nb}~{na}")
+                    };
+                    links.entry(key).or_default().push(format!(
+                        "#{ordinal} {}@{}us",
+                        if *open { "open" } else { "close" },
+                        micros(*at)
+                    ));
+                }
+                TraceEvent::Write { index, fault } => {
+                    if let Some(write) = state.writes.get(*index) {
+                        let digest = blake3::hash(&write.bytes).to_hex();
+                        lanes
+                            .entry(Self::lane_name(&state, &write.lane))
+                            .or_default()
+                            .insert(
+                                write.seq,
+                                format!(
+                                    "#{} conn{} w@{}us len={} b3={} fault={fault:?}",
+                                    write.seq,
+                                    write.pair_ordinal,
+                                    micros(write.at),
+                                    write.bytes.len(),
+                                    &digest[..16],
+                                ),
+                            );
+                    }
+                }
+                TraceEvent::Fate { lane, seq, fate } => {
+                    let name = Self::lane_name(&state, lane);
+                    let text = match fate {
+                        Fate::Delivered { at } => {
+                            deliveries
+                                .entry(Self::name(&state, &lane.dst))
+                                .or_default()
+                                .push(format!("{name} #{seq}@{}us", micros(*at)));
+                            format!("delivered@{}us", micros(*at))
+                        }
+                        Fate::Dropped { at, reason } => {
+                            format!("dropped@{}us {reason:?}", micros(*at))
+                        }
+                    };
+                    fates.insert((name, *seq), text);
+                }
+                TraceEvent::Refused {
+                    src,
+                    dst,
+                    class,
+                    at,
+                } => {
+                    refusals
+                        .entry(Self::name(&state, src))
+                        .or_default()
+                        .push(format!(
+                            "->{} {}@{}us",
+                            Self::name(&state, dst),
+                            class.name(),
+                            micros(*at)
+                        ));
+                }
+                TraceEvent::Publish {
+                    node,
+                    at,
+                    topic,
+                    digest,
+                } => {
+                    publishes
+                        .entry(Self::name(&state, node))
+                        .or_default()
+                        .push(format!(
+                            "@{}us topic={topic} b3={}",
+                            micros(*at),
+                            &hex::encode(digest)[..16]
+                        ));
+                }
+                TraceEvent::Mark { at, text } => marks.push(format!("@{}us {text}", micros(*at))),
+            }
+        }
+        let mut out = String::new();
+        let _ = writeln!(out, "# w3h canonical trace v1 seed={:#x}", self.seed);
+        let section = |out: &mut String, title: &str, map: &BTreeMap<String, Vec<String>>| {
+            let _ = writeln!(out, "[{title}]");
+            for (key, items) in map {
+                let _ = writeln!(out, "{key}");
+                for item in items {
+                    let _ = writeln!(out, "  {item}");
+                }
+            }
+        };
+        section(&mut out, "nodes", &nodes);
+        section(&mut out, "links", &links);
+        let _ = writeln!(out, "[lanes]");
+        for (lane, writes) in &lanes {
+            let _ = writeln!(out, "{lane}");
+            for (seq, write) in writes {
+                let fate = fates
+                    .get(&(lane.clone(), *seq))
+                    .map_or("in-flight", String::as_str);
+                let _ = writeln!(out, "  {write} -> {fate}");
+            }
+        }
+        section(&mut out, "deliveries", &deliveries);
+        section(&mut out, "refusals", &refusals);
+        section(&mut out, "publishes", &publishes);
+        let _ = writeln!(out, "[marks]");
+        for mark in &marks {
+            let _ = writeln!(out, "  {mark}");
+        }
+        out
     }
 
     fn attach(self: &Arc<Self>, peer: PeerId, addr: SocketAddr) -> Arc<SimLink> {
+        let at = self.now();
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let (accept_tx, accept_rx) = mpsc::unbounded_channel();
-        let (lifecycle, _) = broadcast::channel(256);
+        let (lifecycle, _) = broadcast::channel(1024);
         let mut state = self.lock();
         let incarnation = state
             .nodes
             .get(&peer.0)
             .map_or(0, |slot| slot.incarnation.saturating_add(1));
-        Self::close_all_locked(&mut state, peer.0, ConnectionCloseReason::Superseded);
+        Self::close_all_locked(&mut state, peer.0, ConnectionCloseReason::Superseded, at);
         state.by_addr.insert(addr, peer.0);
         state.nodes.insert(
             peer.0,
@@ -231,7 +573,11 @@ impl SimFabric {
                 lifecycle: lifecycle.clone(),
             },
         );
-        state.trace.push(TraceEvent::Attached { node: peer.0 });
+        state.trace.push(TraceEvent::Node {
+            node: peer.0,
+            at,
+            kind: NodeEventKind::Attached { incarnation },
+        });
         drop(state);
         Arc::new(SimLink {
             fabric: Arc::clone(self),
@@ -242,7 +588,12 @@ impl SimFabric {
         })
     }
 
-    fn close_all_locked(state: &mut FabricState, node: Key, reason: ConnectionCloseReason) {
+    fn close_all_locked(
+        state: &mut FabricState,
+        node: Key,
+        reason: ConnectionCloseReason,
+        at: Duration,
+    ) {
         let keys: Vec<(Key, Key)> = state
             .links
             .keys()
@@ -250,36 +601,72 @@ impl SimFabric {
             .copied()
             .collect();
         for key in keys {
-            Self::close_link_locked(state, key, reason);
+            Self::close_link_locked(state, key, reason, at);
         }
     }
 
-    fn close_link_locked(state: &mut FabricState, key: (Key, Key), reason: ConnectionCloseReason) {
+    fn close_link_locked(
+        state: &mut FabricState,
+        key: (Key, Key),
+        reason: ConnectionCloseReason,
+        at: Duration,
+    ) {
         let Some(link) = state.links.remove(&key) else {
             return;
         };
-        let generation = link.generation;
-        state.trace.push(TraceEvent::Closed {
+        link.closed.store(true, Ordering::SeqCst);
+        state.trace.push(TraceEvent::Link {
             a: key.0,
             b: key.1,
-            generation,
+            ordinal: link.ordinal,
+            at,
+            open: false,
         });
-        // Frames of a closed generation are lost, as with a dead QUIC
-        // connection.
-        state
-            .queue
-            .retain(|_, pending| pending.meta.generation != generation);
+        // Frames of the closed connection are lost, each one recorded.
+        let lane_keys: Vec<LaneKey> = state
+            .lanes
+            .keys()
+            .filter(|lane| pair(lane.src, lane.dst) == key)
+            .copied()
+            .collect();
+        for lane in lane_keys {
+            let mut lost = Vec::new();
+            if let Some(lane_state) = state.lanes.get_mut(&lane) {
+                lane_state.queue.retain(|queued| {
+                    if queued.generation == link.generation {
+                        lost.push(queued.seq);
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+            for seq in lost {
+                state.trace.push(TraceEvent::Fate {
+                    lane,
+                    seq,
+                    fate: Fate::Dropped {
+                        at,
+                        reason: DropReason::LinkClosed,
+                    },
+                });
+            }
+        }
         for (me, other) in [(key.0, key.1), (key.1, key.0)] {
             if let Some(slot) = state.nodes.get(&me) {
                 let _ = slot.lifecycle.send((
                     PeerId(other),
-                    PeerLifecycleEvent::Closed { generation, reason },
+                    PeerLifecycleEvent::Closed {
+                        generation: link.generation,
+                        reason,
+                    },
                 ));
             }
         }
     }
 
     fn connect(&self, from: Key, addr: SocketAddr) -> Result<PeerConnection, NodeError> {
+        let at = self.now();
         let mut state = self.lock();
         let to = *state
             .by_addr
@@ -292,25 +679,32 @@ impl SimFabric {
             return Err(NodeError::Connection(format!("sim: {addr} unreachable")));
         }
         let key = pair(from, to);
-        if let Some(link) = state.links.get(&key) {
-            return Ok(self.peer_connection(&state, to, link.generation, Side::Client));
+        if state.links.contains_key(&key) {
+            return Ok(Self::peer_connection(&state, to, Side::Client));
         }
         let generation = state.next_generation;
         state.next_generation = state.next_generation.saturating_add(1);
+        let ordinal = {
+            let next = state.pair_ordinals.entry(key).or_insert(0);
+            let ordinal = *next;
+            *next = next.saturating_add(1);
+            ordinal
+        };
         state.links.insert(
             key,
             LinkState {
                 generation,
-                next_seq: BTreeMap::new(),
-                last_due: BTreeMap::new(),
+                ordinal,
+                closed: Arc::new(AtomicBool::new(false)),
             },
         );
-        state.trace.push(TraceEvent::Connected {
+        state.trace.push(TraceEvent::Link {
             a: key.0,
             b: key.1,
-            generation,
+            ordinal,
+            at,
+            open: true,
         });
-        let inbound_side = self.peer_connection(&state, from, generation, Side::Server);
         for (me, other) in [(from, to), (to, from)] {
             if let Some(slot) = state.nodes.get(&me) {
                 let _ = slot.lifecycle.send((
@@ -319,19 +713,14 @@ impl SimFabric {
                 ));
             }
         }
+        let inbound_side = Self::peer_connection(&state, from, Side::Server);
         if let Some(slot) = state.nodes.get(&to) {
             let _ = slot.accept.send(inbound_side);
         }
-        Ok(self.peer_connection(&state, to, generation, Side::Client))
+        Ok(Self::peer_connection(&state, to, Side::Client))
     }
 
-    fn peer_connection(
-        &self,
-        state: &FabricState,
-        peer: Key,
-        _generation: u64,
-        side: Side,
-    ) -> PeerConnection {
+    fn peer_connection(state: &FabricState, peer: Key, side: Side) -> PeerConnection {
         let addr = state
             .nodes
             .get(&peer)
@@ -353,80 +742,131 @@ impl SimFabric {
         from: Key,
         to: Key,
         generation: Option<u64>,
-        bytes: Vec<u8>,
+        bytes: &[u8],
         delivered: Option<oneshot::Sender<()>>,
     ) -> Result<(), NodeError> {
+        let at = self.now();
+        let class = LaneClass::of(bytes);
         let mut state = self.lock();
         let key = pair(from, to);
-        let Some(link) = state.links.get_mut(&key) else {
+        let live = state
+            .links
+            .get(&key)
+            .map(|link| (link.generation, link.ordinal));
+        let Some((link_generation, ordinal)) =
+            live.filter(|(current, _)| generation.is_none_or(|wanted| wanted == *current))
+        else {
+            state.trace.push(TraceEvent::Refused {
+                src: from,
+                dst: to,
+                class,
+                at,
+            });
             return Err(not_connected(&PeerId(to)));
         };
-        if generation.is_some_and(|g| g != link.generation) {
-            return Err(NodeError::Connection("sim: generation superseded".into()));
-        }
-        let seq = link.next_seq.entry(from).or_insert(0);
-        let link_seq = *seq;
-        *seq = seq.saturating_add(1);
-        let meta = FrameMeta {
+        let lane = LaneKey {
             src: from,
             dst: to,
-            generation: link.generation,
-            link_seq,
-            stream_type: bytes.first().copied().unwrap_or(0),
-            len: bytes.len(),
+            class,
         };
-        let seq_bytes = link_seq.to_le_bytes();
-        let seed_bytes = self.seed.to_le_bytes();
-        let tie = stable_hash(&[&seed_bytes, &from, &to, &seq_bytes]);
-        let jitter = Duration::from_millis(tie % self.jitter_ms.max(1));
-        let mut due = Instant::now() + self.base_latency + jitter;
+        let seq = {
+            let lane_state = state.lanes.entry(lane).or_default();
+            let seq = lane_state.next_seq;
+            lane_state.next_seq = seq.saturating_add(1);
+            seq
+        };
+        let bytes: Arc<[u8]> = Arc::from(bytes);
+        let write = Write {
+            lane,
+            seq,
+            pair_ordinal: ordinal,
+            at,
+            bytes: Arc::clone(&bytes),
+        };
         let mut fault = Fault::Pass;
-        for rule in &state.rules {
-            fault = rule(&meta, &bytes);
+        let mut rule_index = 0;
+        for (index, rule) in state.rules.iter().enumerate() {
+            fault = rule(&write);
             if fault != Fault::Pass {
+                rule_index = index;
                 break;
             }
         }
+        let index = state.writes.len();
+        state.writes.push(write);
+        state.trace.push(TraceEvent::Write { index, fault });
+        let class_name = class.name();
+        let jitter = Duration::from_micros(
+            stable_hash(&[
+                &self.seed.to_le_bytes(),
+                &from,
+                &to,
+                class_name.as_bytes(),
+                &seq.to_le_bytes(),
+            ]) % self.jitter_us.max(1),
+        );
+        let mut due = Instant::now() + self.base_latency + jitter;
         match fault {
             Fault::Drop => {
-                state.trace.push(TraceEvent::Dropped(meta));
+                state.trace.push(TraceEvent::Fate {
+                    lane,
+                    seq,
+                    fate: Fate::Dropped {
+                        at,
+                        reason: DropReason::Rule(rule_index),
+                    },
+                });
                 return Ok(());
             }
             Fault::Delay(extra) => due += extra,
             Fault::Pass => {}
         }
-        // Per-direction FIFO, as on one QUIC connection.
-        let Some(link) = state.links.get_mut(&key) else {
-            return Err(not_connected(&PeerId(to)));
-        };
-        let last = link.last_due.entry(from).or_insert(due);
-        if due < *last {
-            due = *last;
+        let lane_state = state.lanes.entry(lane).or_default();
+        // Strict FIFO within the lane: never due before its predecessor,
+        // and the pump pops lane heads only.
+        if let Some(last) = lane_state.last_due {
+            if due < last {
+                due = last;
+            }
         }
-        *last = due;
-        let unique = state.next_unique;
-        state.next_unique = state.next_unique.saturating_add(1);
-        state.queue.insert(
-            (due, tie, unique),
-            Pending {
-                meta,
-                bytes,
-                delivered,
-            },
-        );
+        lane_state.last_due = Some(due);
+        lane_state.queue.push_back(Queued {
+            seq,
+            due,
+            generation: link_generation,
+            bytes,
+            delivered,
+        });
         drop(state);
         self.wake.notify_one();
         Ok(())
     }
 
-    async fn run_pump(fabric: Arc<Self>) {
+    fn lane_rank(&self, lane: &LaneKey) -> u64 {
+        let class = lane.class.name();
+        stable_hash(&[
+            &self.seed.to_le_bytes(),
+            &lane.src,
+            &lane.dst,
+            class.as_bytes(),
+        ])
+    }
+
+    async fn run_pump(self: Arc<Self>) {
         // The pump owns a strong handle: the fabric lives as long as the
         // scenario's runtime, which drops this task at the end of the test.
         loop {
-            let next_due = fabric.lock().queue.keys().next().map(|(due, _, _)| *due);
-            let notified = fabric.wake.notified();
+            let next_due = {
+                let state = self.lock();
+                state
+                    .lanes
+                    .values()
+                    .filter_map(|lane| lane.queue.front().map(|queued| queued.due))
+                    .min()
+            };
+            let notified = self.wake.notified();
             match next_due {
-                Some(due) if due <= Instant::now() => fabric.deliver_due(),
+                Some(due) if due <= Instant::now() => self.deliver_due(),
                 Some(due) => {
                     tokio::select! {
                         biased;
@@ -439,56 +879,100 @@ impl SimFabric {
         }
     }
 
+    /// Deliver every lane head that is due, earliest first; between heads
+    /// due at the same instant, the lower seeded lane rank goes first.
     fn deliver_due(&self) {
-        let now = Instant::now();
+        let now_instant = Instant::now();
+        let at = self.now();
         let mut state = self.lock();
-        while let Some(entry) = state.queue.first_entry() {
-            if entry.key().0 > now {
+        loop {
+            let next = state
+                .lanes
+                .iter()
+                .filter_map(|(lane, lane_state)| {
+                    lane_state
+                        .queue
+                        .front()
+                        .filter(|queued| queued.due <= now_instant)
+                        .map(|queued| (queued.due, self.lane_rank(lane), *lane))
+                })
+                .min();
+            let Some((_, _, lane)) = next else {
                 break;
-            }
-            let pending = entry.remove();
+            };
+            let Some(queued) = state
+                .lanes
+                .get_mut(&lane)
+                .and_then(|lane_state| lane_state.queue.pop_front())
+            else {
+                break;
+            };
             let live = state
                 .links
-                .get(&pair(pending.meta.src, pending.meta.dst))
-                .is_some_and(|link| link.generation == pending.meta.generation);
+                .get(&pair(lane.src, lane.dst))
+                .is_some_and(|link| link.generation == queued.generation);
             let target = state
                 .nodes
-                .get(&pending.meta.dst)
-                .filter(|slot| slot.online && live)
+                .get(&lane.dst)
+                .filter(|slot| slot.online)
                 .map(|slot| slot.inbound.clone());
-            match target {
-                Some(inbound) => {
-                    let delivered = inbound
-                        .send((
-                            PeerId(pending.meta.src),
-                            pending.meta.generation,
-                            pending.bytes,
-                        ))
-                        .is_ok();
-                    if delivered {
-                        if let Some(ack) = pending.delivered {
+            let fate = match (live, target) {
+                (false, _) => Fate::Dropped {
+                    at,
+                    reason: DropReason::LinkClosed,
+                },
+                (true, None) => Fate::Dropped {
+                    at,
+                    reason: DropReason::DestinationOffline,
+                },
+                (true, Some(inbound)) => {
+                    if inbound
+                        .send((PeerId(lane.src), queued.generation, queued.bytes.to_vec()))
+                        .is_ok()
+                    {
+                        if let Some(ack) = queued.delivered {
                             let _ = ack.send(());
                         }
-                        state.trace.push(TraceEvent::Delivered(pending.meta));
+                        Fate::Delivered { at }
                     } else {
-                        state.trace.push(TraceEvent::Dropped(pending.meta));
+                        Fate::Dropped {
+                            at,
+                            reason: DropReason::DestinationOffline,
+                        }
                     }
                 }
-                None => state.trace.push(TraceEvent::Dropped(pending.meta)),
-            }
+            };
+            state.trace.push(TraceEvent::Fate {
+                lane,
+                seq: queued.seq,
+                fate,
+            });
         }
     }
 
+    fn note_publish(&self, node: Key, topic: &str, payload: &[u8]) {
+        let at = self.now();
+        let digest = *blake3::hash(payload).as_bytes();
+        self.lock().trace.push(TraceEvent::Publish {
+            node,
+            at,
+            topic: topic.to_string(),
+            digest,
+        });
+    }
+
     fn detach(&self, node: Key) {
+        let at = self.now();
         let mut state = self.lock();
         if let Some(slot) = state.nodes.get_mut(&node) {
             slot.online = false;
         }
-        state.trace.push(TraceEvent::Online {
+        state.trace.push(TraceEvent::Node {
             node,
-            online: false,
+            at,
+            kind: NodeEventKind::Detached,
         });
-        Self::close_all_locked(&mut state, node, ConnectionCloseReason::PeerShutdown);
+        Self::close_all_locked(&mut state, node, ConnectionCloseReason::PeerShutdown, at);
     }
 }
 
@@ -502,6 +986,14 @@ pub(crate) struct SimLink {
     lifecycle: broadcast::Sender<(PeerId, PeerLifecycleEvent)>,
 }
 
+impl std::fmt::Debug for SimLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimLink")
+            .field("me", &hex::encode(&self.me.0[..4]))
+            .finish_non_exhaustive()
+    }
+}
+
 impl SimLink {
     pub(crate) fn peer_id(&self) -> PeerId {
         self.me
@@ -511,6 +1003,17 @@ impl SimLink {
         // A virtual handshake round trip.
         tokio::time::sleep(self.fabric.base_latency * 2).await;
         self.fabric.connect(self.me.0, addr)
+    }
+
+    pub(crate) async fn connect_peer(&self, peer_id: PeerId) -> Result<PeerConnection, NodeError> {
+        let addr = self
+            .fabric
+            .lock()
+            .nodes
+            .get(&peer_id.0)
+            .map(|slot| slot.addr)
+            .ok_or_else(|| not_connected(&peer_id))?;
+        self.connect_peer_with_addrs(peer_id, vec![addr]).await
     }
 
     pub(crate) async fn connect_peer_with_addrs(
@@ -527,17 +1030,6 @@ impl SimLink {
             }
         }
         Err(last)
-    }
-
-    pub(crate) async fn connect_peer(&self, peer_id: PeerId) -> Result<PeerConnection, NodeError> {
-        let addr = self
-            .fabric
-            .lock()
-            .nodes
-            .get(&peer_id.0)
-            .map(|slot| slot.addr)
-            .ok_or_else(|| not_connected(&peer_id))?;
-        self.connect_peer_with_addrs(peer_id, vec![addr]).await
     }
 
     pub(crate) fn upsert_peer_hints(&self, _peer_id: PeerId, _addrs: Vec<SocketAddr>) {}
@@ -564,11 +1056,13 @@ impl SimLink {
     }
 
     pub(crate) fn disconnect(&self, peer_id: &PeerId) -> Result<(), NodeError> {
+        let at = self.fabric.now();
         let mut state = self.fabric.lock();
         SimFabric::close_link_locked(
             &mut state,
             pair(self.me.0, peer_id.0),
             ConnectionCloseReason::LifecycleCleanup,
+            at,
         );
         Ok(())
     }
@@ -577,20 +1071,17 @@ impl SimLink {
         let state = self.fabric.lock();
         state
             .links
-            .iter()
-            .filter_map(|((a, b), link)| {
-                let other = if *a == self.me.0 {
-                    *b
+            .keys()
+            .filter_map(|(a, b)| {
+                if *a == self.me.0 {
+                    Some(*b)
                 } else if *b == self.me.0 {
-                    *a
+                    Some(*a)
                 } else {
-                    return None;
-                };
-                Some(
-                    self.fabric
-                        .peer_connection(&state, other, link.generation, Side::Client),
-                )
+                    None
+                }
             })
+            .map(|other| SimFabric::peer_connection(&state, other, Side::Client))
             .collect()
     }
 
@@ -605,8 +1096,7 @@ impl SimLink {
     }
 
     pub(crate) fn send(&self, peer_id: &PeerId, data: &[u8]) -> Result<(), NodeError> {
-        self.fabric
-            .enqueue(self.me.0, peer_id.0, None, data.to_vec(), None)
+        self.fabric.enqueue(self.me.0, peer_id.0, None, data, None)
     }
 
     pub(crate) fn send_on_generation_with_admission<B, F>(
@@ -623,13 +1113,8 @@ impl SimLink {
             return Err(NodeError::Connection("sim: generation superseded".into()));
         }
         let bytes = admit(generation).map_err(NodeError::Endpoint)?;
-        self.fabric.enqueue(
-            self.me.0,
-            peer_id.0,
-            Some(generation),
-            bytes.as_ref().to_vec(),
-            None,
-        )
+        self.fabric
+            .enqueue(self.me.0, peer_id.0, Some(generation), bytes.as_ref(), None)
     }
 
     pub(crate) async fn send_with_receive_ack(
@@ -640,7 +1125,7 @@ impl SimLink {
     ) -> Result<(), NodeError> {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.fabric
-            .enqueue(self.me.0, peer_id.0, None, data.to_vec(), Some(ack_tx))?;
+            .enqueue(self.me.0, peer_id.0, None, data, Some(ack_tx))?;
         match tokio::time::timeout(timeout, ack_rx).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) => Err(NodeError::Connection("sim: frame lost".into())),
@@ -671,6 +1156,21 @@ impl SimLink {
             .links
             .get(&pair(self.me.0, peer.0))
             .map(|link| link.generation)
+    }
+
+    pub(crate) fn session_connection(&self, peer: &PeerId) -> Option<SimConnection> {
+        self.fabric
+            .lock()
+            .links
+            .get(&pair(self.me.0, peer.0))
+            .map(|link| SimConnection {
+                generation: link.generation,
+                closed: Arc::clone(&link.closed),
+            })
+    }
+
+    pub(crate) fn note_publish(&self, topic: &str, payload: &[u8]) {
+        self.fabric.note_publish(self.me.0, topic, payload);
     }
 
     pub(crate) fn shutdown(&self) {
@@ -709,104 +1209,146 @@ pub(crate) fn claim(config: &super::NetworkConfig, peer: PeerId) -> Option<Arc<S
     Some(fabric.attach(peer, addr))
 }
 
-#[cfg(test)]
-mod spike_tests {
-    //! Phase-1 feasibility spike (compile-only on macOS; run in CI from
-    //! W3-H slice S1). Two full `Agent`s — gossip runtime, plane hello,
-    //! receive pump — on one paused current-thread runtime, over the fabric.
+mod fabric_tests {
+    //! Fabric-only checks (no daemons); they run in CI with the `w3h`
+    //! profile.
     use super::*;
-    use crate::network::NetworkConfig;
-    use crate::Agent;
 
-    fn sim_config(plane: &str, last_octet: u8, bootstrap: Vec<SocketAddr>) -> NetworkConfig {
-        NetworkConfig {
-            bind_addr: Some(SocketAddr::from(([198, 18, 0, last_octet], 5483))),
-            bootstrap_nodes: bootstrap,
-            network_id: Some(plane.to_string()),
-            mdns_enabled: false,
-            port_mapping_enabled: false,
-            ..NetworkConfig::default()
-        }
+    fn key(n: u8) -> PeerId {
+        PeerId([n; 32])
     }
 
-    async fn sim_agent(
-        dir: &std::path::Path,
-        config: NetworkConfig,
-    ) -> crate::error::Result<Agent> {
-        Agent::builder()
-            .with_machine_key(dir.join("machine.key"))
-            .with_agent_key(crate::identity::AgentKeypair::generate()?)
-            .with_agent_cert_path(dir.join("agent.cert"))
-            .with_user_key_path(dir.join("absent-user.key"))
-            .with_contact_store_path(dir.join("contacts.json"))
-            .with_peer_cache_disabled()
-            .with_network_config(config)
-            .build()
-            .await
+    fn addr(n: u8) -> SocketAddr {
+        SocketAddr::from(([198, 18, 0, n], 5483))
+    }
+
+    const DM: u8 = super::super::DIRECT_MESSAGE_STREAM_TYPE;
+
+    async fn two_links(fabric: &Arc<SimFabric>) -> (Arc<SimLink>, Arc<SimLink>) {
+        let a = fabric.attach(key(1), addr(1));
+        let b = fabric.attach(key(2), addr(2));
+        fabric.label(&key(1), "A");
+        fabric.label(&key(2), "B");
+        a.connect_addr(addr(2)).await.expect("connect");
+        (a, b)
+    }
+
+    async fn drain(link: &SimLink, n: usize) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for _ in 0..n {
+            let (_, _, bytes) =
+                tokio::time::timeout(Duration::from_secs(5), link.recv_with_generation())
+                    .await
+                    .expect("delivered in time")
+                    .expect("link open");
+            out.push(bytes);
+        }
+        out
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    #[ignore = "W3-H phase-1 spike: compile-only on macOS; enabled in CI by slice S1"]
-    async fn w3h_spike_two_agents_publish_over_sim_fabric() -> anyhow::Result<()> {
-        let plane = "w3h-spike";
-        let fabric = SimFabric::new(0x1164);
-        register(plane, &fabric);
-        let a_dir = tempfile::tempdir()?;
-        let b_dir = tempfile::tempdir()?;
-        let a_addr = SocketAddr::from(([198, 18, 0, 1], 5483));
-        let a = sim_agent(a_dir.path(), sim_config(plane, 1, Vec::new())).await?;
-        let b = sim_agent(b_dir.path(), sim_config(plane, 2, vec![a_addr])).await?;
-        a.join_network().await?;
-        b.join_network().await?;
-
-        let mut sub = a.subscribe("w3h/spike").await?;
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        b.publish("w3h/spike", b"hello".to_vec()).await?;
-        let got = tokio::time::timeout(Duration::from_secs(30), sub.recv())
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("subscription closed"))?;
-        assert_eq!(got.payload.as_ref(), b"hello");
-
-        // Seeded per-frame faults: delay then drop B's pub-sub frames to A.
-        let b_peer = b
-            .network()
-            .ok_or_else(|| anyhow::anyhow!("sim network"))?
-            .peer_id();
-        let delayed_src = b_peer.0;
-        fabric.add_rule(move |meta, _bytes| {
-            if meta.src == delayed_src && meta.link_seq % 7 == 3 {
-                Fault::Delay(Duration::from_millis(250))
+    async fn w3h_fabric_lane_is_fifo_even_with_delay_faults() {
+        let fabric = SimFabric::new(0x5eed);
+        // Delay every frame with an even marker; the lane must still
+        // deliver in write order (no overtaking within a lane).
+        fabric.add_rule(|write| {
+            if write.bytes.get(1).is_some_and(|b| b % 2 == 0) {
+                Fault::Delay(Duration::from_millis(40))
             } else {
                 Fault::Pass
             }
         });
-        fabric.add_rule(|meta, bytes| {
-            if meta.len > 64 * 1024 && bytes.first() == Some(&0) {
+        let (a, b) = two_links(&fabric).await;
+        for i in 0..32u8 {
+            a.send(&key(2), &[DM, i]).expect("send");
+        }
+        let order: Vec<u8> = drain(&b, 32).await.iter().map(|bytes| bytes[1]).collect();
+        assert_eq!(order, (0..32u8).collect::<Vec<_>>());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn w3h_fabric_link_close_records_every_lost_frame() {
+        let fabric = SimFabric::new(7);
+        let (a, _b) = two_links(&fabric).await;
+        for i in 0..5u8 {
+            a.send(&key(2), &[DM, i]).expect("send");
+        }
+        fabric.set_online(&key(2), false);
+        let trace = fabric.canonical_trace();
+        assert_eq!(trace.matches("LinkClosed").count(), 5, "{trace}");
+        assert!(a.send(&key(2), &[DM, 9]).is_err());
+        assert!(
+            fabric
+                .canonical_trace()
+                .contains("[refusals]\nA\n  ->B direct@"),
+            "a refused send is recorded"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn w3h_fabric_drop_rule_is_recorded_with_the_write() {
+        let fabric = SimFabric::new(9);
+        fabric.add_rule(|write| {
+            if write.seq == 1 {
                 Fault::Drop
             } else {
                 Fault::Pass
             }
         });
+        let (a, b) = two_links(&fabric).await;
+        for i in 0..3u8 {
+            a.send(&key(2), &[DM, i]).expect("send");
+        }
+        assert_eq!(drain(&b, 2).await, vec![vec![DM, 0], vec![DM, 2]]);
+        let writes = fabric.writes();
+        assert_eq!(writes.len(), 3, "the dropped write is still captured");
+        assert_eq!(&*writes[1].bytes, &[DM, 1]);
+        assert!(fabric.canonical_trace().contains("dropped@"));
+    }
 
-        // Fault injection: take A offline; B's next publish must not arrive.
-        let a_peer = a
-            .network()
-            .ok_or_else(|| anyhow::anyhow!("sim network"))?
-            .peer_id();
-        fabric.set_online(&a_peer, false);
-        b.publish("w3h/spike", b"lost".to_vec()).await?;
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn w3h_fabric_partition_refuses_connect_until_healed() {
+        let fabric = SimFabric::new(11);
+        let (a, _b) = two_links(&fabric).await;
+        fabric.set_partitioned(&key(1), &key(2), true);
+        assert!(!a.is_connected(&key(2)), "partition closes the live link");
+        assert!(a.connect_addr(addr(2)).await.is_err());
+        fabric.set_partitioned(&key(1), &key(2), false);
+        a.connect_addr(addr(2)).await.expect("healed");
+        let trace = fabric.canonical_trace();
+        assert!(trace.contains("A~B\n  #0 open@"), "{trace}");
         assert!(
-            tokio::time::timeout(Duration::from_secs(30), sub.recv())
-                .await
-                .is_err(),
-            "an offline node receives nothing"
+            trace.contains("#1 open@"),
+            "a second connection ordinal: {trace}"
         );
-        fabric.set_partitioned(&a_peer, &b_peer, true);
-        fabric.set_partitioned(&a_peer, &b_peer, false);
-        let digest = fabric.trace_digest();
-        assert_ne!(digest, 0);
-        a.shutdown().await;
-        b.shutdown().await;
-        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn w3h_fabric_same_seed_same_trace_other_seed_differs() {
+        async fn run(seed: u64) -> String {
+            let fabric = SimFabric::new(seed);
+            let a = fabric.attach(key(1), addr(1));
+            let b = fabric.attach(key(2), addr(2));
+            let c = fabric.attach(key(3), addr(3));
+            a.connect_addr(addr(3)).await.expect("a-c");
+            b.connect_addr(addr(3)).await.expect("b-c");
+            for i in 0..8u8 {
+                a.send(&key(3), &[DM, i]).expect("a");
+                b.send(&key(3), &[DM, 100 + i]).expect("b");
+            }
+            drain(&c, 16).await;
+            // Compare executions, not the seed header.
+            let trace = fabric.canonical_trace();
+            trace
+                .split_once('\n')
+                .map_or(trace.clone(), |(_, body)| body.to_string())
+        }
+        let first = run(1).await;
+        assert_eq!(first, run(1).await, "same seed, same canonical trace");
+        assert_ne!(
+            first,
+            run(2).await,
+            "the seed drives timing and interleaving"
+        );
     }
 }

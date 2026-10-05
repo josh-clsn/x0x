@@ -164,6 +164,13 @@ pub struct ServerHandle {
     // `Option` so the consuming `wait`/`shutdown_and_wait` can take the join
     // handle out without conflicting with the `Drop` impl (which only cancels).
     pub(super) task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    /// W3-H (#1164) test builds: the daemon's state (weak, so a restart can
+    /// drop it) and its router, so the harness drives the public API through
+    /// `Router::oneshot` without a socket.
+    #[cfg(test)]
+    pub(super) test_state: std::sync::Weak<AppState>,
+    #[cfg(test)]
+    pub(super) test_router: axum::Router,
     // Issue #601/#645: the data-dir and identity-dir instance locks are NOT
     // fields here. They are moved into the supervisor task by
     // `serve_with_options` so they are released only after the supervisor has
