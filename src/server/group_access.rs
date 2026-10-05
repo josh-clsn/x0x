@@ -61,8 +61,8 @@
 //! helpers in `crate::server::routes::named_groups`
 //! (`reject_fork_quarantined_for_actor`,
 //! `reject_unverified_owner_certified_restore`,
-//! `open_envelope_withdrawn_group_conflict`), which is what the inline
-//! code used.
+//! `open_envelope_withdrawn_group_conflict`, `reject_withdrawn_group`),
+//! which is what the inline code used.
 //!
 //! Later slices (S3 admin/mutations, S4 long tail) add the remaining
 //! levels (`Admin`, `JoinSelf`) and flip `Unmigrated` rows to
@@ -77,6 +77,7 @@ use crate::server::rider_auth::ActorContext;
 use crate::server::routes::named_groups::{
     local_join_membership_state, open_envelope_withdrawn_group_conflict,
     reject_fork_quarantined_for_actor, reject_unverified_owner_certified_restore,
+    reject_withdrawn_group,
 };
 use crate::server::state::AppState;
 use axum::extract::{Extension, FromRequestParts, MatchedPath, Path};
@@ -102,15 +103,24 @@ pub(in crate::server) enum MemberState {
 }
 
 /// What a request was admitted at. S1 needs three levels; S2 adds
-/// `RiderScope` and `PublicWrite` for the secure-write family; S3–S4 add
-/// `Admin` and `JoinSelf`.
+/// `SessionBearer`, `RiderScope` and `PublicWrite` for the
+/// secure-write family; S3–S4 add `Admin` and `JoinSelf`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::server) enum AccessLevel {
     /// The durable API token — full authority, subsumes every other level.
     OwnerDurable,
-    /// A session bearer holding a qualifying local seat. Which seat state
-    /// qualifies is the route's admission rule, not the caller's guess.
+    /// A session bearer holding a qualifying local seat — a seat the
+    /// admission core actually verified. Which seat state qualifies is
+    /// the route's admission rule, not the caller's guess; a session
+    /// bearer whose seat was NOT checked is [`AccessLevel::SessionBearer`].
     Member(MemberState),
+    /// A session bearer on the S2 secure-write family (`send`,
+    /// `secure/encrypt|decrypt|reseal`) — the bearer CLASS only, no
+    /// seat verified: `send` admits seatless bearers where the write
+    /// policy allows and `decrypt` still admits banned callers, the
+    /// member gate/ban/write-policy checks being the handler's, in
+    /// their per-route order. Never read as "holds an active seat".
+    SessionBearer,
     /// A rider bearer on a write surface (`send`, `secure/encrypt`). The
     /// level LABELS the actor class — it asserts no verified token grant:
     /// the ADR-0039 grant/ban/role/delegation ladder runs in the handler
@@ -119,11 +129,11 @@ pub(in crate::server) enum AccessLevel {
     /// while `secure/encrypt` checks the grant first).
     RiderScope,
     /// No actor-based gate; the route serves its public projection (any
-    /// remaining gates are local policy, not principal identity). The
-    /// S2 open-envelope surface is the write-side member of this class.
+    /// remaining gates are local policy, not principal identity).
     PublicRead,
     /// No actor-based gate on a write surface; remaining gates are local
-    /// policy (the withdrawn-record conflict on `open-envelope`).
+    /// policy (the withdrawn-record conflict on `open-envelope` — the
+    /// write-side member of the no-actor class).
     PublicWrite,
 }
 
@@ -205,31 +215,32 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
         class: AccessClass::Level(AccessLevel::Member(MemberState::Active)),
     },
     // ── S2 secure-write family: classified ────────────────────────────
-    // Nominal levels take the inventory target's first-named class
-    // ("Member + RiderScope" → Member). The cores assert NO seat and NO
-    // token grant: ban state, write policy, send-as, the member gate and
-    // the ADR-0039 grant/delegation/provenance ladder stay in the
-    // handlers, under their own lock (task rule: those checks keep their
-    // lock and their per-route order).
+    // The inventory target is "Member + RiderScope", but the S2 entry
+    // cores verify NEITHER: no seat lookup, no token grant. The rows
+    // label the bearer class honestly — SessionBearer / RiderScope —
+    // because Member(..) claims a verified seat (see `AccessLevel`).
+    // Ban state, write policy, send-as, the member gate and the
+    // ADR-0039 grant/delegation/provenance ladder stay in the
+    // handlers, under their lock, in their per-route order.
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/send",
-        class: AccessClass::Level(AccessLevel::Member(MemberState::Active)),
+        class: AccessClass::Level(AccessLevel::SessionBearer),
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/secure/encrypt",
-        class: AccessClass::Level(AccessLevel::Member(MemberState::Active)),
+        class: AccessClass::Level(AccessLevel::SessionBearer),
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/secure/decrypt",
-        class: AccessClass::Level(AccessLevel::Member(MemberState::Active)),
+        class: AccessClass::Level(AccessLevel::SessionBearer),
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/secure/reseal",
-        class: AccessClass::Level(AccessLevel::Member(MemberState::Active)),
+        class: AccessClass::Level(AccessLevel::SessionBearer),
     },
     RouteAccess {
         method: Method::POST,
@@ -664,8 +675,8 @@ pub(in crate::server) fn admit_public_messages(
     info: &x0x::groups::GroupInfo,
     local_agent_hex: &str,
 ) -> Admission {
-    if info.withdrawn {
-        return Err(api_error(StatusCode::CONFLICT, "group is withdrawn"));
+    if let Some(resp) = reject_withdrawn_group(info) {
+        return Err(resp);
     }
     if info.policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted {
         return Err(bad_request(
@@ -704,12 +715,14 @@ pub(in crate::server) fn acting_principal_hex(
 
 /// The S2 actor classification shared by `send` and the secure
 /// encrypt/decrypt/reseal endpoints: the level LABELS the actor class
-/// the request entered as (the inventory's "Member + RiderScope"), and
-/// the acting hex names the principal the handler's remaining gates
-/// evaluate. Neither asserts a verified seat or grant — the member
-/// gate, ban state, write policy and the ADR-0039 grant/delegation
-/// ladder keep their per-route order in the handler, under its own
-/// lock.
+/// the request entered as — honestly: a session owner is
+/// `SessionBearer`, not `Member`, because this core looks up no seat
+/// (`send` admits seatless bearers where the write policy allows and
+/// `decrypt` still admits banned callers) — and the acting hex names
+/// the principal the handler's remaining gates evaluate. Neither
+/// asserts a verified seat or grant — the member gate, ban state,
+/// write policy and the ADR-0039 grant/delegation ladder keep their
+/// per-route order in the handler, under its own lock.
 fn secure_write_access(
     info: &x0x::groups::GroupInfo,
     actor: &ActorContext,
@@ -717,7 +730,7 @@ fn secure_write_access(
 ) -> GroupAccess {
     let level = match actor {
         ActorContext::Owner { durable: true } => AccessLevel::OwnerDurable,
-        ActorContext::Owner { durable: false } => AccessLevel::Member(MemberState::Active),
+        ActorContext::Owner { durable: false } => AccessLevel::SessionBearer,
         ActorContext::Rider { .. } => AccessLevel::RiderScope,
     };
     GroupAccess {
@@ -756,9 +769,8 @@ fn send_admission<'a>(
     let Some(info) = groups.get(route_id) else {
         return Err(not_found("group not found"));
     };
-    // `reject_withdrawn_group`'s body.
-    if info.withdrawn {
-        return Err(api_error(StatusCode::CONFLICT, "group is withdrawn"));
+    if let Some(resp) = reject_withdrawn_group(info) {
+        return Err(resp);
     }
     if let Some(resp) = fork_quarantine(info) {
         return Err(resp);
@@ -785,9 +797,8 @@ fn secure_endpoint_admission<'a>(
     let Some(info) = groups.get(route_id) else {
         return Err(not_found("group not found"));
     };
-    // `reject_withdrawn_group`'s body.
-    if info.withdrawn {
-        return Err(api_error(StatusCode::CONFLICT, "group is withdrawn"));
+    if let Some(resp) = reject_withdrawn_group(info) {
+        return Err(resp);
     }
     if let Some(resp) = reject_unverified_owner_certified_restore(info) {
         return Err(resp);
@@ -905,6 +916,23 @@ fn unclassified(method: &Method, path: &str) -> Response {
         .into_response()
 }
 
+/// Fail closed when a CLASSIFIED row cannot be served by this
+/// extractor: the seven pinned-signature routes run their admission
+/// cores directly and never take [`GroupAccess`], and a classified row
+/// without a `:id` parameter (open-envelope) is not extractor-shaped.
+/// Wiring bugs, not public capabilities — the text names the wiring,
+/// not the classification.
+fn extractor_not_wired(method: &Method, path: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "ok": false,
+            "error": format!("{method} {path} does not take the GroupAccess extractor"),
+        })),
+    )
+        .into_response()
+}
+
 /// `GET /groups/:id/members`. The extractor's admission snapshot; the
 /// handler re-runs [`admit_named_group_members`] under its own lock
 /// before serving the roster (r2/P2-1), so this pass is an early
@@ -1015,10 +1043,10 @@ impl FromRequestParts<Arc<AppState>> for GroupAccess {
             .and_then(|rest| rest.split('/').next())
             .and_then(|segment| segment.strip_prefix(':'));
         let Some(id_param) = id_param else {
-            return Err(unclassified(&parts.method, parts.uri.path()));
+            return Err(extractor_not_wired(&parts.method, parts.uri.path()));
         };
         let Some(id) = params.get(id_param) else {
-            return Err(unclassified(&parts.method, parts.uri.path()));
+            return Err(extractor_not_wired(&parts.method, parts.uri.path()));
         };
         let id = id.clone();
         match (row.method.as_str(), row.path) {
@@ -1050,7 +1078,7 @@ impl FromRequestParts<Arc<AppState>> for GroupAccess {
             // `send` could not take this extractor anyway without
             // reordering its body validations (kind/size/thread) after
             // the entry gates.
-            _ => Err(unclassified(&parts.method, parts.uri.path())),
+            _ => Err(extractor_not_wired(&parts.method, parts.uri.path())),
         }
     }
 }
@@ -1315,11 +1343,12 @@ mod tests {
     }
 
     /// The slice contract: exactly the S1 read family and the S2
-    /// secure-write family are classified, at the inventory's target
-    /// levels (S2 rows take the target's first-named class — see the
-    /// table comment); every other group-plane route is an explicit
-    /// `Unmigrated` row so parity holds without claiming a migration
-    /// that has not happened.
+    /// secure-write family are classified, at honest levels (the S2
+    /// rows label the bearer class — SessionBearer/RiderScope —
+    /// because the cores verify no seat; see the table comment); every
+    /// other group-plane route is an explicit `Unmigrated` row so
+    /// parity holds without claiming a migration that has not
+    /// happened.
     #[test]
     fn s1_and_s2_families_classified_and_the_rest_wait_for_their_slice() {
         let expected: &[(Method, &str, AccessLevel)] = &[
@@ -1345,25 +1374,21 @@ mod tests {
                 "/groups/:id/delegations",
                 AccessLevel::Member(MemberState::Active),
             ),
-            (
-                Method::POST,
-                "/groups/:id/send",
-                AccessLevel::Member(MemberState::Active),
-            ),
+            (Method::POST, "/groups/:id/send", AccessLevel::SessionBearer),
             (
                 Method::POST,
                 "/groups/:id/secure/encrypt",
-                AccessLevel::Member(MemberState::Active),
+                AccessLevel::SessionBearer,
             ),
             (
                 Method::POST,
                 "/groups/:id/secure/decrypt",
-                AccessLevel::Member(MemberState::Active),
+                AccessLevel::SessionBearer,
             ),
             (
                 Method::POST,
                 "/groups/:id/secure/reseal",
-                AccessLevel::Member(MemberState::Active),
+                AccessLevel::SessionBearer,
             ),
             (
                 Method::POST,
@@ -1920,9 +1945,10 @@ mod tests {
         );
 
         // Admission: the actor class plus the acting principal. A
-        // session bearer is labelled Member WITHOUT a seat lookup and a
-        // rider RiderScope WITHOUT a grant lookup — those gates run in
-        // the handler, in their per-route order.
+        // session bearer is labelled SessionBearer — NOT Member: no
+        // seat lookup happened — and a rider RiderScope WITHOUT a
+        // grant lookup; those gates run in the handler, in their
+        // per-route order.
         let (_, access) = send_admission(&groups, "send", &durable(), &local_hex, |_| None)
             .expect("durable owner admitted");
         assert_eq!(access.level(), AccessLevel::OwnerDurable);
@@ -1931,7 +1957,7 @@ mod tests {
 
         let (_, access) = send_admission(&groups, "send", &session(), &local_hex, |_| None)
             .expect("session bearer admitted (no seat asserted)");
-        assert_eq!(access.level(), AccessLevel::Member(MemberState::Active));
+        assert_eq!(access.level(), AccessLevel::SessionBearer);
         assert_eq!(access.acting_hex(), local_hex);
 
         let (_, access) = send_admission(&groups, "send", &rider(), &local_hex, |_| None)

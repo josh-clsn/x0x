@@ -23500,7 +23500,10 @@ pub(in crate::server) fn require_admin_or_above(
     }
 }
 
-fn reject_withdrawn_group(
+/// Canonical terminal-withdrawal 409 (`group is withdrawn`) — shared
+/// with the group-access admission cores (`server/group_access.rs`),
+/// which call it instead of copying the body.
+pub(in crate::server) fn reject_withdrawn_group(
     info: &x0x::groups::GroupInfo,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
     info.withdrawn
