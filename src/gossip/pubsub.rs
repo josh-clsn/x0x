@@ -5,7 +5,8 @@
 //! - x0x payload-level message authentication (V2 and topic-bound V3)
 //!
 //! Three wire formats coexist during the transition period:
-//! - **V1** (legacy): `[topic_len: u16_be | topic | payload]` — unsigned
+//! - **V1** (legacy): `[topic_len: u16_be | topic | payload]` — unsigned;
+//!   decoded but never delivered to a subscriber (charter I3, #1114)
 //! - **V3** (Signed KV pairing): same fields as V2, with signed topic length
 //! - **V2** (signed): `[0x02 | agent_id | pubkey | signature | topic | payload]`
 
@@ -167,7 +168,8 @@ pub struct PubSubStats {
     /// Messages that decoded successfully + passed trust filter.
     pub incoming_decoded: AtomicU64,
     /// Messages that failed decode (malformed, unsupported version) OR were
-    /// dropped by trust filter (blocked sender).
+    /// dropped by the delivery guard: unsigned (V1) or unverified sender
+    /// (#1114), revoked or blocked sender.
     pub incoming_decode_failed: AtomicU64,
     /// Messages successfully handed to a local subscriber channel.
     pub delivered_to_subscriber: AtomicU64,
@@ -555,7 +557,8 @@ impl SigningContext {
 /// Message published to the pub/sub system.
 ///
 /// Messages may be signed (v2 or v3) or unsigned (v1 legacy). The `sender` and
-/// `verified` fields indicate the authentication state.
+/// `verified` fields indicate the authentication state. A subscription only
+/// yields gossip messages with a `sender` whose signature verified (#1114).
 #[derive(Debug, Clone)]
 pub struct PubSubMessage {
     /// The topic this message was published on.
@@ -1261,7 +1264,8 @@ impl PubSubManager {
     ///
     /// * `network` - The network node (implements GossipTransport)
     /// * `signing` - Optional signing context for message authentication.
-    ///   When `None`, messages are published unsigned (v1 format).
+    ///   When `None`, messages are published unsigned (v1 format), which no
+    ///   x0x subscriber delivers (#1114).
     ///
     /// # Returns
     ///
@@ -2052,7 +2056,8 @@ impl PubSubManager {
     /// Publish a message to a topic.
     ///
     /// When a signing context is present, the message is signed with
-    /// ML-DSA-65 and encoded in v2 format. Otherwise, v1 (unsigned).
+    /// ML-DSA-65 and encoded in v2 format. Otherwise, v1 (unsigned), which no
+    /// x0x subscriber delivers (#1114).
     ///
     /// # Errors
     ///
@@ -2948,6 +2953,11 @@ pub(crate) fn select_one_full_bootstrap_eager_peer(
 
 /// Decode and filter a delivered payload before exposing it to x0x subscribers.
 ///
+/// Only a payload from an identified sender whose inner ML-DSA-65 signature
+/// verified is delivered (charter I3, #1114). Unsigned V1 payloads decode with
+/// `sender = None` and are dropped here: every identity check below keys off
+/// the sender, so delivering them skipped the revocation and Blocked checks.
+///
 /// Revocation is checked against the authoritative gossiped `RevocationSet`
 /// (issue #191) before the operator-local `ContactStore`, so a gossiped
 /// issuer/agent revocation closes delivery even before the eviction loop sets
@@ -2965,19 +2975,26 @@ async fn decode_for_delivery(
         }
     };
 
-    // Drop signed messages with failed verification.
-    if message.sender.is_some() && !message.verified {
-        tracing::warn!(
-            "Dropping pubsub payload with invalid signature from sender {:?}",
-            message.sender
-        );
-        return None;
-    }
+    // Charter I3 (#1114): nothing unsigned or unverified reaches a subscriber.
+    let sender = match message.sender {
+        Some(sender) if message.verified => sender,
+        Some(sender) => {
+            tracing::warn!(
+                "Dropping pubsub payload with invalid signature from sender {:?}",
+                sender
+            );
+            return None;
+        }
+        None => {
+            tracing::debug!("Dropping unsigned (V1) pubsub payload: no verified sender");
+            return None;
+        }
+    };
     // Authoritative gossiped revocation set (issue #191). Checked before the
     // ContactStore below, which is operator-local only — without this a
     // gossiped revocation reaches delivery only once the eviction loop has
     // set trust = Blocked (a race reopens it).
-    if let (Some(rev_set), Some(sender)) = (revocation_set, message.sender) {
+    if let Some(rev_set) = revocation_set {
         if rev_set.read().await.is_agent_revoked(&sender) {
             tracing::debug!(
                 "Dropping delivered payload from revoked sender {} (RevocationSet)",
@@ -2987,7 +3004,7 @@ async fn decode_for_delivery(
         }
     }
 
-    if let (Some(store), Some(sender)) = (contacts, message.sender) {
+    if let Some(store) = contacts {
         let guard = store.read().await;
         // Check revocation first — revoked keys are permanently rejected.
         if guard.is_revoked(&sender) {
@@ -3545,6 +3562,21 @@ mod tests {
     use crate::identity::AgentKeypair;
     use crate::network::NetworkConfig;
 
+    /// A fresh signing context. Production managers always sign, and since
+    /// #1114 nothing unsigned is delivered, so a fixture whose test relies on
+    /// delivery (or on its absence) must sign.
+    fn test_signing() -> Option<Arc<SigningContext>> {
+        Some(Arc::new(SigningContext::from_keypair(
+            &AgentKeypair::generate().expect("keygen"),
+        )))
+    }
+
+    /// A signed inner payload from a fresh remote author (#1114 fixtures).
+    fn remote_signed_inner(topic: &str, payload: Bytes) -> Bytes {
+        let author = SigningContext::from_keypair(&AgentKeypair::generate().expect("keygen"));
+        signed_inner_v2(&author, topic, &payload)
+    }
+
     fn encode_v2(
         agent_id: &AgentId,
         public_key: &[u8],
@@ -3839,7 +3871,7 @@ mod tests {
         let node = Arc::new(NetworkNode::new(network_config, None, None).await.unwrap());
         let mut manager = PubSubManager::new_with_participation(
             node,
-            None,
+            test_signing(),
             None,
             if full {
                 ParticipationMode::Full
@@ -4223,7 +4255,7 @@ mod tests {
                 // inbound expansion is the separate, explicitly held sg gate.
                 let inbound_from = PeerId::new([8; 32]);
                 let inbound_msg_id = [50 + writer; 32];
-                let payload = encode_v1(name, &Bytes::from(format!("remote-{writer}"))).unwrap();
+                let payload = remote_signed_inner(name, Bytes::from(format!("remote-{writer}")));
                 let frame = slice1_signed_frame(MessageKind::Eager, topic, payload, inbound_msg_id);
                 let inbound_before = eager_outbound_attempt_msgs(&manager);
                 manager.handle_incoming(inbound_from, None, frame).await;
@@ -4486,7 +4518,7 @@ mod tests {
             let frame = slice1_signed_frame(
                 MessageKind::Eager,
                 topic,
-                encode_v1(name, &Bytes::from(vec![peer])).unwrap(),
+                remote_signed_inner(name, Bytes::from(vec![peer])),
                 inbound_msg_id,
             );
             let inbound_before = eager_outbound_attempt_msgs(&manager);
@@ -4623,7 +4655,7 @@ mod tests {
                     slice1_signed_frame(
                         MessageKind::Eager,
                         topic,
-                        encode_v1(name, &Bytes::from(vec![peer])).unwrap(),
+                        remote_signed_inner(name, Bytes::from(vec![peer])),
                         [peer; 32],
                     ),
                 )
@@ -4795,7 +4827,7 @@ mod tests {
         let node = Arc::new(NetworkNode::new(network_config, None, None).await.unwrap());
         let mut manager = PubSubManager::new_with_participation(
             node,
-            None,
+            test_signing(),
             None,
             ParticipationMode::Leaf,
             "membership_774",
@@ -5131,7 +5163,7 @@ mod tests {
     async fn full_group_store_write_eager_reaches_roster_member_on_wire() {
         let publisher = PubSubManager::new_with_participation(
             test_node().await,
-            None,
+            test_signing(),
             None,
             ParticipationMode::Full,
             "group_roster_test",
@@ -5642,7 +5674,7 @@ mod tests {
 
     #[tokio::test]
     async fn group_subscribe_registration_is_serialized_with_unsubscribe() {
-        let manager = PubSubManager::new(test_node().await, None).expect("manager");
+        let manager = PubSubManager::new(test_node().await, test_signing()).expect("manager");
         let group_id = "ae".repeat(32);
         let name = format!("x0x/group/{group_id}/kv/{}", "bf".repeat(32));
         let topic = TopicId::from_entity(name.as_bytes());
@@ -6868,7 +6900,7 @@ mod tests {
 
     #[tokio::test]
     async fn normal_subscription_is_ready_for_immediate_publish() {
-        let manager = PubSubManager::new(test_node().await, None).expect("manager");
+        let manager = PubSubManager::new(test_node().await, test_signing()).expect("manager");
         let topic = "ready-normal-topic";
         let payload = Bytes::from_static(b"first-normal-message");
 
@@ -6888,7 +6920,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_dm_topic_subscription_is_ready_for_immediate_publish() {
-        let manager = PubSubManager::new(test_node().await, None).expect("manager");
+        let manager = PubSubManager::new(test_node().await, test_signing()).expect("manager");
         let topic = "x0x/dm/v1/inbox/readiness-control";
         let topic_id = TopicId::new([0x61; 32]);
         let payload = Bytes::from_static(b"first-explicit-dm-message");
@@ -6962,8 +6994,13 @@ mod tests {
         );
     }
 
+    /// #1114: an unsigned manager still publishes inner V1, but no subscriber
+    /// delivers it, its own included. The decode counter proves the message
+    /// reached `decode_for_delivery` and was dropped there rather than lost
+    /// on the way; `test_publish_local_delivery_signed` is the positive
+    /// control.
     #[tokio::test]
-    async fn test_publish_local_delivery_unsigned() {
+    async fn test_publish_local_unsigned_is_not_delivered() {
         let node = test_node().await;
         let manager = PubSubManager::new(node, None).expect("manager");
         let mut sub = manager.subscribe("chat".to_string()).await;
@@ -6973,11 +7010,24 @@ mod tests {
             .await
             .expect("Publish failed");
 
-        let msg = sub.recv().await.expect("Failed to receive message");
-        assert_eq!(msg.topic, "chat");
-        assert_eq!(msg.payload, Bytes::from("hello"));
-        assert!(msg.sender.is_none());
-        assert!(!msg.verified);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while manager.stats().incoming_decode_failed == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the unsigned publish must reach decode_for_delivery");
+        let stats = manager.stats();
+        assert_eq!(stats.incoming_decode_failed, 1);
+        assert_eq!(stats.incoming_decoded, 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), sub.recv())
+                .await
+                .ok()
+                .flatten()
+                .is_none(),
+            "#1114: an unsigned publish must not be delivered"
+        );
     }
 
     #[tokio::test]
@@ -7004,7 +7054,7 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_subscribers() {
         let node = test_node().await;
-        let manager = PubSubManager::new(node, None).expect("manager");
+        let manager = PubSubManager::new(node, test_signing()).expect("manager");
         let mut sub1 = manager.subscribe("news".to_string()).await;
         let mut sub2 = manager.subscribe("news".to_string()).await;
 
@@ -7032,7 +7082,7 @@ mod tests {
     #[tokio::test]
     async fn test_unsubscribe() {
         let node = test_node().await;
-        let manager = PubSubManager::new(node, None).expect("manager");
+        let manager = PubSubManager::new(node, test_signing()).expect("manager");
         let mut sub = manager.subscribe("temp".to_string()).await;
 
         manager
@@ -7253,7 +7303,7 @@ mod tests {
         let node = test_node().await;
         let manager = PubSubManager::new_with_participation(
             node,
-            None,
+            test_signing(),
             None,
             ParticipationMode::Leaf,
             "default_leaf",
@@ -7358,7 +7408,8 @@ mod tests {
         const TOPIC: &str = "x0x.relay.fanout.wiring.test";
         let topic_id = TopicId::from_entity(TOPIC.as_bytes());
 
-        let publisher = PubSubManager::new(test_node().await, None).expect("publisher manager");
+        let publisher =
+            PubSubManager::new(test_node().await, test_signing()).expect("publisher manager");
         let relay = PubSubManager::new_with_participation(
             test_node().await,
             None,
@@ -7594,7 +7645,7 @@ mod tests {
         // With replay detection in PlumTree (before fan-out), all
         // subscribers must receive every legitimate message.
         let node = test_node().await;
-        let manager = PubSubManager::new(node, None).expect("manager");
+        let manager = PubSubManager::new(node, test_signing()).expect("manager");
         let mut sub1 = manager.subscribe("multi".to_string()).await;
         let mut sub2 = manager.subscribe("multi".to_string()).await;
         let mut sub3 = manager.subscribe("multi".to_string()).await;
@@ -7617,9 +7668,11 @@ mod tests {
         // Local publishes are trusted — the replay cache only gates
         // network-incoming messages (handle_eager). An agent that
         // intentionally publishes the same content twice should see
-        // both deliveries locally.
+        // both deliveries locally. Since #1114 the manager signs (unsigned
+        // is never delivered), so this covers duplicate app content; the
+        // two signed envelopes need not be byte-identical.
         let node = test_node().await;
-        let manager = PubSubManager::new(node, None).expect("manager");
+        let manager = PubSubManager::new(node, test_signing()).expect("manager");
         let mut sub = manager.subscribe("dedup".to_string()).await;
 
         manager
@@ -7649,7 +7702,7 @@ mod tests {
 
         const MESSAGES: usize = 100_000;
         let node = test_node().await;
-        let manager = Arc::new(PubSubManager::new(node, None).expect("manager"));
+        let manager = Arc::new(PubSubManager::new(node, test_signing()).expect("manager"));
         let _slow = manager.subscribe("slow-consumer".to_string()).await;
         let mut fast = manager.subscribe("slow-consumer".to_string()).await;
 
@@ -8015,7 +8068,9 @@ mod tests {
         let topic = "adr014-v1-reject";
         let topic_id = TopicId::from_entity(topic.as_bytes());
         let mut sub = manager.subscribe(topic.to_string()).await;
-        let inner = encode_v1(topic, &Bytes::from("v1-era-payload")).expect("inner v1");
+        // #1114: a signed inner payload, so only the outer RejectV1 policy can
+        // be what refuses this frame.
+        let inner = remote_signed_inner(topic, Bytes::from("v1-era-payload"));
         let frame = signed_outer_frame(&outer_signing_key(), topic_id, inner, false);
         assert_eq!(manager.outer_v1_receipts(), 0);
 
@@ -8036,6 +8091,23 @@ mod tests {
                 .is_none(),
             "RejectV1 must not deliver a valid outer V1 frame to subscribers"
         );
+
+        // Positive control: the same shape in an outer V2 frame is delivered.
+        let control = signed_outer_frame_with_id(
+            &outer_signing_key(),
+            topic_id,
+            remote_signed_inner(topic, Bytes::from("v2-era-payload")),
+            true,
+            [0x31; 32],
+        );
+        manager
+            .handle_incoming(PeerId::new([0x19; 32]), None, control)
+            .await;
+        let delivered = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("outer V2 control must be delivered")
+            .expect("subscription open");
+        assert_eq!(delivered.payload, Bytes::from("v2-era-payload"));
     }
 
     #[tokio::test]
@@ -8046,7 +8118,7 @@ mod tests {
         let topic_id = TopicId::from_entity(topic.as_bytes());
         let mut sub = manager.subscribe(topic.to_string()).await;
         let signing_key = outer_signing_key();
-        let inner = encode_v1(topic, &Bytes::from("v2-payload")).expect("inner");
+        let inner = remote_signed_inner(topic, Bytes::from("v2-payload"));
         let good = signed_outer_frame(&signing_key, topic_id, inner.clone(), true);
 
         manager
@@ -8064,9 +8136,10 @@ mod tests {
             "outer V2 must not count as a v1 receipt"
         );
 
-        // Tamper: second valid encode_v1 envelope; sealed hash still over original
+        // Tamper: second valid signed inner envelope (#1114: unsigned would be
+        // dropped by the inner guard anyway); sealed hash still over original
         // inner so mismatch is specifically outer hash check.
-        let inner_alt = encode_v1(topic, &Bytes::from("v2-payload-alt")).expect("inner alt");
+        let inner_alt = remote_signed_inner(topic, Bytes::from("v2-payload-alt"));
         let mut bad_header = MessageHeader {
             version: 1,
             payload_hash: None,
@@ -8154,7 +8227,8 @@ mod tests {
             let topic = format!("adr014-refuse-{reason}");
             let topic_id = TopicId::from_entity(topic.as_bytes());
             let mut sub = manager.subscribe(topic.clone()).await;
-            let inner = encode_v1(&topic, &Bytes::from("still-v1")).expect("inner");
+            // #1114: signed inner, so the refusal below is RejectV1's alone.
+            let inner = remote_signed_inner(&topic, Bytes::from("still-v1"));
             let frame = signed_outer_frame(&outer_signing_key(), topic_id, inner, false);
             manager
                 .handle_incoming(PeerId::new([5; 32]), None, frame)
@@ -8168,6 +8242,22 @@ mod tests {
                     .is_none(),
                 "{reason} must refuse valid outer V1"
             );
+            // Positive control: the same shape in an outer V2 frame is delivered.
+            let control = signed_outer_frame_with_id(
+                &outer_signing_key(),
+                topic_id,
+                remote_signed_inner(&topic, Bytes::from("modern")),
+                true,
+                [0x32; 32],
+            );
+            manager
+                .handle_incoming(PeerId::new([0x15; 32]), None, control)
+                .await;
+            let delivered = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+                .await
+                .expect("outer V2 control must be delivered")
+                .expect("subscription open");
+            assert_eq!(delivered.payload, Bytes::from("modern"), "{reason}");
         }
     }
 
