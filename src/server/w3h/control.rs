@@ -23,6 +23,22 @@ use serde_json::json;
 
 const BASE64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
+/// Percent-encode one path segment (every byte outside RFC 3986's
+/// unreserved set), as the live fixture's `urllib.parse.quote(v, safe="")`
+/// does. A group store id is its topic, `x0x/group/<gid>/kv/<name>`, so
+/// its slashes must not split the `/stores/:id/:key` route.
+fn path_segment(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
 /// The members `label` lists for `group`; `Err` when the read itself fails
 /// (non-2xx, or no `members` array).
 async fn members(sim: &Sim, label: &str, group: &str) -> Result<Vec<String>> {
@@ -142,7 +158,12 @@ async fn try_open_store(sim: &Sim, label: &str, group: &str) -> Result<String> {
 
 async fn read_value(sim: &Sim, label: &str, store: &str, key: &str) -> Option<String> {
     let (status, body) = sim
-        .request(label, Method::GET, &format!("/stores/{store}/{key}"), None)
+        .request(
+            label,
+            Method::GET,
+            &format!("/stores/{}/{}", path_segment(store), path_segment(key)),
+            None,
+        )
         .await
         .ok()?;
     if !status.is_success() {
@@ -249,7 +270,7 @@ async fn w3h_s1_control_group_invite_join_over_public_api() -> Result<()> {
         .api(
             "A",
             Method::PUT,
-            &format!("/stores/{store}/w3h-control"),
+            &format!("/stores/{}/w3h-control", path_segment(&store)),
             Some(json!({"value": BASE64.encode("delivered"), "content_type": "text/plain"})),
         )
         .await?;
