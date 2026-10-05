@@ -1,6 +1,31 @@
 # Architecture Decision Records
 
+## Consolidation review
+
+Read the [15 ADR set](consolidated/README.md) for the direction confirmed by
+David (D198) on 5 October 2026. Its records remain Proposed replacements while the transfer
+checks are open. This index, its status overlay and accepted records continue
+to govern existing work. New docs follow the [style guide](../documentation-style.md).
+
 This directory contains architecture decision records for x0x.
+
+## Transfer rulings (2026-10-05)
+
+D198 confirms the consolidation direction and writing target; the drafts stay
+Proposed until David accepts the transfer. D199 keeps new or changed decisions
+in the numbered ADR series only, under ADR 0087. The reserved numbers and
+0109–0114 acceptance lanes stand; slot revisions are drafts.
+
+D200 confirms ADR 0040's `owner_agent` and current-owner-signed transfers;
+implementation status does not defer that decision. D197 confirms that
+EvidenceV1 from relationship peers needs not-Blocked trust, with verified
+evidence (ADR 0089 decision 2).
+
+D196 refines D16/D54/D181: W3-H requires 20 CI reruns with the same verdict
+and complete structured receipts. Byte-identical traces are non-blocking.
+The red-on-main harness-first gate remains. See the
+[updated rulings digest](../design/x0x-direction.md#5-decisions-d01d200)
+and [Pending transfer map](consolidated/TRANSFER.md#rulings).
 
 ## Status overlay (rulings 2026-09-28..30)
 
