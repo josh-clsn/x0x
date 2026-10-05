@@ -17,6 +17,7 @@ mod auth;
 pub mod config;
 mod crdt_subscriptions;
 mod delegations;
+mod group_access;
 mod instance_lock;
 mod legacy_store_migration;
 mod rider_auth;

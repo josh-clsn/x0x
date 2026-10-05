@@ -1108,29 +1108,18 @@ pub(in crate::server) async fn list_group_delegations(
         let Some(info) = groups.get(&id) else {
             return not_found("group not found");
         };
-        if info.withdrawn {
-            return not_found("group is withdrawn");
-        }
-        let is_member = info.has_active_member(&local_hex);
-        // Sessions need an active local seat before delegation authority is exposed.
-        match &actor {
-            crate::server::rider_auth::ActorContext::Owner { durable: false } if !is_member => {
-                return crate::server::api_error_with_reason(
-                    StatusCode::FORBIDDEN,
-                    "active local group membership required",
-                    "group_membership_required",
-                )
-                .into_response();
-            }
-            crate::server::rider_auth::ActorContext::Owner { .. } => {}
-            _ => return forbidden("rider tokens cannot read group delegations"),
+        // #1166 S1: admission (withdrawn 404 → session-membership 403 →
+        // rider 403 → read-policy 403, today's order) moved to the
+        // group-access chokepoint. This handler keeps its pinned
+        // signature — tests call it directly with positional extractor
+        // arguments — so it runs the shared decision core with the
+        // roster it already holds.
+        if let Err(resp) =
+            crate::server::group_access::admit_group_delegations(info, &actor, &local_hex)
+        {
+            return resp.into_response();
         }
         let quarantine = info.fork_quarantine.clone();
-        let read_open = info.policy.read_access == x0x::groups::GroupReadAccess::Public;
-        // Durable owners retain the existing group read policy.
-        if !is_member && !read_open {
-            return forbidden("members-only read policy");
-        }
         (
             info.stable_group_id().to_string(),
             info.members_v2.clone(),
