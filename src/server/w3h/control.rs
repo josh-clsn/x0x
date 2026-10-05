@@ -400,13 +400,21 @@ fn holds_verified_evidence(sim: &Sim, observer: &str, subject: &str) -> Result<b
     Ok(captured || stored)
 }
 
-/// EvidenceV1 exchanges the initiator completed, as `opener<-acceptor kind`:
-/// the reply is exactly one whole frame (`kind`, u32 length, body), a HELLO
-/// or a well-formed ACK (`Option<[u8; 32]>`), and the opener now holds the
-/// acceptor's network-verified evidence. For a HELLO reply the acceptor
-/// must not have opened an EvidenceV1 stream of its own to the opener, so
-/// that evidence can only have come from the reply.
-fn completed_evidence_exchanges(sim: &Sim, labels: &[&str]) -> Result<Vec<String>> {
+/// Completed EvidenceV1 exchanges opened at or after `since`, as
+/// `opener->acceptor REPLY`. The reply must be exactly one whole frame
+/// (`kind`, u32 length, body), and the side that ingested a Hello must hold
+/// the other side's network-verified evidence afterwards:
+/// - a HELLO reply carries the acceptor's evidence, so the opener must hold
+///   it, and the acceptor must not have opened an EvidenceV1 stream of its
+///   own to the opener (then only the reply can have provided it);
+/// - an ACK reply (bincode `Option<[u8; 32]>`, the acceptor's view of the
+///   opener's certificate) follows the acceptor ingesting the opener's
+///   Hello, so the acceptor must hold the opener's evidence.
+fn completed_evidence_exchanges(
+    sim: &Sim,
+    labels: &[&str],
+    since: Duration,
+) -> Result<Vec<String>> {
     use crate::network::sim::LaneClass;
     const EVIDENCE_V1: u8 = 0x06;
     // `evidence_wire.rs` message kinds.
@@ -423,6 +431,7 @@ fn completed_evidence_exchanges(sim: &Sim, labels: &[&str]) -> Result<Vec<String
         .filter(|w| {
             matches!(w.lane.class, LaneClass::Stream(_))
                 && w.seq == 0
+                && w.at >= since
                 && w.bytes.first() == Some(&EVIDENCE_V1)
         })
         .map(|w| w.lane)
@@ -449,49 +458,68 @@ fn completed_evidence_exchanges(sim: &Sim, labels: &[&str]) -> Result<Vec<String
         if usize::try_from(u32::from_be_bytes(*len)).ok() != Some(body.len()) {
             continue;
         }
-        let well_formed = match kind {
-            HELLO => !opened
-                .iter()
-                .any(|other| other.src == lane.dst && other.dst == lane.src),
-            // bincode (fixint) `Option<[u8; 32]>`: `[0]` or `[1, 32 bytes]`.
-            ACK => body == [0] || (body.len() == 33 && body.first() == Some(&1)),
-            _ => false,
-        };
         let (Some(opener), Some(acceptor)) = (label_of(lane.src), label_of(lane.dst)) else {
             continue;
         };
-        if well_formed && holds_verified_evidence(sim, opener, acceptor)? {
+        let completed = match kind {
+            HELLO => {
+                !opened
+                    .iter()
+                    .any(|other| other.src == lane.dst && other.dst == lane.src)
+                    && holds_verified_evidence(sim, opener, acceptor)?
+            }
+            // bincode (fixint) `Option<[u8; 32]>`: `[0]` or `[1, 32 bytes]`.
+            ACK => {
+                (body == [0] || (body.len() == 33 && body.first() == Some(&1)))
+                    && holds_verified_evidence(sim, acceptor, opener)?
+            }
+            _ => false,
+        };
+        if completed {
             let name = if kind == HELLO { "HELLO" } else { "ACK" };
-            done.push(format!("{opener}<-{acceptor} {name}"));
+            done.push(format!("{opener}->{acceptor} {name}"));
         }
     }
     Ok(done)
 }
 
-/// S4 control: every simulated connection runs the real peer-evidence
-/// hello (`EvidenceV1`) over a simulated byte stream, and the initiator
-/// completes it: a whole HELLO or ACK reply, and verified evidence of the
-/// responder held afterwards.
+/// S4 control: the peer-evidence hello (`EvidenceV1`) runs over simulated
+/// byte streams between relationship peers and completes: a whole HELLO or
+/// ACK reply, and the ingesting side holds the other side's verified
+/// evidence afterwards.
+///
+/// The topology matters (be1a8db CI: two strangers never exchanged any).
+/// A Hello is sent only to a relationship peer: an enrolled machine, a
+/// stored record or a live relationship (ADR 0089 §6; `begin_hello` refuses
+/// when `!related`, `evidence_wire.rs:318`). Here X is O's same-owner
+/// device: O enrolls X's machine before X starts, so O sends X a Hello on
+/// connect.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon controls run in the Linux isolated namespace only"
 )]
 async fn w3h_s4_control_evidence_hello_over_sim_streams() -> Result<()> {
-    let labels = ["A", "B"];
-    let sim = Sim::start(
+    let mut sim = Sim::empty(
         "w3h_s4_control_evidence_hello_over_sim_streams",
         0x5400_0001,
-        &labels,
-    )
-    .await?;
-    mesh(&sim, &labels).await?;
+        &["O", "X"],
+    )?;
+    let outcome = evidence_hello_scenario(&mut sim).await;
+    sim.conclude(outcome).await
+}
+
+async fn evidence_hello_scenario(sim: &mut Sim) -> Result<()> {
+    // Before any daemon starts, like the node keys (`Sim::empty`).
+    let owner = crate::identity::UserKeypair::generate()?;
+    let home = sim.start_owner_device("O", &owner).await?;
+    sim.certify_owner_device("O", "X", &owner, &home).await?;
     let mut done = Vec::new();
     let mut failure = None;
     sim.until(
-        "an EvidenceV1 exchange completes",
+        "an EvidenceV1 exchange between O and X completes",
         secs(60),
-        async |s: &Sim| match completed_evidence_exchanges(s, &labels) {
+        async |s: &Sim| match completed_evidence_exchanges(s, &["O", "X"], Duration::ZERO) {
             Ok(found) => {
                 done = found;
                 !done.is_empty()
@@ -510,7 +538,6 @@ async fn w3h_s4_control_evidence_hello_over_sim_streams() -> Result<()> {
         "checkpoint: EvidenceV1 completed over sim streams: {}",
         done.join(", ")
     ));
-    sim.finish().await?;
     Ok(())
 }
 
@@ -523,19 +550,24 @@ async fn w3h_s4_control_evidence_hello_over_sim_streams() -> Result<()> {
     ignore = "W3-H daemon controls run in the Linux isolated namespace only"
 )]
 async fn w3h_s4_control_owner_sync_over_sim_streams() -> Result<()> {
-    const SYNC_V1: u8 = 0x05;
     let mut sim = Sim::empty(
         "w3h_s4_control_owner_sync_over_sim_streams",
         0x5400_0002,
         &["O", "X"],
     )?;
+    let outcome = owner_sync_scenario(&mut sim).await;
+    sim.conclude(outcome).await
+}
+
+async fn owner_sync_scenario(sim: &mut Sim) -> Result<()> {
+    const SYNC_V1: u8 = 0x05;
     // Before any daemon starts, like the node keys (`Sim::empty`).
     let owner = crate::identity::UserKeypair::generate()?;
     let home = sim.start_owner_device("O", &owner).await?;
     // Waits for X to report `elsewhere` with O's canonical Home id, which
     // only owner sync can deliver.
     sim.certify_owner_device("O", "X", &owner, &home).await?;
-    let synced = answered_streams(&sim, SYNC_V1);
+    let synced = answered_streams(sim, SYNC_V1);
     let (o, x) = (sim.peer("O")?.0, sim.peer("X")?.0);
     ensure!(
         synced.iter().any(|pair| *pair == (x, o) || *pair == (o, x)),
@@ -543,6 +575,5 @@ async fn w3h_s4_control_owner_sync_over_sim_streams() -> Result<()> {
     );
     sim.fabric()
         .mark("checkpoint: X yielded to O's Home via SyncV1 over sim streams");
-    sim.finish().await?;
     Ok(())
 }

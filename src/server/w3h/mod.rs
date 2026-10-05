@@ -754,16 +754,93 @@ impl Sim {
         gated(what, fut).await
     }
 
+    /// Finish the case whatever its outcome, so a failed control still
+    /// writes its trace: the failure is marked first, then [`Self::finish`]
+    /// runs, and the scenario error (if any) wins over a teardown error.
+    pub(crate) async fn conclude(self, outcome: Result<()>) -> Result<()> {
+        if let Err(error) = &outcome {
+            self.fabric.mark(format!("scenario failed: {error:#}"));
+        }
+        let finished = self.finish().await;
+        outcome?;
+        finished.map(|_| ())
+    }
+
+    /// Every node's KV stores, for the non-digested `<case>-<pid>.kv`
+    /// diagnostics file: version, local sequence counter, served digest,
+    /// and every live entry with its OR-set tag and timestamps. Read-only.
+    async fn kv_probe(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        for (label, node) in &self.nodes {
+            let Some(state) = node.state.upgrade() else {
+                continue;
+            };
+            let stores = state.kv_stores.read().await;
+            let mut ids: Vec<&String> = stores.keys().collect();
+            ids.sort();
+            for id in ids {
+                let Some(handle) = stores.get(id) else {
+                    continue;
+                };
+                let store = handle.sync.read().await;
+                let _ = writeln!(
+                    out,
+                    "{label} store={id} version={} seq_counter={} served_digest={}",
+                    store.current_version(),
+                    store.seq_counter_value(),
+                    hex::encode(store.served_digest())
+                );
+                match store.full_delta() {
+                    Ok(delta) => {
+                        let mut added: Vec<_> = delta.added.iter().collect();
+                        added.sort_by(|a, b| a.0.cmp(b.0));
+                        for (key, (entry, (peer, seq))) in added {
+                            let mut metadata: Vec<_> = entry.metadata.iter().collect();
+                            metadata.sort();
+                            let _ = writeln!(
+                                out,
+                                "  {key} tag={}:{seq} created_at={} updated_at={} \
+                                 content_hash={} metadata={metadata:?}",
+                                hex::encode(peer.as_bytes()),
+                                entry.created_at,
+                                entry.updated_at,
+                                hex::encode(entry.content_hash),
+                            );
+                        }
+                        let _ = writeln!(
+                            out,
+                            "  delta version={} removed={} updated={}",
+                            delta.version,
+                            delta.removed.len(),
+                            delta.updated.len()
+                        );
+                    }
+                    Err(error) => {
+                        let _ = writeln!(out, "  full_delta error: {error}");
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Mark `teardown begins`, stop every daemon (in label order, each
     /// inside a named barrier) and verify the teardown. Then print the
     /// digest of the canonical trace up to that mark and, when
     /// `W3H_TRACE_DIR` is set, write `<case>-<pid>.trace` (the digested
-    /// trace, then the teardown as a non-digested appendix) and
-    /// `<case>-<pid>.entropy` (per-thread draw counts). Teardown runs on
+    /// trace, then the teardown as a non-digested appendix),
+    /// `<case>-<pid>.entropy` (per-thread draw counts) and `<case>-<pid>.kv`
+    /// (every node's KV stores, read before teardown). Teardown runs on
     /// real OS threads as well as the runtime, so its timing is not part of
     /// the digest; a barrier timeout or a supervisor error still fails the
     /// run (after the trace is written).
     pub(crate) async fn finish(mut self) -> Result<String> {
+        // Diagnostics only (never digested): read while the daemons run.
+        let kv = match gated("kv probe", self.kv_probe()).await {
+            Ok(kv) => kv,
+            Err(error) => format!("kv probe failed: {error:#}\n"),
+        };
         let cut = self.fabric.cut("teardown begins");
         let handles: Vec<(String, ServerHandle)> = self
             .nodes
@@ -829,6 +906,9 @@ impl Sim {
                 let _ = std::fs::write(dir.join(format!("{stem}.trace")), file);
                 if let Some(stats) = &stats {
                     let _ = std::fs::write(dir.join(format!("{stem}.entropy")), stats);
+                }
+                if !kv.is_empty() {
+                    let _ = std::fs::write(dir.join(format!("{stem}.kv")), &kv);
                 }
                 // Raw payloads (test identities only) are written only when
                 // the CI gate job asks for them (nextest `w3h-gate` profile),
