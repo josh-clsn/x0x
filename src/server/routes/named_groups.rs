@@ -17757,20 +17757,12 @@ pub(in crate::server) async fn create_group_invite(
     let membership_lock = group_membership_lock(&state, &id).await;
     let _membership_guard = membership_lock.lock().await;
     {
+        // #1166 S3: the admin trio (raw-id lookup 404 → seat 403 →
+        // withdrawn 409) runs in the group-access core under this same
+        // lock take.
+        let inviter_hex = hex::encode(state.agent.agent_id().as_bytes());
         let groups = state.named_groups.read().await;
-        let Some(info) = groups.get(&id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
-            )
-                .into_response();
-        };
-        let agent_id = state.agent.agent_id();
-        let inviter_hex = hex::encode(agent_id.as_bytes());
-        if let Err(e) = require_admin_or_above(info, &inviter_hex) {
-            return e.into_response();
-        }
-        if let Some(resp) = reject_withdrawn_group(info) {
+        if let Err(resp) = group_access::admit_admin_group_route(&groups, &id, &inviter_hex) {
             return resp.into_response();
         }
     }
@@ -19606,12 +19598,12 @@ pub(in crate::server) async fn set_group_display_name(
     let agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     let next = {
         let groups = state.named_groups.read().await;
-        let Some(info) = groups.get(&id) else {
-            return not_found("group not found");
+        // #1166 S3: the no-actor entry pair (lookup 404 → withdrawn
+        // 409) runs in the group-access core, under this lock take.
+        let info = match group_access::admit_live_group_route(&groups, &id) {
+            Ok(info) => info,
+            Err(resp) => return resp,
         };
-        if let Some(resp) = reject_withdrawn_group(info) {
-            return resp;
-        }
         let mut next = info.clone();
         next.set_display_name(&agent_hex, req.name.clone());
         next
@@ -19667,15 +19659,12 @@ pub(in crate::server) async fn add_named_group_member(
 
     let (metadata_topic, event, members, epoch, bootstrap_group) = {
         let named_groups = state.named_groups.read().await;
-        let Some(info) = named_groups.get(&id) else {
-            return not_found("group not found");
+        // #1166 S3: the admin trio runs in the group-access core, under
+        // this lock take, before the TreeKEM delegation below.
+        let info = match group_access::admit_admin_group_route(&named_groups, &id, &actor_hex) {
+            Ok(info) => info,
+            Err(resp) => return resp,
         };
-        if let Err(e) = require_admin_or_above(info, &actor_hex) {
-            return e;
-        }
-        if let Some(resp) = reject_withdrawn_group(info) {
-            return resp;
-        }
         if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
             drop(named_groups);
             return add_treekem_named_group_member(state, id, agent_id, req).await;
@@ -20198,16 +20187,13 @@ pub(in crate::server) async fn remove_named_group_member(
 
     let (metadata_topic, event, members, epoch, buffered_survivor_envelopes, delivery_roster) = {
         let named_groups = state.named_groups.read().await;
-        let Some(info) = named_groups.get(&id) else {
-            return not_found("group not found");
+        // #1166 S3: the admin trio runs in the group-access core, under
+        // this lock take (after the TreeKEM pre-dispatch above).
+        let info = match group_access::admit_admin_group_route(&named_groups, &id, &local_agent_hex)
+        {
+            Ok(info) => info,
+            Err(resp) => return resp,
         };
-
-        if let Err(e) = require_admin_or_above(info, &local_agent_hex) {
-            return e;
-        }
-        if let Some(resp) = reject_withdrawn_group(info) {
-            return resp;
-        }
         if !info.has_member(&agent_id_hex) {
             return not_found("member not found");
         }
@@ -22330,18 +22316,11 @@ pub(in crate::server) async fn seal_group_state(
     }
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     {
+        // #1166 S3: the admin trio (the inlined caller_role gate and
+        // this withdrawn check) runs in the group-access core, under
+        // this lock take.
         let groups = state.named_groups.read().await;
-        let Some(info) = groups.get(&id) else {
-            return not_found("group not found");
-        };
-        let role = info.caller_role(&local_hex);
-        if !role
-            .map(|r| r.at_least(x0x::groups::GroupRole::Admin))
-            .unwrap_or(false)
-        {
-            return forbidden("admin role required");
-        }
-        if let Some(resp) = reject_withdrawn_group(info) {
+        if let Err(resp) = group_access::admit_admin_group_route(&groups, &id, &local_hex) {
             return resp;
         }
     }
@@ -22572,14 +22551,11 @@ pub(in crate::server) async fn leave_group(
     // TreeKEM helper below, which must NOT re-acquire it (single-level lock).
     let membership_lock = group_membership_lock(&state, &id).await;
     let _membership_guard = membership_lock.lock().await;
-
     let groups = state.named_groups.read().await;
-    let Some(info) = groups.get(&id) else {
-        return not_found("group not found");
-    };
-    if let Some(resp) = reject_withdrawn_group(info) {
-        return resp;
-    }
+    // #1166 S3: lookup 404 → withdrawn 409 → the ACTIVE-seat gate run
+    // in the group-access core (`admit_self_leave`), under this lock
+    // take.
+    //
     // Issue #446 (review round 5): self-leave requires the caller to be
     // an ACTIVE MEMBER. `leave_disposition` returns Proceed for a
     // non-member (`remove_member` is a no-op on them), which previously
@@ -22590,12 +22566,10 @@ pub(in crate::server) async fn leave_group(
     // PendingJoinBlocked exist for exactly that flow), while the admin
     // gate continues to guard the shared terminal-withdrawal flow
     // (POST /groups/:id/state/withdraw).
-    if info.caller_role(&local_agent_hex).is_none() {
-        return api_error(
-            StatusCode::FORBIDDEN,
-            "leaving a group requires active membership in it",
-        );
-    }
+    let info = match group_access::admit_self_leave(&groups, &id, &local_agent_hex) {
+        Ok(info) => info,
+        Err(resp) => return resp,
+    };
 
     // #369 / PR #370 review item 4: the ONE self-leave routing decision,
     // computed before the plane dispatch so GSS and TreeKEM groups share it.
@@ -24193,15 +24167,12 @@ pub(in crate::server) async fn update_named_group(
     let membership_lock = group_membership_lock(&state, &id).await;
     let _membership_guard = membership_lock.lock().await;
     let groups = state.named_groups.read().await;
-    let Some(info) = groups.get(&id) else {
-        return not_found("group not found");
+    // #1166 S3: the admin trio runs in the group-access core, under this
+    // lock take.
+    let info = match group_access::admit_admin_group_route(&groups, &id, &caller_hex) {
+        Ok(info) => info,
+        Err(resp) => return resp,
     };
-    if let Err(e) = require_admin_or_above(info, &caller_hex) {
-        return e;
-    }
-    if let Some(resp) = reject_withdrawn_group(info) {
-        return resp;
-    }
     let name_update = req.name.clone();
     let desc_update = req.description.clone();
     let mut next = info.clone();
@@ -24285,15 +24256,12 @@ pub(in crate::server) async fn update_group_policy(
     let membership_lock = group_membership_lock(&state, &id).await;
     let membership_guard = membership_lock.lock().await;
     let groups = state.named_groups.read().await;
-    let Some(info) = groups.get(&id) else {
-        return not_found("group not found");
+    // #1166 S3: the admin trio runs in the group-access core, under this
+    // lock take.
+    let info = match group_access::admit_admin_group_route(&groups, &id, &caller_hex) {
+        Ok(info) => info,
+        Err(resp) => return resp,
     };
-    if let Err(e) = require_admin_or_above(info, &caller_hex) {
-        return e;
-    }
-    if let Some(resp) = reject_withdrawn_group(info) {
-        return resp;
-    }
     // (Home fence applied at entry via `home_mutation_requires_durable`.)
 
     let mut new_policy = info.policy.clone();
@@ -24451,10 +24419,9 @@ pub(in crate::server) async fn update_member_role(
         );
     }
 
-    if let Err(e) = require_admin_or_above(info, &caller_hex) {
-        return e;
-    }
-    if let Some(resp) = reject_withdrawn_group(info) {
+    // #1166 S3: the admin gate pair runs in the group-access core —
+    // after the target-entry checks above, exactly today's order.
+    if let Err(resp) = group_access::admin_route_gate(info, &caller_hex) {
         return resp;
     }
 
@@ -24535,15 +24502,12 @@ pub(in crate::server) async fn ban_group_member(
     let membership_lock = group_membership_lock(&state, &id).await;
     let _membership_guard = membership_lock.lock().await;
     let groups = state.named_groups.read().await;
-    let Some(info) = groups.get(&id) else {
-        return not_found("group not found");
+    // #1166 S3: the admin trio runs in the group-access core, under this
+    // lock take, before the TreeKEM delegation below.
+    let info = match group_access::admit_admin_group_route(&groups, &id, &caller_hex) {
+        Ok(info) => info,
+        Err(resp) => return resp,
     };
-    if let Err(e) = require_admin_or_above(info, &caller_hex) {
-        return e;
-    }
-    if let Some(resp) = reject_withdrawn_group(info) {
-        return resp;
-    }
     if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
         drop(groups);
         return ban_treekem_group_member(state, id, agent_id_hex, caller_hex).await;
@@ -24882,15 +24846,12 @@ pub(in crate::server) async fn unban_group_member(
     let membership_lock = group_membership_lock(&state, &id).await;
     let membership_guard = membership_lock.lock().await;
     let groups = state.named_groups.read().await;
-    let Some(info) = groups.get(&id) else {
-        return not_found("group not found");
+    // #1166 S3: the admin trio runs in the group-access core, under this
+    // lock take.
+    let info = match group_access::admit_admin_group_route(&groups, &id, &caller_hex) {
+        Ok(info) => info,
+        Err(resp) => return resp,
     };
-    if let Err(e) = require_admin_or_above(info, &caller_hex) {
-        return e;
-    }
-    if let Some(resp) = reject_withdrawn_group(info) {
-        return resp;
-    }
     if !info.is_banned(&agent_id_hex) {
         return bad_request("member is not banned");
     }
@@ -24946,18 +24907,24 @@ pub(in crate::server) async fn unban_group_member(
 }
 
 /// GET /groups/:id/requests — list join requests (admin+).
+///
+/// #1166 S3: admission (unknown-group 404, the local-seat admin gate —
+/// and NO withdrawn check, today's shape) lives in the `GroupAccess`
+/// extractor; the list below is served from this handler's OWN lock
+/// read, so the admission core runs AGAIN on that same snapshot
+/// (r2/P2-1). The route never read an actor and still does not — the
+/// seat gate evaluates the local daemon.
 pub(in crate::server) async fn list_join_requests(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    _access: crate::server::group_access::GroupAccess,
 ) -> impl IntoResponse {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
-    let Some(info) = groups.get(&id) else {
-        return not_found("group not found");
+    let info = match group_access::admit_join_request_listing(&groups, &id, &caller_hex) {
+        Ok(info) => info,
+        Err(resp) => return resp,
     };
-    if let Err(e) = require_admin_or_above(info, &caller_hex) {
-        return e;
-    }
     let mut requests: Vec<&x0x::groups::JoinRequest> = info.join_requests.values().collect();
     requests.sort_by_key(|r| r.created_at);
     let list: Vec<serde_json::Value> = requests
@@ -24991,12 +24958,13 @@ pub(in crate::server) async fn create_join_request(
 
     let (metadata_topic, event_group_id, request, creator_hex, commit, next) = {
         let groups = state.named_groups.read().await;
-        let Some(info) = groups.get(&id) else {
-            return not_found("group not found");
+        // #1166 S3: the no-actor entry pair (lookup 404 → withdrawn
+        // 409) runs in the group-access core, under this lock take; the
+        // data gates below are unchanged.
+        let info = match group_access::admit_live_group_route(&groups, &id) {
+            Ok(info) => info,
+            Err(resp) => return resp,
         };
-        if let Some(resp) = reject_withdrawn_group(info) {
-            return resp;
-        }
         if info.policy.admission != x0x::groups::GroupAdmission::RequestAccess {
             return forbidden("group admission is not request_access");
         }
@@ -25423,10 +25391,9 @@ pub(in crate::server) async fn approve_join_request(
         };
         // B8: snapshot before mutation for rollback on outbox-persist failure.
         let pre_mutation_snapshot = info.clone();
-        if let Err(e) = require_admin_or_above(info, &caller_hex) {
-            return e;
-        }
-        if let Some(resp) = reject_withdrawn_group(info) {
+        // #1166 S3: the admin gate pair runs in the group-access core,
+        // at this exact position in the write-lock block.
+        if let Err(resp) = group_access::admin_route_gate(info, &caller_hex) {
             return resp;
         }
         if let Some(resp) = treekem_membership_unsupported(info) {
@@ -26127,15 +26094,12 @@ pub(in crate::server) async fn reject_join_request(
 
     let (metadata_topic, event_group_id, requester_hex, commit, next) = {
         let groups = state.named_groups.read().await;
-        let Some(info) = groups.get(&id) else {
-            return not_found("group not found");
+        // #1166 S3: the admin trio runs in the group-access core, under
+        // this lock take.
+        let info = match group_access::admit_admin_group_route(&groups, &id, &caller_hex) {
+            Ok(info) => info,
+            Err(resp) => return resp,
         };
-        if let Err(e) = require_admin_or_above(info, &caller_hex) {
-            return e;
-        }
-        if let Some(resp) = reject_withdrawn_group(info) {
-            return resp;
-        }
         let mut next = info.clone();
         let Some(req) = next.join_requests.get_mut(&request_id) else {
             return not_found("request not found");
@@ -26210,12 +26174,13 @@ pub(in crate::server) async fn cancel_join_request(
 
     let (metadata_topic, event_group_id, requester_hex, commit, next) = {
         let groups = state.named_groups.read().await;
-        let Some(info) = groups.get(&id) else {
-            return not_found("group not found");
+        // #1166 S3: the no-actor entry pair (lookup 404 → withdrawn
+        // 409) runs in the group-access core, under this lock take; the
+        // request-ownership data gates below are unchanged (#1228).
+        let info = match group_access::admit_live_group_route(&groups, &id) {
+            Ok(info) => info,
+            Err(resp) => return resp,
         };
-        if let Some(resp) = reject_withdrawn_group(info) {
-            return resp;
-        }
         let mut next = info.clone();
         let Some(req) = next.join_requests.get_mut(&request_id) else {
             return not_found("request not found");

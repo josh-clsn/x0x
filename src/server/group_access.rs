@@ -910,7 +910,6 @@ pub(in crate::server) fn admit_open_envelope(
 /// the two sites that hold `info` through a lookup of their own —
 /// `PATCH …/members/:agent_id/role` (whose target-entry checks come
 /// FIRST today) and `approve_join_request`'s write-lock block.
-#[allow(dead_code)] // wired by the S3 handler-migration commit
 pub(in crate::server) fn admin_route_gate(
     info: &x0x::groups::GroupInfo,
     local_agent_hex: &str,
@@ -928,7 +927,6 @@ pub(in crate::server) fn admin_route_gate(
 /// [`admin_route_gate`]. The Home durable fence the handlers run at
 /// ENTRY (before the membership lock, before body parse where it
 /// stood) is deliberately NOT here — see [`is_home_or_owner_certified`].
-#[allow(dead_code)] // wired by the S3 handler-migration commit
 pub(in crate::server) fn admit_admin_group_route<'a>(
     groups: &'a HashMap<String, x0x::groups::GroupInfo>,
     route_id: &str,
@@ -962,7 +960,6 @@ pub(in crate::server) fn admit_join_request_listing<'a>(
 /// surface's purpose; the admin gate guards the shared
 /// terminal-withdrawal routing instead, where the sole-member leave
 /// path waives it by design).
-#[allow(dead_code)] // wired by the S3 handler-migration commit
 pub(in crate::server) fn admit_self_leave<'a>(
     groups: &'a HashMap<String, x0x::groups::GroupInfo>,
     route_id: &str,
@@ -989,7 +986,6 @@ pub(in crate::server) fn admit_self_leave<'a>(
 /// remaining gates are data checks keyed on the local daemon's identity
 /// (request ownership, admission policy, the display-name write itself)
 /// and stay in the handlers, in their per-route order.
-#[allow(dead_code)] // wired by the S3 handler-migration commit
 pub(in crate::server) fn admit_live_group_route<'a>(
     groups: &'a HashMap<String, x0x::groups::GroupInfo>,
     route_id: &str,
