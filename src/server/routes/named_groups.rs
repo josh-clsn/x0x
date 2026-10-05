@@ -15408,16 +15408,36 @@ pub(in crate::server) async fn local_join_membership_state(
 ///
 /// #1166 S1: admission (unknown-group 404, rider 403, session seat gate —
 /// a pending seat of either kind refuses) lives in the `GroupAccess`
-/// extractor; the handler re-takes the read lock for its body projection.
+/// extractor. The roster below is served from this handler's OWN lock
+/// read, so the admission core runs AGAIN on that same snapshot
+/// (r2/P2-1): a seat removed between the extractor's read and this one
+/// is refused here, exactly as the pre-extractor single-lock code
+/// refused it. The `Extension` argument keeps its pre-S1 position — a
+/// missing actor stays axum's Extension 500, and it runs before the
+/// extractor.
 pub(in crate::server) async fn get_named_group_members(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
     _access: crate::server::group_access::GroupAccess,
 ) -> impl IntoResponse {
     let groups = state.named_groups.read().await;
     let Some(info) = groups.get(&id) else {
         return not_found("group not found");
     };
+    // Re-run the pure core on THIS lock's roster (r2/P2-1). The label is
+    // only read for session bearers; the other actor arms ignore it.
+    let admission = match &actor {
+        crate::server::rider_auth::ActorContext::Owner { durable: false } => {
+            let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+            let label = local_join_membership_state(state.as_ref(), info, &local_agent_hex).await;
+            group_access::admit_named_group_members(&actor, label)
+        }
+        _ => group_access::admit_named_group_members(&actor, "not_member"),
+    };
+    if let Err(resp) = admission {
+        return resp;
+    }
     let members = named_group_member_values(info);
     (
         StatusCode::OK,
@@ -21692,8 +21712,9 @@ pub(in crate::server) async fn get_group_state_commits(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Query(q): Query<StateCommitsQuery>,
-    // #1166 S1: the live-member gate (withdrawn shells exempt — see the
-    // doc comment above) lives in the `GroupAccess` extractor.
+    // #1166 S1: early admission (unknown-group 404, live-member gate)
+    // lives in the `GroupAccess` extractor; the core runs AGAIN below
+    // under this handler's own lock (r2/P2-1).
     _access: crate::server::group_access::GroupAccess,
 ) -> (StatusCode, Json<serde_json::Value>) {
     const STATE_COMMITS_DEFAULT_LIMIT: usize = 100;
@@ -21703,14 +21724,18 @@ pub(in crate::server) async fn get_group_state_commits(
         .unwrap_or(STATE_COMMITS_DEFAULT_LIMIT)
         .clamp(1, STATE_COMMITS_MAX_LIMIT);
 
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
     let Some(info) = groups.get(&id) else {
         return not_found("group not found");
     };
-
-    // The live-member gate (withdrawn shells exempt) lives in the
-    // `GroupAccess` extractor (#1166 S1); the roster read below is a
-    // body projection under this handler's own lock.
+    // Re-run the live-member core (withdrawn shells exempt — see the doc
+    // comment above) on THIS lock's roster (r2/P2-1): a seat removed
+    // between the extractor's read and this one is refused here, exactly
+    // as the pre-extractor single-lock code refused it.
+    if let Err(resp) = crate::server::group_access::admit_state_commits(info, &local_hex) {
+        return resp;
+    }
 
     let matched = info
         .commit_log

@@ -14,11 +14,14 @@
 //!   holds the table, the axum router (`src/server/mod.rs`) and the
 //!   endpoint registry (`crate::api::ENDPOINTS`) to exactly the same route
 //!   set, so no group route can be added without being classified here.
-//! - [`GroupAccess`], an axum extractor that resolves the `:id` group
-//!   under the named-groups read lock ONCE, applies the route's admission
-//!   rules, and either rejects with the exact status/body the inline code
-//!   produced or hands the handler the resolved level plus the stable
-//!   group id.
+//! - [`GroupAccess`], an axum extractor that resolves the `:id` group —
+//!   percent-decoded through the same axum `Path` machinery the handlers
+//!   used before this module existed — under the named-groups read lock,
+//!   applies the route's admission rules, and either rejects with the
+//!   exact status/body the inline code produced or hands the handler the
+//!   resolved level plus the stable group id. Classification keys off
+//!   the router's own `MatchedPath` pattern, so this module never
+//!   re-implements route matching.
 //!
 //! Two S1 routes (`GET /groups/:id`, `GET /groups/:id/delegations`) cannot
 //! take the extractor: regression tests call their handlers directly with
@@ -30,12 +33,24 @@
 //! their own lock; the decision cannot diverge from the extractor path
 //! because both ends run the same function.
 //!
-//! Behaviour is byte-for-byte preserved (controller condition 3): same
-//! status codes, same bodies, same precedence — 404 (unknown group; plus
-//! the withdrawn 404 where today's handler 404s) → actor admission (rider
-//! 403 / membership 403) → route-local policy gates (409 withdrawn, 400
-//! MlsEncrypted, 403 members-only). Error shapes come from the shared
-//! builders in `crate::server` (`api_error`, `api_error_with_reason`,
+//! Admission runs twice where the handler re-reads group data for its
+//! body (`/members`, `/state/commits`): once in the extractor (an early
+//! refusal that keeps cheap rejects away from the body) and once inside
+//! the handler's own lock via the same pure core, so the served roster
+//! or commit log is always admitted on the snapshot it is read from —
+//! no read-check-serve window between two lock takes. `GET
+//! /groups/:id/messages` is the deliberate exception: its unknown-group
+//! fail-open and its stable-id resolution are one snapshot by design.
+//!
+//! Behaviour is preserved (controller condition 3): same status codes,
+//! same bodies, same precedence — 404 (unknown group; plus the withdrawn
+//! 404 where today's handler 404s) → actor admission (rider 403 /
+//! membership 403) → route-local policy gates (409 withdrawn, 400
+//! MlsEncrypted, 403 members-only). A `:id` that does not
+//! percent-decode keeps the `Path` extractor's own 400, and a missing
+//! actor keeps axum's `Extension` 500 (unreachable behind the auth
+//! middleware, which always inserts one). Error shapes come from the
+//! shared builders in `crate::server` (`api_error`, `api_error_with_reason`,
 //! `not_found`, `forbidden`, `bad_request`), which is what the inline code
 //! used.
 //!
@@ -45,9 +60,10 @@
 //! `clippy.toml` ceiling that forbids the absorbed helpers everywhere
 //! except this module.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::FromRequestParts;
+use axum::extract::{Extension, FromRequestParts, MatchedPath, Path};
 use axum::http::request::Parts;
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -461,54 +477,42 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
 
 // ─────────────────────── table lookup ────────────────────────────────────
 
-/// Match a concrete request path against a router-syntax template,
-/// returning the captured parameter segments in template order. A
-/// `:param` segment captures exactly one NON-empty path segment — the
-/// shape axum's router itself routes, so anything the extractor sees has
-/// already passed the real router's stricter match.
-fn match_template<'p>(template: &str, path: &'p str) -> Option<Vec<&'p str>> {
-    let mut template_segments = template.strip_prefix('/')?.split('/');
-    let mut path_segments = path.strip_prefix('/')?.split('/');
-    let mut params = Vec::new();
-    loop {
-        match (template_segments.next(), path_segments.next()) {
-            (None, None) => return Some(params),
-            (Some(template_segment), Some(path_segment)) => {
-                if let Some(name) = template_segment.strip_prefix(':') {
-                    if name.is_empty() || path_segment.is_empty() {
-                        return None;
-                    }
-                    params.push(path_segment);
-                } else if template_segment != path_segment {
-                    return None;
-                }
-            }
-            _ => return None,
-        }
-    }
-}
-
-/// Resolve a (method, path) to its classification row plus captured path
-/// parameters, or `None` when the request is not a table route.
+/// Resolve a request to its classification row plus the percent-DECODED
+/// path parameters (r2/P2-2), or the exact rejection the pre-extractor
+/// `Path` extractor arguments produced.
 ///
-/// Literal templates scan before parameterised ones so `/groups/discover`
-/// resolves through its own row and never through `/groups/:id` — the
-/// same static-beats-param priority the axum router applies.
-fn classify<'p>(method: &Method, path: &'p str) -> Option<(&'static RouteAccess, Vec<&'p str>)> {
-    for literal_first in [true, false] {
-        for row in GROUP_PLANE_ROUTES {
-            let parameterised = row.path.contains(':');
-            if parameterised == literal_first {
-                continue;
-            }
-            if row.method == *method {
-                if let Some(params) = match_template(row.path, path) {
-                    return Some((row, params));
-                }
-            }
-        }
-    }
-    None
+/// Classification keys off the router's own `MatchedPath` — the route
+/// pattern (`/groups/:id/members`) axum already resolved, static-beats-
+/// param priority included — so this module never re-implements route
+/// matching. The lookup is a plain `(method, pattern)` comparison; the
+/// parity test pins the table's pattern strings byte-for-byte to the
+/// router's, so a renamed parameter cannot slip past normalisation.
+///
+/// Parameters decode through the same `Path` extractor the handlers had
+/// as extractor arguments before this module: the axum router itself
+/// percent-decodes when it captures (so a raw `/groups/%61bc…` request
+/// arrives here already decoded to `abc…`, and the extractor's group
+/// lookup sees the same id the old handler's `Path<String>` saw), and a
+/// segment that does not decode to UTF-8 (`/groups/%FF/messages`) rejects
+/// with `Path`'s own 400 — generated by the router's decoder before serde
+/// is involved, hence byte-identical to the old `Path<String>` rejection.
+async fn resolve_route(
+    parts: &mut Parts,
+) -> Result<(&'static RouteAccess, HashMap<String, String>), Response> {
+    let params = match Path::<HashMap<String, String>>::from_request_parts(parts, &()).await {
+        Ok(Path(params)) => params,
+        Err(rejection) => return Err(rejection.into_response()),
+    };
+    let Some(matched) = parts.extensions.get::<MatchedPath>() else {
+        return Err(unclassified(&parts.method, parts.uri.path()));
+    };
+    let row = GROUP_PLANE_ROUTES
+        .iter()
+        .find(|row| row.method == parts.method && row.path == matched.as_str());
+    let Some(row) = row else {
+        return Err(unclassified(&parts.method, parts.uri.path()));
+    };
+    Ok((row, params))
 }
 
 // ─────────────────────── admission cores (pure) ──────────────────────────
@@ -652,13 +656,14 @@ pub(in crate::server) fn admit_public_messages(
 // ─────────────────────── extractor ───────────────────────────────────────
 
 /// The admission result handed to a handler: the resolved access level
-/// plus the stable group id the route's `:id` resolved to (the raw `:id`
-/// when the messages route falls through for a group unknown locally —
-/// the public-cache fail-open that predates this module).
+/// plus the stable group id the route's `:id` resolved to (the DECODED
+/// `:id` when the messages route falls through for a group unknown
+/// locally — the public-cache fail-open that predates this module).
 ///
-/// Handlers that need live group data re-take the read lock for their
-/// body; admission and body each see one internally-consistent snapshot,
-/// exactly as the pre-extractor code did under its single lock.
+/// This is the extractor's admission snapshot, not the final word:
+/// handlers that re-read group data for their body re-run the pure core
+/// under their own lock (r2/P2-1), so what gets served is always
+/// admitted on the snapshot it was read from.
 pub(in crate::server) struct GroupAccess {
     level: AccessLevel,
     stable_id: String,
@@ -695,64 +700,21 @@ fn unclassified(method: &Method, path: &str) -> Response {
         .into_response()
 }
 
-/// The auth middleware always inserts the actor before handlers run; a
-/// missing extension means the extractor was wired outside the
-/// authenticated stack, so refuse with the middleware's own 401 shape.
-fn missing_actor() -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(serde_json::json!({
-            "error": "missing or invalid Authorization: Bearer token"
-        })),
-    )
-        .into_response()
-}
-
-/// `GET /groups/:id` — the extractor arm. The live handler keeps its
-/// pinned signature and calls [`admit_named_group_details`] directly;
-/// this arm exists so the extractor is total over the classified set.
-async fn admit_details_route(
+/// `GET /groups/:id/members`. The extractor's admission snapshot; the
+/// handler re-runs [`admit_named_group_members`] under its own lock
+/// before serving the roster (r2/P2-1), so this pass is an early
+/// refusal, not the last word.
+async fn admit_members_route(
     state: &AppState,
-    actor: Option<&ActorContext>,
+    actor: &ActorContext,
     id: &str,
 ) -> Result<GroupAccess, Response> {
-    let Some(actor) = actor else {
-        return Err(missing_actor());
-    };
     let groups = state.named_groups.read().await;
     let Some(info) = groups.get(id) else {
         return Err(not_found("group not found").into_response());
     };
     // Session bearers need the #447/#458 seat label; the other actors are
     // decided without it (the arm they take ignores the label).
-    let level = match actor {
-        ActorContext::Owner { durable: false } => {
-            let local_hex = hex::encode(state.agent.agent_id().as_bytes());
-            let label = local_join_membership_state(state, info, &local_hex).await;
-            admit_named_group_details(actor, label)
-        }
-        _ => admit_named_group_details(actor, "not_member"),
-    }
-    .map_err(IntoResponse::into_response)?;
-    Ok(GroupAccess {
-        level,
-        stable_id: info.stable_group_id().to_string(),
-    })
-}
-
-/// `GET /groups/:id/members`.
-async fn admit_members_route(
-    state: &AppState,
-    actor: Option<&ActorContext>,
-    id: &str,
-) -> Result<GroupAccess, Response> {
-    let Some(actor) = actor else {
-        return Err(missing_actor());
-    };
-    let groups = state.named_groups.read().await;
-    let Some(info) = groups.get(id) else {
-        return Err(not_found("group not found").into_response());
-    };
     let level = match actor {
         ActorContext::Owner { durable: false } => {
             let local_hex = hex::encode(state.agent.agent_id().as_bytes());
@@ -816,30 +778,6 @@ async fn admit_state_commits_route(state: &AppState, id: &str) -> Result<GroupAc
     })
 }
 
-/// `GET /groups/:id/delegations` — the extractor arm; the live handler
-/// keeps its pinned signature and calls [`admit_group_delegations`]
-/// directly.
-async fn admit_delegations_route(
-    state: &AppState,
-    actor: Option<&ActorContext>,
-    id: &str,
-) -> Result<GroupAccess, Response> {
-    let Some(actor) = actor else {
-        return Err(missing_actor());
-    };
-    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
-    let groups = state.named_groups.read().await;
-    let Some(info) = groups.get(id) else {
-        return Err(not_found("group not found").into_response());
-    };
-    let level =
-        admit_group_delegations(info, actor, &local_hex).map_err(IntoResponse::into_response)?;
-    Ok(GroupAccess {
-        level,
-        stable_id: info.stable_group_id().to_string(),
-    })
-}
-
 #[async_trait::async_trait]
 impl FromRequestParts<Arc<AppState>> for GroupAccess {
     type Rejection = Response;
@@ -848,34 +786,52 @@ impl FromRequestParts<Arc<AppState>> for GroupAccess {
         parts: &mut Parts,
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
-        let actor = parts.extensions.get::<ActorContext>().cloned();
-        let method = parts.method.clone();
-        let path = parts.uri.path();
-        let Some((row, params)) = classify(&method, path) else {
-            return Err(unclassified(&method, path));
-        };
+        let (row, params) = resolve_route(parts).await?;
         if matches!(row.class, AccessClass::Unmigrated) {
-            return Err(unclassified(&method, path));
+            return Err(unclassified(&parts.method, parts.uri.path()));
         }
-        // Every classified S1 route is `/groups/:id/...`: the first
-        // captured parameter is the group id.
-        let Some(id) = params.first().copied() else {
-            return Err(unclassified(&method, path));
+        // The router's pattern is byte-identical to the row's (the
+        // parity test pins it), so the group id's parameter NAME comes
+        // from the row's own template: the first `:param` segment. Every
+        // classified S1 route is `/groups/:id/...`.
+        let id_param = row
+            .path
+            .strip_prefix("/groups/")
+            .and_then(|rest| rest.split('/').next())
+            .and_then(|segment| segment.strip_prefix(':'));
+        let Some(id_param) = id_param else {
+            return Err(unclassified(&parts.method, parts.uri.path()));
         };
+        let Some(id) = params.get(id_param) else {
+            return Err(unclassified(&parts.method, parts.uri.path()));
+        };
+        let id = id.clone();
         match (row.method.as_str(), row.path) {
-            ("GET", "/groups/:id") => admit_details_route(state.as_ref(), actor.as_ref(), id).await,
             ("GET", "/groups/:id/members") => {
-                admit_members_route(state.as_ref(), actor.as_ref(), id).await
+                // The actor is always present behind the auth
+                // middleware, which inserts one on every admitted
+                // request (auth.rs:171 durable, auth.rs:215 rider) — and
+                // the members handler's own `Extension` argument runs
+                // before this extractor and rejects a missing actor with
+                // the same `Extension` 500 the pre-S1 handler produced,
+                // so this extraction is a typed re-read, never a live
+                // 401 path (r2/P3-4).
+                let Extension(actor) = Extension::<ActorContext>::from_request_parts(parts, state)
+                    .await
+                    .map_err(|rejection| rejection.into_response())?;
+                admit_members_route(state.as_ref(), &actor, &id).await
             }
-            ("GET", "/groups/:id/messages") => admit_messages_route(state.as_ref(), id).await,
-            ("GET", "/groups/:id/state") => admit_state_route(state.as_ref(), id).await,
+            ("GET", "/groups/:id/messages") => admit_messages_route(state.as_ref(), &id).await,
+            ("GET", "/groups/:id/state") => admit_state_route(state.as_ref(), &id).await,
             ("GET", "/groups/:id/state/commits") => {
-                admit_state_commits_route(state.as_ref(), id).await
+                admit_state_commits_route(state.as_ref(), &id).await
             }
-            ("GET", "/groups/:id/delegations") => {
-                admit_delegations_route(state.as_ref(), actor.as_ref(), id).await
-            }
-            _ => Err(unclassified(&method, path)),
+            // `GET /groups/:id` and `/delegations` are classified but
+            // deliberately have no arm: their handlers keep pinned
+            // signatures (tests call them positionally) and run the
+            // cores directly. If a future handler wires this extractor
+            // to one of them, this fails closed instead of guessing.
+            _ => Err(unclassified(&parts.method, parts.uri.path())),
         }
     }
 }
@@ -883,6 +839,10 @@ impl FromRequestParts<Arc<AppState>> for GroupAccess {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use axum::routing::any;
+    use tower::ServiceExt as _;
 
     // ────────────────── parity fixtures ──────────────────
 
@@ -982,9 +942,14 @@ mod tests {
         found
     }
 
-    /// Every group-plane (METHOD, normalized path) wired in the daemon's
-    /// one router builder, parsed out of `src/server/mod.rs`.
-    fn router_group_plane() -> Vec<(String, String)> {
+    /// Every group-plane (METHOD, RAW path) wired in the daemon's one
+    /// router builder, parsed out of `src/server/mod.rs`. RAW means the
+    /// pattern literal verbatim — parameter names included — because
+    /// [`resolve_route`] compares the router's `MatchedPath` pattern to the
+    /// table row byte-for-byte. A group-plane `.route(..)` whose methods
+    /// the parser cannot recognise fails LOUDLY here rather than
+    /// vanishing from parity (r2/P3-3).
+    fn router_group_plane_raw() -> Vec<(String, String)> {
         let source = include_str!("mod.rs");
         let bytes = source.as_bytes();
         let mut routes = Vec::new();
@@ -1018,8 +983,14 @@ mod tests {
             let call = &source[call_start..call_end];
             if let Some(path) = first_string_literal(call) {
                 if is_group_plane(&path) {
-                    for method in method_routers(call) {
-                        routes.push((method.to_uppercase(), normalize(&path)));
+                    let methods = method_routers(call);
+                    assert!(
+                        !methods.is_empty(),
+                        "group-plane route {path} wires no method router the parity parser \
+                         recognises — extend the parser, do not let the route vanish from parity"
+                    );
+                    for method in methods {
+                        routes.push((method.to_uppercase(), path.clone()));
                     }
                 }
             }
@@ -1028,6 +999,15 @@ mod tests {
         routes.sort();
         routes.dedup();
         routes
+    }
+
+    /// Normalized (parameter names collapsed) view of the router's
+    /// group plane, for parity against the registry.
+    fn router_group_plane() -> Vec<(String, String)> {
+        router_group_plane_raw()
+            .into_iter()
+            .map(|(method, path)| (method, normalize(&path)))
+            .collect()
     }
 
     /// The group-plane (METHOD, normalized path) set the CLI/daemon
@@ -1072,6 +1052,46 @@ mod tests {
             table,
             registry_group_plane(),
             "classification table must match the group-plane entries of crate::api::ENDPOINTS"
+        );
+    }
+
+    /// r2/P3-3: the router-source parser sees the whole picture. A
+    /// nested or merged router — or a `.route(..)` whose method wiring
+    /// the parser fails to recognise — would each silently shrink the
+    /// parsed plane while parity still passed against the shrunken
+    /// set. The no-method case is asserted inside
+    /// [`router_group_plane_raw`]; nesting/merging cannot be scoped to
+    /// group paths (their subtree is opaque), so the tokens themselves
+    /// are banned from the one router builder.
+    #[test]
+    fn parity_source_parser_blind_spots_stay_shut() {
+        let source = include_str!("mod.rs");
+        assert!(
+            !source.contains(".nest("),
+            "a nested router's group-plane routes would be invisible to the parity parser"
+        );
+        assert!(
+            !source.contains(".merge("),
+            "a merged router's group-plane routes would be invisible to the parity parser"
+        );
+    }
+
+    /// r2/P2-2: the table's pattern strings are byte-identical to the
+    /// router's, because [`resolve_route`] compares the router's
+    /// `MatchedPath` pattern to the row with a plain string equality —
+    /// a parameter rename must hit both sides or this fails.
+    #[test]
+    fn table_patterns_are_byte_identical_to_the_router() {
+        let mut table: Vec<(String, String)> = GROUP_PLANE_ROUTES
+            .iter()
+            .map(|row| (row.method.as_str().to_string(), row.path.to_string()))
+            .collect();
+        table.sort();
+        table.dedup();
+        assert_eq!(
+            table,
+            router_group_plane_raw(),
+            "MatchedPath classification compares patterns byte-for-byte"
         );
     }
 
@@ -1123,27 +1143,154 @@ mod tests {
         }
     }
 
-    /// Static literals outrank parameter templates (matchit priority) and
-    /// the group id is captured positionally.
-    #[test]
-    fn literals_outrank_params_and_params_capture_the_group_id() {
-        let (row, _) =
-            classify(&Method::GET, "/groups/discover").expect("discover is a table route");
-        assert_eq!(row.path, "/groups/discover");
+    // ────────────────── router-level resolution (r2) ──────────────────
 
-        let (row, params) = classify(&Method::GET, "/groups/abc123/members").expect("members row");
-        assert_eq!(row.path, "/groups/:id/members");
-        assert_eq!(params, vec!["abc123"]);
+    /// Probe handler: runs [`resolve_route`] on the parts a REAL axum
+    /// router produced (MatchedPath + captured, percent-decoded
+    /// UrlParams) and answers with the resolved row pattern plus the
+    /// decoded params, or the rejection response itself.
+    async fn resolve_probe(request: Request<Body>) -> Response {
+        let (mut parts, _) = request.into_parts();
+        match resolve_route(&mut parts).await {
+            Ok((row, params)) => (
+                StatusCode::OK,
+                Json(serde_json::json!({ "path": row.path, "params": params })),
+            )
+                .into_response(),
+            Err(response) => response,
+        }
+    }
 
-        let (row, params) =
-            classify(&Method::GET, "/groups/abc/state/commits").expect("commits row");
-        assert_eq!(row.path, "/groups/:id/state/commits");
-        assert_eq!(params, vec!["abc"]);
+    /// The pre-extractor oracle: what the old `Path(id): Path<String>`
+    /// handler arguments did with the same request.
+    async fn legacy_path_probe(request: Request<Body>) -> Response {
+        let (mut parts, _) = request.into_parts();
+        match Path::<String>::from_request_parts(&mut parts, &()).await {
+            Ok(Path(id)) => (StatusCode::OK, Json(serde_json::json!({ "id": id }))).into_response(),
+            Err(rejection) => rejection.into_response(),
+        }
+    }
 
-        // Different method, empty `:id`, off-plane path: no row.
-        assert!(classify(&Method::POST, "/groups/abc/state").is_none());
-        assert!(classify(&Method::GET, "/groups//members").is_none());
-        assert!(classify(&Method::GET, "/calls").is_none());
+    async fn probe_body(response: Response) -> serde_json::Value {
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1 << 16).await.expect("body");
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| panic!("non-JSON body {bytes:?} ({status})"))
+    }
+
+    /// r2/P2-2: classification rides the router's own `MatchedPath`
+    /// pattern — literal-vs-param priority is the real router's, not a
+    /// re-implementation — and an off-table wiring fails closed.
+    #[tokio::test]
+    async fn classification_rides_the_routers_matched_path() {
+        let app = axum::Router::new()
+            .route("/groups/discover", any(resolve_probe))
+            .route("/groups/:id", any(resolve_probe))
+            .route("/groups/:id/members", any(resolve_probe))
+            // Off-table wiring: mounted, so the probe (not the router's
+            // own 404) answers.
+            .route("/calls/:id", any(resolve_probe));
+
+        // Static literal beats the parameterised row (matchit priority).
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/groups/discover")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = probe_body(response).await;
+        assert_eq!(body["path"], "/groups/discover");
+        assert_eq!(body["params"], serde_json::json!({}));
+
+        // Parameterised rows capture the decoded id by param name.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/groups/abc123/members")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let body = probe_body(response).await;
+        assert_eq!(body["path"], "/groups/:id/members");
+        assert_eq!(body["params"]["id"], "abc123");
+
+        // Method mismatch and off-table wiring fail closed (403).
+        for (method, path) in [("POST", "/groups/abc123/members"), ("GET", "/calls/abc123")] {
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .body(Body::empty())
+                .expect("request");
+            let response = app.clone().oneshot(request).await.expect("response");
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
+        }
+    }
+
+    /// r2/P2-2: a percent-encoded `:id` decodes to exactly the value the
+    /// old `Path<String>` handler argument produced — so
+    /// `/groups/%61bc…` resolves the group (and its gates) instead of
+    /// slipping past the unknown-group lookup into the messages
+    /// public-cache fail-open.
+    #[tokio::test]
+    async fn percent_encoded_ids_decode_exactly_like_the_old_path_extractor() {
+        let new = axum::Router::new()
+            .route("/groups/:id/messages", any(resolve_probe))
+            .oneshot(
+                Request::get("/groups/issue%3821-%6Bnown/messages")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let old = axum::Router::new()
+            .route("/groups/:id/messages", any(legacy_path_probe))
+            .oneshot(
+                Request::get("/groups/issue%3821-%6Bnown/messages")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(new.status(), StatusCode::OK);
+        assert_eq!(old.status(), StatusCode::OK);
+        let new_body = probe_body(new).await;
+        let old_body = probe_body(old).await;
+        assert_eq!(new_body["params"]["id"], old_body["id"]);
+        assert_eq!(new_body["params"]["id"], "issue821-known");
+        assert_eq!(new_body["path"], "/groups/:id/messages");
+    }
+
+    /// r2/P2-2: an id that does not percent-decode to UTF-8 keeps the
+    /// old 400 — byte-identical to the `Path<String>` rejection the
+    /// pre-extractor handler argument produced (the router's own
+    /// decoder rejects before serde is involved).
+    #[tokio::test]
+    async fn invalid_percent_encoding_keeps_the_old_400() {
+        for raw in ["/groups/%FF/messages", "/groups/%C3%28/messages"] {
+            let new = axum::Router::new()
+                .route("/groups/:id/messages", any(resolve_probe))
+                .clone()
+                .oneshot(Request::get(raw).body(Body::empty()).expect("request"))
+                .await
+                .expect("response");
+            let old = axum::Router::new()
+                .route("/groups/:id/messages", any(legacy_path_probe))
+                .clone()
+                .oneshot(Request::get(raw).body(Body::empty()).expect("request"))
+                .await
+                .expect("response");
+            assert_eq!(new.status(), StatusCode::BAD_REQUEST, "{raw}");
+            assert_eq!(old.status(), StatusCode::BAD_REQUEST, "{raw}");
+            let new_bytes = to_bytes(new.into_body(), 1 << 16).await.expect("body");
+            let old_bytes = to_bytes(old.into_body(), 1 << 16).await.expect("body");
+            assert_eq!(new_bytes, old_bytes, "{raw}");
+        }
     }
 
     // ────────────────── admission bodies ──────────────────
