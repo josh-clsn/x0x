@@ -12,8 +12,13 @@
  * otherwise control deterministic:
  *
  *  1. Entropy. getrandom(), getentropy() and syscall(SYS_getrandom, ...)
- *     return a SplitMix64 stream seeded by W3H_ENTROPY_SEED (not a CSPRNG:
- *     test processes only). Rust consumers in the lockfile reach one of
+ *     return SplitMix64 output (not a CSPRNG: test processes only). Each
+ *     THREAD has its own stream, seeded by (W3H_ENTROPY_SEED, the thread's
+ *     name, its ordinal among threads with that name), so one thread's
+ *     draws never move another thread's position: the harness's test
+ *     thread (named after the test by libtest, and running every daemon
+ *     task on its current-thread runtime) sees the same values whatever
+ *     the blocking pool does. Rust consumers in the lockfile reach one of
  *     these: getrandom 0.2 via syscall(SYS_getrandom), getrandom 0.3/0.4
  *     and std (HashMap RandomState, which also seeds tokio's select! RNG)
  *     via getrandom().
@@ -35,6 +40,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/random.h>
@@ -148,8 +154,24 @@ __asm__(
 static atomic_int shim_active;
 static atomic_ulong entropy_calls;
 
-static pthread_mutex_t entropy_lock = PTHREAD_MUTEX_INITIALIZER;
-static uint64_t entropy_state;
+static uint64_t entropy_seed;
+
+/* Per-thread streams and their accounting. */
+#define W3H_MAX_THREADS 512
+#define W3H_NAME_LEN 16
+struct thread_entry {
+    char name[W3H_NAME_LEN];
+    unsigned int ordinal;
+    atomic_ulong draws;
+};
+static pthread_mutex_t registry_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct thread_entry registry[W3H_MAX_THREADS];
+static atomic_int registry_len;
+static atomic_ulong unregistered_draws;
+
+static __thread int tl_seeded;
+static __thread int tl_index = -1;
+static __thread uint64_t tl_state;
 
 typedef int (*clock_gettime_fn)(clockid_t, struct timespec *);
 static _Atomic(clock_gettime_fn) real_clock_gettime;
@@ -177,31 +199,77 @@ __attribute__((constructor)) static void w3h_shim_init(void) {
     if (errno != 0 || end == NULL || *end != '\0') {
         return;
     }
-    entropy_state = (uint64_t)value;
+    entropy_seed = (uint64_t)value;
     atomic_store(&shim_active, 1);
 }
 
 /* ---- entropy ---------------------------------------------------------- */
 
-static uint64_t splitmix64(void) {
-    uint64_t z = (entropy_state += 0x9e3779b97f4a7c15ULL);
+static uint64_t mix64(uint64_t z) {
     z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
     z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
     return z ^ (z >> 31);
 }
 
+static uint64_t splitmix64(uint64_t *state) {
+    return mix64(*state += 0x9e3779b97f4a7c15ULL);
+}
+
+static uint64_t fnv1a(const char *text) {
+    uint64_t hash = 0xcbf29ce484222325ULL;
+    for (; *text != '\0'; ++text) {
+        hash ^= (unsigned char)*text;
+        hash *= 0x100000001b3ULL;
+    }
+    return hash;
+}
+
+/* First draw on this thread: find its name and its ordinal among threads
+ * with the same name (registration order), and derive its stream. */
+static void seed_this_thread(void) {
+    char name[W3H_NAME_LEN];
+    memset(name, 0, sizeof name);
+    if (pthread_getname_np(pthread_self(), name, sizeof name) != 0) {
+        strcpy(name, "?");
+    }
+    unsigned int ordinal = 0;
+    pthread_mutex_lock(&registry_lock);
+    int len = atomic_load(&registry_len);
+    for (int i = 0; i < len; ++i) {
+        if (strncmp(registry[i].name, name, W3H_NAME_LEN) == 0) {
+            ordinal++;
+        }
+    }
+    if (len < W3H_MAX_THREADS) {
+        memcpy(registry[len].name, name, W3H_NAME_LEN);
+        registry[len].ordinal = ordinal;
+        atomic_store(&registry[len].draws, 0);
+        tl_index = len;
+        atomic_store(&registry_len, len + 1);
+    }
+    pthread_mutex_unlock(&registry_lock);
+    tl_state = mix64(entropy_seed ^ mix64(fnv1a(name)) ^ mix64(0x5157ULL + ordinal));
+    tl_seeded = 1;
+}
+
 static void fill(void *buf, size_t len) {
     unsigned char *out = (unsigned char *)buf;
-    pthread_mutex_lock(&entropy_lock);
+    if (!tl_seeded) {
+        seed_this_thread();
+    }
     while (len > 0) {
-        uint64_t word = splitmix64();
+        uint64_t word = splitmix64(&tl_state);
         size_t n = len < sizeof word ? len : sizeof word;
         memcpy(out, &word, n);
         out += n;
         len -= n;
     }
-    pthread_mutex_unlock(&entropy_lock);
     atomic_fetch_add(&entropy_calls, 1);
+    if (tl_index >= 0) {
+        atomic_fetch_add(&registry[tl_index].draws, 1);
+    } else {
+        atomic_fetch_add(&unregistered_draws, 1);
+    }
 }
 
 long w3h_getrandom_syscall(void *buf, size_t len, unsigned int flags) {
@@ -269,6 +337,36 @@ unsigned int w3h_shim_version(void) { return 2; }
 int w3h_shim_active(void) { return atomic_load(&shim_active); }
 
 unsigned long w3h_shim_entropy_calls(void) { return atomic_load(&entropy_calls); }
+
+/* Writes "name#ordinal=draws" entries separated by '\n' into `out` (NUL
+ * terminated, truncated to `cap`). Returns the number of threads that drew
+ * entropy. Diagnostics only: never part of the canonical trace. */
+int w3h_shim_thread_stats(char *out, size_t cap) {
+    if (out == NULL || cap == 0) {
+        return -1;
+    }
+    out[0] = '\0';
+    size_t used = 0;
+    int len = atomic_load(&registry_len);
+    for (int i = 0; i < len && used + 1 < cap; ++i) {
+        int wrote = snprintf(out + used, cap - used, "%.*s#%u=%lu\n", W3H_NAME_LEN,
+                             registry[i].name, registry[i].ordinal,
+                             atomic_load(&registry[i].draws));
+        if (wrote < 0) {
+            break;
+        }
+        used += (size_t)wrote;
+        if (used >= cap) {
+            used = cap - 1;
+            break;
+        }
+    }
+    unsigned long extra = atomic_load(&unregistered_draws);
+    if (extra > 0 && used + 1 < cap) {
+        snprintf(out + used, cap - used, "(unregistered)=%lu\n", extra);
+    }
+    return len;
+}
 
 void w3h_shim_set_wall_offset_ns(uint64_t offset_ns) {
     if (!atomic_load(&shim_active)) {

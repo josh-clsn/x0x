@@ -45,6 +45,8 @@ use crate::network::sim::{self, SimFabric};
 /// Virtual-time budget for one API call (including any network round
 /// trips it waits on).
 const API_BUDGET: Duration = Duration::from_secs(60);
+/// Upper bound for one run's raw payload dump.
+const PAYLOAD_DUMP_CAP: usize = 256 * 1024 * 1024;
 /// Virtual-time budget for a daemon to start.
 const START_BUDGET: Duration = Duration::from_secs(120);
 /// Real-time limit for an await made while the clock gate is closed. A
@@ -55,6 +57,7 @@ const GATED_STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(20
 #[derive(Clone, Copy)]
 struct Shim {
     set_wall_offset_ns: unsafe extern "C" fn(u64),
+    thread_stats: unsafe extern "C" fn(*mut libc::c_char, usize) -> libc::c_int,
 }
 
 /// Why the shim is not controlling this process (recorded in the trace).
@@ -70,14 +73,15 @@ impl Shim {
         use rand::RngCore as _;
         // SAFETY: `dlsym` with RTLD_DEFAULT and NUL-terminated names has no
         // preconditions; null means "not found".
-        let (set_wall, active, calls) = unsafe {
+        let (set_wall, active, calls, stats) = unsafe {
             (
                 libc::dlsym(libc::RTLD_DEFAULT, c"w3h_shim_set_wall_offset_ns".as_ptr()),
                 libc::dlsym(libc::RTLD_DEFAULT, c"w3h_shim_active".as_ptr()),
                 libc::dlsym(libc::RTLD_DEFAULT, c"w3h_shim_entropy_calls".as_ptr()),
+                libc::dlsym(libc::RTLD_DEFAULT, c"w3h_shim_thread_stats".as_ptr()),
             )
         };
-        if set_wall.is_null() || active.is_null() || calls.is_null() {
+        if set_wall.is_null() || active.is_null() || calls.is_null() || stats.is_null() {
             return Err(SHIM_NOT_LOADED.to_string());
         }
         // SAFETY: these are the shim's exported functions with exactly these
@@ -110,12 +114,39 @@ impl Shim {
                 "shim active but an entropy path bypassed it (calls {before} -> {after})"
             ));
         }
-        Ok(Self { set_wall_offset_ns })
+        // SAFETY: the shim's `int w3h_shim_thread_stats(char *, size_t)`.
+        let thread_stats = unsafe {
+            std::mem::transmute::<
+                *mut libc::c_void,
+                unsafe extern "C" fn(*mut libc::c_char, usize) -> libc::c_int,
+            >(stats)
+        };
+        Ok(Self {
+            set_wall_offset_ns,
+            thread_stats,
+        })
     }
 
     #[cfg(not(target_os = "linux"))]
     fn detect() -> std::result::Result<Self, String> {
         Err(SHIM_NOT_LOADED.to_string())
+    }
+
+    /// Per-thread entropy draws (`name#ordinal=draws` lines). Diagnostics
+    /// only; never part of the canonical trace.
+    fn thread_stats(self) -> String {
+        let mut buffer = vec![0u8; 64 * 1024];
+        // SAFETY: the buffer is valid and writable for its length; the shim
+        // NUL-terminates within `cap`.
+        let threads = unsafe { (self.thread_stats)(buffer.as_mut_ptr().cast(), buffer.len()) };
+        let end = buffer
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(buffer.len());
+        format!(
+            "{threads} threads\n{}",
+            String::from_utf8_lossy(&buffer[..end])
+        )
     }
 
     fn set_wall(self, offset: Duration) {
@@ -386,13 +417,20 @@ impl Sim {
             .ok_or_else(|| anyhow!("daemon {label} has no network"))?
             .peer_id();
         self.fabric.label(&peer, label);
+        let agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+        // Identities are part of the canonical trace: if key generation ever
+        // diverges, the gate's first differing line says so.
+        self.fabric.mark(format!(
+            "identity {label} agent={agent_hex} machine={}",
+            hex::encode(peer.0)
+        ));
         let node = SimNode {
             label: label.to_string(),
             router: Some(handle.test_router.clone()),
             state: Arc::downgrade(&state),
             token: state.api_token.clone(),
             peer,
-            agent_hex: hex::encode(state.agent.agent_id().as_bytes()),
+            agent_hex,
             handle: Some(handle),
         };
         self.nodes.insert(label.to_string(), node);
@@ -624,8 +662,21 @@ impl Sim {
         if let Ok(dir) = std::env::var("W3H_TRACE_DIR") {
             let dir = std::path::PathBuf::from(dir);
             if std::fs::create_dir_all(&dir).is_ok() {
-                let file = dir.join(format!("{}-{}.trace", self.case, std::process::id()));
-                let _ = std::fs::write(file, &trace);
+                let stem = format!("{}-{}", self.case, std::process::id());
+                let _ = std::fs::write(dir.join(format!("{stem}.trace")), &trace);
+                // Raw payloads (test identities only) are written only when
+                // the CI gate job asks for them (nextest `w3h-gate` profile).
+                if std::env::var("W3H_DUMP_PAYLOADS").as_deref() == Ok("1") {
+                    let _ = std::fs::write(
+                        dir.join(format!("{stem}.payloads")),
+                        self.fabric.payload_dump(PAYLOAD_DUMP_CAP),
+                    );
+                }
+            }
+        }
+        if let Some(shim) = self.shim {
+            for line in shim.thread_stats().lines() {
+                eprintln!("W3H-ENTROPY {} {line}", self.case);
             }
         }
         if !teardown_errors.is_empty() {

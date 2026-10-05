@@ -433,6 +433,58 @@ impl SimFabric {
             .collect()
     }
 
+    /// Raw payload dump for offline analysis and the ADR 0108 privacy
+    /// audit: every write (in acceptance order) and every refused send that
+    /// carried bytes, each as a UTF-8 header line followed by the raw bytes
+    /// and a newline:
+    /// `W <src>-><dst> <class> #<seq> w@<us> len=<n>` /
+    /// `R <src>-><dst> <class> @<us> <reason> len=<n>`.
+    /// Stops (with a `TRUNCATED` line) before exceeding `cap` bytes.
+    pub(crate) fn payload_dump(&self, cap: usize) -> Vec<u8> {
+        let state = self.lock();
+        let mut out = Vec::new();
+        let push = |header: String, bytes: &[u8], out: &mut Vec<u8>| -> bool {
+            if out.len() + header.len() + bytes.len() + 2 > cap {
+                out.extend_from_slice(b"TRUNCATED\n");
+                return false;
+            }
+            out.extend_from_slice(header.as_bytes());
+            out.push(b'\n');
+            out.extend_from_slice(bytes);
+            out.push(b'\n');
+            true
+        };
+        for write in &state.writes {
+            let header = format!(
+                "W {} #{} w@{}us len={}",
+                Self::lane_name(&state, &write.lane),
+                write.seq,
+                micros(write.at),
+                write.bytes.len()
+            );
+            if !push(header, &write.bytes, &mut out) {
+                return out;
+            }
+        }
+        for refusal in &state.refused {
+            if let Some(bytes) = &refusal.bytes {
+                let header = format!(
+                    "R {}->{} {} @{}us {:?} len={}",
+                    Self::name(&state, &refusal.src),
+                    Self::name(&state, &refusal.dst),
+                    refusal.class.map_or("connect".to_string(), LaneClass::name),
+                    micros(refusal.at),
+                    refusal.reason,
+                    bytes.len()
+                );
+                if !push(header, bytes, &mut out) {
+                    return out;
+                }
+            }
+        }
+        out
+    }
+
     /// Every write so far, in the order the fabric accepted them.
     pub(crate) fn writes(&self) -> Vec<Write> {
         self.lock().writes.clone()
@@ -1455,6 +1507,23 @@ mod fabric_tests {
         assert_eq!(writes.len(), 3, "the dropped write is still captured");
         assert_eq!(&*writes[1].bytes, &[DM, 1]);
         assert!(fabric.canonical_trace().contains("dropped@"));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn w3h_fabric_payload_dump_carries_raw_bytes_and_refusals() {
+        let fabric = SimFabric::new(13);
+        let (a, _b) = two_links(&fabric).await;
+        a.send(&key(2), &[DM, 0xab, 0xcd]).expect("send");
+        fabric.set_online(&key(2), false);
+        assert!(a.send(&key(2), &[DM, 0xef]).is_err());
+        let dump = fabric.payload_dump(1 << 20);
+        let text = String::from_utf8_lossy(&dump);
+        assert!(text.contains("W A->B direct #0 w@"), "{text}");
+        assert!(dump.windows(3).any(|w| w == [DM, 0xab, 0xcd]));
+        assert!(text.contains("R A->B direct @"), "{text}");
+        assert!(dump.windows(2).any(|w| w == [DM, 0xef]));
+        let truncated = fabric.payload_dump(8);
+        assert_eq!(truncated, b"TRUNCATED\n");
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

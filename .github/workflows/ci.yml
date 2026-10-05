@@ -434,7 +434,7 @@ jobs:
         env:
           X0X_ISOLATION_ROLE: w3h-harness
           X0X_RUNTIME_TIMEOUT_SECONDS: 4800
-        run: bash scripts/ci/nextest-isolated.sh --all-features --lib -- --profile w3h --stress-count 20
+        run: bash scripts/ci/nextest-isolated.sh --all-features --lib -- --profile w3h-gate --stress-count 20
 
       - name: Determinism gate (one canonical trace per case)
         run: >-
@@ -446,6 +446,8 @@ jobs:
           --expect w3h_1143_red_baseline_reproduces_owner_cert_member_pending=RED
           --expect w3h_1143_positive_control_consented_owner_announce_admits=GREEN
 
+      # Traces, receipts and raw payload dumps (test identities only; the
+      # `w3h-gate` profile is the only producer of payload dumps).
       - name: Upload W3-H traces
         if: always()
         uses: actions/upload-artifact@v5
@@ -453,6 +455,7 @@ jobs:
           name: w3h-traces
           path: target/w3h/traces/
           if-no-files-found: warn
+          retention-days: 7
 
   test-windows:
     name: Test Suite (Windows)
