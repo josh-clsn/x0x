@@ -4292,7 +4292,9 @@ pub(crate) async fn persist_share_grant_revocations(
     identity_dir: Option<&std::path::Path>,
 ) {
     if let Err(e) = persist_share_grant_revocations_durable(revocation_set, identity_dir).await {
-        tracing::warn!("revocations-v3 persist failed: {e}");
+        if !storage::revocation_persistence_is_blocked(&e) {
+            tracing::warn!("revocations-v3 persist failed: {e}");
+        }
     }
 }
 
@@ -4322,18 +4324,16 @@ const SHARE_GRANT_REVOCATIONS_LOCK_TIMEOUT: std::time::Duration =
 pub(crate) async fn persist_share_grant_revocations_durable(
     revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
     identity_dir: Option<&std::path::Path>,
-) -> std::result::Result<(), String> {
+) -> error::Result<()> {
     let Some(dir) = identity_dir
         .map(std::path::Path::to_path_buf)
         .or_else(storage::x0x_home_dir)
     else {
         return Ok(());
     };
-    let live = revocation_set
-        .read()
-        .await
-        .to_bytes_v3()
-        .map_err(|e| format!("revocations-v3 encode: {e}"))?;
+    let live = revocation_set.read().await.to_bytes_v3().map_err(|e| {
+        error::IdentityError::Storage(std::io::Error::other(format!("revocations-v3 encode: {e}")))
+    })?;
     let _in_process = SHARE_GRANT_REVOCATIONS_WRITE_LOCK.lock().await;
     merge_write_share_grant_revocations(
         &dir.join(SHARE_GRANT_REVOCATIONS_FILE),
@@ -4369,15 +4369,18 @@ pub(crate) async fn merge_write_share_grant_revocations<A, AF>(
     now_unix: u64,
     on_contended: impl Fn(),
     after_read: A,
-) -> std::result::Result<(), String>
+) -> error::Result<()>
 where
     A: FnOnce() -> AF,
     AF: std::future::Future<Output = ()>,
 {
     if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| format!("revocations-v3 dir {}: {e}", parent.display()))?;
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "revocations-v3 dir {}: {e}",
+                parent.display()
+            )))
+        })?;
     }
     let mut lock_path = path.as_os_str().to_owned();
     lock_path.push(".lock");
@@ -4388,28 +4391,26 @@ where
         on_contended,
     )
     .await
-    .map_err(|e| format!("revocations-v3 lock: {e}"))?;
-    let mut merged = match tokio::fs::read(path).await {
-        Ok(bytes) => revocation::RevocationSet::from_bytes_v3(&bytes).unwrap_or_else(|e| {
-            tracing::warn!("revocations-v3 on disk unreadable, rewriting from memory: {e}");
-            revocation::RevocationSet::new()
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => revocation::RevocationSet::new(),
-        Err(e) => return Err(format!("revocations-v3 read {}: {e}", path.display())),
-    };
+    .map_err(|e| {
+        error::IdentityError::Storage(std::io::Error::other(format!("revocations-v3 lock: {e}")))
+    })?;
+    let mut merged = storage::read_revocation_store(path, storage::RevocationStore::V3, true)
+        .await?
+        .unwrap_or_default();
     after_read().await;
-    let live = revocation::RevocationSet::from_bytes_v3(live_v3)
-        .map_err(|e| format!("revocations-v3 re-decode: {e}"))?;
+    let live = revocation::RevocationSet::from_bytes_v3(live_v3).map_err(|e| {
+        error::IdentityError::Storage(std::io::Error::other(format!(
+            "revocations-v3 re-decode: {e}"
+        )))
+    })?;
     merged.merge_v3(live);
     if now_unix != 0 {
         merged.expire_records_older_than(SHARE_GRANT_REVOCATIONS_TTL_SECS, now_unix);
     }
-    let bytes = merged
-        .to_bytes_v3()
-        .map_err(|e| format!("revocations-v3 encode: {e}"))?;
-    storage::write_private_bytes_durable(path, bytes)
-        .await
-        .map_err(|e| format!("revocations-v3 write {}: {e}", path.display()))
+    let bytes = merged.to_bytes_v3().map_err(|e| {
+        error::IdentityError::Storage(std::io::Error::other(format!("revocations-v3 encode: {e}")))
+    })?;
+    storage::write_private_bytes_durable(path, bytes).await
 }
 
 struct RawDirectDelivery {
@@ -10863,9 +10864,11 @@ impl Agent {
                                         )
                                         .await
                                         {
-                                            tracing::warn!(
-                                                "failed to persist revocation set: {e}"
-                                            );
+                                            if !storage::revocation_persistence_is_blocked(&e) {
+                                                tracing::warn!(
+                                                    "failed to persist revocation set: {e}"
+                                                );
+                                            }
                                         }
                                     }
                                     Err(e) => tracing::warn!(
@@ -12884,18 +12887,32 @@ impl Agent {
 
         // 2. Persist. The legacy file filters share-grant records out
         //    (#926 r3), so those also go to `revocations-v3.bin`.
-        storage::save_revocation_set(
+        let mut persisted = storage::save_revocation_set(
             &*self.revocation_set.read().await,
             self.identity_dir.as_deref(),
         )
-        .await?;
-        if matches!(record.subject, revocation::RevokedSubject::ShareGrant(_)) {
-            persist_share_grant_revocations_durable(
-                &self.revocation_set,
-                self.identity_dir.as_deref(),
-            )
-            .await
-            .map_err(|e| error::IdentityError::Storage(std::io::Error::other(e)))?;
+        .await;
+        let additional = match &record.subject {
+            revocation::RevokedSubject::ShareGrant(_) => {
+                persist_share_grant_revocations_durable(
+                    &self.revocation_set,
+                    self.identity_dir.as_deref(),
+                )
+                .await
+            }
+            revocation::RevokedSubject::AgentMachineBinding(_) => {
+                match self.revocation_set.read().await.to_bytes_v2() {
+                    Ok(bytes) => match self.move_file_path("revocations-v2.bin") {
+                        Some(path) => storage::save_private_bytes_to(&path, bytes).await,
+                        None => Ok(()),
+                    },
+                    Err(e) => Err(e),
+                }
+            }
+            _ => Ok(()),
+        };
+        if persisted.is_ok() {
+            persisted = additional;
         }
 
         // 3. Evict from caches.
@@ -12903,19 +12920,30 @@ impl Agent {
 
         // 4. Publish on gossip (best-effort — local enforcement happens regardless).
         if let Some(rt) = &self.gossip_runtime {
-            let records = self.revocation_set.read().await.all_records();
+            let (topic, records) = {
+                let set = self.revocation_set.read().await;
+                match &record.subject {
+                    revocation::RevokedSubject::AgentMachineBinding(_) => {
+                        (REVOCATION_V2_TOPIC, set.binding_records())
+                    }
+                    revocation::RevokedSubject::ShareGrant(_) => {
+                        (REVOCATION_V3_TOPIC, set.share_grant_records())
+                    }
+                    _ => (REVOCATION_TOPIC, set.all_records()),
+                }
+            };
             match bincode::serialize(&records) {
                 Ok(bytes) if !bytes.is_empty() => {
                     let _ = rt
                         .pubsub()
-                        .publish(REVOCATION_TOPIC.to_string(), bytes::Bytes::from(bytes))
+                        .publish(topic.to_string(), bytes::Bytes::from(bytes))
                         .await;
                 }
                 _ => {}
             }
         }
 
-        Ok(())
+        persisted
     }
 
     // === ADR-0043: agent key-move ceremony ===
@@ -14065,25 +14093,6 @@ impl Agent {
         )?;
         self.apply_and_publish_revocation(record.clone(), Some(&cert))
             .await?;
-        // v2 carrier: binding records ride their own topic + file.
-        if let Some(rt) = &self.gossip_runtime {
-            let records = self.revocation_set.read().await.binding_records();
-            if let Ok(bytes) = bincode::serialize(&records) {
-                if !bytes.is_empty() {
-                    let _ = rt
-                        .pubsub()
-                        .publish(REVOCATION_V2_TOPIC.to_string(), bytes::Bytes::from(bytes))
-                        .await;
-                }
-            }
-        }
-        if let Ok(v2) = self.revocation_set.read().await.to_bytes_v2() {
-            if let Some(path) = self.move_file_path("revocations-v2.bin") {
-                if let Err(e) = storage::save_private_bytes_to(&path, v2).await {
-                    tracing::warn!("revocations-v2 persist failed: {e}");
-                }
-            }
-        }
         Ok(record)
     }
 
@@ -18208,18 +18217,24 @@ impl AgentBuilder {
             }
             // Ad-hoc binding records (v2 file) merge into the same set.
             if let Some(dir) = dir {
-                if let Ok(bytes) = tokio::fs::read(dir.join("revocations-v2.bin")).await {
-                    match revocation::RevocationSet::from_bytes_v2(&bytes) {
-                        Ok(v2) => revoked_for_load.merge_v2(v2),
-                        Err(e) => tracing::warn!("revocations-v2.bin unreadable: {e}"),
-                    }
+                if let Ok(Some(v2)) = storage::read_revocation_store(
+                    &dir.join("revocations-v2.bin"),
+                    storage::RevocationStore::V2,
+                    false,
+                )
+                .await
+                {
+                    revoked_for_load.merge_v2(v2);
                 }
                 // ADR-0070: share-grant revocations (v3 file).
-                if let Ok(bytes) = tokio::fs::read(dir.join(SHARE_GRANT_REVOCATIONS_FILE)).await {
-                    match revocation::RevocationSet::from_bytes_v3(&bytes) {
-                        Ok(v3) => revoked_for_load.merge_v3(v3),
-                        Err(e) => tracing::warn!("revocations-v3.bin unreadable: {e}"),
-                    }
+                if let Ok(Some(v3)) = storage::read_revocation_store(
+                    &dir.join(SHARE_GRANT_REVOCATIONS_FILE),
+                    storage::RevocationStore::V3,
+                    false,
+                )
+                .await
+                {
+                    revoked_for_load.merge_v3(v3);
                 }
             }
             (state, logs_corrupt)
@@ -21873,6 +21888,106 @@ mod tests {
                 .expect("fail-open agent load")
         }
 
+        /// A local durability refusal must still enforce, evict and hand
+        /// the revocation to its gossip carrier before returning the error.
+        #[tokio::test]
+        async fn blocked_local_revocations_still_enforce_and_publish_1116() {
+            let dir = tempfile::tempdir().unwrap();
+            for name in [
+                "revocations.bin",
+                "revocations-v2.bin",
+                SHARE_GRANT_REVOCATIONS_FILE,
+            ] {
+                tokio::fs::write(dir.path().join(name), b"unreadable")
+                    .await
+                    .unwrap();
+            }
+            let agent = Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_identity_dir(dir.path())
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_user_key(identity::UserKeypair::generate().unwrap())
+                .with_peer_cache_disabled()
+                .with_network_config(network::NetworkConfig {
+                    bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+                    bootstrap_nodes: vec![],
+                    mdns_enabled: false,
+                    ..network::NetworkConfig::default()
+                })
+                .build()
+                .await
+                .unwrap();
+            let owner = agent.identity.user_keypair().unwrap();
+            let cert = agent.identity.agent_certificate().unwrap();
+            let pubsub = agent.gossip_runtime.as_ref().unwrap().pubsub();
+            let subjects = [
+                (
+                    revocation::RevokedSubject::Agent(agent.agent_id()),
+                    REVOCATION_TOPIC,
+                ),
+                (
+                    revocation::RevokedSubject::AgentMachineBinding(
+                        revocation::AgentMachineBinding {
+                            agent: agent.agent_id(),
+                            machine: agent.machine_id(),
+                            move_epoch: 1,
+                        },
+                    ),
+                    REVOCATION_V2_TOPIC,
+                ),
+                (
+                    revocation::RevokedSubject::ShareGrant(revocation::ShareGrantRevocation {
+                        grant_id: [0x33; 32],
+                        owner: owner.user_id(),
+                        grant_expiry: u64::MAX,
+                    }),
+                    REVOCATION_V3_TOPIC,
+                ),
+            ];
+            for (subject, topic) in subjects {
+                let _subscription = pubsub.subscribe(topic.to_string()).await;
+                let before = pubsub.stats().publish_total;
+                let record = revocation::RevocationRecord::sign(
+                    subject,
+                    owner.public_key(),
+                    owner.secret_key(),
+                    Agent::unix_timestamp_secs(),
+                    None,
+                )
+                .unwrap();
+                let hash = record.record_hash();
+                let err = agent
+                    .apply_and_publish_revocation(record, Some(cert))
+                    .await
+                    .unwrap_err();
+                assert!(storage::revocation_persistence_is_blocked(&err));
+                assert!(agent.revocation_set.read().await.contains_hash(&hash));
+                assert_eq!(
+                    pubsub.stats().publish_total,
+                    before + 1,
+                    "blocked revoke must still publish"
+                );
+            }
+            assert!(agent
+                .contact_store
+                .read()
+                .await
+                .is_blocked(&agent.agent_id()));
+            for name in [
+                "revocations.bin",
+                "revocations-v2.bin",
+                SHARE_GRANT_REVOCATIONS_FILE,
+            ] {
+                assert_eq!(
+                    tokio::fs::read(dir.path().join(name)).await.unwrap(),
+                    b"unreadable"
+                );
+            }
+            agent.shutdown().await;
+        }
+
         /// #1116 / ADR 0085 rule 4: the real startup load and move-state
         /// writer must preserve an unreadable v2 binding-tombstone file.
         #[tokio::test]
@@ -21912,7 +22027,11 @@ mod tests {
 
             // A future refusal to persist is allowed; losing the original
             // bytes or the in-memory tombstone is not.
-            let _persist_result = agent.persist_move_state().await;
+            let refused = agent
+                .persist_move_state()
+                .await
+                .expect_err("v2 write refused");
+            assert!(storage::revocation_persistence_is_blocked(&refused));
             assert!(agent
                 .revocation_set
                 .read()
@@ -21923,6 +22042,20 @@ mod tests {
                 garbage,
                 "persist must leave unreadable revocations-v2.bin byte-identical"
             );
+            tokio::fs::write(
+                &path,
+                revocation::RevocationSet::new().to_bytes_v2().unwrap(),
+            )
+            .await
+            .expect("operator repair");
+            agent
+                .persist_move_state()
+                .await
+                .expect("repair unblocks v2");
+            let restored =
+                revocation::RevocationSet::from_bytes_v2(&tokio::fs::read(&path).await.unwrap())
+                    .unwrap();
+            assert!(restored.is_binding_revoked(&agent.agent_id(), &agent.machine_id()));
         }
 
         /// #1116 / ADR 0085 rule 4: startup ignores an unreadable v3 file,
@@ -21976,6 +22109,24 @@ mod tests {
                 garbage,
                 "persist must leave unreadable revocations-v3.bin byte-identical"
             );
+            let refused =
+                persist_share_grant_revocations_durable(&agent.revocation_set, Some(dir.path()))
+                    .await
+                    .expect_err("v3 write refused");
+            assert!(storage::revocation_persistence_is_blocked(&refused));
+            tokio::fs::write(
+                &path,
+                revocation::RevocationSet::new().to_bytes_v3().unwrap(),
+            )
+            .await
+            .expect("operator repair");
+            persist_share_grant_revocations_durable(&agent.revocation_set, Some(dir.path()))
+                .await
+                .expect("repair unblocks v3");
+            let restored =
+                revocation::RevocationSet::from_bytes_v3(&tokio::fs::read(&path).await.unwrap())
+                    .unwrap();
+            assert!(restored.is_share_grant_revoked(&grant_id, &owner.user_id()));
         }
     }
 
