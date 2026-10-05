@@ -22,7 +22,10 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+mod case_1143;
 mod control;
+mod home;
+mod receipt;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -116,6 +119,64 @@ pub(crate) struct SimNode {
     agent_hex: String,
 }
 
+/// Identity material written into a node's identity directory before its
+/// daemon starts (a fixture preparing signed capabilities, ADR 0108
+/// Validation; never discovered certificate bytes).
+/// Each field is the on-disk encoding (`crate::storage::serialize_*`, or
+/// `AgentCertificate::to_storage_bytes()` — e.g. `POST /owner/agents/issue`
+/// `certificate.storage_b64`).
+#[derive(Default)]
+pub(crate) struct Provision {
+    pub(crate) machine_key: Option<Vec<u8>>,
+    pub(crate) agent_key: Option<Vec<u8>>,
+    pub(crate) user_key: Option<Vec<u8>>,
+    pub(crate) agent_cert: Option<Vec<u8>>,
+}
+
+/// One WARN-or-worse log event from any in-process daemon, with the
+/// virtual time it was emitted at.
+#[derive(Clone, Debug)]
+pub(crate) struct CapturedLog {
+    pub(crate) at: Duration,
+    pub(crate) text: String,
+}
+
+struct LogCapture {
+    fabric: Arc<SimFabric>,
+    logs: Arc<Mutex<Vec<CapturedLog>>>,
+}
+
+struct LogText<'a>(&'a mut String);
+
+impl tracing::field::Visit for LogText<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write as _;
+        let _ = write!(self.0, "{}={:?} ", field.name(), value);
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogCapture {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut text = format!(
+            "{} {}: ",
+            event.metadata().level(),
+            event.metadata().target()
+        );
+        event.record(&mut LogText(&mut text));
+        self.logs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(CapturedLog {
+                at: self.fabric.now(),
+                text,
+            });
+    }
+}
+
 /// A running scenario.
 pub(crate) struct Sim {
     case: String,
@@ -125,7 +186,10 @@ pub(crate) struct Sim {
     nodes: BTreeMap<String, SimNode>,
     gate: Mutex<Option<ClockGate>>,
     shim: Option<Shim>,
+    logs: Arc<Mutex<Vec<CapturedLog>>>,
     root: tempfile::TempDir,
+    // Last: the capture stays installed until every daemon has stopped.
+    _log_guard: tracing::subscriber::DefaultGuard,
 }
 
 fn sim_addr(index: usize) -> Result<SocketAddr> {
@@ -154,6 +218,17 @@ impl Sim {
     /// Start one daemon per label, in order, on a fresh fabric seeded by
     /// `seed`. Node 0 is every other node's bootstrap peer.
     pub(crate) async fn start(case: &str, seed: u64, labels: &[&str]) -> Result<Self> {
+        let mut sim = Self::empty(case, seed)?;
+        for label in labels {
+            sim.start_node_with(label, Provision::default()).await?;
+        }
+        Ok(sim)
+    }
+
+    /// A fabric, clock gate and WARN-log capture with no daemons yet.
+    pub(crate) fn empty(case: &str, seed: u64) -> Result<Self> {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::Layer as _;
         let fabric = SimFabric::new(seed);
         let plane = format!("w3h-{seed:x}");
         sim::register(&plane, &fabric);
@@ -161,7 +236,19 @@ impl Sim {
         if let Some(shim) = shim {
             shim.set_wall(Duration::ZERO);
         }
-        let mut sim = Self {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        // Thread-local: the scenario runs on one current-thread runtime, so
+        // every daemon task emits on this thread.
+        let log_guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(
+                LogCapture {
+                    fabric: Arc::clone(&fabric),
+                    logs: Arc::clone(&logs),
+                }
+                .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+            ),
+        );
+        let sim = Self {
             case: case.to_string(),
             seed,
             plane,
@@ -169,7 +256,9 @@ impl Sim {
             nodes: BTreeMap::new(),
             gate: Mutex::new(Some(ClockGate::close())),
             shim,
+            logs,
             root: tempfile::tempdir()?,
+            _log_guard: log_guard,
         };
         sim.fabric.mark(format!(
             "case {case} entropy={}",
@@ -179,10 +268,18 @@ impl Sim {
                 "uncontrolled"
             }
         ));
-        for (index, label) in labels.iter().enumerate() {
-            sim.start_node(label, index).await?;
-        }
         Ok(sim)
+    }
+
+    /// WARN-or-worse logs captured so far whose text contains every needle.
+    pub(crate) fn logs_containing(&self, needles: &[&str]) -> Vec<CapturedLog> {
+        self.logs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|log| needles.iter().all(|needle| log.text.contains(needle)))
+            .cloned()
+            .collect()
     }
 
     fn daemon_config(&self, label: &str, index: usize) -> Result<DaemonConfig> {
@@ -206,8 +303,30 @@ impl Sim {
         Ok(config)
     }
 
-    async fn start_node(&mut self, label: &str, index: usize) -> Result<()> {
+    /// Write `provision` into the node's identity directory, then start its
+    /// daemon. The first node started is every later node's bootstrap peer.
+    pub(crate) async fn start_node_with(
+        &mut self,
+        label: &str,
+        provision: Provision,
+    ) -> Result<()> {
+        let index = self.nodes.len();
         let config = self.daemon_config(label, index)?;
+        let identity = config
+            .identity_dir
+            .clone()
+            .context("sim nodes always have an identity dir")?;
+        tokio::fs::create_dir_all(&identity).await?;
+        for (file, bytes) in [
+            ("machine.key", provision.machine_key),
+            ("agent.key", provision.agent_key),
+            ("user.key", provision.user_key),
+            ("agent.cert", provision.agent_cert),
+        ] {
+            if let Some(bytes) = bytes {
+                crate::storage::write_private_bytes(&identity.join(file), bytes).await?;
+            }
+        }
         let options = ServeOptions {
             skip_update_check: true,
             cli_no_port_mapping: true,
@@ -243,6 +362,11 @@ impl Sim {
         };
         self.nodes.insert(label.to_string(), node);
         Ok(())
+    }
+
+    /// The node's transport peer id.
+    pub(crate) fn peer(&self, label: &str) -> Result<ant_quic::PeerId> {
+        Ok(self.node(label)?.peer)
     }
 
     fn node(&self, label: &str) -> Result<&SimNode> {

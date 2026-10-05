@@ -47,6 +47,32 @@ class TraceCheckTest(unittest.TestCase):
             self.assertEqual(CHECK.check(d, 1, ['w3h_missing']),
                              ['w3h_missing: no trace written'])
 
+    def receipt(self, d, pid, verdict, stages=('setup_done', 'evidence', 'request_delivered',
+                                               'cause', 'final')):
+        import json
+        body = {'schema': 'w3h.receipt/1', 'case': 'w3h_red', 'verdict': verdict,
+                'stages': [{'stage': stage} for stage in stages]}
+        self.write(d, f'w3h_red-{pid}.receipt.json', json.dumps(body))
+
+    def test_expected_red_receipts_pass(self):
+        with tempfile.TemporaryDirectory() as d:
+            for pid in range(2):
+                self.receipt(d, pid, 'RED')
+            self.assertEqual(CHECK.check_receipts(d, 2, ['w3h_red=RED']), [])
+
+    def test_infra_receipt_is_not_red(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.receipt(d, 1, 'RED')
+            self.receipt(d, 2, 'INFRA')
+            problems = CHECK.check_receipts(d, 2, ['w3h_red=RED'])
+            self.assertTrue(any('verdict INFRA' in p for p in problems), problems)
+
+    def test_red_receipt_missing_cause_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.receipt(d, 1, 'RED', stages=('setup_done', 'evidence', 'request_delivered', 'final'))
+            problems = CHECK.check_receipts(d, 1, ['w3h_red=RED'])
+            self.assertTrue(any("lacks stages ['cause']" in p for p in problems), problems)
+
 
 if __name__ == '__main__':
     unittest.main()

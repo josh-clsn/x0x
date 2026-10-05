@@ -441,6 +441,10 @@ jobs:
           python3 scripts/ci/w3h-trace-check.py target/w3h/traces --runs 20
           --require w3h_s1_control_group_invite_join_over_public_api
           --require w3h_s1_negative_control_offline_joiner_is_not_admitted
+          --require w3h_1143_red_baseline_reproduces_owner_cert_member_pending
+          --require w3h_1143_positive_control_consented_owner_announce_admits
+          --expect w3h_1143_red_baseline_reproduces_owner_cert_member_pending=RED
+          --expect w3h_1143_positive_control_consented_owner_announce_admits=GREEN
 
       - name: Upload W3-H traces
         if: always()

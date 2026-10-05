@@ -10,8 +10,15 @@ for every case:
 - the trace recorded `entropy=controlled` (the preload shim was active).
 
 `--require CASE` names cases that must be present. On a mismatch it prints
-the first divergent line of the canonical trace. Exit 1 on any failure.
+the first divergent line of the canonical trace.
+
+`--expect CASE=VERDICT` (RED, GREEN or INFRA) checks the red-baseline
+receipts (`<case>-<pid>.receipt.json`, schema `w3h.receipt/1`): exactly
+`--runs` receipts, every one with that verdict. A RED receipt must carry
+every stage (setup_done, evidence, request_delivered, cause, final). Exit 1
+on any failure.
 """
+import json
 import argparse
 import difflib
 import hashlib
@@ -72,13 +79,50 @@ def check(directory, runs, required):
     return problems
 
 
+RED_STAGES = ('setup_done', 'evidence', 'request_delivered', 'cause', 'final')
+
+
+def check_receipts(directory, runs, expectations):
+    problems = []
+    receipts = defaultdict(list)
+    for path in sorted(Path(directory).glob('*.receipt.json')):
+        case, _, _pid = path.name[:-len('.receipt.json')].rpartition('-')
+        try:
+            receipts[case].append(json.loads(path.read_text()))
+        except json.JSONDecodeError as error:
+            problems.append(f'{path.name}: unreadable receipt ({error})')
+    for expectation in expectations:
+        case, _, verdict = expectation.partition('=')
+        found = receipts.get(case, [])
+        if len(found) != runs:
+            problems.append(f'{case}: {len(found)} receipts, expected {runs}')
+        for receipt in found:
+            if receipt.get('schema') != 'w3h.receipt/1':
+                problems.append(f'{case}: unknown receipt schema {receipt.get("schema")!r}')
+                break
+            if receipt.get('verdict') != verdict:
+                problems.append(f'{case}: verdict {receipt.get("verdict")}, expected {verdict}')
+                break
+            stages = {stage.get('stage') for stage in receipt.get('stages', [])}
+            if verdict == 'RED' and not set(RED_STAGES) <= stages:
+                problems.append(f'{case}: RED receipt lacks stages {sorted(set(RED_STAGES) - stages)}')
+                break
+        else:
+            if found and len(found) == runs:
+                print(f'{case}: {len(found)} receipts, all {verdict}')
+    return problems
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('directory')
     parser.add_argument('--runs', type=int, required=True)
     parser.add_argument('--require', action='append', default=[])
+    parser.add_argument('--expect', action='append', default=[],
+                        help='CASE=RED|GREEN|INFRA, checked against receipts')
     args = parser.parse_args(argv)
     problems = check(args.directory, args.runs, args.require)
+    problems += check_receipts(args.directory, args.runs, args.expect)
     for problem in problems:
         print(f'W3H-GATE FAIL {problem}', file=sys.stderr)
     return 1 if problems else 0

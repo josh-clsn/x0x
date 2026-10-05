@@ -39,7 +39,7 @@ test-w3h: w3h-shim
 test-w3h-gate: w3h-shim
     rm -rf target/w3h/traces
     python3 scripts/dev/test-isolated.py nextest --all-features --lib -- --profile w3h --stress-count 20
-    python3 scripts/ci/w3h-trace-check.py target/w3h/traces --runs 20 --require w3h_s1_control_group_invite_join_over_public_api --require w3h_s1_negative_control_offline_joiner_is_not_admitted
+    python3 scripts/ci/w3h-trace-check.py target/w3h/traces --runs 20 --require w3h_s1_control_group_invite_join_over_public_api --require w3h_s1_negative_control_offline_joiner_is_not_admitted --require w3h_1143_red_baseline_reproduces_owner_cert_member_pending --require w3h_1143_positive_control_consented_owner_announce_admits --expect w3h_1143_red_baseline_reproduces_owner_cert_member_pending=RED --expect w3h_1143_positive_control_consented_owner_announce_admits=GREEN
 
 # Full-coverage suite run. nextest is fail-fast by default: the first failure
 # cancels everything still queued, so a single flake can hide up to ~800

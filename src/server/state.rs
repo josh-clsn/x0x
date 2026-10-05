@@ -1112,10 +1112,11 @@ pub(super) struct AppState {
     /// #946 r2: requester-side per-digest suppression for group-scoped
     /// certificate fetches (in-flight dedup + 60 s negative cache).
     pub(super) cert_fetch_requested:
-        StdMutex<std::collections::HashMap<String, std::time::Instant>>,
+        StdMutex<std::collections::HashMap<String, tokio::time::Instant>>,
     /// #946: responder-side suppression deadline per (stable group id,
     /// digest) — the answer rate limit and the miss negative cache.
-    pub(super) cert_fetch_answered: StdMutex<std::collections::HashMap<String, std::time::Instant>>,
+    pub(super) cert_fetch_answered:
+        StdMutex<std::collections::HashMap<String, tokio::time::Instant>>,
     /// #946: the current certificate-unobtainable refusal window per
     /// (stable group id, joining member) — the typed refusal is staged only
     /// after CERT_EVIDENCE_DEADLINE_MS of continuous refusals.

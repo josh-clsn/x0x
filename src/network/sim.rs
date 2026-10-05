@@ -377,6 +377,35 @@ impl SimFabric {
         });
     }
 
+    /// Writes from `src` to `dst` made at or after `since` that were
+    /// delivered (any lane), as `(class, seq)`.
+    pub(crate) fn delivered_since(
+        &self,
+        src: &PeerId,
+        dst: &PeerId,
+        since: Duration,
+    ) -> Vec<(LaneClass, u64)> {
+        let state = self.lock();
+        let written: BTreeSet<(LaneKey, u64)> = state
+            .writes
+            .iter()
+            .filter(|write| write.lane.src == src.0 && write.lane.dst == dst.0 && write.at >= since)
+            .map(|write| (write.lane, write.seq))
+            .collect();
+        state
+            .trace
+            .iter()
+            .filter_map(|event| match event {
+                TraceEvent::Fate {
+                    lane,
+                    seq,
+                    fate: Fate::Delivered { .. },
+                } if written.contains(&(*lane, *seq)) => Some((lane.class, *seq)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Every write so far, in the order the fabric accepted them.
     pub(crate) fn writes(&self) -> Vec<Write> {
         self.lock().writes.clone()
