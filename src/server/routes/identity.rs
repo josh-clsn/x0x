@@ -2663,8 +2663,26 @@ pub(in crate::server::routes) mod revocation_persistence_tests {
             let dir = tempfile::tempdir().unwrap();
             let state = state_at(dir.path()).await;
             assert_eq!(state.agent.move_mint_placements().await.unwrap(), 1);
+            let agent_id = state.agent.agent_id();
+            let machine_id = state.agent.machine_id();
+            let revocations = state.agent.revocation_set();
+            let moves = state.agent.move_state();
             let path = dir.path().join(blocked);
             tokio::fs::write(&path, b"unreadable").await.unwrap();
+            {
+                let revoked = revocations.read().await;
+                let placements = moves.read().await;
+                assert_eq!(
+                    x0x::key_move::enforce_pairing(
+                        &revoked,
+                        placements.placement_view(),
+                        &agent_id,
+                        &machine_id,
+                    ),
+                    None,
+                    "binding must be allowed before revoke with {blocked} blocked"
+                );
+            }
             let response = identity_revoke(
                 State(Arc::clone(&state)),
                 axum::extract::Extension(ActorContext::Owner { durable: true }),
@@ -2696,12 +2714,26 @@ pub(in crate::server::routes) mod revocation_persistence_tests {
                     .unwrap()
                     .contains("applied and published; not durable"));
             }
-            assert!(state.agent.revocation_records().await.iter().any(|record| {
-                matches!(
-                    record.subject,
-                    x0x::revocation::RevokedSubject::AgentMachineBinding(_)
-                )
-            }));
+            {
+                // revocation_records() is the legacy v1 snapshot and omits
+                // bindings. Check the live B/P gate used by delivery instead.
+                let revoked = revocations.read().await;
+                let placements = moves.read().await;
+                assert!(
+                    revoked.is_binding_revoked(&agent_id, &machine_id),
+                    "binding revoke must remain applied in memory with {blocked} blocked"
+                );
+                assert_eq!(
+                    x0x::key_move::enforce_pairing(
+                        &revoked,
+                        placements.placement_view(),
+                        &agent_id,
+                        &machine_id,
+                    ),
+                    Some(x0x::key_move::PairingDenial::BindingRevoked),
+                    "delivery must deny the binding with {blocked} blocked"
+                );
+            }
             assert_eq!(tokio::fs::read(path).await.unwrap(), b"unreadable");
             state.agent.shutdown().await;
         }
