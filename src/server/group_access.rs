@@ -710,9 +710,6 @@ pub(in crate::server) fn acting_principal_hex(
 /// gate, ban state, write policy and the ADR-0039 grant/delegation
 /// ladder keep their per-route order in the handler, under its own
 /// lock.
-// Dead until the S2 handler-migration commit wires the wrappers below;
-// that commit removes this allow.
-#[allow(dead_code)]
 fn secure_write_access(
     info: &x0x::groups::GroupInfo,
     actor: &ActorContext,
@@ -747,9 +744,6 @@ fn secure_write_access(
 /// `reject_fork_quarantined_for_actor`, the unit tests pin its position
 /// in the order with a stub, and the end-to-end #877 contract is pinned
 /// by `routes/named_groups/tests/issue877_error_body_session.rs`.
-// Dead until the S2 handler-migration commit wires the wrapper below;
-// that commit removes this allow.
-#[allow(dead_code)]
 fn send_admission<'a>(
     groups: &'a HashMap<String, x0x::groups::GroupInfo>,
     route_id: &str,
@@ -779,9 +773,6 @@ fn send_admission<'a>(
 /// The member gate (its three per-route shapes), the rider ladder and
 /// the crypto follow in the handler under the same lock; the ADR-0066
 /// epoch capture keeps its position immediately after this admission.
-// Dead until the S2 handler-migration commit wires the wrapper below;
-// that commit removes this allow.
-#[allow(dead_code)]
 fn secure_endpoint_admission<'a>(
     groups: &'a HashMap<String, x0x::groups::GroupInfo>,
     route_id: &str,
@@ -813,9 +804,6 @@ fn secure_endpoint_admission<'a>(
 /// fork-quarantine gate. `route_id` is the RAW route `:id` — the same
 /// key the inline gate used for the marker body and the diagnostics
 /// bump.
-// Dead until the S2 handler-migration commit wires the send handler;
-// that commit removes this allow.
-#[allow(dead_code)]
 pub(in crate::server) fn admit_group_send<'a>(
     state: &AppState,
     route_id: &str,
@@ -832,9 +820,6 @@ pub(in crate::server) fn admit_group_send<'a>(
 /// (each holds the named-groups read lock): runs
 /// [`secure_endpoint_admission`] with the canonical fork-quarantine
 /// gate. `route_id` is the RAW route `:id`, as above.
-// Dead until the S2 handler-migration commit wires the three secure
-// handlers; that commit removes this allow.
-#[allow(dead_code)]
 pub(in crate::server) fn admit_secure_endpoint<'a>(
     state: &AppState,
     route_id: &str,
@@ -853,9 +838,6 @@ pub(in crate::server) fn admit_secure_endpoint<'a>(
 /// membership gate, and an unknown group fails OPEN to the crypto (the
 /// envelope itself refuses). Body of the conflict comes from the
 /// canonical `open_envelope_withdrawn_group_conflict`.
-// Dead until the S2 handler-migration commit wires the handler; that
-// commit removes this allow.
-#[allow(dead_code)]
 pub(in crate::server) fn admit_open_envelope(
     groups: &HashMap<String, x0x::groups::GroupInfo>,
     group_id: &str,
@@ -881,9 +863,6 @@ pub(in crate::server) fn admit_open_envelope(
 pub(in crate::server) struct GroupAccess {
     level: AccessLevel,
     stable_id: String,
-    // Dead until the S2 handler-migration commit wires the send
-    // handler's ban/policy gates to it; that commit removes this allow.
-    #[allow(dead_code)]
     acting_hex: String,
 }
 
@@ -908,9 +887,6 @@ impl GroupAccess {
     /// The ACTING PRINCIPAL's hex (S2): the local daemon's agent for
     /// owner bearers and actor-less local-seat surfaces, the sub-agent
     /// for riders — the subject of the handler-side ban/policy gates.
-    // Dead until the S2 handler-migration commit wires the send
-    // handler; that commit removes this allow.
-    #[allow(dead_code)]
     pub(in crate::server) fn acting_hex(&self) -> &str {
         &self.acting_hex
     }
