@@ -77,6 +77,8 @@ pub(crate) struct Receipt {
     seed: String,
     stages: Vec<Stage>,
     verdict: Option<Verdict>,
+    /// Fidelity caveats that apply to this run (never affect the verdict).
+    notes: Vec<String>,
 }
 
 impl Receipt {
@@ -87,7 +89,13 @@ impl Receipt {
             seed: format!("{seed:#x}"),
             stages: Vec::new(),
             verdict: None,
+            notes: Vec::new(),
         }
+    }
+
+    /// Record a fidelity caveat for whoever reads this receipt.
+    pub(crate) fn note(&mut self, text: impl Into<String>) {
+        self.notes.push(text.into());
     }
 
     pub(crate) fn setup_done(&mut self, at_us: u128) {

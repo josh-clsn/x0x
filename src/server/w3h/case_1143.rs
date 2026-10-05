@@ -195,6 +195,10 @@ async fn scenario(sim: &mut Sim, kind: OwnerAnnounce, receipt: &mut Receipt) -> 
 /// the final assertion is recorded as INFRA.
 async fn run(case: &str, kind: OwnerAnnounce) -> Receipt {
     let mut receipt = Receipt::new(case, SEED);
+    receipt.note(
+        "sim has no EvidenceV1 hello yet (no QUIC byte streams until W3-H S4); \
+         owner sync is carried by the harness over an in-memory duplex",
+    );
     match Sim::empty(case, SEED) {
         Ok(mut sim) => {
             if let Err(error) = scenario(&mut sim, kind, &mut receipt).await {
