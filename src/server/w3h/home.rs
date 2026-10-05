@@ -13,10 +13,17 @@
 //!   roster and the joiner's own `membership_state`;
 //! - promotion is `PATCH /groups/:id/members/:agent/role {role: admin}`.
 //!
-//! The one deliberate difference from the live fixture: a device's keys and
-//! certificate are written before its first start instead of through a
-//! stop/restart, so S2 needs no restart support. Nothing here injects
-//! discovered certificate bytes (ADR 0108 Validation).
+//! Two deliberate differences from the live fixture:
+//! - a device's keys and certificate are written before its first start
+//!   instead of through a stop/restart, so S2 needs no restart support;
+//! - owner sync (Tier-1, `SyncV1`) runs over QUIC byte streams, which the
+//!   simulator only gains in slice S4. Until then the harness carries one
+//!   session per new device over an in-memory duplex
+//!   ([`Sim::owner_sync_session`]), running the daemons' own admission and
+//!   session code on both ends; only the transport differs, and the trace
+//!   marks it. S4 removes this and lets the daemons dial for themselves.
+//!
+//! Nothing here injects discovered certificate bytes (ADR 0108 Validation).
 
 #![cfg(test)]
 
@@ -216,17 +223,22 @@ impl Sim {
         .await?;
         self.ok_api(label, Method::POST, "/sync/devices/enroll", json!({}))
             .await?;
+        // Enrolling wakes owner sync at once in the product; here the
+        // harness carries that first session (see the module docs).
+        self.owner_sync_session(label, owner_label).await?;
         let gid = home.gid.clone();
+        let mut last = Value::Null;
         self.until(
             &format!("{label} yields to the canonical Home"),
             SETUP_BUDGET,
             async |s: &Sim| {
-                home_state(s, label).await.is_some_and(|body| {
-                    body["state"] == "elsewhere" && body["canonical_group_id"] == gid.as_str()
-                })
+                last = home_state(s, label).await.unwrap_or(Value::Null);
+                last["state"] == "elsewhere" && last["canonical_group_id"] == gid.as_str()
             },
         )
-        .await?;
+        .await
+        // The receipt names what the device actually reported.
+        .with_context(|| format!("{label} last GET /home: {last}"))?;
         self.ok_api(
             label,
             Method::POST,
@@ -234,6 +246,57 @@ impl Sim {
             json!({"include_user_identity": true, "human_consent": true}),
         )
         .await?;
+        Ok(())
+    }
+
+    /// One Tier-1 owner-sync session, `dialer` → `acceptor`, over an
+    /// in-memory duplex instead of a `SyncV1` QUIC stream (none until S4).
+    /// Both ends run the daemons' own code: the dialer's enrollment check
+    /// and session, the acceptor's admission check and session, and both
+    /// session-status updates. Runs inside a named barrier.
+    pub(crate) async fn owner_sync_session(&self, dialer: &str, acceptor: &str) -> Result<()> {
+        let dialer_state = self.state(dialer)?;
+        let acceptor_state = self.state(acceptor)?;
+        let dialer_sync = dialer_state
+            .owner_sync
+            .clone()
+            .with_context(|| format!("{dialer} has no owner-sync service"))?;
+        let acceptor_sync = acceptor_state
+            .owner_sync
+            .clone()
+            .with_context(|| format!("{acceptor} has no owner-sync service"))?;
+        let dialer_machine = dialer_state.agent.machine_id();
+        let acceptor_machine = acceptor_state.agent.machine_id();
+        let (dialer_io, acceptor_io) = tokio::io::duplex(1024 * 1024);
+        let (mut dialer_recv, mut dialer_send) = tokio::io::split(dialer_io);
+        let (mut acceptor_recv, mut acceptor_send) = tokio::io::split(acceptor_io);
+        self.fabric().mark(format!(
+            "owner-sync session {dialer}->{acceptor} over harness duplex (no SyncV1 streams until S4)"
+        ));
+        let (dialed, accepted) = self
+            .within(
+                &format!("owner-sync {dialer}->{acceptor}"),
+                secs(60),
+                async {
+                    tokio::join!(
+                        dialer_sync.dial_session_for_testing(
+                            &mut dialer_send,
+                            &mut dialer_recv,
+                            &acceptor_machine,
+                        ),
+                        acceptor_sync.accept_session_for_testing(
+                            &mut acceptor_send,
+                            &mut acceptor_recv,
+                            &dialer_machine,
+                        ),
+                    )
+                },
+            )
+            .await?;
+        ensure!(accepted, "{acceptor} refused {dialer}'s owner-sync session");
+        dialed.map_err(|(class, error)| {
+            anyhow!("owner-sync {dialer}->{acceptor}: {class}: {error}")
+        })?;
         Ok(())
     }
 

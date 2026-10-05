@@ -114,6 +114,32 @@ async fn open_store(sim: &Sim, label: &str, group: &str) -> Result<String> {
     Ok(store["id"].as_str().context("store id")?.to_string())
 }
 
+/// `membership_state` of `group` as `label` reports it.
+async fn local_membership(sim: &Sim, label: &str, group: &str) -> Option<String> {
+    let (status, body) = sim
+        .request(label, Method::GET, &format!("/groups/{group}"), None)
+        .await
+        .ok()?;
+    if !status.is_success() {
+        return None;
+    }
+    body["membership_state"].as_str().map(str::to_string)
+}
+
+/// `POST /groups/:id/stores` without a barrier (for use inside one).
+async fn try_open_store(sim: &Sim, label: &str, group: &str) -> Result<String> {
+    let (status, store) = sim
+        .request(
+            label,
+            Method::POST,
+            &format!("/groups/{group}/stores"),
+            Some(json!({"name": "wiki"})),
+        )
+        .await?;
+    ensure!(status.is_success(), "{label} open store: {status} {store}");
+    Ok(store["id"].as_str().context("store id")?.to_string())
+}
+
 async fn read_value(sim: &Sim, label: &str, store: &str, key: &str) -> Option<String> {
     let (status, body) = sim
         .request(label, Method::GET, &format!("/stores/{store}/{key}"), None)
@@ -182,11 +208,42 @@ async fn w3h_s1_control_group_invite_join_over_public_api() -> Result<()> {
     sim.fabric().mark("checkpoint: membership converged on A");
 
     // Data-plane delivery: one write on A reaches B and C through the
-    // group store (the same store id on every member).
+    // group store (the same store id on every member). Each joiner must
+    // first be seated locally (`membership_state == active`, the live
+    // fixture's local readiness) and able to open the store, which needs
+    // the group key; both are awaited inside named barriers.
+    for member in ["B", "C"] {
+        sim.until(
+            &format!("{member} reports active membership"),
+            secs(120),
+            async |s: &Sim| local_membership(s, member, &group).await.as_deref() == Some("active"),
+        )
+        .await?;
+    }
     let store = open_store(&sim, "A", &group).await?;
     for member in ["B", "C"] {
-        let theirs = open_store(&sim, member, &group).await?;
-        ensure!(theirs == store, "{member} opened a different store id");
+        let mut opened = None;
+        let mut last = String::new();
+        sim.until(
+            &format!("{member} opens the group store"),
+            secs(60),
+            async |s: &Sim| match try_open_store(s, member, &group).await {
+                Ok(id) => {
+                    opened = Some(id);
+                    true
+                }
+                Err(error) => {
+                    last = format!("{error:#}");
+                    false
+                }
+            },
+        )
+        .await
+        .with_context(|| format!("{member} last store-open error: {last}"))?;
+        ensure!(
+            opened.as_deref() == Some(store.as_str()),
+            "{member} opened a different store id: {opened:?}"
+        );
     }
     let (status, put) = sim
         .api(
