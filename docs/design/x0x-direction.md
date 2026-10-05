@@ -1,7 +1,7 @@
 # x0x design direction and rulings digest
 
 - **Status:** maintained digest, not an ADR. It records the design rulings
-  David Irvine made from 2026-09-28 to 2026-10-04 (decisions D01–D143 and the
+  David Irvine made from 2026-09-28 to 2026-10-04 (decisions D01–D173 and the
   efficiency decisions E-D1–E-D17).
 - **Updated:** 2026-10-04.
 - **Relationship to ADRs:** ADRs remain the decision records, and only David
@@ -114,7 +114,7 @@ wave that fixes each is in section 7.
 | I12 | **Resource bounds.** A daemon never fills its host's disk, spends a user's uplink as infrastructure, or grows queues without bound, and every bound is visible. |
 | I13 | **Plane isolation.** A test or named daemon never joins production by accident. |
 
-## 5. Decisions D01–D143
+## 5. Decisions D01–D173
 
 Status key: **implemented** = in effect on `main` (code, configuration or an
 Accepted ADR); **ruled** = decided by David, work outstanding or ongoing;
@@ -270,6 +270,35 @@ and D29 (an ADR 0089 slice pulled into v0.46).
 | D141 | ADR 0080, cap on a recorded deliver_to list: **64 agents**. The shared-agent cap. A longer list is still delivered but not recorded (`not_recorded`, cause `over_cap`). It bounds the file at about 2 MiB. | Ruled (2026-10-04); ADR 0080 Proposed |
 | D142 | ADR 0080, gossiped records during a store hold: **Same rule**. Recorded as a requirement on ADR 0098: a gossiped record also acts in memory during a hold. | Ruled (2026-10-04); ADR 0080 Proposed |
 | D143 | ADR 0080, recent outcomes kept for the grants diagnostics: **Keep the last 1,024 outcomes**. In memory, oldest first out. | Ruled (2026-10-04); ADR 0080 Proposed |
+| D145 | ADR 0088 slices, replies to a joiner that is not yet a member: **Named amendment to 0107**. Same rule, written as an amendment owned by 0108 §8 and reused by 0112. | Ruled (2026-10-04); ADR 0088 slices Proposed |
+| D146 | ADR 0088 slices, exceptions to Accepted authority rules: **Approve all four**. Each follows a design you chose (D126, D129, D87, D130). | Ruled (2026-10-04); ADR 0088 slices Proposed |
+| D147 | ADR 0088 slices, local-only state lost to a corrupt file: **Accept them**. Each loss ends in a typed state with a stated next step; nothing is silently trusted. | Ruled (2026-10-04); ADR 0088 slices Proposed |
+| D148 | ADR 0088 slices, keeping quarantined copies: **Keep until the operator or group deletion**. Never deleted automatically, except that a group's copies go when that group's own files are deleted. Diagnostics list each copy with its size. | Ruled (2026-10-04); ADR 0088 slices Proposed |
+| D149 | ADR 0108, review the JoinPendingNotice design: **Approve**. S2's Accept still waits on the other S2 items. | Ruled (2026-10-04); ADR 0108 Proposed |
+| D150 | ADR 0108, withdraw retry interval: **Once per 30 s slot**. Once per D66 30 s slot per (Home, holder), about 126 bytes each; it stops when nothing is missing. | Ruled (2026-10-04); ADR 0108 Proposed |
+| D151 | ADR 0110, review the rebinding and owner-recovery designs: **Approve**. S4's Accept still waits on the other items here and the harness numbers. | Ruled (2026-10-04); ADR 0110 Proposed |
+| D152 | ADR 0110, an owner who never acts: **Named §2 entry**. "OwnerCertified group waiting for its owner", typed `waiting_for_eligible_admin_revocation` or `waiting_for_admin_certificate_renewal`, exit: the owner signs or renews. | Ruled (2026-10-04); ADR 0110 Proposed |
+| D153 | ADR 0110, legacy members across the new exit commits: **Extend it**. Same hold-and-strand rule, written into §6's named entry. | Ruled (2026-10-04); ADR 0110 Proposed |
+| D154 | ADR 0110, joiner notice when no eligible admin exists: **Any Active member signs one cause**. Any Active member may serve the notice with the single cause `no_eligible_admin`. It grants nothing. 0108's signer rule changes to match. | Ruled (2026-10-04); ADR 0110 Proposed |
+| D155 | ADR 0110, self-rebind cutoff: **Cutoff, then hand to the admin**. Before `not_after − τ` the agent self-rebinds; after it, the agent hands the renewal to the designated admin, who commits it. | Ruled (2026-10-04); ADR 0110 Proposed |
+| D156 | ADR 0109, owner-axis re-seat needs the owner's key: **Promoted-admin re-seat mandate**. A `ReseatMandateV1` modelled on D87's repair mandate. | Ruled (2026-10-04); ADR 0109 Proposed |
+| D157 | ADR 0111, what the promotion chain shows the joiner: **Accept it**. The joiner is already seated when it receives the chain, and would see the roster anyway. | Ruled (2026-10-04); ADR 0111 Proposed |
+| D158 | ADR 0111, rebuild attempts per file: **Once per file per run**. A failed rebuild waits for the next daemon start. | Ruled (2026-10-04); ADR 0111 Proposed |
+| D159 | ADR 0112, review the replay design: **Approve**. Includes the new acceptance rule (retiring a valid sibling). | Ruled (2026-10-04); ADR 0112 Proposed |
+| D160 | ADR 0112, forks that replay cannot settle: **Demotion precedence plus a §2 entry**. When one branch first demotes or removes an admin and every rival commit is by that admin, the demoting branch survives. Anything else becomes the named §2 entry `owner_fork_unanchored`, exit: an owner-anchored advance. | Ruled (2026-10-04); ADR 0112 Proposed |
+| D161 | ADR 0112, a joiner that sent two requests: **Keeps the seat**. The evidence is shown to admins, who may remove it the normal way. | Ruled (2026-10-04); ADR 0112 Proposed |
+| D162 | ADR 0112, s6 values not yet ruled: **Accept**. Prune margin 10 min after expiry; 256 bytes per consumption entry; a terminal's validation time no earlier than its predecessor's minus 5 min; replay on the 5-minute maintenance pass; members keep fork-point tree state, and joiners their init keys, for 30 days (the maximum invite lifetime). | Ruled (2026-10-04); ADR 0112 Proposed |
+| D163 | ADR 0112, replay over the tombstone cap: **Bounded overflow**. The replay lands and may exceed the caps by the retired branches' entries; new V5 mints and redemptions refuse with `invite_capacity_exhausted` until prunes bring it under. | Ruled (2026-10-04); ADR 0112 Proposed |
+| D164 | ADR 0112, which redemption wins when two retired branches used one invite: **Branch hash, then entry order**. Order retired branches by terminal hash, lowest first, then entries within each branch; the first redemption keeps the seat, and the other consumes nothing more. | Ruled (2026-10-04); ADR 0112 Proposed |
+| D165 | ADR 0112, two admins add different late admissions at once: **Narrow exception**. A replay-fork marker that depends only on the original fork's evidence may be settled by one combined replay that covers both sets. Unrelated containment stays. The combined evidence is recorded durably. | Ruled (2026-10-04); ADR 0112 Proposed |
+| D166 | ADR 0114, adoption exception, vouchers and residuals: **As proposed**. Allow the exception for §7 only, two vouchers or the owner mandate, and add both residuals to the S8(b) manual-exit entry. | Ruled (2026-10-04); ADR 0114 Proposed |
+| D167 | ADR 0114, proof that a member kept its group keys: **Retention token**. At each confirmation the member derives a token from its epoch exporter secret; its receipt records the token's hash. The member keeps the token wrapped under its current epoch key and reveals it once to prove retention. Losing the snapshot loses the token. | Ruled (2026-10-04); ADR 0114 Proposed |
+| D168 | ADR 0114, ciphertext from skipped epochs: **Named §2 entry**. "Skipped-epoch ciphertext", typed `history_gap {from_epoch, to_epoch}`, no exit; current store state still arrives through S5. | Ruled (2026-10-04); ADR 0114 Proposed |
+| D169 | ADR 0080, lost deliver_to lists: **Empty replacement**. Lists are lost; those grants become `not_recorded`, cause `quarantined`. Revocation still works by gossip. | Ruled (2026-10-04); ADR 0080 Proposed |
+| D170 | ADR 0109, which removals a promoted admin may undo: **only its own removals**. A node removed by another admin needs that admin or an owner-key admin (a named L1 limit). | Ruled (2026-10-04); ADR 0109 Proposed |
+| D171 | ADR 0108, Withdraw retries: **a monotonic 30 s interval**, separate from D66 slots. David's note led to a Lamport recovery generation with no wall time. | Ruled (2026-10-04); ADR 0108 Proposed |
+| D172 | ADR 0108, D66 push slots: **wall time read once, then monotonic**, keeping the fractional slot phase. | Ruled (2026-10-04); ADR 0108 Proposed |
+| D173 | ADR 0108, future-dated slot anchor: **hold with a typed `anchor_future_dated` wait** on the shared signed `committed_at`; only rank 1 pushes once wall time passes it. | Ruled (2026-10-04); ADR 0108 Proposed |
 | COMMS | Use plain controlled language (about 80% toward ASD-STE100), fixed decision templates and one release contact; record and share each ruling, check live GitHub before requesting approval, keep the release dashboard current and include diagrams in briefs. Trial explainer videos after promotion. | Ruled; adopted 2026-10-02 |
 
 ## 6. Efficiency decisions E-D1–E-D17 (Track E)

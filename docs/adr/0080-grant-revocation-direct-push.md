@@ -3,9 +3,10 @@
 - **Status:** Proposed
 - **Date:** 2026-09-27 (first draft); revised 2026-10-04 under D63; rulings
   D108–D114 recorded 2026-10-04; round-2 rulings D120 and D139–D143
-  recorded 2026-10-04
+  recorded 2026-10-04; round-3 rulings D147, D148 and D169 recorded
+  2026-10-04
 - **Decision owners:** David Irvine (#994 Root decision, 2026-09-27; D23;
-  D63; D108–D114; D120; D139–D143)
+  D63; D108–D114; D120; D139–D143; D147; D148; D169)
 - **Author:** OMP (first draft); revised by Claude (Opus)
 - **Reviewers:** cross-model review required before acceptance; David Irvine (acceptance)
 - **Supersedes:** none
@@ -303,24 +304,28 @@ the push reaches those daemons too (D112).
   - A missing file with no pending copy, whether or not history copies
     exist, is a fresh start: an empty map, and every grant is
     `not_recorded`, cause `absent`.
-  - **The step 4 replacement** is set by open question 1. Under option
-    (a), it is an empty map whose `rebuilt_from` lists the transaction's
-    `txid`. Under option (b), it would be rebuilt from the other copy.
+  - **The step 4 replacement (D169)** is an empty map whose
+    `rebuilt_from` lists the transaction's `txid`. No second local copy
+    is kept.
 - **What no holder has (D120).** The list is issuer-only state. No
   grantee, host or `deliver_to` agent keeps a copy, and no protocol asks
   for one. So nothing can be rebuilt from holders, and this ADR claims no
-  such rebuild. Under option (a) of open question 1, each grant whose
-  entry was in the quarantined file becomes `not_recorded`, cause
+  such rebuild. David accepted this loss outcome (D147, D169): each grant
+  whose entry was in the quarantined file becomes `not_recorded`, cause
   `quarantined`, and its list is lost. Its `deliver_to` daemons get gossip
-  only at revoke. The grants themselves live in the `X0SG` store, so they
-  are unaffected.
-- **The amendment.** This ADR proposes to amend ADR 0085 rule 4 for
-  `share-grants.deliverto` only, as ADR 0108 §5a describes. D120 rules the
-  quarantine. What replaces the file is open question 1, so the amendment
-  is complete only once David rules on that. ADR 0085 rule 5 is not
-  amended. The lifecycle never deletes a quarantined copy; how long copies
-  are kept is open question 2. The amendment takes effect when this ADR
-  is Accepted.
+  only at revoke, so revocation still reaches them. The grants themselves
+  live in the `X0SG` store, so they are unaffected. Nothing is silently
+  trusted: the loss is a typed state, and the next step is gossip.
+- **The amendment.** This ADR amends ADR 0085 rule 4 for
+  `share-grants.deliverto` only, as ADR 0108 §5a describes, ruled by David
+  (D120 for the quarantine, D169 for the empty replacement). ADR 0085
+  rule 5 is not amended. The amendment takes effect when this ADR is
+  Accepted.
+- **Retention (D148).** Quarantined copies follow ADR 0108 §5a's
+  retention rule. The lifecycle never deletes them. This file belongs to
+  no group, so its copies stay until an operator removes them.
+  `GET /diagnostics/grants` lists each copy with its `txid`, hash and
+  size.
 - **Typed states.** Each issued grant has one `deliver_to_record` state.
   The `POST /grants` response, each `GET /grants` entry and the
   `DELETE /grants/:id` response report it with its `grant_id`.
@@ -339,9 +344,9 @@ the push reaches those daemons too (D112).
   | `held_in_memory`, cause `awaiting_host_commit` | ADR 0094 has not yet host-committed the running binary | ADR 0094's host commit | none of its own; ADR 0094's commit or rollback ends it | host commit, then a persist: `recorded`. A rollback or restart first: `not_recorded`, cause `absent` |
   | `held_in_memory`, cause `write_failed`, with the error | an ordinary sidecar persist failed | the next successful persist (the next issue or prune) | none | that persist: `recorded`. A restart first: `not_recorded`, cause `absent` |
   | `held_in_memory`, cause one of ADR 0108 §5a's sidecar states, with its fields | the sidecar is not usable, so it runs memory-only and no write runs | §5a's exit for that state; for `awaiting_host_commit`, the host commit | none | host commit: the quarantine runs, then a persist: `recorded`. Otherwise a restart: `not_recorded`, cause `absent` |
-  | `unavailable`, cause one of ADR 0108 §5a's sidecar states, with its fields | the grant was in the issued store at load; its list, if any, is in that file | §5a's exit for that state; for `awaiting_host_commit`, the host commit | none | a load that reads the file: `recorded` if it holds an entry, else `not_recorded`, cause `absent`. A quarantine: as open question 1 rules |
+  | `unavailable`, cause one of ADR 0108 §5a's sidecar states, with its fields | the grant was in the issued store at load; its list, if any, is in that file | §5a's exit for that state; for `awaiting_host_commit`, the host commit | none | a load that reads the file: `recorded` if it holds an entry, else `not_recorded`, cause `absent`. A quarantine: `not_recorded`, cause `quarantined` (D169) |
   | `not_recorded`, cause `over_cap` (D141) | the request named more than 64 agents | nothing | none | terminal |
-  | `not_recorded`, cause `quarantined` (D120; option (a) of open question 1) | the entry was in a quarantined file, and the replacement does not restore it | nothing | none | terminal. After a restart the grant shows cause `absent`, because the damaged file cannot say which grants it held |
+  | `not_recorded`, cause `quarantined` (D120, D147, D169) | the entry was in a quarantined file, and the replacement does not restore it | nothing | none | terminal. After a restart the grant shows cause `absent`, because the damaged file cannot say which grants it held |
   | `not_recorded`, cause `absent` | no entry: issued before the sidecar existed, on another owner install, while downgraded, or lost at a restart | nothing | none | terminal |
 - **Mixed versions and downgrade.** There is no wire change. A released
   binary never reads the sidecar or a quarantined copy, so a downgrade
@@ -631,10 +636,10 @@ listing that ADR 0098 defines shows pushed records too.
   another owner install, held only in memory across a restart, listed with
   more than 64 agents (D141), in a quarantined file (D120), or present
   while the sidecar is unreadable (section 3a).
-- Under option (a) of open question 1, a quarantine loses the lists in
-  that file for good, because no holder has a copy (D120). The lifecycle
-  never deletes a quarantined copy, so each damaged file leaves one copy
-  of at most about 2 MiB until open question 2 sets a retention rule.
+- A quarantine loses the lists in that file for good, because no holder
+  has a copy (D120, D147, D169). The lifecycle never deletes a
+  quarantined copy, so each damaged file leaves one copy of at most about
+  2 MiB until an operator removes it (D148).
 - The split ingest (D139) changes the shared barrier and its lock order
   for every remote carrier, not only the push.
 - The issue call now persists the sidecar before the grant becomes
@@ -829,8 +834,7 @@ and 13 and their variants.
    - **12d, a damaged sidecar is quarantined (D120, red).** After the
      setup run, keep the `X0GDT1\0\0` header, overwrite the body with
      random bytes, and record the file's sha256. Start O
-     (host-committed) at T = 0 s. The assertions follow option (a) of
-     open question 1. Then:
+     (host-committed) at T = 0 s. The assertions follow D169. Then:
      - `GET /diagnostics/grants` lists one history copy whose sha256
        equals the recorded one. The sidecar state is `ok`, and the
        replacement's `rebuilt_from` lists that copy's `txid`.
@@ -897,7 +901,7 @@ and 13 and their variants.
      `sidecar_unavailable { file, cause: awaiting_host_commit }`, G0
      shows `unavailable` with that state, and nothing is moved until the
      host commit. After it, the quarantine runs, and G0 shows
-     `not_recorded`, cause `quarantined` (option (a) of open question 1).
+     `not_recorded`, cause `quarantined` (D169).
      Red on main: none of these states exists.
    - **12f, a downgrade (control).** The candidate O issues G9
      (`recorded`) and stops. The released v0.46.1 binary starts on the
@@ -988,10 +992,9 @@ and 13 and their variants.
 
 ## Rulings and open questions
 
-**Blocking David's Accept:** open question 1, and the cross-model review
-named under Reviewers. Open question 2 blocks only the implementing
-slice's code. The code also waits for the D28 review of ADRs 0070 and
-0077 (D114).
+**Blocking David's Accept:** only the cross-model review named under
+Reviewers. No open question remains. The code also waits for the D28
+review of ADRs 0070 and 0077 (D114).
 
 David ruled Q1–Q7 on 2026-10-04 (D108–D114):
 
@@ -1036,46 +1039,26 @@ David ruled the round-2 questions on 2026-10-04 (D120, D139–D143):
   recommendation. Applied to the quarantine of this ADR's one sidecar, the
   `deliver_to` list (section 3a), through the shared lifecycle of ADR 0108
   §5a. A damaged file is moved aside byte-identical. A valid newer
-  version is never quarantined, so ADR 0085 rule 5 holds. D120 rules the quarantine, so this ADR proposes an
-  amendment to ADR 0085 rule 4 for this sidecar only. The rebuild part
-  cannot be met as written: no holder has the lists. What replaces the
-  file is open question 1. This ADR is not an ADR 0088 slice, so it adds
-  no ADR 0088 §2 entry.
+  version is never quarantined, so ADR 0085 rule 5 holds. The rebuild
+  part cannot be met as written, because no holder has the lists; D169
+  settles what replaces the file. This ADR is not an ADR 0088 slice, so
+  it adds no ADR 0088 §2 entry.
 
-Still open for David:
+David ruled the round-3 questions on 2026-10-04 (D147, D148, D169):
 
-1. **What replaces a quarantined `deliver_to` sidecar (D120). Blocks
-   Accept.** D120 rules a rebuild from holders. Only the issuing install
-   ever has a grant's `deliver_to` list. No grantee, host or `deliver_to`
-   agent keeps a copy, and no protocol asks for one. So nothing can be
-   rebuilt from holders.
-   - (a) Approve an empty replacement. The quarantine writes an empty
-     sidecar. Each grant whose entry was in the damaged file becomes
-     `not_recorded`, cause `quarantined`, and its list is lost for good.
-     Its `deliver_to` daemons then get gossip only at revoke. Cost: slower
-     revocation at those daemons. There is no access risk, because gossip
-     still revokes and the list gives no authority.
-   - (b) Keep a recoverable local copy (a candidate, for review). Every
-     persist writes two copies with the durable write, first A, then B,
-     each with a generation number. Load uses the highest generation that
-     decodes. A damaged copy is quarantined, and the replacement is
-     rebuilt from the other copy. Only when both are damaged does (a)
-     apply. A crash between the two writes leaves A one generation ahead,
-     and load rewrites B from it. Cost: twice the sidecar writes, up to
-     about 2 MiB more disk, and one more file in the downgrade and fault
-     tests.
-
-   Recommended: (a). The list only speeds up revocation, and losing it
-   never keeps a grant alive. (b) doubles every sidecar write to guard
-   against a rare fault. Section 3a and cases 12d, 12e and 12i are written
-   for (a). Under (b), they gain a restore-from-copy step and a
-   both-copies-damaged case.
-2. **Retention of quarantined `deliver_to` copies (D120). Blocks code,
-   not Accept.** ADR 0108 §5a never deletes a quarantined copy and leaves
-   retention to each ADR. Proposal: keep every copy until an operator
-   removes it, and list each one in `GET /diagnostics/grants` with its
-   `txid`, hash and size. Each copy is at most about 2 MiB, and a copy
-   only appears when the file is damaged. The rule needs David's ruling.
+- **D169, lost `deliver_to` lists:** an empty replacement. The lists in
+  a quarantined file are lost, and those grants become `not_recorded`,
+  cause `quarantined`. Revocation still reaches their `deliver_to`
+  daemons by gossip. No second local copy is kept (section 3a).
+- **D147, local-only state lost to a corrupt file:** the stated outcome
+  is accepted. The loss ends in a typed state with a stated next step,
+  gossip at revoke, and nothing is silently trusted (section 3a).
+- **D148, keeping quarantined copies:** kept until an operator removes
+  them, by ADR 0108 §5a's rule. This file belongs to no group.
+  Diagnostics list each copy with its size (section 3a). The earlier
+  retention question is dropped.
+- With D169, the ADR 0085 rule 4 amendment for `share-grants.deliverto`
+  is complete, ruled by David (D120, D169).
 
 ## Notes for AI-assisted work
 
