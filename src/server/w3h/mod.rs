@@ -18,9 +18,11 @@
 //!
 //! Determinism (plan §3a): [`Sim::finish`] renders the fabric's canonical
 //! trace up to the `teardown begins` mark and prints
-//! `W3H-TRACE case=… seed=… entropy=… digest=…`; the CI gate requires one
-//! digest per case across 20 reruns. Teardown is recorded in a trace
-//! appendix that is not digested; a teardown error still fails the run.
+//! `W3H-TRACE case=… seed=… entropy=… digest=…`. The CI gate (ruling D196)
+//! requires the same verdict with complete receipts in all 20 reruns and
+//! reports the number of distinct digests per case without failing on it.
+//! Teardown is recorded in a trace appendix that is not digested; a
+//! teardown error still fails the run.
 //! Every node's machine and agent keys are generated on the test thread
 //! before any daemon starts ([`Sim::empty`]), so the entropy a daemon
 //! draws can never shift a later node's identity.

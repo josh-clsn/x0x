@@ -35,7 +35,8 @@ w3h-shim:
 test-w3h: w3h-shim
     python3 scripts/dev/test-isolated.py nextest --all-features --lib -- --profile w3h
 
-# Determinism gate: each case 20 times; one canonical-trace digest per case.
+# W3-H gate (D196): each case 20 times; the same verdict and complete receipts
+# every time. Distinct traces are reported; add --strict-traces to require one.
 test-w3h-gate: w3h-shim
     rm -rf target/w3h/traces
     python3 scripts/dev/test-isolated.py nextest --all-features --lib -- --profile w3h --stress-count 20

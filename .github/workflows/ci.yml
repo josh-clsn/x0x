@@ -382,7 +382,9 @@ jobs:
   w3h-harness:
     # W3-H (#1164): deterministic simulation harness. Builds the entropy /
     # wall-clock preload shim, runs every `w3h_` case 20 times in the
-    # isolated namespace, and requires one canonical trace per case.
+    # isolated namespace, and requires the same verdict in every rerun with
+    # complete receipts (ruling D196). Distinct canonical traces per case
+    # are reported, not required.
     name: W3-H harness (determinism)
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -436,7 +438,10 @@ jobs:
           X0X_RUNTIME_TIMEOUT_SECONDS: 4800
         run: bash scripts/ci/nextest-isolated.sh --all-features --lib -- --profile w3h-gate --stress-count 20
 
-      - name: Determinism gate (one canonical trace per case)
+      # D196: blocking on the verdict (the same in all 20 reruns, every
+      # receipt complete); the per-case distinct-trace counts are printed
+      # (`W3H-TRACES`) and do not fail the job.
+      - name: W3-H gate (verdict-stable reruns, D196)
         run: >-
           python3 scripts/ci/w3h-trace-check.py target/w3h/traces --runs 20
           --require w3h_s1_control_group_invite_join_over_public_api
