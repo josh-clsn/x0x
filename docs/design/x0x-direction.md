@@ -1,9 +1,9 @@
 # x0x design direction and rulings digest
 
 - **Status:** maintained digest, not an ADR. It records the design rulings
-  David Irvine made from 2026-09-28 to 2026-10-04 (decisions D01–D178 and the
+  David Irvine made from 2026-09-28 to 2026-10-05 (decisions D01–D195 and the
   efficiency decisions E-D1–E-D17).
-- **Updated:** 2026-10-04.
+- **Updated:** 2026-10-05.
 - **Relationship to ADRs:** ADRs remain the decision records, and only David
   marks an ADR Accepted. Where a ruling here changes what an Accepted ADR
   means in practice, the status overlay at the top of the
@@ -114,7 +114,7 @@ wave that fixes each is in section 7.
 | I12 | **Resource bounds.** A daemon never fills its host's disk, spends a user's uplink as infrastructure, or grows queues without bound, and every bound is visible. |
 | I13 | **Plane isolation.** A test or named daemon never joins production by accident. |
 
-## 5. Decisions D01–D178
+## 5. Decisions D01–D195
 
 Status key: **implemented** = in effect on `main` (code, configuration or an
 Accepted ADR); **ruled** = decided by David, work outstanding or ongoing;
@@ -304,6 +304,23 @@ and D29 (an ADR 0089 slice pulled into v0.46).
 | D176 | Full GO for v0.46.3, including the crates.io and ClawHub promotion. | Implemented (2026-10-05) |
 | D177 | Continue the v0.46.3 rollout after a harness-setup timeout on the first Home run (second run at the 103/104 baseline). | Implemented (2026-10-05) |
 | D178 | ADR 0108 (S2, Home-scoped owner certificate) is Accepted as written, including its §5a shared quarantine lifecycle, its §8 JoinPendingNotice and its named amendment to ADR 0107. | Implemented (2026-10-05); ADR 0108 Accepted |
+| D179 | Claude takes over as controller of the agent team; Root stays release manager. | Implemented (2026-10-05) |
+| D180 | Codex and OMP author code on every lane (extends D07's W2-only exception); every PR is reviewed by a different model family; lanes follow the resolution plan §4. | Implemented (2026-10-05) |
+| D181 | Red cases in the W3-H simulation harness (#1164), shown red on main in CI, satisfy harness-first (D16); standalone in-process tests still do not (D54 stands). | Ruled (2026-10-05) |
+| D182 | ADR 0094: release manifests may be at most 5 min in the future (same 300 s rule as certificates and V5 invites). | Ruled (2026-10-05) |
+| D183 | ADR 0094: compiled rollout window 60 min for installs with self-update enabled. | Ruled (2026-10-05) |
+| D184 | ADR 0094: fleet rollout default 60 min and minimum 60 min; private rehearsal hosts with the test key may use 0. | Ruled (2026-10-05) |
+| D185 | ADR 0094: an authenticated API apply waits for staging unless it asks `now=true`; eligibility, holds and transaction checks always apply. | Ruled (2026-10-05) |
+| D186 | ADR 0094 / ADR 0087 rule 7: the prerelease ban stays; lifting it needs a later human-accepted ADR with census evidence. | Ruled (2026-10-05) |
+| D187 | ADR 0094: probe time limit 90 s (Defender's 60 s maximum plus 30 s to run). | Ruled (2026-10-05) |
+| D188 | ADR 0094: host faults are Interrupted, classified by phase; failures during rollback or a hold write are recovery-failed. | Ruled (2026-10-05) |
+| D189 | ADR 0094: interrupted attempts retry as fresh transactions at 30, 60 and 120 min (N = 3), then hold with `retries_exhausted`. | Ruled (2026-10-05) |
+| D190 | ADR 0094: a failed-release hold clears on a newer release or an authenticated, recorded local clear; never for recovery-failed. | Ruled (2026-10-05) |
+| D191 | ADR 0094: shutdown flush limit 30 s. | Ruled (2026-10-05) |
+| D192 | ADR 0094: trial budget 11 min — 30 s flush, 3 launches of 120 s readiness + 60 s stable health, 10 s reap and 10 s gap; restore allowances defined. | Ruled (2026-10-05) |
+| D193 | ADR 0094: local checks block commit; a host that had a send-ready peer must reach one and keep it through the stable interval (a miss is Interrupted). | Ruled (2026-10-05) |
+| D194 | ADR 0094: keep the last committed binary pair as recovery material; refuse staging below 1 GiB free. | Ruled (2026-10-05) |
+| D195 | ADR 0094: SKILL.md installs only after the verified candidate's health holds; the prior guide is kept and restored in recovery. | Ruled (2026-10-05) |
 | COMMS | Use plain controlled language (about 80% toward ASD-STE100), fixed decision templates and one release contact; record and share each ruling, check live GitHub before requesting approval, keep the release dashboard current and include diagrams in briefs. Trial explainer videos after promotion. | Ruled; adopted 2026-10-02 |
 
 ## 6. Efficiency decisions E-D1–E-D17 (Track E)
