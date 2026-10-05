@@ -1220,8 +1220,11 @@ mod tests {
         assert_eq!(body["path"], "/groups/:id/members");
         assert_eq!(body["params"]["id"], "abc123");
 
-        // Method mismatch and off-table wiring fail closed (403).
-        for (method, path) in [("POST", "/groups/abc123/members"), ("GET", "/calls/abc123")] {
+        // A wired pattern whose method has no table row (PUT members —
+        // POST /groups/:id/members IS a row, Unmigrated, and
+        // resolve_route resolves it; the class check lives in
+        // GroupAccess) and off-table wiring fail closed (403).
+        for (method, path) in [("PUT", "/groups/abc123/members"), ("GET", "/calls/abc123")] {
             let request = Request::builder()
                 .method(method)
                 .uri(path)

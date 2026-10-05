@@ -16338,6 +16338,11 @@ pub(in crate::server) struct GetMessagesQuery {
 pub(in crate::server) async fn get_group_public_messages(
     State(state): State<Arc<AppState>>,
     Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
+    // Pre-S1 position: `Path` rejected a bad `:id` escape before `Query`
+    // ran — keep it so a request with both a bad path and a bad query
+    // still gets the Path 400 first. The id itself comes from the
+    // GroupAccess snapshot now, hence `_id`.
+    Path(_id): Path<String>,
     Query(query): Query<GetMessagesQuery>,
     access: crate::server::group_access::GroupAccess,
 ) -> impl IntoResponse {
