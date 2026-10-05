@@ -1,7 +1,7 @@
 # x0x design direction and rulings digest
 
 - **Status:** maintained digest, not an ADR. It records the design rulings
-  David Irvine made from 2026-09-28 to 2026-10-04 (decisions D01–D173 and the
+  David Irvine made from 2026-09-28 to 2026-10-04 (decisions D01–D178 and the
   efficiency decisions E-D1–E-D17).
 - **Updated:** 2026-10-04.
 - **Relationship to ADRs:** ADRs remain the decision records, and only David
@@ -114,7 +114,7 @@ wave that fixes each is in section 7.
 | I12 | **Resource bounds.** A daemon never fills its host's disk, spends a user's uplink as infrastructure, or grows queues without bound, and every bound is visible. |
 | I13 | **Plane isolation.** A test or named daemon never joins production by accident. |
 
-## 5. Decisions D01–D173
+## 5. Decisions D01–D178
 
 Status key: **implemented** = in effect on `main` (code, configuration or an
 Accepted ADR); **ruled** = decided by David, work outstanding or ongoing;
@@ -299,6 +299,11 @@ and D29 (an ADR 0089 slice pulled into v0.46).
 | D171 | ADR 0108, Withdraw retries: **a monotonic 30 s interval**, separate from D66 slots. David's note led to a Lamport recovery generation with no wall time. | Ruled (2026-10-04); ADR 0108 Proposed |
 | D172 | ADR 0108, D66 push slots: **wall time read once, then monotonic**, keeping the fractional slot phase. | Ruled (2026-10-04); ADR 0108 Proposed |
 | D173 | ADR 0108, future-dated slot anchor: **hold with a typed `anchor_future_dated` wait** on the shared signed `committed_at`; only rank 1 pushes once wall time passes it. | Ruled (2026-10-04); ADR 0108 Proposed |
+| D174 | #1190 may ship in v0.46.3 without a real-network survivor-rekey check, given in-process coverage and a clean short eph re-check; the fixture follows (#1216). | Ruled (2026-10-05) |
+| D175 | Ship v0.46.3 with #1190; the removal-notice finding (#1217) moves to v0.46.4. | Implemented (v0.46.3 released 2026-10-05) |
+| D176 | Full GO for v0.46.3, including the crates.io and ClawHub promotion. | Implemented (2026-10-05) |
+| D177 | Continue the v0.46.3 rollout after a harness-setup timeout on the first Home run (second run at the 103/104 baseline). | Implemented (2026-10-05) |
+| D178 | ADR 0108 (S2, Home-scoped owner certificate) is Accepted as written, including its §5a shared quarantine lifecycle, its §8 JoinPendingNotice and its named amendment to ADR 0107. | Implemented (2026-10-05); ADR 0108 Accepted |
 | COMMS | Use plain controlled language (about 80% toward ASD-STE100), fixed decision templates and one release contact; record and share each ruling, check live GitHub before requesting approval, keep the release dashboard current and include diagrams in briefs. Trial explainer videos after promotion. | Ruled; adopted 2026-10-02 |
 
 ## 6. Efficiency decisions E-D1–E-D17 (Track E)
