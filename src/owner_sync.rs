@@ -2278,7 +2278,10 @@ pub const OWNER_REANNOUNCE_MIN_INTERVAL: Duration = Duration::from_secs(60);
 /// machines seen within one interval (enrolled machines only).
 pub(crate) struct ReannounceLimiter {
     interval: Duration,
-    last: std::collections::HashMap<[u8; 32], std::time::Instant>,
+    /// `tokio::time::Instant` reads the std clock unless tokio time is paused
+    /// (tests only), so the W3-H simulation can age this window with virtual
+    /// time across a restart.
+    last: std::collections::HashMap<[u8; 32], tokio::time::Instant>,
 }
 
 impl ReannounceLimiter {
@@ -2291,7 +2294,7 @@ impl ReannounceLimiter {
 
     /// Whether `machine` may trigger a re-announcement at `now`; records it
     /// when allowed.
-    pub(crate) fn allow(&mut self, machine: &MachineId, now: std::time::Instant) -> bool {
+    pub(crate) fn allow(&mut self, machine: &MachineId, now: tokio::time::Instant) -> bool {
         let interval = self.interval;
         self.last
             .retain(|_, at| now.saturating_duration_since(*at) < interval);
@@ -2424,7 +2427,7 @@ impl OwnerSyncService {
         {
             return;
         }
-        if !limiter.allow(&machine, std::time::Instant::now()) {
+        if !limiter.allow(&machine, tokio::time::Instant::now()) {
             tracing::debug!(
                 target: "x0x::owner_sync",
                 machine = %hex::encode(machine.0),
@@ -4627,7 +4630,7 @@ mod home_pointer_election_tests {
     fn owner_reconnect_reannounce_is_rate_limited_per_machine() {
         let interval = OWNER_REANNOUNCE_MIN_INTERVAL;
         let mut limiter = ReannounceLimiter::new(interval);
-        let t0 = std::time::Instant::now();
+        let t0 = tokio::time::Instant::now();
         assert!(
             limiter.allow(&MachineId([1; 32]), t0),
             "first connect re-announces"

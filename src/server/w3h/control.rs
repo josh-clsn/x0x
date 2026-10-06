@@ -41,7 +41,7 @@ fn path_segment(raw: &str) -> String {
 
 /// The members `label` lists for `group`; `Err` when the read itself fails
 /// (non-2xx, or no `members` array).
-async fn members(sim: &Sim, label: &str, group: &str) -> Result<Vec<String>> {
+pub(super) async fn members(sim: &Sim, label: &str, group: &str) -> Result<Vec<String>> {
     let (status, info) = sim
         .request(label, Method::GET, &format!("/groups/{group}"), None)
         .await?;
@@ -54,7 +54,7 @@ async fn members(sim: &Sim, label: &str, group: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-async fn mesh(sim: &Sim, labels: &[&str]) -> Result<()> {
+pub(super) async fn mesh(sim: &Sim, labels: &[&str]) -> Result<()> {
     sim.until("mesh up", secs(60), async |s: &Sim| {
         for label in labels {
             if s.connected_peer_count(label).await == 0 {
@@ -66,7 +66,7 @@ async fn mesh(sim: &Sim, labels: &[&str]) -> Result<()> {
     .await
 }
 
-async fn create_group(sim: &Sim, owner: &str) -> Result<String> {
+pub(super) async fn create_group(sim: &Sim, owner: &str) -> Result<String> {
     let (status, created) = sim
         .api(
             owner,
@@ -85,7 +85,7 @@ async fn create_group(sim: &Sim, owner: &str) -> Result<String> {
         .to_string())
 }
 
-async fn invite(sim: &Sim, inviter: &str, group: &str) -> Result<String> {
+pub(super) async fn invite(sim: &Sim, inviter: &str, group: &str) -> Result<String> {
     let (status, invite) = sim
         .api(
             inviter,
@@ -101,7 +101,7 @@ async fn invite(sim: &Sim, inviter: &str, group: &str) -> Result<String> {
         .to_string())
 }
 
-async fn join(sim: &Sim, joiner: &str, link: &str) -> Result<()> {
+pub(super) async fn join(sim: &Sim, joiner: &str, link: &str) -> Result<()> {
     let (status, joined) = sim
         .api(
             joiner,
@@ -131,7 +131,7 @@ async fn open_store(sim: &Sim, label: &str, group: &str) -> Result<String> {
 }
 
 /// `membership_state` of `group` as `label` reports it.
-async fn local_membership(sim: &Sim, label: &str, group: &str) -> Option<String> {
+pub(super) async fn local_membership(sim: &Sim, label: &str, group: &str) -> Option<String> {
     let (status, body) = sim
         .request(label, Method::GET, &format!("/groups/{group}"), None)
         .await

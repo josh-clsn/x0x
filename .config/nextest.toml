@@ -56,6 +56,35 @@ run-wrapper = 'w3h-sim-dump'
 default-filter = 'test(/(^|::)w3h_/)'
 slow-timeout = { period = "60s", terminate-after = 5 }
 success-output = "final"
+
+# W3-H S3: the #1143 cases with creator and admin identities permuted (ADR
+# 0108 s2_home_anonymous_owner_offline: "repeat with creator/admin
+# identities permuted"). `W3H_IDENTITY_ORDER` names the case's labels from
+# the lowest agent id to the highest; `Sim::empty` assigns the pre-generated
+# keys sorted that way and marks the order in the trace. Each order writes
+# to its own trace dir, so its receipts are gated on their own (`just
+# test-w3h-permuted`). The positive control stays unpermuted.
+[scripts.wrapper.w3h-sim-creator-low]
+command = 'env RUST_MIN_STACK=16777216 X0X_HOME=/tmp/x0x-nextest-home HOME=/tmp/x0x-nextest-home LD_PRELOAD=target/w3h/libw3h_shim.so W3H_SHIM_ACTIVE=1 W3H_ENTROPY_SEED=0x1164 W3H_TRACE_DIR=target/w3h/traces-creator-low W3H_IDENTITY_ORDER=O,X,A,J'
+
+[[profile.w3h-permuted-creator-low.scripts]]
+filter = 'all()'
+run-wrapper = 'w3h-sim-creator-low'
+
+[profile.w3h-permuted-creator-low]
+default-filter = 'test(/(^|::)w3h_1143_/) and not test(/positive_control/)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[scripts.wrapper.w3h-sim-admin-low]
+command = 'env RUST_MIN_STACK=16777216 X0X_HOME=/tmp/x0x-nextest-home HOME=/tmp/x0x-nextest-home LD_PRELOAD=target/w3h/libw3h_shim.so W3H_SHIM_ACTIVE=1 W3H_ENTROPY_SEED=0x1164 W3H_TRACE_DIR=target/w3h/traces-admin-low W3H_IDENTITY_ORDER=A,X,O,J'
+
+[[profile.w3h-permuted-admin-low.scripts]]
+filter = 'all()'
+run-wrapper = 'w3h-sim-admin-low'
+
+[profile.w3h-permuted-admin-low]
+default-filter = 'test(/(^|::)w3h_1143_/) and not test(/positive_control/)'
+slow-timeout = { period = "60s", terminate-after = 5 }
 [profile.default]
 # Network integration tests need longer timeouts for QUIC handshakes
 # and gossip propagation on macOS

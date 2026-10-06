@@ -34,6 +34,7 @@ mod case_1143;
 mod control;
 mod home;
 mod receipt;
+mod restart;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -60,6 +61,15 @@ const PAYLOAD_DUMP_CAP: usize = 32 * 1024 * 1024;
 const TRACE_APPENDIX: &str = "# --- appendix: teardown (not digested) ---";
 /// Virtual-time budget for a daemon to start.
 const START_BUDGET: Duration = Duration::from_secs(120);
+/// Virtual time a stopped daemon's stray tasks get to release its state
+/// before [`Sim::stop`] reports INFRA.
+const DRAIN_BUDGET: Duration = Duration::from_secs(30);
+/// Environment variable naming the agent-id order of a case's labels, from
+/// lowest to highest (e.g. `A,X,O,J`): [`Sim::empty`] then assigns the
+/// pre-generated keys sorted by agent id in that order. Set only by the
+/// `w3h-permuted-*` nextest profiles (W3-H S3, ADR 0108 "repeat with
+/// creator/admin identities permuted").
+const IDENTITY_ORDER_ENV: &str = "W3H_IDENTITY_ORDER";
 /// Real-time limit for an await made while the clock gate is closed. A
 /// stall past it means the case needed time outside a named barrier.
 const GATED_STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
@@ -189,9 +199,24 @@ impl ClockGate {
     }
 }
 
+/// How [`Sim::stop`] takes a daemon down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RestartMode {
+    /// The daemon stays on the fabric while it shuts down, so its farewell
+    /// traffic (disconnects, last publishes) is part of the trace.
+    Graceful,
+    /// The node is taken off the fabric first, so no frame leaves it after
+    /// the crash mark. A model, not a real crash: in-process tasks still
+    /// drain and file writes still complete (torn-write cases damage files
+    /// between [`Sim::stop`] and [`Sim::start_again`] instead).
+    Crash,
+}
+
 /// One simulated daemon.
 pub(crate) struct SimNode {
     label: String,
+    /// The node's address slot (`198.18.0.<index + 1>`), kept across restarts.
+    index: usize,
     handle: Option<ServerHandle>,
     router: Option<axum::Router>,
     state: Weak<AppState>,
@@ -379,6 +404,27 @@ impl Observations {
     }
 }
 
+/// The permuted agent-id order of `labels` requested through
+/// [`IDENTITY_ORDER_ENV`], if any. It must name exactly `labels`.
+fn identity_order(labels: &[&str]) -> Result<Option<Vec<String>>> {
+    let Ok(raw) = std::env::var(IDENTITY_ORDER_ENV) else {
+        return Ok(None);
+    };
+    let order: Vec<String> = raw
+        .split(',')
+        .map(|label| label.trim().to_string())
+        .collect();
+    let mut wanted: Vec<&str> = order.iter().map(String::as_str).collect();
+    let mut have = labels.to_vec();
+    wanted.sort_unstable();
+    have.sort_unstable();
+    ensure!(
+        wanted == have,
+        "INFRA: {IDENTITY_ORDER_ENV}={raw} does not name exactly this case's nodes {labels:?}"
+    );
+    Ok(Some(order))
+}
+
 /// Whether this run of `case` writes a payload dump: the first run that
 /// finishes (it records its digest in `<case>.first-digest`) and the first
 /// run whose digest differs from it (`<case>.divergent-digest`). Later runs
@@ -432,12 +478,39 @@ impl Sim {
             Err(reason) => (None, format!("uncontrolled ({reason})")),
         };
         let mut keys = BTreeMap::new();
-        for label in labels {
-            let pair = (MachineKeypair::generate()?, AgentKeypair::generate()?);
-            if keys.insert((*label).to_string(), pair).is_some() {
+        let mut generated = Vec::with_capacity(labels.len());
+        for _ in labels {
+            generated.push((MachineKeypair::generate()?, AgentKeypair::generate()?));
+        }
+        let order = identity_order(labels)?;
+        let assigned: Vec<&str> = match &order {
+            Some(order) => {
+                // Lowest agent id first; `order` names who plays each rank.
+                generated.sort_by_key(|pair| pair.1.agent_id().0);
+                order.iter().map(String::as_str).collect()
+            }
+            None => labels.to_vec(),
+        };
+        for (label, pair) in assigned.into_iter().zip(generated) {
+            if keys.insert(label.to_string(), pair).is_some() {
                 bail!("node label {label} declared twice");
             }
         }
+        // Every case records the actual agent-id order of its labels, so a
+        // permuted run that did not take effect is visible in its trace.
+        let mut ranked: Vec<(&String, [u8; 32])> = keys
+            .iter()
+            .map(|(label, (_, agent))| (label, agent.agent_id().0))
+            .collect();
+        ranked.sort_by_key(|entry| entry.1);
+        let ranked: Vec<&str> = ranked.iter().map(|(label, _)| label.as_str()).collect();
+        if let Some(order) = &order {
+            ensure!(
+                ranked == order.iter().map(String::as_str).collect::<Vec<_>>(),
+                "INFRA: identity order {order:?} did not take effect (got {ranked:?})"
+            );
+        }
+        let ranked = ranked.join("<");
         let logs = Arc::new(Mutex::new(Vec::new()));
         // Thread-local: the scenario runs on one current-thread runtime, so
         // every daemon task emits on this thread.
@@ -464,6 +537,10 @@ impl Sim {
             _log_guard: log_guard,
         };
         sim.fabric.mark(format!("case {case} entropy={entropy}"));
+        sim.fabric.mark(format!(
+            "identity order {ranked} (by agent id{})",
+            if order.is_some() { ", permuted" } else { "" }
+        ));
         Ok(sim)
     }
 
@@ -545,6 +622,20 @@ impl Sim {
                 crate::storage::write_private_bytes(&identity.join(file), bytes).await?;
             }
         }
+        let node = self.serve_node(label, index, config).await?;
+        // Identities are part of the canonical trace: if key generation ever
+        // diverges, the gate's first differing line says so.
+        self.fabric.mark(format!(
+            "identity {label} agent={} machine={}",
+            node.agent_hex,
+            hex::encode(node.peer.0)
+        ));
+        self.nodes.insert(label.to_string(), node);
+        Ok(())
+    }
+
+    /// Serve `label`'s daemon from `config` inside a `start` barrier.
+    async fn serve_node(&self, label: &str, index: usize, config: DaemonConfig) -> Result<SimNode> {
         let options = ServeOptions {
             skip_update_check: true,
             cli_no_port_mapping: true,
@@ -569,24 +660,115 @@ impl Sim {
             .ok_or_else(|| anyhow!("daemon {label} has no network"))?
             .peer_id();
         self.fabric.label(&peer, label);
-        let agent_hex = hex::encode(state.agent.agent_id().as_bytes());
-        // Identities are part of the canonical trace: if key generation ever
-        // diverges, the gate's first differing line says so.
-        self.fabric.mark(format!(
-            "identity {label} agent={agent_hex} machine={}",
-            hex::encode(peer.0)
-        ));
-        let node = SimNode {
+        Ok(SimNode {
             label: label.to_string(),
+            index,
             router: Some(handle.test_router.clone()),
             state: Arc::downgrade(&state),
             token: state.api_token.clone(),
             peer,
-            agent_hex,
+            agent_hex: hex::encode(state.agent.agent_id().as_bytes()),
             handle: Some(handle),
+        })
+    }
+
+    /// Stop `label`'s daemon. A [`RestartMode::Crash`] takes the node off
+    /// the fabric first; a [`RestartMode::Graceful`] stop leaves it online
+    /// while it shuts down. The daemon drains inside a `stop` barrier, then
+    /// its state must be released (a `drain` barrier lets virtual time pass
+    /// so stray tasks can finish): a daemon state that outlives its stop is
+    /// INFRA, because a stopped daemon's tasks could still act on its data
+    /// and identity dirs while the next incarnation uses them.
+    pub(crate) async fn stop(&mut self, label: &str, mode: RestartMode) -> Result<()> {
+        let mode_name = match mode {
+            RestartMode::Graceful => "graceful",
+            RestartMode::Crash => "crash",
         };
+        let (handle, peer, state) = {
+            let node = self
+                .nodes
+                .get_mut(label)
+                .ok_or_else(|| anyhow!("no simulated node {label}"))?;
+            let handle = node
+                .handle
+                .take()
+                .ok_or_else(|| anyhow!("{label} is already stopped"))?;
+            node.router = None;
+            (handle, node.peer, node.state.clone())
+        };
+        self.fabric.mark(format!("fault stop {label} {mode_name}"));
+        if mode == RestartMode::Crash {
+            self.fabric.set_online(&peer, false);
+        }
+        self.within(
+            &format!("stop {label}"),
+            START_BUDGET,
+            handle.shutdown_and_wait(),
+        )
+        .await?
+        .with_context(|| format!("INFRA: {label} shutdown"))?;
+        let released = self
+            .until(&format!("drain {label}"), DRAIN_BUDGET, async |_: &Sim| {
+                state.strong_count() == 0
+            })
+            .await;
+        if let Err(error) = released {
+            if expired(&error) {
+                bail!(
+                    "INFRA: {label}'s daemon state is still held by {} references after its \
+                     stop; a stopped daemon could still act on its data and identity dirs",
+                    state.strong_count()
+                );
+            }
+            return Err(error);
+        }
+        self.fabric.mark(format!("stopped {label}"));
+        Ok(())
+    }
+
+    /// Start a stopped daemon again on the same data and identity dirs and
+    /// the same address. Its machine key persists, so its peer id must be
+    /// unchanged; the fabric attaches it as the next incarnation.
+    pub(crate) async fn start_again(&mut self, label: &str) -> Result<()> {
+        let (index, peer, agent_hex) = {
+            let node = self.node(label)?;
+            ensure!(node.handle.is_none(), "{label} is still running");
+            (node.index, node.peer, node.agent_hex.clone())
+        };
+        let config = self.daemon_config(label, index)?;
+        let node = self.serve_node(label, index, config).await?;
+        ensure!(
+            node.peer == peer && node.agent_hex == agent_hex,
+            "INFRA: {label} restarted with a different identity"
+        );
+        let incarnation = self
+            .fabric
+            .incarnation_of(&peer)
+            .context("restarted node is not on the fabric")?;
+        self.fabric
+            .mark(format!("restarted {label} inc={incarnation}"));
         self.nodes.insert(label.to_string(), node);
         Ok(())
+    }
+
+    /// [`Self::stop`] then [`Self::start_again`].
+    pub(crate) async fn restart(&mut self, label: &str, mode: RestartMode) -> Result<()> {
+        self.stop(label, mode).await?;
+        self.start_again(label).await
+    }
+
+    /// A node's data dir, for fixture file damage while it is stopped.
+    pub(crate) fn data_dir(&self, label: &str) -> Result<std::path::PathBuf> {
+        ensure!(
+            self.node(label)?.handle.is_none(),
+            "{label} is running; stop it before touching its files"
+        );
+        Ok(self.root.path().join(label).join("data"))
+    }
+
+    /// The node's address slot (its sim address is `sim_addr(index)`).
+    pub(crate) fn node_index(&self, label: &str) -> Result<usize> {
+        Ok(self.node(label)?.index)
     }
 
     /// The node's transport peer id.
