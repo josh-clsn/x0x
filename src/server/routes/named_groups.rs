@@ -15041,6 +15041,9 @@ async fn join_status_body(state: &AppState, id: &str) -> (StatusCode, serde_json
                     .find(|info| info.stable_group_id() == id || info.mls_group_id == id)
                     .map(|info| (info.stable_group_id().to_string(), info))
             });
+        // #1166 S5 ceiling: the join-status BODY field (`join_state`),
+        // not route admission — the PublicRead row never refuses.
+        #[allow(clippy::disallowed_methods)]
         let pending = match resolved.as_ref() {
             Some((_, info)) => {
                 let agent_hex = hex::encode(state.agent.agent_id().as_bytes());
@@ -15092,27 +15095,28 @@ pub(in crate::server) async fn get_named_group(
     Path(id): Path<String>,
     Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
 ) -> impl IntoResponse {
-    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     // #447/#458: typed LOCAL membership state so a joiner in limbo (local
     // stub persisted, authority never committed its MemberAdded) can see
     // "pending_authority_commit" instead of a bare 200 that reads as full
     // membership.
-    let (info, membership_state) = {
+    let (info, membership_state, level) = {
         let groups = state.named_groups.read().await;
         let Some(info) = groups.get(&id) else {
             return not_found("group not found");
         };
         let info = info.clone();
-        let state_label =
-            local_join_membership_state(state.as_ref(), &info, &local_agent_hex).await;
-        (info, state_label)
+        // #1166 S1: admission moved to the group-access chokepoint. This
+        // handler keeps its (State, Path, Extension) signature — the
+        // withdrawn-tombstone regression test calls it directly with
+        // positional extractor arguments — so it runs the shared decision
+        // core with the seat label resolved under the same lock read
+        // (S5: inside `admit_named_group_details_of_state`, which also
+        // returns the label — the 200 body below embeds it).
+        let (membership_state, level) =
+            group_access::admit_named_group_details_of_state(state.as_ref(), &info, &actor).await;
+        (info, membership_state, level)
     };
-    // #1166 S1: admission moved to the group-access chokepoint. This
-    // handler keeps its (State, Path, Extension) signature — the
-    // withdrawn-tombstone regression test calls it directly with
-    // positional extractor arguments — so it runs the shared decision
-    // core with the seat label it already resolved under the lock.
-    let level = match group_access::admit_named_group_details(&actor, membership_state) {
+    let level = match level {
         Ok(level) => level,
         Err(resp) => return resp,
     };
@@ -15426,15 +15430,11 @@ pub(in crate::server) async fn get_named_group_members(
         return not_found("group not found");
     };
     // Re-run the pure core on THIS lock's roster (r2/P2-1). The label is
-    // only read for session bearers; the other actor arms ignore it.
-    let admission = match &actor {
-        crate::server::rider_auth::ActorContext::Owner { durable: false } => {
-            let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
-            let label = local_join_membership_state(state.as_ref(), info, &local_agent_hex).await;
-            group_access::admit_named_group_members(&actor, label)
-        }
-        _ => group_access::admit_named_group_members(&actor, "not_member"),
-    };
+    // only read for session bearers; the other actor arms ignore it —
+    // both inside `admit_named_group_members_of_state` (S5
+    // single-sourced the arm the extractor runs too).
+    let admission =
+        group_access::admit_named_group_members_of_state(state.as_ref(), info, &actor).await;
     if let Err(resp) = admission {
         return resp;
     }
@@ -18743,6 +18743,8 @@ pub(in crate::server) async fn join_group_via_invite(
                 .cloned();
             if let Some(info) = info {
                 let joiner_hex = hex::encode(agent_id.as_bytes());
+                #[allow(clippy::disallowed_methods)]
+                // #1166 S5: join-flow classification, not route admission
                 let membership_state =
                     local_join_membership_state(state.as_ref(), &info, &joiner_hex).await;
                 let not_member_row = (membership_state == "not_member")
@@ -19876,11 +19878,9 @@ async fn add_treekem_named_group_member(
                 Json(serde_json::json!({ "ok": false, "error": "group not found" })),
             );
         };
-        if let Err(e) = require_admin_or_above(info, &actor_hex) {
+        // #1166 S5: the admin pair absorbed into the chokepoint core.
+        if let Err(e) = group_access::admin_route_gate(info, &actor_hex) {
             return e;
-        }
-        if let Some(resp) = reject_withdrawn_group(info) {
-            return resp;
         }
         if info.has_member(&agent_hex) {
             return (
@@ -21454,11 +21454,9 @@ async fn remove_treekem_named_group_member(
                 Json(serde_json::json!({ "ok": false, "error": "group not found" })),
             );
         };
-        if let Err(e) = require_admin_or_above(info, &local_agent_hex) {
+        // #1166 S5: the admin pair absorbed into the chokepoint core.
+        if let Err(e) = group_access::admin_route_gate(info, &local_agent_hex) {
             return e;
-        }
-        if let Some(resp) = reject_withdrawn_group(info) {
-            return resp;
         }
         if !info.has_member(&agent_id_hex) {
             return (
@@ -22434,6 +22432,11 @@ async fn withdraw_named_group_terminal(
         let Some(info) = groups.get(id) else {
             return Err(not_found("group not found"));
         };
+        // #1166 S5 ceiling: the admin leg is CONDITIONAL — the
+        // sole-member leave path passes `require_admin = false` (the
+        // #446 waived leg) — so it is not the chokepoint's
+        // unconditional admin pair.
+        #[allow(clippy::disallowed_methods)]
         if require_admin {
             require_admin_or_above(info, &local_hex)?;
         }
@@ -24683,11 +24686,9 @@ async fn ban_treekem_group_member(
                 Json(serde_json::json!({ "ok": false, "error": "group not found" })),
             );
         };
-        if let Err(e) = require_admin_or_above(info, &caller_hex) {
+        // #1166 S5: the admin pair absorbed into the chokepoint core.
+        if let Err(e) = group_access::admin_route_gate(info, &caller_hex) {
             return e;
-        }
-        if let Some(resp) = reject_withdrawn_group(info) {
-            return resp;
         }
         // ADR-0016 R2: friendly pre-check before any TreeKEM work begins.
         if let Some(resp) = last_admin_precheck(info, |g| g.ban_member(&agent_id_hex, None)) {
@@ -25857,11 +25858,9 @@ async fn approve_treekem_join_request(
         let Some(info) = groups.get(&id) else {
             return not_found("group not found");
         };
-        if let Err(e) = require_admin_or_above(info, &caller_hex) {
+        // #1166 S5: the admin pair absorbed into the chokepoint core.
+        if let Err(e) = group_access::admin_route_gate(info, &caller_hex) {
             return e;
-        }
-        if let Some(resp) = reject_withdrawn_group(info) {
-            return resp;
         }
         let Some(req) = info.join_requests.get(&request_id) else {
             return not_found("request not found");
@@ -26860,6 +26859,10 @@ async fn treekem_group_encrypt_for_actor(
             if let Some(resp) = reject_unverified_owner_certified_restore(info) {
                 return resp;
             }
+            // #1166 S5 ceiling: TreeKEM helper with an Option<actor>
+            // shape (S3 note 1) — the gate position under this lock is
+            // load-bearing (ADR-0066 epoch capture follows it).
+            #[allow(clippy::disallowed_methods)]
             if let Some(resp) = match actor {
                 Some(actor) => reject_fork_quarantined_for_actor(state, group_id_hex, info, actor),
                 None => reject_fork_quarantined(state, group_id_hex, info),
@@ -27023,6 +27026,9 @@ async fn treekem_group_decrypt_for_actor(
             if let Some(resp) = reject_unverified_owner_certified_restore(info) {
                 return resp;
             }
+            // #1166 S5 ceiling: TreeKEM helper with an Option<actor>
+            // shape (S3 note 1) — same class as the encrypt twin above.
+            #[allow(clippy::disallowed_methods)]
             if let Some(resp) = match actor {
                 Some(actor) => reject_fork_quarantined_for_actor(state, group_id_hex, info, actor),
                 None => reject_fork_quarantined(state, group_id_hex, info),
@@ -27146,6 +27152,11 @@ pub(in crate::server) async fn secure_group_encrypt(
         ..
     } = &actor
     {
+        // #1166 S5 ceiling: the ADR-0039 ladder keeps its handler-side
+        // order (grant → ban → role → delegation → provenance) under
+        // this lock — the S2 ruling, pinned by the rider tests; the
+        // chokepoint's RiderScope label asserts no verified grant.
+        #[allow(clippy::disallowed_methods)]
         if !actor.rider_allows_group(info.stable_group_id()) {
             return forbidden(
                 "rider token is not granted this group (ADR-0039 deny-by-default; Home must be delegated explicitly)",
@@ -54393,10 +54404,10 @@ pub(in crate::server) mod tests {
         {
             let groups = a_state.named_groups.read().await;
             let info = groups.get(&group_id).expect("A holds the group");
-            assert!(
-                require_admin_or_above(info, &a_hex).is_ok(),
-                "A has independent admin authority"
-            );
+            #[allow(clippy::disallowed_methods)]
+            // #1166 S5: authority precondition assert, not admission
+            let a_holds_admin = require_admin_or_above(info, &a_hex).is_ok();
+            assert!(a_holds_admin, "A has independent admin authority");
         }
         assert!(member_treekem_kp(&a_state, &group_id, &member_hex)
             .await

@@ -570,6 +570,9 @@ pub(in crate::server) fn populate_invite_base_state_v4(
 /// credential, exactly like `POST /groups/:id/invite` (its #446 durable
 /// fence). A session bearer (or a rider, or a direct handler call with
 /// no actor context) gets the group OMITTED with a recorded reason.
+// #1166 S5 ceiling: the card-invite mint filter reuses the authority
+// predicate in a background loop (skip-and-count, not refuse) — it is
+// not a route admission gate, so it is not a group_access core.
 pub(in crate::server) async fn get_agent_card(
     State(state): State<Arc<AppState>>,
     actor: Option<axum::extract::Extension<crate::server::rider_auth::ActorContext>>,
@@ -647,6 +650,9 @@ pub(in crate::server) async fn get_agent_card(
                 }
                 let inviter_hex = hex::encode(agent_id.as_bytes());
                 // Only active admins may mint; others are skipped silently.
+                // #1166 S5 ceiling: the card filter is a background
+                // skip-and-count, not route admission — allow at the call.
+                #[allow(clippy::disallowed_methods)]
                 if crate::server::routes::named_groups::require_admin_or_above(info, &inviter_hex)
                     .is_err()
                 {
@@ -699,6 +705,9 @@ pub(in crate::server) async fn get_agent_card(
                 let Some(info) = groups.get(&map_key) else {
                     continue;
                 };
+                // #1166 S5 ceiling: same authority predicate, same
+                // background-mint ruling as phase 1.
+                #[allow(clippy::disallowed_methods)]
                 if crate::server::routes::named_groups::require_admin_or_above(info, &inviter_hex)
                     .is_err()
                 {

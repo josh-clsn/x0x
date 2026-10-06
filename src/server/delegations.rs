@@ -840,29 +840,14 @@ pub(in crate::server) async fn delegate_group_authority(
     // Group snapshot: membership, policy, state binding for the carrier.
     let snapshot = {
         let groups = state.named_groups.read().await;
-        // ADR0066-LOOKUP-WAIVER: row 15 (mint) resolves the group for the WHOLE route: a miss is a 404
-        // before any marker is read, so it fails closed, and the §3b gate six
-        // lines down consumes this same `info`. Same disposition as row 16.
-        let Some(info) = groups.get(&id) else {
-            return not_found("group not found");
+        // #1166 S5: the entry gates (row 15's lookup/withdrawn/§3b
+        // quarantine, waiver and all) moved to the group-access
+        // chokepoint — same order, same bodies, run at this same
+        // position under this same lock.
+        let info = match crate::server::group_access::admit_delegate_route(&state, &groups, &id) {
+            Ok(info) => info,
+            Err(resp) => return resp.into_response(),
         };
-        if info.withdrawn {
-            return not_found("group is withdrawn");
-        }
-        // ADR-0066 §3b row 15: minting NEW authority from a contested
-        // roster is refused, at the same site as the `withdrawn` check
-        // the ADR names. Everything irreversible this handler does comes
-        // later — the delegation id is drawn (`fresh_delegation_id`), the
-        // envelope is signed with the agent key, the carrier's history
-        // row is committed, the index is written and the carrier is
-        // published to the group bus. Refusing here means none of that
-        // runs: no signature exists, no row is written, nothing is
-        // gossiped. R5: immediately, with the §5 message and no grace.
-        if let Some(resp) =
-            crate::server::routes::named_groups::reject_fork_quarantined(&state, &id, info)
-        {
-            return resp.into_response();
-        }
         if info.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic {
             return bad_request("delegation rides the SignedPublic group bus");
         }

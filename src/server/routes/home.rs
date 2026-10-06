@@ -4496,6 +4496,9 @@ pub(in crate::server::routes) mod tests {
     /// loosened to "any non-session actor" while the middleware still
     /// happens to reject riders on its own.
     #[tokio::test]
+    // #1166 S5: fixture PRECONDITION (the rider must hold the grant the
+    // test then proves the seat gate refuses) — not admission logic.
+    #[allow(clippy::disallowed_methods)]
     async fn home_seat_refuses_rider_caller() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let state = owned_state(dir.path(), [0x52; 32]).await?;
