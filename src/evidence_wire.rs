@@ -21,6 +21,9 @@ use tokio::{
 mod decode;
 pub(crate) mod lookup;
 
+#[cfg(test)]
+mod admission_tests;
+
 const MESSAGE_CAP: usize = 32 * 1024;
 // Reserve the frame, decoded vectors, and signed-part verification copies.
 // All requests/replies, including outbound reads, acquire this conservative
