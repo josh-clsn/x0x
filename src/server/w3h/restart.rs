@@ -99,14 +99,27 @@ async fn restart_scenario(sim: &mut Sim, mode: RestartMode) -> Result<()> {
             leaked.len()
         );
     }
+    // The reconnect is awaited inside a barrier. Virtual time is frozen
+    // outside barriers, and B's bootstrap dial to A needs a handshake round
+    // trip of virtual time after B starts, so a check made right after the
+    // restart can never see it. Neither can `wait_seated`: both rosters it
+    // reads are restored from disk and hold at the restart instant.
+    sim.until(
+        "a new A~B connection after B's restart",
+        secs(60),
+        async |s: &Sim| {
+            let opens = s.fabric().link_opens(&a, &b);
+            opens.len() > opens_before && opens.iter().any(|(_, at)| *at >= attached_at)
+        },
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "no new A~B connection after B's restart ({opens_before} opens before, {} after)",
+            sim.fabric().link_opens(&a, &b).len()
+        )
+    })?;
     wait_seated(sim, &group, "B seated again after its restart").await?;
-    let opens = sim.fabric().link_opens(&a, &b);
-    ensure!(
-        opens.len() > opens_before && opens.iter().any(|(_, at)| *at >= attached_at),
-        "no new A~B connection after B's restart ({} opens before, {} after)",
-        opens_before,
-        opens.len()
-    );
     sim.fabric().mark(format!(
         "checkpoint: B seated again as incarnation {incarnation} after a {mode:?} restart"
     ));
