@@ -882,7 +882,9 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
          dm_frames_delivered_to_m={dm_second} dm_dropped={dropped_second} m_final={}",
         m_final.json()
     ));
-    if arm == Arm::GossipOnly {
+    // Cause stages explain a RED; a GREEN receipt must carry no false cause
+    // (the W3-H gate rejects that), so record them only when not applied.
+    if arm == Arm::GossipOnly && !applied {
         receipt.cause(
             "M's G metadata listener is gone (registry and pubsub subscription) after it \
              applied the gossip MemberAdded",
