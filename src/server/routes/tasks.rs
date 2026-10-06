@@ -187,6 +187,10 @@ pub(in crate::server) async fn task_list_fork_quarantine(
 /// set the same precedence on
 /// `delegate_group_authority`, where the quarantine refusal precedes the
 /// ban/role checks.
+/// #1166 S5 ceiling: this shared task-list gate parses the group out of
+/// the task-list `:id`, not a `:id` path param, so it cannot live in
+/// the group-route chokepoint; the call is allow-listed here.
+#[allow(clippy::disallowed_methods)]
 async fn reject_quarantined_task_mutation(
     state: &Arc<AppState>,
     id: &str,
@@ -1490,6 +1494,9 @@ pub(in crate::server) async fn update_task(
         if let Some((_, info)) =
             crate::server::resolve_group_entry_locked(&groups, &scoped.group_id)
         {
+            // #1166 S5 ceiling: ADR-0066 §3b row 17 (delegation-honouring
+            // branch) — task-list ids again, same class as the shared gate.
+            #[allow(clippy::disallowed_methods)]
             if let Some(refused) =
                 crate::server::routes::named_groups::reject_fork_quarantined_for_actor(
                     &state,

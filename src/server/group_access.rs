@@ -722,6 +722,43 @@ pub(in crate::server) fn admit_named_group_members(
     }
 }
 
+/// The details admission with the #447/#458 seat label resolved INSIDE
+/// this module (#1166 S5): the handler (pinned signature) used to call
+/// `local_join_membership_state` by hand and feed the pure core; the
+/// label read is now single-sourced here, under the caller's own lock.
+/// The label is RETURNED because it is response data on this route —
+/// the 200 body embeds `membership_state` for EVERY admitted actor
+/// arm (durable owners included) — so unlike the members sibling it
+/// is computed unconditionally, exactly as the inline code did.
+pub(in crate::server) async fn admit_named_group_details_of_state(
+    state: &AppState,
+    info: &x0x::groups::GroupInfo,
+    actor: &ActorContext,
+) -> (String, Admission) {
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let label = local_join_membership_state(state, info, &local_hex).await;
+    let admission = admit_named_group_details(actor, label);
+    (label.to_string(), admission)
+}
+
+/// The members sibling of [`admit_named_group_details_of_state`]: the
+/// label is only read for session bearers (the other arms ignore it),
+/// exactly the arm shape the handler and extractor arm shared.
+pub(in crate::server) async fn admit_named_group_members_of_state(
+    state: &AppState,
+    info: &x0x::groups::GroupInfo,
+    actor: &ActorContext,
+) -> Admission {
+    match actor {
+        ActorContext::Owner { durable: false } => {
+            let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+            let label = local_join_membership_state(state, info, &local_hex).await;
+            admit_named_group_members(actor, label)
+        }
+        _ => admit_named_group_members(actor, "not_member"),
+    }
+}
+
 /// `GET /groups/:id/delegations` admission (ADR-0040 list, ADR-0066 §3b
 /// row 16 annotate-class). Order is today's: withdrawn → 404 (a withdrawn
 /// shell exposes no delegation authority), session bearer without an
@@ -980,9 +1017,12 @@ pub(in crate::server) fn admit_open_envelope(
 /// The Admin-family gate pair, in today's order: the local daemon's
 /// seat at Admin+ (`require_admin_or_above`'s "admin role required"
 /// 403) THEN the withdrawn 409. Given the already-borrowed group, for
-/// the two sites that hold `info` through a lookup of their own —
+/// the sites that hold `info` through a lookup of their own —
 /// `PATCH …/members/:agent_id/role` (whose target-entry checks come
-/// FIRST today) and `approve_join_request`'s write-lock block.
+/// FIRST today), `approve_join_request`'s write-lock block, and (S5)
+/// the four TreeKEM delegation helpers `add/remove/ban_treekem_*` and
+/// `approve_treekem_join_request`, whose inline pairs this core
+/// absorbed at their exact positions under their own locks.
 pub(in crate::server) fn admin_route_gate(
     info: &x0x::groups::GroupInfo,
     local_agent_hex: &str,
@@ -1219,15 +1259,12 @@ async fn admit_members_route(
     };
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     // Session bearers need the #447/#458 seat label; the other actors are
-    // decided without it (the arm they take ignores the label).
-    let level = match actor {
-        ActorContext::Owner { durable: false } => {
-            let label = local_join_membership_state(state, info, &local_hex).await;
-            admit_named_group_members(actor, label)
-        }
-        _ => admit_named_group_members(actor, "not_member"),
-    }
-    .map_err(IntoResponse::into_response)?;
+    // decided without it (the arm they take ignores the label) — the
+    // same `admit_named_group_members_of_state` arm the handler re-runs
+    // under its own lock (S5 single-sourced the shape).
+    let level = admit_named_group_members_of_state(state, info, actor)
+        .await
+        .map_err(IntoResponse::into_response)?;
     Ok(GroupAccess {
         level,
         stable_id: info.stable_group_id().to_string(),

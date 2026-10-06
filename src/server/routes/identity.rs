@@ -570,6 +570,10 @@ pub(in crate::server) fn populate_invite_base_state_v4(
 /// credential, exactly like `POST /groups/:id/invite` (its #446 durable
 /// fence). A session bearer (or a rider, or a direct handler call with
 /// no actor context) gets the group OMITTED with a recorded reason.
+// #1166 S5 ceiling: the card-invite mint filter reuses the authority
+// predicate in a background loop (skip-and-count, not refuse) — it is
+// not a route admission gate, so it is not a group_access core.
+#[allow(clippy::disallowed_methods)]
 pub(in crate::server) async fn get_agent_card(
     State(state): State<Arc<AppState>>,
     actor: Option<axum::extract::Extension<crate::server::rider_auth::ActorContext>>,
