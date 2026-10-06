@@ -1464,8 +1464,9 @@ impl GroupInfo {
     /// representable to receivers.
     ///
     /// ADR 0108 §4: in a Home scope ([`Self::is_home_scope`]) an anonymous
-    /// announced digest is no disclosure, exactly as in
-    /// [`Self::owner_cert_verdict`], so the two stay consistent.
+    /// announced digest from the agent's bound machine is no disclosure,
+    /// exactly as in [`Self::owner_cert_verdict`], so the two stay
+    /// consistent.
     #[must_use]
     pub fn owner_cert_admission_failures(
         &self,
@@ -1498,7 +1499,8 @@ impl GroupInfo {
                 // different from the embedded cert's digest means the owner
                 // re-keyed/re-issued — the embedded cert is STALE and must
                 // not seat. ADR 0108 §4: in Home scope an anonymous digest
-                // is no announce at all, never a contradiction.
+                // from the agent's bound machine is no announce at all,
+                // never a contradiction.
                 let embedded_is_stale = m.certificate.as_ref().is_some_and(|cert| {
                     evidence
                         .disclosed_digest_for(agent_hex, home_scope)
@@ -1551,11 +1553,14 @@ impl GroupInfo {
     ///
     /// ADR 0108 §4 (the Home verdict rule, #1143): in a committed Home
     /// scope ([`Self::is_home_scope`]) the canonical anonymous announced
-    /// digest is absence of public disclosure, the same as no discovery
-    /// entry ([`owner_cert::OwnerCertEvidence::disclosed_digest_for`]). It
-    /// is never stale against the embedded certificate, never a warranted
-    /// fetch and never starts grace, so a valid embedded certificate is
-    /// `Clean` and its grace stamp is cleared. A certificate-bearing
+    /// digest, announced by the agent's current authenticated bound machine,
+    /// is absence of public disclosure, the same as no discovery entry
+    /// ([`owner_cert::OwnerCertEvidence::disclosed_digest_for`]). That
+    /// digest is never stale against the embedded certificate, never a
+    /// warranted fetch and never starts grace, so a valid embedded
+    /// certificate is `Clean` and its grace stamp is cleared. An anonymous
+    /// digest from any other machine keeps the rule above (ADR 0108's
+    /// premise: only the bound machine can send it). A certificate-bearing
     /// announced digest that differs keeps today's stale handling; invalid,
     /// wrong-owner, wrong-agent, expired or revoked evidence never becomes
     /// `Clean`; digest-only seats stay `DigestPending`. Ordinary groups
@@ -1628,9 +1633,10 @@ impl GroupInfo {
                 per_member.insert(agent_hex, owner_cert::MemberCertStatus::DigestPending);
                 continue;
             }
-            // ADR 0108 §4: in Home scope an anonymous digest is no
-            // announce at all, so it can neither stale the embedded
-            // certificate nor leave a fetch in flight below.
+            // ADR 0108 §4: in Home scope an anonymous digest from the
+            // agent's bound machine is no announce at all, so it can
+            // neither stale the embedded certificate nor leave a fetch in
+            // flight below.
             let embedded_is_stale = embedded.as_ref().is_some_and(|cert| {
                 evidence
                     .disclosed_digest_for(&agent_hex, home_scope)
@@ -3755,14 +3761,26 @@ mod tests {
         }
     }
 
-    /// Evidence holding the creator's canonical anonymous announce digest,
-    /// exactly as the evidence builder records an anonymous announce.
-    fn anonymous_evidence(home: &CommittedHome) -> owner_cert::OwnerCertEvidence {
+    /// Evidence holding the creator's canonical anonymous announce digest
+    /// WITHOUT the bound-machine mark: what the evidence builder records
+    /// for an anonymous announce that another machine signed (ADR 0108 §4's
+    /// premise does not hold for it).
+    fn unbound_anonymous_evidence(home: &CommittedHome) -> owner_cert::OwnerCertEvidence {
         let mut evidence = owner_cert::OwnerCertEvidence::new(home.now_unix);
         evidence.observe_pending_digest(
             home.creator_hex.clone(),
             crate::announce_v3::anonymous_cert_digest(),
         );
+        evidence
+    }
+
+    /// Evidence holding the creator's canonical anonymous announce digest,
+    /// exactly as the evidence builder records an anonymous announce from
+    /// the creator's current authenticated bound machine.
+    fn anonymous_evidence(home: &CommittedHome) -> owner_cert::OwnerCertEvidence {
+        let mut evidence = unbound_anonymous_evidence(home);
+        evidence.observe_bound_machine_anonymous(home.creator_hex.clone());
+        assert!(evidence.anonymous_from_bound_machine(&home.creator_hex));
         evidence
     }
 
@@ -3873,16 +3891,101 @@ mod tests {
             .expect("seal");
         assert!(!info.is_home_scope());
 
+        // Even from the creator's own bound machine: outside a Home the
+        // anonymous digest keeps today's reading.
         let mut evidence = owner_cert::OwnerCertEvidence::new(now_unix);
         evidence.observe_pending_digest(
             creator_hex.clone(),
             crate::announce_v3::anonymous_cert_digest(),
         );
+        evidence.observe_bound_machine_anonymous(creator_hex.clone());
         assert!(matches!(
             creator_status(&mut info, &creator_hex, &evidence),
             owner_cert::MemberCertStatus::InGrace { .. }
         ));
         assert!(missing_since(&info, &creator_hex).is_some());
+    }
+
+    #[test]
+    fn home_anonymous_digest_from_another_machine_keeps_todays_rule() {
+        // WHY (ADR 0108 §4's premise, Codex P2 on #1247): "only the subject
+        // agent's authenticated bound machine can sign its announce". Any
+        // machine can sign a V3 announce naming any agent, so an anonymous
+        // digest the builder did not mark as the bound machine's is no
+        // absence signal. In a committed Home it reads exactly as today:
+        // stale against valid embedded bytes (InGrace, grace starts), and a
+        // fetch in flight for expired ones (InGrace, never the Failed that
+        // the next seal would evict).
+        let mut home = committed_home();
+        let creator = home.creator_hex.clone();
+        let evidence = unbound_anonymous_evidence(&home);
+        assert!(!evidence.anonymous_from_bound_machine(&creator));
+        assert_eq!(
+            evidence.disclosed_digest_for(&creator, true),
+            Some(crate::announce_v3::anonymous_cert_digest())
+        );
+        assert!(evidence.disclosed_fetch_in_flight(&creator, true));
+        assert!(matches!(
+            creator_status(&mut home.info, &creator, &evidence),
+            owner_cert::MemberCertStatus::InGrace { .. }
+        ));
+        assert!(missing_since(&home.info, &creator).is_some());
+
+        let mut info = home.info.clone();
+        seat_bytes(
+            &mut info,
+            &creator,
+            crate::identity::AgentCertificate::issue_with_expiry(
+                &home.owner,
+                &home.creator_kp,
+                Some(1),
+            )
+            .expect("expired cert"),
+        );
+        assert!(info.is_home_scope());
+        assert!(matches!(
+            creator_status(&mut info, &creator, &evidence),
+            owner_cert::MemberCertStatus::InGrace { .. }
+        ));
+    }
+
+    #[test]
+    fn bound_machine_mark_follows_the_recorded_digest() {
+        // WHY: the mark vouches for one recorded anonymous digest. A newer
+        // digest or certificate for the agent replaces what the mark was
+        // about, so it clears the mark; the mark alone, without an
+        // anonymous digest, says nothing.
+        let home = committed_home();
+        let creator = home.creator_hex.clone();
+        let anonymous = crate::announce_v3::anonymous_cert_digest();
+        let mut evidence = owner_cert::OwnerCertEvidence::new(home.now_unix);
+        evidence.observe_bound_machine_anonymous(creator.clone());
+        assert!(
+            !evidence.anonymous_from_bound_machine(&creator),
+            "no digest"
+        );
+
+        evidence.observe_pending_digest(creator.clone(), anonymous);
+        evidence.observe_bound_machine_anonymous(creator.clone());
+        assert!(evidence.anonymous_from_bound_machine(&creator));
+        assert_eq!(evidence.disclosed_digest_for(&creator, true), None);
+
+        evidence.observe_pending_digest(creator.clone(), [0xEE; 32]);
+        evidence.observe_pending_digest(creator.clone(), anonymous);
+        assert!(
+            !evidence.anonymous_from_bound_machine(&creator),
+            "a re-recorded digest needs its own mark"
+        );
+        assert_eq!(
+            evidence.disclosed_digest_for(&creator, true),
+            Some(anonymous)
+        );
+
+        evidence.observe_bound_machine_anonymous(creator.clone());
+        let cert =
+            crate::identity::AgentCertificate::issue(&home.owner, &home.creator_kp).expect("cert");
+        evidence.insert_cert(creator.clone(), cert);
+        assert!(!evidence.anonymous_from_bound_machine(&creator));
     }
 
     #[test]

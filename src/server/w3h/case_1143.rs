@@ -15,7 +15,9 @@
 //!   `OwnerCertMemberPending` naming O, although A held O's bytes:
 //!   `owner_cert_verdict` treated the anonymous announce as contradicting
 //!   the embedded certificate. S2-1's Home verdict rule reads that digest
-//!   as no disclosure in a committed Home (`GroupInfo::is_home_scope`).
+//!   as no disclosure in a committed Home (`GroupInfo::is_home_scope`),
+//!   because O's own bound machine announced it: O's announce reaches A
+//!   signed by O's agent key, so A's listener binds O to O's machine.
 //!
 //! Two tests share the scenario:
 //! - `w3h_1143_positive_control_consented_owner_announce_admits`: the only
@@ -87,8 +89,9 @@ async fn admin_holds_owner_certificate(sim: &Sim, home: &HomeIds) -> Result<(boo
 /// when the resolved certificate passes the owner check, or when the seat's
 /// embedded certificate passes it and is not stale; stale means O's latest
 /// announced digest differs from the embedded certificate's digest, except
-/// that in a committed Home scope the anonymous digest is no disclosure and
-/// never stale (ADR 0108 §4).
+/// that in a committed Home scope an anonymous digest announced by O's
+/// current authenticated bound machine is no disclosure and never stale
+/// (ADR 0108 §4).
 ///
 /// All digests here are announce digests: `blake3(bincode((user_id,
 /// certificate)))` (`announce_v3::cert_digest`), never the roster seat
@@ -109,16 +112,23 @@ struct OwnerView {
     /// Whether A's Home record is a committed Home scope
     /// (`GroupInfo::is_home_scope`), which selects ADR 0108's verdict rule.
     home_scope: bool,
+    /// Whether A's evidence marks O's anonymous digest as announced by O's
+    /// current authenticated bound machine (the ADR 0108 §4 premise; O's
+    /// own announce reaches A signed by O's agent key, so A binds O to O's
+    /// machine).
+    bound_anonymous: bool,
     /// O's status in the verdict (`None`: O is not an active member).
     status: Option<MemberCertStatus>,
 }
 
 impl OwnerView {
     /// The announced digest the verdict reads (ADR 0108 §4: in Home scope
-    /// the anonymous digest is no disclosure).
+    /// the anonymous digest from O's bound machine is no disclosure).
     fn disclosed(&self) -> Option<[u8; 32]> {
         self.announced.filter(|announced| {
-            !(self.home_scope && *announced == crate::announce_v3::anonymous_cert_digest())
+            !(self.home_scope
+                && self.bound_anonymous
+                && *announced == crate::announce_v3::anonymous_cert_digest())
         })
     }
 
@@ -145,7 +155,7 @@ impl OwnerView {
         };
         format!(
             "announced {}; O publishes {}; anonymous {}; resolved {}; seat {} committed={} \
-             home_scope={} stale={}; verdict {} via {}",
+             home_scope={} bound_anonymous={} stale={}; verdict {} via {}",
             self.announced.map_or("none".to_string(), hex8),
             hex8(self.published),
             hex8(crate::announce_v3::anonymous_cert_digest()),
@@ -153,6 +163,7 @@ impl OwnerView {
             cert(self.embedded),
             self.seat_committed,
             self.home_scope,
+            self.bound_anonymous,
             self.stale(),
             self.status
                 .as_ref()
@@ -227,6 +238,7 @@ async fn admin_view_of_owner(sim: &Sim, home: &HomeIds) -> Result<OwnerView> {
         }
     });
     let home_scope = info.is_home_scope();
+    let bound_anonymous = evidence.anonymous_from_bound_machine(&owner_hex);
     let mut clone = info;
     let status = clone
         .owner_cert_verdict(&evidence)
@@ -240,6 +252,7 @@ async fn admin_view_of_owner(sim: &Sim, home: &HomeIds) -> Result<OwnerView> {
         embedded,
         seat_committed,
         home_scope,
+        bound_anonymous,
         status,
     })
 }

@@ -21847,8 +21847,9 @@ async fn owner_certified_seal_with_eviction(
         }
         let evidence = owner_cert_seal_evidence(state, info).await;
         // ADR 0108 §4 (#1143): on the live record, so in a committed Home
-        // an anonymous announce neither graces nor evicts a member whose
-        // embedded certificate verifies.
+        // an anonymous announce from a member's own bound machine neither
+        // graces nor evicts a member whose embedded certificate verifies
+        // (`mark_bound_machine_anonymous_announces`).
         info.owner_cert_verdict(&evidence)
     };
     // The members that remain seated once the Failed set is gone: Clean ∪
@@ -22930,6 +22931,8 @@ pub(in crate::server) async fn owner_cert_evidence_for(
     // ingest-time binding rule: the cached pair was verified against the
     // agent that triggered the fetch, and the digest is attacker-choosable,
     // so the certificate must bind THIS entry's agent id before it counts.
+    let anonymous = x0x::announce_v3::anonymous_cert_digest();
+    let mut anonymous_entries: Vec<AnonymousDiscoveryEntry> = Vec::new();
     {
         let cache = state.agent.identity_discovery_cache();
         let cache = cache.read().await;
@@ -22937,6 +22940,14 @@ pub(in crate::server) async fn owner_cert_evidence_for(
             let entry_hex = hex::encode(entry.agent_id.as_bytes());
             if !wanted.contains(&entry_hex) {
                 continue;
+            }
+            if entry.cert_digest == Some(anonymous) {
+                anonymous_entries.push(AnonymousDiscoveryEntry {
+                    agent_hex: entry_hex.clone(),
+                    agent_id: entry.agent_id,
+                    machine_id: entry.machine_id,
+                    machine_public_key: entry.machine_public_key.clone(),
+                });
             }
             match entry.agent_certificate.as_ref() {
                 Some(cert) => {
@@ -22974,7 +22985,81 @@ pub(in crate::server) async fn owner_cert_evidence_for(
             }
         }
     }
+    mark_bound_machine_anonymous_announces(state, &mut evidence, anonymous_entries, now_unix).await;
     evidence
+}
+
+/// A wanted agent's discovery entry that holds the canonical anonymous
+/// digest, as read under the discovery lock.
+struct AnonymousDiscoveryEntry {
+    agent_hex: String,
+    agent_id: x0x::identity::AgentId,
+    /// The entry's machine id. Routing state: the connector rewrites it to
+    /// whatever machine is connected.
+    machine_id: x0x::identity::MachineId,
+    /// The machine key the entry's latest key-bearing announce carried.
+    /// Only verified announces write it (V3: key ↔ machine id).
+    machine_public_key: Vec<u8>,
+}
+
+/// ADR 0108 §4 (#1143; Codex P2 on #1247): mark each anonymous digest that
+/// the subject's own authenticated bound machine announced.
+///
+/// The Home rule reads an anonymous digest as absence of disclosure because
+/// "only the subject agent's authenticated bound machine can sign its
+/// announce". That needs checking here: a V3 announce is signed by a
+/// machine key alone, and the identity listener caches one for discovery
+/// even when it refuses it as a binding source (not direct-origin), so any
+/// machine can put an anonymous digest for any agent into discovery. An
+/// entry counts only when all of these hold:
+/// - the agent has a retained authenticated binding (its latest
+///   direct-origin identity announce or origin attestation;
+///   `Agent::authenticated_bound_machine`) whose known certificate expiry
+///   has not passed;
+/// - the entry's machine id is that machine, and so is the machine the
+///   entry's machine key derives. The key is the one that verified the
+///   announce; the id alone is routing state the connector can rewrite;
+/// - neither that machine nor the agent's binding to it is revoked.
+///
+/// Any other anonymous digest keeps today's reading (stale against the
+/// embedded certificate, fetch in flight). Each lock is taken alone.
+async fn mark_bound_machine_anonymous_announces(
+    state: &AppState,
+    evidence: &mut x0x::groups::owner_cert::OwnerCertEvidence,
+    entries: Vec<AnonymousDiscoveryEntry>,
+    now_unix: u64,
+) {
+    let mut bound = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(binding) = state
+            .agent
+            .authenticated_bound_machine(&entry.agent_id)
+            .await
+        else {
+            continue;
+        };
+        if x0x::identity::is_expired(binding.cert_not_after, now_unix) {
+            continue;
+        }
+        let signer = ant_quic::MlDsaPublicKey::from_bytes(&entry.machine_public_key)
+            .ok()
+            .map(|key| x0x::identity::MachineId::from_public_key(&key));
+        if entry.machine_id == binding.machine_id && signer == Some(binding.machine_id) {
+            bound.push((entry, binding.machine_id));
+        }
+    }
+    if bound.is_empty() {
+        return;
+    }
+    let revocation_set = state.agent.revocation_set();
+    let revoked = revocation_set.read().await;
+    for (entry, machine) in bound {
+        if !revoked.is_machine_revoked(&machine)
+            && !revoked.is_binding_revoked(&entry.agent_id, &machine)
+        {
+            evidence.observe_bound_machine_anonymous(entry.agent_hex);
+        }
+    }
 }
 
 /// r3 (Codex 8) → r4 (hs-FU-A round 4, Codex r3 addendum item 9): the
@@ -23182,7 +23267,8 @@ pub(in crate::server) async fn seal_commit_owner_certified(
     // ADR 0108 §4 (#1143): `info` is the caller's working copy, which
     // already holds the seat write. Its Home scope is read from metadata,
     // policy and `commit_log` (`GroupInfo::is_home_scope`), never from the
-    // state hash, so an anonymous announce does not block this seal.
+    // state hash, so an anonymous announce from a member's own bound
+    // machine does not block this seal.
     let verdict = info.owner_cert_verdict(&evidence);
     if !verdict.is_all_clean() {
         let group_id = info.stable_group_id().to_string();
@@ -35754,8 +35840,8 @@ fn join_artifact_serving_refusal_for(
 /// certificate a serve relies on. An #842 inline-certificate first join with
 /// no announce has a Clean verdict and is served. ADR 0108 §4 (ADR 0107's
 /// permitted Clean alternative): in a committed Home an anonymous announce
-/// is no disclosure, so it does not withhold either; in an ordinary
-/// OwnerCertified group it still does.
+/// from the recipient's own bound machine is no disclosure, so it does not
+/// withhold either; in an ordinary OwnerCertified group it still does.
 async fn join_artifact_serving_refusal(
     state: &AppState,
     group_id: &str,
