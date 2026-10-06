@@ -679,7 +679,12 @@ impl Sim {
     /// so stray tasks can finish): a daemon state that outlives its stop is
     /// INFRA, because a stopped daemon's tasks could still act on its data
     /// and identity dirs while the next incarnation uses them.
-    pub(crate) async fn stop(&mut self, label: &str, mode: RestartMode) -> Result<()> {
+    ///
+    /// Returns the trace position just after the `fault stop` mark. For a
+    /// crash, the node leaves the fabric at that position: the mark and
+    /// `set_online(false)` run on the test thread with no await between
+    /// them, so no daemon task can write in between.
+    pub(crate) async fn stop(&mut self, label: &str, mode: RestartMode) -> Result<usize> {
         let mode_name = match mode {
             RestartMode::Graceful => "graceful",
             RestartMode::Crash => "crash",
@@ -696,7 +701,7 @@ impl Sim {
             node.router = None;
             (handle, node.peer, node.state.clone())
         };
-        self.fabric.mark(format!("fault stop {label} {mode_name}"));
+        let stop_mark = self.fabric.cut(format!("fault stop {label} {mode_name}"));
         if mode == RestartMode::Crash {
             self.fabric.set_online(&peer, false);
         }
@@ -723,7 +728,7 @@ impl Sim {
             return Err(error);
         }
         self.fabric.mark(format!("stopped {label}"));
-        Ok(())
+        Ok(stop_mark)
     }
 
     /// Start a stopped daemon again on the same data and identity dirs and

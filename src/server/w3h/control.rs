@@ -117,7 +117,7 @@ pub(super) async fn join(sim: &Sim, joiner: &str, link: &str) -> Result<()> {
     Ok(())
 }
 
-async fn open_store(sim: &Sim, label: &str, group: &str) -> Result<String> {
+pub(super) async fn open_store(sim: &Sim, label: &str, group: &str) -> Result<String> {
     let (status, store) = sim
         .api(
             label,
@@ -143,7 +143,7 @@ pub(super) async fn local_membership(sim: &Sim, label: &str, group: &str) -> Opt
 }
 
 /// `POST /groups/:id/stores` without a barrier (for use inside one).
-async fn try_open_store(sim: &Sim, label: &str, group: &str) -> Result<String> {
+pub(super) async fn try_open_store(sim: &Sim, label: &str, group: &str) -> Result<String> {
     let (status, store) = sim
         .request(
             label,
@@ -156,7 +156,7 @@ async fn try_open_store(sim: &Sim, label: &str, group: &str) -> Result<String> {
     Ok(store["id"].as_str().context("store id")?.to_string())
 }
 
-async fn read_value(sim: &Sim, label: &str, store: &str, key: &str) -> Option<String> {
+pub(super) async fn read_value(sim: &Sim, label: &str, store: &str, key: &str) -> Option<String> {
     let (status, body) = sim
         .request(
             label,
@@ -171,6 +171,27 @@ async fn read_value(sim: &Sim, label: &str, store: &str, key: &str) -> Option<St
     }
     let bytes = BASE64.decode(body["value"].as_str()?).ok()?;
     String::from_utf8(bytes).ok()
+}
+
+/// `label` writes `value` under `key` in the group store `store`, inside
+/// its own barrier (the S1 control's write, as a helper).
+pub(super) async fn put_value(
+    sim: &Sim,
+    label: &str,
+    store: &str,
+    key: &str,
+    value: &str,
+) -> Result<()> {
+    let (status, put) = sim
+        .api(
+            label,
+            Method::PUT,
+            &format!("/stores/{}/{}", path_segment(store), path_segment(key)),
+            Some(json!({"value": BASE64.encode(value), "content_type": "text/plain"})),
+        )
+        .await?;
+    ensure!(status.is_success(), "{label} put {key}: {status} {put}");
+    Ok(())
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]

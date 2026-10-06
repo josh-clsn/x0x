@@ -1338,6 +1338,23 @@ impl SimFabric {
             .collect()
     }
 
+    /// Sends refused from `src` whose trace events lie at or after trace
+    /// position `from` (any destination).
+    pub(crate) fn refused_from(&self, src: &PeerId, from: usize) -> Vec<Refusal> {
+        let state = self.lock();
+        state
+            .trace
+            .iter()
+            .skip(from)
+            .filter_map(|event| match event {
+                TraceEvent::Refused { index } => state.refused.get(*index),
+                _ => None,
+            })
+            .filter(|refusal| refusal.src == src.0)
+            .cloned()
+            .collect()
+    }
+
     /// Writes from `src` (any destination, any lane) delivered at or after
     /// `since`, as `(dst, class, seq)`.
     pub(crate) fn delivered_from_since(
@@ -1522,16 +1539,63 @@ impl SimFabric {
         self.lock().nodes.get(&node.0).map(|slot| slot.incarnation)
     }
 
-    /// When `node` was attached as `incarnation`, if it was.
-    pub(crate) fn attached_at(&self, node: &PeerId, incarnation: u64) -> Option<Duration> {
-        self.lock().trace.iter().find_map(|event| match event {
-            TraceEvent::Node {
-                node: at_node,
-                at,
-                kind: NodeEventKind::Attached { incarnation: inc },
-            } if *at_node == node.0 && *inc == incarnation => Some(*at),
-            _ => None,
+    /// The trace position of `node`'s attach as `incarnation`, if it was
+    /// attached so. Restart checks compare trace positions, not virtual
+    /// times: with paused time, events on both sides of a boundary can
+    /// share one instant.
+    pub(crate) fn attach_position(&self, node: &PeerId, incarnation: u64) -> Option<usize> {
+        self.lock().trace.iter().position(|event| {
+            matches!(
+                event,
+                TraceEvent::Node {
+                    node: at_node,
+                    kind: NodeEventKind::Attached { incarnation: inc },
+                    ..
+                } if *at_node == node.0 && *inc == incarnation
+            )
         })
+    }
+
+    /// Ordinals of the `a`~`b` connections opened at trace positions at or
+    /// after `from`.
+    pub(crate) fn link_opens_from(&self, a: &PeerId, b: &PeerId, from: usize) -> Vec<u64> {
+        let key = pair(a.0, b.0);
+        let state = self.lock();
+        state
+            .trace
+            .iter()
+            .skip(from)
+            .filter_map(|event| match event {
+                TraceEvent::Link {
+                    a,
+                    b,
+                    ordinal,
+                    open: true,
+                    ..
+                } if (*a, *b) == key => Some(*ordinal),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Writes from `src` whose trace events lie at positions in `range`.
+    pub(crate) fn writes_from_between(
+        &self,
+        src: &PeerId,
+        range: std::ops::Range<usize>,
+    ) -> Vec<Write> {
+        let state = self.lock();
+        let end = range.end.min(state.trace.len());
+        let start = range.start.min(end);
+        state.trace[start..end]
+            .iter()
+            .filter_map(|event| match event {
+                TraceEvent::Write { index, .. } => state.writes.get(*index),
+                _ => None,
+            })
+            .filter(|write| write.lane.src == src.0)
+            .cloned()
+            .collect()
     }
 
     /// Every connection opened between `a` and `b`, as `(ordinal, at)`.
@@ -2269,7 +2333,7 @@ mod fabric_tests {
         // A restarts: same peer id and address, next incarnation.
         let new_a = fabric.attach(key(1), addr(1));
         assert_eq!(fabric.incarnation_of(&key(1)), Some(1));
-        assert!(fabric.attached_at(&key(1), 1).is_some());
+        assert!(fabric.attach_position(&key(1), 1).is_some());
         assert!(
             old_a.send(&key(2), &[DM, 1]).is_err(),
             "a stale sender is refused"

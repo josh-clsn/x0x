@@ -8,10 +8,13 @@
 //! for (`NoHint`), as ant-quic does with its peer cache disabled.
 //!
 //! The controls, each run 20 times in CI:
-//! - graceful and crash restarts of a seated group member: the member is
-//!   seated again and its owner still lists it, the trace shows the next
-//!   incarnation and a new connection, and after a crash no frame leaves
-//!   the node until it is attached again;
+//! - graceful and crash restarts of a seated group member. Each stop passes
+//!   the drain guard; the trace shows the next incarnation and a new
+//!   connection to the group's owner; fresh group traffic flows both ways
+//!   after the restart (the rosters alone prove nothing: both are restored
+//!   from disk). After a crash, no frame leaves the node between the crash
+//!   mark and its new attach (trace positions, not virtual times, which
+//!   paused time lets events on both sides of a boundary share);
 //! - a negative control for the hint rule: a restarted node cannot dial a
 //!   peer by id until it learns that peer's address;
 //! - a harness guard: a daemon state that outlives its stop is INFRA.
@@ -19,28 +22,41 @@
 #![cfg(test)]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use super::control::{create_group, invite, join, local_membership, members, mesh};
+use super::control::{
+    create_group, invite, join, local_membership, members, mesh, open_store, put_value, read_value,
+    try_open_store,
+};
 use super::*;
 use crate::network::sim::RefusalReason;
 
-/// Seat B in a group A owns, and wait until A lists B and B reports itself
-/// active. Every read must complete and succeed.
-async fn seat_b(sim: &Sim) -> Result<String> {
-    let group = create_group(sim, "A").await?;
-    let link = invite(sim, "A", &group).await?;
-    join(sim, "B", &link).await?;
-    wait_seated(sim, &group, "B seated in A's group").await?;
+/// Seat `member` in a group `owner` creates, and wait until `owner` lists
+/// `member` and `member` reports itself active.
+async fn seat(sim: &Sim, owner: &str, member: &str) -> Result<String> {
+    let group = create_group(sim, owner).await?;
+    let link = invite(sim, owner, &group).await?;
+    join(sim, member, &link).await?;
+    wait_seated(
+        sim,
+        owner,
+        member,
+        &group,
+        &format!("{member} seated in {owner}'s group"),
+    )
+    .await?;
     Ok(group)
 }
 
-async fn wait_seated(sim: &Sim, group: &str, what: &str) -> Result<()> {
-    let b = sim.agent_hex("B")?;
+/// Wait until `owner` lists `member` in `group` and `member` reports itself
+/// active. Every roster read must complete and succeed.
+async fn wait_seated(sim: &Sim, owner: &str, member: &str, group: &str, what: &str) -> Result<()> {
+    let id = sim.agent_hex(member)?;
     let mut seen = Observations::default();
     sim.until(what, secs(180), async |s: &Sim| {
-        let Some(listed) = seen.observe(members(s, "A", group)).await else {
+        let Some(listed) = seen.observe(members(s, owner, group)).await else {
             return true;
         };
-        listed.contains(&b) && local_membership(s, "B", group).await.as_deref() == Some("active")
+        listed.contains(&id)
+            && local_membership(s, member, group).await.as_deref() == Some("active")
     })
     .await?;
     if seen.failed() {
@@ -49,81 +65,135 @@ async fn wait_seated(sim: &Sim, group: &str, what: &str) -> Result<()> {
     Ok(())
 }
 
-/// Restart B in `mode` and check what the restart must show.
-async fn restart_scenario(sim: &mut Sim, mode: RestartMode) -> Result<()> {
-    mesh(sim, &["A", "B", "C"]).await?;
-    let group = seat_b(sim).await?;
-    let (a, b) = (sim.peer("A")?, sim.peer("B")?);
+/// Fresh group traffic after `restarted`'s restart, both ways, through the
+/// group store (the S1 data plane): `peer` opens the store, `restarted`
+/// opens the same store id, `restarted` writes a key `peer` must read, then
+/// `peer` writes a key `restarted` must read. Both keys are new, so only
+/// traffic after the restart can satisfy the reads. This needs the
+/// restarted daemon's group key, its store subscription and its message
+/// processing, which a restored roster does not show.
+async fn fresh_group_traffic(sim: &Sim, group: &str, restarted: &str, peer: &str) -> Result<()> {
+    let store = open_store(sim, peer, group).await?;
+    let mut opened = None;
+    let mut last = String::new();
+    sim.until(
+        &format!("{restarted} opens the group store after its restart"),
+        secs(60),
+        async |s: &Sim| match try_open_store(s, restarted, group).await {
+            Ok(id) => {
+                opened = Some(id);
+                true
+            }
+            Err(error) => {
+                last = format!("{error:#}");
+                false
+            }
+        },
+    )
+    .await
+    .with_context(|| format!("{restarted} last store-open error: {last}"))?;
+    ensure!(
+        opened.as_deref() == Some(store.as_str()),
+        "{restarted} opened a different store id: {opened:?}"
+    );
+    for (writer, reader) in [(restarted, peer), (peer, restarted)] {
+        let key = format!("w3h-after-restart-{writer}");
+        let value = format!("{writer} wrote after {restarted}'s restart");
+        put_value(sim, writer, &store, &key, &value).await?;
+        sim.until(
+            &format!("{reader} reads {writer}'s write after {restarted}'s restart"),
+            secs(120),
+            async |s: &Sim| {
+                read_value(s, reader, &store, &key).await.as_deref() == Some(value.as_str())
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Restart `member`, seated in `owner`'s `group`, in `mode`, and check what
+/// the restart must show.
+async fn restart_member(
+    sim: &mut Sim,
+    owner: &str,
+    member: &str,
+    group: &str,
+    mode: RestartMode,
+) -> Result<()> {
+    let (o, m) = (sim.peer(owner)?, sim.peer(member)?);
     let before = sim
         .fabric()
-        .incarnation_of(&b)
-        .context("B is not on the fabric")?;
-    let opens_before = sim.fabric().link_opens(&a, &b).len();
-    let stopped_at = sim.fabric().now();
-    sim.stop("B", mode).await?;
-    // The fixture seam for torn-write cases: B's files, while it is down.
-    let data = sim.data_dir("B")?;
+        .incarnation_of(&m)
+        .with_context(|| format!("{member} is not on the fabric"))?;
+    let stop_mark = sim.stop(member, mode).await?;
+    // The fixture seam for torn-write cases: the node's files, while it is
+    // down.
+    let data = sim.data_dir(member)?;
     ensure!(
         data.is_dir(),
-        "B's data dir {} is missing while it is stopped",
+        "{member}'s data dir {} is missing while it is stopped",
         data.display()
     );
-    sim.start_again("B").await?;
+    sim.start_again(member).await?;
     let incarnation = sim
         .fabric()
-        .incarnation_of(&b)
-        .context("B is not on the fabric after its restart")?;
+        .incarnation_of(&m)
+        .with_context(|| format!("{member} is not on the fabric after its restart"))?;
     ensure!(
         incarnation == before + 1,
-        "B restarted as incarnation {incarnation}, expected {}",
+        "{member} restarted as incarnation {incarnation}, expected {}",
         before + 1
     );
-    let attached_at = sim
+    let attached = sim
         .fabric()
-        .attached_at(&b, incarnation)
-        .context("no attach event for B's new incarnation")?;
+        .attach_position(&m, incarnation)
+        .with_context(|| format!("no attach event for {member}'s new incarnation"))?;
     if mode == RestartMode::Crash {
-        // Between the crash mark and the new attach, nothing B wrote may
-        // have left it: the crashed daemon was taken off the fabric first.
-        let leaked: Vec<_> = sim
-            .fabric()
-            .writes()
-            .into_iter()
-            .filter(|write| {
-                write.lane.src == b.0 && write.at >= stopped_at && write.at < attached_at
-            })
-            .collect();
+        // Between the crash mark and the new attach, nothing the node wrote
+        // may have left it: the crashed daemon was taken off the fabric
+        // first. Trace positions bound the window, so a write just before
+        // the crash or just after the attach at the same virtual instant
+        // falls on its own side.
+        let leaked = sim.fabric().writes_from_between(&m, stop_mark..attached);
         ensure!(
             leaked.is_empty(),
-            "{} frames left B between its crash and its new incarnation",
+            "{} frames left {member} between its crash and its new incarnation",
             leaked.len()
         );
     }
     // The reconnect is awaited inside a barrier. Virtual time is frozen
-    // outside barriers, and B's bootstrap dial to A needs a handshake round
-    // trip of virtual time after B starts, so a check made right after the
-    // restart can never see it. Neither can `wait_seated`: both rosters it
-    // reads are restored from disk and hold at the restart instant.
+    // outside barriers, and the restarted node's bootstrap dial needs a
+    // handshake round trip of virtual time, so a check made right after the
+    // restart can never see it (CI run 37393307134).
     sim.until(
-        "a new A~B connection after B's restart",
+        &format!("a new {owner}~{member} connection after {member}'s restart"),
         secs(60),
-        async |s: &Sim| {
-            let opens = s.fabric().link_opens(&a, &b);
-            opens.len() > opens_before && opens.iter().any(|(_, at)| *at >= attached_at)
-        },
+        async |s: &Sim| !s.fabric().link_opens_from(&o, &m, attached).is_empty(),
     )
     .await
-    .with_context(|| {
-        format!(
-            "no new A~B connection after B's restart ({opens_before} opens before, {} after)",
-            sim.fabric().link_opens(&a, &b).len()
-        )
-    })?;
-    wait_seated(sim, &group, "B seated again after its restart").await?;
+    .with_context(|| format!("no new {owner}~{member} connection after {member}'s restart"))?;
+    wait_seated(
+        sim,
+        owner,
+        member,
+        group,
+        &format!("{member} seated again after its restart"),
+    )
+    .await?;
+    fresh_group_traffic(sim, group, member, owner).await?;
     sim.fabric().mark(format!(
-        "checkpoint: B seated again as incarnation {incarnation} after a {mode:?} restart"
+        "checkpoint: {member} seated again as incarnation {incarnation} after a {mode:?} \
+         restart, with group traffic both ways"
     ));
     Ok(())
+}
+
+/// Restart B, seated in A's group, in `mode`.
+async fn restart_scenario(sim: &mut Sim, mode: RestartMode) -> Result<()> {
+    mesh(sim, &["A", "B", "C"]).await?;
+    let group = seat(sim, "A", "B").await?;
+    restart_member(sim, "A", "B", &group, mode).await
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -170,13 +240,17 @@ async fn hint_scenario(sim: &mut Sim) -> Result<()> {
     sim.fabric().mark("fault B~C partitioned");
     sim.fabric().set_partitioned(&b, &c, true);
     sim.restart("C", RestartMode::Graceful).await?;
-    let restarted_at = sim.fabric().now();
     let network = sim
         .state("C")?
         .agent
         .network()
         .cloned()
         .context("C has no network")?;
+    // A trace position, not a time: a refusal from before the restart at
+    // the same virtual instant must not count for this dial.
+    let dial_mark = sim
+        .fabric()
+        .cut("C dials B by peer id with no known address");
     let dial = sim
         .at_instant(
             "C dials B by peer id with no known address",
@@ -189,7 +263,7 @@ async fn hint_scenario(sim: &mut Sim) -> Result<()> {
     );
     let refused = sim
         .fabric()
-        .refused_since(&c, restarted_at)
+        .refused_from(&c, dial_mark)
         .into_iter()
         .any(|refusal| refusal.dst == b.0 && refusal.reason == RefusalReason::NoHint);
     ensure!(
