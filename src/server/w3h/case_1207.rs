@@ -1678,7 +1678,29 @@ async fn scenario(
         paths["t_view_of_n_final"] = view(sim, "T", "N").await?.json();
     }
     receipt.note(format!("paths {paths}"));
-    if variant.red_shape() {
+    let evidence_at_h = h_n_final.usable_age.is_some() || h_n_final.captured;
+    let ingress = n_to_h["direct_delivered"].as_u64().unwrap_or(0) > 0
+        || n_to_h["gossip_inbox_publishes"].as_u64().unwrap_or(0) > 0;
+    let in_time = run.done_at.is_some_and(|done| done <= run.deadline);
+    // The path each GREEN must take, where the case names one: with S1,
+    // N's deferred Hello after the release; for the third holder, H's
+    // Lookup answered FOUND by T.
+    let path_ok = match variant {
+        Variant::Race(Order::RosterThenDiscovery) if ready_hello => {
+            run.released.is_some_and(|released| {
+                streams_between(sim, &labels, "H", "N", released)
+                    .iter()
+                    .any(|s| s.starts_with("N->H HELLO"))
+            })
+        }
+        Variant::ThirdHolder => lookups.iter().any(|s| s.starts_with("H->T LOOKUP/FOUND")),
+        _ => true,
+    };
+    let final_passed =
+        run.active && evidence_at_h && ingress && run.decrypted && in_time && path_ok;
+    // Cause stages explain a RED; a GREEN receipt must carry no false cause
+    // (the W3-H gate rejects that), so record them only when not passed.
+    if variant.red_shape() && !final_passed {
         receipt.cause(
             "no EvidenceV1 Hello between H and N after the connect",
             Some(json!(hellos_after).to_string()),
@@ -1713,24 +1735,6 @@ async fn scenario(
             );
         }
     }
-    let evidence_at_h = h_n_final.usable_age.is_some() || h_n_final.captured;
-    let ingress = n_to_h["direct_delivered"].as_u64().unwrap_or(0) > 0
-        || n_to_h["gossip_inbox_publishes"].as_u64().unwrap_or(0) > 0;
-    let in_time = run.done_at.is_some_and(|done| done <= run.deadline);
-    // The path each GREEN must take, where the case names one: with S1,
-    // N's deferred Hello after the release; for the third holder, H's
-    // Lookup answered FOUND by T.
-    let path_ok = match variant {
-        Variant::Race(Order::RosterThenDiscovery) if ready_hello => {
-            run.released.is_some_and(|released| {
-                streams_between(sim, &labels, "H", "N", released)
-                    .iter()
-                    .any(|s| s.starts_with("N->H HELLO"))
-            })
-        }
-        Variant::ThirdHolder => lookups.iter().any(|s| s.starts_with("H->T LOOKUP/FOUND")),
-        _ => true,
-    };
     receipt.note(format!(
         "final: active={} evidence_at_h={evidence_at_h} ingress={ingress} decrypted={} \
          done_at_us={:?} deadline_us={} path_ok={path_ok}",
@@ -1739,11 +1743,7 @@ async fn scenario(
         run.done_at.map(|t| t.as_micros()),
         run.deadline.as_micros()
     ));
-    receipt.finish(
-        FINAL,
-        run.active && evidence_at_h && ingress && run.decrypted && in_time && path_ok,
-        at(sim),
-    );
+    receipt.finish(FINAL, final_passed, at(sim));
     Ok(())
 }
 
