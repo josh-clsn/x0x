@@ -79,10 +79,17 @@
 //! which is what the inline code used.
 //!
 //! `POST /groups/:id/delegate` is the one row still `Unmigrated` (its
-//! handlers live in `routes/delegations.rs`, outside the S4 file set;
-//! the auth middleware already durable-gates it). S5 activates the
-//! `clippy.toml` ceiling that forbids the absorbed helpers everywhere
-//! except this module.
+//! handler lives in `routes/delegations.rs`, outside the S4 file set;
+//! the auth middleware already durable-gates it); it migrates under
+//! S5. S5 also activates the `clippy.toml` `disallowed-methods`
+//! ceiling on the absorbed admission helpers
+//! (`local_join_membership_state`, `require_admin_or_above`,
+//! `reject_fork_quarantined_for_actor`,
+//! `ActorContext::rider_allows_group`): they may be called freely in
+//! this module (the one module-level allow below) and at an explicit,
+//! commented allow site everywhere else — a new inline call anywhere
+//! else is the #821/#870/#877 drift class and fails CI clippy.
+#![allow(clippy::disallowed_methods)]
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1633,6 +1640,39 @@ mod tests {
             router_group_plane_raw(),
             "MatchedPath classification compares patterns byte-for-byte"
         );
+    }
+
+    /// S5: the `clippy.toml` ceiling is build configuration — `cargo
+    /// test` never reads it, so silently deleting or emptying it would
+    /// re-open the inline-admission drift class (#821/#870/#877) with
+    /// every behavioural suite still green. This test pins the four
+    /// disallowed paths (and the controller's two deliberate
+    /// exclusions — review-d condition 2 extended by the S5 caller
+    /// audit) so removing the ceiling is a visible, deliberate edit.
+    #[test]
+    fn disallowed_methods_ceiling_is_pinned() {
+        let config = include_str!("../../clippy.toml");
+        for path in [
+            "x0x::server::routes::named_groups::local_join_membership_state",
+            "x0x::server::routes::named_groups::require_admin_or_above",
+            "x0x::server::routes::named_groups::reject_fork_quarantined_for_actor",
+            "x0x::server::rider_auth::ActorContext::rider_allows_group",
+        ] {
+            assert!(
+                config.contains(&format!("path = \"{path}\"")),
+                "clippy.toml must keep {path} on disallowed-methods — the #1166 ceiling"
+            );
+        }
+        for excluded in [
+            "x0x::server::rider_auth::ActorContext::is_durable_owner",
+            "x0x::groups::GroupInfo::has_active_member",
+        ] {
+            assert!(
+                !config.contains(&format!("path = \"{excluded}\"")),
+                "{excluded} is deliberately NOT ceiling-listed (legitimate non-group / \
+                 domain callers — see clippy.toml's header); listing it needs a new ruling"
+            );
+        }
     }
 
     /// The slice contract: every family through S4 is classified, at
