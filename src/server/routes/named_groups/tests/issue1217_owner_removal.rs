@@ -228,6 +228,12 @@ async fn s1217_removal_revalidates_binding_and_revocation_after_repair() -> anyh
         }
         repair.release();
         tokio::time::timeout(Duration::from_secs(3), send).await??;
+        if change == "revoked_before" {
+            assert!(
+                repair.reached.try_acquire().is_err(),
+                "revoked_before: reached repair despite pre-repair revocation"
+            );
+        }
         x0x::general_cold_barrier::disarm(g.authority.agent.agent_id(), g.joiner.agent.agent_id());
         let delivered = removal_deliveries(&g.authority, &g.joiner)
             .iter()
@@ -266,7 +272,7 @@ async fn s1217_only_local_author_removal_notices_opt_in() -> anyhow::Result<()> 
     let mut self_leave = removal_notice(&g.authority, &g.authority, &g.stable, false);
     let mut relayed = removal_notice(&g.authority, &g.joiner, &g.stable, true);
     if let NamedGroupMetadataEvent::MemberRemoved { actor, .. } = &mut relayed {
-        *actor = hex_of(&g.joiner);
+        *actor = hex::encode([0x5a; 32]);
     }
     let mut deleted = NamedGroupMetadataEvent::GroupDeleted {
         group_id: g.stable.clone(),
