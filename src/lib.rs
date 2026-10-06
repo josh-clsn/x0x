@@ -15744,6 +15744,36 @@ impl Agent {
         machine_id: &identity::MachineId,
         call_caller: Option<&identity::AgentId>,
     ) -> error::NetworkResult<Vec<identity::AgentId>> {
+        Self::gate_peer_machine_inbound_for_evidence(
+            discovery_cache,
+            contact_store,
+            revocation_set,
+            move_state,
+            connect_policy,
+            owner_trust,
+            machine_id,
+            call_caller,
+            false,
+        )
+        .await
+    }
+
+    /// Shared gate with a narrow ADR 0089 mode. Only Unknown relationship
+    /// peers gain evidence admission; every other check remains unchanged.
+    #[allow(clippy::too_many_arguments)]
+    async fn gate_peer_machine_inbound_for_evidence(
+        discovery_cache: &std::sync::Arc<
+            tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+        >,
+        contact_store: &std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+        revocation_set: &std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+        move_state: &std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>>,
+        connect_policy: &std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
+        owner_trust: &owner_trust::OwnerTrust,
+        machine_id: &identity::MachineId,
+        call_caller: Option<&identity::AgentId>,
+        evidence_only: bool,
+    ) -> error::NetworkResult<Vec<identity::AgentId>> {
         // Identity gate — resolve ALL agents on this machine from the
         // discovery cache, then check each (revoked → trust). A single
         // non-Accept agent denies the traffic (fail-closed, #192).
@@ -15821,9 +15851,18 @@ impl Agent {
                     grant_only.push(*agent_id);
                 }
             }
+            let evidence_relationship = evidence_only
+                && pair.decision == trust::TrustDecision::Unknown
+                && evidence_wire::unknown_relationship(
+                    discovery_cache,
+                    owner_trust,
+                    agent_id,
+                    machine_id,
+                )
+                .await;
             let trust_decision = Some(
                 pair.decision
-                    .with_owner_trust(has_connect_grant || has_call_grant),
+                    .with_owner_trust(has_connect_grant || has_call_grant || evidence_relationship),
             );
             let (revoked_agent, revoked_machine) = {
                 let revoked = revocation_set.read().await;
@@ -16129,7 +16168,8 @@ impl Agent {
     }
 
     /// Keep the main gate-first path independent of strangers' prefix reads.
-    /// Known denials never get a pre-identity exception, including EvidenceV1.
+    /// Unknown relationship peers get only a bounded EvidenceV1 prefix probe.
+    /// All other denials remain on the shared gate.
     #[allow(clippy::too_many_arguments)]
     async fn admit_stream_before_prefix(
         discovery_cache: &std::sync::Arc<
@@ -16158,11 +16198,35 @@ impl Agent {
                 owner_trust,
                 machine_id,
             )
-            .await
-            .ok()?;
+            .await;
+            let agents = match agents {
+                Ok(agents) => agents,
+                Err(error::NetworkError::PeerTrustRejected { .. }) => {
+                    Self::gate_peer_machine_inbound_for_evidence(
+                        discovery_cache,
+                        contact_store,
+                        revocation_set,
+                        move_state,
+                        connect_policy,
+                        owner_trust,
+                        machine_id,
+                        None,
+                        true,
+                    )
+                    .await
+                    .ok()?;
+                    return Some(streams::InboundAdmission {
+                        agents: None,
+                        prefix: Some(limits.admit_prefix(*machine_id)?),
+                        evidence_only: true,
+                    });
+                }
+                Err(_) => return None,
+            };
             return Some(streams::InboundAdmission {
                 agents: Some(agents),
                 prefix: None,
+                evidence_only: false,
             });
         }
         if owner_trust
@@ -16172,11 +16236,13 @@ impl Agent {
             return Some(streams::InboundAdmission {
                 agents: None,
                 prefix: None,
+                evidence_only: false,
             });
         }
         Some(streams::InboundAdmission {
             agents: None,
             prefix: Some(limits.admit_prefix(*machine_id)?),
+            evidence_only: false,
         })
     }
 
@@ -16246,6 +16312,33 @@ impl Agent {
         // Acquire both the machine stream slot and aggregate allocation permit
         // before queueing. The lease carries the original body deadline.
         if protocol == streams::StreamProtocol::EvidenceV1 {
+            // Recheck live denials and relationships after the prefix wait.
+            // A previously known machine cannot turn into a stranger bypass
+            // if its discovery entries disappear during that wait.
+            let known = discovery_cache
+                .read()
+                .await
+                .values()
+                .any(|a| a.machine_id == machine_id);
+            let machine_revoked = revocation_set.read().await.is_machine_revoked(&machine_id);
+            if machine_revoked
+                || ((known || admission.agents.is_some() || admission.evidence_only)
+                    && Self::gate_peer_machine_inbound_for_evidence(
+                        &discovery_cache,
+                        &contact_store,
+                        &revocation_set,
+                        &move_state,
+                        &connect_policy,
+                        &owner_trust,
+                        &machine_id,
+                        None,
+                        true,
+                    )
+                    .await
+                    .is_err())
+            {
+                return;
+            }
             if let (Some(sender), Some(lease)) = (
                 incoming.registered_sender(protocol),
                 evidence_limits.admit(
@@ -16351,7 +16444,8 @@ impl Agent {
     /// Called automatically by [`Agent::join_network`]. The loop is the sole
     /// transport acceptor. Known peers clear the identity and ACL gates before
     /// any prefix read. Verified enrollment bypasses the pre-identity pool;
-    /// strangers alone use its two-per-machine, 32-total slots. Body bytes
+    /// strangers and Unknown relationship peers use its two-per-machine,
+    /// 32-total slots. Body bytes
     /// reach only the selected acceptor after protocol admission.
     fn start_stream_accept_loop(&self) {
         if !self.stream_accept.start_once() {

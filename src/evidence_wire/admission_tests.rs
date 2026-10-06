@@ -24,6 +24,7 @@ struct Fixture {
     initiator: Agent,
     responder: Agent,
     context: Arc<Context>,
+    policy: Arc<RuntimePolicy>,
     incoming: Arc<StreamAccept>,
     evidence_acceptor: StreamAcceptor,
     app_acceptor: StreamAcceptor,
@@ -104,7 +105,7 @@ impl Fixture {
         runtime.start(
             dir.path().join("evidence"),
             Default::default(),
-            policy,
+            policy.clone(),
             Arc::clone(&responder.capability_store.evidence_wire),
         );
         assert!(runtime.wait(0).await, "evidence store must finish loading");
@@ -169,6 +170,7 @@ impl Fixture {
             initiator,
             responder,
             context,
+            policy,
             incoming,
             evidence_acceptor,
             app_acceptor,
@@ -192,6 +194,15 @@ impl Fixture {
     }
 
     async fn exchange(&mut self, protocol: StreamProtocol, hello: &Hello) -> Outcome {
+        self.exchange_after_admission(protocol, hello, None).await
+    }
+
+    async fn exchange_after_admission(
+        &mut self,
+        protocol: StreamProtocol,
+        hello: &Hello,
+        denial: Option<Denial>,
+    ) -> Outcome {
         let body = codec().serialize(hello).unwrap();
         let (mut send, mut reply) = tokio::time::timeout(
             Duration::from_secs(10),
@@ -238,6 +249,9 @@ impl Fixture {
         else {
             return Outcome::BeforePrefixRefused;
         };
+        if let Some(denial) = denial {
+            self.deny(denial).await;
+        }
         Agent::dispatch_admitted_stream(
             Arc::clone(&self.incoming),
             Arc::clone(&r.identity_discovery_cache),
@@ -379,31 +393,43 @@ async fn issue1241_stranger_evidence_keeps_current_admission_and_ttl_only_storag
 
 #[tokio::test]
 async fn issue1241_unknown_group_peer_non_evidence_stream_stays_gated() {
-    let mut f = Fixture::new(true, true).await;
-    let outcome = f.exchange(StreamProtocol::SocksV1, &f.hello()).await;
-    f.responder
-        .contact_store
-        .write()
-        .await
-        .set_trust(&f.initiator.agent_id(), TrustLevel::Trusted);
-    let trusted = f.exchange(StreamProtocol::SocksV1, &f.hello()).await;
-    f.shutdown().await;
-    assert!(
-        matches!(
-            outcome,
-            Outcome::BeforePrefixRefused | Outcome::ProtocolRefused
-        ),
-        "Unknown group peer must not reach an application acceptor: {outcome:?}"
-    );
-    assert_eq!(
-        f.context.runtime.diagnostics()["evidence_hello_received"],
-        0
-    );
-    assert_eq!(
-        trusted,
-        Outcome::ApplicationDelivered,
-        "live application acceptor control"
-    );
+    for protocol in [
+        StreamProtocol::ForwardV1,
+        StreamProtocol::SocksV1,
+        StreamProtocol::ForwardV2,
+        StreamProtocol::WebRtcV1,
+        StreamProtocol::SyncV1,
+    ] {
+        let mut f = Fixture::new(true, true).await;
+        if protocol != StreamProtocol::SocksV1 {
+            drop(f.app_acceptor);
+            f.app_acceptor = f.incoming.register(protocol).unwrap();
+        }
+        let outcome = f.exchange(protocol, &f.hello()).await;
+        f.responder
+            .contact_store
+            .write()
+            .await
+            .set_trust(&f.initiator.agent_id(), TrustLevel::Trusted);
+        let trusted = f.exchange(protocol, &f.hello()).await;
+        f.shutdown().await;
+        assert!(
+            matches!(
+                outcome,
+                Outcome::BeforePrefixRefused | Outcome::ProtocolRefused
+            ),
+            "Unknown group peer must not reach an application acceptor: {outcome:?}"
+        );
+        assert_eq!(
+            f.context.runtime.diagnostics()["evidence_hello_received"],
+            0
+        );
+        assert_eq!(
+            trusted,
+            Outcome::ApplicationDelivered,
+            "live application acceptor control"
+        );
+    }
 }
 
 #[tokio::test]
@@ -438,4 +464,286 @@ async fn issue1241_admitted_group_peer_forged_hello_is_not_ingested() {
         0
     );
     assert_eq!(f.context.runtime.diagnostics()["evidence_hello_refused"], 1);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Denial {
+    Blocked,
+    Known,
+    MachinePin,
+    AgentRevoked,
+    MachineRevoked,
+    BindingRevoked,
+    PlacementMoved,
+    Expired,
+    Acl,
+    CoResidentBlocked,
+    RelationshipRemoved,
+    DiscoveryRemoved,
+}
+
+impl Fixture {
+    async fn deny(&self, denial: Denial) {
+        use crate::revocation::{RevocationRecord, RevokedSubject};
+        let r = &self.responder;
+        let agent = self.initiator.agent_id();
+        let machine = self.initiator.machine_id();
+        match denial {
+            Denial::Blocked | Denial::Known | Denial::MachinePin => {
+                let mut contacts = r.contact_store.write().await;
+                contacts.set_trust(
+                    &agent,
+                    match denial {
+                        Denial::Blocked => TrustLevel::Blocked,
+                        Denial::Known => TrustLevel::Known,
+                        _ => TrustLevel::Unknown,
+                    },
+                );
+                if matches!(denial, Denial::MachinePin) {
+                    contacts.set_identity_type(&agent, crate::contacts::IdentityType::Pinned);
+                }
+            }
+            Denial::AgentRevoked | Denial::MachineRevoked => {
+                let (subject, public, secret) = if matches!(denial, Denial::AgentRevoked) {
+                    (
+                        RevokedSubject::Agent(agent),
+                        self.initiator.identity.agent_keypair().public_key(),
+                        self.initiator.identity.agent_keypair().secret_key(),
+                    )
+                } else {
+                    (
+                        RevokedSubject::Machine(machine),
+                        self.initiator.identity.machine_keypair().public_key(),
+                        self.initiator.identity.machine_keypair().secret_key(),
+                    )
+                };
+                let record = RevocationRecord::sign(
+                    subject,
+                    public,
+                    secret,
+                    dm_capability::now_unix_ms() / 1000,
+                    None,
+                )
+                .unwrap();
+                r.revocation_set
+                    .write()
+                    .await
+                    .verify_and_insert(record, None)
+                    .unwrap();
+            }
+            Denial::BindingRevoked => {
+                r.revocation_set.write().await.union_bundle_retired(&[
+                    crate::revocation::AgentMachineBinding {
+                        agent,
+                        machine,
+                        move_epoch: 1,
+                    },
+                ]);
+            }
+            Denial::PlacementMoved => {
+                let owner = crate::identity::UserKeypair::generate().unwrap();
+                let record = crate::key_move::PlacementRecord::sign(
+                    agent,
+                    owner.public_key().as_bytes(),
+                    crate::key_move::Placement::Pinned(MachineId([99; 32])),
+                    1,
+                    dm_capability::now_unix_ms() / 1000,
+                    owner.secret_key(),
+                )
+                .unwrap();
+                r.move_state
+                    .write()
+                    .await
+                    .cache_placement(
+                        record,
+                        crate::key_move::PlacementAuthority::local_owner(&owner),
+                    )
+                    .unwrap();
+            }
+            Denial::Expired => {
+                r.identity_discovery_cache
+                    .write()
+                    .await
+                    .get_mut(&agent)
+                    .unwrap()
+                    .cert_not_after = Some(1);
+            }
+            Denial::Acl => {
+                r.set_connect_policy(Arc::new(crate::connect::ConnectPolicy::Enabled(
+                    crate::connect::ConnectAcl {
+                        loaded_from: "/test".into(),
+                        loaded_at_unix_ms: 0,
+                        allow: Vec::new(),
+                        owner_allow: Vec::new(),
+                        grant_allow: Vec::new(),
+                    },
+                )));
+            }
+            Denial::CoResidentBlocked => {
+                let other = AgentId([255; 32]);
+                let mut entry = r.identity_discovery_cache.read().await[&agent].clone();
+                entry.agent_id = other;
+                r.identity_discovery_cache
+                    .write()
+                    .await
+                    .insert(other, entry);
+                r.contact_store
+                    .write()
+                    .await
+                    .set_trust(&other, TrustLevel::Blocked);
+            }
+            Denial::RelationshipRemoved => self.policy.set_groups(Arc::new(|_| Some(false))),
+            Denial::DiscoveryRemoved => {
+                r.identity_discovery_cache.write().await.clear();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn issue1241_evidence_exception_preserves_and_rechecks_denials() {
+    for denial in [
+        Denial::Blocked,
+        Denial::Known,
+        Denial::MachinePin,
+        Denial::AgentRevoked,
+        Denial::MachineRevoked,
+        Denial::BindingRevoked,
+        Denial::PlacementMoved,
+        Denial::Expired,
+        Denial::Acl,
+        Denial::CoResidentBlocked,
+        Denial::RelationshipRemoved,
+        Denial::DiscoveryRemoved,
+    ] {
+        for after_prefix_admission in [false, true] {
+            // No discovery has its existing stranger path; test its removal
+            // only AFTER admission as a known Unknown relationship peer.
+            if !after_prefix_admission && matches!(denial, Denial::DiscoveryRemoved) {
+                continue;
+            }
+            let mut f = Fixture::new(true, true).await;
+            if !after_prefix_admission {
+                f.deny(denial).await;
+            }
+            let outcome = f
+                .exchange_after_admission(
+                    StreamProtocol::EvidenceV1,
+                    &f.hello(),
+                    after_prefix_admission.then_some(denial),
+                )
+                .await;
+            f.shutdown().await;
+            assert_eq!(
+                outcome,
+                if after_prefix_admission {
+                    Outcome::ProtocolRefused
+                } else {
+                    Outcome::BeforePrefixRefused
+                },
+                "{denial:?}, after admission: {after_prefix_admission}"
+            );
+            assert_eq!(
+                f.context.runtime.diagnostics()["evidence_hello_received"],
+                0
+            );
+            assert!(f
+                .store()
+                .usable_agent(f.initiator.agent_id(), dm_capability::now_unix_ms())
+                .is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn issue1241_unknown_relationship_prefix_slots_are_bounded_and_released() {
+    let f = Fixture::new(true, true).await;
+    let r = &f.responder;
+    let machine = f.initiator.machine_id();
+    let admit = || {
+        Agent::admit_stream_before_prefix(
+            &r.identity_discovery_cache,
+            &r.contact_store,
+            &r.revocation_set,
+            &r.move_state,
+            &r.connect_policy,
+            &r.owner_trust,
+            &machine,
+            &f.context.runtime.wire_limits,
+        )
+    };
+    let first = admit().await.expect("first prefix slot");
+    assert!(first.agents.is_none() && first.prefix.is_some() && first.evidence_only);
+    let second = admit().await.expect("second prefix slot");
+    assert!(
+        admit().await.is_none(),
+        "third same-machine prefix must reset"
+    );
+    drop(first);
+    let replacement = admit().await.expect("dropped slot is reusable");
+    let others: Vec<_> = (0..30)
+        .map(|id| {
+            f.context
+                .runtime
+                .wire_limits
+                .admit_prefix(MachineId([id; 32]))
+                .unwrap()
+        })
+        .collect();
+    assert!(f
+        .context
+        .runtime
+        .wire_limits
+        .admit_prefix(MachineId([31; 32]))
+        .is_none());
+    drop(others);
+    drop(second);
+    drop(replacement);
+    assert!(admit().await.is_some());
+    f.shutdown().await;
+}
+
+#[tokio::test]
+async fn issue1241_roster_alone_does_not_trigger_outbound_hello() {
+    let mut f = Fixture::new(true, true).await;
+    let machine = f.initiator.machine_id();
+    assert!(
+        f.context.related(machine).await,
+        "fresh discovery resolves the roster peer"
+    );
+    f.responder.identity_discovery_cache.write().await.clear();
+    assert!(f.store().related(
+        f.initiator.agent_id(),
+        machine,
+        None,
+        dm_capability::now_unix_ms()
+    ));
+    assert!(
+        !f.context.related(machine).await,
+        "a roster agent without a machine mapping cannot trigger Hello"
+    );
+    let outcome = f.exchange(StreamProtocol::EvidenceV1, &f.hello()).await;
+    f.shutdown().await;
+    assert_eq!(outcome, Outcome::HelloVerified);
+    assert!(
+        f.context.related(machine).await,
+        "an inbound verified Hello supplies the missing evidence"
+    );
+    assert!(
+        f.responder
+            .authenticated_machine_bindings
+            .read()
+            .await
+            .peek(&f.initiator.agent_id())
+            .is_none(),
+        "Hello supplies evidence, not a live binding-cache insertion"
+    );
+    assert!(f
+        .store()
+        .usable(
+            f.initiator.agent_id(),
+            machine,
+            dm_capability::now_unix_ms()
+        )
+        .is_some());
 }
