@@ -4446,6 +4446,19 @@ impl NetworkNode {
             .map_err(|e| NetworkError::NodeError(format!("open_bi: {e}")))
     }
 
+    /// Current transport generation for readiness fencing (QUIC and Sim).
+    /// Busy/uninitialized state is distinct from an absent connection, so a
+    /// transient read failure cannot clear a live connection's Hello marker.
+    /// The outer node read uses try_read; the inner generation lookup briefly
+    /// takes the ant-quic lifecycle lock or the Sim fabric lock.
+    pub(crate) fn try_connection_generation(&self, peer_id: &AntPeerId) -> Result<Option<u64>, ()> {
+        let node = self.node.try_read().map_err(|_| ())?;
+        let node = node.as_ref().ok_or(())?;
+        Ok(node
+            .current_connection_generation(peer_id)
+            .filter(|generation| *generation != STALE_GENERATION_SENTINEL))
+    }
+
     /// Test-only: open a raw application byte-stream WITHOUT writing the
     /// protocol prefix. Used by the FIX 1 regression to simulate a peer that
     /// opens a QUIC stream and never sends the prefix (the accept-loop

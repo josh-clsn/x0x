@@ -21,6 +21,7 @@ enum Outcome {
 
 struct Fixture {
     _dir: tempfile::TempDir,
+    _fabric: Option<Arc<crate::network::sim::SimFabric>>,
     initiator: Agent,
     responder: Agent,
     context: Arc<Context>,
@@ -36,7 +37,22 @@ impl Fixture {
     }
 
     async fn new_with_load(related: bool, discovered: bool, loaded: bool) -> Self {
+        Self::new_with_transport(related, discovered, loaded, false).await
+    }
+
+    async fn new_with_transport(
+        related: bool,
+        discovered: bool,
+        loaded: bool,
+        simulated: bool,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
+        let plane = format!("s1-{}", dir.path().display());
+        let fabric = simulated.then(|| {
+            let fabric = crate::network::sim::SimFabric::new(1207);
+            crate::network::sim::register(&plane, &fabric);
+            fabric
+        });
         let mut agents = Vec::new();
         for name in ["initiator", "responder"] {
             let path = dir.path().join(name);
@@ -51,7 +67,20 @@ impl Fixture {
                     .with_contact_store_path(path.join("contacts.json"))
                     .with_peer_cache_disabled()
                     .with_network_config(crate::network::NetworkConfig {
-                        bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+                        bind_addr: Some(
+                            if simulated {
+                                if name == "initiator" {
+                                    "198.18.0.1:5483"
+                                } else {
+                                    "198.18.0.2:5483"
+                                }
+                            } else {
+                                "127.0.0.1:0"
+                            }
+                            .parse()
+                            .unwrap(),
+                        ),
+                        network_id: simulated.then(|| plane.clone()),
                         bootstrap_nodes: Vec::new(),
                         mdns_enabled: false,
                         port_mapping_enabled: false,
@@ -173,6 +202,7 @@ impl Fixture {
         assert_eq!(connected.0, responder.machine_id().0);
         Self {
             _dir: dir,
+            _fabric: fabric,
             initiator,
             responder,
             context,
@@ -754,17 +784,15 @@ async fn issue1241_roster_alone_does_not_trigger_outbound_hello() {
         .is_some());
 }
 
-// S1's test switch is local to the synchronous start call. It neither mutates
-// process environment nor changes another test's agent. Main ignores it; the
-// fix reads it at the same seam as the daemon's operational opt-in.
-thread_local! {
-    static READY_HELLO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
+// Capture the same per-runtime opt-in as daemon startup. This neither mutates
+// process environment nor changes another test's agent.
 fn start_ready_wire(agent: &Agent, enabled: bool) {
-    READY_HELLO.with(|flag| flag.set(enabled));
+    agent
+        .peer_evidence()
+        .wire_limits
+        .ready_hello
+        .store(enabled, std::sync::atomic::Ordering::Release);
     agent.start_evidence_wire();
-    READY_HELLO.with(|flag| flag.set(false));
 }
 
 impl Fixture {
@@ -993,6 +1021,23 @@ async fn issue1207_busy_roster_and_change_flood_coalesce() {
 }
 
 #[tokio::test]
+async fn issue1207_sim_transport_late_readiness_exchanges_real_hello() {
+    let f = Fixture::new_with_transport(false, true, true, true).await;
+    assert!(
+        f.responder
+            .network()
+            .unwrap()
+            .peer_link_conn(&ant_quic::PeerId(f.initiator.machine_id().0))
+            .await
+            .is_err(),
+        "this control must use Sim, with no QUIC handle"
+    );
+    f.ready_wire(true, true, true).await;
+    f.roster_ready();
+    f.one_exchange().await;
+}
+
+#[tokio::test]
 async fn issue1207_late_readiness_preserves_denials() {
     for denial in [
         Denial::Blocked,
@@ -1006,8 +1051,13 @@ async fn issue1207_late_readiness_preserves_denials() {
     ] {
         let f = Fixture::new(false, true).await;
         f.ready_wire(true, false, true).await;
-        f.roster_ready();
-        f.deny(denial).await;
+        if matches!(denial, Denial::RelationshipRemoved) {
+            f.roster_ready();
+            f.deny(denial).await;
+        } else {
+            f.deny(denial).await;
+            f.roster_ready();
+        }
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert_eq!(f.sent(), 0, "denial must prevent emission: {denial:?}");
         assert!(f
