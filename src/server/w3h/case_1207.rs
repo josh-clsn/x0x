@@ -119,10 +119,14 @@
 //!   on disk: H is eligible at the second connect, and the same
 //!   either-direction exchange completes.
 //! - Authorized third holder: T, a G0 member that holds N's live record
-//!   and knows H (both from Hellos at T's own restart), answers H's
+//!   and can resolve H (both from Hellos at T's own restart), answers H's
 //!   Lookup for N (lookup.rs:281-302, :496-508). A Lookup responder serves
-//!   only a live record, so T restarts past N's 60 s Hello window from
-//!   N's setup restart, and the case requires both of T's records live.
+//!   only a live record, so T restarts before N's setup restart (after
+//!   it, N would never Hello T again: its per-machine attempt marker is
+//!   cleared only by a local disconnect), and N's restart comes 61 s
+//!   later, past T's inbound Hello gate. The case requires exactly what
+//!   the responder needs (`third_holder_ready`); the final still needs H's
+//!   Lookup answered FOUND by T.
 //!
 //! # GREEN, RED, flag
 //!
@@ -333,10 +337,10 @@ struct View {
     stored: bool,
     /// Age (s) of the usable stored record's announcement, if any.
     usable_age: Option<u64>,
-    /// The store's live record of the peer, from a Hello this incarnation
-    /// verified (`PeerEvidenceStore::live`): the only record a Lookup
-    /// responder serves; the persisted map is not consulted
-    /// (lookup.rs:496-508).
+    /// The store's live record of the peer: current-incarnation verified
+    /// live evidence (`PeerEvidenceStore::live`, peer_evidence.rs:875-897),
+    /// the only record a Lookup responder serves; the persisted map is not
+    /// consulted (lookup.rs:496-508).
     live: bool,
     /// A network-verified Hello/advert capture of the peer (TTL-only).
     captured: bool,
@@ -867,6 +871,30 @@ async fn release_discovery(sim: &Sim, stage: &Stage) -> Result<usize> {
     Ok(position)
 }
 
+/// What T needs to answer H's Lookup for N with FOUND, and nothing more:
+/// - N's live record: `lookup_reply` serves `PeerEvidenceStore::live` only
+///   (lookup.rs:342-350, :496-508);
+/// - an authorized requester: T resolves H's machine (`peer`, lookup.rs:
+///   129-170: an authenticated binding or a discovery entry naming H's
+///   machine, else a usable stored record, as `raw_delivery_with_evidence`
+///   orders them, lib.rs:4468-4487) and shares a context with H, and H
+///   with N (`authorized`, lookup.rs:281-302). G0 relates all three.
+///
+/// H's own live record at T is not required.
+async fn third_holder_ready(sim: &Sim) -> Result<(bool, Value)> {
+    let t_n = view(sim, "T", "N").await?;
+    let t_h = view(sim, "T", "H").await?;
+    let serves_n = t_n.live && t_n.relation;
+    let binding_names_h = t_h.registry || t_h.discovery.is_some_and(|(_, same)| same);
+    let no_binding = !t_h.registry && t_h.discovery.is_none();
+    let resolves_h = t_h.relation && (binding_names_h || (no_binding && t_h.usable_age.is_some()));
+    Ok((
+        serves_n && resolves_h,
+        json!({"serves_n": serves_n, "resolves_h": resolves_h,
+            "t_view_of_n": t_n.json(), "t_view_of_h": t_h.json()}),
+    ))
+}
+
 /// Whether `observer`'s capability registry says `peer`'s machine supports
 /// `peer_evidence_v1` (`None`: no current verified advert).
 fn peer_bit(sim: &Sim, observer: &str, peer: &str) -> Result<Option<bool>> {
@@ -1056,6 +1084,41 @@ async fn scenario(
         .await?,
         "setup: N never saw its promotion"
     );
+    if variant == Variant::ThirdHolder {
+        // T restarts before N does. Its restart runs Hellos with N and H
+        // (neither has sent T one before), so T holds N's live record.
+        // The other order fails: N's restart sends T a Hello, which sets
+        // N's per-machine `attempted` for T; only a PeerDisconnected clears
+        // it (evidence_wire.rs:359-366, :1450), and x0x emits that only for
+        // a local disconnect or eviction (network.rs:1942, :3662), never for
+        // a remote close. So N never sent T's next incarnation a Hello and
+        // answered T's with ACK (evidence_wire.rs:887-909): the 90e1221 runs
+        // left T with only N's persisted record, which a Lookup responder
+        // never serves (lookup.rs:496-508).
+        sim.restart("T", RestartMode::Graceful).await?;
+        // T bootstraps to N; H normally redials T. If it has not within
+        // 10 s, T dials H, so a Hello can run on that link.
+        relink(sim, "T", &["H"]).await?;
+        ensure!(
+            wait_for(
+                sim,
+                "T serves N's live record and can authorize H",
+                SETUP,
+                async |s: &Sim| third_holder_ready(s).await.is_ok_and(|(ok, _)| ok)
+            )
+            .await?,
+            "setup: T never held N's live record with H authorizable"
+        );
+        // N's restart then sends T a Hello; T's inbound gate for N
+        // (evidence_wire.rs:36, :305-323) clears first, so T takes it and
+        // holds N's current-incarnation record.
+        sim.within(
+            "T's Hello window toward N expires",
+            HELLO_WINDOW + secs(1),
+            tokio::time::sleep(HELLO_WINDOW),
+        )
+        .await?;
+    }
     // N restarts on its own directories before it mints H's invite (see
     // "N's metadata listener" in the module doc): if N's own P seat was
     // applied through its P metadata listener, that listener exited, and
@@ -1066,6 +1129,7 @@ async fn scenario(
     receipt.note(format!(
         "setup: N's P metadata listener before N's restart: live={n_listener_before}"
     ));
+    let n_restarted_at = sim.fabric().now();
     sim.restart("N", RestartMode::Graceful).await?;
     let others: Vec<&str> = all.iter().copied().filter(|l| *l != "N").collect();
     relink(sim, "N", &others).await?;
@@ -1092,37 +1156,24 @@ async fn scenario(
     // Control setups that need a Hello before the case restart.
     match variant {
         Variant::ThirdHolder => {
-            // N's setup restart ran Hellos with T. Each side takes one
-            // inbound Hello per machine per HELLO_INTERVAL and sends at most
-            // one (evidence_wire.rs:36, :305-323, :336-357), so a T restart
-            // inside that window gets no Hello from N and keeps only N's
-            // persisted record, which a Lookup responder never serves
-            // (lookup.rs:496-508): the 25cceac runs answered H NOT_FOUND.
-            // T restarts after the window.
-            sim.within(
-                "N's Hello window toward T expires",
-                HELLO_WINDOW + secs(1),
-                tokio::time::sleep(HELLO_WINDOW),
-            )
-            .await?;
-            sim.restart("T", RestartMode::Graceful).await?;
-            // T bootstraps to N; H normally redials T. If it has not
-            // within 10 s, T dials H, so a Hello can run on that link.
-            relink(sim, "T", &["H"]).await?;
+            // Still true after N's restart (T was set up before it).
             ensure!(
                 wait_for(
                     sim,
-                    "T holds N's and H's live records",
+                    "T still serves N's live record and can authorize H",
                     SETUP,
-                    async |s: &Sim| {
-                        let n = view(s, "T", "N").await.is_ok_and(|v| v.live);
-                        let h = view(s, "T", "H").await.is_ok_and(|v| v.live);
-                        n && h
-                    }
+                    async |s: &Sim| third_holder_ready(s).await.is_ok_and(|(ok, _)| ok)
                 )
                 .await?,
-                "setup: T never held both N's and H's live records"
+                "setup: after N's restart, T no longer held N's live record with H authorizable"
             );
+            let t_n = view(sim, "T", "N").await?;
+            let since_n_restart = sim.fabric().now().saturating_sub(n_restarted_at).as_secs();
+            receipt.note(format!(
+                "setup: T's record of N: age {:?} s, N restarted {since_n_restart} s ago \
+                 (current incarnation when the age is not larger)",
+                t_n.usable_age
+            ));
         }
         Variant::PersistedEvidence => {
             sim.restart("H", RestartMode::Graceful).await?;
@@ -1245,6 +1296,11 @@ async fn scenario(
         at_connect["h_view_of_t"] = view(sim, "H", "T").await?.json();
         at_connect["counters"]["T"] = evidence_counters(sim, "T")?;
     }
+    let third_holder_at_connect = if variant == Variant::ThirdHolder {
+        Some(third_holder_ready(sim).await?)
+    } else {
+        None
+    };
 
     // Releases and the join.
     if variant == Variant::Race(Order::DiscoveryThenRoster) {
@@ -1433,6 +1489,14 @@ async fn scenario(
         eligibility.to_string(),
         at(sim),
     );
+    if let Some((ready, detail)) = &third_holder_at_connect {
+        receipt.evidence(
+            "t_serves_n_and_can_authorize_h_at_connect",
+            *ready,
+            detail.to_string(),
+            at(sim),
+        );
+    }
     let first_release = run.released.unwrap_or(run.join).min(run.join);
     let (hello_ok, hello_expectation) = match variant {
         // Which side was eligible is the eligibility stage's; the opener
