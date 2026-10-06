@@ -234,8 +234,10 @@ pub(crate) struct SimNode {
 /// and agent (no strong references left), the EXCLUSIVE lock the history
 /// database takes at open (`history::store`; held, it fails the restart as
 /// `HistoryInit`), and the data-dir and identity-dir instance locks (#601,
-/// #645). Each lock is probed through its production acquire path and
-/// released at once.
+/// #645). The locks are observed, never taken for real: a probe creates,
+/// writes, migrates and repairs nothing, so the restart sees the files
+/// exactly as the stopped daemon left them ([`history_lock_held`],
+/// [`instance_lock_held`]).
 struct Release {
     state: Weak<AppState>,
     agent: Weak<crate::Agent>,
@@ -262,29 +264,92 @@ impl Release {
         if !held.is_empty() {
             return held;
         }
-        // A missing database (history off) holds no lock; the probe must
-        // not create one.
-        if self.history_db.exists() {
-            if let Err(error) = crate::history::store::Store::open_with_busy_timeout(
-                &self.history_db,
-                Duration::ZERO,
-            ) {
-                held.push(format!(
-                    "history db {} ({error})",
-                    self.history_db.display()
-                ));
-            }
+        match history_lock_held(&self.history_db) {
+            Ok(false) => {}
+            Ok(true) => held.push(format!("history db {} (locked)", self.history_db.display())),
+            Err(error) => held.push(format!(
+                "history db {} (probe failed: {error})",
+                self.history_db.display()
+            )),
         }
-        if let Err(error) = super::instance_lock::InstanceLock::acquire(&self.data_dir) {
-            held.push(format!("data-dir instance lock ({error})"));
-        }
-        if let Some(dir) = &self.identity_dir {
-            if let Err(error) = super::instance_lock::InstanceLock::acquire_identity(dir) {
-                held.push(format!("identity-dir instance lock ({error})"));
+        let locks = std::iter::once(("data-dir", &self.data_dir))
+            .chain(self.identity_dir.iter().map(|dir| ("identity-dir", dir)));
+        for (what, dir) in locks {
+            let path = dir.join(super::instance_lock::INSTANCE_LOCK_FILE);
+            match instance_lock_held(&path) {
+                Ok(false) => {}
+                Ok(true) => held.push(format!("{what} instance lock {} (locked)", path.display())),
+                Err(error) => held.push(format!(
+                    "{what} instance lock {} (probe failed: {error})",
+                    path.display()
+                )),
             }
         }
         held
     }
+}
+
+/// Whether some connection holds SQLite's lock on the database at `path`,
+/// observed without changing anything. A missing file holds no lock (and
+/// is not created). Otherwise the existing file is opened read-only, never
+/// created, with a zero busy timeout, and the probe connection is put in
+/// `locking_mode = EXCLUSIVE` (a connection setting; it writes nothing) so
+/// that it never uses a `-shm` file. Then a trivial read:
+/// - another connection's lock (the history store holds one from open to
+///   close) refuses the read's SHARED lock: `SQLITE_BUSY`/`SQLITE_LOCKED`,
+///   held;
+/// - otherwise SQLite would next need the EXCLUSIVE lock to open the WAL,
+///   which a read-only file cannot take, so the read fails with an I/O
+///   error before any `-wal` file is created; that, or a completed read,
+///   means not held.
+///
+/// SQLite tracks the locks of every connection in this process per file,
+/// so a holder in this process (every sim daemon) is seen, as is one in
+/// another process (the kernel lock).
+fn history_lock_held(path: &std::path::Path) -> std::result::Result<bool, String> {
+    use rusqlite::{Connection, ErrorCode, OpenFlags};
+    if !path.exists() {
+        return Ok(false);
+    }
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("read-only open: {error}"))?;
+    conn.busy_timeout(Duration::ZERO)
+        .map_err(|error| format!("busy timeout: {error}"))?;
+    conn.execute_batch("PRAGMA locking_mode = EXCLUSIVE;")
+        .map_err(|error| format!("locking mode: {error}"))?;
+    let read = conn.query_row("SELECT 1 FROM sqlite_master LIMIT 1", [], |_| Ok(()));
+    Ok(matches!(
+        read,
+        Err(rusqlite::Error::SqliteFailure(failure, _))
+            if matches!(failure.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    ))
+}
+
+/// Whether the instance lock file at `path` is locked, observed without
+/// changing it. A missing file is not held (and is not created). Otherwise
+/// the existing file is opened read-only (never created or truncated) and
+/// the production lock primitive ([`crate::file_lock::try_lock_exclusive`],
+/// a non-blocking `flock`, per open file description, so a holder in this
+/// process is seen) is tried; a lock it gets is released when the file
+/// closes, with the file's bytes and times untouched.
+#[cfg(unix)]
+fn instance_lock_held(path: &std::path::Path) -> std::io::Result<bool> {
+    let file = match std::fs::OpenOptions::new().read(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    Ok(!crate::file_lock::try_lock_exclusive(&file)?)
+}
+
+/// Windows' instance lock is a share-mode open, which an observer cannot
+/// test without holding the file itself; W3-H daemon cases run on Linux.
+#[cfg(not(unix))]
+fn instance_lock_held(_path: &std::path::Path) -> std::io::Result<bool> {
+    Ok(false)
 }
 
 /// Identity material written into a node's identity directory before its

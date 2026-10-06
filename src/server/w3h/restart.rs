@@ -438,3 +438,115 @@ async fn w3h_s3_restart_reports_a_held_history_lock_as_infra() -> Result<()> {
     sim.finish().await?;
     Ok(())
 }
+
+/// Every file in `dir` with its bytes and modification time, sorted.
+fn dir_files(dir: &std::path::Path) -> Result<Vec<(String, Vec<u8>, std::time::SystemTime)>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        out.push((
+            entry.file_name().to_string_lossy().into_owned(),
+            std::fs::read(entry.path())?,
+            entry.metadata()?.modified()?,
+        ));
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn names(files: &[(String, Vec<u8>, std::time::SystemTime)]) -> Vec<&str> {
+    files.iter().map(|(name, _, _)| name.as_str()).collect()
+}
+
+/// The drain's history probe only observes (Codex S3 round-3 review): a
+/// missing database stays missing; probing a held or a released database
+/// leaves every file in its directory (the database, and any `-wal` or
+/// `-shm`) byte- and mtime-identical, and creates none; the production
+/// open still works afterwards; an empty file stays empty.
+#[test]
+fn w3h_s3_release_probe_leaves_the_history_db_untouched() -> Result<()> {
+    let probe = |path: &std::path::Path| super::history_lock_held(path).map_err(anyhow::Error::msg);
+    let dir = tempfile::tempdir()?;
+    let db = dir.path().join("history.db");
+    ensure!(!probe(&db)?, "a missing database read as held");
+    ensure!(
+        dir_files(dir.path())?.is_empty(),
+        "probing a missing database created a file"
+    );
+    // The production store holds its lock from open to close.
+    let store = crate::history::store::Store::open(&db)?;
+    let before = dir_files(dir.path())?;
+    ensure!(probe(&db)?, "an open history store's lock was not seen");
+    let after = dir_files(dir.path())?;
+    ensure!(
+        after == before,
+        "probing a held database changed its files: {:?} -> {:?}",
+        names(&before),
+        names(&after)
+    );
+    drop(store);
+    let before = dir_files(dir.path())?;
+    for _ in 0..2 {
+        ensure!(!probe(&db)?, "a closed history store still read as held");
+        let after = dir_files(dir.path())?;
+        ensure!(
+            after == before,
+            "probing a released database changed its files: {:?} -> {:?}",
+            names(&before),
+            names(&after)
+        );
+    }
+    drop(crate::history::store::Store::open(&db)?);
+    let empty = dir.path().join("empty.db");
+    std::fs::write(&empty, b"")?;
+    ensure!(!probe(&empty)?, "an empty file read as held");
+    ensure!(
+        std::fs::metadata(&empty)?.len() == 0,
+        "probing an empty file wrote to it"
+    );
+    Ok(())
+}
+
+/// The drain's instance-lock probe only observes: a missing lock file
+/// stays missing; probing a held or a released lock leaves the file byte-
+/// and mtime-identical (no truncate, no pid rewrite); the production
+/// acquire still works afterwards.
+#[cfg(unix)]
+#[test]
+fn w3h_s3_release_probe_leaves_instance_locks_untouched() -> Result<()> {
+    use super::super::instance_lock::{InstanceLock, INSTANCE_LOCK_FILE};
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join(INSTANCE_LOCK_FILE);
+    ensure!(
+        !super::instance_lock_held(&path)?,
+        "a missing lock file read as held"
+    );
+    ensure!(
+        dir_files(dir.path())?.is_empty(),
+        "probing a missing lock file created it"
+    );
+    let lock = InstanceLock::acquire(dir.path())?;
+    let before = dir_files(dir.path())?;
+    ensure!(
+        super::instance_lock_held(&path)?,
+        "a held instance lock was not seen"
+    );
+    ensure!(
+        dir_files(dir.path())? == before,
+        "probing a held lock changed its file"
+    );
+    drop(lock);
+    let before = dir_files(dir.path())?;
+    for _ in 0..2 {
+        ensure!(
+            !super::instance_lock_held(&path)?,
+            "a released instance lock still read as held"
+        );
+        ensure!(
+            dir_files(dir.path())? == before,
+            "probing a released lock changed its file"
+        );
+    }
+    drop(InstanceLock::acquire(dir.path())?);
+    Ok(())
+}
