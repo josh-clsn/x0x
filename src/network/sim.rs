@@ -1652,14 +1652,14 @@ impl SimFabric {
             .collect()
     }
 
-    /// Trace positions and ordinals of the `a`~`b` connection opens at or
-    /// after `from`.
+    /// Trace positions, ordinals and virtual times of the `a`~`b`
+    /// connection opens at or after `from`.
     pub(crate) fn link_open_positions(
         &self,
         a: &PeerId,
         b: &PeerId,
         from: usize,
-    ) -> Vec<(usize, u64)> {
+    ) -> Vec<(usize, u64, Duration)> {
         let key = pair(a.0, b.0);
         let state = self.lock();
         state
@@ -1672,9 +1672,9 @@ impl SimFabric {
                     a,
                     b,
                     ordinal,
+                    at,
                     open: true,
-                    ..
-                } if (*a, *b) == key => Some((position, *ordinal)),
+                } if (*a, *b) == key => Some((position, *ordinal, *at)),
                 _ => None,
             })
             .collect()

@@ -41,7 +41,15 @@
 //! discovery entry and no stored record for N's machine; N has the G0
 //! relationship but no discovery entry for H. `begin_hello` then sends
 //! nothing (evidence_wire.rs:322-343) and nothing revisits the skipped
-//! Hello (the event loop reacts only to `PeerConnected`, :1055-1071).
+//! Hello (the event loop reacts only to `PeerConnected`, :1055-1071). The
+//! case proves the connect decision was reached: H's own advert and its
+//! evidence load became ready within the job's two 5 s waits
+//! (evidence_wire.rs:930-963), N was ready before the link, and neither
+//! side knew the other's advert to lack `peer_evidence_v1`; a run where a
+//! wait could have timed out is INFRA, not RED.
+//!
+//! G0 relates N to H from the start, so N's eligibility flips on discovery
+//! alone; P's commit (the "committed roster") decides when N pushes to H.
 //!
 //! - Roster first (the red baseline): H redeems N's invite; N commits H's
 //!   P seat (the "committed roster"), stages the result and the Welcome,
@@ -76,17 +84,20 @@
 //!
 //! # GREEN, RED, flag
 //!
-//! GREEN needs, within the join poll's 120 s: verified admin evidence at H,
-//! guarded join-result delivery (H's seat active, which for TreeKEM needs
-//! the Welcome from N) and a decrypted group write from N. RED needs every
+//! GREEN needs, all before ONE absolute deadline (the join call plus the
+//! poll's 120 s): verified admin evidence at H, guarded join-result
+//! delivery (H's seat active, which for TreeKEM needs the Welcome from N,
+//! with N->H traffic observed) and a decrypted group write from N. With S1
+//! on, GREEN also needs N's deferred N->H Hello after the release; the
+//! third-holder control needs H's Lookup answered FOUND by T. RED needs every
 //! precondition plus the named causes: no Hello between H and N after the
 //! connect, none of H's requests reaching N on any DM transport (direct,
 //! relayed or gossip inbox), and no admin evidence or binding at H.
 //!
 //! The `w3h_red_1207_ready_hello_*` tests set `X0X_EVIDENCE_READY_HELLO=1`
-//! (#1251, S1's operational opt-in, read at daemon startup) before any
-//! daemon starts. They are ignored until S1 merges: on main the variable is
-//! read by nothing, so the arm would be RED.
+//! (#1251, S1's operational opt-in, read in `serve_with_options`) before any
+//! daemon starts; every other test clears it. They are ignored until S1
+//! merges: on main the variable is read by nothing, so the arm would be RED.
 //!
 //! Every ordering below is a trace position (`SimFabric::cut`), never a
 //! virtual time. Receipts carry ids, digests and counts, never secrets or
@@ -114,9 +125,12 @@ const JOIN_BOUND: Duration = Duration::from_secs(120);
 /// `GROUP_BACKGROUND_PUBLISH_DELAY` (8 s); a roster-first release waits
 /// past both.
 const PUSH_WINDOW: Duration = Duration::from_secs(12);
-/// An evidence connect job waits up to 5 s for the node's own advert
-/// before it decides on the Hello (`evidence_wire.rs` `DEADLINE`).
-const CONNECT_SETTLE: Duration = Duration::from_secs(6);
+/// Each wait an evidence connect job makes before `begin_hello`: up to 5 s
+/// for the node's own publishable advert, then up to 5 s for the evidence
+/// load barrier (`evidence_wire.rs:930-963`, `runtime.rs` `wait`).
+const CONNECT_WAIT: Duration = Duration::from_secs(5);
+/// Settle past both of those waits, run one after the other.
+const CONNECT_SETTLE: Duration = Duration::from_secs(11);
 /// Budget for every setup readiness wait.
 const SETUP: Duration = Duration::from_secs(180);
 /// `StreamProtocol::EvidenceV1` and the `evidence_wire.rs` message kinds.
@@ -630,6 +644,10 @@ struct Run {
     released: Option<usize>,
     active: bool,
     decrypted: bool,
+    /// When the decrypted read completed, if it did.
+    done_at: Option<Duration>,
+    /// The join's absolute deadline: join call + `JOIN_BOUND`.
+    deadline: Duration,
 }
 
 async fn wait_for(
@@ -664,7 +682,12 @@ async fn release_discovery(sim: &Sim, stage: &Stage) -> Result<usize> {
     Ok(position)
 }
 
-async fn scenario(sim: &mut Sim, variant: Variant, receipt: &mut Receipt) -> Result<()> {
+async fn scenario(
+    sim: &mut Sim,
+    variant: Variant,
+    ready_hello: bool,
+    receipt: &mut Receipt,
+) -> Result<()> {
     let at = |sim: &Sim| sim.fabric().now().as_micros();
     let all = variant.labels();
     // Before any daemon sends: N's artifacts never reach H; H's reach N
@@ -794,11 +817,32 @@ async fn scenario(sim: &mut Sim, variant: Variant, receipt: &mut Receipt) -> Res
         ..Run::default()
     };
     sim.restart("H", RestartMode::Graceful).await?;
-    sim.within(
-        "H's connect jobs settle",
-        CONNECT_SETTLE + secs(1),
-        tokio::time::sleep(CONNECT_SETTLE),
-    )
+    // N's connect job for H's new link runs against N's state as it is
+    // now (N has run since the start), so N's prerequisites are read here,
+    // before the link opens.
+    let n_ready_before = evidence_counters(sim, "N")?;
+    // H's prerequisites are polled from the restart on, recording when each
+    // became ready; the same barrier lets the connect jobs finish.
+    let restarted_at = sim.fabric().now();
+    let mut advert_ready: Option<Duration> = None;
+    let mut load_ready: Option<Duration> = None;
+    sim.within("H's connect jobs settle", CONNECT_SETTLE + secs(1), async {
+        loop {
+            let now = sim.fabric().now();
+            if let Ok(counters) = evidence_counters(sim, "H") {
+                if advert_ready.is_none() && counters["own_advert_publishable"] == true {
+                    advert_ready = Some(now);
+                }
+                if load_ready.is_none() && counters["evidence_load_complete"] == true {
+                    load_ready = Some(now);
+                }
+            }
+            if now.saturating_sub(restarted_at) >= CONNECT_SETTLE {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
     .await?;
     if variant == Variant::ThirdHolder && sim.connected_peer_count("H").await < 2 {
         let network = sim
@@ -820,11 +864,51 @@ async fn scenario(sim: &mut Sim, variant: Variant, receipt: &mut Receipt) -> Res
     }
     run.settled = sim.fabric().cut("case: connect jobs settled");
     let (h_peer, n_peer) = (sim.peer("H")?, sim.peer("N")?);
-    run.connect = sim
+    let first_open = sim
         .fabric()
         .link_open_positions(&h_peer, &n_peer, run.restart)
         .first()
-        .map(|(position, _)| *position);
+        .copied();
+    run.connect = first_open.map(|(position, _, _)| position);
+    // The connect decision completed (reached `begin_hello`): the first
+    // wait ended with H's advert publishable, the second with the evidence
+    // load complete, each within its 5 s from where it started (sampled
+    // every 100 ms, so a recorded time is never early); neither side knew
+    // the other's advert to LACK `peer_evidence_v1` (the only other early
+    // return, evidence_wire.rs:944-951); and N was ready before the link.
+    let peer_bit = |observer: &str, peer: &str| -> Result<Option<bool>> {
+        let (_, machine) = sim.ids(peer)?;
+        Ok(sim
+            .state(observer)?
+            .agent
+            .capability_store
+            .machine_registry_supports(&machine, crate::dm::CapabilityRegistry::PEER_EVIDENCE_V1))
+    };
+    let (h_bit_for_n, n_bit_for_h) = (peer_bit("H", "N")?, peer_bit("N", "H")?);
+    let decision = first_open.map(|(_, _, connected_at)| {
+        let advert_ok = advert_ready.is_some_and(|t| t <= connected_at + CONNECT_WAIT);
+        let load_ok = match (advert_ready, load_ready) {
+            (Some(advert), Some(load)) => load <= advert.max(connected_at) + CONNECT_WAIT,
+            _ => false,
+        };
+        let n_ok = n_ready_before["own_advert_publishable"] == true
+            && n_ready_before["evidence_load_complete"] == true;
+        let bits_ok = h_bit_for_n != Some(false) && n_bit_for_h != Some(false);
+        let relative = |t: Option<Duration>| {
+            t.map(|t| t.as_micros() as i128 - connected_at.as_micros() as i128)
+        };
+        (
+            advert_ok && load_ok && n_ok && bits_ok,
+            json!({
+                "connect_at_us": connected_at.as_micros(),
+                "h_advert_ready_rel_us": relative(advert_ready),
+                "h_load_ready_rel_us": relative(load_ready),
+                "n_ready_before_connect": n_ready_before,
+                "h_registry_peer_evidence_bit_for_n": h_bit_for_n,
+                "n_registry_peer_evidence_bit_for_h": n_bit_for_h,
+            }),
+        )
+    });
     let h_n = view(sim, "H", "N").await?;
     let n_h = view(sim, "N", "H").await?;
     let hello_at_connect = streams_between(sim, &labels, "H", "N", run.restart);
@@ -848,7 +932,7 @@ async fn scenario(sim: &mut Sim, variant: Variant, receipt: &mut Receipt) -> Res
         run.released = Some(release_discovery(sim, &h_identity).await?);
     }
     run.join = sim.fabric().cut("case: H redeems N's invite");
-    let join_started = sim.fabric().now();
+    run.deadline = sim.fabric().now() + JOIN_BOUND;
     join(sim, "H", &h_invite).await?;
     let h_hex = sim.agent_hex("H")?;
     if wait_for(sim, "N commits H's seat in P", secs(60), async |s: &Sim| {
@@ -868,22 +952,23 @@ async fn scenario(sim: &mut Sim, variant: Variant, receipt: &mut Receipt) -> Res
         run.released = Some(release_discovery(sim, &h_identity).await?);
     }
     let n_h_released = view(sim, "N", "H").await?;
-    let elapsed = sim.fabric().now().saturating_sub(join_started);
-    let remaining = (JOIN_BOUND + secs(1)).saturating_sub(elapsed);
+    // ONE absolute deadline (the join poll's 120 s) through membership,
+    // the store, and the decrypted read.
+    let left = |sim: &Sim| run.deadline.saturating_sub(sim.fabric().now());
     run.active = wait_for(
         sim,
-        "H active in P within the join bound",
-        remaining,
+        "H active in P before the join deadline",
+        left(sim),
         async |s: &Sim| local_membership(s, "H", &p).await.as_deref() == Some("active"),
     )
     .await?;
-    if run.active {
+    if run.active && !left(sim).is_zero() {
         let store = open_store(sim, "N", &p).await?;
         let mut opened = None;
         wait_for(
             sim,
-            "H opens P's store",
-            secs(60),
+            "H opens P's store before the join deadline",
+            left(sim),
             async |s: &Sim| match try_open_store(s, "H", &p).await {
                 Ok(id) => {
                     opened = Some(id);
@@ -893,13 +978,21 @@ async fn scenario(sim: &mut Sim, variant: Variant, receipt: &mut Receipt) -> Res
             },
         )
         .await?;
-        if opened.as_deref() == Some(store.as_str()) {
+        if opened.as_deref() == Some(store.as_str()) && !left(sim).is_zero() {
             put_value(sim, "N", &store, "w3h-1207", "N wrote after H joined").await?;
-            run.decrypted = wait_for(sim, "H reads N's write", secs(60), async |s: &Sim| {
-                read_value(s, "H", &store, "w3h-1207").await.as_deref()
-                    == Some("N wrote after H joined")
-            })
+            run.decrypted = wait_for(
+                sim,
+                "H reads N's write before the join deadline",
+                left(sim),
+                async |s: &Sim| {
+                    read_value(s, "H", &store, "w3h-1207").await.as_deref()
+                        == Some("N wrote after H joined")
+                },
+            )
             .await?;
+            if run.decrypted {
+                run.done_at = Some(sim.fabric().now());
+            }
         }
     }
     let final_position = sim.fabric().cut("case: final");
@@ -913,13 +1006,13 @@ async fn scenario(sim: &mut Sim, variant: Variant, receipt: &mut Receipt) -> Res
             json!({"agent": hex8(&agent.0), "machine": hex8(&machine.0)}),
         );
     }
-    let ready_hello = std::env::var(READY_HELLO_ENV).ok();
+    let ready_hello_env = std::env::var(READY_HELLO_ENV).ok();
     receipt.evidence(
         "binary_and_identities",
         true,
         json!({
             "binary_sha256": binary_sha256(),
-            "ready_hello": ready_hello,
+            "ready_hello": ready_hello_env,
             "identities": identities,
             "g0": hex8(g0.as_bytes()),
             "p": hex8(p.as_bytes()),
@@ -970,6 +1063,13 @@ async fn scenario(sim: &mut Sim, variant: Variant, receipt: &mut Receipt) -> Res
             "restart@{} first H~N open@{:?} settled@{}",
             run.restart, run.connect, run.settled
         ),
+        at(sim),
+    );
+    let (decided, decision_detail) = decision.unwrap_or((false, json!("no H~N open")));
+    receipt.evidence(
+        "connect_decision_completed",
+        decided,
+        decision_detail.to_string(),
         at(sim),
     );
     let (eligible_ok, expectation) = match variant {
@@ -1039,7 +1139,7 @@ async fn scenario(sim: &mut Sim, variant: Variant, receipt: &mut Receipt) -> Res
         .link_open_positions(&h_peer, &n_peer, run.settled)
         .len();
     receipt.evidence(
-        "no_h_n_reconnect_after_the_connect",
+        "no_h_n_reconnect_after_settle",
         reconnects == 0,
         format!("{reconnects} H~N opens after settled@{}", run.settled),
         at(sim),
@@ -1129,9 +1229,32 @@ async fn scenario(sim: &mut Sim, variant: Variant, receipt: &mut Receipt) -> Res
     let evidence_at_h = h_n_final.usable_age.is_some() || h_n_final.captured;
     let ingress = n_to_h["direct_delivered"].as_u64().unwrap_or(0) > 0
         || n_to_h["gossip_inbox_publishes"].as_u64().unwrap_or(0) > 0;
+    let in_time = run.done_at.is_some_and(|done| done <= run.deadline);
+    // The path each GREEN must take, where the case names one: with S1,
+    // N's deferred Hello after the release; for the third holder, H's
+    // Lookup answered FOUND by T.
+    let path_ok = match variant {
+        Variant::Race(Order::RosterThenDiscovery) if ready_hello => {
+            run.released.is_some_and(|released| {
+                streams_between(sim, &labels, "H", "N", released)
+                    .iter()
+                    .any(|s| s.starts_with("N->H HELLO"))
+            })
+        }
+        Variant::ThirdHolder => lookups.iter().any(|s| s.starts_with("H->T LOOKUP/FOUND")),
+        _ => true,
+    };
+    receipt.note(format!(
+        "final: active={} evidence_at_h={evidence_at_h} ingress={ingress} decrypted={} \
+         done_at_us={:?} deadline_us={} path_ok={path_ok}",
+        run.active,
+        run.decrypted,
+        run.done_at.map(|t| t.as_micros()),
+        run.deadline.as_micros()
+    ));
     receipt.finish(
         FINAL,
-        run.active && evidence_at_h && ingress && run.decrypted,
+        run.active && evidence_at_h && ingress && run.decrypted && in_time && path_ok,
         at(sim),
     );
     Ok(())
@@ -1140,10 +1263,12 @@ async fn scenario(sim: &mut Sim, variant: Variant, receipt: &mut Receipt) -> Res
 /// Run one variant and return its emitted receipt. Any error before the
 /// final assertion is recorded as INFRA.
 async fn run(case: &str, seed: u64, variant: Variant, ready_hello: bool) -> Receipt {
+    // Before any daemon starts; nextest runs each test in its own
+    // process, so no other test sees it. The off arms clear it explicitly.
     if ready_hello {
-        // Before any daemon starts; nextest runs each test in its own
-        // process, so no other test sees it.
         std::env::set_var(READY_HELLO_ENV, "1");
+    } else {
+        std::env::remove_var(READY_HELLO_ENV);
     }
     let mut receipt = Receipt::new(case, seed);
     receipt.note(format!(
@@ -1160,7 +1285,7 @@ async fn run(case: &str, seed: u64, variant: Variant, ready_hello: bool) -> Rece
     );
     match Sim::empty(case, seed, variant.labels()) {
         Ok(mut sim) => {
-            if let Err(error) = scenario(&mut sim, variant, &mut receipt).await {
+            if let Err(error) = scenario(&mut sim, variant, ready_hello, &mut receipt).await {
                 receipt.infra(format!("{error:#}"), sim.fabric().now().as_micros());
             }
             if let Err(error) = sim.finish().await {
