@@ -224,32 +224,44 @@ pub(crate) struct SimNode {
     /// released (the history database connection, among others), and it
     /// can outlive the daemon state, so [`Sim::stop`] checks it too.
     agent: Weak<crate::Agent>,
+    /// The daemon's history store, when history is on: the one owner of
+    /// the SQLite connection that holds the database's EXCLUSIVE lock from
+    /// open to close. Every holder (the agent's handle, the writer thread,
+    /// the reaper) shares this one `Arc`.
+    history: Option<Weak<crate::history::store::Store>>,
     token: String,
     peer: ant_quic::PeerId,
     agent_hex: String,
 }
 
 /// What a stopped node's next incarnation needs released before it starts
-/// on the same dirs, checked by [`Sim::stop`]'s drain: the old daemon state
-/// and agent (no strong references left), the EXCLUSIVE lock the history
-/// database takes at open (`history::store`; held, it fails the restart as
-/// `HistoryInit`), and the data-dir and identity-dir instance locks (#601,
-/// #645). The locks are observed, never taken for real: a probe creates,
-/// writes, migrates and repairs nothing, so the restart sees the files
-/// exactly as the stopped daemon left them ([`history_lock_held`],
-/// [`instance_lock_held`]).
+/// on the same dirs, checked by [`Sim::stop`]'s drain: the old daemon
+/// state, agent and history store (no strong references left), and the
+/// data-dir and identity-dir instance locks (#601, #645).
+///
+/// The history database is checked in memory, never through SQLite: its
+/// EXCLUSIVE lock lives exactly as long as the store that owns the
+/// connection, so a released store is a released lock. Opening the file,
+/// even read-only, could change what the restart sees (SQLite deletes the
+/// WAL of a zero-page database before any lock check). The instance locks
+/// are observed without creating or writing anything
+/// ([`instance_lock_held`]).
 struct Release {
     state: Weak<AppState>,
     agent: Weak<crate::Agent>,
+    /// The history database's path (for the message) and its store, when
+    /// history is on.
     history_db: std::path::PathBuf,
+    history: Option<Weak<crate::history::store::Store>>,
     data_dir: std::path::PathBuf,
     identity_dir: Option<std::path::PathBuf>,
 }
 
 impl Release {
-    /// Everything still held; empty once all of it is released. The locks
-    /// are probed only after both objects are gone: an object still alive
-    /// is the cause, and its locks would only repeat it.
+    /// Everything still held; empty once all of it is released. The lock
+    /// files are probed only after every object is gone: an object still
+    /// alive is the cause, and its locks would only repeat it. A probe that
+    /// fails is reported, never read as released.
     fn held(&self) -> Vec<String> {
         let mut held = Vec::new();
         if self.state.strong_count() > 0 {
@@ -261,16 +273,20 @@ impl Release {
         if self.agent.strong_count() > 0 {
             held.push(format!("agent by {} references", self.agent.strong_count()));
         }
+        if let Some(store) = self
+            .history
+            .as_ref()
+            .filter(|store| store.strong_count() > 0)
+        {
+            held.push(format!(
+                "history db {} (its store, which keeps the connection and its EXCLUSIVE \
+                 lock, by {} references)",
+                self.history_db.display(),
+                store.strong_count()
+            ));
+        }
         if !held.is_empty() {
             return held;
-        }
-        match history_lock_held(&self.history_db) {
-            Ok(false) => {}
-            Ok(true) => held.push(format!("history db {} (locked)", self.history_db.display())),
-            Err(error) => held.push(format!(
-                "history db {} (probe failed: {error})",
-                self.history_db.display()
-            )),
         }
         let locks = std::iter::once(("data-dir", &self.data_dir))
             .chain(self.identity_dir.iter().map(|dir| ("identity-dir", dir)));
@@ -287,45 +303,6 @@ impl Release {
         }
         held
     }
-}
-
-/// Whether some connection holds SQLite's lock on the database at `path`,
-/// observed without changing anything. A missing file holds no lock (and
-/// is not created). Otherwise the existing file is opened read-only, never
-/// created, with a zero busy timeout, and the probe connection is put in
-/// `locking_mode = EXCLUSIVE` (a connection setting; it writes nothing) so
-/// that it never uses a `-shm` file. Then a trivial read:
-/// - another connection's lock (the history store holds one from open to
-///   close) refuses the read's SHARED lock: `SQLITE_BUSY`/`SQLITE_LOCKED`,
-///   held;
-/// - otherwise SQLite would next need the EXCLUSIVE lock to open the WAL,
-///   which a read-only file cannot take, so the read fails with an I/O
-///   error before any `-wal` file is created; that, or a completed read,
-///   means not held.
-///
-/// SQLite tracks the locks of every connection in this process per file,
-/// so a holder in this process (every sim daemon) is seen, as is one in
-/// another process (the kernel lock).
-fn history_lock_held(path: &std::path::Path) -> std::result::Result<bool, String> {
-    use rusqlite::{Connection, ErrorCode, OpenFlags};
-    if !path.exists() {
-        return Ok(false);
-    }
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|error| format!("read-only open: {error}"))?;
-    conn.busy_timeout(Duration::ZERO)
-        .map_err(|error| format!("busy timeout: {error}"))?;
-    conn.execute_batch("PRAGMA locking_mode = EXCLUSIVE;")
-        .map_err(|error| format!("locking mode: {error}"))?;
-    let read = conn.query_row("SELECT 1 FROM sqlite_master LIMIT 1", [], |_| Ok(()));
-    Ok(matches!(
-        read,
-        Err(rusqlite::Error::SqliteFailure(failure, _))
-            if matches!(failure.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
-    ))
 }
 
 /// Whether the instance lock file at `path` is locked, observed without
@@ -793,6 +770,10 @@ impl Sim {
             router: Some(handle.test_router.clone()),
             state: Arc::downgrade(&state),
             agent: Arc::downgrade(&state.agent),
+            history: state
+                .agent
+                .history()
+                .map(|history| Arc::downgrade(history.store())),
             token: state.api_token.clone(),
             peer,
             agent_hex: hex::encode(state.agent.agent_id().as_bytes()),
@@ -839,6 +820,7 @@ impl Sim {
                     .db_path
                     .clone()
                     .unwrap_or_else(|| config.data_dir.join("history.db")),
+                history: node.history.clone(),
                 data_dir: config.data_dir.clone(),
                 identity_dir: config.identity_dir.clone(),
             };

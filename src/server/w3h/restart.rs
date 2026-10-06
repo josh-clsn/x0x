@@ -439,71 +439,126 @@ async fn w3h_s3_restart_reports_a_held_history_lock_as_infra() -> Result<()> {
     Ok(())
 }
 
-/// Every file in `dir` with its bytes and modification time, sorted.
-fn dir_files(dir: &std::path::Path) -> Result<Vec<(String, Vec<u8>, std::time::SystemTime)>> {
+/// One file as the release check must leave it: name, size, bytes and
+/// modification time.
+type FileState = (String, u64, Vec<u8>, std::time::SystemTime);
+
+/// Every file in `dir`, sorted by name (a full directory comparison).
+fn dir_files(dir: &std::path::Path) -> Result<Vec<FileState>> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
+        let meta = entry.metadata()?;
         out.push((
             entry.file_name().to_string_lossy().into_owned(),
+            meta.len(),
             std::fs::read(entry.path())?,
-            entry.metadata()?.modified()?,
+            meta.modified()?,
         ));
     }
     out.sort();
     Ok(out)
 }
 
-fn names(files: &[(String, Vec<u8>, std::time::SystemTime)]) -> Vec<&str> {
-    files.iter().map(|(name, _, _)| name.as_str()).collect()
+fn names(files: &[FileState]) -> Vec<&str> {
+    files.iter().map(|file| file.0.as_str()).collect()
 }
 
-/// The drain's history probe only observes (Codex S3 round-3 review): a
-/// missing database stays missing; probing a held or a released database
-/// leaves every file in its directory (the database, and any `-wal` or
-/// `-shm`) byte- and mtime-identical, and creates none; the production
-/// open still works afterwards; an empty file stays empty.
-#[test]
-fn w3h_s3_release_probe_leaves_the_history_db_untouched() -> Result<()> {
-    let probe = |path: &std::path::Path| super::history_lock_held(path).map_err(anyhow::Error::msg);
-    let dir = tempfile::tempdir()?;
-    let db = dir.path().join("history.db");
-    ensure!(!probe(&db)?, "a missing database read as held");
-    ensure!(
-        dir_files(dir.path())?.is_empty(),
-        "probing a missing database created a file"
-    );
-    // The production store holds its lock from open to close.
-    let store = crate::history::store::Store::open(&db)?;
-    let before = dir_files(dir.path())?;
-    ensure!(probe(&db)?, "an open history store's lock was not seen");
-    let after = dir_files(dir.path())?;
-    ensure!(
-        after == before,
-        "probing a held database changed its files: {:?} -> {:?}",
-        names(&before),
-        names(&after)
-    );
-    drop(store);
-    let before = dir_files(dir.path())?;
-    for _ in 0..2 {
-        ensure!(!probe(&db)?, "a closed history store still read as held");
-        let after = dir_files(dir.path())?;
+/// A node's dirs for the release check, as `Sim::daemon_config` lays them
+/// out, and the check over them with every object already released.
+fn release_for(root: &std::path::Path) -> Result<Release> {
+    let data_dir = root.join("data");
+    let identity_dir = root.join("identity");
+    std::fs::create_dir_all(&data_dir)?;
+    std::fs::create_dir_all(&identity_dir)?;
+    Ok(Release {
+        state: Weak::new(),
+        agent: Weak::new(),
+        history_db: data_dir.join("history.db"),
+        history: None,
+        data_dir,
+        identity_dir: Some(identity_dir),
+    })
+}
+
+/// Run `release.held()` and require that it left both node dirs exactly as
+/// they were (names, sizes, bytes, mtimes); returns what it reported.
+fn held_without_changes(release: &Release) -> Result<Vec<String>> {
+    let dirs = [
+        release.data_dir.clone(),
+        release.identity_dir.clone().context("identity dir")?,
+    ];
+    let before = dirs
+        .iter()
+        .map(|dir| dir_files(dir))
+        .collect::<Result<Vec<_>>>()?;
+    let held = release.held();
+    let after = dirs
+        .iter()
+        .map(|dir| dir_files(dir))
+        .collect::<Result<Vec<_>>>()?;
+    for (before, after) in before.iter().zip(&after) {
         ensure!(
-            after == before,
-            "probing a released database changed its files: {:?} -> {:?}",
-            names(&before),
-            names(&after)
+            before == after,
+            "the release check changed the node's files: {:?} -> {:?}",
+            names(before),
+            names(after)
         );
     }
-    drop(crate::history::store::Store::open(&db)?);
-    let empty = dir.path().join("empty.db");
-    std::fs::write(&empty, b"")?;
-    ensure!(!probe(&empty)?, "an empty file read as held");
+    Ok(held)
+}
+
+/// The drain's history check never touches the database (Codex S3 review
+/// rounds 3 and 4): it reads the store's reference count, so
+/// - no database: nothing reported, nothing created;
+/// - a zero-byte database with a nonempty WAL (a crash before the first
+///   checkpoint, which SQLite would resolve by deleting the WAL if the
+///   file were opened): nothing reported, both files byte- and
+///   mtime-identical;
+/// - a live production store: reported as the history db, files unchanged;
+/// - the same store dropped: nothing reported, files unchanged, and the
+///   production open still works.
+#[test]
+fn w3h_s3_release_check_leaves_history_files_untouched() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut release = release_for(root.path())?;
     ensure!(
-        std::fs::metadata(&empty)?.len() == 0,
-        "probing an empty file wrote to it"
+        held_without_changes(&release)?.is_empty(),
+        "nothing to release, yet something was held"
     );
+    ensure!(
+        dir_files(&release.data_dir)?.is_empty(),
+        "the check created a file"
+    );
+
+    std::fs::write(&release.history_db, b"")?;
+    let wal = release.data_dir.join("history.db-wal");
+    std::fs::write(
+        &wal,
+        [0x37_u8, 0x7f, 0x06, 0x82, 0, 0x2d, 0xe2, 0x18, 1, 2, 3, 4],
+    )?;
+    release.history = Some(Weak::new());
+    ensure!(
+        held_without_changes(&release)?.is_empty(),
+        "a zero-byte database with a WAL read as held"
+    );
+    ensure!(std::fs::metadata(&wal)?.len() == 12, "the WAL was changed");
+
+    let other = tempfile::tempdir()?;
+    let mut live = release_for(other.path())?;
+    let store = Arc::new(crate::history::store::Store::open(&live.history_db)?);
+    live.history = Some(Arc::downgrade(&store));
+    let held = held_without_changes(&live)?;
+    ensure!(
+        held.len() == 1 && held[0].starts_with("history db "),
+        "a live history store was not reported as the history db: {held:?}"
+    );
+    drop(store);
+    ensure!(
+        held_without_changes(&live)?.is_empty(),
+        "a dropped history store still read as held"
+    );
+    drop(crate::history::store::Store::open(&live.history_db)?);
     Ok(())
 }
 
