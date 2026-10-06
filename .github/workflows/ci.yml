@@ -448,7 +448,7 @@ jobs:
           --require w3h_red_1256_gossip_only_event_after_a_gossip_member_added
           --require w3h_1256_control_second_event_also_by_dm
           --require w3h_1256_control_member_restarted_after_the_first_event
-          --expect w3h_red_1256_gossip_only_event_after_a_gossip_member_added=RED
+          --expect w3h_red_1256_gossip_only_event_after_a_gossip_member_added=GREEN
           --expect w3h_1256_control_second_event_also_by_dm=GREEN
           --expect w3h_1256_control_member_restarted_after_the_first_event=GREEN
           --require w3h_s1_negative_control_offline_joiner_is_not_admitted

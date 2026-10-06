@@ -956,7 +956,8 @@ async fn w3h_red_1256_gossip_only_event_after_a_gossip_member_added() -> Result<
         "w3h_red_1256_gossip_only_event_after_a_gossip_member_added",
         0x1256_0001,
         Arm::GossipOnly,
-        Verdict::Red,
+        // #1256 fixed: RED on main (CI 20/20 on 8244ce7), GREEN with the fix.
+        Verdict::Green,
     )
     .await
 }
