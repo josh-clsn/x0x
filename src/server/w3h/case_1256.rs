@@ -56,17 +56,38 @@
 //! # Receipts
 //!
 //! Every precondition is an `evidence` stage (INFRA when false):
-//! M's listener live before the first event; O seats J; M applies J's seat
-//! with its state equal to O's; no DM-class frame reaches M while that
-//! happens, and frames on G's metadata topic do; M's state equals O's
-//! before the second event; and, per arm, no DM copy of the second event
-//! reaches M (gossip-only and restarted arms), a DM copy does (DM arm), or
-//! M restarted between the events with its listener live (restarted arm).
-//! The request is O's published rename. The red arm's causes are M's
-//! listener (registry and `GET /diagnostics/groups`) gone after the first
-//! event and still gone at the final. Orderings are trace positions
-//! (`SimFabric::mark_indexed`). Receipts carry ids, hashes and counts,
-//! never secrets.
+//! - M's listener live before the first event (both legs below);
+//! - O seats J;
+//! - M applies J's seat with its state equal to O's;
+//! - no DM-class frame reaches M while that happens, and frames on G's
+//!   metadata topic do;
+//! - M's state equals O's before the second event;
+//! - per arm:
+//!   - gossip-only and restarted arms: no DM copy of the rename reaches M
+//!     (no DM-class frame is delivered to M, and M's DM layer hands on no
+//!     copy of the rename);
+//!   - DM arm: a DM copy of the rename itself reaches M (M's DM layer
+//!     hands on a verified payload from O that is byte-equal to O's
+//!     rename event), not merely any DM;
+//!   - restarted arm: M restarted between the events with its listener
+//!     live.
+//!
+//! The request is O's rename, published: PATCH 200, O's record renamed,
+//! and an O-authored frame on G's metadata topic that carries the rename
+//! event's exact bytes, written after the second event's mark. O's publish
+//! logs and swallows a failure or a timeout (named_groups.rs:3225) and the
+//! PATCH still answers 200, so a run without that frame is INFRA. Its
+//! delivery to M is not required: on main, M's unsubscribe can stop it.
+//!
+//! M's listener is read two independent ways: the server's listener
+//! registry (`group_metadata_tasks`), and the pubsub layer's subscriber
+//! count for G's metadata topic. `GET /diagnostics/groups` is recorded
+//! too, but its `subscribed_metadata` reads that same registry
+//! (routes/network.rs:1181), so it is not a third leg. The red arm's
+//! causes are both legs gone after the first event and still gone at the
+//! final. Orderings are trace positions (`SimFabric::mark_indexed`,
+//! `SimFabric::writes_from_between`). Receipts carry ids, hashes, kinds
+//! and counts, never secrets or payloads.
 
 #![cfg(test)]
 
@@ -74,9 +95,13 @@ use super::control::{create_group, invite, join, local_membership, members, mesh
 use super::receipt::{Receipt, Verdict};
 use super::*;
 use crate::network::sim::{Fault, LaneClass, Write};
+use crate::server::routes::named_groups::{
+    named_group_metadata_event_kind, NamedGroupMetadataEvent,
+};
 use anyhow::ensure;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::PoisonError;
 
 /// O first: node 0 is every node's bootstrap peer.
 const LABELS: &[&str] = &["O", "M", "J"];
@@ -84,9 +109,13 @@ const LABELS: &[&str] = &["O", "M", "J"];
 const SETUP: Duration = Duration::from_secs(180);
 /// Bound for O's commit of J's seat and M's apply of it.
 const FIRST_BOUND: Duration = Duration::from_secs(60);
-/// Past the committer's delayed DM resend (`GROUP_BACKGROUND_PUBLISH_DELAY`,
-/// 8 s, named_groups.rs:69), so no DM copy of the first event is still
-/// pending when an arm lifts the rule.
+/// Lets M's apply of the first event, and (on main) its listener's exit and
+/// unsubscribe, settle before the listener is read. It does not drain the
+/// first event's DM sends to M: each attempt waits up to 8 s for its ACK
+/// (routes/direct.rs:33), and a failed attempt backs off before it retries
+/// (dm_send.rs:416), so copies of the first event can still reach M after
+/// the DM arm lifts the rule. The DM arm's evidence is therefore a copy of
+/// the rename itself, never just any DM.
 const SETTLE: Duration = Duration::from_secs(10);
 /// The bound for M's apply of the second event.
 const SECOND_BOUND: Duration = Duration::from_secs(30);
@@ -125,6 +154,14 @@ fn is_dm(write: &Write) -> bool {
         LaneClass::PubSub => contains(&write.bytes, DM_TOPIC_MARKER),
         _ => false,
     }
+}
+
+/// Whether a frame is a pubsub frame on `topic` (a signed pubsub frame
+/// carries its topic) that is not a DM.
+fn on_topic(write: &Write, topic: &str) -> bool {
+    write.lane.class == LaneClass::PubSub
+        && !is_dm(write)
+        && contains(&write.bytes, topic.as_bytes())
 }
 
 /// A fault rule that drops every DM-class frame to `target` while held,
@@ -224,34 +261,68 @@ async fn group_view(sim: &Sim, label: &str, gid: &str) -> Result<Option<GroupVie
     .await
 }
 
-/// Whether `label` has a live metadata listener for `gid` (resolved to its
-/// local key as the server does): the registry the listener installs into
-/// and removes itself from (named_groups.rs:14499-14590).
-async fn listener_live(sim: &Sim, label: &str, gid: &str) -> Result<bool> {
+/// `label`'s metadata listener for `gid` (resolved to its local key as the
+/// server does), read two independent ways at one instant, as
+/// `(registry, subscribed)`:
+/// - the server's listener registry (`group_metadata_tasks`), which the
+///   listener installs into and removes itself from
+///   (named_groups.rs:14499-14590);
+/// - the pubsub layer's own subscriber count for the group's metadata
+///   topic (`PubSubManager::is_topic_subscribed`): the ref count that the
+///   listener's `Subscription` takes and its drop releases
+///   (gossip/pubsub.rs:681). Only that listener subscribes the topic
+///   (named_groups.rs:14522).
+async fn listener_legs(sim: &Sim, label: &str, gid: &str) -> Result<(bool, bool)> {
     let state = sim.state(label)?;
     let gid = gid.to_string();
     sim.at_instant(
         &format!("read {label}'s metadata listener for {gid}"),
         async move {
-            let key = {
+            let record = {
                 let groups = state.named_groups.read().await;
                 crate::server::resolve_group_entry_locked(&groups, &gid)
-                    .map(|(key, _)| key.to_string())
+                    .map(|(key, info)| (key.to_string(), info.metadata_topic.clone()))
             };
-            match key {
-                Some(key) => state.group_metadata_tasks.read().await.contains_key(&key),
+            let Some((key, topic)) = record else {
+                return (false, false);
+            };
+            let registry = state.group_metadata_tasks.read().await.contains_key(&key);
+            let subscribed = match state.agent.pubsub() {
+                Some(pubsub) => pubsub.is_topic_subscribed(&topic).await,
                 None => false,
-            }
+            };
+            (registry, subscribed)
         },
     )
     .await
 }
 
-/// `label`'s listener for `gid`: the registry, and its
-/// `GET /diagnostics/groups` row reduced to the listener flags, the roster
-/// size and the non-zero counters (all counts).
-async fn listener_state(sim: &Sim, label: &str, gid: &str) -> Result<(bool, Value)> {
-    let registry = listener_live(sim, label, gid).await?;
+/// A metadata listener's state (see [`listener_legs`]).
+struct Listener {
+    registry: bool,
+    subscribed: bool,
+    detail: Value,
+}
+
+impl Listener {
+    /// Both legs show the listener.
+    fn live(&self) -> bool {
+        self.registry && self.subscribed
+    }
+
+    /// Neither leg shows it.
+    fn gone(&self) -> bool {
+        !self.registry && !self.subscribed
+    }
+}
+
+/// `label`'s listener for `gid`: both legs, and its `GET /diagnostics/groups`
+/// row reduced to the listener flags, the roster size and the non-zero
+/// counters (all counts). That row's `subscribed_metadata` reads the same
+/// registry (routes/network.rs:1181), so it is recorded, not counted as a
+/// leg.
+async fn listener_state(sim: &Sim, label: &str, gid: &str) -> Result<Listener> {
+    let (registry, subscribed) = listener_legs(sim, label, gid).await?;
     let (status, body) = sim
         .api(label, Method::GET, "/diagnostics/groups", None)
         .await?;
@@ -284,14 +355,137 @@ async fn listener_state(sim: &Sim, label: &str, gid: &str) -> Result<(bool, Valu
             }
         }
     }
-    let subscribed = reduced
-        .get("subscribed_metadata")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    Ok((
-        registry && subscribed,
-        json!({"registry": registry, "diagnostics": Value::Object(reduced)}),
-    ))
+    Ok(Listener {
+        registry,
+        subscribed,
+        detail: json!({
+            "registry": registry,
+            "pubsub_topic_subscribed": subscribed,
+            "diagnostics_reads_the_registry": Value::Object(reduced),
+        }),
+    })
+}
+
+/// Aborts the watcher when the scenario ends, however it ends.
+struct Watcher(tokio::task::JoinHandle<()>);
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// One named-group metadata event that a node's DM layer handed to its
+/// consumers (the direct-channel metadata listener among them).
+struct DmSeen {
+    /// Trace position of the mark recorded on receipt.
+    position: usize,
+    kind: &'static str,
+    from_owner: bool,
+    verified: bool,
+    payload: Vec<u8>,
+}
+
+type DmLog = Arc<std::sync::Mutex<Vec<DmSeen>>>;
+
+/// Watch `label`'s DM layer for named-group metadata events, from now on.
+///
+/// The x0x DM layer carries a DM on either transport: a raw direct frame,
+/// or the recipient's gossip DM inbox, end-to-end encrypted. Both end in
+/// the recipient's `DirectMessaging` fan-out, which its direct-channel
+/// metadata listener reads (server/mod.rs:2059-2086). This watcher is one
+/// more subscriber there, with its own queue: it sees what that listener
+/// sees, takes nothing from it, and decodes each payload as that listener
+/// does. Each receipt is marked in the trace, so its position orders it.
+fn watch_metadata_dms(sim: &Sim, label: &str, owner: &str) -> Result<(Watcher, DmLog)> {
+    let owner = sim.state(owner)?.agent.agent_id();
+    let mut inbox = sim.state(label)?.agent.subscribe_direct();
+    let fabric = Arc::clone(sim.fabric());
+    let seen: DmLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let label = label.to_string();
+    let task = tokio::spawn(async move {
+        while let Some(msg) = inbox.recv().await {
+            let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else {
+                continue;
+            };
+            let kind = named_group_metadata_event_kind(&event);
+            let position = fabric.mark_indexed(format!(
+                "{label}'s DM layer received a named-group {kind} (verified={})",
+                msg.verified
+            ));
+            sink.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(DmSeen {
+                    position,
+                    kind,
+                    from_owner: msg.sender == owner,
+                    verified: msg.verified,
+                    payload: msg.payload,
+                });
+        }
+    });
+    Ok((Watcher(task), seen))
+}
+
+/// How many publishes `label`'s publish recorder holds so far.
+fn published_count(sim: &Sim, label: &str) -> Result<usize> {
+    Ok(sim
+        .state(label)?
+        .named_group_test_recorders
+        .publish_bytes
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .len())
+}
+
+/// Whether `bytes` decode to `actor`'s `GroupMetadataUpdated` naming
+/// [`RENAMED`] at roster revision `revision`.
+fn is_rename(bytes: &[u8], actor: &str, revision: u64) -> bool {
+    match serde_json::from_slice::<NamedGroupMetadataEvent>(bytes) {
+        Ok(NamedGroupMetadataEvent::GroupMetadataUpdated {
+            revision: got,
+            actor: by,
+            name: Some(name),
+            ..
+        }) => got == revision && by.eq_ignore_ascii_case(actor) && name == RENAMED,
+        _ => false,
+    }
+}
+
+/// The exact serialized bytes of `label`'s rename event on `topic`, from
+/// its publish recorder entries at or after `from` (named_groups.rs:3223).
+/// The same bytes are each DM copy's payload (named_groups.rs:3344): both
+/// serialize the one event. The recorder logs the attempt, so this is the
+/// event's content, not proof of its publication.
+fn rename_event_bytes(
+    sim: &Sim,
+    label: &str,
+    from: usize,
+    topic: &str,
+    revision: u64,
+) -> Result<Option<Vec<u8>>> {
+    let actor = sim.agent_hex(label)?;
+    let state = sim.state(label)?;
+    let published = state
+        .named_group_test_recorders
+        .publish_bytes
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    Ok(published
+        .iter()
+        .skip(from)
+        .find(|(on, bytes)| on == topic && is_rename(bytes, &actor, revision))
+        .map(|(_, bytes)| bytes.clone()))
+}
+
+/// The label of the node with transport key `key`.
+fn label_of(sim: &Sim, key: &[u8; 32]) -> &'static str {
+    LABELS
+        .iter()
+        .copied()
+        .find(|label| sim.peer(label).is_ok_and(|peer| peer.0 == *key))
+        .unwrap_or("?")
 }
 
 async fn wait_for(
@@ -343,7 +537,8 @@ async fn relink(sim: &Sim, label: &str, peer: &str) -> Result<()> {
 }
 
 /// Restart `label` on its own directories, relink it to O, and wait until
-/// its listener for `gid` is live. Returns the stop's trace position.
+/// its listener for `gid` is live (both legs). Returns the stop's trace
+/// position.
 async fn restart_member(sim: &mut Sim, label: &str, gid: &str) -> Result<(usize, bool)> {
     let position = sim.fabric().mark_indexed(format!("case: restart {label}"));
     sim.restart(label, RestartMode::Graceful).await?;
@@ -352,7 +547,11 @@ async fn restart_member(sim: &mut Sim, label: &str, gid: &str) -> Result<(usize,
         sim,
         &format!("{label}'s listener for G live after its restart"),
         SETUP,
-        async |s: &Sim| listener_live(s, label, gid).await.unwrap_or(false),
+        async |s: &Sim| {
+            listener_legs(s, label, gid)
+                .await
+                .is_ok_and(|(registry, subscribed)| registry && subscribed)
+        },
     )
     .await?;
     Ok((position, live))
@@ -377,17 +576,19 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
             && local_membership(s, "M", &g).await.as_deref() == Some("active")
     })
     .await?;
-    let (after_own_join, after_own_join_detail) = listener_state(sim, "M", &g).await?;
+    let after_own_join = listener_state(sim, "M", &g).await?;
     receipt.note(format!(
         "setup: M's G metadata listener after its own join, before its setup restart: \
-         live={after_own_join} {after_own_join_detail}"
+         live={} {}",
+        after_own_join.live(),
+        after_own_join.detail
     ));
     let (_, live_after_setup_restart) = restart_member(sim, "M", &g).await?;
     ensure!(
         live_after_setup_restart,
         "setup: M's restart did not re-arm its G metadata listener"
     );
-    let (live_at_start, start_detail) = listener_state(sim, "M", &g).await?;
+    let start = listener_state(sim, "M", &g).await?;
     let metadata_topic = group_view(sim, "O", &g)
         .await?
         .context("O has no record of G")?
@@ -423,11 +624,11 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         tokio::time::sleep(SETTLE),
     )
     .await?;
-    let (live_after_first, after_first_detail) = listener_state(sim, "M", &g).await?;
+    let after_first = listener_state(sim, "M", &g).await?;
     let dropped_first = block.dropped().saturating_sub(dropped_before_first);
     let dm_first = delivered_to(sim, "M", first, first_applied, is_dm)?;
     let topic_first = delivered_to(sim, "M", first, first_applied, |w| {
-        w.lane.class == LaneClass::PubSub && contains(&w.bytes, metadata_topic.as_bytes())
+        on_topic(w, &metadata_topic)
     })?;
 
     // Between the events.
@@ -450,7 +651,10 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         None => false,
     };
 
-    // Second event: O renames G.
+    // Second event: O renames G. M's DM layer is watched from here on (its
+    // current incarnation, after any restart above).
+    let (dm_watch, dm_log) = watch_metadata_dms(sim, "M", "O")?;
+    let published_before = published_count(sim, "O")?;
     let second = sim.fabric().mark_indexed("case: second event, O renames G");
     let dropped_before_second = block.dropped();
     let (status, body) = sim
@@ -462,9 +666,13 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         )
         .await?;
     let o_after = group_view(sim, "O", &g).await?.context("O lost G")?;
-    let published = status.is_success()
-        && o_after.name == RENAMED
-        && o_after.state_revision > o_before.state_revision;
+    let revision = body["revision"].as_u64();
+    let rename = match revision {
+        Some(revision) => {
+            rename_event_bytes(sim, "O", published_before, &metadata_topic, revision)?
+        }
+        None => None,
+    };
     let target_hash = o_after.state_hash.clone();
     let applied = wait_for(
         sim,
@@ -481,29 +689,84 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     .await?;
     let applied_at = applied.then(|| sim.fabric().mark_indexed("case: M applied the rename"));
     let final_position = sim.fabric().mark_indexed("case: final");
+    drop(dm_watch);
     let dropped_second = block.dropped().saturating_sub(dropped_before_second);
     let dm_second = delivered_to(sim, "M", second, final_position, is_dm)?;
     let topic_second = delivered_to(sim, "M", second, final_position, |w| {
-        w.lane.class == LaneClass::PubSub && contains(&w.bytes, metadata_topic.as_bytes())
+        on_topic(w, &metadata_topic)
     })?;
-    // The rename's own copies, where its bytes are plaintext: the signed
-    // topic publish, and a raw direct DM (gossip DMs are encrypted).
-    let rename_on_topic = delivered_to(sim, "M", second, final_position, |w| {
-        w.lane.class == LaneClass::PubSub
-            && contains(&w.bytes, metadata_topic.as_bytes())
-            && contains(&w.bytes, RENAMED.as_bytes())
-    })?;
-    let rename_by_direct_dm = delivered_to(sim, "M", second, final_position, |w| {
-        w.lane.class == LaneClass::Direct && contains(&w.bytes, RENAMED.as_bytes())
-    })?;
-    let (live_final, final_detail) = listener_state(sim, "M", &g).await?;
+    // O's publication of the rename: an O-authored frame on G's metadata
+    // topic that carries the event's exact bytes, written (to any peer)
+    // after the second event's mark. Its delivery is not required.
+    let rename_frames: Vec<Write> = match &rename {
+        Some(bytes) => sim
+            .fabric()
+            .writes_from_between(&sim.peer("O")?, second..final_position)
+            .into_iter()
+            .filter(|w| on_topic(w, &metadata_topic) && contains(&w.bytes, bytes))
+            .collect(),
+        None => Vec::new(),
+    };
+    let rename_frames_to: Vec<&str> = rename_frames
+        .iter()
+        .map(|w| label_of(sim, &w.lane.dst))
+        .collect();
+    let published = status.is_success()
+        && o_after.name == RENAMED
+        && o_after.state_revision > o_before.state_revision
+        && rename.is_some()
+        && !rename_frames.is_empty();
+    // The rename's copies delivered to M, by its exact bytes where they are
+    // plaintext on the wire: the signed topic publish, and a raw direct DM.
+    // Gossip DMs are encrypted on the wire; M's DM layer (below) sees them.
+    let (rename_on_topic, rename_by_direct_dm) = match &rename {
+        Some(bytes) => (
+            delivered_to(sim, "M", second, final_position, |w| {
+                on_topic(w, &metadata_topic) && contains(&w.bytes, bytes)
+            })?,
+            delivered_to(sim, "M", second, final_position, |w| {
+                w.lane.class == LaneClass::Direct && contains(&w.bytes, bytes)
+            })?,
+        ),
+        None => (0, 0),
+    };
+    // What M's DM layer handed on in the window: copies of the rename
+    // itself (byte-equal to O's event), as (position, from O, verified),
+    // and other named-group events by kind (such as a late retry of the
+    // first event's MemberAdded, which can arrive after the rule lifts).
+    let (rename_dms, other_dms) = {
+        let log = dm_log.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut rename_dms = Vec::new();
+        let mut other_dms: BTreeMap<&'static str, usize> = BTreeMap::new();
+        for seen in log
+            .iter()
+            .filter(|seen| second < seen.position && seen.position < final_position)
+        {
+            if rename.as_deref() == Some(seen.payload.as_slice()) {
+                rename_dms.push((seen.position, seen.from_owner, seen.verified));
+            } else {
+                *other_dms.entry(seen.kind).or_default() += 1;
+            }
+        }
+        (rename_dms, other_dms)
+    };
+    let rename_dm_from_o = rename_dms
+        .iter()
+        .any(|(_, from_owner, verified)| *from_owner && *verified);
+    let rename_dms_json: Vec<Value> = rename_dms
+        .iter()
+        .map(|(position, from_owner, verified)| {
+            json!({"position": position, "from_o": from_owner, "verified": verified})
+        })
+        .collect();
+    let final_listener = listener_state(sim, "M", &g).await?;
     let m_final = group_view(sim, "M", &g).await?.context("M lost G")?;
 
     // ---- receipt ----
     receipt.evidence(
         "m_listener_live_before_the_first_event",
-        live_at_start,
-        start_detail.to_string(),
+        start.live(),
+        start.detail.to_string(),
         at(sim),
     );
     receipt.evidence(
@@ -539,11 +802,13 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     match arm {
         Arm::AlsoByDm => {
             receipt.evidence(
-                "dm_copy_of_the_second_event_reached_m",
-                released.is_some_and(|position| position < second) && dm_second > 0,
+                "dm_copy_of_the_rename_reached_m",
+                released.is_some_and(|position| position < second) && rename_dm_from_o,
                 json!({
                     "rule_lifted": released,
-                    "second": second,
+                    "window": [second, final_position],
+                    "rename_copies_m_dm_layer_handed_on": rename_dms_json,
+                    "other_named_group_dms_m_dm_layer_handed_on": other_dms,
                     "dm_frames_delivered_to_m": dm_second,
                     "rename_by_direct_dm_delivered_to_m": rename_by_direct_dm,
                 })
@@ -553,12 +818,14 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         }
         Arm::GossipOnly | Arm::RestartedMember => {
             receipt.evidence(
-                "no_dm_copy_of_the_second_event_reached_m",
-                dm_second == 0,
+                "no_dm_copy_of_the_rename_reached_m",
+                dm_second == 0 && rename_dms.is_empty(),
                 json!({
                     "window": [second, final_position],
                     "dm_frames_delivered_to_m": dm_second,
                     "dm_frames_to_m_dropped_by_the_rule": dropped_second,
+                    "rename_copies_m_dm_layer_handed_on": rename_dms_json,
+                    "other_named_group_dms_m_dm_layer_handed_on": other_dms,
                 })
                 .to_string(),
                 at(sim),
@@ -582,16 +849,31 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         at(sim),
     );
     receipt.request_delivered(
-        "o_published_the_second_event",
+        "o_published_the_rename_on_g_metadata_topic",
         published,
-        json!({"status": status.as_u16(), "ok": body["ok"], "o": o_after.json(),
-            "o_revision_before": o_before.state_revision})
+        json!({
+            "status": status.as_u16(),
+            "ok": body["ok"],
+            "revision": revision,
+            "o": o_after.json(),
+            "o_revision_before": o_before.state_revision,
+            "rename_event_recorded": rename.is_some(),
+            "rename_event_len": rename.as_ref().map(Vec::len),
+            "window": [second, final_position],
+            "rename_frames_written_by_o": rename_frames.len(),
+            "rename_frames_to": rename_frames_to,
+        })
         .to_string(),
         at(sim),
     );
     receipt.note(format!(
-        "listener: after the first event live={live_after_first} {after_first_detail}; \
-         at the final live={live_final} {final_detail}"
+        "listener: after the first event live={} gone={} {}; at the final live={} gone={} {}",
+        after_first.live(),
+        after_first.gone(),
+        after_first.detail,
+        final_listener.live(),
+        final_listener.gone(),
+        final_listener.detail
     ));
     receipt.note(format!(
         "second event: g_metadata_topic_frames_delivered_to_m={topic_second} \
@@ -602,15 +884,17 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     ));
     if arm == Arm::GossipOnly {
         receipt.cause(
-            "M's G metadata listener is gone after it applied the gossip MemberAdded",
-            Some(after_first_detail.to_string()),
-            !live_after_first,
+            "M's G metadata listener is gone (registry and pubsub subscription) after it \
+             applied the gossip MemberAdded",
+            Some(after_first.detail.to_string()),
+            after_first.gone(),
             at(sim),
         );
         receipt.cause(
-            "nothing re-armed M's G metadata listener before the final",
-            Some(final_detail.to_string()),
-            !live_final,
+            "nothing re-armed M's G metadata listener (registry or pubsub subscription) \
+             before the final",
+            Some(final_listener.detail.to_string()),
+            final_listener.gone(),
             at(sim),
         );
     }
