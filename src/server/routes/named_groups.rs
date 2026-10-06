@@ -15041,6 +15041,9 @@ async fn join_status_body(state: &AppState, id: &str) -> (StatusCode, serde_json
                     .find(|info| info.stable_group_id() == id || info.mls_group_id == id)
                     .map(|info| (info.stable_group_id().to_string(), info))
             });
+        // #1166 S5 ceiling: the join-status BODY field (`join_state`),
+        // not route admission — the PublicRead row never refuses.
+        #[allow(clippy::disallowed_methods)]
         let pending = match resolved.as_ref() {
             Some((_, info)) => {
                 let agent_hex = hex::encode(state.agent.agent_id().as_bytes());
@@ -15092,27 +15095,28 @@ pub(in crate::server) async fn get_named_group(
     Path(id): Path<String>,
     Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
 ) -> impl IntoResponse {
-    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     // #447/#458: typed LOCAL membership state so a joiner in limbo (local
     // stub persisted, authority never committed its MemberAdded) can see
     // "pending_authority_commit" instead of a bare 200 that reads as full
     // membership.
-    let (info, membership_state) = {
+    let (info, membership_state, level) = {
         let groups = state.named_groups.read().await;
         let Some(info) = groups.get(&id) else {
             return not_found("group not found");
         };
         let info = info.clone();
-        let state_label =
-            local_join_membership_state(state.as_ref(), &info, &local_agent_hex).await;
-        (info, state_label)
+        // #1166 S1: admission moved to the group-access chokepoint. This
+        // handler keeps its (State, Path, Extension) signature — the
+        // withdrawn-tombstone regression test calls it directly with
+        // positional extractor arguments — so it runs the shared decision
+        // core with the seat label resolved under the same lock read
+        // (S5: inside `admit_named_group_details_of_state`, which also
+        // returns the label — the 200 body below embeds it).
+        let (membership_state, level) =
+            group_access::admit_named_group_details_of_state(state.as_ref(), &info, &actor).await;
+        (info, membership_state, level)
     };
-    // #1166 S1: admission moved to the group-access chokepoint. This
-    // handler keeps its (State, Path, Extension) signature — the
-    // withdrawn-tombstone regression test calls it directly with
-    // positional extractor arguments — so it runs the shared decision
-    // core with the seat label it already resolved under the lock.
-    let level = match group_access::admit_named_group_details(&actor, membership_state) {
+    let level = match level {
         Ok(level) => level,
         Err(resp) => return resp,
     };
@@ -15426,15 +15430,11 @@ pub(in crate::server) async fn get_named_group_members(
         return not_found("group not found");
     };
     // Re-run the pure core on THIS lock's roster (r2/P2-1). The label is
-    // only read for session bearers; the other actor arms ignore it.
-    let admission = match &actor {
-        crate::server::rider_auth::ActorContext::Owner { durable: false } => {
-            let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
-            let label = local_join_membership_state(state.as_ref(), info, &local_agent_hex).await;
-            group_access::admit_named_group_members(&actor, label)
-        }
-        _ => group_access::admit_named_group_members(&actor, "not_member"),
-    };
+    // only read for session bearers; the other actor arms ignore it —
+    // both inside `admit_named_group_members_of_state` (S5
+    // single-sourced the arm the extractor runs too).
+    let admission =
+        group_access::admit_named_group_members_of_state(state.as_ref(), info, &actor).await;
     if let Err(resp) = admission {
         return resp;
     }
@@ -18743,6 +18743,8 @@ pub(in crate::server) async fn join_group_via_invite(
                 .cloned();
             if let Some(info) = info {
                 let joiner_hex = hex::encode(agent_id.as_bytes());
+                #[allow(clippy::disallowed_methods)]
+                // #1166 S5: join-flow classification, not route admission
                 let membership_state =
                     local_join_membership_state(state.as_ref(), &info, &joiner_hex).await;
                 let not_member_row = (membership_state == "not_member")
@@ -19876,11 +19878,9 @@ async fn add_treekem_named_group_member(
                 Json(serde_json::json!({ "ok": false, "error": "group not found" })),
             );
         };
-        if let Err(e) = require_admin_or_above(info, &actor_hex) {
+        // #1166 S5: the admin pair absorbed into the chokepoint core.
+        if let Err(e) = group_access::admin_route_gate(info, &actor_hex) {
             return e;
-        }
-        if let Some(resp) = reject_withdrawn_group(info) {
-            return resp;
         }
         if info.has_member(&agent_hex) {
             return (
@@ -21454,11 +21454,9 @@ async fn remove_treekem_named_group_member(
                 Json(serde_json::json!({ "ok": false, "error": "group not found" })),
             );
         };
-        if let Err(e) = require_admin_or_above(info, &local_agent_hex) {
+        // #1166 S5: the admin pair absorbed into the chokepoint core.
+        if let Err(e) = group_access::admin_route_gate(info, &local_agent_hex) {
             return e;
-        }
-        if let Some(resp) = reject_withdrawn_group(info) {
-            return resp;
         }
         if !info.has_member(&agent_id_hex) {
             return (
@@ -21846,6 +21844,10 @@ async fn owner_certified_seal_with_eviction(
             return Some(Err(resp));
         }
         let evidence = owner_cert_seal_evidence(state, info).await;
+        // ADR 0108 §4 (#1143): on the live record, so in a committed Home
+        // an anonymous announce from a member's own bound machine neither
+        // graces nor evicts a member whose embedded certificate verifies
+        // (`mark_bound_machine_anonymous_announces`).
         info.owner_cert_verdict(&evidence)
     };
     // The members that remain seated once the Failed set is gone: Clean ∪
@@ -22434,6 +22436,11 @@ async fn withdraw_named_group_terminal(
         let Some(info) = groups.get(id) else {
             return Err(not_found("group not found"));
         };
+        // #1166 S5 ceiling: the admin leg is CONDITIONAL — the
+        // sole-member leave path passes `require_admin = false` (the
+        // #446 waived leg) — so it is not the chokepoint's
+        // unconditional admin pair.
+        #[allow(clippy::disallowed_methods)]
         if require_admin {
             require_admin_or_above(info, &local_hex)?;
         }
@@ -22927,6 +22934,8 @@ pub(in crate::server) async fn owner_cert_evidence_for(
     // ingest-time binding rule: the cached pair was verified against the
     // agent that triggered the fetch, and the digest is attacker-choosable,
     // so the certificate must bind THIS entry's agent id before it counts.
+    let anonymous = x0x::announce_v3::anonymous_cert_digest();
+    let mut anonymous_entries: Vec<AnonymousDiscoveryEntry> = Vec::new();
     {
         let cache = state.agent.identity_discovery_cache();
         let cache = cache.read().await;
@@ -22934,6 +22943,14 @@ pub(in crate::server) async fn owner_cert_evidence_for(
             let entry_hex = hex::encode(entry.agent_id.as_bytes());
             if !wanted.contains(&entry_hex) {
                 continue;
+            }
+            if entry.cert_digest == Some(anonymous) {
+                anonymous_entries.push(AnonymousDiscoveryEntry {
+                    agent_hex: entry_hex.clone(),
+                    agent_id: entry.agent_id,
+                    machine_id: entry.machine_id,
+                    machine_public_key: entry.machine_public_key.clone(),
+                });
             }
             match entry.agent_certificate.as_ref() {
                 Some(cert) => {
@@ -22971,7 +22988,81 @@ pub(in crate::server) async fn owner_cert_evidence_for(
             }
         }
     }
+    mark_bound_machine_anonymous_announces(state, &mut evidence, anonymous_entries, now_unix).await;
     evidence
+}
+
+/// A wanted agent's discovery entry that holds the canonical anonymous
+/// digest, as read under the discovery lock.
+struct AnonymousDiscoveryEntry {
+    agent_hex: String,
+    agent_id: x0x::identity::AgentId,
+    /// The entry's machine id. Routing state: the connector rewrites it to
+    /// whatever machine is connected.
+    machine_id: x0x::identity::MachineId,
+    /// The machine key the entry's latest key-bearing announce carried.
+    /// Only verified announces write it (V3: key ↔ machine id).
+    machine_public_key: Vec<u8>,
+}
+
+/// ADR 0108 §4 (#1143; Codex P2 on #1247): mark each anonymous digest that
+/// the subject's own authenticated bound machine announced.
+///
+/// The Home rule reads an anonymous digest as absence of disclosure because
+/// "only the subject agent's authenticated bound machine can sign its
+/// announce". That needs checking here: a V3 announce is signed by a
+/// machine key alone, and the identity listener caches one for discovery
+/// even when it refuses it as a binding source (not direct-origin), so any
+/// machine can put an anonymous digest for any agent into discovery. An
+/// entry counts only when all of these hold:
+/// - the agent has a retained authenticated binding (its latest
+///   direct-origin identity announce or origin attestation;
+///   `Agent::authenticated_bound_machine`) whose known certificate expiry
+///   has not passed;
+/// - the entry's machine id is that machine, and so is the machine the
+///   entry's machine key derives. The key is the one that verified the
+///   announce; the id alone is routing state the connector can rewrite;
+/// - neither that machine nor the agent's binding to it is revoked.
+///
+/// Any other anonymous digest keeps today's reading (stale against the
+/// embedded certificate, fetch in flight). Each lock is taken alone.
+async fn mark_bound_machine_anonymous_announces(
+    state: &AppState,
+    evidence: &mut x0x::groups::owner_cert::OwnerCertEvidence,
+    entries: Vec<AnonymousDiscoveryEntry>,
+    now_unix: u64,
+) {
+    let mut bound = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(binding) = state
+            .agent
+            .authenticated_bound_machine(&entry.agent_id)
+            .await
+        else {
+            continue;
+        };
+        if x0x::identity::is_expired(binding.cert_not_after, now_unix) {
+            continue;
+        }
+        let signer = ant_quic::MlDsaPublicKey::from_bytes(&entry.machine_public_key)
+            .ok()
+            .map(|key| x0x::identity::MachineId::from_public_key(&key));
+        if entry.machine_id == binding.machine_id && signer == Some(binding.machine_id) {
+            bound.push((entry, binding.machine_id));
+        }
+    }
+    if bound.is_empty() {
+        return;
+    }
+    let revocation_set = state.agent.revocation_set();
+    let revoked = revocation_set.read().await;
+    for (entry, machine) in bound {
+        if !revoked.is_machine_revoked(&machine)
+            && !revoked.is_binding_revoked(&entry.agent_id, &machine)
+        {
+            evidence.observe_bound_machine_anonymous(entry.agent_hex);
+        }
+    }
 }
 
 /// r3 (Codex 8) → r4 (hs-FU-A round 4, Codex r3 addendum item 9): the
@@ -23176,6 +23267,11 @@ pub(in crate::server) async fn seal_commit_owner_certified(
         }
     }
     let evidence = owner_cert_seal_evidence(state, info).await;
+    // ADR 0108 §4 (#1143): `info` is the caller's working copy, which
+    // already holds the seat write. Its Home scope is read from metadata,
+    // policy and `commit_log` (`GroupInfo::is_home_scope`), never from the
+    // state hash, so an anonymous announce from a member's own bound
+    // machine does not block this seal.
     let verdict = info.owner_cert_verdict(&evidence);
     if !verdict.is_all_clean() {
         let group_id = info.stable_group_id().to_string();
@@ -24683,11 +24779,9 @@ async fn ban_treekem_group_member(
                 Json(serde_json::json!({ "ok": false, "error": "group not found" })),
             );
         };
-        if let Err(e) = require_admin_or_above(info, &caller_hex) {
+        // #1166 S5: the admin pair absorbed into the chokepoint core.
+        if let Err(e) = group_access::admin_route_gate(info, &caller_hex) {
             return e;
-        }
-        if let Some(resp) = reject_withdrawn_group(info) {
-            return resp;
         }
         // ADR-0016 R2: friendly pre-check before any TreeKEM work begins.
         if let Some(resp) = last_admin_precheck(info, |g| g.ban_member(&agent_id_hex, None)) {
@@ -25857,11 +25951,9 @@ async fn approve_treekem_join_request(
         let Some(info) = groups.get(&id) else {
             return not_found("group not found");
         };
-        if let Err(e) = require_admin_or_above(info, &caller_hex) {
+        // #1166 S5: the admin pair absorbed into the chokepoint core.
+        if let Err(e) = group_access::admin_route_gate(info, &caller_hex) {
             return e;
-        }
-        if let Some(resp) = reject_withdrawn_group(info) {
-            return resp;
         }
         let Some(req) = info.join_requests.get(&request_id) else {
             return not_found("request not found");
@@ -26860,6 +26952,10 @@ async fn treekem_group_encrypt_for_actor(
             if let Some(resp) = reject_unverified_owner_certified_restore(info) {
                 return resp;
             }
+            // #1166 S5 ceiling: TreeKEM helper with an Option<actor>
+            // shape (S3 note 1) — the gate position under this lock is
+            // load-bearing (ADR-0066 epoch capture follows it).
+            #[allow(clippy::disallowed_methods)]
             if let Some(resp) = match actor {
                 Some(actor) => reject_fork_quarantined_for_actor(state, group_id_hex, info, actor),
                 None => reject_fork_quarantined(state, group_id_hex, info),
@@ -27023,6 +27119,9 @@ async fn treekem_group_decrypt_for_actor(
             if let Some(resp) = reject_unverified_owner_certified_restore(info) {
                 return resp;
             }
+            // #1166 S5 ceiling: TreeKEM helper with an Option<actor>
+            // shape (S3 note 1) — same class as the encrypt twin above.
+            #[allow(clippy::disallowed_methods)]
             if let Some(resp) = match actor {
                 Some(actor) => reject_fork_quarantined_for_actor(state, group_id_hex, info, actor),
                 None => reject_fork_quarantined(state, group_id_hex, info),
@@ -27146,6 +27245,11 @@ pub(in crate::server) async fn secure_group_encrypt(
         ..
     } = &actor
     {
+        // #1166 S5 ceiling: the ADR-0039 ladder keeps its handler-side
+        // order (grant → ban → role → delegation → provenance) under
+        // this lock — the S2 ruling, pinned by the rider tests; the
+        // chokepoint's RiderScope label asserts no verified grant.
+        #[allow(clippy::disallowed_methods)]
         if !actor.rider_allows_group(info.stable_group_id()) {
             return forbidden(
                 "rider token is not granted this group (ADR-0039 deny-by-default; Home must be delegated explicitly)",
@@ -35745,7 +35849,10 @@ fn join_artifact_serving_refusal_for(
 /// current evidence. Announce/discovery evidence can therefore only WITHHOLD
 /// (e.g. a stale embedded certificate during a rotation); it is never the
 /// certificate a serve relies on. An #842 inline-certificate first join with
-/// no announce has a Clean verdict and is served.
+/// no announce has a Clean verdict and is served. ADR 0108 §4 (ADR 0107's
+/// permitted Clean alternative): in a committed Home an anonymous announce
+/// from the recipient's own bound machine is no disclosure, so it does not
+/// withhold either; in an ordinary OwnerCertified group it still does.
 async fn join_artifact_serving_refusal(
     state: &AppState,
     group_id: &str,
@@ -35808,6 +35915,9 @@ fn join_artifact_record_probe(
     if info.policy.admission.owner_certified_user_id().is_none() {
         return Ok(None);
     }
+    // Trim the roster only: ADR 0108's Home scope (`GroupInfo::is_home_scope`)
+    // reads metadata, policy and `commit_log`, which the probe must keep, so
+    // the probe's verdict applies the same Home rule as the live record.
     let mut probe = info.clone();
     probe.members_v2.retain(|agent, _| agent == member_hex);
     Ok(Some(probe))
@@ -54393,10 +54503,10 @@ pub(in crate::server) mod tests {
         {
             let groups = a_state.named_groups.read().await;
             let info = groups.get(&group_id).expect("A holds the group");
-            assert!(
-                require_admin_or_above(info, &a_hex).is_ok(),
-                "A has independent admin authority"
-            );
+            #[allow(clippy::disallowed_methods)]
+            // #1166 S5: authority precondition assert, not admission
+            let a_holds_admin = require_admin_or_above(info, &a_hex).is_ok();
+            assert!(a_holds_admin, "A has independent admin authority");
         }
         assert!(member_treekem_kp(&a_state, &group_id, &member_hex)
             .await

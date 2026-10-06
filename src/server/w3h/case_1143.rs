@@ -11,20 +11,21 @@
 //!   consented — the live mechanism); A must have ingested it. Then A mints
 //!   J's seat invite and O goes offline.
 //! - t2: J redeems A's invite. Desired (ADR 0108 S2): A seals and J becomes
-//!   Active without O. On main A refuses: `OwnerCertMemberPending` naming
-//!   O, although A holds O's bytes (`owner_cert_verdict` treats the
-//!   anonymous announce as contradicting the embedded certificate,
-//!   `groups/mod.rs:1462,1575`).
+//!   Active without O. Before ADR 0108 S2-1, A refused with
+//!   `OwnerCertMemberPending` naming O, although A held O's bytes:
+//!   `owner_cert_verdict` treated the anonymous announce as contradicting
+//!   the embedded certificate. S2-1's Home verdict rule reads that digest
+//!   as no disclosure in a committed Home (`GroupInfo::is_home_scope`),
+//!   because O's own bound machine announced it: O's announce reaches A
+//!   signed by O's agent key, so A's listener binds O to O's machine.
 //!
-//! Three tests share the scenario:
-//! - `w3h_1143_red_baseline_reproduces_owner_cert_member_pending` (runs on
-//!   main): passes only if the run's receipt is RED — every stage present
-//!   and the exact cause observed. ADR 0108 S2's PR deletes it.
-//! - `w3h_1143_positive_control_consented_owner_announce_admits` (runs on
-//!   main): the only change is that O's announce carries its consented
-//!   user identity (the documented #1143 workaround); J must be admitted.
-//! - `w3h_red_1143_promoted_admin_admits_with_owner_offline` (ignored until
-//!   ADR 0108 S2): the desired behaviour; S2 removes the `#[ignore]`.
+//! Two tests share the scenario:
+//! - `w3h_1143_positive_control_consented_owner_announce_admits`: the only
+//!   change is that O's announce carries its consented user identity (the
+//!   documented #1143 workaround); J must be admitted.
+//! - `w3h_red_1143_promoted_admin_admits_with_owner_offline`: the desired
+//!   behaviour, expected GREEN. It was RED on main before ADR 0108 S2-1,
+//!   which deleted the red-baseline test that pinned that receipt.
 
 #![cfg(test)]
 
@@ -87,7 +88,10 @@ async fn admin_holds_owner_certificate(sim: &Sim, home: &HomeIds) -> Result<(boo
 /// A's Home record because it updates grace state). O's verdict is `Clean`
 /// when the resolved certificate passes the owner check, or when the seat's
 /// embedded certificate passes it and is not stale; stale means O's latest
-/// announced digest differs from the embedded certificate's digest.
+/// announced digest differs from the embedded certificate's digest, except
+/// that in a committed Home scope an anonymous digest announced by O's
+/// current authenticated bound machine is no disclosure and never stale
+/// (ADR 0108 §4).
 ///
 /// All digests here are announce digests: `blake3(bincode((user_id,
 /// certificate)))` (`announce_v3::cert_digest`), never the roster seat
@@ -102,13 +106,34 @@ struct OwnerView {
     resolved: Option<([u8; 32], bool)>,
     /// A's seat certificate for O: (digest, passes).
     embedded: Option<([u8; 32], bool)>,
+    /// Whether A's seat for O embeds bytes whose roster digest
+    /// (`certificate_digest_hex`) equals the seat's committed digest.
+    seat_committed: bool,
+    /// Whether A's Home record is a committed Home scope
+    /// (`GroupInfo::is_home_scope`), which selects ADR 0108's verdict rule.
+    home_scope: bool,
+    /// Whether A's evidence marks O's anonymous digest as announced by O's
+    /// current authenticated bound machine (the ADR 0108 §4 premise; O's
+    /// own announce reaches A signed by O's agent key, so A binds O to O's
+    /// machine).
+    bound_anonymous: bool,
     /// O's status in the verdict (`None`: O is not an active member).
     status: Option<MemberCertStatus>,
 }
 
 impl OwnerView {
+    /// The announced digest the verdict reads (ADR 0108 §4: in Home scope
+    /// the anonymous digest from O's bound machine is no disclosure).
+    fn disclosed(&self) -> Option<[u8; 32]> {
+        self.announced.filter(|announced| {
+            !(self.home_scope
+                && self.bound_anonymous
+                && *announced == crate::announce_v3::anonymous_cert_digest())
+        })
+    }
+
     fn stale(&self) -> bool {
-        matches!((self.embedded, self.announced), (Some((digest, _)), Some(announced)) if digest != announced)
+        matches!((self.embedded, self.disclosed()), (Some((digest, _)), Some(announced)) if digest != announced)
     }
 
     /// Which certificate made the verdict `Clean`, per the verdict's own
@@ -129,13 +154,16 @@ impl OwnerView {
             })
         };
         format!(
-            "announced {}; O publishes {}; anonymous {}; resolved {}; seat {} stale={}; \
-             verdict {} via {}",
+            "announced {}; O publishes {}; anonymous {}; resolved {}; seat {} committed={} \
+             home_scope={} bound_anonymous={} stale={}; verdict {} via {}",
             self.announced.map_or("none".to_string(), hex8),
             hex8(self.published),
             hex8(crate::announce_v3::anonymous_cert_digest()),
             cert(self.resolved),
             cert(self.embedded),
+            self.seat_committed,
+            self.home_scope,
+            self.bound_anonymous,
             self.stale(),
             self.status
                 .as_ref()
@@ -201,6 +229,16 @@ async fn admin_view_of_owner(sim: &Sim, home: &HomeIds) -> Result<OwnerView> {
         .get(&owner_hex)
         .and_then(|seat| seat.certificate.as_ref())
         .map(assess);
+    let seat_committed = info.members_v2.get(&owner_hex).is_some_and(|seat| {
+        match (&seat.certificate, &seat.certificate_digest) {
+            (Some(cert), Some(digest)) => {
+                crate::groups::owner_cert::certificate_digest_hex(cert).eq_ignore_ascii_case(digest)
+            }
+            _ => false,
+        }
+    });
+    let home_scope = info.is_home_scope();
+    let bound_anonymous = evidence.anonymous_from_bound_machine(&owner_hex);
     let mut clone = info;
     let status = clone
         .owner_cert_verdict(&evidence)
@@ -212,18 +250,24 @@ async fn admin_view_of_owner(sim: &Sim, home: &HomeIds) -> Result<OwnerView> {
         published,
         resolved,
         embedded,
+        seat_committed,
+        home_scope,
+        bound_anonymous,
         status,
     })
 }
 
 /// Whether A's view of O is the one the announce `kind` should produce:
-/// - anonymous (#1143's own state, exclusively): O's latest announced
-///   digest at A is the anonymous one; A's seat for O embeds a certificate
-///   that passes the owner check, but it is stale against that anonymous
-///   digest; and the verdict is the typed `InGrace`. A digest-only seat
+/// - anonymous (#1143's own inputs): O's latest announced digest at A is
+///   the anonymous one, and A's seat for O embeds bytes that pass the owner
+///   check and match the seat's committed digest. A digest-only seat
 ///   (`DigestPending`) would make the seal refuse with the same
 ///   `OwnerCertMemberPending [O]` (the seal lists both), so it must not
-///   count here;
+///   count here. The row checks INPUTS only, never the verdict: the verdict
+///   over these inputs is what ADR 0108 S2-1 changes (`InGrace` on main,
+///   `Clean` after it), so requiring either would make the evidence row
+///   false on one side and turn that receipt into INFRA. The receipt detail
+///   records the verdict, and the final stage observes its effect;
 /// - consented: O's latest announced digest at A is the digest O's
 ///   consented announce publishes (not the anonymous one), the verdict
 ///   seats O as clean, and the certificate that made it clean commits to
@@ -233,9 +277,8 @@ fn view_matches(view: &OwnerView, kind: OwnerAnnounce) -> bool {
     match kind {
         OwnerAnnounce::Anonymous => {
             view.announced == Some(anonymous)
+                && view.seat_committed
                 && matches!(view.embedded, Some((_, true)))
-                && view.stale()
-                && matches!(view.status, Some(MemberCertStatus::InGrace { .. }))
         }
         OwnerAnnounce::Consented => {
             view.published != anonymous
@@ -254,18 +297,98 @@ fn view_matches(view: &OwnerView, kind: OwnerAnnounce) -> bool {
 /// and whose body is `{"type":"fetch_request","group_id":gid,
 /// "member_agent_id":joiner,…}`.
 fn join_fetch_request(bytes: &[u8], gid: &str, joiner: &AgentId) -> bool {
-    if bytes.get(1..33) != Some(joiner.as_bytes().as_slice()) {
-        return false;
+    bytes.get(1..33) == Some(joiner.as_bytes().as_slice())
+        && bytes
+            .get(33..)
+            .is_some_and(|body| fetch_request_body(body, gid, joiner))
+}
+
+/// Whether `payload`, an application DM payload, is `joiner`'s join
+/// `fetch_request` for `gid` naming itself.
+fn fetch_request_body(payload: &[u8], gid: &str, joiner: &AgentId) -> bool {
+    serde_json::from_slice::<serde_json::Value>(payload).is_ok_and(|body| {
+        body["type"] == "fetch_request"
+            && body["group_id"] == gid
+            && body["member_agent_id"] == hex::encode(joiner.as_bytes())
+    })
+}
+
+/// One join `fetch_request` from J that A's DM layer handed to its
+/// consumers (A's join-result listener among them).
+struct RequestSeen {
+    /// Trace position of the mark recorded on receipt.
+    position: usize,
+    at: Duration,
+    verified: bool,
+}
+
+/// Aborts the watcher when the scenario ends, however it ends.
+struct Watcher(tokio::task::JoinHandle<()>);
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        self.0.abort();
     }
-    let Some(Ok(body)) = bytes
-        .get(33..)
-        .map(serde_json::from_slice::<serde_json::Value>)
-    else {
-        return false;
-    };
-    body["type"] == "fetch_request"
-        && body["group_id"] == gid
-        && body["member_agent_id"] == hex::encode(joiner.as_bytes())
+}
+
+/// Watch A's DM layer for J's join `fetch_request` for `gid`, from now on.
+///
+/// The x0x DM layer carries a request on either transport: a raw-QUIC
+/// direct frame, or (when the raw send cannot be used) the recipient's
+/// gossip DM inbox, end-to-end encrypted. Both end in A's `DirectMessaging`
+/// fan-out (`DirectMessaging::handle_incoming`), which A's join-result
+/// listener reads; this watcher is one more subscriber there, with its own
+/// queue, so it sees exactly what that listener sees and takes nothing from
+/// it. Each receipt is marked in the trace, so its trace position orders it
+/// against the join call and the fabric's deliveries.
+fn watch_join_requests(
+    sim: &Sim,
+    gid: &str,
+) -> Result<(Watcher, Arc<std::sync::Mutex<Vec<RequestSeen>>>)> {
+    let joiner = sim.state("J")?.agent.agent_id();
+    let mut inbox = sim.state("A")?.agent.subscribe_direct();
+    let fabric = Arc::clone(sim.fabric());
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let gid = gid.to_string();
+    let task = tokio::spawn(async move {
+        while let Some(msg) = inbox.recv().await {
+            if msg.sender != joiner || !fetch_request_body(&msg.payload, &gid, &joiner) {
+                continue;
+            }
+            let position = fabric.mark_indexed(format!(
+                "A's DM layer received J's join fetch_request (verified={})",
+                msg.verified
+            ));
+            sink.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(RequestSeen {
+                    position,
+                    at: fabric.now(),
+                    verified: msg.verified,
+                });
+        }
+    });
+    Ok((Watcher(task), seen))
+}
+
+/// The transport that carried each received request, by trace position:
+/// `direct` when a direct-lane J->A join `fetch_request` frame was
+/// delivered after the previous received request and before this one,
+/// otherwise the gossip DM inbox. A frame and its hand-off can share a
+/// virtual instant, so this compares positions, never timestamps.
+fn request_transports(received: &[RequestSeen], direct_frames: &[usize]) -> Vec<&'static str> {
+    let mut frames = direct_frames.iter().copied().peekable();
+    received
+        .iter()
+        .map(|seen| {
+            let mut via = "dm_inbox";
+            while frames.next_if(|frame| *frame < seen.position).is_some() {
+                via = "direct";
+            }
+            via
+        })
+        .collect()
 }
 
 async fn scenario(sim: &mut Sim, kind: OwnerAnnounce, receipt: &mut Receipt) -> Result<()> {
@@ -344,31 +467,53 @@ async fn scenario(sim: &mut Sim, kind: OwnerAnnounce, receipt: &mut Receipt) -> 
     let invite = sim.home_seat("A", "J", &home).await?;
     sim.set_online("O", false)?;
 
-    // t2: J redeems A's invite with O offline.
-    let join_from = sim.fabric().now();
-    let admitted = sim.join_home("A", "J", &home, &invite, JOIN_BUDGET).await?;
-    // The request: J's join `fetch_request` for this group, naming J,
-    // delivered to A after the join call.
-    let j_agent = sim.state("J")?.agent.agent_id();
-    let requests: Vec<Duration> = sim
+    // t2: J redeems A's invite with O offline. From this trace position on,
+    // A's DM layer is watched for J's request (`watch_join_requests`).
+    let join_position = sim
         .fabric()
-        .delivered_writes_since(&sim.peer("J")?, &sim.peer("A")?, join_from)
+        .mark_indexed("t2: J redeems A's invite with O offline");
+    let (watcher, received) = watch_join_requests(sim, &home.gid)?;
+    let admitted = sim.join_home("A", "J", &home, &invite, JOIN_BUDGET).await?;
+    drop(watcher);
+    // The request: J's join `fetch_request` for this group, naming J, that
+    // A's DM layer received after the join call, on either DM transport.
+    // A JoinResult answers a request, so this is the request A served (or,
+    // before ADR 0108 S2-1, refused to seal for).
+    let received = std::mem::take(
+        &mut *received
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    let j_agent = sim.state("J")?.agent.agent_id();
+    let direct_frames: Vec<usize> = sim
+        .fabric()
+        .delivered_writes_after(&sim.peer("J")?, &sim.peer("A")?, join_position)
         .into_iter()
         .filter(|(write, _)| {
             write.lane.class == crate::network::sim::LaneClass::Direct
                 && join_fetch_request(&write.bytes, &home.gid, &j_agent)
         })
-        .map(|(_, delivered_at)| delivered_at)
+        .map(|(_, position)| position)
         .collect();
-    let first_request = requests.iter().min().copied();
+    let transports = request_transports(&received, &direct_frames);
+    let via_direct = transports.iter().filter(|via| **via == "direct").count();
+    let first = received
+        .first()
+        .filter(|seen| seen.position > join_position);
+    let first_request = first.map(|seen| seen.at);
     receipt.request_delivered(
         "j_join_fetch_request_reached_a",
-        first_request.is_some(),
+        first.is_some(),
         format!(
-            "{} J->A fetch_request messages for this group naming J delivered after the \
-             join call; first at {:?}us",
-            requests.len(),
-            first_request.map(|t| t.as_micros())
+            "{} join fetch_requests from J for this group naming J reached A's DM layer after \
+             the join call (trace #{join_position}): {via_direct} via direct frames, {} via the \
+             gossip DM inbox; first at trace #{} ({:?}us, via {}, verified={})",
+            received.len(),
+            received.len().saturating_sub(via_direct),
+            first.map_or("none".to_string(), |seen| seen.position.to_string()),
+            first_request.map(|t| t.as_micros()),
+            transports.first().copied().unwrap_or("none"),
+            first.is_some_and(|seen| seen.verified),
         ),
         at(sim),
     );
@@ -445,25 +590,6 @@ async fn run(case: &str, kind: OwnerAnnounce) -> Receipt {
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1143_red_baseline_reproduces_owner_cert_member_pending() -> Result<()> {
-    let receipt = run(
-        "w3h_1143_red_baseline_reproduces_owner_cert_member_pending",
-        OwnerAnnounce::Anonymous,
-    )
-    .await;
-    ensure!(
-        receipt.verdict() == Some(Verdict::Red),
-        "expected a RED receipt on main, got {:?}",
-        receipt.verdict()
-    );
-    Ok(())
-}
-
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
-)]
 async fn w3h_1143_positive_control_consented_owner_announce_admits() -> Result<()> {
     let receipt = run(
         "w3h_1143_positive_control_consented_owner_announce_admits",
@@ -479,7 +605,10 @@ async fn w3h_1143_positive_control_consented_owner_announce_admits() -> Result<(
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-#[ignore = "red baseline: enable with ADR 0108 S2 (#1143)"]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
 async fn w3h_red_1143_promoted_admin_admits_with_owner_offline() -> Result<()> {
     let receipt = run(
         "w3h_red_1143_promoted_admin_admits_with_owner_offline",
@@ -492,4 +621,41 @@ async fn w3h_red_1143_promoted_admin_admits_with_owner_offline() -> Result<()> {
         receipt.verdict()
     );
     Ok(())
+}
+
+/// The request stage's transport attribution compares trace positions: a
+/// direct frame delivered before a receipt (and after the previous one)
+/// carried it; a receipt with no such frame came over the gossip DM inbox.
+#[test]
+fn w3h_1143_request_transport_follows_trace_position() {
+    let seen = |position| RequestSeen {
+        position,
+        at: Duration::ZERO,
+        verified: true,
+    };
+    let received = [seen(10), seen(20), seen(30)];
+    assert_eq!(
+        request_transports(&received, &[5, 25]),
+        ["direct", "dm_inbox", "direct"]
+    );
+    assert_eq!(
+        request_transports(&received, &[]),
+        ["dm_inbox", "dm_inbox", "dm_inbox"]
+    );
+    // A frame delivered after the last receipt carried none of them.
+    assert_eq!(request_transports(&received[..1], &[11]), ["dm_inbox"]);
+    let joiner = AgentId([7; 32]);
+    let body = json!({
+        "type": "fetch_request",
+        "group_id": "g",
+        "member_agent_id": hex::encode(joiner.as_bytes()),
+    })
+    .to_string();
+    assert!(fetch_request_body(body.as_bytes(), "g", &joiner));
+    assert!(!fetch_request_body(body.as_bytes(), "other", &joiner));
+    let mut frame = vec![0u8];
+    frame.extend_from_slice(joiner.as_bytes());
+    frame.extend_from_slice(body.as_bytes());
+    assert!(join_fetch_request(&frame, "g", &joiner));
+    assert!(!join_fetch_request(&frame, "g", &AgentId([8; 32])));
 }

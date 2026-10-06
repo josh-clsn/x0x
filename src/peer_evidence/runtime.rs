@@ -284,6 +284,23 @@ impl EvidenceRuntime {
         });
         true
     }
+    /// True after load and captured move adverts have both been applied.
+    /// This non-blocking probe does not enter or charge the load barrier.
+    pub(crate) fn is_ready(&self) -> bool {
+        self.ready.is_cancelled()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn loading_store_for_test(
+        store: Arc<PeerEvidenceStore>,
+    ) -> (Arc<Self>, tokio_util::sync::CancellationToken) {
+        let runtime = Arc::new(Self::default());
+        runtime.started.store(true, Ordering::Release);
+        assert!(runtime.store.set(store).is_ok());
+        let ready = runtime.ready.clone();
+        (runtime, ready)
+    }
+
     /// Await load within the frame/byte cap. Cancellation releases both permits.
     pub async fn wait(&self, bytes: usize) -> bool {
         if self.ready.is_cancelled() {

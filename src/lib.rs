@@ -12764,6 +12764,21 @@ impl Agent {
         std::sync::Arc::clone(&self.identity_discovery_cache)
     }
 
+    /// `agent_id`'s current authenticated bound machine: the retained
+    /// binding from its latest direct-origin identity announcement or fresh
+    /// origin attestation, read without touching its recency. ADR 0108 §4:
+    /// the OwnerCertified evidence builder reads an anonymous announce as
+    /// absence of disclosure only when this machine signed it.
+    pub(crate) async fn authenticated_bound_machine(
+        &self,
+        agent_id: &identity::AgentId,
+    ) -> Option<dm_inbox::AuthenticatedMachineBinding> {
+        self.authenticated_machine_bindings
+            .read()
+            .await
+            .peek(agent_id)
+    }
+
     /// Return the shared contact store (`pub(crate)` — used by the forwarder
     /// to evaluate trust for ForwardV2 attestation, #204 must-fix 3).
     pub(crate) fn contact_store(
