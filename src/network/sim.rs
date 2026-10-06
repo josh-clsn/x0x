@@ -1633,8 +1633,12 @@ impl SimFabric {
     }
 
     /// Publish attempts by `node` (`Publish` events) at trace positions at
-    /// or after `from`, as `(position, topic)`.
-    pub(crate) fn publishes_from(&self, node: &PeerId, from: usize) -> Vec<(usize, String)> {
+    /// or after `from`, as `(position, topic, virtual time)`.
+    pub(crate) fn publishes_from(
+        &self,
+        node: &PeerId,
+        from: usize,
+    ) -> Vec<(usize, String, Duration)> {
         let state = self.lock();
         state
             .trace
@@ -1645,11 +1649,26 @@ impl SimFabric {
                 TraceEvent::Publish {
                     node: publisher,
                     topic,
+                    at,
                     ..
-                } if *publisher == node.0 => Some((position, topic.clone())),
+                } if *publisher == node.0 => Some((position, topic.clone(), *at)),
                 _ => None,
             })
             .collect()
+    }
+
+    /// How many connection opens and closes involving `node` the trace
+    /// records at positions in `range`.
+    pub(crate) fn link_events_of(&self, node: &PeerId, range: std::ops::Range<usize>) -> usize {
+        let state = self.lock();
+        let end = range.end.min(state.trace.len());
+        let start = range.start.min(end);
+        state.trace[start..end]
+            .iter()
+            .filter(|event| {
+                matches!(event, TraceEvent::Link { a, b, .. } if *a == node.0 || *b == node.0)
+            })
+            .count()
     }
 
     /// Trace positions, ordinals and virtual times of the `a`~`b`

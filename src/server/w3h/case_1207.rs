@@ -42,11 +42,12 @@
 //! relationship but no discovery entry for H. `begin_hello` then sends
 //! nothing (evidence_wire.rs:322-343) and nothing revisits the skipped
 //! Hello (the event loop reacts only to `PeerConnected`, :1055-1071). The
-//! case proves the connect decision was reached: H's own advert and its
-//! evidence load became ready within the job's two 5 s waits
-//! (evidence_wire.rs:930-963), N was ready before the link, and neither
-//! side knew the other's advert to lack `peer_evidence_v1`; a run where a
-//! wait could have timed out is INFRA, not RED.
+//! case proves both connect jobs reached that decision (see
+//! `connect_decision`): H's advert publisher published before the first
+//! wait's deadline, the evidence runtimes' own barrier counters show no
+//! timeout and no permit overflow, N's prerequisites were read (by trace
+//! position) before the link existed, and neither side knew the other's
+//! advert to lack `peer_evidence_v1`. Otherwise the run is INFRA, not RED.
 //!
 //! G0 relates N to H from the start, so N's eligibility flips on discovery
 //! alone; P's commit (the "committed roster") decides when N pushes to H.
@@ -409,6 +410,9 @@ fn evidence_counters(sim: &Sim, label: &str) -> Result<Value> {
     let mut out = json!({ "own_advert_publishable": publishable });
     for key in [
         "evidence_load_complete",
+        "evidence_load_barrier_waits",
+        "evidence_barrier_timeout",
+        "evidence_barrier_overflow",
         "evidence_hello_sent",
         "evidence_hello_received",
         "evidence_hello_refused",
@@ -563,7 +567,7 @@ fn dm_sent(sim: &Sim, src: &str, dst: &str, from: usize) -> Result<Value> {
         .fabric()
         .publishes_from(&ant_quic::PeerId(src_machine.0), from)
         .into_iter()
-        .filter(|(_, topic)| *topic == inbox)
+        .filter(|(_, topic, _)| *topic == inbox)
         .count();
     Ok(json!({
         "direct": direct,
@@ -680,6 +684,125 @@ async fn release_discovery(sim: &Sim, stage: &Stage) -> Result<usize> {
         "INFRA: H's released announcement never reached N's discovery"
     );
     Ok(position)
+}
+
+/// Whether `observer`'s capability registry says `peer`'s machine supports
+/// `peer_evidence_v1` (`None`: no current verified advert).
+fn peer_bit(sim: &Sim, observer: &str, peer: &str) -> Result<Option<bool>> {
+    let (_, machine) = sim.ids(peer)?;
+    Ok(sim
+        .state(observer)?
+        .agent
+        .capability_store
+        .machine_registry_supports(&machine, crate::dm::CapabilityRegistry::PEER_EVIDENCE_V1))
+}
+
+struct DecisionInputs<'a> {
+    h_peer: ant_quic::PeerId,
+    n_peer: ant_quic::PeerId,
+    /// Trace position of H's new incarnation's attach.
+    attached: usize,
+    /// Trace position of N's snapshot, taken while H was down.
+    n_snapshot: usize,
+    /// Trace position and time of the first H~N link of the new incarnation.
+    open_position: usize,
+    connected_at: Duration,
+    settled: usize,
+    settled_at: Duration,
+    n_before: &'a Value,
+    n_bit_before: Option<bool>,
+}
+
+/// Proof that both endpoints' evidence connect jobs for the new H~N link
+/// reached `begin_hello` (`Context::connect`, evidence_wire.rs:927-963),
+/// whose decision is then the relationship check alone. The job can
+/// return earlier in three ways, each excluded here:
+/// - its own advert never became publishable within 5 s: H published its
+///   digest extension (or a targeted response) before that deadline. Only
+///   the advert publisher's publishable branch publishes those topics
+///   (dm_capability_service.rs:549-645; `x0x/caps/v1` is not used, as a
+///   targeted REQUEST also publishes there, :97-114). It reads the same
+///   watch the job waits on (lib.rs:12163), and the caps only upgrade.
+///   N's caps were publishable before the link existed;
+/// - the evidence load barrier returned false: every false return of
+///   `EvidenceRuntime::wait` bumps `evidence_barrier_overflow` (frame or
+///   byte permits) or `evidence_barrier_timeout` (the 5 s timeout)
+///   (peer_evidence/runtime.rs:286-319). H's runtime is new at the
+///   restart, so both must still be 0; N's must not have moved since its
+///   snapshot, taken (by trace position) before the link opened;
+/// - a current verified advert says the peer LACKS `peer_evidence_v1`
+///   (evidence_wire.rs:944-951): neither registry says so, before or after.
+///
+/// Both jobs must also have had their two waits' worth of time (10 s)
+/// before the settle, and the event loop must have been able to see the
+/// `PeerConnected`: the network's event channel holds 32 events and the
+/// job set 64, so the link events on each endpoint in the window are
+/// bounded at 16 (a witness, not a proof, of no broadcast lag).
+fn connect_decision(sim: &Sim, inputs: &DecisionInputs<'_>) -> Result<(bool, Value)> {
+    let count = |counters: &Value, key: &str| counters[key].as_u64();
+    let h_after = evidence_counters(sim, "H")?;
+    let n_after = evidence_counters(sim, "N")?;
+    let h_bit_for_n = peer_bit(sim, "H", "N")?;
+    let n_bit_after = peer_bit(sim, "N", "H")?;
+    let caps_witness = sim
+        .fabric()
+        .publishes_from(&inputs.h_peer, inputs.attached)
+        .into_iter()
+        .find(|(_, topic, _)| {
+            topic == crate::dm_capability::DM_CAPABILITY_DIGEST_TOPIC
+                || topic == crate::dm_capability::DM_CAPABILITY_TARGETED_RESPONSE_TOPIC
+        });
+    let advert_ok = caps_witness
+        .as_ref()
+        .is_some_and(|(_, _, at)| *at < inputs.connected_at + CONNECT_WAIT);
+    let h_wait_ok = count(&h_after, "evidence_barrier_timeout") == Some(0)
+        && count(&h_after, "evidence_barrier_overflow") == Some(0);
+    let n_unmoved = |key: &str| {
+        count(inputs.n_before, key).is_some() && count(inputs.n_before, key) == count(&n_after, key)
+    };
+    let n_ok = inputs.n_snapshot < inputs.open_position
+        && inputs.n_before["own_advert_publishable"] == true
+        && inputs.n_before["evidence_load_complete"] == true
+        && n_unmoved("evidence_barrier_timeout")
+        && n_unmoved("evidence_barrier_overflow");
+    let bits_ok = h_bit_for_n != Some(false)
+        && inputs.n_bit_before != Some(false)
+        && n_bit_after != Some(false);
+    let finished = inputs.connected_at + CONNECT_WAIT * 2 <= inputs.settled_at;
+    let h_events = sim
+        .fabric()
+        .link_events_of(&inputs.h_peer, inputs.attached..inputs.settled);
+    let n_events = sim
+        .fabric()
+        .link_events_of(&inputs.n_peer, inputs.n_snapshot..inputs.settled);
+    let queue_ok = h_events <= 16 && n_events <= 16;
+    Ok((
+        advert_ok && h_wait_ok && n_ok && bits_ok && finished && queue_ok,
+        json!({
+            "connect": {"position": inputs.open_position, "at_us": inputs.connected_at.as_micros()},
+            "h_caps_publish_witness": caps_witness.map(|(position, topic, at)| json!({
+                "position": position, "topic": topic,
+                "rel_us": at.as_micros() as i128 - inputs.connected_at.as_micros() as i128,
+            })),
+            "advert_wait_ok": advert_ok,
+            "h_wait_counters": {
+                "evidence_barrier_timeout": h_after["evidence_barrier_timeout"],
+                "evidence_barrier_overflow": h_after["evidence_barrier_overflow"],
+            },
+            "h_wait_ok": h_wait_ok,
+            "n_snapshot_position": inputs.n_snapshot,
+            "n_before": inputs.n_before,
+            "n_after_wait_counters": {
+                "evidence_barrier_timeout": n_after["evidence_barrier_timeout"],
+                "evidence_barrier_overflow": n_after["evidence_barrier_overflow"],
+            },
+            "n_ok": n_ok,
+            "peer_evidence_bits": {"h_for_n": h_bit_for_n, "n_for_h_before": inputs.n_bit_before,
+                "n_for_h_after": n_bit_after},
+            "jobs_had_10s_before_settle": finished,
+            "link_events_in_window": {"h": h_events, "n": n_events},
+        }),
+    ))
 }
 
 async fn scenario(
@@ -811,38 +934,31 @@ async fn scenario(
     sim.set_online("O", false)?;
     receipt.setup_done(at(sim));
 
-    // The case restart: H's bootstrap dial reconnects it to N at once.
+    // The case restart, split so that N's connect prerequisites are read
+    // while H is down: no link of H's next incarnation can exist yet. H's
+    // bootstrap dial reconnects it to N right after it starts.
     let mut run = Run {
         restart: sim.fabric().cut("case: restart H"),
         ..Run::default()
     };
-    sim.restart("H", RestartMode::Graceful).await?;
-    // N's connect job for H's new link runs against N's state as it is
-    // now (N has run since the start), so N's prerequisites are read here,
-    // before the link opens.
-    let n_ready_before = evidence_counters(sim, "N")?;
-    // H's prerequisites are polled from the restart on, recording when each
-    // became ready; the same barrier lets the connect jobs finish.
-    let restarted_at = sim.fabric().now();
-    let mut advert_ready: Option<Duration> = None;
-    let mut load_ready: Option<Duration> = None;
-    sim.within("H's connect jobs settle", CONNECT_SETTLE + secs(1), async {
-        loop {
-            let now = sim.fabric().now();
-            if let Ok(counters) = evidence_counters(sim, "H") {
-                if advert_ready.is_none() && counters["own_advert_publishable"] == true {
-                    advert_ready = Some(now);
-                }
-                if load_ready.is_none() && counters["evidence_load_complete"] == true {
-                    load_ready = Some(now);
-                }
-            }
-            if now.saturating_sub(restarted_at) >= CONNECT_SETTLE {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
+    sim.stop("H", RestartMode::Graceful).await?;
+    let n_snapshot = sim
+        .fabric()
+        .cut("case: N's connect prerequisites, with H down");
+    let n_before = evidence_counters(sim, "N")?;
+    let n_bit_before = peer_bit(sim, "N", "H")?;
+    sim.start_again("H").await?;
+    let (h_peer, n_peer) = (sim.peer("H")?, sim.peer("N")?);
+    let attached = sim
+        .fabric()
+        .incarnation_of(&h_peer)
+        .and_then(|incarnation| sim.fabric().attach_position(&h_peer, incarnation))
+        .context("INFRA: no attach event for H's new incarnation")?;
+    sim.within(
+        "H's connect jobs settle",
+        CONNECT_SETTLE + secs(1),
+        tokio::time::sleep(CONNECT_SETTLE),
+    )
     .await?;
     if variant == Variant::ThirdHolder && sim.connected_peer_count("H").await < 2 {
         let network = sim
@@ -863,52 +979,34 @@ async fn scenario(
         .await?;
     }
     run.settled = sim.fabric().cut("case: connect jobs settled");
-    let (h_peer, n_peer) = (sim.peer("H")?, sim.peer("N")?);
+    let settled_at = sim.fabric().now();
     let first_open = sim
         .fabric()
-        .link_open_positions(&h_peer, &n_peer, run.restart)
+        .link_open_positions(&h_peer, &n_peer, attached)
         .first()
         .copied();
     run.connect = first_open.map(|(position, _, _)| position);
-    // The connect decision completed (reached `begin_hello`): the first
-    // wait ended with H's advert publishable, the second with the evidence
-    // load complete, each within its 5 s from where it started (sampled
-    // every 100 ms, so a recorded time is never early); neither side knew
-    // the other's advert to LACK `peer_evidence_v1` (the only other early
-    // return, evidence_wire.rs:944-951); and N was ready before the link.
-    let peer_bit = |observer: &str, peer: &str| -> Result<Option<bool>> {
-        let (_, machine) = sim.ids(peer)?;
-        Ok(sim
-            .state(observer)?
-            .agent
-            .capability_store
-            .machine_registry_supports(&machine, crate::dm::CapabilityRegistry::PEER_EVIDENCE_V1))
-    };
-    let (h_bit_for_n, n_bit_for_h) = (peer_bit("H", "N")?, peer_bit("N", "H")?);
-    let decision = first_open.map(|(_, _, connected_at)| {
-        let advert_ok = advert_ready.is_some_and(|t| t <= connected_at + CONNECT_WAIT);
-        let load_ok = match (advert_ready, load_ready) {
-            (Some(advert), Some(load)) => load <= advert.max(connected_at) + CONNECT_WAIT,
-            _ => false,
-        };
-        let n_ok = n_ready_before["own_advert_publishable"] == true
-            && n_ready_before["evidence_load_complete"] == true;
-        let bits_ok = h_bit_for_n != Some(false) && n_bit_for_h != Some(false);
-        let relative = |t: Option<Duration>| {
-            t.map(|t| t.as_micros() as i128 - connected_at.as_micros() as i128)
-        };
-        (
-            advert_ok && load_ok && n_ok && bits_ok,
-            json!({
-                "connect_at_us": connected_at.as_micros(),
-                "h_advert_ready_rel_us": relative(advert_ready),
-                "h_load_ready_rel_us": relative(load_ready),
-                "n_ready_before_connect": n_ready_before,
-                "h_registry_peer_evidence_bit_for_n": h_bit_for_n,
-                "n_registry_peer_evidence_bit_for_h": n_bit_for_h,
-            }),
+    let decision = first_open.map(|(open_position, _, connected_at)| {
+        connect_decision(
+            sim,
+            &DecisionInputs {
+                h_peer,
+                n_peer,
+                attached,
+                n_snapshot,
+                open_position,
+                connected_at,
+                settled: run.settled,
+                settled_at,
+                n_before: &n_before,
+                n_bit_before,
+            },
         )
     });
+    let decision = match decision {
+        Some(result) => Some(result?),
+        None => None,
+    };
     let h_n = view(sim, "H", "N").await?;
     let n_h = view(sim, "N", "H").await?;
     let hello_at_connect = streams_between(sim, &labels, "H", "N", run.restart);
