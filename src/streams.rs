@@ -599,10 +599,12 @@ impl PeerStream {
 }
 
 /// Admission decided before reading any protocol bytes. A prefix lease is
-/// present only for machines without known agents or verified enrollment.
+/// present for strangers and Unknown relationship peers.
 pub(crate) struct InboundAdmission {
     pub(crate) agents: Option<Vec<crate::identity::AgentId>>,
     pub(crate) prefix: Option<crate::evidence_wire::PrefixLease>,
+    /// A known Unknown relationship peer: recheck it even if discovery vanishes.
+    pub(crate) evidence_only: bool,
 }
 
 /// First agent of a stream's agent list, `None` when the list is empty

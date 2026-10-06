@@ -248,3 +248,14 @@ audit:
 # Block banned/typosquat crates and unknown sources (supply-chain guard)
 deny:
     cargo deny check bans sources
+
+# W3-H S3: the #1143 red baseline with creator and admin identities permuted
+# (5 reruns per order; see the `w3h-permuted-*` nextest profiles). Each order
+# is gated on its own receipts. Update the --expect list with the base gate's
+# when the #1143 cases change (ADR 0108 S2).
+test-w3h-permuted: w3h-shim
+    rm -rf target/w3h/traces-creator-low target/w3h/traces-admin-low
+    python3 scripts/dev/test-isolated.py nextest --all-features --lib -- --profile w3h-permuted-creator-low --stress-count 5
+    python3 scripts/dev/test-isolated.py nextest --all-features --lib -- --profile w3h-permuted-admin-low --stress-count 5
+    python3 scripts/ci/w3h-trace-check.py target/w3h/traces-creator-low --runs 5 --require w3h_1143_red_baseline_reproduces_owner_cert_member_pending --expect w3h_1143_red_baseline_reproduces_owner_cert_member_pending=RED
+    python3 scripts/ci/w3h-trace-check.py target/w3h/traces-admin-low --runs 5 --require w3h_1143_red_baseline_reproduces_owner_cert_member_pending --expect w3h_1143_red_baseline_reproduces_owner_cert_member_pending=RED

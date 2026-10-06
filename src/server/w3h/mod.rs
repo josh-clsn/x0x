@@ -34,6 +34,7 @@ mod case_1143;
 mod control;
 mod home;
 mod receipt;
+mod restart;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -60,6 +61,15 @@ const PAYLOAD_DUMP_CAP: usize = 32 * 1024 * 1024;
 const TRACE_APPENDIX: &str = "# --- appendix: teardown (not digested) ---";
 /// Virtual-time budget for a daemon to start.
 const START_BUDGET: Duration = Duration::from_secs(120);
+/// Virtual time a stopped daemon's stray tasks get to release its state
+/// before [`Sim::stop`] reports INFRA.
+const DRAIN_BUDGET: Duration = Duration::from_secs(30);
+/// Environment variable naming the agent-id order of a case's labels, from
+/// lowest to highest (e.g. `A,X,O,J`): [`Sim::empty`] then assigns the
+/// pre-generated keys sorted by agent id in that order. Set only by the
+/// `w3h-permuted-*` nextest profiles (W3-H S3, ADR 0108 "repeat with
+/// creator/admin identities permuted").
+const IDENTITY_ORDER_ENV: &str = "W3H_IDENTITY_ORDER";
 /// Real-time limit for an await made while the clock gate is closed. A
 /// stall past it means the case needed time outside a named barrier.
 const GATED_STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
@@ -189,15 +199,153 @@ impl ClockGate {
     }
 }
 
+/// How [`Sim::stop`] takes a daemon down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RestartMode {
+    /// The daemon stays on the fabric while it shuts down, so its farewell
+    /// traffic (disconnects, last publishes) is part of the trace.
+    Graceful,
+    /// The node is taken off the fabric first, so no frame leaves it after
+    /// the crash mark. A model, not a real crash: in-process tasks still
+    /// drain and file writes still complete (torn-write cases damage files
+    /// between [`Sim::stop`] and [`Sim::start_again`] instead).
+    Crash,
+}
+
 /// One simulated daemon.
 pub(crate) struct SimNode {
     label: String,
+    /// The node's address slot (`198.18.0.<index + 1>`), kept across restarts.
+    index: usize,
     handle: Option<ServerHandle>,
     router: Option<axum::Router>,
     state: Weak<AppState>,
+    /// The daemon's agent. It owns handles the next incarnation needs
+    /// released (the history database connection, among others), and it
+    /// can outlive the daemon state, so [`Sim::stop`] checks it too.
+    agent: Weak<crate::Agent>,
+    /// The daemon's history store, when history is on.
+    history: Option<HistoryRelease>,
     token: String,
     peer: ant_quic::PeerId,
     agent_hex: String,
+}
+
+/// A daemon's history store as the drain sees it. The store is the one
+/// owner of the SQLite connection that holds the database's EXCLUSIVE lock
+/// from open to close; every holder (the agent's handle, the writer thread,
+/// the reaper) shares one `Arc<Store>`. Its strong count reaches zero
+/// before its destructor runs, possibly on another thread, so the drain
+/// waits for the store's close watch, which fires only once the connection
+/// has closed; the count is kept for the message.
+#[derive(Clone)]
+struct HistoryRelease {
+    store: Weak<crate::history::store::Store>,
+    closed: Arc<crate::history::store::close_watch::CloseWatch>,
+}
+
+impl HistoryRelease {
+    fn of(store: &Arc<crate::history::store::Store>) -> Self {
+        Self {
+            store: Arc::downgrade(store),
+            closed: store.close_watch(),
+        }
+    }
+}
+
+/// What a stopped node's next incarnation needs released before it starts
+/// on the same dirs, checked by [`Sim::stop`]'s drain: the old daemon
+/// state, agent and history store (no strong references left), and the
+/// data-dir and identity-dir instance locks (#601, #645).
+///
+/// The history database is checked in memory, never through SQLite: its
+/// EXCLUSIVE lock lives exactly as long as the store's connection, so a
+/// closed connection ([`HistoryRelease`]) is a released lock. Opening the file,
+/// even read-only, could change what the restart sees (SQLite deletes the
+/// WAL of a zero-page database before any lock check). The instance locks
+/// are observed without creating or writing anything
+/// ([`instance_lock_held`]).
+struct Release {
+    state: Weak<AppState>,
+    agent: Weak<crate::Agent>,
+    /// The history database's path (for the message) and its store, when
+    /// history is on.
+    history_db: std::path::PathBuf,
+    history: Option<HistoryRelease>,
+    data_dir: std::path::PathBuf,
+    identity_dir: Option<std::path::PathBuf>,
+}
+
+impl Release {
+    /// Everything still held; empty once all of it is released. The lock
+    /// files are probed only after every object is gone: an object still
+    /// alive is the cause, and its locks would only repeat it. A probe that
+    /// fails is reported, never read as released.
+    fn held(&self) -> Vec<String> {
+        let mut held = Vec::new();
+        if self.state.strong_count() > 0 {
+            held.push(format!(
+                "daemon state by {} references",
+                self.state.strong_count()
+            ));
+        }
+        if self.agent.strong_count() > 0 {
+            held.push(format!("agent by {} references", self.agent.strong_count()));
+        }
+        if let Some(history) = self
+            .history
+            .as_ref()
+            .filter(|history| !history.closed.closed())
+        {
+            held.push(format!(
+                "history db {} (its connection, with the EXCLUSIVE lock, has not closed; \
+                 store held by {} references)",
+                self.history_db.display(),
+                history.store.strong_count()
+            ));
+        }
+        if !held.is_empty() {
+            return held;
+        }
+        let locks = std::iter::once(("data-dir", &self.data_dir))
+            .chain(self.identity_dir.iter().map(|dir| ("identity-dir", dir)));
+        for (what, dir) in locks {
+            let path = dir.join(super::instance_lock::INSTANCE_LOCK_FILE);
+            match instance_lock_held(&path) {
+                Ok(false) => {}
+                Ok(true) => held.push(format!("{what} instance lock {} (locked)", path.display())),
+                Err(error) => held.push(format!(
+                    "{what} instance lock {} (probe failed: {error})",
+                    path.display()
+                )),
+            }
+        }
+        held
+    }
+}
+
+/// Whether the instance lock file at `path` is locked, observed without
+/// changing it. A missing file is not held (and is not created). Otherwise
+/// the existing file is opened read-only (never created or truncated) and
+/// the production lock primitive ([`crate::file_lock::try_lock_exclusive`],
+/// a non-blocking `flock`, per open file description, so a holder in this
+/// process is seen) is tried; a lock it gets is released when the file
+/// closes, with the file's bytes and times untouched.
+#[cfg(unix)]
+fn instance_lock_held(path: &std::path::Path) -> std::io::Result<bool> {
+    let file = match std::fs::OpenOptions::new().read(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    Ok(!crate::file_lock::try_lock_exclusive(&file)?)
+}
+
+/// Windows' instance lock is a share-mode open, which an observer cannot
+/// test without holding the file itself; W3-H daemon cases run on Linux.
+#[cfg(not(unix))]
+fn instance_lock_held(_path: &std::path::Path) -> std::io::Result<bool> {
+    Ok(false)
 }
 
 /// Identity material written into a node's identity directory before its
@@ -379,6 +527,27 @@ impl Observations {
     }
 }
 
+/// The permuted agent-id order of `labels` requested through
+/// [`IDENTITY_ORDER_ENV`], if any. It must name exactly `labels`.
+fn identity_order(labels: &[&str]) -> Result<Option<Vec<String>>> {
+    let Ok(raw) = std::env::var(IDENTITY_ORDER_ENV) else {
+        return Ok(None);
+    };
+    let order: Vec<String> = raw
+        .split(',')
+        .map(|label| label.trim().to_string())
+        .collect();
+    let mut wanted: Vec<&str> = order.iter().map(String::as_str).collect();
+    let mut have = labels.to_vec();
+    wanted.sort_unstable();
+    have.sort_unstable();
+    ensure!(
+        wanted == have,
+        "INFRA: {IDENTITY_ORDER_ENV}={raw} does not name exactly this case's nodes {labels:?}"
+    );
+    Ok(Some(order))
+}
+
 /// Whether this run of `case` writes a payload dump: the first run that
 /// finishes (it records its digest in `<case>.first-digest`) and the first
 /// run whose digest differs from it (`<case>.divergent-digest`). Later runs
@@ -432,12 +601,39 @@ impl Sim {
             Err(reason) => (None, format!("uncontrolled ({reason})")),
         };
         let mut keys = BTreeMap::new();
-        for label in labels {
-            let pair = (MachineKeypair::generate()?, AgentKeypair::generate()?);
-            if keys.insert((*label).to_string(), pair).is_some() {
+        let mut generated = Vec::with_capacity(labels.len());
+        for _ in labels {
+            generated.push((MachineKeypair::generate()?, AgentKeypair::generate()?));
+        }
+        let order = identity_order(labels)?;
+        let assigned: Vec<&str> = match &order {
+            Some(order) => {
+                // Lowest agent id first; `order` names who plays each rank.
+                generated.sort_by_key(|pair| pair.1.agent_id().0);
+                order.iter().map(String::as_str).collect()
+            }
+            None => labels.to_vec(),
+        };
+        for (label, pair) in assigned.into_iter().zip(generated) {
+            if keys.insert(label.to_string(), pair).is_some() {
                 bail!("node label {label} declared twice");
             }
         }
+        // Every case records the actual agent-id order of its labels, so a
+        // permuted run that did not take effect is visible in its trace.
+        let mut ranked: Vec<(&String, [u8; 32])> = keys
+            .iter()
+            .map(|(label, (_, agent))| (label, agent.agent_id().0))
+            .collect();
+        ranked.sort_by_key(|entry| entry.1);
+        let ranked: Vec<&str> = ranked.iter().map(|(label, _)| label.as_str()).collect();
+        if let Some(order) = &order {
+            ensure!(
+                ranked == order.iter().map(String::as_str).collect::<Vec<_>>(),
+                "INFRA: identity order {order:?} did not take effect (got {ranked:?})"
+            );
+        }
+        let ranked = ranked.join("<");
         let logs = Arc::new(Mutex::new(Vec::new()));
         // Thread-local: the scenario runs on one current-thread runtime, so
         // every daemon task emits on this thread.
@@ -464,6 +660,10 @@ impl Sim {
             _log_guard: log_guard,
         };
         sim.fabric.mark(format!("case {case} entropy={entropy}"));
+        sim.fabric.mark(format!(
+            "identity order {ranked} (by agent id{})",
+            if order.is_some() { ", permuted" } else { "" }
+        ));
         Ok(sim)
     }
 
@@ -545,6 +745,20 @@ impl Sim {
                 crate::storage::write_private_bytes(&identity.join(file), bytes).await?;
             }
         }
+        let node = self.serve_node(label, index, config).await?;
+        // Identities are part of the canonical trace: if key generation ever
+        // diverges, the gate's first differing line says so.
+        self.fabric.mark(format!(
+            "identity {label} agent={} machine={}",
+            node.agent_hex,
+            hex::encode(node.peer.0)
+        ));
+        self.nodes.insert(label.to_string(), node);
+        Ok(())
+    }
+
+    /// Serve `label`'s daemon from `config` inside a `start` barrier.
+    async fn serve_node(&self, label: &str, index: usize, config: DaemonConfig) -> Result<SimNode> {
         let options = ServeOptions {
             skip_update_check: true,
             cli_no_port_mapping: true,
@@ -569,24 +783,141 @@ impl Sim {
             .ok_or_else(|| anyhow!("daemon {label} has no network"))?
             .peer_id();
         self.fabric.label(&peer, label);
-        let agent_hex = hex::encode(state.agent.agent_id().as_bytes());
-        // Identities are part of the canonical trace: if key generation ever
-        // diverges, the gate's first differing line says so.
-        self.fabric.mark(format!(
-            "identity {label} agent={agent_hex} machine={}",
-            hex::encode(peer.0)
-        ));
-        let node = SimNode {
+        Ok(SimNode {
             label: label.to_string(),
+            index,
             router: Some(handle.test_router.clone()),
             state: Arc::downgrade(&state),
+            agent: Arc::downgrade(&state.agent),
+            history: state
+                .agent
+                .history()
+                .map(|history| HistoryRelease::of(history.store())),
             token: state.api_token.clone(),
             peer,
-            agent_hex,
+            agent_hex: hex::encode(state.agent.agent_id().as_bytes()),
             handle: Some(handle),
+        })
+    }
+
+    /// Stop `label`'s daemon. A [`RestartMode::Crash`] takes the node off
+    /// the fabric first; a [`RestartMode::Graceful`] stop leaves it online
+    /// while it shuts down. The daemon drains inside a `stop` barrier, then
+    /// everything its next incarnation needs must be released ([`Release`];
+    /// a `drain` barrier lets virtual time pass so stray tasks can finish).
+    /// Anything still held is INFRA: a stopped daemon's objects could still
+    /// act on its data and identity dirs while the next incarnation uses
+    /// them, and a held lock fails the restart itself.
+    ///
+    /// Returns the trace position just after the `fault stop` mark. For a
+    /// crash, the node leaves the fabric at that position: the mark and
+    /// `set_online(false)` run on the test thread with no await between
+    /// them, so no daemon task can write in between.
+    pub(crate) async fn stop(&mut self, label: &str, mode: RestartMode) -> Result<usize> {
+        let mode_name = match mode {
+            RestartMode::Graceful => "graceful",
+            RestartMode::Crash => "crash",
         };
+        let index = self.node(label)?.index;
+        let config = self.daemon_config(label, index)?;
+        let (handle, peer, release) = {
+            let node = self
+                .nodes
+                .get_mut(label)
+                .ok_or_else(|| anyhow!("no simulated node {label}"))?;
+            let handle = node
+                .handle
+                .take()
+                .ok_or_else(|| anyhow!("{label} is already stopped"))?;
+            node.router = None;
+            let release = Release {
+                state: node.state.clone(),
+                agent: node.agent.clone(),
+                // As the daemon resolves it (server/mod.rs, ADR-0023).
+                history_db: config
+                    .history
+                    .db_path
+                    .clone()
+                    .unwrap_or_else(|| config.data_dir.join("history.db")),
+                history: node.history.clone(),
+                data_dir: config.data_dir.clone(),
+                identity_dir: config.identity_dir.clone(),
+            };
+            (handle, node.peer, release)
+        };
+        let stop_mark = self.fabric.cut(format!("fault stop {label} {mode_name}"));
+        if mode == RestartMode::Crash {
+            self.fabric.set_online(&peer, false);
+        }
+        self.within(
+            &format!("stop {label}"),
+            START_BUDGET,
+            handle.shutdown_and_wait(),
+        )
+        .await?
+        .with_context(|| format!("INFRA: {label} shutdown"))?;
+        let released = self
+            .until(&format!("drain {label}"), DRAIN_BUDGET, async |_: &Sim| {
+                release.held().is_empty()
+            })
+            .await;
+        if let Err(error) = released {
+            if expired(&error) {
+                bail!(
+                    "INFRA: {label}'s stopped daemon is still held after its stop: {}; a \
+                     stopped daemon could still act on its data and identity dirs",
+                    release.held().join("; ")
+                );
+            }
+            return Err(error);
+        }
+        self.fabric.mark(format!("stopped {label}"));
+        Ok(stop_mark)
+    }
+
+    /// Start a stopped daemon again on the same data and identity dirs and
+    /// the same address. Its machine key persists, so its peer id must be
+    /// unchanged; the fabric attaches it as the next incarnation.
+    pub(crate) async fn start_again(&mut self, label: &str) -> Result<()> {
+        let (index, peer, agent_hex) = {
+            let node = self.node(label)?;
+            ensure!(node.handle.is_none(), "{label} is still running");
+            (node.index, node.peer, node.agent_hex.clone())
+        };
+        let config = self.daemon_config(label, index)?;
+        let node = self.serve_node(label, index, config).await?;
+        ensure!(
+            node.peer == peer && node.agent_hex == agent_hex,
+            "INFRA: {label} restarted with a different identity"
+        );
+        let incarnation = self
+            .fabric
+            .incarnation_of(&peer)
+            .context("restarted node is not on the fabric")?;
+        self.fabric
+            .mark(format!("restarted {label} inc={incarnation}"));
         self.nodes.insert(label.to_string(), node);
         Ok(())
+    }
+
+    /// [`Self::stop`] then [`Self::start_again`].
+    pub(crate) async fn restart(&mut self, label: &str, mode: RestartMode) -> Result<()> {
+        self.stop(label, mode).await?;
+        self.start_again(label).await
+    }
+
+    /// A node's data dir, for fixture file damage while it is stopped.
+    pub(crate) fn data_dir(&self, label: &str) -> Result<std::path::PathBuf> {
+        ensure!(
+            self.node(label)?.handle.is_none(),
+            "{label} is running; stop it before touching its files"
+        );
+        Ok(self.root.path().join(label).join("data"))
+    }
+
+    /// The node's address slot (its sim address is `sim_addr(index)`).
+    pub(crate) fn node_index(&self, label: &str) -> Result<usize> {
+        Ok(self.node(label)?.index)
     }
 
     /// The node's transport peer id.
