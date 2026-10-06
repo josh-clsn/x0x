@@ -8,13 +8,16 @@
 //! for (`NoHint`), as ant-quic does with its peer cache disabled.
 //!
 //! The controls, each run 20 times in CI:
-//! - graceful and crash restarts of a seated group member. Each stop passes
-//!   the drain guard; the trace shows the next incarnation and a new
-//!   connection to the group's owner; fresh group traffic flows both ways
-//!   after the restart (the rosters alone prove nothing: both are restored
-//!   from disk). After a crash, no frame leaves the node between the crash
-//!   mark and its new attach (trace positions, not virtual times, which
-//!   paused time lets events on both sides of a boundary share);
+//! - graceful and crash restarts of a seated group member, and a graceful
+//!   restart of an owner-backed member (an install with an owner key, so
+//!   with owner sync and a Home). Each stop passes the drain guard; the
+//!   trace shows the next incarnation and a new connection to the group's
+//!   owner; fresh group traffic flows both ways after the restart (the
+//!   rosters alone prove nothing: both are restored from disk). After a
+//!   crash, no frame leaves the node between the crash mark and its new
+//!   attach (trace positions, not virtual times, which paused time lets
+//!   events on both sides of a boundary share). The owner-backed member
+//!   must also still serve its Home;
 //! - a negative control for the hint rule: a restarted node cannot dial a
 //!   peer by id until it learns that peer's address;
 //! - a harness guard: a daemon state that outlives its stop is INFRA.
@@ -225,6 +228,61 @@ async fn w3h_s3_control_crash_restart_reseats_member() -> Result<()> {
     )
     .await?;
     let outcome = restart_scenario(&mut sim, RestartMode::Crash).await;
+    sim.conclude(outcome).await
+}
+
+/// Owner-backed restart (Codex S3 review, finding 1): O starts with the
+/// owner key, so it runs owner sync and provisions a Home. Owner sync's
+/// daemon view once held the daemon state strongly, a cycle no stop could
+/// clear, so this restart could never pass the drain guard. O, seated in
+/// A's ordinary group, is restarted gracefully: the restart must show
+/// everything an ordinary member's does, and O must still serve its own
+/// Home afterwards.
+async fn owner_backed_scenario(sim: &mut Sim) -> Result<()> {
+    // Before any daemon starts, like the node keys (`Sim::empty`).
+    let owner = crate::identity::UserKeypair::generate()?;
+    // A starts first: node 0 is every later node's bootstrap peer, so the
+    // restarted O dials A by address again.
+    sim.start_node_with("A", Provision::default()).await?;
+    let home = sim.start_owner_device("O", &owner).await?;
+    ensure!(
+        sim.state("O")?.owner_sync.is_some(),
+        "INFRA: O runs no owner sync, so its restart would not be owner-backed"
+    );
+    mesh(sim, &["A", "O"]).await?;
+    let group = seat(sim, "A", "O").await?;
+    restart_member(sim, "A", "O", &group, RestartMode::Graceful).await?;
+    let mut last = serde_json::Value::Null;
+    sim.until(
+        "O serves its Home again after its restart",
+        secs(60),
+        async |s: &Sim| {
+            last = match s.request("O", Method::GET, "/home", None).await {
+                Ok((status, body)) if status.is_success() => body,
+                _ => serde_json::Value::Null,
+            };
+            last["state"] == "local" && last["group_id"] == home.gid.as_str()
+        },
+    )
+    .await
+    .with_context(|| format!("O's last GET /home: {last}"))?;
+    sim.fabric()
+        .mark("checkpoint: owner-backed O restarted through the drain guard and serves its Home");
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon controls run in the Linux isolated namespace only"
+)]
+async fn w3h_s3_control_owner_backed_restart_reseats_member() -> Result<()> {
+    let mut sim = Sim::empty(
+        "w3h_s3_control_owner_backed_restart_reseats_member",
+        0x5300_0005,
+        &["A", "O"],
+    )?;
+    let outcome = owner_backed_scenario(&mut sim).await;
     sim.conclude(outcome).await
 }
 
