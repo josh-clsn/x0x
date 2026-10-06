@@ -117,16 +117,21 @@
 //! - Intact persisted evidence: H restarts once while N knows it (N's
 //!   Hello stores N's record at H), then restarts again with that record
 //!   on disk: H is eligible at the second connect, and the same
-//!   either-direction exchange completes.
+//!   either-direction exchange completes. In both controls the case
+//!   restart comes 61 s after the last setup Hello, past N's inbound gate
+//!   for H: N's attempt marker for H stays set (see below), so H's Hello
+//!   is the only one that can complete the exchange.
 //! - Authorized third holder: T, a G0 member that holds N's live record
 //!   and can resolve H (both from Hellos at T's own restart), answers H's
 //!   Lookup for N (lookup.rs:281-302, :496-508). A Lookup responder serves
 //!   only a live record, so T restarts before N's setup restart (after
 //!   it, N would never Hello T again: its per-machine attempt marker is
 //!   cleared only by a local disconnect), and N's restart comes 61 s
-//!   later, past T's inbound Hello gate. The case requires exactly what
-//!   the responder needs (`third_holder_ready`); the final still needs H's
-//!   Lookup answered FOUND by T.
+//!   later, past T's inbound Hello gate (T's live record of N may still be
+//!   the previous incarnation's; a note records which). The case requires
+//!   a fixture-specific form of what the responder needs
+//!   (`third_holder_ready`); the final still needs H's Lookup answered
+//!   FOUND by T.
 //!
 //! # GREEN, RED, flag
 //!
@@ -871,7 +876,8 @@ async fn release_discovery(sim: &Sim, stage: &Stage) -> Result<usize> {
     Ok(position)
 }
 
-/// What T needs to answer H's Lookup for N with FOUND, and nothing more:
+/// A fixture-specific check of what T needs to answer H's Lookup for N
+/// with FOUND:
 /// - N's live record: `lookup_reply` serves `PeerEvidenceStore::live` only
 ///   (lookup.rs:342-350, :496-508);
 /// - an authorized requester: T resolves H's machine (`peer`, lookup.rs:
@@ -880,7 +886,11 @@ async fn release_discovery(sim: &Sim, stage: &Stage) -> Result<usize> {
 ///   orders them, lib.rs:4468-4487) and shares a context with H, and H
 ///   with N (`authorized`, lookup.rs:281-302). G0 relates all three.
 ///
-/// H's own live record at T is not required.
+/// It is not the responder's predicate: it reads the DM registry instead
+/// of the authenticated binding, and it omits binding precedence,
+/// certificate expiry and revocation, which this fixture never exercises
+/// (no certificates, no revocations, one machine per agent). H's own live
+/// record at T is not required.
 async fn third_holder_ready(sim: &Sim) -> Result<(bool, Value)> {
     let t_n = view(sim, "T", "N").await?;
     let t_h = view(sim, "T", "H").await?;
@@ -1110,8 +1120,9 @@ async fn scenario(
             "setup: T never held N's live record with H authorizable"
         );
         // N's restart then sends T a Hello; T's inbound gate for N
-        // (evidence_wire.rs:36, :305-323) clears first, so T takes it and
-        // holds N's current-incarnation record.
+        // (evidence_wire.rs:36, :305-323) clears first, so T can take N's
+        // current-incarnation record. The post-restart check accepts the
+        // live record of either incarnation; a note records which.
         sim.within(
             "T's Hello window toward N expires",
             HELLO_WINDOW + secs(1),
@@ -1186,6 +1197,28 @@ async fn scenario(
             );
         }
         _ => {}
+    }
+    if matches!(
+        variant,
+        Variant::AdminKnowsJoiner | Variant::PersistedEvidence
+    ) {
+        // H and N exchanged Hellos in setup: at N's restart, and at H's
+        // first restart in the persisted control. Which side opens first
+        // can differ between runs. If H's Hello was the request, N's inbound
+        // gate for H (evidence_wire.rs:36, :305-323) refuses H's
+        // connect-time Hello for 60 s, and N sends none: its attempt marker
+        // for H, set by its setup Hello, is cleared only by a local
+        // disconnect (evidence_wire.rs:359-366, :1450; see the third-holder
+        // setup). The 3c39573 W3-H iteration 12 recorded `H->N HELLO/none`
+        // with N's `evidence_hello_refused` 0 -> 1 and one more Hello
+        // received in setup than in the GREEN iterations. The case restart
+        // comes past that gate.
+        sim.within(
+            "N's inbound Hello gate for H expires",
+            HELLO_WINDOW + secs(1),
+            tokio::time::sleep(HELLO_WINDOW),
+        )
+        .await?;
     }
     sim.set_online("O", false)?;
     receipt.setup_done(at(sim));
