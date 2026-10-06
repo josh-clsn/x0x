@@ -32,6 +32,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new(related: bool, discovered: bool) -> Self {
+        Self::new_with_load(related, discovered, true).await
+    }
+
+    async fn new_with_load(related: bool, discovered: bool, loaded: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let mut agents = Vec::new();
         for name in ["initiator", "responder"] {
@@ -102,22 +106,24 @@ impl Fixture {
         }));
         let runtime = Arc::clone(responder.peer_evidence());
         responder.owner_trust.install_evidence(&runtime);
-        runtime.start(
-            dir.path().join("evidence"),
-            Default::default(),
-            policy.clone(),
-            Arc::clone(&responder.capability_store.evidence_wire),
-        );
-        assert!(runtime.wait(0).await, "evidence store must finish loading");
-        assert_eq!(
-            runtime.store().unwrap().related(
-                peer,
-                initiator.machine_id(),
-                None,
-                dm_capability::now_unix_ms(),
-            ),
-            related,
-        );
+        if loaded {
+            runtime.start(
+                dir.path().join("evidence"),
+                Default::default(),
+                policy.clone(),
+                Arc::clone(&responder.capability_store.evidence_wire),
+            );
+            assert!(runtime.wait(0).await, "evidence store must finish loading");
+            assert_eq!(
+                runtime.store().unwrap().related(
+                    peer,
+                    initiator.machine_id(),
+                    None,
+                    dm_capability::now_unix_ms(),
+                ),
+                related,
+            );
+        }
         assert!(responder.contact_store.read().await.get(&peer).is_none());
         assert_eq!(
             responder.contact_store.read().await.trust_level(&peer),
@@ -746,4 +752,389 @@ async fn issue1241_roster_alone_does_not_trigger_outbound_hello() {
             dm_capability::now_unix_ms()
         )
         .is_some());
+}
+
+// S1's test switch is local to the synchronous start call. It neither mutates
+// process environment nor changes another test's agent. Main ignores it; the
+// fix reads it at the same seam as the daemon's operational opt-in.
+thread_local! {
+    static READY_HELLO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn start_ready_wire(agent: &Agent, enabled: bool) {
+    READY_HELLO.with(|flag| flag.set(enabled));
+    agent.start_evidence_wire();
+    READY_HELLO.with(|flag| flag.set(false));
+}
+
+impl Fixture {
+    async fn ready_wire(&self, enabled: bool, existing: bool, publishable: bool) {
+        let peer = self.responder.agent_id();
+        let runtime = self.initiator.peer_evidence();
+        self.initiator.owner_trust.install_evidence(runtime);
+        let policy = Arc::new(RuntimePolicy::new(
+            self.initiator.agent_id(),
+            self.initiator.owner_trust.clone(),
+            Arc::clone(&self.initiator.revocation_set),
+        ));
+        policy.set_groups(Arc::new(move |agent| Some(agent == peer)));
+        runtime.start(
+            self._dir.path().join("initiator-evidence"),
+            Default::default(),
+            policy,
+            Arc::clone(&self.initiator.capability_store.evidence_wire),
+        );
+        assert!(runtime.wait(0).await);
+        self.initiator
+            .dm_capabilities_tx
+            .send_replace(crate::dm::DmCapabilities::v1_gossip_ready(vec![42; 1184]));
+        if publishable {
+            self.publish_ready();
+        }
+        // Only the responder runs the scheduler under test. The initiator
+        // receives and replies using the production ingress and Hello paths.
+        start_ready_wire(&self.initiator, false);
+        self.initiator.start_stream_accept_loop();
+        self.responder.start_stream_accept_loop();
+        if !existing {
+            self.initiator
+                .network()
+                .unwrap()
+                .disconnect(&ant_quic::PeerId(self.responder.machine_id().0))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        start_ready_wire(&self.responder, enabled);
+        if !existing {
+            let address = self
+                .responder
+                .network()
+                .unwrap()
+                .bound_addr()
+                .await
+                .unwrap();
+            self.initiator
+                .network()
+                .unwrap()
+                .connect_addr(address)
+                .await
+                .unwrap();
+        }
+        // Let the original connect job finish, including its five-second
+        // advert timeout. No reconnect or identity publication follows this.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert_eq!(self.sent(), 0, "setup must not send an early Hello");
+    }
+
+    fn publish_ready(&self) {
+        self.responder
+            .dm_capabilities_tx
+            .send_replace(crate::dm::DmCapabilities::v1_gossip_ready(vec![43; 1184]));
+    }
+
+    fn roster_ready(&self) {
+        let peer = self.initiator.agent_id();
+        self.policy
+            .set_groups(Arc::new(move |agent| Some(agent == peer)));
+    }
+
+    fn sent(&self) -> u64 {
+        self.context
+            .runtime
+            .wire_limits
+            .counters
+            .evidence_hello_sent
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    async fn one_exchange(&self) {
+        let peer = self.initiator.agent_id();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if self
+                    .context
+                    .runtime
+                    .usable_agent(peer, dm_capability::now_unix_ms())
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("late readiness must produce usable verified evidence without reconnect");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(self.sent(), 1, "one real outbound Hello");
+        assert_eq!(
+            self.initiator.peer_evidence().diagnostics()["evidence_hello_received"],
+            1
+        );
+        assert_eq!(
+            self.initiator.peer_evidence().diagnostics()["evidence_hello_sent"],
+            1
+        );
+        assert!(self
+            .initiator
+            .peer_evidence()
+            .usable_agent(self.responder.agent_id(), dm_capability::now_unix_ms(),)
+            .is_some());
+        assert!(
+            self.responder
+                .authenticated_machine_bindings
+                .read()
+                .await
+                .peek(&peer)
+                .is_none(),
+            "evidence must not invent an authenticated binding"
+        );
+        self.initiator.shutdown_token.cancel();
+        self.responder.shutdown_token.cancel();
+        self.shutdown().await;
+    }
+}
+
+async fn ready_order(mapping_first: bool, enabled: bool) {
+    let f = Fixture::new(false, true).await;
+    let entry = f
+        .responder
+        .identity_discovery_cache
+        .write()
+        .await
+        .remove(&f.initiator.agent_id())
+        .unwrap();
+    f.ready_wire(enabled, false, true).await;
+    if mapping_first {
+        f.responder
+            .identity_discovery_cache
+            .write()
+            .await
+            .insert(entry.agent_id, entry.clone());
+    } else {
+        f.roster_ready();
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(f.sent(), 0, "one prerequisite alone cannot authorize");
+    if mapping_first {
+        f.roster_ready();
+    } else {
+        f.responder
+            .identity_discovery_cache
+            .write()
+            .await
+            .insert(entry.agent_id, entry);
+    }
+    if enabled {
+        f.one_exchange().await;
+    } else {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(
+            f.sent(),
+            0,
+            "default off preserves the lost-trigger behavior"
+        );
+        f.initiator.shutdown_token.cancel();
+        f.responder.shutdown_token.cancel();
+        f.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn issue1207_mapping_then_roster_sends_one_hello() {
+    ready_order(true, true).await;
+}
+
+#[tokio::test]
+async fn issue1207_roster_then_mapping_sends_one_hello() {
+    ready_order(false, true).await;
+}
+
+#[tokio::test]
+async fn issue1207_default_off_keeps_connect_only_behavior() {
+    ready_order(true, false).await;
+}
+
+#[tokio::test]
+async fn issue1207_connection_before_subscription_is_reconciled() {
+    let f = Fixture::new(false, true).await;
+    f.ready_wire(true, true, true).await;
+    f.roster_ready();
+    f.one_exchange().await;
+}
+
+#[tokio::test]
+async fn issue1207_local_capability_ready_after_connect_timeout() {
+    let f = Fixture::new(false, true).await;
+    f.ready_wire(true, false, false).await;
+    f.roster_ready();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(f.sent(), 0);
+    f.publish_ready();
+    f.one_exchange().await;
+}
+
+#[tokio::test]
+async fn issue1207_busy_roster_and_change_flood_coalesce() {
+    let f = Fixture::new(false, true).await;
+    let roster = Arc::new(tokio::sync::RwLock::new(false));
+    let live = Arc::clone(&roster);
+    f.policy
+        .set_groups(Arc::new(move |_| live.try_read().ok().map(|r| *r)));
+    let mut guard = roster.write().await;
+    f.ready_wire(true, false, true).await;
+    *guard = true;
+    drop(guard);
+    for _ in 0..10_000 {
+        *roster.write().await = true;
+        f.publish_ready();
+    }
+    f.one_exchange().await;
+}
+
+#[tokio::test]
+async fn issue1207_late_readiness_preserves_denials() {
+    for denial in [
+        Denial::Blocked,
+        Denial::CoResidentBlocked,
+        Denial::AgentRevoked,
+        Denial::MachineRevoked,
+        Denial::BindingRevoked,
+        Denial::PlacementMoved,
+        Denial::Expired,
+        Denial::RelationshipRemoved,
+    ] {
+        let f = Fixture::new(false, true).await;
+        f.ready_wire(true, false, true).await;
+        f.roster_ready();
+        f.deny(denial).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(f.sent(), 0, "denial must prevent emission: {denial:?}");
+        assert!(f
+            .context
+            .runtime
+            .usable_agent(f.initiator.agent_id(), dm_capability::now_unix_ms())
+            .is_none());
+        f.initiator.shutdown_token.cancel();
+        f.responder.shutdown_token.cancel();
+        f.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn issue1207_unrelated_machine_never_sends() {
+    let f = Fixture::new(false, true).await;
+    f.ready_wire(true, true, true).await;
+    for _ in 0..1000 {
+        f.publish_ready();
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(f.sent(), 0);
+    f.initiator.shutdown_token.cancel();
+    f.responder.shutdown_token.cancel();
+    f.shutdown().await;
+}
+
+#[tokio::test]
+async fn issue1207_evidence_load_ready_after_connect_timeout() {
+    let f = Fixture::new_with_load(false, true, false).await;
+    f.ready_wire(true, false, true).await;
+    f.roster_ready();
+    f.context.runtime.start(
+        f._dir.path().join("late-evidence"),
+        Default::default(),
+        f.policy.clone(),
+        Arc::clone(&f.responder.capability_store.evidence_wire),
+    );
+    assert!(f.context.runtime.wait(0).await);
+    f.one_exchange().await;
+}
+
+#[tokio::test]
+async fn issue1207_peer_capability_becomes_ready_later() {
+    let f = Fixture::new(false, true).await;
+    let mut caps = crate::dm::DmCapabilities::v1_gossip_ready(vec![42; 1184]);
+    caps.application_registry.bits = 0;
+    assert!(f.responder.capability_store.insert(
+        f.initiator.agent_id(),
+        f.initiator.machine_id(),
+        caps.clone(),
+        dm_capability::now_unix_ms()
+    ));
+    f.ready_wire(true, false, true).await;
+    f.roster_ready();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(f.sent(), 0);
+    caps.application_registry = crate::dm::CapabilityRegistry::current();
+    assert!(f.responder.capability_store.insert(
+        f.initiator.agent_id(),
+        f.initiator.machine_id(),
+        caps,
+        dm_capability::now_unix_ms()
+    ));
+    f.one_exchange().await;
+}
+
+#[tokio::test]
+async fn issue1207_reset_and_ready_flood_never_repeat_attempt() {
+    let f = Fixture::new(true, true).await;
+    let network = Arc::clone(f.initiator.network().unwrap());
+    let reset_peer = tokio::spawn(async move {
+        let (_, send, mut recv) = network.accept_bi().await.unwrap();
+        assert_eq!(
+            recv.read_u8().await.unwrap(),
+            StreamProtocol::EvidenceV1.as_u8()
+        );
+        let (kind, body) = read_message(&mut recv, &Limits::default()).await.unwrap();
+        assert_eq!(kind, HELLO);
+        decode::hello(&body)
+            .unwrap()
+            .into_record()
+            .verify(dm_capability::now_unix_ms(), W_MS)
+            .unwrap();
+        // Refuse the actual exchange by resetting its reply stream.
+        drop((send, recv));
+    });
+    f.initiator
+        .network()
+        .unwrap()
+        .disconnect(&ant_quic::PeerId(f.responder.machine_id().0))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    f.publish_ready();
+    start_ready_wire(&f.responder, true);
+    let address = f.responder.network().unwrap().bound_addr().await.unwrap();
+    f.initiator
+        .network()
+        .unwrap()
+        .connect_addr(address)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(8), reset_peer)
+        .await
+        .unwrap()
+        .unwrap();
+    for _ in 0..10_000 {
+        f.publish_ready();
+        f.roster_ready();
+    }
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    assert_eq!(
+        f.sent(),
+        1,
+        "reset and floods never clear the actual attempt"
+    );
+    assert!(!f
+        .context
+        .runtime
+        .wire_limits
+        .begin_hello(f.initiator.machine_id(), true));
+    assert!(f
+        .context
+        .runtime
+        .usable_agent(f.initiator.agent_id(), dm_capability::now_unix_ms())
+        .is_none());
+    f.responder.shutdown_token.cancel();
+    f.shutdown().await;
 }
