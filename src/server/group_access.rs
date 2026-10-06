@@ -1741,21 +1741,45 @@ mod tests {
     /// S5: the `clippy.toml` ceiling is build configuration — `cargo
     /// test` never reads it, so silently deleting or emptying it would
     /// re-open the inline-admission drift class (#821/#870/#877) with
-    /// every behavioural suite still green. This test pins the four
-    /// disallowed paths (and the controller's two deliberate
-    /// exclusions — review-d condition 2 extended by the S5 caller
-    /// audit) so removing the ceiling is a visible, deliberate edit.
+    /// every behavioural suite still green. The config is PARSED, not
+    /// text-matched, so a commented-out entry or a reformatting
+    /// (bare string vs `{ path = ... }` table) cannot slip past: the
+    /// exact `disallowed-methods` set is pinned — the four #1166 paths
+    /// present, the controller's two deliberate exclusions (review-d
+    /// condition 2 extended by the S5 caller audit) absent, and no
+    /// fifth entry — so touching the ceiling is a visible, deliberate
+    /// edit.
     #[test]
     fn disallowed_methods_ceiling_is_pinned() {
-        let config = include_str!("../../clippy.toml");
-        for path in [
+        let config: toml::Table =
+            toml::from_str(include_str!("../../clippy.toml")).expect("clippy.toml parses as TOML");
+        let entries = config
+            .get("disallowed-methods")
+            .and_then(|value| value.as_array())
+            .expect("clippy.toml carries a `disallowed-methods` array");
+        // clippy accepts bare-string entries and `{ path = ... }`
+        // tables; every entry must yield a path or the pin under-counts.
+        let listed: std::collections::BTreeSet<&str> = entries
+            .iter()
+            .map(|entry| match entry {
+                toml::Value::String(path) => Ok(path.as_str()),
+                toml::Value::Table(table) => table
+                    .get("path")
+                    .and_then(toml::Value::as_str)
+                    .ok_or_else(|| format!("entry without a `path` key: {entry}")),
+                other => Err(format!("unsupported entry shape: {other}")),
+            })
+            .collect::<Result<_, _>>()
+            .expect("every disallowed-methods entry carries a path");
+        let ceiling = [
             "x0x::server::routes::named_groups::local_join_membership_state",
             "x0x::server::routes::named_groups::require_admin_or_above",
             "x0x::server::routes::named_groups::reject_fork_quarantined_for_actor",
             "x0x::server::rider_auth::ActorContext::rider_allows_group",
-        ] {
+        ];
+        for path in ceiling {
             assert!(
-                config.contains(&format!("path = \"{path}\"")),
+                listed.contains(path),
                 "clippy.toml must keep {path} on disallowed-methods — the #1166 ceiling"
             );
         }
@@ -1764,11 +1788,17 @@ mod tests {
             "x0x::groups::GroupInfo::has_active_member",
         ] {
             assert!(
-                !config.contains(&format!("path = \"{excluded}\"")),
+                !listed.contains(excluded),
                 "{excluded} is deliberately NOT ceiling-listed (legitimate non-group / \
                  domain callers — see clippy.toml's header); listing it needs a new ruling"
             );
         }
+        // Exact set, not just membership: an unruled fifth entry fails too.
+        assert_eq!(
+            listed,
+            ceiling.into_iter().collect(),
+            "disallowed-methods must be exactly the four #1166 paths"
+        );
     }
 
     /// The slice contract: every family through S4 is classified, at

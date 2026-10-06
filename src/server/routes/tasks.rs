@@ -190,7 +190,6 @@ pub(in crate::server) async fn task_list_fork_quarantine(
 /// #1166 S5 ceiling: this shared task-list gate parses the group out of
 /// the task-list `:id`, not a `:id` path param, so it cannot live in
 /// the group-route chokepoint; the call is allow-listed here.
-#[allow(clippy::disallowed_methods)]
 async fn reject_quarantined_task_mutation(
     state: &Arc<AppState>,
     id: &str,
@@ -202,12 +201,15 @@ async fn reject_quarantined_task_mutation(
     }
     let groups = state.named_groups.read().await;
     let (_, info) = crate::server::resolve_group_entry_locked(&groups, &scoped.group_id)?;
-    crate::server::routes::named_groups::reject_fork_quarantined_for_actor(
+    // #1166 S5 ceiling: statement-scoped — the ruling is the fn doc above.
+    #[allow(clippy::disallowed_methods)]
+    let refused = crate::server::routes::named_groups::reject_fork_quarantined_for_actor(
         state,
         &scoped.group_id,
         info,
         actor,
-    )
+    );
+    refused
 }
 
 /// Apply group authorization to a task list handle at the CRDT layer.
