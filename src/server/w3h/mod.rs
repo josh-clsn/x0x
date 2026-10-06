@@ -37,6 +37,10 @@ mod home;
 mod receipt;
 mod restart;
 
+// Kept apart from the list above so concurrent case branches never touch
+// the same lines.
+mod case_1256;
+
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, Weak};
