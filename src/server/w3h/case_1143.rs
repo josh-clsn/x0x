@@ -23,8 +23,9 @@
 //! - `w3h_1143_positive_control_consented_owner_announce_admits` (runs on
 //!   main): the only change is that O's announce carries its consented
 //!   user identity (the documented #1143 workaround); J must be admitted.
-//! - `w3h_red_1143_promoted_admin_admits_with_owner_offline` (ignored until
-//!   ADR 0108 S2): the desired behaviour; S2 removes the `#[ignore]`.
+//! - `w3h_red_1143_promoted_admin_admits_with_owner_offline`: the desired
+//!   behaviour, expected GREEN. ADR 0108 S2-1 enables it; on main it
+//!   fails, because the receipt is RED.
 
 #![cfg(test)]
 
@@ -102,6 +103,9 @@ struct OwnerView {
     resolved: Option<([u8; 32], bool)>,
     /// A's seat certificate for O: (digest, passes).
     embedded: Option<([u8; 32], bool)>,
+    /// Whether A's seat for O embeds bytes whose roster digest
+    /// (`certificate_digest_hex`) equals the seat's committed digest.
+    seat_committed: bool,
     /// O's status in the verdict (`None`: O is not an active member).
     status: Option<MemberCertStatus>,
 }
@@ -129,13 +133,14 @@ impl OwnerView {
             })
         };
         format!(
-            "announced {}; O publishes {}; anonymous {}; resolved {}; seat {} stale={}; \
-             verdict {} via {}",
+            "announced {}; O publishes {}; anonymous {}; resolved {}; seat {} committed={} \
+             stale={}; verdict {} via {}",
             self.announced.map_or("none".to_string(), hex8),
             hex8(self.published),
             hex8(crate::announce_v3::anonymous_cert_digest()),
             cert(self.resolved),
             cert(self.embedded),
+            self.seat_committed,
             self.stale(),
             self.status
                 .as_ref()
@@ -201,6 +206,14 @@ async fn admin_view_of_owner(sim: &Sim, home: &HomeIds) -> Result<OwnerView> {
         .get(&owner_hex)
         .and_then(|seat| seat.certificate.as_ref())
         .map(assess);
+    let seat_committed = info.members_v2.get(&owner_hex).is_some_and(|seat| {
+        match (&seat.certificate, &seat.certificate_digest) {
+            (Some(cert), Some(digest)) => {
+                crate::groups::owner_cert::certificate_digest_hex(cert).eq_ignore_ascii_case(digest)
+            }
+            _ => false,
+        }
+    });
     let mut clone = info;
     let status = clone
         .owner_cert_verdict(&evidence)
@@ -212,18 +225,22 @@ async fn admin_view_of_owner(sim: &Sim, home: &HomeIds) -> Result<OwnerView> {
         published,
         resolved,
         embedded,
+        seat_committed,
         status,
     })
 }
 
 /// Whether A's view of O is the one the announce `kind` should produce:
-/// - anonymous (#1143's own state, exclusively): O's latest announced
-///   digest at A is the anonymous one; A's seat for O embeds a certificate
-///   that passes the owner check, but it is stale against that anonymous
-///   digest; and the verdict is the typed `InGrace`. A digest-only seat
+/// - anonymous (#1143's own inputs): O's latest announced digest at A is
+///   the anonymous one, and A's seat for O embeds bytes that pass the owner
+///   check and match the seat's committed digest. A digest-only seat
 ///   (`DigestPending`) would make the seal refuse with the same
 ///   `OwnerCertMemberPending [O]` (the seal lists both), so it must not
-///   count here;
+///   count here. The row checks INPUTS only, never the verdict: the verdict
+///   over these inputs is what ADR 0108 S2-1 changes (`InGrace` on main,
+///   `Clean` after it), so requiring either would make the evidence row
+///   false on one side and turn that receipt into INFRA. The receipt detail
+///   records the verdict, and the final stage observes its effect;
 /// - consented: O's latest announced digest at A is the digest O's
 ///   consented announce publishes (not the anonymous one), the verdict
 ///   seats O as clean, and the certificate that made it clean commits to
@@ -233,9 +250,8 @@ fn view_matches(view: &OwnerView, kind: OwnerAnnounce) -> bool {
     match kind {
         OwnerAnnounce::Anonymous => {
             view.announced == Some(anonymous)
+                && view.seat_committed
                 && matches!(view.embedded, Some((_, true)))
-                && view.stale()
-                && matches!(view.status, Some(MemberCertStatus::InGrace { .. }))
         }
         OwnerAnnounce::Consented => {
             view.published != anonymous
@@ -479,7 +495,10 @@ async fn w3h_1143_positive_control_consented_owner_announce_admits() -> Result<(
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-#[ignore = "red baseline: enable with ADR 0108 S2 (#1143)"]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
 async fn w3h_red_1143_promoted_admin_admits_with_owner_offline() -> Result<()> {
     let receipt = run(
         "w3h_red_1143_promoted_admin_admits_with_owner_offline",
