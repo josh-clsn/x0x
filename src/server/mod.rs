@@ -1295,6 +1295,10 @@ pub async fn serve_with_options(
                         .all(|id| g.members_v2.get(*id).is_some_and(|m| m.is_active()))
             }))
         }));
+    agent.peer_evidence().wire_limits.ready_hello.store(
+        std::env::var("X0X_EVIDENCE_READY_HELLO").as_deref() == Ok("1"),
+        std::sync::atomic::Ordering::Release,
+    );
     let evidence_state = Arc::downgrade(&state);
     agent.start_peer_evidence(
         config.data_dir.clone(),

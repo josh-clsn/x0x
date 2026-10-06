@@ -738,6 +738,54 @@ impl PeerEvidenceStore {
     ) -> bool {
         self.policy.relation(agent, machine, cert, now) != 0
     }
+    /// Live relationship without waiting on a policy lock.
+    pub(crate) fn try_related(
+        &self,
+        agent: AgentId,
+        machine: MachineId,
+        cert: Option<&AgentCertificate>,
+        now: u64,
+    ) -> Option<bool> {
+        self.policy
+            .try_relation(agent, machine, cert, now)
+            .map(|r| r != 0)
+    }
+
+    /// Indexed candidates without blocking. Callers must check usability;
+    /// the index itself confers no authority.
+    pub(crate) fn try_agents_on_machine(
+        &self,
+        machine: MachineId,
+        limit: usize,
+    ) -> std::result::Result<Vec<AgentId>, ()> {
+        let state = self.state.try_lock().map_err(|_| ())?;
+        Ok(state
+            .by_machine
+            .range((machine.0, [0; 32])..=(machine.0, [255; 32]))
+            .take(limit)
+            .map(|(_, a)| AgentId(*a))
+            .collect())
+    }
+
+    /// A usable relationship on this exact machine, without blocking.
+    pub(crate) fn try_has_machine(
+        &self,
+        machine: MachineId,
+        now: u64,
+        limit: usize,
+    ) -> Option<bool> {
+        for agent in self.try_agents_on_machine(machine, limit).ok()? {
+            if self
+                .try_usable_agent(agent, now)
+                .ok()?
+                .is_some_and(|view| view.announcement.machine_id == machine)
+            {
+                return Some(true);
+            }
+        }
+        Some(false)
+    }
+
     /// Resolve an unknown machine, then run the same point-of-use authority check.
     pub fn usable_agent(&self, agent: AgentId, now: u64) -> Option<Arc<EvidenceView>> {
         let machine = self
