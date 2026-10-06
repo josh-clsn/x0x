@@ -21,6 +21,10 @@ use tokio::{
 mod decode;
 pub(crate) mod lookup;
 
+#[cfg(test)]
+#[path = "evidence_wire/tests/admission.rs"]
+mod admission_tests;
+
 const MESSAGE_CAP: usize = 32 * 1024;
 // Reserve the frame, decoded vectors, and signed-part verification copies.
 // All requests/replies, including outbound reads, acquire this conservative
@@ -208,8 +212,8 @@ impl State {
     }
 }
 impl Limits {
-    /// Only machines without known agents or verified enrollment use this
-    /// pool. Entries exist only while a lease is alive, across all connections.
+    /// Strangers and Unknown relationship peers share this bounded prefix pool.
+    /// Entries exist only while a lease is alive, across all connections.
     pub(crate) fn admit_prefix(self: &Arc<Self>, machine: MachineId) -> Option<PrefixLease> {
         let admitted = self.prefix.lock().ok().and_then(|mut slots| {
             if slots.values().sum::<usize>() >= 32 || slots.get(&machine).copied().unwrap_or(0) >= 2
@@ -573,6 +577,36 @@ fn mint_hello(
         certificate,
         have_certificate: None,
     })
+}
+
+/// Live relationship check for the shared gate's evidence-only Unknown mode.
+/// Discovery locates the candidate; only ingest_hello verifies/stores its bytes.
+pub(crate) async fn unknown_relationship(
+    discovery: &tokio::sync::RwLock<HashMap<AgentId, crate::DiscoveredAgent>>,
+    owner: &crate::owner_trust::OwnerTrust,
+    agent: &AgentId,
+    machine: &MachineId,
+) -> bool {
+    let certificate = discovery
+        .read()
+        .await
+        .get(agent)
+        .filter(|entry| entry.machine_id == *machine)
+        .map(|entry| entry.agent_certificate.clone());
+    let Some(certificate) = certificate else {
+        return false;
+    };
+    owner
+        .evidence()
+        .and_then(|runtime| runtime.store())
+        .is_some_and(|store| {
+            store.related(
+                *agent,
+                *machine,
+                certificate.as_ref(),
+                dm_capability::now_unix_ms(),
+            )
+        })
 }
 
 pub(crate) struct Context {
