@@ -2492,10 +2492,22 @@ impl OwnerSyncService {
     /// session tasks is bounded by the semaphore — a flood of inbound
     /// streams cannot spawn unbounded tasks. Without a permit the stream
     /// is dropped (reset) right there.
+    ///
+    /// WHY a `Weak<Self>` (as [`Self::spawn_reannounce_on_owner_connect`]):
+    /// `acceptor.next()` never returns `None` (the acceptor keeps a sender
+    /// of its own channel for deregistration), so this task never ends by
+    /// itself. With an `Arc` it kept the service, and through it the agent
+    /// and the agent's history database lock, alive after the daemon shut
+    /// down, and the service's `Drop`, which aborts this task, never ran.
+    /// With a `Weak` the service drops with its last owner, and its `Drop`
+    /// aborts this task.
     async fn spawn_acceptor_loop(self: &Arc<Self>, mut acceptor: crate::streams::StreamAcceptor) {
-        let service = Arc::clone(self);
+        let service = Arc::downgrade(self);
         let task = tokio::spawn(async move {
             while let Some(stream) = acceptor.next().await {
+                let Some(service) = service.upgrade() else {
+                    break; // the service is gone: drop => reset
+                };
                 let permit = match service.session_permits.clone().try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {
@@ -2506,7 +2518,6 @@ impl OwnerSyncService {
                         continue; // drop => reset, fail closed and bounded
                     }
                 };
-                let service = Arc::clone(&service);
                 tokio::spawn(async move { service.handle_inbound(stream, permit).await });
             }
         });
