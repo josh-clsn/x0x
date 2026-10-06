@@ -1534,6 +1534,11 @@ impl SimFabric {
         self.lock().nodes.get(&node).map(|slot| slot.addr)
     }
 
+    /// Whether `node` is attached and online, if it is attached.
+    pub(crate) fn is_online(&self, node: &PeerId) -> Option<bool> {
+        self.lock().nodes.get(&node.0).map(|slot| slot.online)
+    }
+
     /// `node`'s current incarnation (0 for its first attach), if attached.
     pub(crate) fn incarnation_of(&self, node: &PeerId) -> Option<u64> {
         self.lock().nodes.get(&node.0).map(|slot| slot.incarnation)
@@ -1595,6 +1600,83 @@ impl SimFabric {
             })
             .filter(|write| write.lane.src == src.0)
             .cloned()
+            .collect()
+    }
+
+    /// Every write with its trace position and fate (`None` while still in
+    /// flight), in the order the fabric accepted them.
+    pub(crate) fn writes_with_positions(&self) -> Vec<(usize, Write, Option<Fate>)> {
+        let state = self.lock();
+        let fates: BTreeMap<(LaneKey, u64), Fate> = state
+            .trace
+            .iter()
+            .filter_map(|event| match event {
+                TraceEvent::Fate { lane, seq, fate } => Some(((*lane, *seq), *fate)),
+                _ => None,
+            })
+            .collect();
+        state
+            .trace
+            .iter()
+            .enumerate()
+            .filter_map(|(position, event)| match event {
+                TraceEvent::Write { index, .. } => state.writes.get(*index).map(|write| {
+                    (
+                        position,
+                        write.clone(),
+                        fates.get(&(write.lane, write.seq)).copied(),
+                    )
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Publish attempts by `node` (`Publish` events) at trace positions at
+    /// or after `from`, as `(position, topic)`.
+    pub(crate) fn publishes_from(&self, node: &PeerId, from: usize) -> Vec<(usize, String)> {
+        let state = self.lock();
+        state
+            .trace
+            .iter()
+            .enumerate()
+            .skip(from)
+            .filter_map(|(position, event)| match event {
+                TraceEvent::Publish {
+                    node: publisher,
+                    topic,
+                    ..
+                } if *publisher == node.0 => Some((position, topic.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Trace positions and ordinals of the `a`~`b` connection opens at or
+    /// after `from`.
+    pub(crate) fn link_open_positions(
+        &self,
+        a: &PeerId,
+        b: &PeerId,
+        from: usize,
+    ) -> Vec<(usize, u64)> {
+        let key = pair(a.0, b.0);
+        let state = self.lock();
+        state
+            .trace
+            .iter()
+            .enumerate()
+            .skip(from)
+            .filter_map(|(position, event)| match event {
+                TraceEvent::Link {
+                    a,
+                    b,
+                    ordinal,
+                    open: true,
+                    ..
+                } if (*a, *b) == key => Some((position, *ordinal)),
+                _ => None,
+            })
             .collect()
     }
 
