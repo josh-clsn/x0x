@@ -11,11 +11,14 @@
 //! - [`GROUP_PLANE_ROUTES`], a static classification table keyed by
 //!   (method, path) covering EVERY group-plane route the router wires
 //!   (`/groups*`, `/history*`, `/task-lists*`, `/mls/groups*`). Routes are
-//!   either classified at their target [`AccessLevel`] or explicitly
-//!   [`AccessClass::Unmigrated`] until their slice lands. A parity test
-//!   holds the table, the axum router (`src/server/mod.rs`) and the
-//!   endpoint registry (`crate::api::ENDPOINTS`) to exactly the same route
-//!   set, so no group route can be added without being classified here.
+//!   either classified at their target [`AccessLevel`] or — through S4
+//!   — explicitly pending classification until its slice landed.
+//!   S5 migrated the last row (`POST /groups/:id/delegate`), retired
+//!   the `Unmigrated` variant, and now a new group route lands
+//!   CLASSIFIED: the parity test holds the table, the axum router
+//!   (`src/server/mod.rs`) and the endpoint registry
+//!   (`crate::api::ENDPOINTS`) to exactly the same route set, so no
+//!   group route can be added without a classification row here.
 //! - [`GroupAccess`], an axum extractor that resolves the `:id` group —
 //!   percent-decoded through the same axum `Path` machinery the handlers
 //!   used before this module existed — under the named-groups read lock,
@@ -78,11 +81,13 @@
 //! `open_envelope_withdrawn_group_conflict`, `reject_withdrawn_group`),
 //! which is what the inline code used.
 //!
-//! `POST /groups/:id/delegate` is the one row still `Unmigrated` (its
-//! handler lives in `routes/delegations.rs`, outside the S4 file set;
-//! the auth middleware already durable-gates it); it migrates under
-//! S5. S5 also activates the `clippy.toml` `disallowed-methods`
-//! ceiling on the absorbed admission helpers
+//! `POST /groups/:id/delegate` — the one S4 row left `Unmigrated` —
+//! migrated in S5 with the same discipline: its handler
+//! (`routes/delegations.rs`) keeps its signature (the Json body must
+//! keep answering 400 before any gate) and calls the
+//! [`admit_delegate_route`] core at the inline gates' exact position
+//! under its own lock. S5 also activates the `clippy.toml`
+//! `disallowed-methods` ceiling on the absorbed admission helpers
 //! (`local_join_membership_state`, `require_admin_or_above`,
 //! `reject_fork_quarantined_for_actor`,
 //! `ActorContext::rider_allows_group`): they may be called freely in
@@ -97,7 +102,7 @@ use std::sync::Arc;
 use crate as x0x;
 use crate::server::rider_auth::ActorContext;
 use crate::server::routes::named_groups::{
-    local_join_membership_state, open_envelope_withdrawn_group_conflict,
+    local_join_membership_state, open_envelope_withdrawn_group_conflict, reject_fork_quarantined,
     reject_fork_quarantined_for_actor, reject_unverified_owner_certified_restore,
     reject_withdrawn_group, require_admin_or_above,
 };
@@ -200,29 +205,22 @@ pub(in crate::server) type Admission = Result<AccessLevel, (StatusCode, Json<ser
 
 // ─────────────────────── classification table ────────────────────────────
 
-/// A route's migration state under the group-access chokepoint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::server) enum AccessClass {
-    /// Admitted at this level by [`GroupAccess`] / the admission cores.
-    /// The level is the route's NOMINAL class (the slice plan's inventory
-    /// target); per-route rules (policy arms, withdrawn-shell exemptions,
-    /// pending-join stubs) live in the admission cores.
-    Level(AccessLevel),
-    /// Wired in the router, listed for parity, but its slice has not
-    /// migrated the handler yet. It must keep whatever inline checks it
-    /// has today.
-    Unmigrated,
-}
-
-/// One row of the group-plane classification table.
+/// One row of the classification table. Every group-plane route is
+/// classified (S5 migrated the last `Unmigrated` row and retired that
+/// variant with its now-unread wrapper enum): a new route lands here
+/// at its real [`AccessLevel`] or it does not land — the parity test
+/// fails. The level is the route's NOMINAL class (the slice plan's
+/// inventory target); per-route rules (policy arms, withdrawn-shell
+/// exemptions, pending-join stubs) live in the admission cores.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::server) struct RouteAccess {
     /// HTTP method.
     pub(in crate::server) method: Method,
     /// Path in router syntax (`/groups/:id/members`), identical to the
     /// axum route pattern and the `ENDPOINTS` registry path.
     pub(in crate::server) path: &'static str,
-    /// Admission class.
-    pub(in crate::server) class: AccessClass,
+    /// The access level this route is admitted at.
+    pub(in crate::server) level: AccessLevel,
 }
 
 /// The complete group-plane route set: every `/groups*`, `/history*`,
@@ -236,10 +234,11 @@ pub(in crate::server) struct RouteAccess {
 /// secure-write family — `POST /groups/:id/send`,
 /// `secure/encrypt|decrypt|reseal`, `secure/open-envelope`; S3 the
 /// admin/mutation family; S4 the long tail (both section comments
-/// carry the honest labels). The one row left as
-/// [`AccessClass::Unmigrated`] is `POST /groups/:id/delegate`
-/// (`routes/delegations.rs`, outside the S4 file set; already
-/// durable-gated by the auth middleware).
+/// carry the honest labels); S5 `POST /groups/:id/delegate`
+/// (`routes/delegations.rs`) at `OwnerDurable` — the #446 durable
+/// gate its handler runs first is the only actor-based check; the
+/// SignedPublic/ban/write-policy/to_agent gates after admission are
+/// data checks, keyed on the local daemon.
 pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
     // ── S1 read family: classified ────────────────────────────────────
     // `/groups/:id` additionally serves the pending_authority_commit stub
@@ -248,32 +247,32 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
     RouteAccess {
         method: Method::GET,
         path: "/groups/:id",
-        class: AccessClass::Level(AccessLevel::Member(MemberState::Active)),
+        level: AccessLevel::Member(MemberState::Active),
     },
     RouteAccess {
         method: Method::GET,
         path: "/groups/:id/members",
-        class: AccessClass::Level(AccessLevel::Member(MemberState::Active)),
+        level: AccessLevel::Member(MemberState::Active),
     },
     RouteAccess {
         method: Method::GET,
         path: "/groups/:id/messages",
-        class: AccessClass::Level(AccessLevel::PublicRead),
+        level: AccessLevel::PublicRead,
     },
     RouteAccess {
         method: Method::GET,
         path: "/groups/:id/state",
-        class: AccessClass::Level(AccessLevel::PublicRead),
+        level: AccessLevel::PublicRead,
     },
     RouteAccess {
         method: Method::GET,
         path: "/groups/:id/state/commits",
-        class: AccessClass::Level(AccessLevel::Member(MemberState::Active)),
+        level: AccessLevel::Member(MemberState::Active),
     },
     RouteAccess {
         method: Method::GET,
         path: "/groups/:id/delegations",
-        class: AccessClass::Level(AccessLevel::Member(MemberState::Active)),
+        level: AccessLevel::Member(MemberState::Active),
     },
     // ── S2 secure-write family: classified ────────────────────────────
     // The inventory target is "Member + RiderScope", but the S2 entry
@@ -286,27 +285,27 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/send",
-        class: AccessClass::Level(AccessLevel::SessionBearer),
+        level: AccessLevel::SessionBearer,
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/secure/encrypt",
-        class: AccessClass::Level(AccessLevel::SessionBearer),
+        level: AccessLevel::SessionBearer,
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/secure/decrypt",
-        class: AccessClass::Level(AccessLevel::SessionBearer),
+        level: AccessLevel::SessionBearer,
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/secure/reseal",
-        class: AccessClass::Level(AccessLevel::SessionBearer),
+        level: AccessLevel::SessionBearer,
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/secure/open-envelope",
-        class: AccessClass::Level(AccessLevel::PublicWrite),
+        level: AccessLevel::PublicWrite,
     },
     // ── S3 admin/mutation family: classified ──────────────────────────
     // `Admin` is today's `require_admin_or_above`: the LOCAL DAEMON's
@@ -324,87 +323,87 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/invite",
-        class: AccessClass::Level(AccessLevel::Admin),
+        level: AccessLevel::Admin,
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/members",
-        class: AccessClass::Level(AccessLevel::Admin),
+        level: AccessLevel::Admin,
     },
     RouteAccess {
         method: Method::DELETE,
         path: "/groups/:id/members/:agent_id",
-        class: AccessClass::Level(AccessLevel::Admin),
+        level: AccessLevel::Admin,
     },
     RouteAccess {
         method: Method::PATCH,
         path: "/groups/:id/members/:agent_id/role",
-        class: AccessClass::Level(AccessLevel::Admin),
+        level: AccessLevel::Admin,
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/ban/:agent_id",
-        class: AccessClass::Level(AccessLevel::Admin),
+        level: AccessLevel::Admin,
     },
     RouteAccess {
         method: Method::DELETE,
         path: "/groups/:id/ban/:agent_id",
-        class: AccessClass::Level(AccessLevel::Admin),
+        level: AccessLevel::Admin,
     },
     RouteAccess {
         method: Method::PATCH,
         path: "/groups/:id",
-        class: AccessClass::Level(AccessLevel::Admin),
+        level: AccessLevel::Admin,
     },
     RouteAccess {
         method: Method::PATCH,
         path: "/groups/:id/policy",
-        class: AccessClass::Level(AccessLevel::Admin),
+        level: AccessLevel::Admin,
     },
     RouteAccess {
         method: Method::PUT,
         path: "/groups/:id/display-name",
-        class: AccessClass::Level(AccessLevel::PublicWrite),
+        level: AccessLevel::PublicWrite,
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/state/seal",
-        class: AccessClass::Level(AccessLevel::Admin),
+        level: AccessLevel::Admin,
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/state/withdraw",
-        class: AccessClass::Level(AccessLevel::Admin),
+        level: AccessLevel::Admin,
     },
     RouteAccess {
         method: Method::DELETE,
         path: "/groups/:id",
-        class: AccessClass::Level(AccessLevel::JoinSelf),
+        level: AccessLevel::JoinSelf,
     },
     RouteAccess {
         method: Method::GET,
         path: "/groups/:id/requests",
-        class: AccessClass::Level(AccessLevel::Admin),
+        level: AccessLevel::Admin,
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/requests",
-        class: AccessClass::Level(AccessLevel::PublicWrite),
+        level: AccessLevel::PublicWrite,
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/requests/:request_id/approve",
-        class: AccessClass::Level(AccessLevel::Admin),
+        level: AccessLevel::Admin,
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/requests/:request_id/reject",
-        class: AccessClass::Level(AccessLevel::Admin),
+        level: AccessLevel::Admin,
     },
     RouteAccess {
         method: Method::DELETE,
         path: "/groups/:id/requests/:request_id",
-        class: AccessClass::Level(AccessLevel::PublicWrite),
+        level: AccessLevel::PublicWrite,
     },
     // ── S4 long tail: classified ─────────────────────────────────────
     // Honest labels, nothing tightened (every gate below is today's,
@@ -441,187 +440,189 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
     RouteAccess {
         method: Method::POST,
         path: "/groups",
-        class: AccessClass::Level(AccessLevel::PublicWrite),
+        level: AccessLevel::PublicWrite,
     },
     RouteAccess {
         method: Method::GET,
         path: "/groups",
-        class: AccessClass::Level(AccessLevel::PublicRead),
+        level: AccessLevel::PublicRead,
     },
     RouteAccess {
         method: Method::GET,
         path: "/groups/discover",
-        class: AccessClass::Level(AccessLevel::PublicRead),
+        level: AccessLevel::PublicRead,
     },
     RouteAccess {
         method: Method::GET,
         path: "/groups/discover/nearby",
-        class: AccessClass::Level(AccessLevel::PublicRead),
+        level: AccessLevel::PublicRead,
     },
     RouteAccess {
         method: Method::GET,
         path: "/groups/discover/subscriptions",
-        class: AccessClass::Level(AccessLevel::PublicRead),
+        level: AccessLevel::PublicRead,
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/discover/subscribe",
-        class: AccessClass::Level(AccessLevel::PublicWrite),
+        level: AccessLevel::PublicWrite,
     },
     RouteAccess {
         method: Method::DELETE,
         path: "/groups/discover/subscribe/:kind/:shard",
-        class: AccessClass::Level(AccessLevel::PublicWrite),
+        level: AccessLevel::PublicWrite,
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/cards/import",
-        class: AccessClass::Level(AccessLevel::PublicWrite),
+        level: AccessLevel::PublicWrite,
     },
     RouteAccess {
         method: Method::GET,
         path: "/groups/cards/:id",
-        class: AccessClass::Level(AccessLevel::PublicRead),
+        level: AccessLevel::PublicRead,
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/join",
-        class: AccessClass::Level(AccessLevel::PublicWrite),
+        level: AccessLevel::PublicWrite,
     },
     RouteAccess {
         method: Method::GET,
         path: "/groups/:id/join-status",
-        class: AccessClass::Level(AccessLevel::PublicRead),
+        level: AccessLevel::PublicRead,
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/quarantine/clear",
-        class: AccessClass::Level(AccessLevel::PublicWrite),
+        level: AccessLevel::PublicWrite,
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/stores",
-        class: AccessClass::Level(AccessLevel::SessionBearer),
+        level: AccessLevel::SessionBearer,
     },
     RouteAccess {
         method: Method::GET,
         path: "/groups/:id/stores/:app/legacy-imports",
-        class: AccessClass::Level(AccessLevel::SessionBearer),
+        level: AccessLevel::SessionBearer,
     },
     RouteAccess {
         method: Method::GET,
         path: "/groups/:id/stores/:app/legacy-imports/:source_id",
-        class: AccessClass::Level(AccessLevel::SessionBearer),
+        level: AccessLevel::SessionBearer,
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/stores/:app/legacy-imports/:source_id",
-        class: AccessClass::Level(AccessLevel::SessionBearer),
+        level: AccessLevel::SessionBearer,
     },
     RouteAccess {
         method: Method::GET,
         path: "/history",
-        class: AccessClass::Level(AccessLevel::SessionBearer),
+        level: AccessLevel::SessionBearer,
     },
     RouteAccess {
         method: Method::DELETE,
         path: "/history",
-        class: AccessClass::Level(AccessLevel::SessionBearer),
+        level: AccessLevel::SessionBearer,
     },
     RouteAccess {
         method: Method::GET,
         path: "/history/message/:msg_id",
-        class: AccessClass::Level(AccessLevel::PublicRead),
+        level: AccessLevel::PublicRead,
     },
     RouteAccess {
         method: Method::GET,
         path: "/history/scopes",
-        class: AccessClass::Level(AccessLevel::PublicRead),
+        level: AccessLevel::PublicRead,
     },
     RouteAccess {
         method: Method::GET,
         path: "/history/search",
-        class: AccessClass::Level(AccessLevel::PublicRead),
+        level: AccessLevel::PublicRead,
     },
     RouteAccess {
         method: Method::GET,
         path: "/history/stats",
-        class: AccessClass::Level(AccessLevel::PublicRead),
+        level: AccessLevel::PublicRead,
     },
     RouteAccess {
         method: Method::GET,
         path: "/task-lists",
-        class: AccessClass::Level(AccessLevel::PublicRead),
+        level: AccessLevel::PublicRead,
     },
     RouteAccess {
         method: Method::POST,
         path: "/task-lists",
-        class: AccessClass::Level(AccessLevel::Member(MemberState::Active)),
+        level: AccessLevel::Member(MemberState::Active),
     },
     RouteAccess {
         method: Method::GET,
         path: "/task-lists/:id/tasks",
-        class: AccessClass::Level(AccessLevel::Member(MemberState::Active)),
+        level: AccessLevel::Member(MemberState::Active),
     },
     RouteAccess {
         method: Method::POST,
         path: "/task-lists/:id/tasks",
-        class: AccessClass::Level(AccessLevel::Member(MemberState::Active)),
+        level: AccessLevel::Member(MemberState::Active),
     },
     RouteAccess {
         method: Method::PATCH,
         path: "/task-lists/:id/tasks/:tid",
-        class: AccessClass::Level(AccessLevel::Member(MemberState::Active)),
+        level: AccessLevel::Member(MemberState::Active),
     },
     RouteAccess {
         method: Method::POST,
         path: "/mls/groups",
-        class: AccessClass::Level(AccessLevel::PublicWrite),
+        level: AccessLevel::PublicWrite,
     },
     RouteAccess {
         method: Method::GET,
         path: "/mls/groups",
-        class: AccessClass::Level(AccessLevel::PublicRead),
+        level: AccessLevel::PublicRead,
     },
     RouteAccess {
         method: Method::GET,
         path: "/mls/groups/:id",
-        class: AccessClass::Level(AccessLevel::PublicRead),
+        level: AccessLevel::PublicRead,
     },
     RouteAccess {
         method: Method::POST,
         path: "/mls/groups/:id/members",
-        class: AccessClass::Level(AccessLevel::PublicWrite),
+        level: AccessLevel::PublicWrite,
     },
     RouteAccess {
         method: Method::DELETE,
         path: "/mls/groups/:id/members/:agent_id",
-        class: AccessClass::Level(AccessLevel::PublicWrite),
+        level: AccessLevel::PublicWrite,
     },
     RouteAccess {
         method: Method::POST,
         path: "/mls/groups/:id/encrypt",
-        class: AccessClass::Level(AccessLevel::PublicWrite),
+        level: AccessLevel::PublicWrite,
     },
     RouteAccess {
         method: Method::POST,
         path: "/mls/groups/:id/decrypt",
-        class: AccessClass::Level(AccessLevel::PublicWrite),
+        level: AccessLevel::PublicWrite,
     },
     RouteAccess {
         method: Method::POST,
         path: "/mls/groups/:id/welcome",
-        class: AccessClass::Level(AccessLevel::PublicWrite),
+        level: AccessLevel::PublicWrite,
     },
-    // The one row outside S4's file set: `routes/delegations.rs` owns
-    // the handler (durable bypass → rider 403 → session-membership
-    // 403, the DOC pattern), and the auth middleware durable-gates the
-    // route. It migrates under its own slice; the parity tests keep it
-    // listed either way.
+    // ── S5 delegate mint: classified ────────────────────────────────
+    // The #446 durable gate the handler runs FIRST (mirrored by the
+    // auth middleware's durable-owner requirement) is the only
+    // actor-based check — sessions 403, riders never reach the
+    // handler. Everything after the lookup/withdrawn/QUAR admission
+    // (SignedPublic 400, ban 403, write policy, to_agent member 400)
+    // is a data check keyed on the local daemon.
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/delegate",
-        class: AccessClass::Unmigrated,
+        level: AccessLevel::OwnerDurable,
     },
 ];
 
@@ -1168,6 +1169,62 @@ pub(in crate::server) fn admit_legacy_import_route(actor: &ActorContext) -> Admi
     }
 }
 
+// ─────────────────────── admission cores (S5 delegate) ──────────────────
+
+/// `POST /groups/:id/delegate` entry admission (ADR-0040 mint, ADR-0066
+/// §3b row 15), in today's order: raw-id lookup 404 → withdrawn **404**
+/// (a withdrawn shell exposes no delegation authority — the S1
+/// delegations-list disposition, NOT the mutation family's 409) → the
+/// actor-BLIND fork-quarantine 409 (row 15's gate; the #446 durable
+/// gate the handler runs first means a session bearer can never reach
+/// it, so the for-actor seat shape is unreachable here by design).
+/// Everything after — the SignedPublic 400, the ban 403, the write
+/// policy, the to_agent member 400 — is data/policy the handler keeps,
+/// in its order, under this same lock.
+///
+/// The fork-quarantine gate is injected (the S2 pattern) so the pure
+/// core stays AppState-free; the public wrapper wires the canonical
+/// `reject_fork_quarantined`, and the unit tests pin the order with
+/// stubs.
+fn delegate_admission<'a>(
+    groups: &'a HashMap<String, x0x::groups::GroupInfo>,
+    route_id: &str,
+    fork_quarantine: impl FnOnce(
+        &x0x::groups::GroupInfo,
+    ) -> Option<(StatusCode, Json<serde_json::Value>)>,
+) -> Result<&'a x0x::groups::GroupInfo, (StatusCode, Json<serde_json::Value>)> {
+    // ADR0066-LOOKUP-WAIVER: row 15 (mint) resolves the group for the WHOLE
+    // route: a miss is a 404 before any marker is read, so it fails closed,
+    // and the §3b gate below consumes this same `info`. Same disposition as
+    // row 16. (Carried from the inline handler lookup — #1166 S5.)
+    let Some(info) = groups.get(route_id) else {
+        return Err(not_found("group not found"));
+    };
+    if info.withdrawn {
+        return Err(not_found("group is withdrawn"));
+    }
+    if let Some(resp) = fork_quarantine(info) {
+        return Err(resp);
+    }
+    Ok(info)
+}
+
+/// The delegate-mint entry admission for the handler (`routes/
+/// delegations.rs`, which holds the named-groups read lock for the
+/// snapshot block): runs [`delegate_admission`] with the canonical
+/// actor-blind fork-quarantine gate. `route_id` is the RAW route
+/// `:id`, the same key the inline gate used for the marker body and
+/// the diagnostics bump.
+pub(in crate::server) fn admit_delegate_route<'a>(
+    state: &AppState,
+    groups: &'a HashMap<String, x0x::groups::GroupInfo>,
+    route_id: &str,
+) -> Result<&'a x0x::groups::GroupInfo, (StatusCode, Json<serde_json::Value>)> {
+    delegate_admission(groups, route_id, |info| {
+        reject_fork_quarantined(state, route_id, info)
+    })
+}
+
 // ─────────────────────── extractor ───────────────────────────────────────
 
 /// The admission result handed to a handler: the resolved access level,
@@ -1358,9 +1415,9 @@ impl FromRequestParts<Arc<AppState>> for GroupAccess {
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
         let (row, params) = resolve_route(parts).await?;
-        if matches!(row.class, AccessClass::Unmigrated) {
-            return Err(unclassified(&parts.method, parts.uri.path()));
-        }
+        // (S5 removed the Unmigrated arm: every row is classified now,
+        // so a table hit always has a real admission rule and a MISS
+        // already failed closed in `resolve_route` above.)
         // The router's pattern is byte-identical to the row's (the
         // parity test pins it), so the group id's parameter NAME comes
         // from the row's own template: the first `:param` segment. Every
@@ -1400,21 +1457,23 @@ impl FromRequestParts<Arc<AppState>> for GroupAccess {
             ("GET", "/groups/:id/requests") => admit_join_requests_route(state.as_ref(), &id).await,
             // Classified routes deliberately left without an arm: the
             // S1 `GET /groups/:id` + `/delegations`, the five S2
-            // secure-write handlers, the S3 mutation family and the
-            // four S4 stores handlers all run their cores directly
-            // under their own lock — their signatures are pinned by
-            // positional test callers, or an extractor argument would
-            // reorder rejection precedence (body-parse 400s, the
-            // request routes' durability 503 and side-effect orderings
-            // all precede the gates today). Every other S4 route has
-            // NO `:id`-shaped admission at all (discovery/cards/join,
-            // the history scope gates, the task-list id parsers, the
-            // #1228 no-actor surfaces) — classification-only, the
-            // handler keeps today's exact checks. If a future handler
-            // wires this extractor to any of them, this fails closed
-            // instead of guessing — and note `send` could not take
-            // this extractor anyway without reordering its body
-            // validations (kind/size/thread) after the entry gates.
+            // secure-write handlers, the S3 mutation family, the four
+            // S4 stores handlers and the S5 delegate mint all run
+            // their cores directly under their own lock — their
+            // signatures are pinned by positional test callers, or an
+            // extractor argument would reorder rejection precedence
+            // (body-parse 400s, the request routes' durability 503,
+            // the delegate's #446 403-before-parse and side-effect
+            // orderings all precede the gates today). Every other S4
+            // route has NO `:id`-shaped admission at all
+            // (discovery/cards/join, the history scope gates, the
+            // task-list id parsers, the #1228 no-actor surfaces) —
+            // classification-only, the handler keeps today's exact
+            // checks. If a future handler wires this extractor to any
+            // of them, this fails closed instead of guessing — and
+            // note `send` could not take this extractor anyway without
+            // reordering its body validations (kind/size/thread)
+            // after the entry gates.
             _ => Err(extractor_not_wired(&parts.method, parts.uri.path())),
         }
     }
@@ -1715,12 +1774,12 @@ mod tests {
     /// The slice contract: every family through S4 is classified, at
     /// honest levels (the S2 rows label the bearer class, the S3 rows
     /// the seat/no-actor reality, the S4 rows the long tail's actual
-    /// gates — see the table comments); the one remaining
-    /// group-plane route is an explicit `Unmigrated` row
-    /// (`POST /groups/:id/delegate`) so parity holds without claiming
-    /// a migration that has not happened.
+    /// gates — see the table comments), and S5 migrated the last row
+    /// (`POST /groups/:id/delegate` at OwnerDurable) and retired the
+    /// `Unmigrated` class — a new group-plane route MUST land with a
+    /// row and an entry here.
     #[test]
-    fn s1_through_s4_families_classified_and_delegate_waits_for_its_slice() {
+    fn s1_through_s5_families_fully_classified() {
         let expected: &[(Method, &str, AccessLevel)] = &[
             (
                 Method::GET,
@@ -1941,22 +2000,23 @@ mod tests {
                 "/mls/groups/:id/welcome",
                 AccessLevel::PublicWrite,
             ),
+            (
+                Method::POST,
+                "/groups/:id/delegate",
+                AccessLevel::OwnerDurable,
+            ),
         ];
-        let classified = GROUP_PLANE_ROUTES
-            .iter()
-            .filter(|row| matches!(row.class, AccessClass::Level(_)))
-            .count();
         assert_eq!(
-            classified,
+            GROUP_PLANE_ROUTES.len(),
             expected.len(),
-            "exactly the S1–S4 families may be classified; anything new needs a row AND an entry here"
+            "every group-plane row is classified (S1–S5); anything new needs a row AND an entry here"
         );
         for (method, path, level) in expected {
             let row = GROUP_PLANE_ROUTES
                 .iter()
                 .find(|row| row.method == *method && row.path == *path)
                 .unwrap_or_else(|| panic!("{method} {path} missing from the table"));
-            assert_eq!(row.class, AccessClass::Level(*level), "{method} {path}");
+            assert_eq!(row.level, *level, "{method} {path}");
         }
     }
 
@@ -1993,8 +2053,7 @@ mod tests {
                 AccessLevel::PublicWrite
             };
             assert_eq!(
-                row.class,
-                AccessClass::Level(expected),
+                row.level, expected,
                 "{method} {path}: #1228 unchecked surface — classifying it any tighter is a \
                  behaviour change that needs its own reviewed PR"
             );
@@ -2078,10 +2137,11 @@ mod tests {
         assert_eq!(body["path"], "/groups/:id/members");
         assert_eq!(body["params"]["id"], "abc123");
 
-        // A wired pattern whose method has no table row (PUT members —
-        // POST /groups/:id/members IS a row, Unmigrated, and
-        // resolve_route resolves it; the class check lives in
-        // GroupAccess) and off-table wiring fail closed (403).
+        // A wired pattern whose METHOD has no table row (PUT members —
+        // the POST row exists, but no PUT) and off-table wiring both
+        // fail closed in `resolve_route` with the 403 `unclassified`
+        // body (S5: rows no longer carry a class check — every row is
+        // classified).
         for (method, path) in [("PUT", "/groups/abc123/members"), ("GET", "/calls/abc123")] {
             let request = Request::builder()
                 .method(method)
@@ -2950,5 +3010,58 @@ mod tests {
             "legacy source export requires the local owner authority",
             None,
         );
+    }
+
+    // ────────────────── S5 delegate admission ──────────────────
+
+    /// `POST /groups/:id/delegate` entry admission: raw-id lookup 404 →
+    /// withdrawn **404** (the delegations-family disposition — NOT the
+    /// mutation family's 409: a withdrawn shell mints no authority) →
+    /// the actor-blind ADR-0066 §3b row-15 quarantine gate (the #446
+    /// durable gate the handler runs first means the for-actor seat
+    /// shape cannot fire here); admission hands the borrowed group
+    /// back for the handler's data gates. Order pinned with stubs,
+    /// bodies are the inline handler's exact ones.
+    #[test]
+    fn delegate_admission_reproduces_the_inline_decisions() {
+        let mut groups = HashMap::new();
+
+        // Unknown group: the raw-id lookup 404s before any gate runs.
+        assert_secure_refusal(
+            delegate_admission(&groups, "missing", |_| {
+                panic!("the lookup 404 must fire before the quarantine gate")
+            }),
+            StatusCode::NOT_FOUND,
+            "group not found",
+            None,
+        );
+
+        // Withdrawn shell: the 404 fires before the gate.
+        let mut withdrawn = group_with_local_seat("del");
+        withdrawn.withdrawn = true;
+        groups.insert("del".to_string(), withdrawn);
+        assert_secure_refusal(
+            delegate_admission(&groups, "del", |_| {
+                panic!("the withdrawn 404 must fire before the quarantine gate")
+            }),
+            StatusCode::NOT_FOUND,
+            "group is withdrawn",
+            None,
+        );
+
+        groups.insert("del".to_string(), group_with_local_seat("del"));
+
+        // A gate refusal propagates verbatim — the row-15 409 shape.
+        assert_secure_refusal(
+            delegate_admission(&groups, "del", |_| Some(quarantine_marker_409())),
+            StatusCode::CONFLICT,
+            "fork quarantine active",
+            Some("fork_quarantined"),
+        );
+
+        // Admission returns the borrowed group for the handler's data
+        // gates (SignedPublic 400, ban 403, write policy, to_agent).
+        let info = delegate_admission(&groups, "del", |_| None).expect("live group admitted");
+        assert_eq!(info.stable_group_id(), "del");
     }
 }
