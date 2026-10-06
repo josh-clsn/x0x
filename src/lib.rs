@@ -433,7 +433,41 @@ pub(crate) struct PinnedTransportScript {
     only_listed_connected: bool,
     repair_connects: bool,
     repair_delay: std::time::Duration,
+    repair_gate: Option<std::sync::Arc<PinnedRepairGate>>,
     connected: std::sync::Mutex<std::collections::HashSet<identity::MachineId>>,
+}
+
+/// Test seam (x0x #1207, P3): parks the scripted send-readiness repair on
+/// entry until the test releases it, so a test can change state while a
+/// repair is under way without assuming scheduler timing.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct PinnedRepairGate {
+    /// One permit each time a repair enters.
+    pub(crate) reached: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl PinnedRepairGate {
+    pub(crate) fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            reached: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        })
+    }
+
+    /// Let every current and future repair through.
+    pub(crate) fn release(&self) {
+        self.release.close();
+    }
+
+    async fn park(&self) {
+        self.reached.add_permits(1);
+        if let Ok(permit) = self.release.acquire().await {
+            permit.forget();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -446,8 +480,15 @@ impl PinnedTransportScript {
             only_listed_connected: true,
             repair_connects,
             repair_delay: std::time::Duration::ZERO,
+            repair_gate: None,
             connected: std::sync::Mutex::new(machines.iter().copied().collect()),
         }
+    }
+
+    /// The send-readiness repair parks on entry at `gate` until released.
+    pub(crate) fn with_repair_gate(mut self, gate: std::sync::Arc<PinnedRepairGate>) -> Self {
+        self.repair_gate = Some(gate);
+        self
     }
 
     /// The send-readiness repair takes `delay` before it reports.
@@ -476,6 +517,9 @@ impl PinnedTransportScript {
     }
 
     async fn repair(&self, peer: &ant_quic::PeerId) -> error::NetworkResult<()> {
+        if let Some(gate) = &self.repair_gate {
+            gate.park().await;
+        }
         tokio::time::sleep(self.repair_delay).await;
         if !self.repair_connects {
             return Err(error::NetworkError::ConnectionFailed(
@@ -494,6 +538,21 @@ impl PinnedTransportScript {
 static PINNED_STANDIN_TRANSPORT: std::sync::LazyLock<
     std::sync::Mutex<
         std::collections::HashMap<identity::AgentId, std::sync::Arc<PinnedTransportScript>>,
+    >,
+> = std::sync::LazyLock::new(Default::default);
+
+/// x0x #1207 (test builds): every general raw-QUIC delivery a strict
+/// in-process stand-in made, as `(sender, recipient, machine, payload)`.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+static GENERAL_RAW_STANDIN_DELIVERIES: std::sync::LazyLock<
+    std::sync::Mutex<
+        Vec<(
+            identity::AgentId,
+            identity::AgentId,
+            identity::MachineId,
+            Vec<u8>,
+        )>,
     >,
 > = std::sync::LazyLock::new(Default::default);
 
@@ -3131,6 +3190,77 @@ async fn record_announced_machine_binding(
 /// `HYDRATION_PUBLISH` (in blob hydration, after the discovery patch and
 /// before the binding's expiry update). Unarmed points pass straight
 /// through.
+/// x0x #1207 (test builds): a barrier at the entry of the general path's
+/// cold-recipient wait, keyed by (sender, recipient), so a test can inject
+/// the recipient's binding only after the send has entered the wait. An
+/// optional payload length selects one send among others to the same
+/// recipient. `reached` counts arrivals; `release` (closed) lets every
+/// current and future arrival through. Other sends pass straight through.
+#[cfg(test)]
+pub(crate) mod general_cold_barrier {
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    pub(crate) struct Gate {
+        pub(crate) reached: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+        bytes: Option<usize>,
+    }
+
+    impl Gate {
+        /// Let every current and future arrival through.
+        pub(crate) fn release(&self) {
+            self.release.close();
+        }
+    }
+
+    type Key = (crate::identity::AgentId, crate::identity::AgentId);
+
+    static GATES: LazyLock<Mutex<HashMap<Key, Arc<Gate>>>> = LazyLock::new(Default::default);
+
+    pub(crate) fn arm(
+        sender: crate::identity::AgentId,
+        recipient: crate::identity::AgentId,
+        payload_len: Option<usize>,
+    ) -> Arc<Gate> {
+        let gate = Arc::new(Gate {
+            reached: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+            bytes: payload_len,
+        });
+        if let Ok(mut gates) = GATES.lock() {
+            gates.insert((sender, recipient), Arc::clone(&gate));
+        }
+        gate
+    }
+
+    pub(crate) fn disarm(sender: crate::identity::AgentId, recipient: crate::identity::AgentId) {
+        if let Ok(mut gates) = GATES.lock() {
+            if let Some(gate) = gates.remove(&(sender, recipient)) {
+                gate.release();
+            }
+        }
+    }
+
+    pub(crate) async fn park(
+        sender: &crate::identity::AgentId,
+        recipient: &crate::identity::AgentId,
+        bytes: usize,
+    ) {
+        let gate = GATES
+            .lock()
+            .ok()
+            .and_then(|gates| gates.get(&(*sender, *recipient)).cloned())
+            .filter(|gate| gate.bytes.is_none_or(|selected| selected == bytes));
+        if let Some(gate) = gate {
+            gate.reached.add_permits(1);
+            if let Ok(permit) = gate.release.acquire().await {
+                permit.forget();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod announced_record_barrier {
     use std::collections::HashMap;
@@ -8860,6 +8990,8 @@ impl Agent {
                     resolution = "last_resort_connect",
                     "no machine_id known; triggering connect_to_agent"
                 );
+                #[cfg(test)]
+                general_cold_barrier::park(&self.identity.agent_id(), agent_id, bytes).await;
                 let _ = self.connect_to_agent(agent_id).await;
                 let id = self
                     .direct_messaging
@@ -9051,6 +9183,59 @@ impl Agent {
         })
     }
 
+    /// In-process stand-in for the GENERAL raw-QUIC send (x0x #1207,
+    /// #1217): the production target resolution (`resolve_raw_quic_target`,
+    /// over the strict stand-in's scripted transport), with the network
+    /// write replaced by a delivery witness. Strict test agents only.
+    #[cfg(test)]
+    async fn general_raw_standin(
+        &self,
+        agent_id: &identity::AgentId,
+        payload: &[u8],
+        agent_prefix: &str,
+        send_start: std::time::Instant,
+    ) -> error::NetworkResult<dm::DmPath> {
+        let transport =
+            RawQuicTransport::Scripted(pinned_standin_transport(&self.identity.agent_id()));
+        let target = self
+            .resolve_raw_quic_target(
+                agent_id,
+                &transport,
+                agent_prefix,
+                payload.len(),
+                send_start,
+            )
+            .await?;
+        if let Ok(mut deliveries) = GENERAL_RAW_STANDIN_DELIVERIES.lock() {
+            deliveries.push((
+                self.identity.agent_id(),
+                *agent_id,
+                target.machine_id,
+                payload.to_vec(),
+            ));
+        }
+        Ok(dm::DmPath::RawQuic)
+    }
+
+    /// Test seam (x0x #1207): the general raw-QUIC deliveries this agent's
+    /// strict stand-in made, as `(recipient, machine, payload)`.
+    #[cfg(test)]
+    pub(crate) fn general_raw_standin_deliveries_for_testing(
+        &self,
+    ) -> Vec<(identity::AgentId, identity::MachineId, Vec<u8>)> {
+        let me = self.identity.agent_id();
+        GENERAL_RAW_STANDIN_DELIVERIES
+            .lock()
+            .map(|deliveries| {
+                deliveries
+                    .iter()
+                    .filter(|(from, ..)| *from == me)
+                    .map(|(_, to, machine, payload)| (*to, *machine, payload.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     async fn send_direct_raw_quic(
         &self,
         agent_id: &identity::AgentId,
@@ -9069,6 +9254,12 @@ impl Agent {
             "raw_quic"
         };
 
+        #[cfg(test)]
+        if self.network.is_none() && pinned_standin_is_strict(&self.identity.agent_id()) {
+            return self
+                .general_raw_standin(agent_id, payload, &agent_prefix, send_start)
+                .await;
+        }
         let network = self.network.as_ref().ok_or_else(|| {
             tracing::warn!(
                 target: "x0x::direct",
