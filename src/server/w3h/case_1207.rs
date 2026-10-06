@@ -36,15 +36,17 @@
 //! A daemon's metadata listener exits after any apply that returns
 //! `ACCEPTED_EXIT` (named_groups.rs:14577-14581), which includes every
 //! `MemberAdded` (:12314), and dropping its subscription unsubscribes the
-//! topic (gossip/pubsub.rs:681). Only a daemon start re-arms it
-//! (server/mod.rs:1458-1468). If N's own P seat is applied through that
-//! listener during setup, N never sees H's P-topic `MemberJoined`. The
-//! CI traces of 5af2732 fit that: in the discovery-first run each of H's
-//! 12 P-topic publishes of `MemberJoined` in the 60 s commit wait reached
-//! N, and N never committed, while every committed join (the controls,
-//! and N's own join at O) followed a DM copy. The receipt now records N's
-//! listener before N's setup restart (a note: the observed cause) and
-//! requires it live at the connect. The incident's admin committed the
+//! topic (gossip/pubsub.rs:681). No automatic re-arm follows this exit;
+//! restart re-arms this fixture (daemon start, server/mod.rs:1458-1468).
+//! If N's own P seat is applied through that listener during setup, N
+//! never sees H's P-topic `MemberJoined` (#1256). The CI traces of
+//! 5af2732 fit that: in the discovery-first run each of H's 12 P-topic
+//! publishes of `MemberJoined` in the 60 s commit wait reached N, and N
+//! never committed, while every committed join (the controls, and N's
+//! own join at O) followed a DM copy. The receipt records N's listener
+//! before N's setup restart as a note; `live=false` there proves the
+//! listener is absent, not which event stopped it. It requires the
+//! listener live at the connect. The incident's admin committed the
 //! joiner's seat; in this shape that needs a live listener, which an
 //! admin restarted since its own seat has.
 //!
@@ -107,15 +109,20 @@
 //! # Controls (GREEN on main)
 //!
 //! - Admin knows joiner: H's artifacts reach N normally, so N is eligible
-//!   at the connect and sends the Hello. (N's discovery cache is in
-//!   memory, so H re-announces after N's setup restart in the two controls
-//!   whose H is not staged.)
+//!   at the connect, and a connect-time Hello exchange completes. Either
+//!   side may open it: each side's 60 s Hello gate decides which connect
+//!   job sends first, and N's setup restart may already have run one.
+//!   (N's discovery cache is in memory, so H re-announces after N's setup
+//!   restart in the two controls whose H is not staged.)
 //! - Intact persisted evidence: H restarts once while N knows it (N's
 //!   Hello stores N's record at H), then restarts again with that record
-//!   on disk: H is eligible at the second connect.
+//!   on disk: H is eligible at the second connect, and the same
+//!   either-direction exchange completes.
 //! - Authorized third holder: T, a G0 member that holds N's live record
 //!   and knows H (both from Hellos at T's own restart), answers H's
-//!   Lookup for N (lookup.rs:281-302, :496-508).
+//!   Lookup for N (lookup.rs:281-302, :496-508). A Lookup responder serves
+//!   only a live record, so T restarts past N's 60 s Hello window from
+//!   N's setup restart, and the case requires both of T's records live.
 //!
 //! # GREEN, RED, flag
 //!
@@ -168,6 +175,9 @@ const CONNECT_WAIT: Duration = Duration::from_secs(5);
 const CONNECT_SETTLE: Duration = Duration::from_secs(11);
 /// Budget for every setup readiness wait.
 const SETUP: Duration = Duration::from_secs(180);
+/// Past `HELLO_INTERVAL` (60 s, evidence_wire.rs:36): the per-machine
+/// gate on inbound and outbound Hellos.
+const HELLO_WINDOW: Duration = Duration::from_secs(61);
 /// `StreamProtocol::EvidenceV1` and the `evidence_wire.rs` message kinds.
 const EVIDENCE_V1: u8 = 0x06;
 const HELLO: u8 = 1;
@@ -323,6 +333,11 @@ struct View {
     stored: bool,
     /// Age (s) of the usable stored record's announcement, if any.
     usable_age: Option<u64>,
+    /// The store's live record of the peer, from a Hello this incarnation
+    /// verified (`PeerEvidenceStore::live`): the only record a Lookup
+    /// responder serves; the persisted map is not consulted
+    /// (lookup.rs:496-508).
+    live: bool,
     /// A network-verified Hello/advert capture of the peer (TTL-only).
     captured: bool,
     /// The discovery entry for the peer: (age in s, names its machine).
@@ -352,6 +367,7 @@ impl View {
             "related": self.related(),
             "stored": self.stored,
             "usable_age_s": self.usable_age,
+            "live": self.live,
             "captured": self.captured,
             "discovery_age_s": self.discovery.map(|(age, _)| age),
             "discovery_names_machine": self.discovery.map(|(_, same)| same),
@@ -397,6 +413,7 @@ async fn view(sim: &Sim, observer: &str, peer: &str) -> Result<View> {
         View {
             stored: store.as_ref().is_some_and(|s| s.has_machine(machine, now)),
             usable_age,
+            live: store.as_ref().is_some_and(|s| s.live(agent, now).is_some()),
             captured: state
                 .agent
                 .capability_store
@@ -1075,6 +1092,19 @@ async fn scenario(
     // Control setups that need a Hello before the case restart.
     match variant {
         Variant::ThirdHolder => {
+            // N's setup restart ran Hellos with T. Each side takes one
+            // inbound Hello per machine per HELLO_INTERVAL and sends at most
+            // one (evidence_wire.rs:36, :305-323, :336-357), so a T restart
+            // inside that window gets no Hello from N and keeps only N's
+            // persisted record, which a Lookup responder never serves
+            // (lookup.rs:496-508): the 25cceac runs answered H NOT_FOUND.
+            // T restarts after the window.
+            sim.within(
+                "N's Hello window toward T expires",
+                HELLO_WINDOW + secs(1),
+                tokio::time::sleep(HELLO_WINDOW),
+            )
+            .await?;
             sim.restart("T", RestartMode::Graceful).await?;
             // T bootstraps to N; H normally redials T. If it has not
             // within 10 s, T dials H, so a Hello can run on that link.
@@ -1082,20 +1112,16 @@ async fn scenario(
             ensure!(
                 wait_for(
                     sim,
-                    "T holds N's and H's records",
+                    "T holds N's and H's live records",
                     SETUP,
                     async |s: &Sim| {
-                        let n = view(s, "T", "N")
-                            .await
-                            .is_ok_and(|v| v.usable_age.is_some());
-                        let h = view(s, "T", "H")
-                            .await
-                            .is_ok_and(|v| v.usable_age.is_some());
+                        let n = view(s, "T", "N").await.is_ok_and(|v| v.live);
+                        let h = view(s, "T", "H").await.is_ok_and(|v| v.live);
                         n && h
                     }
                 )
                 .await?,
-                "setup: T never held both N's and H's records"
+                "setup: T never held both N's and H's live records"
             );
         }
         Variant::PersistedEvidence => {
@@ -1189,6 +1215,21 @@ async fn scenario(
     let h_n = view(sim, "H", "N").await?;
     let n_h = view(sim, "N", "H").await?;
     let hello_at_connect = streams_between(sim, &labels, "H", "N", run.restart);
+    // A completed connect-time Hello exchange in either direction: a Hello
+    // request on a stream opened after H's restart and before the settle,
+    // answered with the acceptor's Hello or an ACK (evidence_wire.rs:
+    // 887-909: the acceptor answers ACK instead of its own Hello when its
+    // shared 60 s gate, its relationship check or its advert says no).
+    let hello_exchange_at_connect = {
+        let (h_key, n_key) = (labels.key("H"), labels.key("N"));
+        evidence_streams(sim, run.restart).iter().any(|s| {
+            ((s.opener == h_key && s.acceptor == n_key)
+                || (s.opener == n_key && s.acceptor == h_key))
+                && s.position < run.settled
+                && s.request == Some(HELLO)
+                && matches!(s.reply, Some(HELLO | ACK))
+        })
+    };
     let g0_h = seats_active(sim, "H", &g0, &["H", "N"]).await?;
     let g0_n = seats_active(sim, "N", &g0, &["N", "H"]).await?;
     let n_listener_at_connect = metadata_listener_live(sim, "N", &p).await?;
@@ -1394,13 +1435,11 @@ async fn scenario(
     );
     let first_release = run.released.unwrap_or(run.join).min(run.join);
     let (hello_ok, hello_expectation) = match variant {
-        Variant::AdminKnowsJoiner => (
-            hello_at_connect.iter().any(|s| s.starts_with("N->H HELLO")),
-            "N->H Hello at the connect",
-        ),
-        Variant::PersistedEvidence => (
-            hello_at_connect.iter().any(|s| s.starts_with("H->N HELLO")),
-            "H->N Hello at the connect",
+        // Which side was eligible is the eligibility stage's; the opener
+        // depends on which connect job's 60 s gate fires first.
+        Variant::AdminKnowsJoiner | Variant::PersistedEvidence => (
+            hello_exchange_at_connect,
+            "a completed H~N Hello exchange, either direction, at the connect",
         ),
         _ => (
             streams_between(sim, &labels, "H", "N", run.restart)
@@ -1442,10 +1481,10 @@ async fn scenario(
     // whatever each side has learned since. So no H~N link may open after
     // the settle until the first exchange that could give H N's evidence
     // (a Hello between H and N, or a Lookup answered FOUND to H), or the
-    // final when there is none. Real daemons do not redial a live link on
-    // their own: the sim reported no active reader for a live link, which
-    // made the first raw send refresh it (fixed in `SimLink::
-    // connection_health`).
+    // final when there is none. A real daemon does not redial a healthy
+    // connection on its own: the sim reported no active reader for a
+    // healthy simulated connection, which made the first raw send refresh
+    // it (fixed in `SimLink::connection_health`).
     let (h_key, n_key) = (labels.key("H"), labels.key("N"));
     let t_key = all.contains(&"T").then(|| labels.key("T"));
     let rescue = evidence_streams(sim, run.settled)
@@ -1522,7 +1561,7 @@ async fn scenario(
     // listener) or as a DM (above). N's P diagnostics row carries the
     // listener flag and the join-rejection counters.
     let n_p_final = group_diagnostics(sim, "N", &p).await?;
-    let paths = json!({
+    let mut paths = json!({
         "n_p_diagnostics_final": n_p_final,
         "hellos_h_n_after_connect": hellos_after,
         "lookups_after_join": lookups,
@@ -1535,6 +1574,12 @@ async fn scenario(
             "join": run.join, "committed": run.committed, "released": run.released,
             "final": final_position},
     });
+    if variant == Variant::ThirdHolder {
+        // T's lookup counters tell an unauthorized refusal from a missing
+        // live record.
+        paths["counters_final"]["T"] = evidence_counters(sim, "T")?;
+        paths["t_view_of_n_final"] = view(sim, "T", "N").await?.json();
+    }
     receipt.note(format!("paths {paths}"));
     if variant.red_shape() {
         receipt.cause(

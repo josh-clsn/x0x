@@ -1885,13 +1885,16 @@ impl SimLink {
         }
     }
 
-    /// A live sim link reports what ant-quic reports for a live connection:
-    /// connected, its generation, and an active reader task (ant-quic's
+    /// A connected sim link is a healthy simulated connection, and reports
+    /// what ant-quic reports for a healthy connection: connected, its
+    /// generation, and an active reader task (ant-quic's
     /// `ConnectionHealth::reader_task_active` is `None` only while
-    /// disconnected). Reporting `None` for a live link sent every first
-    /// raw send per peer down `NetworkNode::ensure_peer_send_ready`'s
-    /// refresh branch (`peer_needs_pre_send_probe`): a disconnect and a
-    /// redial that a real daemon does not make (W3-H #1207 S0 round 4).
+    /// disconnected). Reporting `None` for a healthy simulated connection
+    /// sent every first raw send per peer down
+    /// `NetworkNode::ensure_peer_send_ready`'s refresh branch
+    /// (`peer_needs_pre_send_probe`): a disconnect and a redial that a
+    /// real daemon on a healthy connection does not make (W3-H #1207 S0
+    /// round 4).
     pub(crate) fn connection_health(&self, peer_id: &PeerId) -> ant_quic::ConnectionHealth {
         let generation = self.current_connection_generation(peer_id);
         ant_quic::ConnectionHealth {
@@ -2789,9 +2792,10 @@ mod fabric_tests {
         );
     }
 
-    /// A live link reports an active reader, as ant-quic does, so the
-    /// daemon's pre-send readiness check does not refresh (disconnect and
-    /// redial) a healthy link on its first raw send.
+    /// A healthy simulated connection reports an active reader, as ant-quic
+    /// does for a healthy connection, so the daemon's pre-send readiness
+    /// check does not refresh (disconnect and redial) it on its first raw
+    /// send.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn w3h_fabric_live_link_health_reports_an_active_reader() {
         let fabric = SimFabric::new(11);
