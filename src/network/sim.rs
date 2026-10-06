@@ -1885,11 +1885,19 @@ impl SimLink {
         }
     }
 
+    /// A live sim link reports what ant-quic reports for a live connection:
+    /// connected, its generation, and an active reader task (ant-quic's
+    /// `ConnectionHealth::reader_task_active` is `None` only while
+    /// disconnected). Reporting `None` for a live link sent every first
+    /// raw send per peer down `NetworkNode::ensure_peer_send_ready`'s
+    /// refresh branch (`peer_needs_pre_send_probe`): a disconnect and a
+    /// redial that a real daemon does not make (W3-H #1207 S0 round 4).
     pub(crate) fn connection_health(&self, peer_id: &PeerId) -> ant_quic::ConnectionHealth {
         let generation = self.current_connection_generation(peer_id);
         ant_quic::ConnectionHealth {
             connected: generation.is_some(),
             generation,
+            reader_task_active: generation.is_some().then_some(true),
             ..ant_quic::ConnectionHealth::default()
         }
     }
@@ -2779,6 +2787,24 @@ mod fabric_tests {
             trace.contains("#1 open@"),
             "a second connection ordinal: {trace}"
         );
+    }
+
+    /// A live link reports an active reader, as ant-quic does, so the
+    /// daemon's pre-send readiness check does not refresh (disconnect and
+    /// redial) a healthy link on its first raw send.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn w3h_fabric_live_link_health_reports_an_active_reader() {
+        let fabric = SimFabric::new(11);
+        let (a, _b) = two_links(&fabric).await;
+        let live = a.connection_health(&key(2));
+        assert!(live.connected);
+        assert!(live.generation.is_some());
+        assert_eq!(live.reader_task_active, Some(true));
+        a.disconnect(&key(2)).expect("disconnect");
+        let gone = a.connection_health(&key(2));
+        assert!(!gone.connected);
+        assert_eq!(gone.generation, None);
+        assert_eq!(gone.reader_task_active, None);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

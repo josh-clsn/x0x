@@ -8,18 +8,45 @@
 //!
 //! Nodes N (admin; node 0, so every node's bootstrap peer), O (owner of
 //! both groups) and H (the joiner); the third-holder control adds T. No
-//! node has a contact for another (Unknown trust throughout).
+//! node trusts another: a received identity announcement creates only an
+//! Unknown-trust contact (lib.rs:11382 -> contacts.rs:422-432), and
+//! contacts never relate (`peer_evidence::relationship_set`: enrollments,
+//! grants and active groups only). The case allows those and nothing above
+//! Unknown, none at H for N, and, where H is staged, N's for H only with
+//! H's released announcement and never with DM capabilities.
 //!
 //! - G0, owned by O, seats N and H (and T). It is the shared active group
 //!   the eph incident's joiner had with its admin (the gss group): the
 //!   relationship H needs to STORE N's Hello (`peer_evidence` stores
-//!   relationship evidence only, `evidence_wire.rs:504`), because H's own
+//!   relationship evidence only, `evidence_wire.rs:518`), because H's own
 //!   seat in the group it is joining becomes active only after the Welcome
 //!   it cannot fetch (named_groups.rs:12151-12304).
 //! - P, owned by O, `private_secure` (TreeKEM): O seats N and promotes it
-//!   to admin; N mints H's invite. O then goes offline.
+//!   to admin. N restarts on its own directories (see "N's metadata
+//!   listener") and mints H's invite. O then goes offline.
 //! - H restarts (real same-directory restart, `Sim::restart`). Its
 //!   bootstrap dial reconnects it to N at once: the connect position.
+//!
+//! # N's metadata listener
+//!
+//! H has no route to N (N's artifacts never reach H), so its direct
+//! delivery of `MemberJoined` to the inviter (named_groups.rs:19347,
+//! :3319) resolves nothing, and its copy on P's metadata topic is the only
+//! one that reaches N. Only the inviter applies it (named_groups.rs:13775).
+//! A daemon's metadata listener exits after any apply that returns
+//! `ACCEPTED_EXIT` (named_groups.rs:14577-14581), which includes every
+//! `MemberAdded` (:12314), and dropping its subscription unsubscribes the
+//! topic (gossip/pubsub.rs:681). Only a daemon start re-arms it
+//! (server/mod.rs:1458-1468). If N's own P seat is applied through that
+//! listener during setup, N never sees H's P-topic `MemberJoined`. The
+//! CI traces of 5af2732 fit that: in the discovery-first run each of H's
+//! 12 P-topic publishes of `MemberJoined` in the 60 s commit wait reached
+//! N, and N never committed, while every committed join (the controls,
+//! and N's own join at O) followed a DM copy. The receipt now records N's
+//! listener before N's setup restart (a note: the observed cause) and
+//! requires it live at the connect. The incident's admin committed the
+//! joiner's seat; in this shape that needs a live listener, which an
+//! admin restarted since its own seat has.
 //!
 //! Two fault rules stage the nodes' signed identity artifacts (identity,
 //! machine and rendezvous announcements; capability adverts):
@@ -37,37 +64,42 @@
 //! # Why roster-first is the failure shape
 //!
 //! At the connect position neither side is eligible
-//! (`evidence_wire::Context::related`, evidence_wire.rs:631-667): H has no
+//! (`evidence_wire::Context::related`, evidence_wire.rs:645-681): H has no
 //! discovery entry and no stored record for N's machine; N has the G0
 //! relationship but no discovery entry for H. `begin_hello` then sends
-//! nothing (evidence_wire.rs:322-343) and nothing revisits the skipped
-//! Hello (the event loop reacts only to `PeerConnected`, :1055-1071). The
-//! case proves both connect jobs reached that decision (see
-//! `connect_decision`): H's advert publisher published before the first
-//! wait's deadline, the evidence runtimes' own barrier counters show no
-//! timeout and no permit overflow, N's prerequisites were read (by trace
-//! position) before the link existed, and neither side knew the other's
-//! advert to lack `peer_evidence_v1`. Otherwise the run is INFRA, not RED.
+//! nothing (evidence_wire.rs:336-357) and, with S1 off, nothing revisits
+//! the skipped Hello (the event loop reacts only to `PeerConnected`,
+//! :1434-1458). The case witnesses that both connect jobs, once
+//! dispatched, reached that decision (see `connect_decision`): H's advert
+//! publisher published before the first wait's deadline, the evidence
+//! runtimes' own barrier counters show no timeout and no permit overflow,
+//! N's prerequisites were read (by trace position) before the link
+//! existed, and neither side knew the other's advert to lack
+//! `peer_evidence_v1`. Otherwise the run is INFRA, not RED. No H~N link may
+//! reopen after the settle before the first exchange that could give H
+//! N's evidence: a new link is a new connect decision.
 //!
 //! G0 relates N to H from the start, so N's eligibility flips on discovery
 //! alone; P's commit (the "committed roster") decides when N pushes to H.
 //!
 //! - Roster first (the red baseline): H redeems N's invite; N commits H's
-//!   P seat (the "committed roster"), stages the result and the Welcome,
-//!   and its pushes to H fail (no binding, no capability). Past the push
-//!   window, discovery is released: N is now eligible, but no Hello
-//!   follows. H cannot resolve N for its Welcome fetch: no discovery entry
-//!   or registry entry (lib.rs:8815-8833), no advert (lib.rs:7432), no
-//!   stored evidence, and no Lookup responder (lookup.rs:238-279: no
-//!   connected machine names N, no own-host hint). The join poll times out
-//!   at 120 s (named_groups.rs:33763, :37946).
+//!   P seat from the P-topic `MemberJoined` (the "committed roster"),
+//!   stages the result and the Welcome, and its pushes to H fail (no
+//!   binding, no capability). Past the push window, discovery is released:
+//!   N is now eligible, but no Hello follows. H cannot resolve N for its
+//!   Welcome fetch: no discovery entry or registry entry
+//!   (lib.rs:8815-8833), no advert (lib.rs:7432), no stored evidence, and
+//!   no Lookup responder (lookup.rs:238-279: no connected machine names N,
+//!   no own-host hint). The join poll times out at 120 s
+//!   (named_groups.rs:33867, :38056).
 //! - Discovery first: N learns H's mapping before its commit, so its
 //!   commit-time `MemberAdded` push reaches H as a raw DM. H's raw receive
 //!   records an own-host hint and spawns a Lookup (lib.rs:4489-4511,
 //!   runtime.rs:228-231) that N answers for itself (lookup.rs:264-277,
 //!   281-302), with the G0 relationship on both sides. Predicted GREEN on
 //!   main, so this order is a control, not a baseline: the daemon already
-//!   recovers it (UNVERIFIED until CI).
+//!   recovers it (UNVERIFIED: the 5af2732 run never reached the commit,
+//!   see "N's metadata listener").
 //! - No mapping on either side: discovery is never released. No Hello is
 //!   possible in either direction, even with S1 (needs a Proposed ADR per
 //!   the plan's "Alternatives"); RED with and without S1.
@@ -75,7 +107,9 @@
 //! # Controls (GREEN on main)
 //!
 //! - Admin knows joiner: H's artifacts reach N normally, so N is eligible
-//!   at the connect and sends the Hello.
+//!   at the connect and sends the Hello. (N's discovery cache is in
+//!   memory, so H re-announces after N's setup restart in the two controls
+//!   whose H is not staged.)
 //! - Intact persisted evidence: H restarts once while N knows it (N's
 //!   Hello stores N's record at H), then restarts again with that record
 //!   on disk: H is eligible at the second connect.
@@ -96,9 +130,9 @@
 //! relayed or gossip inbox), and no admin evidence or binding at H.
 //!
 //! The `w3h_red_1207_ready_hello_*` tests set `X0X_EVIDENCE_READY_HELLO=1`
-//! (#1251, S1's operational opt-in, read in `serve_with_options`) before any
-//! daemon starts; every other test clears it. They are ignored until S1
-//! merges: on main the variable is read by nothing, so the arm would be RED.
+//! (#1251, S1's operational opt-in, read in `serve_with_options`,
+//! server/mod.rs:1299) before any daemon starts; every other test clears
+//! it. S1 merged in 0abd524, so they run.
 //!
 //! Every ordering below is a trace position (`SimFabric::cut`), never a
 //! virtual time. Receipts carry ids, digests and counts, never secrets or
@@ -282,7 +316,7 @@ fn binary_sha256() -> String {
 }
 
 /// One endpoint's view of the other, from the inputs
-/// `evidence_wire::Context::related` reads (evidence_wire.rs:631-667), plus
+/// `evidence_wire::Context::related` reads (evidence_wire.rs:645-681), plus
 /// the sources a send could use.
 struct View {
     /// A usable stored record names the peer's machine (`has_machine`).
@@ -299,8 +333,13 @@ struct View {
     relation: bool,
     /// The DM registry names the peer's machine.
     registry: bool,
-    /// A contact entry exists for the peer.
-    contact: bool,
+    /// The peer's contact entry, if any: its trust level and whether it
+    /// carries DM capabilities. Every foreign identity announcement creates
+    /// an `Unknown` one (lib.rs:11382 `register_announced_machine` ->
+    /// contacts.rs:422-432 `add_machine`); contacts never relate
+    /// (`peer_evidence::relationship_set`: enrollments, grants and active
+    /// groups only).
+    contact: Option<(crate::contacts::TrustLevel, bool)>,
 }
 
 impl View {
@@ -319,7 +358,9 @@ impl View {
             "discovery_fresh": self.discovery_fresh,
             "relation": self.relation,
             "registry": self.registry,
-            "contact": self.contact,
+            "contact": self.contact.map(|(trust, caps)| json!({
+                "trust": trust.to_string(), "dm_capabilities": caps,
+            })),
         })
     }
 }
@@ -373,7 +414,13 @@ async fn view(sim: &Sim, observer: &str, peer: &str) -> Result<View> {
                 .as_ref()
                 .is_some_and(|s| s.related(agent, machine, cert.as_ref(), now)),
             registry: state.agent.direct_messaging.get_machine_id(&agent).await == Some(machine),
-            contact: state.agent.contact_store.read().await.get(&agent).is_some(),
+            contact: state
+                .agent
+                .contact_store
+                .read()
+                .await
+                .get(&agent)
+                .map(|c| (c.trust_level, c.dm_capabilities.is_some())),
         }
     })
     .await
@@ -616,6 +663,110 @@ fn artifacts_delivered(sim: &Sim, subject: &str, toward: &str, from: usize) -> R
         .count())
 }
 
+/// Whether `label` has a live metadata listener for group `gid` (resolved
+/// to its local key as the server does): the registry
+/// `ensure_named_group_metadata_listener` installs into and an exiting
+/// listener removes itself from (named_groups.rs:14499-14590);
+/// `GET /diagnostics/groups` reports it as `subscribed_metadata`.
+async fn metadata_listener_live(sim: &Sim, label: &str, gid: &str) -> Result<bool> {
+    let state = sim.state(label)?;
+    let gid = gid.to_string();
+    sim.at_instant(
+        &format!("read {label}'s metadata listener for {gid}"),
+        async move {
+            let key = {
+                let groups = state.named_groups.read().await;
+                crate::server::resolve_group_entry_locked(&groups, &gid)
+                    .map(|(key, _)| key.to_string())
+            };
+            match key {
+                Some(key) => state.group_metadata_tasks.read().await.contains_key(&key),
+                None => false,
+            }
+        },
+    )
+    .await
+}
+
+/// `label`'s `GET /diagnostics/groups` row for `gid`, reduced to the
+/// listener flags, the roster size and the non-zero counters (all counts).
+async fn group_diagnostics(sim: &Sim, label: &str, gid: &str) -> Result<Value> {
+    let (status, body) = sim
+        .api(label, Method::GET, "/diagnostics/groups", None)
+        .await?;
+    ensure!(
+        status.is_success(),
+        "{label} GET /diagnostics/groups: {status}"
+    );
+    let key = {
+        let state = sim.state(label)?;
+        let gid = gid.to_string();
+        sim.at_instant(&format!("resolve {label}'s key for {gid}"), async move {
+            let groups = state.named_groups.read().await;
+            crate::server::resolve_group_entry_locked(&groups, &gid)
+                .map_or(gid.clone(), |(key, _)| key.to_string())
+        })
+        .await?
+    };
+    let Some(row) = body["groups"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["group_id"] == key.as_str()))
+    else {
+        return Ok(json!(null));
+    };
+    let mut out = serde_json::Map::new();
+    if let Some(fields) = row.as_object() {
+        for (key, value) in fields {
+            let keep = matches!(
+                key.as_str(),
+                "subscribed_metadata" | "subscribed_public" | "members_v2_size"
+            ) || value.as_u64().is_some_and(|count| count > 0);
+            if keep {
+                out.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    Ok(Value::Object(out))
+}
+
+/// After `label` restarts, make sure it is linked to each of `peers`: the
+/// peer's own redial gets 10 s, then `label` dials it.
+async fn relink(sim: &Sim, label: &str, peers: &[&str]) -> Result<()> {
+    for peer in peers {
+        let peer_id = sim.peer(peer)?;
+        let linked = wait_for(
+            sim,
+            &format!("{label}~{peer} linked after {label}'s restart"),
+            secs(10),
+            async |s: &Sim| {
+                let Some(network) = s.state(label).ok().and_then(|n| n.agent.network().cloned())
+                else {
+                    return false;
+                };
+                network.is_connected(&peer_id).await
+            },
+        )
+        .await?;
+        if !linked {
+            let network = sim
+                .state(label)?
+                .agent
+                .network()
+                .cloned()
+                .with_context(|| format!("{label} has no network"))?;
+            let addr = super::sim_addr(sim.node_index(peer)?)?;
+            sim.within(
+                &format!("{label} dials {peer}"),
+                secs(10),
+                network.connect_addr(addr),
+            )
+            .await?
+            .with_context(|| format!("{label} dials {peer}"))?;
+        }
+    }
+    Ok(())
+}
+
 /// Create a `private_secure` group on `owner` and seat each of `members`:
 /// the owner lists the member and the member reports itself active.
 async fn group_with(sim: &Sim, owner: &str, seat: &[&str]) -> Result<String> {
@@ -667,20 +818,33 @@ async fn wait_for(
     }
 }
 
+/// `subject` re-announces (`POST /announce`); whether `observer`'s
+/// discovery cache then names `subject`'s machine, fresh, within 30 s.
+async fn announce_and_wait(sim: &Sim, subject: &str, observer: &str) -> Result<bool> {
+    let (status, body) = sim
+        .api(subject, Method::POST, "/announce", Some(json!({})))
+        .await?;
+    ensure!(status.is_success(), "{subject} announce: {status} {body}");
+    wait_for(
+        sim,
+        &format!("{observer}'s discovery names {subject}"),
+        secs(30),
+        async |s: &Sim| {
+            view(s, observer, subject)
+                .await
+                .is_ok_and(|v| v.discovery_fresh)
+        },
+    )
+    .await
+}
+
 /// Release H's identity artifacts toward N and wait until N's discovery
 /// cache names H's machine.
 async fn release_discovery(sim: &Sim, stage: &Stage) -> Result<usize> {
     let position = sim.fabric().cut("release: H's identity artifacts toward N");
     stage.release();
-    let (status, body) = sim
-        .api("H", Method::POST, "/announce", Some(json!({})))
-        .await?;
-    ensure!(status.is_success(), "H announce: {status} {body}");
     ensure!(
-        wait_for(sim, "N's discovery names H", secs(30), async |s: &Sim| {
-            view(s, "N", "H").await.is_ok_and(|v| v.discovery_fresh)
-        })
-        .await?,
+        announce_and_wait(sim, "H", "N").await?,
         "INFRA: H's released announcement never reached N's discovery"
     );
     Ok(position)
@@ -713,10 +877,13 @@ struct DecisionInputs<'a> {
     n_bit_before: Option<bool>,
 }
 
-/// Proof that both endpoints' evidence connect jobs for the new H~N link
-/// reached `begin_hello` (`Context::connect`, evidence_wire.rs:927-963),
-/// whose decision is then the relationship check alone. The job can
-/// return earlier in three ways, each excluded here:
+/// Witnesses that each endpoint's evidence connect job for the new H~N
+/// link, once dispatched, reached `begin_hello` (`Context::connect`, the
+/// off path, evidence_wire.rs:1017-1060), whose decision is then the
+/// relationship check alone. Dispatch itself is assumed, not observed:
+/// the event loop spawns one job per `PeerConnected` it receives
+/// (evidence_wire.rs:1447-1449). Once dispatched, the job can return
+/// earlier in three ways, each excluded here:
 /// - its own advert never became publishable within 5 s: H published its
 ///   digest extension (or a targeted response) before that deadline. Only
 ///   the advert publisher's publishable branch publishes those topics
@@ -727,17 +894,23 @@ struct DecisionInputs<'a> {
 /// - the evidence load barrier returned false: every false return of
 ///   `EvidenceRuntime::wait` bumps `evidence_barrier_overflow` (frame or
 ///   byte permits) or `evidence_barrier_timeout` (the 5 s timeout)
-///   (peer_evidence/runtime.rs:286-319). H's runtime is new at the
+///   (peer_evidence/runtime.rs:305-338). H's runtime is new at the
 ///   restart, so both must still be 0; N's must not have moved since its
 ///   snapshot, taken (by trace position) before the link opened;
 /// - a current verified advert says the peer LACKS `peer_evidence_v1`
-///   (evidence_wire.rs:944-951): neither registry says so, before or after.
+///   (evidence_wire.rs:1046-1052): neither registry says so, before or
+///   after.
 ///
 /// Both jobs must also have had their two waits' worth of time (10 s)
-/// before the settle, and the event loop must have been able to see the
-/// `PeerConnected`: the network's event channel holds 32 events and the
-/// job set 64, so the link events on each endpoint in the window are
-/// bounded at 16 (a witness, not a proof, of no broadcast lag).
+/// before the settle. The network's event channel holds 32 events and the
+/// job set 64; at most 16 link events on each endpoint in the window is a
+/// churn witness (little link churn while the jobs ran), not a bound on
+/// the channel's lag.
+///
+/// With S1 on (`X0X_EVIDENCE_READY_HELLO=1`) a connect job is admitted by
+/// `ReadyPolicy::eligible` on each ready pass instead of waiting
+/// (evidence_wire.rs:1023-1028); the same counters and witnesses are
+/// recorded, and the decision is revisited on every pass.
 fn connect_decision(sim: &Sim, inputs: &DecisionInputs<'_>) -> Result<(bool, Value)> {
     let count = |counters: &Value, key: &str| counters[key].as_u64();
     let h_after = evidence_counters(sim, "H")?;
@@ -866,6 +1039,37 @@ async fn scenario(
         .await?,
         "setup: N never saw its promotion"
     );
+    // N restarts on its own directories before it mints H's invite (see
+    // "N's metadata listener" in the module doc): if N's own P seat was
+    // applied through its P metadata listener, that listener exited, and
+    // only a startup re-arms it (server/mod.rs:1458-1468). Without it, H's
+    // MemberJoined, which reaches N only on P's metadata topic in the
+    // staged arms, is never applied.
+    let n_listener_before = metadata_listener_live(sim, "N", &p).await?;
+    receipt.note(format!(
+        "setup: N's P metadata listener before N's restart: live={n_listener_before}"
+    ));
+    sim.restart("N", RestartMode::Graceful).await?;
+    let others: Vec<&str> = all.iter().copied().filter(|l| *l != "N").collect();
+    relink(sim, "N", &others).await?;
+    ensure!(
+        wait_for(
+            sim,
+            "N's P metadata listener live after its restart",
+            SETUP,
+            async |s: &Sim| metadata_listener_live(s, "N", &p).await.unwrap_or(false)
+        )
+        .await?,
+        "setup: N's restart did not re-arm its P metadata listener"
+    );
+    if !variant.h_staged() {
+        // N's discovery cache is in memory: H re-announces, so N knows H
+        // again as it did before its restart.
+        ensure!(
+            announce_and_wait(sim, "H", "N").await?,
+            "setup: N's discovery never named H again after N's restart"
+        );
+    }
     let h_invite = invite(sim, "N", &p).await?;
 
     // Control setups that need a Hello before the case restart.
@@ -874,32 +1078,7 @@ async fn scenario(
             sim.restart("T", RestartMode::Graceful).await?;
             // T bootstraps to N; H normally redials T. If it has not
             // within 10 s, T dials H, so a Hello can run on that link.
-            let h_peer = sim.peer("H")?;
-            let linked = wait_for(
-                sim,
-                "T~H linked after T's restart",
-                secs(10),
-                async |s: &Sim| {
-                    let Some(network) = s.state("T").ok().and_then(|t| t.agent.network().cloned())
-                    else {
-                        return false;
-                    };
-                    network.is_connected(&h_peer).await
-                },
-            )
-            .await?;
-            if !linked {
-                let network = sim
-                    .state("T")?
-                    .agent
-                    .network()
-                    .cloned()
-                    .context("T has no network")?;
-                let h_addr = super::sim_addr(sim.node_index("H")?)?;
-                sim.within("T dials H", secs(10), network.connect_addr(h_addr))
-                    .await?
-                    .context("T dials H")?;
-            }
+            relink(sim, "T", &["H"]).await?;
             ensure!(
                 wait_for(
                     sim,
@@ -1012,6 +1191,7 @@ async fn scenario(
     let hello_at_connect = streams_between(sim, &labels, "H", "N", run.restart);
     let g0_h = seats_active(sim, "H", &g0, &["H", "N"]).await?;
     let g0_n = seats_active(sim, "N", &g0, &["N", "H"]).await?;
+    let n_listener_at_connect = metadata_listener_live(sim, "N", &p).await?;
     let mut at_connect = json!({
         "h_view_of_n": h_n.json(),
         "n_view_of_h": n_h.json(),
@@ -1120,12 +1300,38 @@ async fn scenario(
     );
     let h_n_final = view(sim, "H", "N").await?;
     let n_h_final = view(sim, "N", "H").await?;
+    // Every foreign identity announcement creates an Unknown-trust contact
+    // (see `View::contact`), and contacts never relate. #1207 needs no
+    // contact above Unknown; none at H for N (N's artifacts never reach
+    // H); and, where H is staged, N's contact for H only with H's released
+    // announcement and never with DM capabilities (the capability stage
+    // holds throughout).
+    let unknown_only = |contact: Option<(crate::contacts::TrustLevel, bool)>| {
+        contact.is_none_or(|(trust, _)| trust == crate::contacts::TrustLevel::Unknown)
+    };
+    let staged_ok = !variant.h_staged()
+        || (n_h.contact.is_none()
+            && (run.released.is_some() || n_h_final.contact.is_none())
+            && n_h_final.contact.is_none_or(|(_, caps)| !caps));
     receipt.evidence(
-        "no_contacts_between_h_and_n",
-        !h_n_final.contact && !n_h_final.contact,
+        "contacts_unknown_trust_and_staged_mapping_only_on_release",
+        h_n_final.contact.is_none() && unknown_only(n_h_final.contact) && staged_ok,
+        json!({
+            "h_contact_for_n": h_n_final.json()["contact"],
+            "n_contact_for_h_at_connect": n_h.json()["contact"],
+            "n_contact_for_h_final": n_h_final.json()["contact"],
+            "h_staged": variant.h_staged(),
+            "released": run.released.is_some(),
+        })
+        .to_string(),
+        at(sim),
+    );
+    receipt.evidence(
+        "n_p_metadata_listener_live_at_connect",
+        n_listener_at_connect,
         format!(
-            "H has N: {}; N has H: {}",
-            h_n_final.contact, n_h_final.contact
+            "N's P metadata listener at the connect: {n_listener_at_connect} \
+             (re-armed by N's setup restart)"
         ),
         at(sim),
     );
@@ -1232,14 +1438,50 @@ async fn scenario(
             at(sim),
         );
     }
-    let reconnects = sim
+    // A new H~N link is a new connect: its jobs decide Hello afresh, with
+    // whatever each side has learned since. So no H~N link may open after
+    // the settle until the first exchange that could give H N's evidence
+    // (a Hello between H and N, or a Lookup answered FOUND to H), or the
+    // final when there is none. Real daemons do not redial a live link on
+    // their own: the sim reported no active reader for a live link, which
+    // made the first raw send refresh it (fixed in `SimLink::
+    // connection_health`).
+    let (h_key, n_key) = (labels.key("H"), labels.key("N"));
+    let t_key = all.contains(&"T").then(|| labels.key("T"));
+    let rescue = evidence_streams(sim, run.settled)
+        .into_iter()
+        .filter(|s| {
+            let h_n = (s.opener == h_key && s.acceptor == n_key)
+                || (s.opener == n_key && s.acceptor == h_key);
+            let h_t = t_key.is_some_and(|t| s.opener == h_key && s.acceptor == t);
+            (h_n && s.request == Some(HELLO))
+                || ((h_n || h_t) && s.opener == h_key && s.reply == Some(FOUND))
+        })
+        .map(|s| s.position)
+        .min();
+    let window_end = rescue.unwrap_or(final_position);
+    let opens: Vec<usize> = sim
         .fabric()
         .link_open_positions(&h_peer, &n_peer, run.settled)
-        .len();
+        .into_iter()
+        .map(|(position, _, _)| position)
+        .collect();
+    let early: Vec<usize> = opens
+        .iter()
+        .copied()
+        .filter(|position| *position < window_end)
+        .collect();
     receipt.evidence(
-        "no_h_n_reconnect_after_settle",
-        reconnects == 0,
-        format!("{reconnects} H~N opens after settled@{}", run.settled),
+        "no_h_n_reconnect_before_the_rescue",
+        early.is_empty(),
+        json!({
+            "settled": run.settled,
+            "rescue": rescue,
+            "window_end": window_end,
+            "h_n_opens_after_settle": opens,
+            "in_window": early,
+        })
+        .to_string(),
         at(sim),
     );
     let withheld = artifacts_delivered(sim, "N", "H", run.restart)?;
@@ -1276,7 +1518,12 @@ async fn scenario(
         .collect();
     let h_to_n = dm_sent(sim, "H", "N", run.join)?;
     let n_to_h = dm_sent(sim, "N", "H", run.join)?;
+    // How H's MemberJoined could reach N: on P's metadata topic (N's
+    // listener) or as a DM (above). N's P diagnostics row carries the
+    // listener flag and the join-rejection counters.
+    let n_p_final = group_diagnostics(sim, "N", &p).await?;
     let paths = json!({
+        "n_p_diagnostics_final": n_p_final,
         "hellos_h_n_after_connect": hellos_after,
         "lookups_after_join": lookups,
         "h_to_n_dm": h_to_n,
@@ -1517,10 +1764,13 @@ async fn w3h_1207_control_authorized_third_holder() -> Result<()> {
     .await
 }
 
-/// S1 on (#1251): the red baseline must turn GREEN. Ignored until S1
-/// merges; on main the opt-in is read by nothing and the arm is RED.
+/// S1 on (#1251, merged in 0abd524): the red baseline must turn GREEN
+/// through N's deferred N->H Hello after the release.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-#[ignore = "enable with #1207 S1 (#1251, X0X_EVIDENCE_READY_HELLO)"]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
 async fn w3h_red_1207_ready_hello_roster_then_discovery() -> Result<()> {
     expect(
         "w3h_red_1207_ready_hello_roster_then_discovery",
@@ -1535,7 +1785,10 @@ async fn w3h_red_1207_ready_hello_roster_then_discovery() -> Result<()> {
 /// S1 on: with no mapping on either side, the deferred Hello has nothing
 /// to fire on; the case must stay RED.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-#[ignore = "enable with #1207 S1 (#1251, X0X_EVIDENCE_READY_HELLO)"]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
 async fn w3h_red_1207_ready_hello_no_mapping_stays_red() -> Result<()> {
     expect(
         "w3h_red_1207_ready_hello_no_mapping_stays_red",
