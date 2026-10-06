@@ -51,18 +51,13 @@ pub(in crate::server) struct HomeMarker {
 }
 
 /// ADR-0038 Home policy: Hidden + OwnerCertified(owner) + MlsEncrypted +
-/// MembersOnly/MembersOnly.
+/// MembersOnly/MembersOnly. Delegates to [`crate::groups::GroupPolicy::home`],
+/// the one definition ADR 0108 §1's Home scope also checks against.
 #[must_use]
 pub(in crate::server) fn home_policy(
     owner: &crate::identity::UserId,
 ) -> crate::groups::GroupPolicy {
-    crate::groups::GroupPolicy {
-        discoverability: crate::groups::GroupDiscoverability::Hidden,
-        admission: crate::groups::GroupAdmission::OwnerCertified(*owner),
-        confidentiality: crate::groups::GroupConfidentiality::MlsEncrypted,
-        read_access: crate::groups::GroupReadAccess::MembersOnly,
-        write_access: crate::groups::GroupWriteAccess::MembersOnly,
-    }
+    crate::groups::GroupPolicy::home(owner)
 }
 
 /// Whether `policy` is EXACTLY the Home policy for `owner` — all five axes
