@@ -509,15 +509,16 @@ fn held_without_changes(release: &Release) -> Result<Vec<String>> {
 }
 
 /// The drain's history check never touches the database (Codex S3 review
-/// rounds 3 and 4): it reads the store's reference count, so
+/// rounds 3 and 4): it reads the store's close watch, so
 /// - no database: nothing reported, nothing created;
+/// - a live production store: reported as the history db and nothing
+///   else, files unchanged;
+/// - the same store dropped: nothing reported, files unchanged, and the
+///   production open still works;
 /// - a zero-byte database with a nonempty WAL (a crash before the first
 ///   checkpoint, which SQLite would resolve by deleting the WAL if the
-///   file were opened): nothing reported, both files byte- and
-///   mtime-identical;
-/// - a live production store: reported as the history db, files unchanged;
-/// - the same store dropped: nothing reported, files unchanged, and the
-///   production open still works.
+///   file were opened), its store closed: nothing reported, both files
+///   byte- and mtime-identical.
 #[test]
 fn w3h_s3_release_check_leaves_history_files_untouched() -> Result<()> {
     let root = tempfile::tempdir()?;
@@ -531,23 +532,10 @@ fn w3h_s3_release_check_leaves_history_files_untouched() -> Result<()> {
         "the check created a file"
     );
 
-    std::fs::write(&release.history_db, b"")?;
-    let wal = release.data_dir.join("history.db-wal");
-    std::fs::write(
-        &wal,
-        [0x37_u8, 0x7f, 0x06, 0x82, 0, 0x2d, 0xe2, 0x18, 1, 2, 3, 4],
-    )?;
-    release.history = Some(Weak::new());
-    ensure!(
-        held_without_changes(&release)?.is_empty(),
-        "a zero-byte database with a WAL read as held"
-    );
-    ensure!(std::fs::metadata(&wal)?.len() == 12, "the WAL was changed");
-
     let other = tempfile::tempdir()?;
     let mut live = release_for(other.path())?;
     let store = Arc::new(crate::history::store::Store::open(&live.history_db)?);
-    live.history = Some(Arc::downgrade(&store));
+    live.history = Some(HistoryRelease::of(&store));
     let held = held_without_changes(&live)?;
     ensure!(
         held.len() == 1 && held[0].starts_with("history db "),
@@ -556,9 +544,77 @@ fn w3h_s3_release_check_leaves_history_files_untouched() -> Result<()> {
     drop(store);
     ensure!(
         held_without_changes(&live)?.is_empty(),
-        "a dropped history store still read as held"
+        "a closed history store still read as held"
     );
     drop(crate::history::store::Store::open(&live.history_db)?);
+
+    std::fs::write(&release.history_db, b"")?;
+    let wal = release.data_dir.join("history.db-wal");
+    std::fs::write(
+        &wal,
+        [0x37_u8, 0x7f, 0x06, 0x82, 0, 0x2d, 0xe2, 0x18, 1, 2, 3, 4],
+    )?;
+    release.history = live.history.clone();
+    ensure!(
+        held_without_changes(&release)?.is_empty(),
+        "a zero-byte database with a WAL read as held"
+    );
+    ensure!(std::fs::metadata(&wal)?.len() == 12, "the WAL was changed");
+    Ok(())
+}
+
+/// The drain waits for the history connection to close, not for the
+/// store's last reference (Codex S3 review round 5): the strong count
+/// reaches zero before the destructor runs, and the destructor can run on
+/// another thread (the reaper's blocking task). Here the last `Arc<Store>`
+/// is dropped on another thread whose drop a test-only hook pauses just
+/// before the connection closes. While it is paused, the store has no
+/// strong reference left and the check must still report the history db;
+/// once the drop finishes, nothing, and the production open works.
+#[test]
+fn w3h_s3_release_check_waits_for_the_history_connection_to_close() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut release = release_for(root.path())?;
+    let store = Arc::new(crate::history::store::Store::open(&release.history_db)?);
+    let history = HistoryRelease::of(&store);
+    release.history = Some(history.clone());
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+    history.closed.before_close(move || {
+        let _ = entered_tx.send(());
+        let _ = resume_rx.recv();
+    });
+    let dropper = std::thread::spawn(move || drop(store));
+    let paused = entered_rx.recv_timeout(std::time::Duration::from_secs(60));
+    // Release the dropper whatever happens next, so a failed check cannot
+    // leave the thread parked.
+    let outcome = (|| -> Result<()> {
+        paused.context("the store's drop never reached the before-close hook")?;
+        ensure!(
+            history.store.strong_count() == 0,
+            "the store still has strong references while its destructor runs"
+        );
+        let held = held_without_changes(&release)?;
+        ensure!(
+            held.len() == 1 && held[0].starts_with("history db "),
+            "a history store mid-destruction was not reported as the history db: {held:?}"
+        );
+        Ok(())
+    })();
+    let _ = resume_tx.send(());
+    dropper
+        .join()
+        .map_err(|_| anyhow!("the dropping thread panicked"))?;
+    outcome?;
+    ensure!(
+        history.closed.closed(),
+        "the close watch did not fire after the drop"
+    );
+    ensure!(
+        held_without_changes(&release)?.is_empty(),
+        "a closed history store still read as held"
+    );
+    drop(crate::history::store::Store::open(&release.history_db)?);
     Ok(())
 }
 

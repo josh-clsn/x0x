@@ -224,14 +224,33 @@ pub(crate) struct SimNode {
     /// released (the history database connection, among others), and it
     /// can outlive the daemon state, so [`Sim::stop`] checks it too.
     agent: Weak<crate::Agent>,
-    /// The daemon's history store, when history is on: the one owner of
-    /// the SQLite connection that holds the database's EXCLUSIVE lock from
-    /// open to close. Every holder (the agent's handle, the writer thread,
-    /// the reaper) shares this one `Arc`.
-    history: Option<Weak<crate::history::store::Store>>,
+    /// The daemon's history store, when history is on.
+    history: Option<HistoryRelease>,
     token: String,
     peer: ant_quic::PeerId,
     agent_hex: String,
+}
+
+/// A daemon's history store as the drain sees it. The store is the one
+/// owner of the SQLite connection that holds the database's EXCLUSIVE lock
+/// from open to close; every holder (the agent's handle, the writer thread,
+/// the reaper) shares one `Arc<Store>`. Its strong count reaches zero
+/// before its destructor runs, possibly on another thread, so the drain
+/// waits for the store's close watch, which fires only once the connection
+/// has closed; the count is kept for the message.
+#[derive(Clone)]
+struct HistoryRelease {
+    store: Weak<crate::history::store::Store>,
+    closed: Arc<crate::history::store::close_watch::CloseWatch>,
+}
+
+impl HistoryRelease {
+    fn of(store: &Arc<crate::history::store::Store>) -> Self {
+        Self {
+            store: Arc::downgrade(store),
+            closed: store.close_watch(),
+        }
+    }
 }
 
 /// What a stopped node's next incarnation needs released before it starts
@@ -240,8 +259,8 @@ pub(crate) struct SimNode {
 /// data-dir and identity-dir instance locks (#601, #645).
 ///
 /// The history database is checked in memory, never through SQLite: its
-/// EXCLUSIVE lock lives exactly as long as the store that owns the
-/// connection, so a released store is a released lock. Opening the file,
+/// EXCLUSIVE lock lives exactly as long as the store's connection, so a
+/// closed connection ([`HistoryRelease`]) is a released lock. Opening the file,
 /// even read-only, could change what the restart sees (SQLite deletes the
 /// WAL of a zero-page database before any lock check). The instance locks
 /// are observed without creating or writing anything
@@ -252,7 +271,7 @@ struct Release {
     /// The history database's path (for the message) and its store, when
     /// history is on.
     history_db: std::path::PathBuf,
-    history: Option<Weak<crate::history::store::Store>>,
+    history: Option<HistoryRelease>,
     data_dir: std::path::PathBuf,
     identity_dir: Option<std::path::PathBuf>,
 }
@@ -273,16 +292,16 @@ impl Release {
         if self.agent.strong_count() > 0 {
             held.push(format!("agent by {} references", self.agent.strong_count()));
         }
-        if let Some(store) = self
+        if let Some(history) = self
             .history
             .as_ref()
-            .filter(|store| store.strong_count() > 0)
+            .filter(|history| !history.closed.closed())
         {
             held.push(format!(
-                "history db {} (its store, which keeps the connection and its EXCLUSIVE \
-                 lock, by {} references)",
+                "history db {} (its connection, with the EXCLUSIVE lock, has not closed; \
+                 store held by {} references)",
                 self.history_db.display(),
-                store.strong_count()
+                history.store.strong_count()
             ));
         }
         if !held.is_empty() {
@@ -773,7 +792,7 @@ impl Sim {
             history: state
                 .agent
                 .history()
-                .map(|history| Arc::downgrade(history.store())),
+                .map(|history| HistoryRelease::of(history.store())),
             token: state.api_token.clone(),
             peer,
             agent_hex: hex::encode(state.agent.agent_id().as_bytes()),
