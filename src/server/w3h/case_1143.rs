@@ -11,21 +11,19 @@
 //!   consented — the live mechanism); A must have ingested it. Then A mints
 //!   J's seat invite and O goes offline.
 //! - t2: J redeems A's invite. Desired (ADR 0108 S2): A seals and J becomes
-//!   Active without O. On main A refuses: `OwnerCertMemberPending` naming
-//!   O, although A holds O's bytes (`owner_cert_verdict` treats the
-//!   anonymous announce as contradicting the embedded certificate,
-//!   `groups/mod.rs:1462,1575`).
+//!   Active without O. Before ADR 0108 S2-1, A refused with
+//!   `OwnerCertMemberPending` naming O, although A held O's bytes:
+//!   `owner_cert_verdict` treated the anonymous announce as contradicting
+//!   the embedded certificate. S2-1's Home verdict rule reads that digest
+//!   as no disclosure in a committed Home (`GroupInfo::is_home_scope`).
 //!
-//! Three tests share the scenario:
-//! - `w3h_1143_red_baseline_reproduces_owner_cert_member_pending` (runs on
-//!   main): passes only if the run's receipt is RED — every stage present
-//!   and the exact cause observed. ADR 0108 S2's PR deletes it.
-//! - `w3h_1143_positive_control_consented_owner_announce_admits` (runs on
-//!   main): the only change is that O's announce carries its consented
-//!   user identity (the documented #1143 workaround); J must be admitted.
+//! Two tests share the scenario:
+//! - `w3h_1143_positive_control_consented_owner_announce_admits`: the only
+//!   change is that O's announce carries its consented user identity (the
+//!   documented #1143 workaround); J must be admitted.
 //! - `w3h_red_1143_promoted_admin_admits_with_owner_offline`: the desired
-//!   behaviour, expected GREEN. ADR 0108 S2-1 enables it; on main it
-//!   fails, because the receipt is RED.
+//!   behaviour, expected GREEN. It was RED on main before ADR 0108 S2-1,
+//!   which deleted the red-baseline test that pinned that receipt.
 
 #![cfg(test)]
 
@@ -88,7 +86,9 @@ async fn admin_holds_owner_certificate(sim: &Sim, home: &HomeIds) -> Result<(boo
 /// A's Home record because it updates grace state). O's verdict is `Clean`
 /// when the resolved certificate passes the owner check, or when the seat's
 /// embedded certificate passes it and is not stale; stale means O's latest
-/// announced digest differs from the embedded certificate's digest.
+/// announced digest differs from the embedded certificate's digest, except
+/// that in a committed Home scope the anonymous digest is no disclosure and
+/// never stale (ADR 0108 §4).
 ///
 /// All digests here are announce digests: `blake3(bincode((user_id,
 /// certificate)))` (`announce_v3::cert_digest`), never the roster seat
@@ -106,13 +106,24 @@ struct OwnerView {
     /// Whether A's seat for O embeds bytes whose roster digest
     /// (`certificate_digest_hex`) equals the seat's committed digest.
     seat_committed: bool,
+    /// Whether A's Home record is a committed Home scope
+    /// (`GroupInfo::is_home_scope`), which selects ADR 0108's verdict rule.
+    home_scope: bool,
     /// O's status in the verdict (`None`: O is not an active member).
     status: Option<MemberCertStatus>,
 }
 
 impl OwnerView {
+    /// The announced digest the verdict reads (ADR 0108 §4: in Home scope
+    /// the anonymous digest is no disclosure).
+    fn disclosed(&self) -> Option<[u8; 32]> {
+        self.announced.filter(|announced| {
+            !(self.home_scope && *announced == crate::announce_v3::anonymous_cert_digest())
+        })
+    }
+
     fn stale(&self) -> bool {
-        matches!((self.embedded, self.announced), (Some((digest, _)), Some(announced)) if digest != announced)
+        matches!((self.embedded, self.disclosed()), (Some((digest, _)), Some(announced)) if digest != announced)
     }
 
     /// Which certificate made the verdict `Clean`, per the verdict's own
@@ -134,13 +145,14 @@ impl OwnerView {
         };
         format!(
             "announced {}; O publishes {}; anonymous {}; resolved {}; seat {} committed={} \
-             stale={}; verdict {} via {}",
+             home_scope={} stale={}; verdict {} via {}",
             self.announced.map_or("none".to_string(), hex8),
             hex8(self.published),
             hex8(crate::announce_v3::anonymous_cert_digest()),
             cert(self.resolved),
             cert(self.embedded),
             self.seat_committed,
+            self.home_scope,
             self.stale(),
             self.status
                 .as_ref()
@@ -214,6 +226,7 @@ async fn admin_view_of_owner(sim: &Sim, home: &HomeIds) -> Result<OwnerView> {
             _ => false,
         }
     });
+    let home_scope = info.is_home_scope();
     let mut clone = info;
     let status = clone
         .owner_cert_verdict(&evidence)
@@ -226,6 +239,7 @@ async fn admin_view_of_owner(sim: &Sim, home: &HomeIds) -> Result<OwnerView> {
         resolved,
         embedded,
         seat_committed,
+        home_scope,
         status,
     })
 }
@@ -454,25 +468,6 @@ async fn run(case: &str, kind: OwnerAnnounce) -> Receipt {
     }
     receipt.emit();
     receipt
-}
-
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
-)]
-async fn w3h_1143_red_baseline_reproduces_owner_cert_member_pending() -> Result<()> {
-    let receipt = run(
-        "w3h_1143_red_baseline_reproduces_owner_cert_member_pending",
-        OwnerAnnounce::Anonymous,
-    )
-    .await;
-    ensure!(
-        receipt.verdict() == Some(Verdict::Red),
-        "expected a RED receipt on main, got {:?}",
-        receipt.verdict()
-    );
-    Ok(())
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]

@@ -21846,6 +21846,9 @@ async fn owner_certified_seal_with_eviction(
             return Some(Err(resp));
         }
         let evidence = owner_cert_seal_evidence(state, info).await;
+        // ADR 0108 §4 (#1143): on the live record, so in a committed Home
+        // an anonymous announce neither graces nor evicts a member whose
+        // embedded certificate verifies.
         info.owner_cert_verdict(&evidence)
     };
     // The members that remain seated once the Failed set is gone: Clean ∪
@@ -23176,6 +23179,10 @@ pub(in crate::server) async fn seal_commit_owner_certified(
         }
     }
     let evidence = owner_cert_seal_evidence(state, info).await;
+    // ADR 0108 §4 (#1143): `info` is the caller's working copy, which
+    // already holds the seat write. Its Home scope is read from metadata,
+    // policy and `commit_log` (`GroupInfo::is_home_scope`), never from the
+    // state hash, so an anonymous announce does not block this seal.
     let verdict = info.owner_cert_verdict(&evidence);
     if !verdict.is_all_clean() {
         let group_id = info.stable_group_id().to_string();
@@ -35745,7 +35752,10 @@ fn join_artifact_serving_refusal_for(
 /// current evidence. Announce/discovery evidence can therefore only WITHHOLD
 /// (e.g. a stale embedded certificate during a rotation); it is never the
 /// certificate a serve relies on. An #842 inline-certificate first join with
-/// no announce has a Clean verdict and is served.
+/// no announce has a Clean verdict and is served. ADR 0108 §4 (ADR 0107's
+/// permitted Clean alternative): in a committed Home an anonymous announce
+/// is no disclosure, so it does not withhold either; in an ordinary
+/// OwnerCertified group it still does.
 async fn join_artifact_serving_refusal(
     state: &AppState,
     group_id: &str,
@@ -35808,6 +35818,9 @@ fn join_artifact_record_probe(
     if info.policy.admission.owner_certified_user_id().is_none() {
         return Ok(None);
     }
+    // Trim the roster only: ADR 0108's Home scope (`GroupInfo::is_home_scope`)
+    // reads metadata, policy and `commit_log`, which the probe must keep, so
+    // the probe's verdict applies the same Home rule as the live record.
     let mut probe = info.clone();
     probe.members_v2.retain(|agent, _| agent == member_hex);
     Ok(Some(probe))

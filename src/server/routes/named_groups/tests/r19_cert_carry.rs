@@ -96,6 +96,292 @@ async fn anonymous_announce_invalidates_hand_installed_cert() -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// ADR 0108 S2-1 (#1143): the Home verdict rule at all three verdict sites —
+// the seal, the eviction path and the ADR 0107 serving guard. The ordinary
+// OwnerCertified control above is kept unchanged.
+// ---------------------------------------------------------------------------
+
+/// The mechanism control's daemon: a loopback-only agent with no owner key
+/// (so no certificate of its own), no peer cache, and no `join_network`.
+async fn announce_writer_state(dir: &std::path::Path, plane: &str) -> Result<Arc<AppState>> {
+    let mut config = isolated_loopback_config(plane);
+    config.port_mapping_enabled = false;
+    let agent = Arc::new(
+        Agent::builder()
+            .with_identity_dir(dir)
+            .with_machine_key(dir.join("machine.key"))
+            .with_agent_key(x0x::identity::AgentKeypair::generate()?)
+            .with_agent_cert_path(dir.join("agent.cert"))
+            .with_user_key_path(dir.join("absent-user.key"))
+            .with_contact_store_path(dir.join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(config)
+            .build()
+            .await?,
+    );
+    secure_endpoint_test_state_at(dir, agent).await
+}
+
+/// [`owner_certified_group`] as a Home: the ADR-0038 policy and metadata,
+/// committed by one owner-certified seal, so `is_home_scope()` holds
+/// (ADR 0108 §1). Every seat must be Clean for that seal.
+async fn committed_home_group(
+    state: &AppState,
+    owner: &x0x::identity::UserKeypair,
+    suffix: &str,
+    seats: &[(String, &x0x::identity::AgentCertificate, bool)],
+) -> Result<(String, x0x::groups::GroupInfo)> {
+    let (group_key, mut info) = owner_certified_group(&state.agent, owner, suffix, seats);
+    info.policy = x0x::groups::GroupPolicy::home(&owner.user_id());
+    info.home = Some(x0x::groups::HomeMetadata {
+        primary_agent: hex::encode(state.agent.agent_id().as_bytes()),
+        placements: std::collections::BTreeMap::new(),
+        provisioned_at_ms: 1,
+    });
+    assert!(
+        !info.is_home_scope(),
+        "the Home metadata is not committed yet"
+    );
+    seal_commit_owner_certified(
+        state,
+        &mut info,
+        state.agent.identity().agent_keypair(),
+        now_millis_u64(),
+    )
+    .await?;
+    assert!(info.is_home_scope(), "fixture: a committed Home scope");
+    Ok((group_key, info))
+}
+
+/// [`owner_certified_group`], sealed once like [`committed_home_group`], so
+/// the ordinary twin differs from the Home only in Home scope.
+async fn committed_ordinary_group(
+    state: &AppState,
+    owner: &x0x::identity::UserKeypair,
+    suffix: &str,
+    seats: &[(String, &x0x::identity::AgentCertificate, bool)],
+) -> Result<(String, x0x::groups::GroupInfo)> {
+    let (group_key, mut info) = owner_certified_group(&state.agent, owner, suffix, seats);
+    seal_commit_owner_certified(
+        state,
+        &mut info,
+        state.agent.identity().agent_keypair(),
+        now_millis_u64(),
+    )
+    .await?;
+    assert!(!info.is_home_scope());
+    Ok((group_key, info))
+}
+
+/// The discovery entry an ANONYMOUS announce leaves for `agent_id`: the
+/// canonical anonymous digest and no certificate.
+async fn install_anonymous_discovery(state: &AppState, agent_id: x0x::identity::AgentId) {
+    state.agent.identity_discovery_cache().write().await.insert(
+        agent_id,
+        x0x::DiscoveredAgent {
+            self_name: None,
+            agent_id,
+            machine_id: x0x::identity::MachineId([0u8; 32]),
+            user_id: None,
+            addresses: Vec::new(),
+            announced_at: 0,
+            last_seen: 0,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: None,
+            agent_certificate: None,
+            agent_public_key: Vec::new(),
+            cert_digest: Some(x0x::announce_v3::anonymous_cert_digest()),
+        },
+    );
+}
+
+/// SEAL SITE. The Home twin of
+/// `anonymous_announce_invalidates_hand_installed_cert`: the same anonymous
+/// announce lands through the same real listener and drops the discovered
+/// certificate, but the group is a committed Home, so the anonymous digest
+/// is no disclosure (ADR 0108 §4). The seal succeeds on the roster-embedded
+/// certificate and starts no grace. Before S2-1 it refused with
+/// `OwnerCertMemberPending`, exactly like the ordinary control.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn anonymous_announce_keeps_hand_installed_cert_in_a_committed_home() -> Result<()> {
+    let plane = format!("r19-home-writer-{}", rand::random::<u32>());
+    let dir = tempfile::tempdir()?;
+    let state = announce_writer_state(dir.path(), &plane).await?;
+    let owner = x0x::identity::UserKeypair::generate()?;
+    let cert =
+        x0x::identity::AgentCertificate::issue(&owner, state.agent.identity().agent_keypair())?;
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    install_discovery_cert(&state, &state.agent, &cert).await;
+    let (_, mut info) =
+        committed_home_group(&state, &owner, &plane, &[(local_hex.clone(), &cert, true)]).await?;
+
+    anonymous_announce_lands(&state.agent).await?;
+    let evidence = owner_cert_seal_evidence(&state, &info).await;
+    assert_eq!(
+        evidence.digest_for(&local_hex),
+        Some(x0x::announce_v3::anonymous_cert_digest()),
+        "the seal evidence holds the anonymous digest"
+    );
+    assert!(evidence.cert_for(&local_hex).is_none());
+    seal_commit_owner_certified(
+        &state,
+        &mut info,
+        state.agent.identity().agent_keypair(),
+        now_millis_u64(),
+    )
+    .await
+    .expect("in a committed Home the anonymous digest is no disclosure");
+    assert_eq!(
+        info.members_v2[&local_hex].certificate_missing_since_ms, None,
+        "no grace was started"
+    );
+    assert!(info.is_home_scope(), "the new head still covers the Home");
+    assert!(state.agent.peers().await?.is_empty());
+    state.agent.shutdown().await;
+    Ok(())
+}
+
+/// EVICTION SITE (`owner_certified_seal_with_eviction`, the explicit seal
+/// route), on the live record. The creator's announce is anonymous and its
+/// missing-evidence grace window has expired. In the ordinary twin that
+/// verdict is `Failed(NoCertificate)`, the eviction set. In a committed Home
+/// the creator is Clean: nothing is evicted, the stale grace stamp is
+/// cleared, and the all-clean seal commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn eviction_path_keeps_an_anonymous_creator_seated_in_a_committed_home() -> Result<()> {
+    let plane = format!("r19-home-evict-{}", rand::random::<u32>());
+    let dir = tempfile::tempdir()?;
+    let state = announce_writer_state(dir.path(), &plane).await?;
+    let owner = x0x::identity::UserKeypair::generate()?;
+    let local_cert =
+        x0x::identity::AgentCertificate::issue(&owner, state.agent.identity().agent_keypair())?;
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    install_discovery_cert(&state, &state.agent, &local_cert).await;
+    let creator_kp = x0x::identity::AgentKeypair::generate()?;
+    let creator_hex = hex::encode(creator_kp.agent_id().as_bytes());
+    let creator_cert = x0x::identity::AgentCertificate::issue(&owner, &creator_kp)?;
+    let seats = [
+        (local_hex.clone(), &local_cert, true),
+        (creator_hex.clone(), &creator_cert, true),
+    ];
+    let (_, ordinary) = committed_ordinary_group(&state, &owner, "evict-ordinary", &seats).await?;
+    let (home_key, home) = committed_home_group(&state, &owner, "evict-home", &seats).await?;
+    install_anonymous_discovery(&state, creator_kp.agent_id()).await;
+    let expired_grace = |mut info: x0x::groups::GroupInfo| {
+        info.members_v2
+            .get_mut(&creator_hex)
+            .expect("creator seat")
+            .certificate_missing_since_ms = Some(1);
+        info
+    };
+
+    // Ordinary control: the expired grace window makes the creator the
+    // eviction set.
+    let mut ordinary = expired_grace(ordinary);
+    let evidence = owner_cert_seal_evidence(&state, &ordinary).await;
+    let failed = ordinary.owner_cert_verdict(&evidence).failed();
+    assert_eq!(
+        failed,
+        vec![(
+            creator_hex.clone(),
+            x0x::groups::owner_cert::OwnerCertFailure::NoCertificate
+        )],
+        "the ordinary twin evicts the anonymous creator"
+    );
+
+    // The Home, through the production eviction path.
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(home_key.clone(), expired_grace(home));
+    let (commit, evicted, _) = owner_certified_seal_with_eviction(&state, &home_key, &local_hex)
+        .await
+        .expect("an OwnerCertified group takes the eviction path")
+        .unwrap_or_else(|(status, body)| panic!("eviction-path seal refused: {status} {body:?}"));
+    assert!(evicted.is_empty(), "nobody is evicted: {evicted:?}");
+    assert!(!commit.roster_root.is_empty());
+    let groups = state.named_groups.read().await;
+    let info = groups.get(&home_key).expect("the Home");
+    assert!(
+        info.has_active_member(&creator_hex),
+        "the creator stays seated"
+    );
+    assert_eq!(
+        info.members_v2[&creator_hex].certificate_missing_since_ms, None,
+        "the stale grace stamp is cleared"
+    );
+    drop(groups);
+    state.agent.shutdown().await;
+    Ok(())
+}
+
+/// SERVING GUARD SITE (ADR 0107, both the pre-phase check and the stream
+/// seam). The verdict there runs on a probe clone trimmed to the recipient's
+/// seat. A Home joiner whose announce is anonymous is Clean there and is
+/// served: ADR 0107's permitted Clean alternative (ADR 0108 §4). In the
+/// ordinary twin the same joiner is still withheld as `InGrace`. The W3-H
+/// #1143 case cannot catch this: its joiner announces consented.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn serving_guard_serves_an_anonymous_home_joiner_and_withholds_the_ordinary_one() -> Result<()>
+{
+    let plane = format!("r19-home-serve-{}", rand::random::<u32>());
+    let dir = tempfile::tempdir()?;
+    let state = announce_writer_state(dir.path(), &plane).await?;
+    let owner = x0x::identity::UserKeypair::generate()?;
+    let local_cert =
+        x0x::identity::AgentCertificate::issue(&owner, state.agent.identity().agent_keypair())?;
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    install_discovery_cert(&state, &state.agent, &local_cert).await;
+    let joiner_kp = x0x::identity::AgentKeypair::generate()?;
+    let joiner_hex = hex::encode(joiner_kp.agent_id().as_bytes());
+    let joiner_cert = x0x::identity::AgentCertificate::issue(&owner, &joiner_kp)?;
+    let seats = [
+        (local_hex.clone(), &local_cert, true),
+        (joiner_hex.clone(), &joiner_cert, true),
+    ];
+    let (ordinary_key, ordinary) =
+        committed_ordinary_group(&state, &owner, "serve-ordinary", &seats).await?;
+    let (home_key, home) = committed_home_group(&state, &owner, "serve-home", &seats).await?;
+    install_anonymous_discovery(&state, joiner_kp.agent_id()).await;
+    {
+        let mut groups = state.named_groups.write().await;
+        groups.insert(ordinary_key.clone(), ordinary);
+        groups.insert(home_key.clone(), home);
+    }
+
+    // Home: served at the pre-phase and at the seam.
+    let evidence = join_artifact_serving_check(&state, &home_key, &joiner_hex)
+        .await
+        .unwrap_or_else(|refusal| panic!("the anonymous Home joiner was withheld: {refusal:?}"));
+    assert!(evidence.is_some(), "an OwnerCertified verdict was taken");
+    assert_eq!(
+        join_artifact_seam_refusal(&state, &home_key, &joiner_hex, evidence),
+        None,
+        "the seam serves the anonymous Home joiner"
+    );
+
+    // Ordinary twin: still withheld on both checks.
+    assert_eq!(
+        join_artifact_serving_refusal(&state, &ordinary_key, &joiner_hex).await,
+        Some(JoinArtifactRefusal::CertificateInGrace)
+    );
+    let evidence = owner_cert_evidence_for(&state, &[joiner_hex.as_str()]).await;
+    assert_eq!(
+        join_artifact_seam_refusal(&state, &ordinary_key, &joiner_hex, Some(evidence)),
+        Some(JoinArtifactRefusal::CertificateInGrace)
+    );
+    state.agent.shutdown().await;
+    Ok(())
+}
+
 fn seat_digest(cert: &x0x::identity::AgentCertificate) -> String {
     x0x::groups::owner_cert::certificate_digest_hex(cert)
 }

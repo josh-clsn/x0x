@@ -221,6 +221,30 @@ impl OwnerCertEvidence {
         self.digest_for(agent_hex).is_some() && self.cert_for(agent_hex).is_none()
     }
 
+    /// The announced digest a verdict reads for `agent_hex` (ADR 0108 §4).
+    ///
+    /// With `home_scope` set (the group is a committed Home scope,
+    /// [`crate::groups::GroupInfo::is_home_scope`]), the canonical
+    /// anonymous digest is absence of public disclosure: it reads as no
+    /// discovery entry at all. It never contradicts committed evidence,
+    /// never counts as a warranted certificate fetch and never starts
+    /// missing-evidence grace. A certificate-bearing digest, and every
+    /// digest outside Home scope, reads exactly as [`Self::digest_for`].
+    #[must_use]
+    pub fn disclosed_digest_for(&self, agent_hex: &str, home_scope: bool) -> Option<[u8; 32]> {
+        self.digest_for(agent_hex).filter(|digest| {
+            !(home_scope && *digest == crate::announce_v3::anonymous_cert_digest())
+        })
+    }
+
+    /// [`Self::fetch_in_flight`] over [`Self::disclosed_digest_for`]: in
+    /// Home scope an anonymous announce never leaves a fetch outstanding.
+    #[must_use]
+    pub fn disclosed_fetch_in_flight(&self, agent_hex: &str, home_scope: bool) -> bool {
+        self.disclosed_digest_for(agent_hex, home_scope).is_some()
+            && self.cert_for(agent_hex).is_none()
+    }
+
     /// Whether `agent_hex` is locally known to be revoked (ADR-0018).
     #[must_use]
     pub fn is_revoked(&self, agent_hex: &str) -> bool {
