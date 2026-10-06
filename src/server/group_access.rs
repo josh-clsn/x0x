@@ -1,5 +1,6 @@
 //! Group-plane access admission — issue #1166 slices S1 (read family),
-//! S2 (secure-write family) and S3 (admin/mutation family).
+//! S2 (secure-write family), S3 (admin/mutation family) and S4 (the
+//! long tail).
 //!
 //! One chokepoint owns the answer to "who may enter a group route" for
 //! the group plane. Before this module every handler re-derived that
@@ -40,7 +41,14 @@
 //! run the same function. `GET /groups/:id/requests` is the S3
 //! exception: no body argument, no durability-first ordering and no
 //! positional callers — its handler takes the extractor and re-runs
-//! the core under its own lock (the `/members` pattern).
+//! the core under its own lock (the `/members` pattern). The S4 stores
+//! handlers join the pinned-signature family (~60 positional callers
+//! in `routes/stores.rs`'s test module) and run the two S4 cores at
+//! the inline checks' exact position; everything else S4 classifies
+//! was already gated by shared helpers (`reject_quarantined_task_mutation`,
+//! `ensure_task_list_access`, the history scope gates) or by nothing
+//! at all, so those routes are classification-only — the table row
+//! states the honest level and the handler keeps today's exact checks.
 //!
 //! Admission runs twice where the handler re-reads group data for its
 //! body (`/members`, `/state/commits`): once in the extractor (an early
@@ -70,9 +78,11 @@
 //! `open_envelope_withdrawn_group_conflict`, `reject_withdrawn_group`),
 //! which is what the inline code used.
 //!
-//! Later slices (S4 long tail) classify the remaining routes; S5
-//! activates the `clippy.toml` ceiling that forbids the absorbed
-//! helpers everywhere except this module.
+//! `POST /groups/:id/delegate` is the one row still `Unmigrated` (its
+//! handlers live in `routes/delegations.rs`, outside the S4 file set;
+//! the auth middleware already durable-gates it). S5 activates the
+//! `clippy.toml` ceiling that forbids the absorbed helpers everywhere
+//! except this module.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -110,22 +120,30 @@ pub(in crate::server) enum MemberState {
 /// What a request was admitted at. S1 needs three levels; S2 adds
 /// `SessionBearer`, `RiderScope` and `PublicWrite` for the
 /// secure-write family; S3 adds `Admin` and `JoinSelf` for the
-/// admin/mutation family; S4 classifies the long tail.
+/// admin/mutation family; S4 classified the long tail at these same
+/// levels (see the table's S4 section comment).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::server) enum AccessLevel {
     /// The durable API token — full authority, subsumes every other level.
     OwnerDurable,
-    /// A session bearer holding a qualifying local seat — a seat the
-    /// admission core actually verified. Which seat state qualifies is
-    /// the route's admission rule, not the caller's guess; a session
-    /// bearer whose seat was NOT checked is [`AccessLevel::SessionBearer`].
+    /// A local seat the admission core actually verified — which seat
+    /// (whose, and what state qualifies) is the route's admission rule,
+    /// not the caller's guess. On the S1 read family it is the session
+    /// bearer's own seat (`local_join_membership_state`); on the S4
+    /// task-list family it is the DAEMON's active seat, evaluated
+    /// bearer-blind (`ensure_task_list_access` — a durable owner
+    /// without the seat is refused too). A session bearer whose seat
+    /// was NOT checked is [`AccessLevel::SessionBearer`].
     Member(MemberState),
-    /// A session bearer on the S2 secure-write family (`send`,
-    /// `secure/encrypt|decrypt|reseal`) — the bearer CLASS only, no
-    /// seat verified: `send` admits seatless bearers where the write
-    /// policy allows and `decrypt` still admits banned callers, the
-    /// member gate/ban/write-policy checks being the handler's, in
-    /// their per-route order. Never read as "holds an active seat".
+    /// A session bearer admitted on bearer CLASS alone, no seat, no
+    /// grant verified — the S2 secure-write family (`send`,
+    /// `secure/encrypt|decrypt|reseal`: `send` admits seatless bearers
+    /// where the write policy allows and `decrypt` still admits banned
+    /// callers) and the S4 history/stores surfaces whose gates are
+    /// scope-conditional (`GET /history`'s per-scope rider grant,
+    /// `DELETE /history`'s fork-quarantine backstop) or rider-only
+    /// defence-in-depth (the stores routes). Never read as "holds an
+    /// active seat" or "no rider can enter".
     SessionBearer,
     /// A rider bearer on a write surface (`send`, `secure/encrypt`). The
     /// level LABELS the actor class — it asserts no verified token grant:
@@ -149,12 +167,23 @@ pub(in crate::server) enum AccessLevel {
     /// an ACTIVE seat, any role — the #446 round-5 gate. The bearer
     /// class is never consulted.
     JoinSelf,
-    /// No actor-based gate; the route serves its public projection (any
-    /// remaining gates are local policy, not principal identity).
+    /// No actor-based gate: no property of the bearer can refuse the
+    /// request (riders are unreachable through the auth middleware's
+    /// deny-by-default allowlist; owner-class bearers are never
+    /// refused). What the route serves — and any filtering of it, like
+    /// the task-list collection's seat filter or the history surfaces'
+    /// session marker visibility — is local policy, not principal
+    /// identity.
     PublicRead,
     /// No actor-based gate on a write surface; remaining gates are local
-    /// policy (the withdrawn-record conflict on `open-envelope` — the
-    /// write-side member of the no-actor class).
+    /// policy or data checks, not principal identity — the write-side
+    /// member of the no-actor class (S2's `open-envelope`, S3's
+    /// display-name and request create/cancel). Issue #1228 tracks
+    /// that `POST /groups/:id/quarantine/clear` and the `/mls/groups*`
+    /// routes ALSO sit here with no gate at all: S4 classifies them at
+    /// that reality without tightening; each fix is a separate reviewed
+    /// change, pinned by the `s4_pins_the_no_actor_check_routes_as_unchanged`
+    /// test.
     PublicWrite,
 }
 
@@ -199,9 +228,11 @@ pub(in crate::server) struct RouteAccess {
 /// `/messages`, `/state`, `/state/commits`, `/delegations`; S2 the
 /// secure-write family — `POST /groups/:id/send`,
 /// `secure/encrypt|decrypt|reseal`, `secure/open-envelope`; S3 the
-/// admin/mutation family (see its section comment for the honest
-/// labels). Everything else waits for its slice as
-/// [`AccessClass::Unmigrated`].
+/// admin/mutation family; S4 the long tail (both section comments
+/// carry the honest labels). The one row left as
+/// [`AccessClass::Unmigrated`] is `POST /groups/:id/delegate`
+/// (`routes/delegations.rs`, outside the S4 file set; already
+/// durable-gated by the auth middleware).
 pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
     // ── S1 read family: classified ────────────────────────────────────
     // `/groups/:id` additionally serves the pending_authority_commit stub
@@ -368,185 +399,221 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
         path: "/groups/:id/requests/:request_id",
         class: AccessClass::Level(AccessLevel::PublicWrite),
     },
-    // ── S4 long tail: waiting ─────────────────────────────────────────
+    // ── S4 long tail: classified ─────────────────────────────────────
+    // Honest labels, nothing tightened (every gate below is today's,
+    // kept exactly where it stood):
+    // - Discovery, cards, group create/list, join, join-status and the
+    //   plain history reads (message/scopes/search/stats) refuse NO
+    //   bearer — PublicRead / PublicWrite by the no-actor rule.
+    // - `GET /history` (the one rider-reachable history surface, via
+    //   the ADR-0039 allowlist) and `DELETE /history` CAN refuse on
+    //   the actor — the per-scope rider grant 403, and the #877
+    //   fork-quarantine-for-actor backstop on a purge — while sessions
+    //   pass with nothing verified: SessionBearer, gates handler-side
+    //   (they consume the query's scope, so they cannot move into an
+    //   extractor).
+    // - stores: `POST /groups/:id/stores` keeps its rider-grant 403
+    //   (`admit_group_store_route`) and the legacy-import trio its
+    //   owner-class 403 (`admit_legacy_import_route`), both now via
+    //   the S4 cores at the inline checks' exact position; nominal
+    //   SessionBearer.
+    // - task-lists: the `:id` is a task-list id, not a group id — the
+    //   group (and every gate) is parsed OUT of it. A group-scoped id
+    //   requires the LOCAL DAEMON's active seat, bearer-blind
+    //   (`ensure_task_list_access`; a durable owner without the seat
+    //   is refused too) plus the QUAR mutation gate
+    //   (`reject_quarantined_task_mutation`, which runs FIRST so an
+    //   alias-keyed group fails for the right reason); a plain id is
+    //   ungated. Rows label the scoped case (Member = the verified
+    //   daemon seat); the collection never refuses — it FILTERS by the
+    //   same seat rule — so it is PublicRead.
+    // - #1228's unchecked surfaces — `quarantine/clear` and every
+    //   `/mls/groups*` route — are classified at their REAL no-actor
+    //   level; tightening them is a separate reviewed PR, pinned by
+    //   `s4_pins_the_no_actor_check_routes_as_unchanged`.
     RouteAccess {
         method: Method::POST,
         path: "/groups",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::PublicWrite),
     },
     RouteAccess {
         method: Method::GET,
         path: "/groups",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::PublicRead),
     },
     RouteAccess {
         method: Method::GET,
         path: "/groups/discover",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::PublicRead),
     },
     RouteAccess {
         method: Method::GET,
         path: "/groups/discover/nearby",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::PublicRead),
     },
     RouteAccess {
         method: Method::GET,
         path: "/groups/discover/subscriptions",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::PublicRead),
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/discover/subscribe",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::PublicWrite),
     },
     RouteAccess {
         method: Method::DELETE,
         path: "/groups/discover/subscribe/:kind/:shard",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::PublicWrite),
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/cards/import",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::PublicWrite),
     },
     RouteAccess {
         method: Method::GET,
         path: "/groups/cards/:id",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::PublicRead),
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/join",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::PublicWrite),
     },
     RouteAccess {
         method: Method::GET,
         path: "/groups/:id/join-status",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::PublicRead),
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/quarantine/clear",
-        class: AccessClass::Unmigrated,
-    },
-    RouteAccess {
-        method: Method::POST,
-        path: "/groups/:id/delegate",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::PublicWrite),
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/stores",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::SessionBearer),
     },
     RouteAccess {
         method: Method::GET,
         path: "/groups/:id/stores/:app/legacy-imports",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::SessionBearer),
     },
     RouteAccess {
         method: Method::GET,
         path: "/groups/:id/stores/:app/legacy-imports/:source_id",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::SessionBearer),
     },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/stores/:app/legacy-imports/:source_id",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::SessionBearer),
     },
     RouteAccess {
         method: Method::GET,
         path: "/history",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::SessionBearer),
     },
     RouteAccess {
         method: Method::DELETE,
         path: "/history",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::SessionBearer),
     },
     RouteAccess {
         method: Method::GET,
         path: "/history/message/:msg_id",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::PublicRead),
     },
     RouteAccess {
         method: Method::GET,
         path: "/history/scopes",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::PublicRead),
     },
     RouteAccess {
         method: Method::GET,
         path: "/history/search",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::PublicRead),
     },
     RouteAccess {
         method: Method::GET,
         path: "/history/stats",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::PublicRead),
     },
     RouteAccess {
         method: Method::GET,
         path: "/task-lists",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::PublicRead),
     },
     RouteAccess {
         method: Method::POST,
         path: "/task-lists",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::Member(MemberState::Active)),
     },
     RouteAccess {
         method: Method::GET,
         path: "/task-lists/:id/tasks",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::Member(MemberState::Active)),
     },
     RouteAccess {
         method: Method::POST,
         path: "/task-lists/:id/tasks",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::Member(MemberState::Active)),
     },
     RouteAccess {
         method: Method::PATCH,
         path: "/task-lists/:id/tasks/:tid",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::Member(MemberState::Active)),
     },
     RouteAccess {
         method: Method::POST,
         path: "/mls/groups",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::PublicWrite),
     },
     RouteAccess {
         method: Method::GET,
         path: "/mls/groups",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::PublicRead),
     },
     RouteAccess {
         method: Method::GET,
         path: "/mls/groups/:id",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::PublicRead),
     },
     RouteAccess {
         method: Method::POST,
         path: "/mls/groups/:id/members",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::PublicWrite),
     },
     RouteAccess {
         method: Method::DELETE,
         path: "/mls/groups/:id/members/:agent_id",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::PublicWrite),
     },
     RouteAccess {
         method: Method::POST,
         path: "/mls/groups/:id/encrypt",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::PublicWrite),
     },
     RouteAccess {
         method: Method::POST,
         path: "/mls/groups/:id/decrypt",
-        class: AccessClass::Unmigrated,
+        class: AccessClass::Level(AccessLevel::PublicWrite),
     },
     RouteAccess {
         method: Method::POST,
         path: "/mls/groups/:id/welcome",
+        class: AccessClass::Level(AccessLevel::PublicWrite),
+    },
+    // The one row outside S4's file set: `routes/delegations.rs` owns
+    // the handler (durable bypass → rider 403 → session-membership
+    // 403, the DOC pattern), and the auth middleware durable-gates the
+    // route. It migrates under its own slice; the parity tests keep it
+    // listed either way.
+    RouteAccess {
+        method: Method::POST,
+        path: "/groups/:id/delegate",
         class: AccessClass::Unmigrated,
     },
 ];
@@ -1010,6 +1077,50 @@ pub(in crate::server) fn is_home_or_owner_certified(info: &x0x::groups::GroupInf
     info.home.is_some() || info.policy.admission.owner_certified_user_id().is_some()
 }
 
+// ─────────────────────── admission cores (S4 long tail) ──────────────────
+
+/// `POST /groups/:id/stores`: the rider grant on the binding's STABLE
+/// group id — owner-class bearers pass on class, a rider only with its
+/// token's explicit grant (ADR-0039). Riders cannot reach this route
+/// through the auth middleware (deny-by-default allowlist), so the
+/// grant arm is defence in depth, exactly as the inline check kept it;
+/// the body is byte-identical (`forbidden`). Runs at the inline
+/// check's position: after the plane/binding resolution's lock block,
+/// on the resolved `binding.stable_group_id`.
+pub(in crate::server) fn admit_group_store_route(
+    actor: &ActorContext,
+    stable_group_id: &str,
+) -> Admission {
+    match actor {
+        ActorContext::Owner { durable: true } => Ok(AccessLevel::OwnerDurable),
+        ActorContext::Owner { durable: false } => Ok(AccessLevel::SessionBearer),
+        ActorContext::Rider { .. } if actor.rider_allows_group(stable_group_id) => {
+            Ok(AccessLevel::RiderScope)
+        }
+        ActorContext::Rider { .. } => Err(forbidden("rider token is not granted this group")),
+    }
+}
+
+/// The legacy-import trio (`GET /groups/:id/stores/:app/legacy-imports`,
+/// `GET+POST …/legacy-imports/:source_id`): the local owner-authority
+/// gate — an Owner-CLASS bearer (durable or session) passes, every
+/// rider is refused, grant or not. The inline code followed the owner
+/// match with a `rider_allows_group` check that only Owners could
+/// reach and that is `true` for every Owner, so it could never fire;
+/// folding it away is behaviour-identical, and the stores rider test
+/// pins the observable contract (a GRANTED rider still gets this 403).
+/// Runs at the inline pair's position: inside the named-groups lock
+/// block, after `find_store_group` and the canonical-id 400.
+pub(in crate::server) fn admit_legacy_import_route(actor: &ActorContext) -> Admission {
+    match actor {
+        ActorContext::Owner { durable: true } => Ok(AccessLevel::OwnerDurable),
+        ActorContext::Owner { durable: false } => Ok(AccessLevel::SessionBearer),
+        ActorContext::Rider { .. } => Err(forbidden(
+            "legacy source export requires the local owner authority",
+        )),
+    }
+}
+
 // ─────────────────────── extractor ───────────────────────────────────────
 
 /// The admission result handed to a handler: the resolved access level,
@@ -1245,17 +1356,21 @@ impl FromRequestParts<Arc<AppState>> for GroupAccess {
             ("GET", "/groups/:id/requests") => admit_join_requests_route(state.as_ref(), &id).await,
             // Classified routes deliberately left without an arm: the
             // S1 `GET /groups/:id` + `/delegations`, the five S2
-            // secure-write handlers and the S3 mutation family all run
-            // their cores directly under their own lock — their
-            // signatures are pinned by positional test callers, or an
-            // extractor argument would reorder rejection precedence
-            // (body-parse 400s, the request routes' durability 503 and
-            // side-effect orderings all precede the gates today). If a
-            // future handler wires this extractor to one of them, this
-            // fails closed instead of guessing — and note `send` could
-            // not take this extractor anyway without reordering its
-            // body validations (kind/size/thread) after the entry
-            // gates.
+            // secure-write handlers, the S3 mutation family and the
+            // four S4 stores handlers all run their cores directly
+            // under their own lock — their signatures are pinned by
+            // positional test callers, or an extractor argument would
+            // reorder rejection precedence (body-parse 400s, the
+            // request routes' durability 503 and side-effect orderings
+            // all precede the gates today). Every other S4 route has
+            // NO `:id`-shaped admission at all (discovery/cards/join,
+            // the history scope gates, the task-list id parsers, the
+            // #1228 no-actor surfaces) — classification-only, the
+            // handler keeps today's exact checks. If a future handler
+            // wires this extractor to any of them, this fails closed
+            // instead of guessing — and note `send` could not take
+            // this extractor anyway without reordering its body
+            // validations (kind/size/thread) after the entry gates.
             _ => Err(extractor_not_wired(&parts.method, parts.uri.path())),
         }
     }
@@ -1520,15 +1635,15 @@ mod tests {
         );
     }
 
-    /// The slice contract: exactly the S1 read, S2 secure-write and S3
-    /// admin/mutation families are classified, at honest levels (the
-    /// S2 rows label the bearer class — SessionBearer/RiderScope —
-    /// because the cores verify no seat; the S3 rows label the seat /
-    /// no-actor reality — see the table comments); every other
-    /// group-plane route is an explicit `Unmigrated` row so parity
-    /// holds without claiming a migration that has not happened.
+    /// The slice contract: every family through S4 is classified, at
+    /// honest levels (the S2 rows label the bearer class, the S3 rows
+    /// the seat/no-actor reality, the S4 rows the long tail's actual
+    /// gates — see the table comments); the one remaining
+    /// group-plane route is an explicit `Unmigrated` row
+    /// (`POST /groups/:id/delegate`) so parity holds without claiming
+    /// a migration that has not happened.
     #[test]
-    fn s1_s2_and_s3_families_classified_and_the_rest_wait_for_their_slice() {
+    fn s1_through_s4_families_classified_and_delegate_waits_for_its_slice() {
         let expected: &[(Method, &str, AccessLevel)] = &[
             (
                 Method::GET,
@@ -1630,6 +1745,125 @@ mod tests {
                 "/groups/:id/requests/:request_id",
                 AccessLevel::PublicWrite,
             ),
+            (Method::POST, "/groups", AccessLevel::PublicWrite),
+            (Method::GET, "/groups", AccessLevel::PublicRead),
+            (Method::GET, "/groups/discover", AccessLevel::PublicRead),
+            (
+                Method::GET,
+                "/groups/discover/nearby",
+                AccessLevel::PublicRead,
+            ),
+            (
+                Method::GET,
+                "/groups/discover/subscriptions",
+                AccessLevel::PublicRead,
+            ),
+            (
+                Method::POST,
+                "/groups/discover/subscribe",
+                AccessLevel::PublicWrite,
+            ),
+            (
+                Method::DELETE,
+                "/groups/discover/subscribe/:kind/:shard",
+                AccessLevel::PublicWrite,
+            ),
+            (
+                Method::POST,
+                "/groups/cards/import",
+                AccessLevel::PublicWrite,
+            ),
+            (Method::GET, "/groups/cards/:id", AccessLevel::PublicRead),
+            (Method::POST, "/groups/join", AccessLevel::PublicWrite),
+            (
+                Method::GET,
+                "/groups/:id/join-status",
+                AccessLevel::PublicRead,
+            ),
+            (
+                Method::POST,
+                "/groups/:id/quarantine/clear",
+                AccessLevel::PublicWrite,
+            ),
+            (
+                Method::POST,
+                "/groups/:id/stores",
+                AccessLevel::SessionBearer,
+            ),
+            (
+                Method::GET,
+                "/groups/:id/stores/:app/legacy-imports",
+                AccessLevel::SessionBearer,
+            ),
+            (
+                Method::GET,
+                "/groups/:id/stores/:app/legacy-imports/:source_id",
+                AccessLevel::SessionBearer,
+            ),
+            (
+                Method::POST,
+                "/groups/:id/stores/:app/legacy-imports/:source_id",
+                AccessLevel::SessionBearer,
+            ),
+            (Method::GET, "/history", AccessLevel::SessionBearer),
+            (Method::DELETE, "/history", AccessLevel::SessionBearer),
+            (
+                Method::GET,
+                "/history/message/:msg_id",
+                AccessLevel::PublicRead,
+            ),
+            (Method::GET, "/history/scopes", AccessLevel::PublicRead),
+            (Method::GET, "/history/search", AccessLevel::PublicRead),
+            (Method::GET, "/history/stats", AccessLevel::PublicRead),
+            (Method::GET, "/task-lists", AccessLevel::PublicRead),
+            (
+                Method::POST,
+                "/task-lists",
+                AccessLevel::Member(MemberState::Active),
+            ),
+            (
+                Method::GET,
+                "/task-lists/:id/tasks",
+                AccessLevel::Member(MemberState::Active),
+            ),
+            (
+                Method::POST,
+                "/task-lists/:id/tasks",
+                AccessLevel::Member(MemberState::Active),
+            ),
+            (
+                Method::PATCH,
+                "/task-lists/:id/tasks/:tid",
+                AccessLevel::Member(MemberState::Active),
+            ),
+            (Method::POST, "/mls/groups", AccessLevel::PublicWrite),
+            (Method::GET, "/mls/groups", AccessLevel::PublicRead),
+            (Method::GET, "/mls/groups/:id", AccessLevel::PublicRead),
+            (
+                Method::POST,
+                "/mls/groups/:id/members",
+                AccessLevel::PublicWrite,
+            ),
+            (
+                Method::DELETE,
+                "/mls/groups/:id/members/:agent_id",
+                AccessLevel::PublicWrite,
+            ),
+            (
+                Method::POST,
+                "/mls/groups/:id/encrypt",
+                AccessLevel::PublicWrite,
+            ),
+            (
+                Method::POST,
+                "/mls/groups/:id/decrypt",
+                AccessLevel::PublicWrite,
+            ),
+            (
+                Method::POST,
+                "/mls/groups/:id/welcome",
+                AccessLevel::PublicWrite,
+            ),
         ];
         let classified = GROUP_PLANE_ROUTES
             .iter()
@@ -1638,7 +1872,7 @@ mod tests {
         assert_eq!(
             classified,
             expected.len(),
-            "exactly the S1 read, S2 secure-write and S3 admin/mutation families may be classified"
+            "exactly the S1–S4 families may be classified; anything new needs a row AND an entry here"
         );
         for (method, path, level) in expected {
             let row = GROUP_PLANE_ROUTES
@@ -1646,6 +1880,47 @@ mod tests {
                 .find(|row| row.method == *method && row.path == *path)
                 .unwrap_or_else(|| panic!("{method} {path} missing from the table"));
             assert_eq!(row.class, AccessClass::Level(*level), "{method} {path}");
+        }
+    }
+
+    /// Issue #1228's still-unchecked surfaces, pinned at their REAL
+    /// level: `POST /groups/:id/quarantine/clear` and every
+    /// `/mls/groups*` route carry NO actor-based check today — any
+    /// valid bearer (a 10-minute session token included) reaches them;
+    /// only riders are stopped, by the auth middleware's
+    /// deny-by-default allowlist. S4 classifies them PublicRead /
+    /// PublicWrite — the no-actor class — WITHOUT tightening: each fix
+    /// is a separate reviewed change, and fixing it means editing this
+    /// list and the row together, deliberately.
+    #[test]
+    fn s4_pins_the_no_actor_check_routes_as_unchanged() {
+        let unchecked: &[(Method, &str)] = &[
+            (Method::POST, "/groups/:id/quarantine/clear"),
+            (Method::POST, "/mls/groups"),
+            (Method::GET, "/mls/groups"),
+            (Method::GET, "/mls/groups/:id"),
+            (Method::POST, "/mls/groups/:id/members"),
+            (Method::DELETE, "/mls/groups/:id/members/:agent_id"),
+            (Method::POST, "/mls/groups/:id/encrypt"),
+            (Method::POST, "/mls/groups/:id/decrypt"),
+            (Method::POST, "/mls/groups/:id/welcome"),
+        ];
+        for (method, path) in unchecked {
+            let row = GROUP_PLANE_ROUTES
+                .iter()
+                .find(|row| row.method == *method && row.path == *path)
+                .unwrap_or_else(|| panic!("{method} {path} missing from the table"));
+            let expected = if *method == Method::GET {
+                AccessLevel::PublicRead
+            } else {
+                AccessLevel::PublicWrite
+            };
+            assert_eq!(
+                row.class,
+                AccessClass::Level(expected),
+                "{method} {path}: #1228 unchecked surface — classifying it any tighter is a \
+                 behaviour change that needs its own reviewed PR"
+            );
         }
     }
 
@@ -2513,5 +2788,90 @@ mod tests {
         );
         groups.insert("live".to_string(), fixture_group("live"));
         assert!(admit_live_group_route(&groups, "live").is_ok());
+    }
+
+    /// `POST /groups/:id/stores`: the rider grant on the resolved
+    /// binding's stable id — owners pass on class (durable or session,
+    /// nothing else verified), a rider only with its token's grant.
+    #[test]
+    fn group_store_admission_reproduces_the_inline_decisions() {
+        assert_eq!(
+            admit_group_store_route(&durable(), "stable").unwrap(),
+            AccessLevel::OwnerDurable
+        );
+        assert_eq!(
+            admit_group_store_route(&session(), "stable").unwrap(),
+            AccessLevel::SessionBearer
+        );
+
+        let granted = ActorContext::Rider {
+            sub_agent_id: "aa".repeat(32),
+            token_id: 1,
+            token_hash: "hash".to_string(),
+            groups: vec!["stable".to_string()],
+        };
+        assert_eq!(
+            admit_group_store_route(&granted, "stable").unwrap(),
+            AccessLevel::RiderScope,
+            "a granted rider passes — the token's explicit grant is the check"
+        );
+        assert_refusal(
+            admit_group_store_route(&rider(), "stable"),
+            StatusCode::FORBIDDEN,
+            "rider token is not granted this group",
+            None,
+        );
+        // The grant is exact, not prefix-wise: `stab` does not lift
+        // `stable`.
+        let near_miss = ActorContext::Rider {
+            sub_agent_id: "aa".repeat(32),
+            token_id: 2,
+            token_hash: "hash".to_string(),
+            groups: vec!["stab".to_string()],
+        };
+        assert_refusal(
+            admit_group_store_route(&near_miss, "stable"),
+            StatusCode::FORBIDDEN,
+            "rider token is not granted this group",
+            None,
+        );
+    }
+
+    /// The legacy-import trio's owner-authority gate: owner-class
+    /// bearers pass (durable or session), every rider is refused —
+    /// GRANT OR NOT, because the grant check the inline code ran after
+    /// the owner match was unreachable for riders and always-true for
+    /// owners (the stores rider test pins the granted-rider 403
+    /// end-to-end).
+    #[test]
+    fn legacy_import_admission_reproduces_the_inline_decisions() {
+        assert_eq!(
+            admit_legacy_import_route(&durable()).unwrap(),
+            AccessLevel::OwnerDurable
+        );
+        assert_eq!(
+            admit_legacy_import_route(&session()).unwrap(),
+            AccessLevel::SessionBearer
+        );
+
+        assert_refusal(
+            admit_legacy_import_route(&rider()),
+            StatusCode::FORBIDDEN,
+            "legacy source export requires the local owner authority",
+            None,
+        );
+        let granted = ActorContext::Rider {
+            sub_agent_id: "aa".repeat(32),
+            token_id: 3,
+            token_hash: "hash".to_string(),
+            groups: vec!["stable".to_string()],
+        };
+        // The grant cannot lift the owner-class requirement.
+        assert_refusal(
+            admit_legacy_import_route(&granted),
+            StatusCode::FORBIDDEN,
+            "legacy source export requires the local owner authority",
+            None,
+        );
     }
 }
