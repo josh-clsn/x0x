@@ -133,6 +133,15 @@ pub(crate) enum RefusalReason {
     /// Bytes already in a stream that its reader had not read when the
     /// stream was reset. As with QUIC RESET_STREAM, they are discarded.
     ResetDiscarded,
+    /// An operation from a link of a node's previous incarnation (a daemon
+    /// that was restarted): refused, so a stopped daemon can neither send
+    /// as the restarted node nor take it offline.
+    StaleIncarnation,
+    /// A dial by peer id alone to a peer this incarnation knows no address
+    /// for (no hint, no earlier dial or inbound connection, no live link).
+    /// ant-quic would also try coordinator-assisted traversal here; the sim
+    /// has no coordinator model and refuses.
+    NoHint,
 }
 
 /// A send the transport refused, with the bytes when there were any.
@@ -822,6 +831,8 @@ impl SimFabric {
         Arc::new(SimLink {
             fabric: Arc::clone(self),
             me: peer,
+            incarnation,
+            hints: Mutex::new(BTreeMap::new()),
             inbound: tokio::sync::Mutex::new(inbound_rx),
             accept: tokio::sync::Mutex::new(accept_rx),
             streams: tokio::sync::Mutex::new(streams_rx),
@@ -1327,6 +1338,23 @@ impl SimFabric {
             .collect()
     }
 
+    /// Sends refused from `src` whose trace events lie at or after trace
+    /// position `from` (any destination).
+    pub(crate) fn refused_from(&self, src: &PeerId, from: usize) -> Vec<Refusal> {
+        let state = self.lock();
+        state
+            .trace
+            .iter()
+            .skip(from)
+            .filter_map(|event| match event {
+                TraceEvent::Refused { index } => state.refused.get(*index),
+                _ => None,
+            })
+            .filter(|refusal| refusal.src == src.0)
+            .cloned()
+            .collect()
+    }
+
     /// Writes from `src` (any destination, any lane) delivered at or after
     /// `since`, as `(dst, class, seq)`.
     pub(crate) fn delivered_from_since(
@@ -1474,6 +1502,138 @@ impl SimFabric {
         });
     }
 
+    /// Whether `incarnation` is still `node`'s current one; when it is not,
+    /// the attempted operation is recorded as a `StaleIncarnation` refusal.
+    fn current_incarnation(&self, node: Key, incarnation: u64, what: Option<(Key, &[u8])>) -> bool {
+        let at = self.now();
+        let mut state = self.lock();
+        if state
+            .nodes
+            .get(&node)
+            .is_some_and(|slot| slot.incarnation == incarnation)
+        {
+            return true;
+        }
+        let (dst, bytes) = what.map_or((node, None), |(dst, bytes)| (dst, Some(Arc::from(bytes))));
+        Self::refuse_locked(
+            &mut state,
+            Refusal {
+                src: node,
+                dst,
+                class: bytes.as_deref().map(LaneClass::of),
+                at,
+                reason: RefusalReason::StaleIncarnation,
+                bytes,
+            },
+        );
+        false
+    }
+
+    /// The address `node` is attached at, if it is attached.
+    fn addr_of(&self, node: Key) -> Option<SocketAddr> {
+        self.lock().nodes.get(&node).map(|slot| slot.addr)
+    }
+
+    /// `node`'s current incarnation (0 for its first attach), if attached.
+    pub(crate) fn incarnation_of(&self, node: &PeerId) -> Option<u64> {
+        self.lock().nodes.get(&node.0).map(|slot| slot.incarnation)
+    }
+
+    /// The trace position of `node`'s attach as `incarnation`, if it was
+    /// attached so. Restart checks compare trace positions, not virtual
+    /// times: with paused time, events on both sides of a boundary can
+    /// share one instant.
+    pub(crate) fn attach_position(&self, node: &PeerId, incarnation: u64) -> Option<usize> {
+        self.lock().trace.iter().position(|event| {
+            matches!(
+                event,
+                TraceEvent::Node {
+                    node: at_node,
+                    kind: NodeEventKind::Attached { incarnation: inc },
+                    ..
+                } if *at_node == node.0 && *inc == incarnation
+            )
+        })
+    }
+
+    /// Ordinals of the `a`~`b` connections opened at trace positions at or
+    /// after `from`.
+    pub(crate) fn link_opens_from(&self, a: &PeerId, b: &PeerId, from: usize) -> Vec<u64> {
+        let key = pair(a.0, b.0);
+        let state = self.lock();
+        state
+            .trace
+            .iter()
+            .skip(from)
+            .filter_map(|event| match event {
+                TraceEvent::Link {
+                    a,
+                    b,
+                    ordinal,
+                    open: true,
+                    ..
+                } if (*a, *b) == key => Some(*ordinal),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Writes from `src` whose trace events lie at positions in `range`.
+    pub(crate) fn writes_from_between(
+        &self,
+        src: &PeerId,
+        range: std::ops::Range<usize>,
+    ) -> Vec<Write> {
+        let state = self.lock();
+        let end = range.end.min(state.trace.len());
+        let start = range.start.min(end);
+        state.trace[start..end]
+            .iter()
+            .filter_map(|event| match event {
+                TraceEvent::Write { index, .. } => state.writes.get(*index),
+                _ => None,
+            })
+            .filter(|write| write.lane.src == src.0)
+            .cloned()
+            .collect()
+    }
+
+    /// Every connection opened between `a` and `b`, as `(ordinal, at)`.
+    pub(crate) fn link_opens(&self, a: &PeerId, b: &PeerId) -> Vec<(u64, Duration)> {
+        let key = pair(a.0, b.0);
+        self.lock()
+            .trace
+            .iter()
+            .filter_map(|event| match event {
+                TraceEvent::Link {
+                    a,
+                    b,
+                    ordinal,
+                    at,
+                    open: true,
+                } if (*a, *b) == key => Some((*ordinal, *at)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Record a refused dial by peer id alone (`NoHint`).
+    fn refuse_no_hint(&self, from: Key, to: Key) {
+        let at = self.now();
+        let mut state = self.lock();
+        Self::refuse_locked(
+            &mut state,
+            Refusal {
+                src: from,
+                dst: to,
+                class: None,
+                at,
+                reason: RefusalReason::NoHint,
+                bytes: None,
+            },
+        );
+    }
+
     fn detach(&self, node: Key) {
         let at = self.now();
         let mut state = self.lock();
@@ -1494,6 +1654,14 @@ impl SimFabric {
 pub(crate) struct SimLink {
     fabric: Arc<SimFabric>,
     me: PeerId,
+    /// The node incarnation this link was attached as. Every operation
+    /// from a link whose incarnation is no longer the node's current one is
+    /// refused (`StaleIncarnation`).
+    incarnation: u64,
+    /// Addresses this incarnation knows per peer: peer hints, addresses it
+    /// dialled, and peers that connected to it. A dial by peer id alone
+    /// uses only these (W3-H S3: restart-cold fidelity).
+    hints: Mutex<BTreeMap<Key, BTreeSet<SocketAddr>>>,
     inbound: tokio::sync::Mutex<mpsc::UnboundedReceiver<(PeerId, u64, Vec<u8>)>>,
     accept: tokio::sync::Mutex<mpsc::UnboundedReceiver<PeerConnection>>,
     streams: tokio::sync::Mutex<mpsc::UnboundedReceiver<(PeerId, SimSend, SimRecv)>>,
@@ -1513,30 +1681,77 @@ impl SimLink {
         self.me
     }
 
+    /// Whether this link's incarnation is still the node's current one
+    /// (records a `StaleIncarnation` refusal when it is not).
+    fn current(&self) -> bool {
+        self.fabric
+            .current_incarnation(self.me.0, self.incarnation, None)
+    }
+
+    fn learn(&self, peer: Key, addr: SocketAddr) {
+        self.hints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(peer)
+            .or_default()
+            .insert(addr);
+    }
+
     pub(crate) async fn connect_addr(&self, addr: SocketAddr) -> Result<PeerConnection, NodeError> {
+        if !self.current() {
+            return Err(NodeError::ShuttingDown);
+        }
         // A virtual handshake round trip.
         tokio::time::sleep(self.fabric.base_latency * 2).await;
-        self.fabric.connect(self.me.0, addr)
+        if !self.current() {
+            return Err(NodeError::ShuttingDown);
+        }
+        let conn = self.fabric.connect(self.me.0, addr)?;
+        self.learn(conn.peer_id.0, addr);
+        Ok(conn)
     }
 
+    /// Dial by peer id alone: a live link, or only the addresses this
+    /// incarnation knows for the peer (see [`Self::hints`]).
     pub(crate) async fn connect_peer(&self, peer_id: PeerId) -> Result<PeerConnection, NodeError> {
-        let addr = self
-            .fabric
-            .lock()
-            .nodes
-            .get(&peer_id.0)
-            .map(|slot| slot.addr)
-            .ok_or_else(|| not_connected(&peer_id))?;
-        self.connect_peer_with_addrs(peer_id, vec![addr]).await
+        self.connect_peer_with_addrs(peer_id, Vec::new()).await
     }
 
+    /// Dial `peer_id` at `addrs` plus the addresses this incarnation knows
+    /// for it, reusing a live link (as ant-quic's orchestrated connect does).
     pub(crate) async fn connect_peer_with_addrs(
         &self,
         peer_id: PeerId,
         addrs: Vec<SocketAddr>,
     ) -> Result<PeerConnection, NodeError> {
+        if !self.current() {
+            return Err(NodeError::ShuttingDown);
+        }
+        if self.is_connected(&peer_id) {
+            if let Some(addr) = self.fabric.addr_of(peer_id.0) {
+                // A live link is reused at once, as ant-quic does.
+                return self.fabric.connect(self.me.0, addr);
+            }
+        }
+        let mut candidates = addrs;
+        let known = self
+            .hints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&peer_id.0)
+            .cloned()
+            .unwrap_or_default();
+        for addr in known {
+            if !candidates.contains(&addr) {
+                candidates.push(addr);
+            }
+        }
+        if candidates.is_empty() {
+            self.fabric.refuse_no_hint(self.me.0, peer_id.0);
+            return Err(not_connected(&peer_id));
+        }
         let mut last = not_connected(&peer_id);
-        for addr in addrs {
+        for addr in candidates {
             match self.connect_addr(addr).await {
                 Ok(conn) if conn.peer_id == peer_id => return Ok(conn),
                 Ok(_) => last = NodeError::Connection("sim: peer id mismatch".into()),
@@ -1546,7 +1761,12 @@ impl SimLink {
         Err(last)
     }
 
-    pub(crate) fn upsert_peer_hints(&self, _peer_id: PeerId, _addrs: Vec<SocketAddr>) {}
+    /// Learn addresses for a peer (ant-quic `upsert_peer_hints`).
+    pub(crate) fn upsert_peer_hints(&self, peer_id: PeerId, addrs: Vec<SocketAddr>) {
+        for addr in addrs {
+            self.learn(peer_id.0, addr);
+        }
+    }
 
     pub(crate) fn connection_health(&self, peer_id: &PeerId) -> ant_quic::ConnectionHealth {
         let generation = self.current_connection_generation(peer_id);
@@ -1566,6 +1786,9 @@ impl SimLink {
     }
 
     pub(crate) fn open_bi(&self, peer_id: &PeerId) -> Result<(SimSend, SimRecv), NodeError> {
+        if !self.current() {
+            return Err(NodeError::ShuttingDown);
+        }
         self.fabric.open_stream(self.me.0, peer_id.0)
     }
 
@@ -1579,10 +1802,17 @@ impl SimLink {
     }
 
     pub(crate) async fn accept(&self) -> Option<PeerConnection> {
-        self.accept.lock().await.recv().await
+        let conn = self.accept.lock().await.recv().await?;
+        if let TransportAddr::Udp(addr) = conn.remote_addr {
+            self.learn(conn.peer_id.0, addr);
+        }
+        Some(conn)
     }
 
     pub(crate) fn disconnect(&self, peer_id: &PeerId) -> Result<(), NodeError> {
+        if !self.current() {
+            return Ok(());
+        }
         let at = self.fabric.now();
         let mut state = self.fabric.lock();
         SimFabric::close_link_locked(
@@ -1622,7 +1852,17 @@ impl SimLink {
         self.lifecycle.subscribe()
     }
 
+    /// Whether a send from this link may proceed (records the refused
+    /// bytes as `StaleIncarnation` when it may not).
+    fn current_for(&self, peer_id: &PeerId, data: &[u8]) -> bool {
+        self.fabric
+            .current_incarnation(self.me.0, self.incarnation, Some((peer_id.0, data)))
+    }
+
     pub(crate) fn send(&self, peer_id: &PeerId, data: &[u8]) -> Result<(), NodeError> {
+        if !self.current_for(peer_id, data) {
+            return Err(NodeError::ShuttingDown);
+        }
         self.fabric.enqueue(self.me.0, peer_id.0, None, data, None)
     }
 
@@ -1641,6 +1881,9 @@ impl SimLink {
             return Err(NodeError::Connection("sim: generation superseded".into()));
         }
         let bytes = admit(generation).map_err(NodeError::Endpoint)?;
+        if !self.current_for(peer_id, bytes.as_ref()) {
+            return Err(NodeError::ShuttingDown);
+        }
         self.fabric
             .enqueue(self.me.0, peer_id.0, Some(generation), bytes.as_ref(), None)
     }
@@ -1651,6 +1894,9 @@ impl SimLink {
         data: &[u8],
         timeout: Duration,
     ) -> Result<(), NodeError> {
+        if !self.current_for(peer_id, data) {
+            return Err(NodeError::ShuttingDown);
+        }
         let (ack_tx, ack_rx) = oneshot::channel();
         self.fabric
             .enqueue(self.me.0, peer_id.0, None, data, Some(ack_tx))?;
@@ -1698,11 +1944,17 @@ impl SimLink {
     }
 
     pub(crate) fn note_publish(&self, topic: &str, payload: &[u8]) {
-        self.fabric.note_publish(self.me.0, topic, payload);
+        if self.current() {
+            self.fabric.note_publish(self.me.0, topic, payload);
+        }
     }
 
+    /// Detach this incarnation. A stale incarnation's late shutdown must
+    /// not take the restarted node offline: it is refused and recorded.
     pub(crate) fn shutdown(&self) {
-        self.fabric.detach(self.me.0);
+        if self.current() {
+            self.fabric.detach(self.me.0);
+        }
     }
 }
 
@@ -2072,6 +2324,68 @@ mod fabric_tests {
         let full = fabric.canonical_trace();
         assert!(!full.contains("in-flight") && !full.contains("written before the cut"));
         assert_eq!(fabric.canonical_trace_until(usize::MAX), full);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn w3h_fabric_stale_incarnation_can_neither_send_nor_detach() {
+        let fabric = SimFabric::new(31);
+        let (old_a, _b) = two_links(&fabric).await;
+        // A restarts: same peer id and address, next incarnation.
+        let new_a = fabric.attach(key(1), addr(1));
+        assert_eq!(fabric.incarnation_of(&key(1)), Some(1));
+        assert!(fabric.attach_position(&key(1), 1).is_some());
+        assert!(
+            old_a.send(&key(2), &[DM, 1]).is_err(),
+            "a stale sender is refused"
+        );
+        assert!(old_a.connect_addr(addr(2)).await.is_err());
+        old_a.shutdown();
+        assert!(
+            new_a.is_running(),
+            "a stale shutdown must not take the new incarnation offline"
+        );
+        new_a
+            .connect_addr(addr(2))
+            .await
+            .expect("the new incarnation dials");
+        new_a.send(&key(2), &[DM, 2]).expect("and sends");
+        assert_eq!(
+            fabric.link_opens(&key(1), &key(2)).len(),
+            2,
+            "a new connection ordinal"
+        );
+        let trace = fabric.canonical_trace();
+        assert!(trace.contains("StaleIncarnation"), "{trace}");
+        assert!(trace.contains("attached inc=1@"), "{trace}");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn w3h_fabric_peer_id_dial_needs_a_known_address() {
+        let fabric = SimFabric::new(32);
+        let a = fabric.attach(key(1), addr(1));
+        let _b = fabric.attach(key(2), addr(2));
+        let c = fabric.attach(key(3), addr(3));
+        for (n, name) in [(1, "A"), (2, "B"), (3, "C")] {
+            fabric.label(&key(n), name);
+        }
+        // C dialled A by address, so A is known; B is not.
+        c.connect_addr(addr(1)).await.expect("C dials A");
+        assert!(c.connect_peer(key(2)).await.is_err(), "no hint for B");
+        assert!(fabric.canonical_trace().contains("NoHint"));
+        c.connect_peer(key(1))
+            .await
+            .expect("A's address was learned by dialling it");
+        c.upsert_peer_hints(key(2), vec![addr(2)]);
+        c.connect_peer(key(2))
+            .await
+            .expect("a hint makes B dialable");
+        // An inbound connection teaches the acceptor the dialler's address.
+        let accepted = a.accept().await.expect("A accepts C");
+        assert_eq!(accepted.peer_id, key(3));
+        a.disconnect(&key(3)).expect("disconnect");
+        a.connect_peer(key(3))
+            .await
+            .expect("A learned C's address from the inbound connection");
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

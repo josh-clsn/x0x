@@ -152,6 +152,9 @@ fn revision_of(event: &NamedGroupMetadataEvent) -> Option<u64> {
     named_group_metadata_event_commit(event).map(|c| c.revision)
 }
 
+// #1166 S5: join-state PROBE (asserts the #447/#458 label), not
+// admission.
+#[allow(clippy::disallowed_methods)]
 async fn local_state(joiner: &AppState, group_key: &str) -> &'static str {
     let info = joiner.named_groups.read().await.get(group_key).cloned();
     match info {
