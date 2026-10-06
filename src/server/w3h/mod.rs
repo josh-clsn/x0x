@@ -220,9 +220,71 @@ pub(crate) struct SimNode {
     handle: Option<ServerHandle>,
     router: Option<axum::Router>,
     state: Weak<AppState>,
+    /// The daemon's agent. It owns handles the next incarnation needs
+    /// released (the history database connection, among others), and it
+    /// can outlive the daemon state, so [`Sim::stop`] checks it too.
+    agent: Weak<crate::Agent>,
     token: String,
     peer: ant_quic::PeerId,
     agent_hex: String,
+}
+
+/// What a stopped node's next incarnation needs released before it starts
+/// on the same dirs, checked by [`Sim::stop`]'s drain: the old daemon state
+/// and agent (no strong references left), the EXCLUSIVE lock the history
+/// database takes at open (`history::store`; held, it fails the restart as
+/// `HistoryInit`), and the data-dir and identity-dir instance locks (#601,
+/// #645). Each lock is probed through its production acquire path and
+/// released at once.
+struct Release {
+    state: Weak<AppState>,
+    agent: Weak<crate::Agent>,
+    history_db: std::path::PathBuf,
+    data_dir: std::path::PathBuf,
+    identity_dir: Option<std::path::PathBuf>,
+}
+
+impl Release {
+    /// Everything still held; empty once all of it is released. The locks
+    /// are probed only after both objects are gone: an object still alive
+    /// is the cause, and its locks would only repeat it.
+    fn held(&self) -> Vec<String> {
+        let mut held = Vec::new();
+        if self.state.strong_count() > 0 {
+            held.push(format!(
+                "daemon state by {} references",
+                self.state.strong_count()
+            ));
+        }
+        if self.agent.strong_count() > 0 {
+            held.push(format!("agent by {} references", self.agent.strong_count()));
+        }
+        if !held.is_empty() {
+            return held;
+        }
+        // A missing database (history off) holds no lock; the probe must
+        // not create one.
+        if self.history_db.exists() {
+            if let Err(error) = crate::history::store::Store::open_with_busy_timeout(
+                &self.history_db,
+                Duration::ZERO,
+            ) {
+                held.push(format!(
+                    "history db {} ({error})",
+                    self.history_db.display()
+                ));
+            }
+        }
+        if let Err(error) = super::instance_lock::InstanceLock::acquire(&self.data_dir) {
+            held.push(format!("data-dir instance lock ({error})"));
+        }
+        if let Some(dir) = &self.identity_dir {
+            if let Err(error) = super::instance_lock::InstanceLock::acquire_identity(dir) {
+                held.push(format!("identity-dir instance lock ({error})"));
+            }
+        }
+        held
+    }
 }
 
 /// Identity material written into a node's identity directory before its
@@ -665,6 +727,7 @@ impl Sim {
             index,
             router: Some(handle.test_router.clone()),
             state: Arc::downgrade(&state),
+            agent: Arc::downgrade(&state.agent),
             token: state.api_token.clone(),
             peer,
             agent_hex: hex::encode(state.agent.agent_id().as_bytes()),
@@ -675,10 +738,11 @@ impl Sim {
     /// Stop `label`'s daemon. A [`RestartMode::Crash`] takes the node off
     /// the fabric first; a [`RestartMode::Graceful`] stop leaves it online
     /// while it shuts down. The daemon drains inside a `stop` barrier, then
-    /// its state must be released (a `drain` barrier lets virtual time pass
-    /// so stray tasks can finish): a daemon state that outlives its stop is
-    /// INFRA, because a stopped daemon's tasks could still act on its data
-    /// and identity dirs while the next incarnation uses them.
+    /// everything its next incarnation needs must be released ([`Release`];
+    /// a `drain` barrier lets virtual time pass so stray tasks can finish).
+    /// Anything still held is INFRA: a stopped daemon's objects could still
+    /// act on its data and identity dirs while the next incarnation uses
+    /// them, and a held lock fails the restart itself.
     ///
     /// Returns the trace position just after the `fault stop` mark. For a
     /// crash, the node leaves the fabric at that position: the mark and
@@ -689,7 +753,9 @@ impl Sim {
             RestartMode::Graceful => "graceful",
             RestartMode::Crash => "crash",
         };
-        let (handle, peer, state) = {
+        let index = self.node(label)?.index;
+        let config = self.daemon_config(label, index)?;
+        let (handle, peer, release) = {
             let node = self
                 .nodes
                 .get_mut(label)
@@ -699,7 +765,19 @@ impl Sim {
                 .take()
                 .ok_or_else(|| anyhow!("{label} is already stopped"))?;
             node.router = None;
-            (handle, node.peer, node.state.clone())
+            let release = Release {
+                state: node.state.clone(),
+                agent: node.agent.clone(),
+                // As the daemon resolves it (server/mod.rs, ADR-0023).
+                history_db: config
+                    .history
+                    .db_path
+                    .clone()
+                    .unwrap_or_else(|| config.data_dir.join("history.db")),
+                data_dir: config.data_dir.clone(),
+                identity_dir: config.identity_dir.clone(),
+            };
+            (handle, node.peer, release)
         };
         let stop_mark = self.fabric.cut(format!("fault stop {label} {mode_name}"));
         if mode == RestartMode::Crash {
@@ -714,15 +792,15 @@ impl Sim {
         .with_context(|| format!("INFRA: {label} shutdown"))?;
         let released = self
             .until(&format!("drain {label}"), DRAIN_BUDGET, async |_: &Sim| {
-                state.strong_count() == 0
+                release.held().is_empty()
             })
             .await;
         if let Err(error) = released {
             if expired(&error) {
                 bail!(
-                    "INFRA: {label}'s daemon state is still held by {} references after its \
-                     stop; a stopped daemon could still act on its data and identity dirs",
-                    state.strong_count()
+                    "INFRA: {label}'s stopped daemon is still held after its stop: {}; a \
+                     stopped daemon could still act on its data and identity dirs",
+                    release.held().join("; ")
                 );
             }
             return Err(error);

@@ -20,7 +20,9 @@
 //!   must also still serve its Home;
 //! - a negative control for the hint rule: a restarted node cannot dial a
 //!   peer by id until it learns that peer's address;
-//! - a harness guard: a daemon state that outlives its stop is INFRA.
+//! - harness guards: a stopped daemon that is not released is INFRA,
+//!   whether its daemon state is still held or only its history database
+//!   lock is (the drain proves release, not only zero state references).
 
 #![cfg(test)]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -390,6 +392,49 @@ async fn w3h_s3_restart_reports_a_leaked_daemon_state_as_infra() -> Result<()> {
     drop(leaked);
     sim.fabric()
         .mark("checkpoint: a leaked daemon state makes the stop INFRA");
+    sim.finish().await?;
+    Ok(())
+}
+
+/// Harness guard: the drain proves release, not only that the daemon state
+/// is gone. Here the daemon state and agent are released, but the test
+/// keeps a history handle, so the history database stays open with its
+/// EXCLUSIVE lock and the next incarnation could not open it
+/// (`HistoryInit`). [`Sim::stop`] must report INFRA naming the history
+/// lock, and nothing else.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon controls run in the Linux isolated namespace only"
+)]
+async fn w3h_s3_restart_reports_a_held_history_lock_as_infra() -> Result<()> {
+    let mut sim = Sim::start(
+        "w3h_s3_restart_reports_a_held_history_lock_as_infra",
+        0x5300_0006,
+        &["A", "B"],
+    )
+    .await?;
+    let held = sim
+        .state("B")?
+        .agent
+        .history()
+        .cloned()
+        .context("B runs no history store")?;
+    let stopped = sim.stop("B", RestartMode::Graceful).await;
+    let error = stopped
+        .err()
+        .context("a stop with B's history database still open succeeded")?;
+    let text = format!("{error:#}");
+    ensure!(
+        text.contains("INFRA")
+            && text.contains("history db")
+            && !text.contains("daemon state by")
+            && !text.contains("agent by"),
+        "unexpected stop error: {text}"
+    );
+    drop(held);
+    sim.fabric()
+        .mark("checkpoint: a held history lock makes the stop INFRA");
     sim.finish().await?;
     Ok(())
 }
