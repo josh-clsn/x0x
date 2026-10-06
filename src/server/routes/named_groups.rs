@@ -22076,6 +22076,11 @@ pub(in crate::server) async fn remove_named_group_member(
             "epoch": epoch,
             "member_count": members.len(),
             "members": members,
+            // The signed MemberRemoved exactly as published and delivered,
+            // so a caller can carry it to the removed member over a
+            // transport of its own when that member is offline past the
+            // redelivery window.
+            "event": event,
         })),
     )
 }
@@ -23340,6 +23345,8 @@ async fn remove_treekem_named_group_member(
             "epoch": treekem_epoch,
             "member_count": named_group_member_values(&next).len(),
             "members": named_group_member_values(&next),
+            // See the GSS arm: the signed event as published and delivered.
+            "event": event,
         })),
     )
 }
@@ -26734,7 +26741,9 @@ pub(in crate::server) async fn ban_group_member(
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "ok": true, "revision": revision })),
+        // The signed MemberBanned as published and delivered, for a caller
+        // that carries it to the banned member over its own transport.
+        Json(serde_json::json!({ "ok": true, "revision": revision, "event": event })),
     )
 }
 
@@ -26904,7 +26913,9 @@ async fn ban_treekem_group_member(
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "ok": true, "revision": revision })),
+        // The signed MemberBanned as published and delivered, for a caller
+        // that carries it to the banned member over its own transport.
+        Json(serde_json::json!({ "ok": true, "revision": revision, "event": event })),
     )
 }
 

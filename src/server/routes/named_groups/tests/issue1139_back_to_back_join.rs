@@ -3433,3 +3433,131 @@ async fn the_sweep_skips_a_busy_group_that_cannot_qualify() -> Result<()> {
     assert_eq!(swept.ok(), Some(0), "the sweep finished without the lock");
     Ok(())
 }
+
+/// Body of a handler response, as JSON.
+async fn wa_json(response: axum::response::Response) -> Result<(StatusCode, serde_json::Value)> {
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    Ok((status, serde_json::from_slice(&bytes)?))
+}
+
+/// The removed device applies `event` through the local-apply door
+/// (`POST /groups/:id/apply-metadata-event`), as a caller that carried it
+/// over its own transport would hand it in.
+async fn wa_apply_through_the_door(
+    s: &BackToBack,
+    device: &Arc<AppState>,
+    event: &NamedGroupMetadataEvent,
+) -> Result<StatusCode> {
+    let response = apply_group_metadata_event(
+        State(Arc::clone(device)),
+        Path(s.group_key.clone()),
+        Json(ApplyMetadataEventRequest {
+            event_b64: BASE64.encode(serde_json::to_vec(event)?),
+            sender_agent_id: hex::encode(s.authority_id.as_bytes()),
+        }),
+    )
+    .await
+    .into_response();
+    Ok(response.status())
+}
+
+/// `DELETE /groups/:id/members/:agent_id` answers with the signed
+/// `MemberRemoved` it published, and that event, carried to the removed
+/// device over any transport, departs it: the row is wiped.
+#[tokio::test]
+async fn the_removal_response_carries_the_event_that_departs_the_removed_device() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    wa_seat_j1_with_keys(&s).await?;
+    let j1_hex = hex::encode(s.j1.agent.agent_id().as_bytes());
+    anyhow::ensure!(wa_state(&s.j1, &s.group_key).await == "active");
+    wa_clear_published(&s);
+
+    let (status, body) = wa_json(
+        remove_named_group_member(
+            State(Arc::clone(&s._authority)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
+            Path((s.group_key.clone(), j1_hex.clone())),
+        )
+        .await
+        .into_response(),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "remove-member: {body}");
+    let event: NamedGroupMetadataEvent = serde_json::from_value(body["event"].clone())?;
+    assert!(
+        matches!(&event, NamedGroupMetadataEvent::MemberRemoved { agent_id, .. } if *agent_id == j1_hex),
+        "the response carries the removal of the removed member: {event:?}"
+    );
+    assert!(
+        wa_published(&s)
+            .iter()
+            .any(|(_, published)| *published == event),
+        "the response's event is the one published"
+    );
+
+    assert_eq!(
+        wa_apply_through_the_door(&s, &s.j1, &event).await?,
+        StatusCode::OK,
+        "the removed device applies its own signed removal"
+    );
+    assert_eq!(
+        wa_state(&s.j1, &s.group_key).await,
+        "no_row",
+        "and its row is wiped, so a later invite is a real join"
+    );
+    Ok(())
+}
+
+/// `POST /groups/:id/ban/:agent_id` answers with the signed
+/// `MemberBanned` it published, and that event, carried to the banned
+/// device, ends its membership there.
+#[tokio::test]
+async fn the_ban_response_carries_the_event_that_departs_the_banned_device() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    wa_seat_j1_with_keys(&s).await?;
+    let j1_hex = hex::encode(s.j1.agent.agent_id().as_bytes());
+    anyhow::ensure!(wa_state(&s.j1, &s.group_key).await == "active");
+    wa_clear_published(&s);
+
+    let (status, body) = wa_json(
+        ban_group_member(
+            State(Arc::clone(&s._authority)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
+            Path((s.group_key.clone(), j1_hex.clone())),
+        )
+        .await
+        .into_response(),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "ban: {body}");
+    let event: NamedGroupMetadataEvent = serde_json::from_value(body["event"].clone())?;
+    assert!(
+        matches!(&event, NamedGroupMetadataEvent::MemberBanned { agent_id, .. } if *agent_id == j1_hex),
+        "the response carries the ban of the banned member: {event:?}"
+    );
+    assert!(
+        wa_published(&s)
+            .iter()
+            .any(|(_, published)| *published == event),
+        "the response's event is the one published"
+    );
+
+    assert_eq!(
+        wa_apply_through_the_door(&s, &s.j1, &event).await?,
+        StatusCode::OK,
+        "the banned device applies its own signed ban"
+    );
+    assert_ne!(
+        wa_state(&s.j1, &s.group_key).await,
+        "active",
+        "and it is no longer a member there"
+    );
+    Ok(())
+}
