@@ -47,7 +47,15 @@ impl Fixture {
         simulated: bool,
     ) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let plane = format!("s1-{}", dir.path().display());
+        // A plane id allows only [A-Za-z0-9._-]; use the tempdir's own name.
+        let plane = format!(
+            "s1-{}",
+            dir.path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap()
+                .trim_start_matches('.')
+        );
         let fabric = simulated.then(|| {
             let fabric = crate::network::sim::SimFabric::new(1207);
             crate::network::sim::register(&plane, &fabric);
