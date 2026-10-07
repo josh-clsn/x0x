@@ -20079,13 +20079,28 @@ const JOIN_REARM_POLL_TIMEOUT: Duration = Duration::from_secs(120);
 static REARM_POLL_WINDOW_OVERRIDES: std::sync::LazyLock<StdMutex<HashMap<String, Duration>>> =
     std::sync::LazyLock::new(|| StdMutex::new(HashMap::new()));
 
-/// Test-only: shorten the re-arm window for one group, so a test drives
-/// the live timeout instead of finalizing by hand.
+/// Removes its re-arm window override on drop, like `JoinPollWindowGuard`.
 #[cfg(test)]
-fn set_rearm_poll_window_for_test(stable_group_id: &str, window: Duration) {
+struct RearmPollWindowGuard(String);
+
+#[cfg(test)]
+impl Drop for RearmPollWindowGuard {
+    fn drop(&mut self) {
+        if let Ok(mut overrides) = REARM_POLL_WINDOW_OVERRIDES.lock() {
+            overrides.remove(&self.0);
+        }
+    }
+}
+
+/// Test-only: shorten the re-arm window for one group while the returned
+/// guard lives, so a test drives the live timeout instead of finalizing by
+/// hand.
+#[cfg(test)]
+fn set_rearm_poll_window_for_test(stable_group_id: &str, window: Duration) -> RearmPollWindowGuard {
     if let Ok(mut overrides) = REARM_POLL_WINDOW_OVERRIDES.lock() {
         overrides.insert(stable_group_id.to_string(), window);
     }
+    RearmPollWindowGuard(stable_group_id.to_string())
 }
 
 fn rearm_poll_window(stable_group_id: &str) -> Duration {
@@ -36336,13 +36351,22 @@ pub(in crate::server) async fn respawn_unconverged_join_polls(
 /// fixed 2s interval for a day.
 const JOIN_RESULT_POLL_HORIZON: Duration = PENDING_JOIN_RESULT_TTL;
 
-/// Retention for recorded expected join-result inviters. Must cover the
-/// join-result poll horizon so late roster-repair responses are still
-/// accepted instead of rejected as `missing_expected_inviter`. A pin
-/// authorizes nothing on its own — it names the one inviter whose
-/// `MemberAdded` this joiner will consider, and the event still goes
-/// through `apply_named_group_metadata_event`.
-const EXPECTED_JOIN_RESULT_INVITER_TTL: Duration = JOIN_RESULT_POLL_HORIZON;
+/// How long a pin outlives the join-poll horizon. The pin is stamped at
+/// the join route, before the poll takes its deadline, so a pin whose TTL
+/// equalled the horizon was already expired when the poll timed out.
+const EXPECTED_JOIN_RESULT_INVITER_MARGIN: Duration = Duration::from_secs(60 * 60);
+
+/// Retention for recorded expected join-result inviters: the join-poll
+/// horizon plus [`EXPECTED_JOIN_RESULT_INVITER_MARGIN`]. A pin must survive
+/// its own attempt's natural timeout, for two reasons: a timed-out pin still
+/// authorizes a late result from its inviter (#390), and it is what lets
+/// the next invite from that same inviter re-arm the stuck join (ADR 0107)
+/// instead of re-keying. A pin authorizes nothing on its own: it names the
+/// one inviter whose `MemberAdded` this joiner will consider, and the event
+/// still goes through `apply_named_group_metadata_event`.
+const EXPECTED_JOIN_RESULT_INVITER_TTL: Duration = Duration::from_secs(
+    JOIN_RESULT_POLL_HORIZON.as_secs() + EXPECTED_JOIN_RESULT_INVITER_MARGIN.as_secs(),
+);
 
 const JOIN_RESULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 

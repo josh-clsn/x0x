@@ -357,6 +357,10 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
     if is_grants_path(path) {
         return true;
     }
+    // This fork's engine-A relay-bridge doors change durable state.
+    if is_engine_a_bridge_path(method, path) {
+        return true;
+    }
     match *method {
         Method::POST => {
             matches!(
@@ -372,6 +376,25 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
             ) || is_two_segment_action(path, "delegate")
         }
         Method::DELETE => is_sync_device_path(path),
+        _ => false,
+    }
+}
+
+/// This fork's engine-A relay-bridge doors, durable token only:
+/// `POST /groups/<id>/apply-metadata-event` and
+/// `GET|POST /groups/<id>/join-result/<member>`.
+fn is_engine_a_bridge_path(method: &Method, path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/groups/") else {
+        return false;
+    };
+    let segs: Vec<&str> = rest.split('/').collect();
+    match segs.as_slice() {
+        [id, "apply-metadata-event"] => !id.is_empty() && *method == Method::POST,
+        [id, "join-result", member] => {
+            !id.is_empty()
+                && !member.is_empty()
+                && (*method == Method::GET || *method == Method::POST)
+        }
         _ => false,
     }
 }
@@ -1195,6 +1218,46 @@ mod tests {
             store.refresh(&token, after),
             Err(SessionRefreshError::Unknown)
         );
+    }
+
+    /// This fork's engine-A relay-bridge doors are durable-token only at
+    /// the route layer, so a session bearer gets 403 before any body parse.
+    #[test]
+    fn engine_a_bridge_doors_require_the_durable_token() {
+        let g = "ab".repeat(32);
+        let m = "cd".repeat(32);
+        assert!(requires_durable_owner(
+            &Method::POST,
+            &format!("/groups/{g}/apply-metadata-event")
+        ));
+        assert!(requires_durable_owner(
+            &Method::GET,
+            &format!("/groups/{g}/join-result/{m}")
+        ));
+        assert!(requires_durable_owner(
+            &Method::POST,
+            &format!("/groups/{g}/join-result/{m}")
+        ));
+        assert!(!requires_durable_owner(
+            &Method::GET,
+            &format!("/groups/{g}/apply-metadata-event")
+        ));
+        assert!(!requires_durable_owner(
+            &Method::DELETE,
+            &format!("/groups/{g}/join-result/{m}")
+        ));
+        assert!(!requires_durable_owner(
+            &Method::POST,
+            "/groups//apply-metadata-event"
+        ));
+        assert!(!requires_durable_owner(
+            &Method::GET,
+            &format!("/groups/{g}/join-result/")
+        ));
+        assert!(!requires_durable_owner(
+            &Method::GET,
+            &format!("/groups/{g}/join-result/{m}/extra")
+        ));
     }
 
     #[test]

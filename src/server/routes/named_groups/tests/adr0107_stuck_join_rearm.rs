@@ -5456,7 +5456,8 @@ async fn s8a_rearm_times_out_live_and_the_next_invite_rekeys_after_a_restart() -
         .write()
         .await
         .remove(&join_result_key(&s.stable, &j2_hex));
-    super::super::set_rearm_poll_window_for_test(&s.stable, Duration::from_millis(1_500));
+    let _window =
+        super::super::set_rearm_poll_window_for_test(&s.stable, Duration::from_millis(1_500));
 
     let (status, body, first) = redeem_fresh_invite(&s, &s.j2, &s.authority).await?;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -5565,5 +5566,130 @@ async fn s8a_redeeming_the_same_link_during_a_rearm_burns_no_epoch() -> anyhow::
         .get(&s.group_key)
         .map(|info| (info.state_revision, info.secret_epoch));
     assert_eq!(epoch_before, epoch_after, "the authority burned no epoch");
+    Ok(())
+}
+
+/// The pin is stamped before the poll takes its deadline, so it must
+/// outlive the join-poll horizon or it is gone the moment the join times
+/// out naturally. Here the device's ORIGINAL join reaches its real deadline
+/// (the production poll, with a short window), its pin is then aged by the
+/// full horizon as a natural timeout would leave it, and the next invite
+/// from the same inviter still re-arms (fetch-only, no MemberJoined) and
+/// keys the device from the authority's original result.
+#[tokio::test]
+async fn s8a_a_natural_timeout_keeps_the_pin_and_the_same_inviter_rearms() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    let j2_hex = hex_of(&s.j2);
+    super::super::apply_join_result_intervening_events(
+        &s.j2,
+        &s.authority_id,
+        true,
+        &s.stable,
+        Some(s.base + 2),
+        Some(s.j2_attempt.as_str()),
+        vec![s.j1_add.clone()],
+    )
+    .await;
+    // Replace the attempt's 24 h poll with the production poll at a short
+    // deadline: the attempt then times out on its own.
+    {
+        let mut attempts = s.j2.pending_join_attempts.lock().expect("attempt registry");
+        let attempt = attempts
+            .get_mut(&join_result_key(&s.stable, &j2_hex))
+            .expect("J2's first attempt");
+        for poll in attempt.polls.drain(..) {
+            poll.abort();
+        }
+    }
+    let poll = tokio::spawn(super::super::poll_join_result_until_deadline(
+        Arc::clone(&s.j2),
+        s.group_key.clone(),
+        s.stable.clone(),
+        vec![s.authority_id],
+        j2_hex.clone(),
+        true,
+        None,
+        s.j2_attempt.clone(),
+        tokio::time::Instant::now() + Duration::from_millis(1_000),
+    ));
+    tokio::time::timeout(Duration::from_secs(20), poll).await??;
+    assert_eq!(local_state(&s.j2, &s.group_key).await, "not_member");
+    assert!(
+        attempt_of(&s.j2, &s.stable).is_none(),
+        "the attempt finalized itself"
+    );
+    // Age the pin by the whole horizon, as a natural 24 h timeout leaves it.
+    {
+        let mut pins = s.j2.expected_join_result_inviters.lock().expect("pins");
+        let pin = pins
+            .get_mut(&join_result_key(&s.stable, &j2_hex))
+            .expect("the timed-out pin is kept (#390)");
+        assert!(pin.timed_out);
+        pin.created_at = Instant::now()
+            .checked_sub(super::super::JOIN_RESULT_POLL_HORIZON)
+            .expect("monotonic clock far enough from boot");
+    }
+    assert!(
+        pin_of(&s.j2, &s.stable).is_some(),
+        "the pin outlives the horizon it was stamped before"
+    );
+
+    let (status, body, attempt) = redeem_fresh_invite(&s, &s.j2, &s.authority).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(join_state_of(&body), "pending_authority_commit", "{body}");
+    let attempt = attempt.expect("the same-inviter invite re-arms");
+    assert!(
+        attempt_of(&s.j2, &s.stable).is_some_and(|(_, stored)| stored.is_none()),
+        "a re-arm, not a re-key: no MemberJoined volley"
+    );
+    let served = serve_result(&s.authority, &s.j2, &s.stable, &attempt, Some(s.base + 1))
+        .await
+        .expect("the authority still holds the original result");
+    let served = with_pulled_welcome(&s.authority, &s.j2, &s.stable, served).await;
+    deliver(&s.j2, &s.authority_id, served, &attempt).await;
+    assert!(
+        keyed(&s.j2, &s.group_key).await,
+        "the original Welcome keys the device"
+    );
+    Ok(())
+}
+
+/// A re-arm does not survive a restart (its attempt and 120 s poll are in
+/// memory), so its persisted pin loads as timed out: the device reads
+/// `not_member` instead of "joining", and the next invite re-keys.
+#[tokio::test]
+async fn s8a_a_restart_during_a_rearm_loads_its_pin_timed_out() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    stuck_with_carry(&s).await?;
+    let (status, body, _) = redeem_fresh_invite(&s, &s.j2, &s.authority).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let live = pin_of(&s.j2, &s.stable).expect("the re-arm pin");
+    assert!(live.2 && !live.1, "a live re-arm pin: {live:?}");
+    assert_eq!(
+        local_state(&s.j2, &s.group_key).await,
+        "pending_authority_commit"
+    );
+
+    // Restart: the in-memory attempt and pins are gone; boot reloads pins.
+    s.j2.pending_join_attempts.lock().expect("attempts").clear();
+    s.j2.expected_join_result_inviters
+        .lock()
+        .expect("pins")
+        .clear();
+    super::super::join_result_pins::load(&s.j2).await;
+    let loaded = pin_of(&s.j2, &s.stable).expect("the pin reloads");
+    assert!(
+        loaded.1 && loaded.2,
+        "a re-arm pin loads timed out: {loaded:?}"
+    );
+    assert_eq!(local_state(&s.j2, &s.group_key).await, "not_member");
+
+    let (status, body, next) = redeem_fresh_invite(&s, &s.j2, &s.authority).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let next = next.expect("the next invite starts a new attempt");
+    complete_rekey(&s, &next).await?;
+    assert!(keyed(&s.j2, &s.group_key).await);
     Ok(())
 }
