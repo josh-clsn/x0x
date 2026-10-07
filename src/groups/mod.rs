@@ -4244,6 +4244,9 @@ mod tests {
         assert_eq!(
             creator_status(&mut probe, &creator, &evidence),
             owner_cert::MemberCertStatus::Clean
+        );
+    }
+
     /// Every remaining member observes the same self-leave. If each reacted,
     /// they would all commit at the same epoch and wedge the group on duelling
     /// commits — so selection must resolve to exactly one, and must do it from

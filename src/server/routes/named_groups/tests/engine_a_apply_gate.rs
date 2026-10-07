@@ -225,3 +225,98 @@ async fn engine_a_apply_refuses_events_that_authorize_on_the_sender_alone() -> R
     }
     Ok(())
 }
+
+async fn get_inline(
+    state: &Arc<AppState>,
+    group_id: &str,
+    member_hex: &str,
+) -> Result<(StatusCode, serde_json::Value)> {
+    let response = get_join_result_inline(
+        State(Arc::clone(state)),
+        Path((group_id.to_string(), member_hex.to_string())),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    Ok((status, serde_json::from_slice(&body)?))
+}
+
+/// The bridged `GET /groups/:id/join-result/:member` door hands out the same
+/// recovery bytes as the fetch path, so it runs the ADR 0107 serving guard:
+/// a member with no Active seat on the current roster gets nothing, and its
+/// staged result is purged; an Active member is served; an unknown group is
+/// a 404 that creates no lock-registry entry.
+#[tokio::test]
+async fn get_join_result_inline_runs_the_serving_guard() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let group_id_storage = "7b".repeat(32);
+    let group_id = group_id_storage.as_str();
+    let inviter = state.agent.agent_id();
+    let inviter_hex = hex::encode(inviter.as_bytes());
+    let joiner_hex = hex::encode(
+        x0x::identity::AgentKeypair::generate()?
+            .agent_id()
+            .as_bytes(),
+    );
+    state.named_groups.write().await.insert(
+        group_id.to_string(),
+        treekem_metadata_group_info(inviter, group_id, group_id),
+    );
+    let staged_add = NamedGroupMetadataEvent::MemberAdded {
+        group_id: group_id.to_string(),
+        revision: 2,
+        actor: inviter_hex.clone(),
+        agent_id: joiner_hex.clone(),
+        display_name: None,
+        treekem_commit_b64: Some("commit".into()),
+        treekem_welcome_b64: Some("V0VMQ09NRQ==".into()),
+        welcome_ref: None,
+        treekem_epoch: Some(2),
+        treekem_key_package_hash: None,
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
+        certificate_b64: None,
+        owner_mandate: None,
+        roster_certificates_b64: Vec::new(),
+        commit: None,
+    };
+    let key = join_result_key(group_id, &joiner_hex);
+
+    let (status, body) = get_inline(&state, &"00".repeat(32), &joiner_hex).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["reason"], "group_unknown");
+
+    // Staged for a member the roster does not seat: refused and purged.
+    stage_join_result(&state, group_id, &joiner_hex, staged_add.clone(), None).await;
+    assert!(state.pending_join_results.read().await.contains_key(&key));
+    let (status, body) = get_inline(&state, group_id, &joiner_hex).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["reason"], "member_not_active");
+    assert!(
+        !state.pending_join_results.read().await.contains_key(&key),
+        "a definitive refusal purges the staged result"
+    );
+
+    // Seated on the current roster: served, with the inline Welcome intact.
+    state
+        .named_groups
+        .write()
+        .await
+        .get_mut(group_id)
+        .expect("group")
+        .add_member(
+            joiner_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            None,
+            None,
+        );
+    stage_join_result(&state, group_id, &joiner_hex, staged_add, None).await;
+    let (status, body) = get_inline(&state, group_id, &joiner_hex).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["event"].to_string().contains("V0VMQ09NRQ=="),
+        "the served event carries the inline Welcome: {body}"
+    );
+    Ok(())
+}

@@ -566,6 +566,13 @@ pub(in crate::server) struct PendingJoinResult {
     /// terminal to the authority's real current head.
     head_attestation: Option<HeadAttestation>,
     created_at_ms: u64,
+    /// Process-local staging instant for the ADR 0107 egress machinery: the
+    /// artifact's identity on a serve path (a purge or re-seal replaces it)
+    /// and the base of its cancel-only egress deadline. It is not persisted:
+    /// an entry reloaded from the sidecar reads as staged at load time, and
+    /// the wall-clock `created_at_ms` sweep stays the authoritative expiry.
+    #[serde(skip, default = "Instant::now")]
+    created_at: Instant,
     /// When the owner positively observed this join-result reaching the
     /// joiner (an acked direct send, or a completed inline/bridged
     /// serve). `None` = never delivered — the owner-side truth behind the
@@ -949,6 +956,13 @@ pub(in crate::server) struct PendingWelcome {
     joiner_agent: String,
     bytes: Vec<u8>,
     created_at_ms: u64,
+    /// Process-local staging instant for the ADR 0107 egress machinery: the
+    /// artifact's identity on a serve path (a purge or re-seal replaces it)
+    /// and the base of its cancel-only egress deadline. It is not persisted:
+    /// an entry reloaded from the sidecar reads as staged at load time, and
+    /// the wall-clock `created_at_ms` sweep stays the authoritative expiry.
+    #[serde(skip, default = "Instant::now")]
+    created_at: Instant,
 }
 
 pub(in crate::server) struct PendingWelcomeReceive {
@@ -20019,7 +20033,7 @@ async fn rearm_sealed_unconfirmed_join(
                     poll_state,
                     poll_group,
                     poll_event_group,
-                    inviter,
+                    vec![inviter],
                     poll_member,
                     await_treekem,
                     None,
@@ -20338,6 +20352,7 @@ pub(in crate::server) async fn join_group_via_invite(
     // invite as an idempotent success. It is cleared below and the join
     // proceeds as a NEW attempt — unless ADR 0107 re-arms it instead.
     let mut stale_not_member_row = false;
+    let mut rearm_remnant: Option<x0x::groups::GroupInfo> = None;
     // A withdrawn group answers 409 before anything else looks at its row:
     // the tombstone is the guard against reanimating a deleted group.
     {
@@ -20430,7 +20445,46 @@ pub(in crate::server) async fn join_group_via_invite(
             );
         }
         if not_member_row == Some(NotMemberJoinRow::UnseatedJoinRemnant) {
-            stale_not_member_row = true;
+            // ADR 0107 (0088 S8 (a)): the VERIFIED invite base is the
+            // discriminator. A base that seats this device proves the
+            // authority sealed its add, so the remnant is re-armed (neither
+            // the #1148 clear nor the base-seat shortcut runs). Otherwise
+            // #1148's clear stands.
+            let base_seats_device = view
+                .base_roster
+                .get(&joiner_hex)
+                .is_some_and(|seat| seat.state == x0x::groups::GroupMemberState::Active);
+            #[cfg(test)]
+            let base_seats_device = base_seats_device && !rearm_disabled_for_test(&group_id_hex);
+            // This fork: a re-arm that already ended `timed_out` because the
+            // authority's original artifacts were gone would only time out
+            // again. The next fresh invite takes the ordinary new-attempt
+            // path instead: its MemberJoined volley makes the authority
+            // re-key the seated device (remove and re-add) and stage a
+            // fresh result.
+            let rearm_already_failed = {
+                let outcomes = state
+                    .last_join_outcomes
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                [
+                    group_id_hex.as_str(),
+                    info.stable_group_id(),
+                    info.mls_group_id.as_str(),
+                ]
+                .iter()
+                .any(|key| {
+                    outcomes.get(*key).is_some_and(|outcome| {
+                        outcome.outcome == "timed_out"
+                            && outcome.reason == Some(JOIN_REARM_TIMEOUT_REASON)
+                    })
+                })
+            };
+            if base_seats_device && !rearm_already_failed {
+                rearm_remnant = Some(info.clone());
+            } else {
+                stale_not_member_row = true;
+            }
         } else {
             let converged = if not_member_row.is_some() {
                 true
@@ -20471,35 +20525,41 @@ pub(in crate::server) async fn join_group_via_invite(
                     // can never transmit unowned. A post-restart pending
                     // has no registry entry (empty attempt id): its legacy
                     // repair wrapper spawns detached (C8's deadline owner).
-                    let owning_attempt_id = {
+                    let (owning_attempt_id, fetch_only) = {
                         let attempts = state
                             .pending_join_attempts
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         attempts
                             .get(&join_result_key(&refire_stable, &joiner_hex))
-                            .map(|entry| entry.attempt_id.clone())
+                            .map(|entry| (entry.attempt_id.clone(), entry.stored_resend.is_none()))
                             .unwrap_or_default()
                     };
-                    spawn_attempt_task_under_guard(
-                        state.as_ref(),
-                        invite_stable_group_id,
-                        &joiner_hex,
-                        &owning_attempt_id,
-                        AttemptTaskKind::Task,
-                        Some(&membership_guard),
-                        async move {
-                            refire_pending_join_volley(
-                                &refire_state,
-                                &refire_group_id,
-                                refire_stable,
-                                &refire_inviter,
-                                refire_secret,
-                                refire_treekem,
-                            )
-                            .await;
-                        },
-                    );
+                    // ADR 0107: a REGISTERED attempt without a stored
+                    // volley is a fetch-only S8 (a) re-arm. It keeps
+                    // polling for the original result and never sends
+                    // a `MemberJoined` (no new admission is asked for).
+                    if !fetch_only {
+                        spawn_attempt_task_under_guard(
+                            state.as_ref(),
+                            invite_stable_group_id,
+                            &joiner_hex,
+                            &owning_attempt_id,
+                            AttemptTaskKind::Task,
+                            Some(&membership_guard),
+                            async move {
+                                refire_pending_join_volley(
+                                    &refire_state,
+                                    &refire_group_id,
+                                    refire_stable,
+                                    &refire_inviter,
+                                    refire_secret,
+                                    refire_treekem,
+                                )
+                                .await;
+                            },
+                        );
+                    }
                     drop(membership_guard);
                 }
                 let confirmed = membership_state == "active";
@@ -24536,7 +24596,9 @@ pub(in crate::server) async fn leave_group(
             // disposition covers. Every other non-member leave stays refused.
             // The fence only answers the membership 403: an unknown group
             // (404) and a withdrawn tombstone (409) keep the core's reply.
-            let local_only_drop = groups.get(&id).is_some_and(|info| {
+            // ADR0066-LOOKUP-WAIVER: this is the leave route's own raw-id row,
+            // the one admit_self_leave just refused; no alias is consulted.
+            let fence_row = groups.get(&id).filter(|info| {
                 !info.withdrawn
                     && info.caller_role(&local_agent_hex).is_none()
                     && actor.is_durable_owner()
@@ -24544,15 +24606,15 @@ pub(in crate::server) async fn leave_group(
                     && treekem_leave_disposition(info, &local_agent_hex)
                         == TreeKemLeaveDisposition::LocalOnlyDrop
             });
-            if !local_only_drop {
+            let Some(fence_row) = fence_row else {
                 return resp;
-            }
+            };
             // D39 containment: a fork-quarantined row is cleared only through
             // POST /groups/:id/quarantine/clear (force + reason, audited); a
             // local drop would erase the marker and its evidence unrecorded.
-            if groups.get(&id).is_some_and(|info| {
-                classify_not_member_join_row(info, &local_agent_hex) == NotMemberJoinRow::Quarantined
-            }) {
+            if classify_not_member_join_row(fence_row, &local_agent_hex)
+                == NotMemberJoinRow::Quarantined
+            {
                 return api_error_with_reason(
                     StatusCode::CONFLICT,
                     "this group's local row is fork-quarantined; clear it with \
@@ -36612,6 +36674,26 @@ pub(in crate::server) async fn get_join_result_inline(
     Path((id, member)): Path<(String, String)>,
 ) -> impl IntoResponse {
     let key = join_result_key(&id, &member);
+    // ADR 0107: this door hands out the same recovery bytes as the fetch
+    // path, so it runs the same serving guard under the group's membership
+    // lock. A definitive refusal purges the member's staged artifacts; the
+    // caller stops polling on 409 (a 404 still means "not staged yet").
+    let Some(membership_lock) = group_membership_lock_for_known_group(&state, &id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "reason": "group_unknown" })),
+        );
+    };
+    let _membership_guard = membership_lock.lock().await;
+    if let Some(refusal) = join_artifact_serving_refusal(&state, &id, &member).await {
+        if refusal.is_definitive() {
+            purge_member_join_artifacts(&state, &id, &member).await;
+        }
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "ok": false, "reason": refusal.reason() })),
+        );
+    }
     let mut event = {
         let now_ms = now_millis_u64();
         let mut results = state.pending_join_results.write().await;
@@ -36953,6 +37035,7 @@ async fn stage_join_result(
     results.insert(
         key.clone(),
         PendingJoinResult {
+            created_at: std::time::Instant::now(),
             head_attestation: head_attestation.clone(),
             event,
             created_at_ms: now_ms,
@@ -40600,16 +40683,19 @@ async fn handle_join_result_message_bound(
             // admission for this group BEFORE answering, so "nothing
             // staged" can turn into a staged result on the next poll.
             retry_pending_owner_cert_joins(state, Some(&group_id)).await;
-            // Signed fetches are replayable for the staging TTL, and the serve
-            // pays an ML-DSA sign plus a locked staging sweep per request. The
-            // per-(group, member) entry mirrors the mk-serve throttle; the
-            // joiner's poll backoff is coarser than the window, so a
-            // legitimate retry is never blocked.
+            // A signed fetch on an unverified transport (#377) is replayable
+            // by anyone holding its bytes for the staging TTL, and the serve
+            // pays an ML-DSA sign plus a locked staging sweep per request, so
+            // those are throttled per (group, member, attempt); the joiner's
+            // poll backoff is coarser than the window. A verified fetch comes
+            // from the bound member itself and is bounded by the ADR 0107
+            // fetch admission instead, so it is never throttled here: a
+            // re-fetch after a cancelled egress must be admitted.
             let throttle_key = format!(
                 "{group_id}:jr-serve:{sender_hex}:{}",
                 attempt_id.as_deref().unwrap_or("")
             );
-            {
+            if !verified {
                 let mut throttle = state.treekem_catchup_throttle.write().await;
                 if throttle
                     .get(&throttle_key)
@@ -41770,6 +41856,7 @@ async fn stage_treekem_welcome(
     let source = hex::encode(state.agent.agent_id().as_bytes());
     let now_ms = now_millis_u64();
     let pending = PendingWelcome {
+        created_at: std::time::Instant::now(),
         group_id: group_id.to_string(),
         joiner_agent: joiner_agent.to_string(),
         bytes,
@@ -46094,6 +46181,7 @@ pub(in crate::server) mod tests {
             state.pending_join_results.write().await.insert(
                 "authority-key".to_string(),
                 PendingJoinResult {
+                    created_at: std::time::Instant::now(),
                     event: NamedGroupMetadataEvent::GroupDeleted {
                         group_id: event_group.clone(),
                         actor: member.clone(),
@@ -46110,6 +46198,7 @@ pub(in crate::server) mod tests {
             state.pending_welcomes.write().await.insert(
                 "welcome-sentinel".to_string(),
                 PendingWelcome {
+                    created_at: std::time::Instant::now(),
                     group_id: event_group.clone(),
                     joiner_agent: member.clone(),
                     bytes: vec![1, 2, 3],
@@ -54477,6 +54566,7 @@ pub(in crate::server) mod tests {
     fn pending_welcome_flags_only_staged_fresh_undelivered_members() {
         fn staged(delivered: Option<u64>, created_at_ms: u64) -> PendingJoinResult {
             PendingJoinResult {
+                created_at: std::time::Instant::now(),
                 event: NamedGroupMetadataEvent::GroupDeleted {
                     group_id: "g".into(),
                     revision: 1,
@@ -54549,6 +54639,7 @@ pub(in crate::server) mod tests {
             // round-trip instead: serialize a current entry, strip the new
             // field, re-parse.
             let entry = PendingJoinResult {
+                created_at: std::time::Instant::now(),
                 event: NamedGroupMetadataEvent::GroupDeleted {
                     group_id: "g".into(),
                     revision: 1,
@@ -55659,6 +55750,7 @@ pub(in crate::server) mod tests {
         };
 
         let pending = PendingWelcome {
+            created_at: std::time::Instant::now(),
             group_id: group_id.clone(),
             joiner_agent: hex::encode(joiner_id.as_bytes()),
             bytes: bytes.clone(),
@@ -55823,6 +55915,7 @@ pub(in crate::server) mod tests {
         owner.pending_welcomes.write().await.insert(
             welcome_id.clone(),
             PendingWelcome {
+                created_at: std::time::Instant::now(),
                 group_id: group_id.clone(),
                 joiner_agent: hex::encode(joiner_id.as_bytes()),
                 bytes,
@@ -55933,6 +56026,7 @@ pub(in crate::server) mod tests {
         owner.pending_welcomes.write().await.insert(
             welcome_id.clone(),
             PendingWelcome {
+                created_at: std::time::Instant::now(),
                 group_id: group_id.clone(),
                 joiner_agent: hex::encode(joiner_id.as_bytes()),
                 bytes,
@@ -56171,6 +56265,7 @@ pub(in crate::server) mod tests {
         owner.pending_welcomes.write().await.insert(
             welcome_id.clone(),
             PendingWelcome {
+                created_at: std::time::Instant::now(),
                 group_id: group_id.clone(),
                 joiner_agent: joiner_id.clone(),
                 bytes: bytes.clone(),
@@ -58413,6 +58508,7 @@ pub(in crate::server) mod tests {
         f.state.pending_welcomes.write().await.insert(
             "welcome-376".to_string(),
             PendingWelcome {
+                created_at: std::time::Instant::now(),
                 group_id: f.stable_group_id.clone(),
                 joiner_agent: f.peer_hex.clone(),
                 bytes: vec![1, 2, 3],

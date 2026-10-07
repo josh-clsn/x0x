@@ -82,6 +82,20 @@ async fn staged_join_result_and_welcome_survive_restart_and_serve_inline() -> Re
         "a fresh state must start with empty staging (the pre-fix behavior)"
     );
     load_join_result_staging(&restarted).await;
+    // ADR 0107: the inline door serves only a member seated on the current
+    // roster, so the restarted daemon holds the group with the member Active.
+    let mut info = treekem_metadata_group_info(restarted.agent.agent_id(), group_id, group_id);
+    info.add_member(
+        member_hex.clone(),
+        x0x::groups::GroupRole::Member,
+        None,
+        None,
+    );
+    restarted
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.to_string(), info);
 
     let response = get_join_result_inline(
         State(Arc::clone(&restarted)),
@@ -113,12 +127,14 @@ async fn expired_staging_entries_are_not_restored() -> Result<()> {
     let member_hex = "bb".repeat(32);
     let inviter_hex = "aa".repeat(32);
     let entry = |created_at_ms: u64| PendingJoinResult {
+        created_at: std::time::Instant::now(),
         event: member_added_with_welcome_ref("g", &member_hex, &inviter_hex, None),
         created_at_ms,
         delivered_at_ms: None,
         head_attestation: None,
     };
     let welcome = |created_at_ms: u64| PendingWelcome {
+        created_at: std::time::Instant::now(),
         group_id: "g".to_string(),
         joiner_agent: member_hex.clone(),
         bytes: vec![1, 2, 3],

@@ -211,6 +211,7 @@ pub(super) async fn serve_result(
             accepts_refusal: true,
             accepts_control_blob_ref: true,
             attempt_id: Some(attempt.to_string()),
+            signed_by: None,
         },
     )
     .await;
@@ -363,6 +364,7 @@ async fn with_pulled_welcome(
             head_attestation,
             roster_certificates_b64,
             intervening_events,
+            signed_by,
         } => {
             if let NamedGroupMetadataEvent::MemberAdded {
                 treekem_welcome_b64,
@@ -389,6 +391,7 @@ async fn with_pulled_welcome(
                 head_attestation,
                 roster_certificates_b64,
                 intervening_events,
+                signed_by,
             }
         }
         other => other,
@@ -1044,6 +1047,7 @@ async fn s8a_1150_lost_staging_never_claims_recovery() -> anyhow::Result<()> {
         let expired = Instant::now()
             .checked_sub(super::super::PENDING_JOIN_RESULT_TTL + Duration::from_secs(1))
             .expect("monotonic clock far enough from boot");
+        let expired_ms = aged_ms(super::super::PENDING_JOIN_RESULT_TTL + Duration::from_secs(1));
         let serving = match case {
             LostStaging::ResultExpired => {
                 if let Some(p) = s
@@ -1054,6 +1058,7 @@ async fn s8a_1150_lost_staging_never_claims_recovery() -> anyhow::Result<()> {
                     .get_mut(&join_result_key(&s.stable, &j2_hex))
                 {
                     p.created_at = expired;
+                    p.created_at_ms = expired_ms;
                 }
                 Arc::clone(&s.authority)
             }
@@ -1066,6 +1071,7 @@ async fn s8a_1150_lost_staging_never_claims_recovery() -> anyhow::Result<()> {
                     .get_mut(&welcome_id)
                 {
                     w.created_at = expired;
+                    w.created_at_ms = expired_ms;
                 }
                 Arc::clone(&s.authority)
             }
@@ -2842,6 +2848,7 @@ async fn s8a_r4_copied_join_result_blob_expires_with_the_original() -> anyhow::R
                 p.created_at = Instant::now()
                     .checked_sub(ttl - Duration::from_millis(1500))
                     .expect("monotonic clock far enough from boot");
+                p.created_at_ms = aged_ms(ttl - Duration::from_millis(1500));
             }
         }
         let reference = staged_join_result_blob(&s).await?;
@@ -2851,6 +2858,7 @@ async fn s8a_r4_copied_join_result_blob_expires_with_the_original() -> anyhow::R
                     p.created_at = Instant::now()
                         .checked_sub(ttl + Duration::from_secs(1))
                         .expect("monotonic clock far enough from boot");
+                    p.created_at_ms = aged_ms(ttl + Duration::from_secs(1));
                 }
             }
             _ => tokio::time::sleep(Duration::from_millis(2000)).await,
@@ -2910,6 +2918,7 @@ async fn s8a_r4_welcome_fetch_admission_is_fair_across_groups() -> anyhow::Resul
     s.authority.pending_welcomes.write().await.insert(
         other_welcome.clone(),
         super::super::PendingWelcome {
+            created_at_ms: super::super::now_millis_u64(),
             group_id: other_group.clone(),
             joiner_agent: hex_of(&s.j1),
             bytes: other_bytes,
@@ -3128,7 +3137,16 @@ async fn age_staged_result(state: &AppState, key: &str, remaining: Duration) {
         p.created_at = Instant::now()
             .checked_sub(super::super::PENDING_JOIN_RESULT_TTL - remaining)
             .expect("monotonic clock far enough from boot");
+        p.created_at_ms = aged_ms(super::super::PENDING_JOIN_RESULT_TTL - remaining);
     }
+}
+
+/// The wall-clock stamp this fork persists beside the staging instant, aged
+/// by `ago`; the sidecar sweep keys on it, so a test that ages an artifact
+/// must move both.
+fn aged_ms(ago: Duration) -> u64 {
+    super::super::now_millis_u64()
+        .saturating_sub(u64::try_from(ago.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// WHY (note r3 G3): pinned ant-quic's ACK-v2 send retries internally and
@@ -3279,6 +3297,8 @@ async fn s8a_r5_deadline_cuts_stalled_exchanges() -> anyhow::Result<()> {
             w.created_at = Instant::now()
                 .checked_sub(super::super::PENDING_WELCOME_TTL - Duration::from_millis(1500))
                 .expect("monotonic clock far enough from boot");
+            w.created_at_ms =
+                aged_ms(super::super::PENDING_WELCOME_TTL - Duration::from_millis(1500));
         }
         let armed = super::super::join_egress_test_barrier::arm(&j2_hex, "welcome_frame");
         assert!(serve_welcome(&s.authority, &s.j2, &s.stable, &welcome_id).await);
@@ -3611,6 +3631,7 @@ async fn s8a_r5_g7_join_result_listener_never_waits_on_a_group_lock() -> anyhow:
         base_state_hash: None,
         accepts_refusal: true,
         accepts_control_blob_ref: true,
+        signed_by: None,
         attempt_id: Some(s.j2_attempt.clone()),
     };
     s.authority
@@ -3703,8 +3724,10 @@ async fn s8a_r5_g8_chunk_fetch_admission_is_validated_and_fair() -> anyhow::Resu
     s.authority.pending_join_results.write().await.insert(
         join_result_key(&group_b, &j1_hex),
         super::super::PendingJoinResult {
+            created_at_ms: super::super::now_millis_u64(),
             event: s.j1_add.clone(),
             head_attestation: None,
+            delivered_at_ms: None,
             created_at: staged_at,
         },
     );
@@ -4466,6 +4489,7 @@ async fn s8a_r6_duplicate_fetches_never_overlap_inline_egress() -> anyhow::Resul
                 base_state_hash: None,
                 accepts_refusal: true,
                 accepts_control_blob_ref: true,
+                signed_by: None,
                 attempt_id: Some(g.attempt.clone()),
             },
         )
@@ -4621,6 +4645,7 @@ async fn s8a_r6_a_fetch_after_a_cancelled_egress_is_admitted() -> anyhow::Result
         base_state_hash: None,
         accepts_refusal: true,
         accepts_control_blob_ref: true,
+        signed_by: None,
         attempt_id: Some(g.attempt.clone()),
     };
     let armed = super::super::join_egress_test_barrier::arm(&g_hex, "join_result");
@@ -5379,3 +5404,74 @@ async fn s8a_r7h_owner_restart_welcome_offer_and_complete_take_the_admitted_path
 
 // D204 / #1217: main-compatible owner-removal regression and controls.
 include!("issue1217_owner_removal.rs");
+
+/// This fork composes its returning-member re-key with ADR 0107: a re-arm
+/// that timed out because the authority's original result was gone leaves
+/// the device keyless, and re-arming again against the same lost caches
+/// would only time out again. The NEXT fresh invite therefore takes the
+/// ordinary new-attempt path, whose MemberJoined volley the authority answers
+/// with its remove-and-re-add re-key and a freshly staged result, and the
+/// device ends keyed.
+#[tokio::test]
+async fn s8a_rearm_timeout_falls_back_to_a_rekeying_new_attempt() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    stuck_with_carry(&s).await?;
+    let j2_hex = hex_of(&s.j2);
+    s.authority
+        .pending_join_results
+        .write()
+        .await
+        .remove(&join_result_key(&s.stable, &j2_hex));
+
+    let (status, body, first) = redeem_fresh_invite(&s, &s.j2, &s.authority).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let first = first.expect("the first fresh invite re-arms");
+    let (_, stored) = attempt_of(&s.j2, &s.stable).expect("re-armed attempt");
+    assert!(stored.is_none(), "a re-arm is fetch-only");
+    assert!(
+        serve_result(&s.authority, &s.j2, &s.stable, &first, Some(s.base + 1))
+            .await
+            .is_none(),
+        "nothing to serve: the original result is gone"
+    );
+    super::super::finalize_join_attempt(
+        &s.j2,
+        &s.group_key,
+        &s.stable,
+        &j2_hex,
+        &first,
+        super::super::JoinAttemptOutcome::TimedOut,
+        super::super::JoinFinalizeGuard::Unlocked,
+    )
+    .await;
+    assert_rearm_timed_out(&s.j2, &s.group_key, "first fresh invite");
+    assert!(!keyed(&s.j2, &s.group_key).await);
+
+    let (status, body, second) = redeem_fresh_invite(&s, &s.j2, &s.authority).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let second = second.expect("the second fresh invite starts a new attempt");
+    assert_ne!(second, first);
+    let (_, Some(member_joined)) = attempt_of(&s.j2, &s.stable).expect("new attempt") else {
+        anyhow::bail!("the fallback attempt stores no MemberJoined volley");
+    };
+    let accepted = super::super::apply_named_group_metadata_event(
+        &s.authority,
+        member_joined,
+        s.j2.agent.agent_id(),
+        true,
+        None,
+    )
+    .await
+    .accepted;
+    assert!(accepted, "the authority re-keys the seated device");
+    let from = remnant_revision(&s.j2, &s.group_key).await;
+    let served = serve_result(&s.authority, &s.j2, &s.stable, &second, from)
+        .await
+        .expect("the re-keyed result is staged and served");
+    let served = with_pulled_welcome(&s.authority, &s.j2, &s.stable, served).await;
+    deliver(&s.j2, &s.authority_id, served, &second).await;
+    assert!(keyed(&s.j2, &s.group_key).await, "the device ends keyed");
+    assert_eq!(local_state(&s.j2, &s.group_key).await, "active");
+    Ok(())
+}

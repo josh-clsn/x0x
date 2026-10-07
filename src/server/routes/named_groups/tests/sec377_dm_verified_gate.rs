@@ -58,6 +58,20 @@ async fn join_result_fetch_request_requires_verified_sender() -> Result<()> {
     let local_hex = hex::encode(local.as_bytes());
     let inviter_hex = "aa".repeat(32);
     let group_id = "sec377-join-result-group";
+    // ADR 0107: the FetchRequest arm serves only a member seated on the
+    // current roster.
+    let mut info = treekem_metadata_group_info(local, group_id, group_id);
+    info.add_member(
+        local_hex.clone(),
+        x0x::groups::GroupRole::Member,
+        None,
+        None,
+    );
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.to_string(), info);
 
     stage_join_result(
         &state,
@@ -68,40 +82,72 @@ async fn join_result_fetch_request_requires_verified_sender() -> Result<()> {
     )
     .await;
 
-    let mut rx = state.agent.subscribe_direct();
-    let fetch = JoinResultMessage::FetchRequest {
+    let fetch = |signed_by: Option<CatchupSigner>| JoinResultMessage::FetchRequest {
         group_id: group_id.to_string(),
         member_agent_id: local_hex.clone(),
-        signed_by: None,
+        signed_by,
         from_revision: None,
         base_state_hash: None,
         accepts_refusal: false,
         attempt_id: None,
         accepts_control_blob_ref: false,
     };
+    // ADR 0107: class-R bytes leave through the admitted pinned transport,
+    // so the serve decision is read from the arm's test witness.
+    let serves = |state: &AppState| {
+        state
+            .named_group_test_recorders
+            .join_result_serves
+            .lock()
+            .expect("serve witness")
+            .len()
+    };
 
-    // Unverified: the AgentId is attacker-chosen, so the member check is
-    // vacuous. Nothing may be sent back.
-    handle_join_result_message(&state, &local, false, fetch.clone()).await;
-    assert!(
-        tokio::time::timeout(Duration::from_millis(250), rx.recv())
-            .await
-            .is_err(),
+    // Unverified and unsigned: the AgentId is attacker-chosen, so the member
+    // check is vacuous. Nothing may be served.
+    handle_join_result_message(&state, &local, false, fetch(None)).await;
+    assert_eq!(
+        serves(&state),
+        0,
         "staged join result was served to a requester whose AgentId the transport could not verify"
     );
 
-    // Verified: the legitimate joiner still gets its staged result.
-    handle_join_result_message(&state, &local, true, fetch).await;
-    let served = tokio::time::timeout(Duration::from_millis(2_000), rx.recv())
-        .await
-        .map_err(|_| anyhow::anyhow!("verified join-result fetch was not served"))?
-        .ok_or_else(|| anyhow::anyhow!("direct subscriber closed"))?;
+    // Verified: the legitimate joiner gets its staged result, and an
+    // immediate re-fetch is served too (verified fetches are not throttled).
+    handle_join_result_message(&state, &local, true, fetch(None)).await;
+    assert_eq!(serves(&state), 1, "verified fetch must be served");
+    let payload = state
+        .named_group_test_recorders
+        .join_result_serves
+        .lock()
+        .expect("serve witness")[0]
+        .2
+        .clone();
     assert!(
         matches!(
-            serde_json::from_slice::<JoinResultMessage>(&served.payload)?,
+            serde_json::from_slice::<JoinResultMessage>(&payload)?,
             JoinResultMessage::Result { .. }
         ),
         "verified fetch must be answered with the staged Result"
+    );
+    handle_join_result_message(&state, &local, true, fetch(None)).await;
+    assert_eq!(serves(&state), 2, "a verified re-fetch is never throttled");
+
+    // Signed on an unverified transport (#377, the phone path): served once,
+    // and a replay of the same bytes inside the window is throttled.
+    let signed =
+        || build_catchup_signer(&state, &join_result_fetch_sign_input(group_id, &local_hex));
+    handle_join_result_message(&state, &local, false, fetch(signed())).await;
+    assert_eq!(
+        serves(&state),
+        3,
+        "a signed fetch is served without transport verification"
+    );
+    handle_join_result_message(&state, &local, false, fetch(signed())).await;
+    assert_eq!(
+        serves(&state),
+        3,
+        "a replayed signed fetch inside the window is throttled"
     );
 
     Ok(())

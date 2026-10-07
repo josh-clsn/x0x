@@ -5213,7 +5213,10 @@ async fn issue1103_record_clear_preserves_treekem_rebind_and_retry() -> Result<(
             assert_eq!(tokio::fs::read(&snapshot_path).await?, original_snapshot);
             let envelope =
                 decode_treekem_snapshot_envelope(&original_snapshot)?.expect("seeded snapshot");
-            assert!(!treekem_snapshot_envelope_matches_info(&envelope, &initial));
+            // This fork (#399): the snapshot binding tracks the TreeKEM epoch,
+            // not roster metadata, so a metadata-only advance leaves the
+            // seeded snapshot current rather than stale.
+            assert!(treekem_snapshot_envelope_matches_info(&envelope, &initial));
             assert_eq!(envelope.security_binding, initial.security_binding);
             assert!(state
                 .treekem_groups
