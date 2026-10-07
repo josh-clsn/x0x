@@ -20429,6 +20429,8 @@ pub(in crate::server) async fn join_group_via_invite(
         // (pending, or seated without TreeKEM state) takes the convergence
         // gate below.
         let joiner_hex = hex::encode(agent_id.as_bytes());
+        #[allow(clippy::disallowed_methods)]
+        // #1166 S5: join-flow classification, not route admission
         let membership_state =
             local_join_membership_state(state.as_ref(), &info, &joiner_hex).await;
         let not_member_row = (membership_state == "not_member")

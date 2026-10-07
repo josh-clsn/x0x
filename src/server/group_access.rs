@@ -497,6 +497,27 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
         path: "/groups/:id/quarantine/clear",
         level: AccessLevel::PublicWrite,
     },
+    // This fork's engine-A relay-bridge doors, classified at their reality:
+    // no actor-based gate in the handler (riders are denied by the auth
+    // allowlist). What they admit is decided by the event itself: the
+    // apply doors take only commit-signed events or the self-signed
+    // original MemberJoined and verify them as any delivery would, and the
+    // GET runs the ADR 0107 serving guard for the named member.
+    RouteAccess {
+        method: Method::POST,
+        path: "/groups/:id/apply-metadata-event",
+        level: AccessLevel::PublicWrite,
+    },
+    RouteAccess {
+        method: Method::GET,
+        path: "/groups/:id/join-result/:member",
+        level: AccessLevel::PublicRead,
+    },
+    RouteAccess {
+        method: Method::POST,
+        path: "/groups/:id/join-result/:member",
+        level: AccessLevel::PublicWrite,
+    },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/stores",
@@ -2034,6 +2055,22 @@ mod tests {
                 Method::POST,
                 "/groups/:id/delegate",
                 AccessLevel::OwnerDurable,
+            ),
+            // This fork's engine-A relay-bridge doors.
+            (
+                Method::POST,
+                "/groups/:id/apply-metadata-event",
+                AccessLevel::PublicWrite,
+            ),
+            (
+                Method::GET,
+                "/groups/:id/join-result/:member",
+                AccessLevel::PublicRead,
+            ),
+            (
+                Method::POST,
+                "/groups/:id/join-result/:member",
+                AccessLevel::PublicWrite,
             ),
         ];
         assert_eq!(
