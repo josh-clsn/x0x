@@ -947,6 +947,10 @@ pub(in crate::server) struct ExpectedJoinResultInviter {
     /// join no longer counts as pending: the typed membership state reports
     /// `not_member` exactly as upstream's D39 recovery expects.
     timed_out: bool,
+    /// Armed by an ADR 0107 re-arm (fetch-only). A re-arm pin that timed
+    /// out is the durable "re-arm failed" marker: the next fresh invite
+    /// re-keys instead of re-arming again, across a restart too.
+    rearm: bool,
 }
 
 /// Wall-clock for the same sidecar-restart reason as [`PendingJoinResult`].
@@ -19985,7 +19989,7 @@ async fn rearm_sealed_unconfirmed_join(
         // The same membership → persistence critical section as a fresh
         // install, so join-status never observes a torn re-arm.
         let _persistence_guard = state.named_groups_persistence_lock.lock().await;
-        record_expected_join_result_inviter(
+        record_rearm_join_result_inviter(
             state.as_ref(),
             expected_key.clone(),
             invite.inviter.clone(),
@@ -20014,6 +20018,7 @@ async fn rearm_sealed_unconfirmed_join(
                 },
             );
     }
+    persist_join_result_pins(state.as_ref()).await;
     ensure_named_group_listeners(Arc::clone(state), &remnant_key).await;
     {
         let poll_state = Arc::clone(state);
@@ -20021,6 +20026,7 @@ async fn rearm_sealed_unconfirmed_join(
         let poll_event_group = stable.clone();
         let poll_member = joiner_hex.clone();
         let poll_attempt = attempt_id.clone();
+        let deadline = tokio::time::Instant::now() + rearm_poll_window(&stable);
         spawn_attempt_task_under_guard(
             state,
             &stable,
@@ -20029,7 +20035,7 @@ async fn rearm_sealed_unconfirmed_join(
             AttemptTaskKind::Poll,
             Some(&membership_guard),
             async move {
-                poll_join_result_until_membership_confirmed(
+                poll_join_result_until_deadline(
                     poll_state,
                     poll_group,
                     poll_event_group,
@@ -20038,6 +20044,7 @@ async fn rearm_sealed_unconfirmed_join(
                     await_treekem,
                     None,
                     poll_attempt,
+                    deadline,
                 )
                 .await;
             },
@@ -20060,6 +20067,38 @@ async fn rearm_sealed_unconfirmed_join(
             "chat_topic": remnant.general_chat_topic(),
         })),
     )
+}
+
+/// How long an ADR 0107 re-arm polls for the original result: upstream's
+/// own join-poll bound, not this fork's 24 h join horizon. A re-arm only
+/// succeeds while the original authority still holds the artifacts, so
+/// when it cannot, the device must reach the re-key quickly.
+const JOIN_REARM_POLL_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[cfg(test)]
+static REARM_POLL_WINDOW_OVERRIDES: std::sync::LazyLock<StdMutex<HashMap<String, Duration>>> =
+    std::sync::LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// Test-only: shorten the re-arm window for one group, so a test drives
+/// the live timeout instead of finalizing by hand.
+#[cfg(test)]
+fn set_rearm_poll_window_for_test(stable_group_id: &str, window: Duration) {
+    if let Ok(mut overrides) = REARM_POLL_WINDOW_OVERRIDES.lock() {
+        overrides.insert(stable_group_id.to_string(), window);
+    }
+}
+
+fn rearm_poll_window(stable_group_id: &str) -> Duration {
+    #[cfg(test)]
+    if let Some(window) = REARM_POLL_WINDOW_OVERRIDES
+        .lock()
+        .ok()
+        .and_then(|overrides| overrides.get(stable_group_id).copied())
+    {
+        return window;
+    }
+    let _ = stable_group_id;
+    JOIN_REARM_POLL_TIMEOUT
 }
 
 pub(in crate::server) async fn join_group_via_invite(
@@ -20446,6 +20485,29 @@ pub(in crate::server) async fn join_group_via_invite(
                 "fork_quarantined",
             );
         }
+        // ADR 0107: a live re-arm owns this join. It is fetch-only, so a
+        // repeated redemption answers pending and changes nothing: re-running
+        // the join would publish a MemberJoined, and the authority would
+        // re-key a device whose original result is still being fetched.
+        let rearm_in_flight = state
+            .pending_join_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&join_result_key(info.stable_group_id(), &joiner_hex))
+            .is_some_and(|attempt| attempt.stored_resend.is_none());
+        if rearm_in_flight && not_member_row.is_none() {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "already_joined": false,
+                    "join_state": "pending_authority_commit",
+                    "group_id": group_id_hex,
+                    "group_name": info.name,
+                    "chat_topic": info.general_chat_topic(),
+                })),
+            );
+        }
         if not_member_row == Some(NotMemberJoinRow::UnseatedJoinRemnant) {
             // ADR 0107 (0088 S8 (a)): the VERIFIED invite base is the
             // discriminator. A base that seats this device proves the
@@ -20458,31 +20520,43 @@ pub(in crate::server) async fn join_group_via_invite(
                 .is_some_and(|seat| seat.state == x0x::groups::GroupMemberState::Active);
             #[cfg(test)]
             let base_seats_device = base_seats_device && !rearm_disabled_for_test(&group_id_hex);
-            // This fork: a re-arm that already ended `timed_out` because the
-            // authority's original artifacts were gone would only time out
-            // again. The next fresh invite takes the ordinary new-attempt
-            // path instead: its MemberJoined volley makes the authority
-            // re-key the seated device (remove and re-add) and stage a
-            // fresh result.
-            let rearm_already_failed = {
-                let outcomes = state
-                    .last_join_outcomes
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                [
-                    group_id_hex.as_str(),
-                    info.stable_group_id(),
-                    info.mls_group_id.as_str(),
-                ]
-                .iter()
-                .any(|key| {
-                    outcomes.get(*key).is_some_and(|outcome| {
-                        outcome.outcome == "timed_out"
-                            && outcome.reason == Some(JOIN_REARM_TIMEOUT_REASON)
+            // This fork: re-arm only where it can succeed, and never
+            // twice. The device's own pin (persisted) names the inviter
+            // its timed-out attempt asked; an invite from anyone else
+            // cannot fetch that original result, so it re-keys at once.
+            // A re-arm pin that timed out, or a re-arm outcome recorded
+            // this run, means the original artifacts are gone: the next
+            // fresh invite takes the ordinary new attempt, whose
+            // MemberJoined makes the authority re-key the seated device.
+            let pin = join_result_pin_view(
+                state.as_ref(),
+                &join_result_key(info.stable_group_id(), &joiner_hex),
+            );
+            let invite_from_sealer = pin
+                .as_ref()
+                .is_some_and(|(inviter, _, _)| inviter.eq_ignore_ascii_case(&invite.inviter));
+            let rearm_already_failed = pin
+                .as_ref()
+                .is_some_and(|(_, timed_out, rearm)| *timed_out && *rearm)
+                || {
+                    let outcomes = state
+                        .last_join_outcomes
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    [
+                        group_id_hex.as_str(),
+                        info.stable_group_id(),
+                        info.mls_group_id.as_str(),
+                    ]
+                    .iter()
+                    .any(|key| {
+                        outcomes.get(*key).is_some_and(|outcome| {
+                            outcome.outcome == "timed_out"
+                                && outcome.reason == Some(JOIN_REARM_TIMEOUT_REASON)
+                        })
                     })
-                })
-            };
-            if base_seats_device && !rearm_already_failed {
+                };
+            if base_seats_device && invite_from_sealer && !rearm_already_failed {
                 rearm_remnant = Some(info.clone());
             } else {
                 stale_not_member_row = true;
@@ -36460,6 +36534,28 @@ async fn unconverged_local_stub_for_join_result(state: &AppState, event_group_id
 }
 
 fn record_expected_join_result_inviter(state: &AppState, key: String, inviter_agent_id: String) {
+    record_join_result_pin(state, key, inviter_agent_id, false);
+}
+
+/// The pin for an ADR 0107 re-arm (see [`ExpectedJoinResultInviter`]).
+fn record_rearm_join_result_inviter(state: &AppState, key: String, inviter_agent_id: String) {
+    record_join_result_pin(state, key, inviter_agent_id, true);
+}
+
+/// The joiner's pin for `key`, timed out or not: (inviter, timed_out, rearm).
+fn join_result_pin_view(state: &AppState, key: &str) -> Option<(String, bool, bool)> {
+    let mut expected = state.expected_join_result_inviters.lock().ok()?;
+    expected.retain(|_, pending| pending.created_at.elapsed() < EXPECTED_JOIN_RESULT_INVITER_TTL);
+    expected.get(key).map(|pending| {
+        (
+            pending.inviter_agent_id.clone(),
+            pending.timed_out,
+            pending.rearm,
+        )
+    })
+}
+
+fn record_join_result_pin(state: &AppState, key: String, inviter_agent_id: String, rearm: bool) {
     let Ok(mut expected) = state.expected_join_result_inviters.lock() else {
         tracing::warn!(
             "expected join-result inviter map is poisoned; join-result response will be rejected"
@@ -36474,6 +36570,7 @@ fn record_expected_join_result_inviter(state: &AppState, key: String, inviter_ag
             created_at: Instant::now(),
             recorded_at_ms: now_millis_u64(),
             timed_out: false,
+            rearm,
         },
     );
 }
@@ -36588,9 +36685,18 @@ fn engine_a_apply_refusal(event: &NamedGroupMetadataEvent) -> Option<&'static st
 /// routing key only; the authoritative group is resolved from the event itself.
 pub(in crate::server) async fn apply_group_metadata_event(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Path(id): Path<String>,
     Json(req): Json<ApplyMetadataEventRequest>,
 ) -> impl IntoResponse {
+    if !actor.is_durable_owner() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "this relay-bridge route requires the durable API token (not a session token)",
+        );
+    }
     let event_bytes = match BASE64.decode(&req.event_b64) {
         Ok(b) => b,
         Err(e) => {
@@ -36673,8 +36779,17 @@ fn set_inline_welcome(event: &mut NamedGroupMetadataEvent, welcome_b64: String) 
 /// polls with backoff rather than relaying a welcome-less event.
 pub(in crate::server) async fn get_join_result_inline(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Path((id, member)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    if !actor.is_durable_owner() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "this relay-bridge route requires the durable API token (not a session token)",
+        );
+    }
     let key = join_result_key(&id, &member);
     // ADR 0107: this door hands out the same recovery bytes as the fetch
     // path, so it runs the same serving guard under the group's membership
@@ -36783,9 +36898,18 @@ pub(in crate::server) struct ApplyJoinResultRequest {
 /// (127.0.0.1 + API token).
 pub(in crate::server) async fn apply_join_result_endpoint(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Path((id, member)): Path<(String, String)>,
     Json(req): Json<ApplyJoinResultRequest>,
 ) -> impl IntoResponse {
+    if !actor.is_durable_owner() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "this relay-bridge route requires the durable API token (not a session token)",
+        );
+    }
     let event_bytes = match BASE64.decode(&req.event_b64) {
         Ok(b) => b,
         Err(e) => {
@@ -39237,6 +39361,11 @@ async fn purge_member_join_artifacts(state: &AppState, group_id: &str, member_he
             "ADR 0107: dropped an ineligible member's staged join artifacts"
         );
     }
+    // #390: the sidecar must record the wipe, or a restart inside the
+    // staging TTL reloads an ineligible member's result and Welcome.
+    if dropped_results > 0 || !welcome_ids.is_empty() {
+        persist_join_result_staging(state).await;
+    }
 }
 
 /// Abort the owner-side streams of these Welcomes and wait until each has
@@ -40679,12 +40808,6 @@ async fn handle_join_result_message_bound(
             if !verified && accepts_refusal {
                 tracing::warn!(group_id = %LogHexId::group(&group_id), sender = %LogHexId::agent(&sender_hex), "#477: refusal-capable fetch over an UNVERIFIED direct message — no refusal served");
             }
-            // #447: the joiner is still polling — its certificate evidence
-            // may have resolved since the last volley rejection (async blob
-            // fetch completed, heartbeat landed). Re-run any retained
-            // admission for this group BEFORE answering, so "nothing
-            // staged" can turn into a staged result on the next poll.
-            retry_pending_owner_cert_joins(state, Some(&group_id)).await;
             // A signed fetch on an unverified transport (#377) is replayable
             // by anyone holding its bytes for the staging TTL, and the serve
             // pays an ML-DSA sign plus a locked staging sweep per request, so
@@ -40707,6 +40830,12 @@ async fn handle_join_result_message_bound(
                 }
                 throttle.insert(throttle_key, Instant::now());
             }
+            // #447: the joiner is still polling — its certificate evidence
+            // may have resolved since the last volley rejection (async blob
+            // fetch completed, heartbeat landed). Re-run any retained
+            // admission for this group BEFORE answering, so "nothing
+            // staged" can turn into a staged result on the next poll.
+            retry_pending_owner_cert_joins(state, Some(&group_id)).await;
             let key = join_result_key(&group_id, &member_agent_id);
             // #477 A4: the result/refusal selection is linearized with the
             // apply path — the SAME lookup-gated membership mutex the apply

@@ -3449,6 +3449,7 @@ async fn wa_apply_through_the_door(
 ) -> Result<StatusCode> {
     let response = apply_group_metadata_event(
         State(Arc::clone(device)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
         Path(s.group_key.clone()),
         Json(ApplyMetadataEventRequest {
             event_b64: BASE64.encode(serde_json::to_vec(event)?),

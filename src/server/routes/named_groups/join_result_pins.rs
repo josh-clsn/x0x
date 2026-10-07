@@ -37,6 +37,8 @@ struct PersistedPin {
     recorded_at_ms: u64,
     #[serde(default)]
     timed_out: bool,
+    #[serde(default)]
+    rearm: bool,
 }
 
 pub(super) fn pins_path(state: &AppState) -> PathBuf {
@@ -61,6 +63,7 @@ pub(super) async fn persist(state: &AppState) {
                         inviter_agent_id: pin.inviter_agent_id.clone(),
                         recorded_at_ms: pin.recorded_at_ms,
                         timed_out: pin.timed_out,
+                        rearm: pin.rearm,
                     },
                 )
             })
@@ -110,6 +113,7 @@ pub(super) async fn load(state: &AppState) {
             created_at: Instant::now().checked_sub(age).unwrap_or_else(Instant::now),
             recorded_at_ms: pin.recorded_at_ms,
             timed_out: pin.timed_out,
+            rearm: pin.rearm,
         });
     }
 }

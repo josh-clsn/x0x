@@ -729,8 +729,11 @@ async fn s8a_1150_rearm_recovers_after_joiner_restart_without_stored_secrets() -
     let dir = tempfile::tempdir()?;
     let s = build(dir.path()).await?;
     stuck_with_carry(&s).await?;
-    // Restart J2: a new daemon over the same data dir and agent key.
+    // Restart J2: a new daemon over the same data dir and agent key. Boot
+    // reloads the persisted staging and inviter pins, as `serve` does: this
+    // fork re-arms only for the inviter the timed-out attempt's pin names.
     let restarted = device(&s.dir, "j2", keypair(&s.j2_kp)?).await?;
+    super::super::load_join_result_staging(&restarted).await;
     assert_eq!(
         local_state(&restarted, &s.group_key).await,
         "not_member",
@@ -5405,55 +5408,16 @@ async fn s8a_r7h_owner_restart_welcome_offer_and_complete_take_the_admitted_path
 // D204 / #1217: main-compatible owner-removal regression and controls.
 include!("issue1217_owner_removal.rs");
 
-/// This fork composes its returning-member re-key with ADR 0107: a re-arm
-/// that timed out because the authority's original result was gone leaves
-/// the device keyless, and re-arming again against the same lost caches
-/// would only time out again. The NEXT fresh invite therefore takes the
-/// ordinary new-attempt path, whose MemberJoined volley the authority answers
-/// with its remove-and-re-add re-key and a freshly staged result, and the
-/// device ends keyed.
-#[tokio::test]
-async fn s8a_rearm_timeout_falls_back_to_a_rekeying_new_attempt() -> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let s = build(dir.path()).await?;
-    stuck_with_carry(&s).await?;
-    let j2_hex = hex_of(&s.j2);
-    s.authority
-        .pending_join_results
-        .write()
-        .await
-        .remove(&join_result_key(&s.stable, &j2_hex));
+/// The device's persisted pin for `stable`: (inviter, timed_out, rearm).
+fn pin_of(joiner: &AppState, stable: &str) -> Option<(String, bool, bool)> {
+    super::super::join_result_pin_view(joiner, &join_result_key(stable, &hex_of(joiner)))
+}
 
-    let (status, body, first) = redeem_fresh_invite(&s, &s.j2, &s.authority).await?;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let first = first.expect("the first fresh invite re-arms");
-    let (_, stored) = attempt_of(&s.j2, &s.stable).expect("re-armed attempt");
-    assert!(stored.is_none(), "a re-arm is fetch-only");
-    assert!(
-        serve_result(&s.authority, &s.j2, &s.stable, &first, Some(s.base + 1))
-            .await
-            .is_none(),
-        "nothing to serve: the original result is gone"
-    );
-    super::super::finalize_join_attempt(
-        &s.j2,
-        &s.group_key,
-        &s.stable,
-        &j2_hex,
-        &first,
-        super::super::JoinAttemptOutcome::TimedOut,
-        super::super::JoinFinalizeGuard::Unlocked,
-    )
-    .await;
-    assert_rearm_timed_out(&s.j2, &s.group_key, "first fresh invite");
-    assert!(!keyed(&s.j2, &s.group_key).await);
-
-    let (status, body, second) = redeem_fresh_invite(&s, &s.j2, &s.authority).await?;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let second = second.expect("the second fresh invite starts a new attempt");
-    assert_ne!(second, first);
-    let (_, Some(member_joined)) = attempt_of(&s.j2, &s.stable).expect("new attempt") else {
-        anyhow::bail!("the fallback attempt stores no MemberJoined volley");
+/// The authority answers the fallback attempt's MemberJoined with its
+/// re-key; the served result then keys the device.
+async fn complete_rekey(s: &Fixture, attempt: &str) -> anyhow::Result<()> {
+    let (_, Some(member_joined)) = attempt_of(&s.j2, &s.stable).expect("attempt") else {
+        anyhow::bail!("the attempt stores no MemberJoined volley: it is not a re-keying attempt");
     };
     let accepted = super::super::apply_named_group_metadata_event(
         &s.authority,
@@ -5464,14 +5428,142 @@ async fn s8a_rearm_timeout_falls_back_to_a_rekeying_new_attempt() -> anyhow::Res
     )
     .await
     .accepted;
-    assert!(accepted, "the authority re-keys the seated device");
+    anyhow::ensure!(accepted, "the authority re-keys the seated device");
     let from = remnant_revision(&s.j2, &s.group_key).await;
-    let served = serve_result(&s.authority, &s.j2, &s.stable, &second, from)
+    let served = serve_result(&s.authority, &s.j2, &s.stable, attempt, from)
         .await
-        .expect("the re-keyed result is staged and served");
+        .ok_or_else(|| anyhow::anyhow!("the re-keyed result is staged and served"))?;
     let served = with_pulled_welcome(&s.authority, &s.j2, &s.stable, served).await;
-    deliver(&s.j2, &s.authority_id, served, &second).await;
+    deliver(&s.j2, &s.authority_id, served, attempt).await;
+    Ok(())
+}
+
+/// A re-arm whose original result is gone ends on its own, within the
+/// re-arm bound (upstream's 120 s, not this fork's 24 h join horizon), and
+/// leaves a persisted "re-arm failed" marker. After a restart (in-memory
+/// outcomes and pins gone, pins reloaded from disk) the next fresh invite
+/// takes the re-keying new attempt instead of re-arming again, and the
+/// device ends keyed.
+#[tokio::test]
+async fn s8a_rearm_times_out_live_and_the_next_invite_rekeys_after_a_restart() -> anyhow::Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    stuck_with_carry(&s).await?;
+    let j2_hex = hex_of(&s.j2);
+    s.authority
+        .pending_join_results
+        .write()
+        .await
+        .remove(&join_result_key(&s.stable, &j2_hex));
+    super::super::set_rearm_poll_window_for_test(&s.stable, Duration::from_millis(1_500));
+
+    let (status, body, first) = redeem_fresh_invite(&s, &s.j2, &s.authority).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let first = first.expect("the first fresh invite re-arms");
+    assert!(
+        attempt_of(&s.j2, &s.stable).is_some_and(|(_, stored)| stored.is_none()),
+        "a re-arm is fetch-only"
+    );
+    let ended = tokio::time::timeout(Duration::from_secs(20), async {
+        while attempt_of(&s.j2, &s.stable).is_some_and(|(id, _)| id == first) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(ended.is_ok(), "the re-arm ends by itself within its bound");
+    assert_rearm_timed_out(&s.j2, &s.group_key, "live re-arm timeout");
+    assert!(!keyed(&s.j2, &s.group_key).await);
+    let pin = pin_of(&s.j2, &s.stable).expect("the re-arm pin outlives the timeout");
+    assert!(
+        pin.1 && pin.2,
+        "the pin is the timed-out re-arm marker: {pin:?}"
+    );
+
+    // Restart: in-memory outcomes and pins are lost; the pins file is not.
+    s.j2.last_join_outcomes.lock().expect("outcomes").clear();
+    s.j2.expected_join_result_inviters
+        .lock()
+        .expect("pins")
+        .clear();
+    super::super::join_result_pins::load(&s.j2).await;
+    assert_eq!(pin_of(&s.j2, &s.stable), Some(pin), "the marker is durable");
+
+    let (status, body, second) = redeem_fresh_invite(&s, &s.j2, &s.authority).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let second = second.expect("the next fresh invite starts a new attempt");
+    assert_ne!(second, first);
+    complete_rekey(&s, &second).await?;
     assert!(keyed(&s.j2, &s.group_key).await, "the device ends keyed");
     assert_eq!(local_state(&s.j2, &s.group_key).await, "active");
+    Ok(())
+}
+
+/// A re-arm can only fetch the original result from the inviter the
+/// timed-out attempt asked (its pin). An invite from anyone else re-keys on
+/// the FIRST redemption: no fetch-only attempt, no wait.
+#[tokio::test]
+async fn s8a_an_invite_from_another_inviter_rekeys_on_the_first_try() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    stuck_with_carry(&s).await?;
+    // The timed-out attempt asked another admin; the authority mints now.
+    {
+        let key = join_result_key(&s.stable, &hex_of(&s.j2));
+        let mut pins = s.j2.expected_join_result_inviters.lock().expect("pins");
+        let pin = pins.get_mut(&key).expect("the timed-out attempt's pin");
+        pin.inviter_agent_id = hex_of(&s.j1);
+    }
+    let (status, body, attempt) = redeem_fresh_invite(&s, &s.j2, &s.authority).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let attempt = attempt.expect("a new attempt");
+    assert!(
+        attempt_of(&s.j2, &s.stable).is_some_and(|(_, stored)| stored.is_some()),
+        "not a re-arm: the attempt carries its MemberJoined volley"
+    );
+    complete_rekey(&s, &attempt).await?;
+    assert!(keyed(&s.j2, &s.group_key).await, "the device ends keyed");
+    assert_eq!(local_state(&s.j2, &s.group_key).await, "active");
+    Ok(())
+}
+
+/// Redeeming the same link again while a re-arm is live answers pending and
+/// changes nothing: the fetch-only attempt stays the owner, no MemberJoined
+/// volley is stored (so none can reach the authority), and the authority's
+/// epoch does not move.
+#[tokio::test]
+async fn s8a_redeeming_the_same_link_during_a_rearm_burns_no_epoch() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    stuck_with_carry(&s).await?;
+    let link = mint_for(&s.authority, &s.group_key, &s.j2).await?;
+    let (status, body, first) = redeem_link(&s, &s.j2, link.clone()).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let first = first.expect("the fresh invite re-arms");
+    let epoch_before = s
+        .authority
+        .named_groups
+        .read()
+        .await
+        .get(&s.group_key)
+        .map(|info| (info.state_revision, info.secret_epoch));
+
+    let (status, body, second) = redeem_link(&s, &s.j2, link).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(join_state_of(&body), "pending_authority_commit", "{body}");
+    assert!(second.is_none(), "no new attempt replaces the re-arm");
+    assert_eq!(
+        attempt_of(&s.j2, &s.stable),
+        Some((first, None)),
+        "the re-arm still owns the join, with no MemberJoined volley"
+    );
+    let epoch_after = s
+        .authority
+        .named_groups
+        .read()
+        .await
+        .get(&s.group_key)
+        .map(|info| (info.state_revision, info.secret_epoch));
+    assert_eq!(epoch_before, epoch_after, "the authority burned no epoch");
     Ok(())
 }
