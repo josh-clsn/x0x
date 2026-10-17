@@ -300,3 +300,118 @@ async fn fetch_ends_at_its_deadline_while_a_request_is_outstanding() -> anyhow::
     assert!(joiner.pending_welcome_waiters.read().await.is_empty());
     Ok(())
 }
+
+/// The raw deliveries `from`'s strict stand-in made to `to`'s machine.
+fn raw_frames_to(from: &AppState, to: &AppState) -> Vec<Vec<u8>> {
+    from.agent
+        .general_raw_standin_deliveries_for_testing()
+        .into_iter()
+        .filter(|(agent, machine, _)| {
+            *agent == to.agent.agent_id() && *machine == to.agent.machine_id()
+        })
+        .map(|(_, _, payload)| payload)
+        .collect()
+}
+
+/// Over a live direct connection to the owner, the joiner's FetchRequest and
+/// ChunkAck take raw QUIC although the owner's gossip-inbox advert is known.
+/// Without one they keep the gossip inbox, and so does a stalled retry.
+#[tokio::test]
+async fn welcome_control_frames_take_raw_quic_over_a_live_connection() -> anyhow::Result<()> {
+    let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+    let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+    let owner_id = owner.agent.agent_id();
+    let owner_machine = owner.agent.machine_id();
+    // A gossip-capable owner: a gossip-preferred frame never touches raw
+    // QUIC (and this agent has no gossip runtime, so it fails instead).
+    let kem = x0x::groups::kem_envelope::AgentKemKeypair::generate()?;
+    assert!(joiner.agent.capability_store().insert(
+        owner_id,
+        owner_machine,
+        x0x::dm::DmCapabilities::v1_gossip_ready(kem.public_bytes.clone()),
+        x0x::dm::now_unix_ms(),
+    ));
+    let now = now_millis_u64() / 1000;
+    joiner
+        .agent
+        .insert_discovered_agent_for_testing(x0x::DiscoveredAgent {
+            self_name: None,
+            agent_id: owner_id,
+            machine_id: owner_machine,
+            user_id: None,
+            addresses: Vec::new(),
+            announced_at: now,
+            last_seen: now,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: None,
+            agent_certificate: None,
+            agent_public_key: Vec::new(),
+            cert_digest: None,
+        })
+        .await;
+    joiner
+        .agent
+        .set_pinned_standin_strict_resolution_for_testing(true);
+    let live_machines = [owner_machine];
+    let connected = |live: bool| {
+        joiner.agent.script_pinned_standin_transport_for_testing(
+            x0x::PinnedTransportScript::connected_only(
+                if live { &live_machines[..] } else { &[] },
+                false,
+            ),
+        );
+    };
+
+    let request = WelcomeBlobMessage::FetchRequest {
+        group_id: "e5".repeat(32),
+        welcome_id: "f5".repeat(32),
+    };
+    let ack = WelcomeBlobMessage::ChunkAck {
+        welcome_id: "f5".repeat(32),
+        sequence: 0,
+    };
+    connected(true);
+    let fetched = send_welcome_fetch_request(&joiner, &owner_id, &request, true).await;
+    assert!(fetched.is_ok(), "{fetched:?}");
+    let acked = send_welcome_blob_message(&joiner, &owner_id, &ack)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert!(matches!(acked.path, x0x::dm::DmPath::RawQuic));
+    assert_eq!(
+        raw_frames_to(&joiner, &owner),
+        vec![
+            welcome_blob_payload(&request).map_err(anyhow::Error::msg)?,
+            welcome_blob_payload(&ack).map_err(anyhow::Error::msg)?,
+        ],
+        "both frames went over the live connection"
+    );
+
+    // A stalled retry hedges on the gossip inbox, even over the connection.
+    assert!(
+        send_welcome_fetch_request(&joiner, &owner_id, &request, false)
+            .await
+            .is_err()
+    );
+    // No live connection: the gossip inbox stays preferred.
+    connected(false);
+    assert!(
+        send_welcome_fetch_request(&joiner, &owner_id, &request, true)
+            .await
+            .is_err()
+    );
+    assert!(send_welcome_blob_message(&joiner, &owner_id, &ack)
+        .await
+        .is_err());
+    assert_eq!(raw_frames_to(&joiner, &owner).len(), 2, "no raw send since");
+
+    joiner
+        .agent
+        .set_pinned_standin_strict_resolution_for_testing(false);
+    Ok(())
+}

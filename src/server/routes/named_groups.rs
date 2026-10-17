@@ -42059,18 +42059,26 @@ async fn stage_treekem_welcome(
     }
 }
 
-fn welcome_blob_send_config(msg: &WelcomeBlobMessage) -> x0x::dm::DmSendConfig {
+/// The DM config for one Welcome-blob frame. `direct` says a direct
+/// connection to the peer is live right now
+/// ([`Agent::has_live_direct_connection`]).
+fn welcome_blob_send_config(msg: &WelcomeBlobMessage, direct: bool) -> x0x::dm::DmSendConfig {
     match msg {
         WelcomeBlobMessage::Chunk { .. } => file_transfer_send_config(),
         WelcomeBlobMessage::FetchRequest { .. }
         | WelcomeBlobMessage::Offer { .. }
         | WelcomeBlobMessage::ChunkAck { .. }
         | WelcomeBlobMessage::Complete { .. } => x0x::dm::DmSendConfig {
-            // Welcome-blob control messages must keep the gossip-inbox path
-            // preferred: the raw-preferred default for user DMs does not
-            // apply here, because a welcome fetch races the very connection
-            // establishment that raw delivery depends on.
-            prefer_raw_quic_if_connected: false,
+            // Without a live connection the gossip inbox stays preferred: a
+            // Welcome fetch races the very connection establishment raw
+            // delivery depends on, and the raw path would first spend its
+            // send-readiness repair and a discovery redial. Over a live one
+            // (the owner's Welcome frames arrive on it) that race is over:
+            // the raw receive-ACK confirms delivery in a round trip, while a
+            // metered leaf's gossip-inbox receipt rides only its inbox topic
+            // and can take minutes. A raw failure still falls back to the
+            // gossip inbox.
+            prefer_raw_quic_if_connected: direct,
             ..direct_message_send_config()
         },
     }
@@ -42094,9 +42102,10 @@ async fn send_welcome_blob_message(
     msg: &WelcomeBlobMessage,
 ) -> std::result::Result<x0x::dm::DmReceipt, String> {
     let payload = welcome_blob_payload(msg)?;
+    let direct = state.agent.has_live_direct_connection(agent_id).await;
     state
         .agent
-        .send_direct_with_config(agent_id, payload, welcome_blob_send_config(msg))
+        .send_direct_with_config(agent_id, payload, welcome_blob_send_config(msg, direct))
         .await
         .map_err(|e| e.to_string())
 }
@@ -42120,15 +42129,21 @@ fn classify_welcome_fetch_send_error(error: x0x::dm::DmError) -> WelcomeFetchSen
     }
 }
 
+/// Send one FetchRequest. A fetch's first request takes raw QUIC over a
+/// live connection to the owner (`first`); a stalled retry takes the gossip
+/// inbox, whose signed envelope the owner can attribute even when its cold
+/// caches cannot yet bind our raw frames to us (a restarted owner).
 async fn send_welcome_fetch_request(
     state: &Arc<AppState>,
     agent_id: &AgentId,
     request: &WelcomeBlobMessage,
+    first: bool,
 ) -> std::result::Result<(), WelcomeFetchSendError> {
     let payload = welcome_blob_payload(request).map_err(WelcomeFetchSendError::Failed)?;
+    let direct = first && state.agent.has_live_direct_connection(agent_id).await;
     state
         .agent
-        .send_direct_with_config(agent_id, payload, welcome_blob_send_config(request))
+        .send_direct_with_config(agent_id, payload, welcome_blob_send_config(request, direct))
         .await
         .map(|_| ())
         .map_err(classify_welcome_fetch_send_error)
@@ -42170,9 +42185,12 @@ async fn fetch_treekem_welcome_with_retries(
     welcome_ref: &WelcomeRef,
 ) -> std::result::Result<Vec<u8>, String> {
     let send_state = Arc::clone(state);
+    let mut sent = 0_usize;
     fetch_treekem_welcome_via(state, group_id, welcome_ref, move |source, request| {
         let state = Arc::clone(&send_state);
-        async move { send_welcome_fetch_request(&state, &source, &request).await }
+        let first = sent == 0;
+        sent += 1;
+        async move { send_welcome_fetch_request(&state, &source, &request, first).await }
     })
     .await
 }
@@ -56600,16 +56618,33 @@ pub(in crate::server) mod tests {
             group_id: "aa".repeat(32),
             welcome_id: "bb".repeat(32),
         };
-        let fetch_config = welcome_blob_send_config(&fetch);
+        let fetch_config = welcome_blob_send_config(&fetch, false);
         assert!(!fetch_config.prefer_raw_quic_if_connected);
         assert!(!fetch_config.stop_fallback_on_raw_error);
+        // Over a live connection a control frame prefers raw QUIC with the
+        // receive ACK, and still falls back to the gossip inbox.
+        for control in [
+            fetch.clone(),
+            WelcomeBlobMessage::ChunkAck {
+                welcome_id: "bb".repeat(32),
+                sequence: 0,
+            },
+        ] {
+            let direct = welcome_blob_send_config(&control, true);
+            assert!(direct.prefer_raw_quic_if_connected);
+            assert!(direct.raw_quic_receive_ack_timeout.is_some());
+            assert!(!direct.stop_fallback_on_raw_error);
+            assert!(!direct.require_gossip);
+            let gossip = welcome_blob_send_config(&control, false);
+            assert!(!gossip.prefer_raw_quic_if_connected);
+        }
 
         let chunk = WelcomeBlobMessage::Chunk {
             welcome_id: "bb".repeat(32),
             sequence: 0,
             data: "Yw==".to_string(),
         };
-        let chunk_config = welcome_blob_send_config(&chunk);
+        let chunk_config = welcome_blob_send_config(&chunk, false);
         assert!(chunk_config.prefer_raw_quic_if_connected);
         // Welcome-blob chunks reuse `file_transfer_send_config()`, which keeps
         // capability-aware gossip fallback enabled (`stop_fallback_on_raw_error

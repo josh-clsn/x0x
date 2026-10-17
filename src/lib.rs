@@ -10416,6 +10416,35 @@ impl Agent {
         }
     }
 
+    /// Whether a direct QUIC connection to `agent_id`'s machine is live right
+    /// now. Unlike [`Self::is_agent_connected`] it also asks the DM registry,
+    /// which learns the machine from the peer's own verified raw frames
+    /// before any announcement of it lands. Never dials.
+    pub(crate) async fn has_live_direct_connection(&self, agent_id: &identity::AgentId) -> bool {
+        let transport = match self.network.as_ref() {
+            Some(network) => RawQuicTransport::Network(network),
+            #[cfg(test)]
+            None if pinned_standin_is_strict(&self.identity.agent_id()) => {
+                RawQuicTransport::Scripted(pinned_standin_transport(&self.identity.agent_id()))
+            }
+            None => return false,
+        };
+        let cached = {
+            let cache = self.identity_discovery_cache.read().await;
+            cache
+                .get(agent_id)
+                .map(|entry| entry.machine_id)
+                .filter(|machine| machine.0 != [0u8; 32])
+        };
+        let registry = self.direct_messaging.get_machine_id(agent_id).await;
+        for machine in [cached, registry].into_iter().flatten() {
+            if transport.is_connected(&ant_quic::PeerId(machine.0)).await {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Get list of currently connected agents.
     ///
     /// Returns agents that have been discovered and are currently connected
