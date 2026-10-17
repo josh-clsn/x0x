@@ -1186,6 +1186,10 @@ pub async fn serve_with_options(
             crate::server::routes::named_groups::WELCOME_FETCH_PER_GROUP_CAP,
             crate::server::routes::named_groups::WELCOME_FETCH_HANDLER_CAP,
         ),
+        welcome_chunk_ack_admission: crate::server::routes::named_groups::FairAdmission::new(
+            crate::server::routes::named_groups::WELCOME_CHUNK_ACK_PER_GROUP_CAP,
+            crate::server::routes::named_groups::WELCOME_CHUNK_ACK_CAP,
+        ),
         join_result_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
             crate::server::routes::named_groups::JOIN_RESULT_FETCH_PER_GROUP_CAP,
             crate::server::routes::named_groups::JOIN_RESULT_FETCH_HANDLER_CAP,

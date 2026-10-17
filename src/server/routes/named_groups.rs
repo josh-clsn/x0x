@@ -39435,6 +39435,19 @@ pub(in crate::server) const WELCOME_FETCH_PER_GROUP_CAP: usize = 2;
 /// staged Welcome's deadline.
 const WELCOME_FETCH_HANDLER_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bound on a joiner's concurrent Welcome `ChunkAck` sends, which run off
+/// the Welcome listener.
+pub(in crate::server) const WELCOME_CHUNK_ACK_CAP: usize = 32;
+
+/// A group's share of [`WELCOME_CHUNK_ACK_CAP`]: the owner's chunk window
+/// (`FILE_CHUNK_WINDOW`), so a stream never outruns its acks' slots.
+pub(in crate::server) const WELCOME_CHUNK_ACK_PER_GROUP_CAP: usize = 8;
+
+/// Bound on one `ChunkAck` send. It covers the DM layer's own worst case
+/// (an 8 s raw receive-ACK, then a gossip-inbox attempt, its backoff and
+/// one retry of 8 s each), so it only ends a send that would not end.
+const WELCOME_CHUNK_ACK_BUDGET: Duration = Duration::from_secs(45);
+
 /// ADR 0107 (review r2): spawn a join-artifact egress task registered under
 /// `(group_id, recipient)`. Its body runs only AFTER registration, so a
 /// removal or ban that quiesces this recipient can never miss it. Every body
@@ -42256,17 +42269,29 @@ where
     let mut due = started;
     let mut last_progress_bytes = 0;
     let mut received = None;
-    for (attempt, delay) in retry_delays.iter().enumerate() {
+    // Sent FetchRequests whose outcome is still pending. They are polled
+    // beside the Welcome waiter and the schedule, never awaited alone: a
+    // gossip-inbox receipt can take minutes on a metered leaf, and the
+    // Complete and the deadline must be seen while it is outstanding. At most
+    // one per scheduled attempt; any still pending end with this fetch.
+    let mut requests = futures::stream::FuturesUnordered::new();
+    'schedule: for (attempt, delay) in retry_delays.iter().enumerate() {
         due += *delay;
         if due >= deadline {
             break;
         }
-        tokio::select! {
-            result = &mut rx => {
-                received = Some(result);
-                break;
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut rx => {
+                    received = Some(result);
+                    break 'schedule;
+                }
+                Some(outcome) = futures::StreamExt::next(&mut requests), if !requests.is_empty() => {
+                    settle_welcome_fetch_request(state, group_id, welcome_ref, outcome).await?;
+                }
+                () = tokio::time::sleep_until(due) => break,
             }
-            () = tokio::time::sleep_until(due) => {}
         }
         if attempt > 0 {
             let progress_bytes = state
@@ -42299,28 +42324,25 @@ where
                 group_id: group_id.to_string(),
                 welcome_id: welcome_ref.welcome_id.clone(),
             };
-            match send(source, request).await {
-                Ok(()) => {}
-                Err(WelcomeFetchSendError::ReceiptUnconfirmed(error)) => {
-                    tracing::warn!(
-                        target: "welcome.trace",
-                        stage = "fetch_request_receipt_unconfirmed",
-                        group_id,
-                        welcome_id = %welcome_ref.welcome_id,
-                        error = %error,
-                        "waiting for Welcome despite unconfirmed FetchRequest receipt",
-                    );
-                }
-                Err(WelcomeFetchSendError::Failed(error)) => {
-                    cleanup_welcome_fetch_state(state, &welcome_ref.welcome_id).await;
-                    return Err(error);
-                }
-            }
+            requests.push(send(source, request));
         }
     }
     if received.is_none() {
-        received = tokio::time::timeout_at(deadline, &mut rx).await.ok();
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut rx => {
+                    received = Some(result);
+                    break;
+                }
+                Some(outcome) = futures::StreamExt::next(&mut requests), if !requests.is_empty() => {
+                    settle_welcome_fetch_request(state, group_id, welcome_ref, outcome).await?;
+                }
+                () = tokio::time::sleep_until(deadline) => break,
+            }
+        }
     }
+    drop(requests);
     let received = match received {
         Some(Ok(result)) => result?,
         Some(Err(_)) => return Err("TreeKEM Welcome waiter dropped".to_string()),
@@ -42341,6 +42363,35 @@ where
         return Err("TreeKEM Welcome blake3 mismatch".to_string());
     }
     Ok(received)
+}
+
+/// Settle one sent FetchRequest. Only a request that could not be sent ends
+/// the fetch; a missing receipt keeps it waiting, because the request may
+/// well have landed (#841).
+async fn settle_welcome_fetch_request(
+    state: &Arc<AppState>,
+    group_id: &str,
+    welcome_ref: &WelcomeRef,
+    outcome: std::result::Result<(), WelcomeFetchSendError>,
+) -> std::result::Result<(), String> {
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(WelcomeFetchSendError::ReceiptUnconfirmed(error)) => {
+            tracing::warn!(
+                target: "welcome.trace",
+                stage = "fetch_request_receipt_unconfirmed",
+                group_id,
+                welcome_id = %welcome_ref.welcome_id,
+                error = %error,
+                "waiting for Welcome despite unconfirmed FetchRequest receipt",
+            );
+            Ok(())
+        }
+        Err(WelcomeFetchSendError::Failed(error)) => {
+            cleanup_welcome_fetch_state(state, &welcome_ref.welcome_id).await;
+            Err(error)
+        }
+    }
 }
 
 /// Decode a transfer frame only after the DM layer verified its sender.
@@ -42364,8 +42415,10 @@ pub(in crate::server) fn decode_welcome_blob_message(
 /// membership lock. A lock holder may itself be waiting for Offer, Chunk or
 /// Complete frames on this same listener, so handling the fetch inline could
 /// stall every group's frames (a dependency cycle). Receive-side frames stay
-/// inline and never take a membership lock. With every slot busy, the fetch
-/// is dropped; the joiner's bounded retry schedule asks again.
+/// inline and never take a membership lock, nor wait on the network: a
+/// chunk's `ChunkAck` is sent from a bounded task (`spawn_welcome_chunk_ack`).
+/// With every slot busy, the fetch is dropped; the joiner's bounded retry
+/// schedule asks again.
 pub(in crate::server) async fn dispatch_welcome_blob_message(
     state: &Arc<AppState>,
     sender: &AgentId,
@@ -42994,21 +43047,100 @@ async fn handle_welcome_blob_chunk(
         receive.received_bytes = receive.received_bytes.saturating_add(decoded.len() as u64);
         receive.chunks.insert(sequence, decoded);
     }
+    let group_id = receive.group_id.clone();
     drop(receives);
     tracing::debug!(target: "welcome.trace", stage = "chunk_recv", welcome_id = %welcome_id, seq = sequence);
+    spawn_welcome_chunk_ack(state, sender, &group_id, welcome_id, sequence);
+}
 
-    let ack = WelcomeBlobMessage::ChunkAck {
-        welcome_id: welcome_id.clone(),
-        sequence,
-    };
-    match send_welcome_blob_message(state, sender, &ack).await {
-        Ok(_) => {
-            tracing::debug!(target: "welcome.trace", stage = "chunk_ack_sent", welcome_id = %welcome_id, seq = sequence);
+/// Acknowledge a received Welcome chunk without holding the Welcome
+/// listener. The ack's delivery receipt can take minutes on a metered leaf
+/// (its gossip-inbox receipt rides only the joiner's inbox topic). Awaited
+/// inline, it held every later Chunk and the Complete behind it until the
+/// joiner's bounded fetch expired and discarded the receive.
+///
+/// Sends are admitted per `(welcome, chunk)` under a per-group share and a
+/// global cap, and each ends within [`WELCOME_CHUNK_ACK_BUDGET`]. A refused
+/// ack is dropped: acks are cumulative (`FileChunkAckSlot::record_ack` keeps
+/// the highest), so a later one covers it, and a stream whose final ack is
+/// lost ends without its Complete; the joiner's next fetch restreams it
+/// (`replace_welcome_stream`).
+fn spawn_welcome_chunk_ack(
+    state: &Arc<AppState>,
+    owner: &AgentId,
+    group_id: &str,
+    welcome_id: String,
+    sequence: u64,
+) {
+    let ticket = match state
+        .welcome_chunk_ack_admission
+        .try_admit(&format!("{welcome_id}:{sequence}"), group_id)
+    {
+        Ok(ticket) => ticket,
+        Err(refusal) => {
+            tracing::debug!(target: "welcome.trace", stage = "chunk_ack_not_admitted", welcome_id = %welcome_id, seq = sequence, ?refusal);
+            return;
         }
-        Err(e) => {
-            tracing::warn!(welcome_id = %LogHexId::new("welcome", &welcome_id), sequence, "failed to ack Welcome blob chunk: {e}");
+    };
+    let task_state = Arc::clone(state);
+    let owner = *owner;
+    tokio::spawn(async move {
+        let _ticket = ticket;
+        let ack = WelcomeBlobMessage::ChunkAck {
+            welcome_id: welcome_id.clone(),
+            sequence,
+        };
+        match tokio::time::timeout(
+            WELCOME_CHUNK_ACK_BUDGET,
+            send_welcome_chunk_ack(&task_state, &owner, &ack),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                tracing::debug!(target: "welcome.trace", stage = "chunk_ack_sent", welcome_id = %welcome_id, seq = sequence);
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(welcome_id = %LogHexId::new("welcome", &welcome_id), sequence, "failed to ack Welcome blob chunk: {e}");
+            }
+            Err(_) => {
+                tracing::warn!(welcome_id = %LogHexId::new("welcome", &welcome_id), sequence, "Welcome blob chunk ack ran out of its budget");
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+static WELCOME_CHUNK_ACK_TEST_GATES: std::sync::OnceLock<
+    StdMutex<HashMap<String, Arc<WelcomeChunkAckTestGate>>>,
+> = std::sync::OnceLock::new();
+
+/// Test builds: a Welcome whose acks park here, as a send whose delivery
+/// receipt never arrives does, instead of reaching the transport.
+#[cfg(test)]
+#[derive(Default)]
+struct WelcomeChunkAckTestGate {
+    started: AtomicUsize,
+}
+
+async fn send_welcome_chunk_ack(
+    state: &Arc<AppState>,
+    owner: &AgentId,
+    ack: &WelcomeBlobMessage,
+) -> std::result::Result<(), String> {
+    #[cfg(test)]
+    if let WelcomeBlobMessage::ChunkAck { welcome_id, .. } = ack {
+        let gate = WELCOME_CHUNK_ACK_TEST_GATES
+            .get()
+            .and_then(|gates| gates.lock().ok())
+            .and_then(|gates| gates.get(welcome_id).cloned());
+        if let Some(gate) = gate {
+            gate.started.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await;
         }
     }
+    send_welcome_blob_message(state, owner, ack)
+        .await
+        .map(|_| ())
 }
 
 async fn handle_welcome_blob_complete(state: &Arc<AppState>, sender: &AgentId, welcome_id: &str) {
@@ -43250,6 +43382,7 @@ pub(in crate::server) mod tests {
     mod requester_offer;
     mod sec377_dm_verified_gate;
     mod self_leave_rekey;
+    mod welcome_unblock;
     mod wp_c;
     fn fake_group_state_commit(
         group_id: &str,
@@ -44000,6 +44133,10 @@ pub(in crate::server) mod tests {
             welcome_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
                 crate::server::routes::named_groups::WELCOME_FETCH_PER_GROUP_CAP,
                 crate::server::routes::named_groups::WELCOME_FETCH_HANDLER_CAP,
+            ),
+            welcome_chunk_ack_admission: crate::server::routes::named_groups::FairAdmission::new(
+                crate::server::routes::named_groups::WELCOME_CHUNK_ACK_PER_GROUP_CAP,
+                crate::server::routes::named_groups::WELCOME_CHUNK_ACK_CAP,
             ),
             join_result_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
                 crate::server::routes::named_groups::JOIN_RESULT_FETCH_PER_GROUP_CAP,
