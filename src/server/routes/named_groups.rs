@@ -49153,6 +49153,140 @@ pub(in crate::server) mod tests {
         Ok(())
     }
 
+    /// A pair code imported after the contact's signed announcement must not
+    /// wipe what the announcement told us (the UI drills' leaf runs): the
+    /// card carries no addresses, and stamped with our clock it outranked
+    /// the announcement until the contact's next heartbeat.
+    #[tokio::test]
+    async fn card_import_after_a_signed_announcement_keeps_its_addresses() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let target_id = crate::identity::AgentKeypair::generate()?.agent_id();
+        let announced_machine = crate::identity::MachineId([0x21; 32]);
+        let card_machine = crate::identity::MachineId([0x11; 32]);
+        let addr: std::net::SocketAddr = "203.0.113.7:5483".parse()?;
+        let relay = crate::identity::MachineId([0x31; 32]);
+        let coordinator = crate::identity::MachineId([0x41; 32]);
+        let announced_at = now_millis_u64() / 1000 - 30;
+        state
+            .agent
+            .insert_discovered_agent_for_testing(x0x::DiscoveredAgent {
+                self_name: Some("Alice".to_string()),
+                agent_id: target_id,
+                machine_id: announced_machine,
+                user_id: None,
+                addresses: vec![addr],
+                announced_at,
+                last_seen: announced_at,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: Some(true),
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: vec![coordinator],
+                relay_candidates: vec![relay],
+                cert_not_after: None,
+                agent_certificate: None,
+                agent_public_key: Vec::new(),
+                cert_digest: None,
+            })
+            .await;
+
+        // The card names a new machine (a reinstall) and no addresses.
+        let card = x0x::groups::card::AgentCard::new(
+            "Alice".to_string(),
+            &target_id,
+            &hex::encode(card_machine.0),
+        );
+        assert!(card.addresses.is_empty());
+        let req: ImportCardRequest = serde_json::from_value(serde_json::json!({
+            "card": card.to_link(),
+            "trust_level": "known"
+        }))
+        .context("deserialize ImportCardRequest")?;
+        let response = import_agent_card(State(Arc::clone(&state)), Json(req))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let entry = state
+            .agent
+            .discovered_agent_for_testing(&target_id)
+            .await
+            .context("the contact stays discovered")?;
+        assert_eq!(entry.addresses, vec![addr], "the announced addresses stay");
+        assert_eq!(entry.reachable_via, vec![coordinator]);
+        assert_eq!(entry.relay_candidates, vec![relay]);
+        assert_eq!(
+            entry.announced_at, announced_at,
+            "the card is no announcement"
+        );
+        assert_eq!(
+            entry.machine_id, card_machine,
+            "the card's machine is taken"
+        );
+        let machine = state
+            .agent
+            .discovered_machine_for_testing(&announced_machine)
+            .await
+            .context("the announced machine stays")?;
+        assert_eq!(machine.addresses, vec![addr]);
+
+        // A later signed announcement is not outranked by the import.
+        state
+            .agent
+            .insert_discovered_agent_for_testing(x0x::DiscoveredAgent {
+                addresses: Vec::new(),
+                announced_at: announced_at + 1,
+                ..entry
+            })
+            .await;
+        let fresh = state.agent.discovered_agent_for_testing(&target_id).await;
+        assert_eq!(
+            fresh.map(|entry| entry.announced_at),
+            Some(announced_at + 1)
+        );
+        Ok(())
+    }
+
+    /// A card for a contact we have never heard announce is recorded as an
+    /// observation: the first signed announcement replaces it, even one
+    /// signed (by its clock) before we imported the card.
+    #[tokio::test]
+    async fn card_only_entry_yields_to_an_earlier_signed_announcement() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let target_id = crate::identity::AgentKeypair::generate()?.agent_id();
+        let card_link = make_unsigned_card_link("Bob", &target_id);
+        let req: ImportCardRequest = serde_json::from_value(serde_json::json!({
+            "card": card_link,
+            "trust_level": "known"
+        }))
+        .context("deserialize ImportCardRequest")?;
+        let response = import_agent_card(State(Arc::clone(&state)), Json(req))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let entry = state
+            .agent
+            .discovered_agent_for_testing(&target_id)
+            .await
+            .context("the card is recorded")?;
+        assert_eq!(entry.announced_at, 0);
+
+        let addr: std::net::SocketAddr = "203.0.113.9:5483".parse()?;
+        let signed_before_import = now_millis_u64() / 1000 - 60;
+        state
+            .agent
+            .insert_discovered_agent_for_testing(x0x::DiscoveredAgent {
+                addresses: vec![addr],
+                announced_at: signed_before_import,
+                ..entry
+            })
+            .await;
+        let entry = state.agent.discovered_agent_for_testing(&target_id).await;
+        assert_eq!(entry.map(|entry| entry.addresses), Some(vec![addr]));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn explicit_patch_downgrade_still_works() -> Result<()> {
         let (state, _dir) = secure_endpoint_test_state().await?;

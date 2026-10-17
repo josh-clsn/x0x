@@ -10335,6 +10335,93 @@ impl Agent {
         .await;
     }
 
+    /// Record the discovery hint an imported agent card carries.
+    ///
+    /// A card is not a signed announcement and must never outrank one.
+    /// Stamped with the importer's clock, it replaced the announced address
+    /// set (a pair code carries none) and the relay hints until the
+    /// contact's next heartbeat. So the card is recorded as an observation:
+    /// - an entry a signed announcement made keeps its addresses, relay
+    ///   hints and `announced_at`; only the card's machine id is taken, the
+    ///   binding the capability store and the DM registry take from the
+    ///   same import (a contact that reinstalled has a new machine);
+    /// - a new entry, or one only a card made, carries `announced_at` 0, so
+    ///   the next signed announcement replaces it whatever the two clocks
+    ///   say;
+    /// - the machine cache merges the card's addresses as observed ones,
+    ///   never clearing an announced set (the #308 observation rule).
+    pub(crate) async fn record_card_discovery_hint(
+        &self,
+        agent_id: identity::AgentId,
+        machine_id: identity::MachineId,
+        addresses: Vec<std::net::SocketAddr>,
+    ) {
+        let now = Self::unix_timestamp_secs();
+        let hint = DiscoveredAgent {
+            self_name: None,
+            agent_id,
+            machine_id,
+            user_id: None,
+            addresses,
+            announced_at: 0,
+            last_seen: now,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: None,
+            agent_certificate: None,
+            agent_public_key: Vec::new(),
+            cert_digest: None,
+        };
+        upsert_discovered_machine_from_agent(&self.machine_discovery_cache, &hint).await;
+        let announced = {
+            let mut cache = self.identity_discovery_cache.write().await;
+            match cache.get_mut(&agent_id) {
+                Some(existing) if existing.announced_at > 0 => {
+                    if machine_id.0 != [0u8; 32] {
+                        existing.machine_id = machine_id;
+                    }
+                    existing.last_seen = existing.last_seen.max(now);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !announced {
+            upsert_discovered_agent(&self.identity_discovery_cache, &self.verified_cert_tx, hint)
+                .await;
+        }
+        if machine_id.0 != [0u8; 32] {
+            self.direct_messaging
+                .register_agent(agent_id, machine_id)
+                .await;
+            if let Some(ref network) = self.network {
+                if network.is_connected(&ant_quic::PeerId(machine_id.0)).await {
+                    self.direct_messaging
+                        .mark_connected(agent_id, machine_id)
+                        .await;
+                }
+            }
+        }
+    }
+
+    /// Test seam: read one machine-cache entry.
+    #[cfg(test)]
+    pub(crate) async fn discovered_machine_for_testing(
+        &self,
+        machine: &identity::MachineId,
+    ) -> Option<DiscoveredMachine> {
+        self.machine_discovery_cache
+            .read()
+            .await
+            .get(machine)
+            .cloned()
+    }
+
     /// Test seam: read one discovery-cache entry.
     pub async fn discovered_agent_for_testing(
         &self,

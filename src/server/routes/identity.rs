@@ -1034,29 +1034,16 @@ pub(in crate::server) async fn import_agent_card(
         capability_store_entries = capability_store.len(),
     );
 
+    // The card is a hint, never an announcement: it must not outrank what
+    // the contact's signed announcement already told us.
     if machine_id_bytes != [0u8; 32] || !addresses.is_empty() {
         state
             .agent
-            .insert_discovered_agent_for_testing(x0x::DiscoveredAgent {
-                self_name: None,
+            .record_card_discovery_hint(
                 agent_id,
-                machine_id: x0x::identity::MachineId(machine_id_bytes),
-                user_id: None,
+                x0x::identity::MachineId(machine_id_bytes),
                 addresses,
-                announced_at: now,
-                last_seen: now,
-                machine_public_key: Vec::new(),
-                nat_type: None,
-                can_receive_direct: None,
-                is_relay: None,
-                is_coordinator: None,
-                reachable_via: Vec::new(),
-                relay_candidates: Vec::new(),
-                cert_not_after: None,
-                agent_certificate: None,
-                agent_public_key: Vec::new(),
-                cert_digest: None,
-            })
+            )
             .await;
     }
 
