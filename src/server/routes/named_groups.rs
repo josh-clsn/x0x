@@ -3567,36 +3567,56 @@ fn named_group_event_delivery_future(
     let group_id = named_group_metadata_event_group_id(event).to_string();
     let requester = recipient_hex.to_string();
     Some(async move {
-        let result = if payload.len() > x0x::dm::MAX_PAYLOAD_BYTES {
-            control_blob::send_reference(
-                &control_blobs,
-                &agent,
-                &recipient,
-                control_blob::ControlBlobKind::NamedGroupEvent,
-                &group_id,
-                None,
-                payload,
-                cold_removal,
-            )
-            .await
-        } else if cold_removal {
-            agent
-                .send_direct_with_config_cold_wait(
+        // A metered leaf dials no peer of its own accord, so a recipient it
+        // was never connected to is reached over gossip alone and its
+        // gossip-inbox receipt can outlast the whole send. Dial it on demand
+        // beside the send, within one DM attempt, so the receipt and the DM
+        // layer's retry can ride a direct connection. A cold removal notice
+        // resolves and dials its recipient itself.
+        let connect = async {
+            if !cold_removal {
+                agent
+                    .connect_for_pending_send(&recipient, NAMED_GROUP_DELIVERY_CONNECT_BUDGET)
+                    .await;
+            }
+        };
+        let send = async {
+            if payload.len() > x0x::dm::MAX_PAYLOAD_BYTES {
+                control_blob::send_reference(
+                    &control_blobs,
+                    &agent,
                     &recipient,
+                    control_blob::ControlBlobKind::NamedGroupEvent,
+                    &group_id,
+                    None,
                     payload,
-                    named_group_direct_delivery_config(),
-                    x0x::dm::PINNED_RESOLUTION_WAIT,
+                    cold_removal,
                 )
                 .await
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        } else {
-            agent
-                .send_direct_with_config(&recipient, payload, named_group_direct_delivery_config())
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string())
+            } else if cold_removal {
+                agent
+                    .send_direct_with_config_cold_wait(
+                        &recipient,
+                        payload,
+                        named_group_direct_delivery_config(),
+                        x0x::dm::PINNED_RESOLUTION_WAIT,
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            } else {
+                agent
+                    .send_direct_with_config(
+                        &recipient,
+                        payload,
+                        named_group_direct_delivery_config(),
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            }
         };
+        let (result, ()) = tokio::join!(send, connect);
         if let Err(e) = result {
             tracing::warn!(
                 requester = %LogHexId::agent(&requester),
@@ -3605,6 +3625,11 @@ fn named_group_event_delivery_future(
         }
     })
 }
+
+/// Bound on the demand dial beside a named-group direct delivery: one DM
+/// attempt (`direct_message_send_config`), so a connection it makes is up
+/// before the DM layer's retry.
+const NAMED_GROUP_DELIVERY_CONNECT_BUDGET: Duration = Duration::from_secs(8);
 
 pub(in crate::server) fn spawn_named_group_event_delivery(
     state: &AppState,
@@ -39443,10 +39468,11 @@ pub(in crate::server) const WELCOME_CHUNK_ACK_CAP: usize = 32;
 /// (`FILE_CHUNK_WINDOW`), so a stream never outruns its acks' slots.
 pub(in crate::server) const WELCOME_CHUNK_ACK_PER_GROUP_CAP: usize = 8;
 
-/// Bound on one `ChunkAck` send. It covers the DM layer's own worst case
-/// (an 8 s raw receive-ACK, then a gossip-inbox attempt, its backoff and
-/// one retry of 8 s each), so it only ends a send that would not end.
-const WELCOME_CHUNK_ACK_BUDGET: Duration = Duration::from_secs(45);
+/// Bound on one `ChunkAck` send. It exceeds the DM layer's own bound for
+/// the frame's config (a raw attempt with its supersede reissue and zombie
+/// resend, then a gossip-inbox attempt, its backoff and one retry: 8 s
+/// windows each), so it only ends a send that would not end.
+const WELCOME_CHUNK_ACK_BUDGET: Duration = Duration::from_secs(60);
 
 /// ADR 0107 (review r2): spawn a join-artifact egress task registered under
 /// `(group_id, recipient)`. Its body runs only AFTER registration, so a

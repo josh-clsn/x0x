@@ -587,6 +587,27 @@ static GENERAL_RAW_STANDIN_DELIVERIES: std::sync::LazyLock<
     >,
 > = std::sync::LazyLock::new(Default::default);
 
+/// Test builds: the next ACKed raw sends of these agents fail as a zombie
+/// connection's do (the receive ACK never comes while the connection still
+/// reads as connected), one per count.
+#[cfg(test)]
+static INJECTED_ZOMBIE_ACK_FAILURES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<identity::AgentId, usize>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+fn take_injected_zombie_ack_failure(agent: &identity::AgentId) -> bool {
+    INJECTED_ZOMBIE_ACK_FAILURES
+        .lock()
+        .ok()
+        .and_then(|mut failures| {
+            let left = failures.get_mut(agent)?;
+            *left = left.checked_sub(1)?;
+            Some(())
+        })
+        .is_some()
+}
+
 #[cfg(test)]
 fn pinned_standin_transport(agent: &identity::AgentId) -> std::sync::Arc<PinnedTransportScript> {
     PINNED_STANDIN_TRANSPORT
@@ -6153,6 +6174,7 @@ impl Agent {
         }
 
         let dial_timeout = std::time::Duration::from_secs(8);
+
         let local_probe_timeout = std::time::Duration::from_secs(3);
         let direct_probe_addrs = local_direct_probe_addrs(&info.addresses);
 
@@ -9766,6 +9788,85 @@ impl Agent {
         prefer_newest_grace: std::time::Duration,
         cold_wait: Option<ColdWait>,
     ) -> error::NetworkResult<dm::DmPath> {
+        let mut torn_down = false;
+        let result = self
+            .send_direct_raw_quic_once(
+                agent_id,
+                payload,
+                receive_ack_timeout,
+                prefer_newest_grace,
+                cold_wait,
+                &mut torn_down,
+            )
+            .await;
+        let Some(window) = receive_ack_timeout.filter(|_| torn_down && result.is_err()) else {
+            return result;
+        };
+        // The send that tore the zombie down redials and resends once, in
+        // one more receive-ACK window, rather than failing and leaving the
+        // redial to its caller's next retry (a gossip fallback whose receipt
+        // a metered leaf may not see for minutes, or a whole retry cycle).
+        // The redial is the per-send demand dial a leaf keeps (resolution's
+        // send-readiness repair, then `connect_to_agent`), not mesh
+        // maintenance.
+        let mut resend_torn_down = false;
+        match tokio::time::timeout(
+            window,
+            self.send_direct_raw_quic_once(
+                agent_id,
+                payload,
+                receive_ack_timeout,
+                prefer_newest_grace,
+                cold_wait,
+                &mut resend_torn_down,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(path)) => {
+                tracing::info!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    to = %network::hex_prefix(&agent_id.0, 4),
+                    "resent over a redialed connection after a zombie teardown"
+                );
+                Ok(path)
+            }
+            Ok(Err(resend_error)) => {
+                tracing::debug!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    to = %network::hex_prefix(&agent_id.0, 4),
+                    error = %resend_error,
+                    "resend after a zombie teardown failed"
+                );
+                result
+            }
+            Err(_) => {
+                tracing::debug!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    to = %network::hex_prefix(&agent_id.0, 4),
+                    "resend after a zombie teardown ran out of its receive-ACK window"
+                );
+                result
+            }
+        }
+    }
+
+    /// One raw-QUIC send: resolution, any repair or redial, and the
+    /// transmission. Sets `torn_down` when an ACKed send failed on a
+    /// connection that still read as connected and that zombie was torn
+    /// down.
+    async fn send_direct_raw_quic_once(
+        &self,
+        agent_id: &identity::AgentId,
+        payload: &[u8],
+        receive_ack_timeout: Option<std::time::Duration>,
+        prefer_newest_grace: std::time::Duration,
+        cold_wait: Option<ColdWait>,
+        torn_down: &mut bool,
+    ) -> error::NetworkResult<dm::DmPath> {
         let send_start = std::time::Instant::now();
         // x0x #1207 (P2): ONE absolute deadline, from the start of this raw
         // attempt, for every resolution read of an opted-in send. The
@@ -9847,16 +9948,26 @@ impl Agent {
             // ant-quic's send_with_receive_ack contract) and reissue once
             // against the new generation. The reissue does not race again;
             // a healthy peer should converge in a single supersede cycle.
-            self.send_ack_racing_replaced(
-                network.as_ref(),
-                ant_peer_id,
-                machine_id,
-                &wire,
-                timeout,
-                prefer_newest_grace,
-                agent_id,
-            )
-            .await
+            #[cfg(test)]
+            let zombie = take_injected_zombie_ack_failure(&self.identity.agent_id());
+            #[cfg(not(test))]
+            let zombie = false;
+            if zombie {
+                Err(error::NetworkError::ConnectionFailed(
+                    "send_with_receive_ack failed: injected zombie (test)".to_string(),
+                ))
+            } else {
+                self.send_ack_racing_replaced(
+                    network.as_ref(),
+                    ant_peer_id,
+                    machine_id,
+                    &wire,
+                    timeout,
+                    prefer_newest_grace,
+                    agent_id,
+                )
+                .await
+            }
         } else {
             tracing::debug!(
                 target: "dm.trace",
@@ -9926,19 +10037,22 @@ impl Agent {
                 // as connected means the connection is a zombie: the remote
                 // endpoint is gone (supersede/NAT loss without a lifecycle
                 // event) yet `is_connected` keeps steering every retry back
-                // onto it via `cached_connected`. Tear it down so the next
-                // attempt fails the fast path and takes the X0X-0031/0033
+                // onto it via `cached_connected`. Tear it down so the resend
+                // fails the fast path and takes the X0X-0031/0033
                 // send-readiness repair (fresh dial) instead of re-sending
                 // into the same dead connection until the caller's deadline.
                 if receive_ack_timeout.is_some() && network.is_connected(&ant_peer_id).await {
                     match network.disconnect(&ant_peer_id).await {
-                        Ok(()) => tracing::info!(
-                            target: "x0x::direct",
-                            stage = "send",
-                            to = %agent_prefix,
-                            %machine_prefix,
-                            "tore down zombie connection after acked send failure; retry will redial"
-                        ),
+                        Ok(()) => {
+                            *torn_down = true;
+                            tracing::info!(
+                                target: "x0x::direct",
+                                stage = "send",
+                                to = %agent_prefix,
+                                %machine_prefix,
+                                "tore down zombie connection after acked send failure; redialing to resend"
+                            );
+                        }
                         Err(de) => tracing::debug!(
                             target: "x0x::direct",
                             stage = "send",
@@ -10530,6 +10644,32 @@ impl Agent {
             }
         }
         false
+    }
+
+    /// Dial `agent_id` for a pending send when no direct connection to it is
+    /// live, within `budget`. This is the per-send demand dial a metered
+    /// leaf keeps; it gives up only proactive mesh maintenance (see
+    /// `proactive_reconnect_allowed`). Returns whether a direct connection
+    /// is live afterwards.
+    pub(crate) async fn connect_for_pending_send(
+        &self,
+        agent_id: &identity::AgentId,
+        budget: std::time::Duration,
+    ) -> bool {
+        if self.has_live_direct_connection(agent_id).await {
+            return true;
+        }
+        let _ = tokio::time::timeout(budget, self.connect_to_agent(agent_id)).await;
+        self.has_live_direct_connection(agent_id).await
+    }
+
+    /// Test seam: this agent's next `count` ACKed raw sends fail as a zombie
+    /// connection's do. Test builds only.
+    #[cfg(test)]
+    pub(crate) fn inject_zombie_ack_failures_for_testing(&self, count: usize) {
+        if let Ok(mut failures) = INJECTED_ZOMBIE_ACK_FAILURES.lock() {
+            failures.insert(self.identity.agent_id(), count);
+        }
     }
 
     /// Get list of currently connected agents.
@@ -25675,6 +25815,138 @@ mod tests {
         } else {
             addr
         }
+    }
+
+    /// Two loopback agents for the demand-dial tests: `alice` is a metered
+    /// leaf (no proactive redial), `bob` runs its direct listener, and each
+    /// knows the other's signed-announcement record.
+    async fn leaf_and_peer(dir: &std::path::Path) -> (Agent, Agent, std::net::SocketAddr) {
+        let build = |name: &str| {
+            Agent::builder()
+                .with_machine_key(dir.join(format!("{name}-machine.key")))
+                .with_agent_key_path(dir.join(format!("{name}-agent.key")))
+                .with_contact_store_path(dir.join(format!("{name}-contacts.json")))
+                .with_peer_cache_dir(dir.join(format!("{name}-peers")))
+                .with_network_config(loopback_network_config())
+                .build()
+        };
+        let alice = build("alice").await.expect("alice");
+        alice.set_leaf_mode(true);
+        let bob = build("bob").await.expect("bob");
+        bob.start_direct_listener();
+        let address = |agent: &Agent| {
+            let network = std::sync::Arc::clone(agent.network().expect("network"));
+            async move { normalize_loopback_addr(network.bound_addr().await.expect("bound")) }
+        };
+        let (alice_addr, bob_addr) = (address(&alice).await, address(&bob).await);
+        let now = Agent::unix_timestamp_secs();
+        let record = |agent: &Agent, addr| DiscoveredAgent {
+            self_name: None,
+            agent_id: agent.agent_id(),
+            machine_id: agent.machine_id(),
+            user_id: None,
+            addresses: vec![addr],
+            announced_at: now,
+            last_seen: now,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: Some(true),
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: None,
+            agent_certificate: None,
+            agent_public_key: Vec::new(),
+            cert_digest: None,
+        };
+        alice
+            .insert_discovered_agent_for_testing(record(&bob, bob_addr))
+            .await;
+        bob.insert_discovered_agent_for_testing(record(&alice, alice_addr))
+            .await;
+        (alice, bob, bob_addr)
+    }
+
+    /// An ACKed raw send that tears a zombie connection down redials and
+    /// resends inside the same send, within one more receive-ACK window,
+    /// on a metered leaf too: the payload arrives once and the send
+    /// succeeds instead of failing over to its caller's next retry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn zombie_teardown_redials_and_resends_within_the_send() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (alice, bob, bob_addr) = leaf_and_peer(dir.path()).await;
+        let mut bob_rx = bob.subscribe_direct();
+        let alice_network = alice.network().expect("alice network");
+        let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+        alice_network
+            .connect_addr(bob_addr)
+            .await
+            .expect("alice connects to bob");
+        await_quiesced_connection(
+            alice_network,
+            &bob_peer,
+            std::time::Duration::from_secs(1) * test_time_multiplier(),
+        )
+        .await;
+
+        // The first ACKed send fails as a zombie's does: no receive ACK,
+        // while the connection still reads as connected.
+        alice.inject_zombie_ack_failures_for_testing(1);
+        let window = std::time::Duration::from_secs(5) * test_time_multiplier();
+        let payload = b"resent after a zombie teardown".to_vec();
+        let started = std::time::Instant::now();
+        let path = alice
+            .send_direct_raw_quic(
+                &bob.agent_id(),
+                &payload,
+                Some(window),
+                std::time::Duration::from_millis(250),
+                None,
+            )
+            .await
+            .expect("the send redials and resends after the teardown");
+        assert_eq!(path, dm::DmPath::RawQuicAcked);
+        assert!(
+            started.elapsed() < window,
+            "the resend ran within its receive-ACK window"
+        );
+        assert!(alice_network.is_connected(&bob_peer).await, "redialed");
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), bob_rx.recv())
+            .await
+            .expect("bob receives the resend")
+            .expect("bob's direct subscription is open");
+        assert_eq!(received.sender, alice.agent_id());
+        assert_eq!(received.payload, payload);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), bob_rx.recv())
+                .await
+                .is_err(),
+            "one copy only"
+        );
+    }
+
+    /// A send's demand dial reaches a known peer that a metered leaf holds
+    /// no connection to (leaf mode stops only proactive redials).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pending_send_dials_on_demand_from_a_leaf() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (alice, bob, _bob_addr) = leaf_and_peer(dir.path()).await;
+        let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+        assert!(!alice.has_live_direct_connection(&bob.agent_id()).await);
+        assert!(
+            alice
+                .connect_for_pending_send(
+                    &bob.agent_id(),
+                    std::time::Duration::from_secs(8) * test_time_multiplier(),
+                )
+                .await,
+            "the demand dial connects"
+        );
+        let alice_network = alice.network().expect("alice network");
+        assert!(alice_network.is_connected(&bob_peer).await);
+        assert!(alice.has_live_direct_connection(&bob.agent_id()).await);
     }
 
     /// Mesh-off must be a safe no-op on an agent that never had a network:
