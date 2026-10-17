@@ -432,3 +432,14 @@ Remaining notes:
 - **Retry classification.** Certificate expiry is classified as definitive and purges, consistent with the existing serving guard. A later certificate renewal does not re-send a purged share; the next rotation does.
 - **Joiner side.** A `Result` arm handled on the joiner's listener still waits inline for the joiner's own group lock. That is outside these gaps.
 - **Shared fault cell.** The in-process local-delete tests (`r9_local_delete_completes_without_deadlock`, `r10_delete_fault_matrix_through_production_path`) share a global delete-fault cell, so they must run in separate processes (as nextest does). This predates round 5.
+
+**Fork: the joiner's control frames (welcome-unblock).** The joiner's FetchRequest and ChunkAck stay on the general path. On a metered leaf their gossip-inbox receipt rides only the joiner's inbox topic and can take minutes, while every owner frame arrives in milliseconds. Two waits on that receipt held the room key for about two minutes in the UI drills' leaf runs. Three changes remove them:
+- The Welcome listener does not send a ChunkAck itself. It hands the ack to a task under `welcome_chunk_ack_admission` (one per `(welcome, chunk)`, 8 per group, 32 global) and goes on to the next frame. Each send ends within `WELCOME_CHUNK_ACK_BUDGET`. A refused ack is dropped: acks are cumulative, and a stream that loses its final ack ends without its Complete, which the joiner's next fetch restreams.
+- The fetch polls each sent FetchRequest beside its waiter and its deadline. It sees the Complete while a receipt is outstanding, and it ends at `WELCOME_FETCH_UNDER_GUARD_TIMEOUT`.
+- Over a direct connection that is live now (`Agent::has_live_direct_connection`), a ChunkAck and a fetch's first FetchRequest prefer raw QUIC with the receive ACK. A raw failure falls back to the gossip inbox. Without a live connection, and for a stalled retry, the gossip inbox stays preferred: a restarted owner can attribute its signed envelope before its cold caches can bind our raw frames to us.
+
+| Item | Status | Evidence |
+|---|---|---|
+| The Welcome listener awaited each ChunkAck receipt | Fixed | `welcome_completes_while_chunk_ack_receipts_never_arrive`, `chunk_ack_sends_are_bounded_and_end_within_their_budget` |
+| The fetch awaited each FetchRequest receipt inline | Fixed | `late_fetch_request_receipt_keeps_the_pending_receive`, `fetch_ends_at_its_deadline_while_a_request_is_outstanding` |
+| Joiner control frames preferred the gossip inbox over a live connection | Fixed | `welcome_control_frames_take_raw_quic_over_a_live_connection` |
