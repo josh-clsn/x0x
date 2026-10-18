@@ -3567,56 +3567,36 @@ fn named_group_event_delivery_future(
     let group_id = named_group_metadata_event_group_id(event).to_string();
     let requester = recipient_hex.to_string();
     Some(async move {
-        // A metered leaf dials no peer of its own accord, so a recipient it
-        // was never connected to is reached over gossip alone and its
-        // gossip-inbox receipt can outlast the whole send. Dial it on demand
-        // beside the send, within one DM attempt, so the receipt and the DM
-        // layer's retry can ride a direct connection. A cold removal notice
-        // resolves and dials its recipient itself.
-        let connect = async {
-            if !cold_removal {
-                agent
-                    .connect_for_pending_send(&recipient, NAMED_GROUP_DELIVERY_CONNECT_BUDGET)
-                    .await;
-            }
-        };
-        let send = async {
-            if payload.len() > x0x::dm::MAX_PAYLOAD_BYTES {
-                control_blob::send_reference(
-                    &control_blobs,
-                    &agent,
+        let result = if payload.len() > x0x::dm::MAX_PAYLOAD_BYTES {
+            control_blob::send_reference(
+                &control_blobs,
+                &agent,
+                &recipient,
+                control_blob::ControlBlobKind::NamedGroupEvent,
+                &group_id,
+                None,
+                payload,
+                cold_removal,
+            )
+            .await
+        } else if cold_removal {
+            agent
+                .send_direct_with_config_cold_wait(
                     &recipient,
-                    control_blob::ControlBlobKind::NamedGroupEvent,
-                    &group_id,
-                    None,
                     payload,
-                    cold_removal,
+                    named_group_direct_delivery_config(),
+                    x0x::dm::PINNED_RESOLUTION_WAIT,
                 )
                 .await
-            } else if cold_removal {
-                agent
-                    .send_direct_with_config_cold_wait(
-                        &recipient,
-                        payload,
-                        named_group_direct_delivery_config(),
-                        x0x::dm::PINNED_RESOLUTION_WAIT,
-                    )
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
-            } else {
-                agent
-                    .send_direct_with_config(
-                        &recipient,
-                        payload,
-                        named_group_direct_delivery_config(),
-                    )
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
-            }
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        } else {
+            agent
+                .send_direct_with_config(&recipient, payload, named_group_direct_delivery_config())
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         };
-        let (result, ()) = tokio::join!(send, connect);
         if let Err(e) = result {
             tracing::warn!(
                 requester = %LogHexId::agent(&requester),
@@ -3625,11 +3605,6 @@ fn named_group_event_delivery_future(
         }
     })
 }
-
-/// Bound on the demand dial beside a named-group direct delivery: one DM
-/// attempt (`direct_message_send_config`), so a connection it makes is up
-/// before the DM layer's retry.
-const NAMED_GROUP_DELIVERY_CONNECT_BUDGET: Duration = Duration::from_secs(8);
 
 pub(in crate::server) fn spawn_named_group_event_delivery(
     state: &AppState,
