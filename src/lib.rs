@@ -589,10 +589,15 @@ static GENERAL_RAW_STANDIN_DELIVERIES: std::sync::LazyLock<
 
 /// Test builds: the next ACKed raw sends of these agents fail as a zombie
 /// connection's do (the receive ACK never comes while the connection still
-/// reads as connected), one per count, each after the given delay.
+/// reads as connected), one per queued delay, each after its delay.
 #[cfg(test)]
 static INJECTED_ZOMBIE_ACK_FAILURES: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<identity::AgentId, (usize, std::time::Duration)>>,
+    std::sync::Mutex<
+        std::collections::HashMap<
+            identity::AgentId,
+            std::collections::VecDeque<std::time::Duration>,
+        >,
+    >,
 > = std::sync::LazyLock::new(Default::default);
 
 #[cfg(test)]
@@ -600,11 +605,7 @@ fn take_injected_zombie_ack_failure(agent: &identity::AgentId) -> Option<std::ti
     INJECTED_ZOMBIE_ACK_FAILURES
         .lock()
         .ok()
-        .and_then(|mut failures| {
-            let (left, delay) = failures.get_mut(agent)?;
-            *left = left.checked_sub(1)?;
-            Some(*delay)
-        })
+        .and_then(|mut failures| failures.get_mut(agent)?.pop_front())
 }
 
 #[cfg(test)]
@@ -9806,24 +9807,26 @@ impl Agent {
                 &mut zombie_window,
             )
             .await;
-        let Some(window_end) = zombie_window.filter(|_| result.is_err()) else {
+        let (Some(window_end), Some(window)) = (
+            zombie_window.filter(|_| result.is_err()),
+            receive_ack_timeout,
+        ) else {
             return result;
         };
-        // The send that tore a zombie down redials and resends once, within
-        // what is left of its own receive-ACK window, rather than leaving
-        // the redial to its caller's next retry (a gossip fallback whose
-        // receipt a metered leaf may not see for minutes, or a whole retry
-        // cycle). The raw path's worst case before that fallback is
-        // unchanged: an ACK wait that used its whole window leaves no time,
-        // and the send fails as before. The redial is the per-send demand
-        // dial a leaf keeps (resolution's send-readiness repair, then
-        // `connect_to_agent`), not mesh maintenance.
-        if tokio::time::Instant::now() >= window_end {
-            return result;
-        }
+        // The send that tore a zombie down redials and resends once, inside
+        // ONE more receive-ACK window counted from the end of its first
+        // one, rather than leaving the redial to its caller's next retry (a
+        // gossip fallback whose receipt a metered leaf may not see for
+        // minutes, or a whole retry cycle). So a raw send's worst case
+        // before that fallback is two windows, and only after a zombie was
+        // torn down; a send without one keeps its single window. The redial
+        // is the per-send demand dial a leaf keeps (resolution's
+        // send-readiness repair, then `connect_to_agent`), not mesh
+        // maintenance.
+        let resend_deadline = window_end + window;
         let mut resend_zombie_window = None;
         match tokio::time::timeout_at(
-            window_end,
+            resend_deadline,
             self.send_direct_raw_quic_once(
                 agent_id,
                 payload,
@@ -9859,7 +9862,7 @@ impl Agent {
                     target: "x0x::direct",
                     stage = "send",
                     to = %network::hex_prefix(&agent_id.0, 4),
-                    "resend after a zombie teardown ran out of the receive-ACK window"
+                    "resend after a zombie teardown ran out of its receive-ACK window"
                 );
                 result
             }
@@ -10053,8 +10056,8 @@ impl Agent {
                 // endpoint is gone (supersede/NAT loss without a lifecycle
                 // event) yet `is_connected` keeps steering every retry back
                 // onto it via `cached_connected`. Tear it down so the resend
-                // (in what is left of this window) or the caller's next retry
-                // fails the fast path and takes the X0X-0031/0033
+                // (in one more window) or the caller's next retry fails the
+                // fast path and takes the X0X-0031/0033
                 // send-readiness repair (fresh dial) instead of re-sending
                 // into the same dead connection until the caller's deadline.
                 if receive_ack_timeout.is_some() && network.is_connected(&ant_peer_id).await {
@@ -10714,16 +10717,13 @@ impl Agent {
         false
     }
 
-    /// Test seam: this agent's next `count` ACKed raw sends fail as a zombie
-    /// connection's do, each after `delay`. Test builds only.
+    /// Test seam: this agent's next ACKed raw sends fail as a zombie
+    /// connection's do, one per entry of `delays`, each after its delay.
+    /// Test builds only.
     #[cfg(test)]
-    pub(crate) fn inject_zombie_ack_failures_for_testing(
-        &self,
-        count: usize,
-        delay: std::time::Duration,
-    ) {
+    pub(crate) fn inject_zombie_ack_failures_for_testing(&self, delays: &[std::time::Duration]) {
         if let Ok(mut failures) = INJECTED_ZOMBIE_ACK_FAILURES.lock() {
-            failures.insert(self.identity.agent_id(), (count, delay));
+            failures.insert(self.identity.agent_id(), delays.iter().copied().collect());
         }
     }
 
@@ -25924,11 +25924,10 @@ mod tests {
     }
 
     /// An ACKed raw send that tears a zombie connection down redials and
-    /// resends inside the same send, within what is left of its receive-ACK
-    /// window, on a metered leaf too: the payload arrives once and the send
-    /// succeeds instead of failing over to its caller's next retry. A zombie
-    /// whose ACK wait used the whole window is torn down but not resent, so
-    /// the raw path's worst case before a fallback is what it was.
+    /// resends inside the same send, on a metered leaf too, within ONE more
+    /// receive-ACK window counted from the end of its first: the payload
+    /// arrives once and the send succeeds instead of failing over to its
+    /// caller's next retry. A send without a zombie keeps its one window.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn zombie_teardown_redials_and_resends_within_the_send() {
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -25936,85 +25935,98 @@ mod tests {
         let mut bob_rx = bob.subscribe_direct();
         let alice_network = alice.network().expect("alice network");
         let bob_peer = ant_quic::PeerId(bob.machine_id().0);
-        alice_network
-            .connect_addr(bob_addr)
-            .await
-            .expect("alice connects to bob");
-        await_quiesced_connection(
-            alice_network,
-            &bob_peer,
-            std::time::Duration::from_secs(1) * test_time_multiplier(),
-        )
-        .await;
+        let settle = std::time::Duration::from_millis(500) * test_time_multiplier();
+        let connect = || async {
+            if !alice_network.is_connected(&bob_peer).await {
+                alice_network
+                    .connect_addr(bob_addr)
+                    .await
+                    .expect("alice connects to bob");
+            }
+            await_quiesced_connection(alice_network, &bob_peer, settle).await;
+        };
+        let send = |payload: &'static [u8], window: std::time::Duration| {
+            let alice = &alice;
+            let to = bob.agent_id();
+            async move {
+                let started = std::time::Instant::now();
+                let result = alice
+                    .send_direct_raw_quic(
+                        &to,
+                        payload,
+                        Some(window),
+                        std::time::Duration::from_millis(250),
+                        None,
+                    )
+                    .await;
+                (result, started.elapsed())
+            }
+        };
+        let quiet = std::time::Duration::from_millis(500);
 
-        // The first ACKed send fails as a zombie's does: no receive ACK,
-        // while the connection still reads as connected.
-        alice.inject_zombie_ack_failures_for_testing(1, std::time::Duration::ZERO);
+        // 1. A zombie torn down mid-window: the resend lands at once.
+        connect().await;
         let window = std::time::Duration::from_secs(5) * test_time_multiplier();
-        let payload = b"resent after a zombie teardown".to_vec();
-        let started = std::time::Instant::now();
-        let path = alice
-            .send_direct_raw_quic(
-                &bob.agent_id(),
-                &payload,
-                Some(window),
-                std::time::Duration::from_millis(250),
-                None,
-            )
-            .await
-            .expect("the send redials and resends after the teardown");
-        assert_eq!(path, dm::DmPath::RawQuicAcked);
-        assert!(
-            started.elapsed() < window,
-            "the resend ran within its receive-ACK window"
-        );
-        assert!(alice_network.is_connected(&bob_peer).await, "redialed");
-
+        alice.inject_zombie_ack_failures_for_testing(&[std::time::Duration::ZERO]);
+        let (result, took) = send(b"mid-window zombie", window).await;
+        assert_eq!(result.expect("resent"), dm::DmPath::RawQuicAcked);
+        assert!(took < window, "{took:?}");
         let received = tokio::time::timeout(std::time::Duration::from_secs(2), bob_rx.recv())
             .await
             .expect("bob receives the resend")
             .expect("bob's direct subscription is open");
         assert_eq!(received.sender, alice.agent_id());
-        assert_eq!(received.payload, payload);
+        assert_eq!(received.payload, b"mid-window zombie");
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(500), bob_rx.recv())
-                .await
-                .is_err(),
-            "one copy only"
+            tokio::time::timeout(quiet, bob_rx.recv()).await.is_err(),
+            "one copy"
         );
 
-        // A zombie that spends the whole window: torn down, not resent.
-        await_quiesced_connection(
-            alice_network,
-            &bob_peer,
-            std::time::Duration::from_millis(500) * test_time_multiplier(),
-        )
-        .await;
+        // 2. A zombie that spends its whole window: the resend gets one more.
+        connect().await;
         let window = std::time::Duration::from_secs(1);
-        alice.inject_zombie_ack_failures_for_testing(1, window);
-        let started = std::time::Instant::now();
-        let spent = alice
-            .send_direct_raw_quic(
-                &bob.agent_id(),
-                b"never resent",
-                Some(window),
-                std::time::Duration::from_millis(250),
-                None,
-            )
-            .await;
-        assert!(spent.is_err(), "no time was left to resend");
+        alice.inject_zombie_ack_failures_for_testing(&[window]);
+        let (result, took) = send(b"whole-window zombie", window).await;
+        assert_eq!(result.expect("resent"), dm::DmPath::RawQuicAcked);
+        assert!(took >= window && took < 2 * window, "{took:?}");
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), bob_rx.recv())
+            .await
+            .expect("bob receives the resend")
+            .expect("bob's direct subscription is open");
+        assert_eq!(received.payload, b"whole-window zombie");
         assert!(
-            started.elapsed() < window + std::time::Duration::from_millis(900),
-            "no second window: {:?}",
-            started.elapsed()
+            tokio::time::timeout(quiet, bob_rx.recv()).await.is_err(),
+            "one copy"
         );
-        assert!(!alice_network.is_connected(&bob_peer).await, "torn down");
+
+        // 3. The resend hangs too: it never runs past one window beyond the
+        //    first's, so the send ends at two windows.
+        connect().await;
+        alice.inject_zombie_ack_failures_for_testing(&[window, 3 * window]);
+        let (result, took) = send(b"two zombies", window).await;
+        assert!(result.is_err());
+        let slack = std::time::Duration::from_millis(400);
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(500), bob_rx.recv())
-                .await
-                .is_err(),
-            "nothing was resent"
+            took >= 2 * window - slack && took < 2 * window + slack,
+            "{took:?}"
         );
+        assert!(tokio::time::timeout(quiet, bob_rx.recv()).await.is_err());
+
+        // 4. No zombie: the connection is gone when the ACK wait fails, so
+        //    nothing is torn down and the send keeps its single window.
+        connect().await;
+        let delay = std::time::Duration::from_millis(500);
+        alice.inject_zombie_ack_failures_for_testing(&[delay]);
+        let drop_network = std::sync::Arc::clone(alice_network);
+        let dropper = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = drop_network.disconnect(&bob_peer).await;
+        });
+        let (result, took) = send(b"no zombie", window).await;
+        dropper.await.expect("dropper");
+        assert!(result.is_err());
+        assert!(took >= delay && took < delay + slack, "{took:?}");
+        assert!(tokio::time::timeout(quiet, bob_rx.recv()).await.is_err());
     }
 
     /// fetch>it's same-computer link: after the contact's signed
