@@ -1014,6 +1014,9 @@ pub(super) struct AppState {
     /// the single Welcome listener loop (a metered leaf's gossip-inbox
     /// receipt can take minutes): a per-group share and a global cap.
     pub(super) welcome_chunk_ack_admission: crate::server::routes::named_groups::FairAdmission,
+    /// The joiner's in-flight Welcome `ChunkAck` sends with their admission
+    /// tickets, per `(welcome, chunk)`; drained at shutdown.
+    pub(super) welcome_ack_tasks: crate::server::routes::named_groups::WelcomeAckTasks,
     /// ADR 0107 (r5 G7): fair, coalescing admission for join-result
     /// `FetchRequest` handlers, which run off the shared join-result
     /// listener: one in-flight handler per `(group, member)`, a per-group

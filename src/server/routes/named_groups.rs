@@ -10,6 +10,7 @@ mod control_blob;
 mod fair_admission;
 mod join_result_pins;
 mod seat_cert_fetch;
+mod welcome_acks;
 pub(in crate::server) use control_blob::{
     handle_control_blob_message, ControlBlobMessage, ControlBlobState,
 };
@@ -19,6 +20,7 @@ pub(in crate::server) use seat_cert_fetch::{
     handle_group_cert_fetch_request, handle_group_cert_fetch_response, publish_group_cert_fetch,
     CertEvidenceStamp, GROUP_CERT_FETCH_DOMAIN, GROUP_CERT_FETCH_RESPONSE_DOMAIN,
 };
+pub(in crate::server) use welcome_acks::WelcomeAckTasks;
 
 mod requester_offer;
 pub(in crate::server) use requester_offer::{
@@ -976,6 +978,10 @@ pub(in crate::server) struct PendingWelcomeReceive {
     total_chunks: u64,
     chunks: BTreeMap<u64, Vec<u8>>,
     received_bytes: u64,
+    /// A Complete arrived before every chunk: a stream ended early (a
+    /// replaced stream's Complete, or a chunk lost on the way). The fetch's
+    /// next scheduled attempt asks again even if bytes arrived meanwhile.
+    ended_early: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -39444,9 +39450,9 @@ pub(in crate::server) const WELCOME_CHUNK_ACK_CAP: usize = 32;
 pub(in crate::server) const WELCOME_CHUNK_ACK_PER_GROUP_CAP: usize = 8;
 
 /// Bound on one `ChunkAck` send. It exceeds the DM layer's own bound for
-/// the frame's config (a raw attempt with its supersede reissue and zombie
-/// resend, then two gossip-inbox publishes: 8 s windows each), so it only
-/// ends a send that would not end.
+/// the frame's config (a raw attempt with its supersede reissue, then two
+/// gossip-inbox publishes: 8 s windows each), so it only ends a send that
+/// would not end. An ack also ends with its Welcome's receive.
 const WELCOME_CHUNK_ACK_BUDGET: Duration = Duration::from_secs(60);
 
 /// ADR 0107 (review r2): spawn a join-artifact egress task registered under
@@ -42136,10 +42142,11 @@ fn classify_welcome_fetch_send_error(error: x0x::dm::DmError) -> WelcomeFetchSen
     }
 }
 
-/// Send one FetchRequest. A fetch's first request takes raw QUIC over a
-/// live connection to the owner (`first`); a stalled retry takes the gossip
-/// inbox, whose signed envelope the owner can attribute even when its cold
-/// caches cannot yet bind our raw frames to us (a restarted owner).
+/// Send one FetchRequest. A fetch's first scheduled request takes raw QUIC
+/// over a live connection to the owner (`first`). A stalled retry, and the
+/// first request of a fetch that joined one in flight (itself a retry), take
+/// the gossip inbox, whose signed envelope the owner can attribute even when
+/// its cold caches cannot yet bind our raw frames to us (a restarted owner).
 async fn send_welcome_fetch_request(
     state: &Arc<AppState>,
     agent_id: &AgentId,
@@ -42179,6 +42186,7 @@ async fn cleanup_welcome_fetch_state(state: &Arc<AppState>, welcome_id: &str) {
         .write()
         .await
         .remove(welcome_id);
+    state.welcome_ack_tasks.release_welcome(welcome_id);
     state
         .pending_welcome_waiters
         .write()
@@ -42192,18 +42200,22 @@ async fn fetch_treekem_welcome_with_retries(
     welcome_ref: &WelcomeRef,
 ) -> std::result::Result<Vec<u8>, String> {
     let send_state = Arc::clone(state);
-    let mut sent = 0_usize;
-    fetch_treekem_welcome_via(state, group_id, welcome_ref, move |source, request| {
-        let state = Arc::clone(&send_state);
-        let first = sent == 0;
-        sent += 1;
-        async move { send_welcome_fetch_request(&state, &source, &request, first).await }
-    })
+    fetch_treekem_welcome_via(
+        state,
+        group_id,
+        welcome_ref,
+        move |source, request, first| {
+            let state = Arc::clone(&send_state);
+            async move { send_welcome_fetch_request(&state, &source, &request, first).await }
+        },
+    )
     .await
 }
 
 /// Fetch a Welcome with an injectable request sender so the receive path can
-/// be tested when the FetchRequest's delivery receipt is lost.
+/// be tested when the FetchRequest's delivery receipt is lost. The sender
+/// gets `(owner, request, first)`; `first` marks the fetch's first scheduled
+/// request.
 async fn fetch_treekem_welcome_via<S, F>(
     state: &Arc<AppState>,
     group_id: &str,
@@ -42211,7 +42223,7 @@ async fn fetch_treekem_welcome_via<S, F>(
     send: S,
 ) -> std::result::Result<Vec<u8>, String>
 where
-    S: FnMut(AgentId, WelcomeBlobMessage) -> F,
+    S: FnMut(AgentId, WelcomeBlobMessage, bool) -> F,
     F: std::future::Future<Output = std::result::Result<(), WelcomeFetchSendError>>,
 {
     fetch_treekem_welcome_via_schedule(
@@ -42234,7 +42246,7 @@ async fn fetch_treekem_welcome_via_schedule<S, F>(
     fetch_timeout: Duration,
 ) -> std::result::Result<Vec<u8>, String>
 where
-    S: FnMut(AgentId, WelcomeBlobMessage) -> F,
+    S: FnMut(AgentId, WelcomeBlobMessage, bool) -> F,
     F: std::future::Future<Output = std::result::Result<(), WelcomeFetchSendError>>,
 {
     if welcome_ref.byte_len > x0x::files::MAX_TRANSFER_SIZE {
@@ -42265,6 +42277,10 @@ where
                 return Err("conflicting in-flight TreeKEM Welcome fetch".to_string());
             }
             None => {
+                // A new fetch: no ack of an earlier one may hold its slots.
+                state
+                    .welcome_ack_tasks
+                    .release_welcome(&welcome_ref.welcome_id);
                 receives.insert(
                     welcome_ref.welcome_id.clone(),
                     PendingWelcomeReceive {
@@ -42274,6 +42290,7 @@ where
                         total_chunks,
                         chunks: BTreeMap::new(),
                         received_bytes: 0,
+                        ended_early: false,
                     },
                 );
                 true
@@ -42319,14 +42336,20 @@ where
             }
         }
         if attempt > 0 {
-            let progress_bytes = state
+            let (progress_bytes, ended_early) = state
                 .pending_welcome_receives
-                .read()
+                .write()
                 .await
-                .get(&welcome_ref.welcome_id)
-                .map_or(0, |receive| receive.received_bytes);
-            if progress_bytes > last_progress_bytes {
-                last_progress_bytes = progress_bytes;
+                .get_mut(&welcome_ref.welcome_id)
+                .map_or((0, false), |receive| {
+                    (
+                        receive.received_bytes,
+                        std::mem::take(&mut receive.ended_early),
+                    )
+                });
+            let progressed = progress_bytes > last_progress_bytes;
+            last_progress_bytes = last_progress_bytes.max(progress_bytes);
+            if progressed && !ended_early {
                 tracing::debug!(
                     target: "welcome.trace",
                     stage = "fetch_retry_stream_progress",
@@ -42342,6 +42365,7 @@ where
                 group_id,
                 welcome_id = %welcome_ref.welcome_id,
                 attempt,
+                ended_early,
             );
         }
         if should_send_fetch || attempt > 0 {
@@ -42349,7 +42373,9 @@ where
                 group_id: group_id.to_string(),
                 welcome_id: welcome_ref.welcome_id.clone(),
             };
-            requests.push(send(source, request));
+            // Only the first scheduled attempt is a first request; joining a
+            // fetch in flight sends its first one as a retry.
+            requests.push(send(source, request, attempt == 0));
         }
     }
     if received.is_none() {
@@ -42563,6 +42589,7 @@ pub(in crate::server) async fn handle_welcome_blob_message(
                     .write()
                     .await
                     .remove(&welcome_id);
+                state.welcome_ack_tasks.release_welcome(&welcome_id);
                 notify_welcome_waiters(
                     state,
                     &welcome_id,
@@ -43085,13 +43112,16 @@ async fn handle_welcome_blob_chunk(
 /// joiner's bounded fetch expired and discarded the receive.
 ///
 /// Sends are admitted under a per-group share and a global cap, and each
-/// ends within [`WELCOME_CHUNK_ACK_BUDGET`]. A chunk received again (the
-/// owner restreams) is acked again, not coalesced with an earlier ack that
-/// may have landed on the replaced stream's slot. A refused ack is dropped:
-/// acks are cumulative (`FileChunkAckSlot::record_ack` keeps the highest),
-/// so a later one covers it, and a stream whose final ack is lost ends
-/// without its Complete; the joiner's next FetchRequest restreams it
-/// (`replace_welcome_stream`).
+/// ends within [`WELCOME_CHUNK_ACK_BUDGET`]. They are registered per
+/// `(welcome, chunk)` in [`WelcomeAckTasks`]: a chunk received again (the
+/// owner restreams) releases the earlier ack's slot and is acked again, so a
+/// stalled burst from an old stream never refuses a restream's acks, and the
+/// acks end with their Welcome's receive. A refused ack is dropped: acks are
+/// cumulative (`FileChunkAckSlot::record_ack` keeps the highest), so a later
+/// one covers it, and a stream whose final ack is lost ends without its
+/// Complete; the joiner's next FetchRequest restreams it
+/// (`replace_welcome_stream`), which within a fetch that is making progress
+/// means the next fetch.
 fn spawn_welcome_chunk_ack(
     state: &Arc<AppState>,
     owner: &AgentId,
@@ -43099,12 +43129,11 @@ fn spawn_welcome_chunk_ack(
     welcome_id: String,
     sequence: u64,
 ) {
-    static ACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let key = format!(
-        "{welcome_id}:{sequence}:{}",
-        ACKS.fetch_add(1, Ordering::Relaxed)
-    );
-    let ticket = match state.welcome_chunk_ack_admission.try_admit(&key, group_id) {
+    state.welcome_ack_tasks.release(&welcome_id, sequence);
+    let ticket = match state
+        .welcome_chunk_ack_admission
+        .try_admit(&format!("{welcome_id}:{sequence}"), group_id)
+    {
         Ok(ticket) => ticket,
         Err(refusal) => {
             tracing::debug!(target: "welcome.trace", stage = "chunk_ack_not_admitted", welcome_id = %welcome_id, seq = sequence, ?refusal);
@@ -43113,8 +43142,9 @@ fn spawn_welcome_chunk_ack(
     };
     let task_state = Arc::clone(state);
     let owner = *owner;
-    tokio::spawn(async move {
-        let _ticket = ticket;
+    let task_welcome = welcome_id.clone();
+    let send = async move {
+        let welcome_id = task_welcome;
         let ack = WelcomeBlobMessage::ChunkAck {
             welcome_id: welcome_id.clone(),
             sequence,
@@ -43129,13 +43159,19 @@ fn spawn_welcome_chunk_ack(
                 tracing::debug!(target: "welcome.trace", stage = "chunk_ack_sent", welcome_id = %welcome_id, seq = sequence);
             }
             Ok(Err(e)) => {
-                tracing::warn!(welcome_id = %LogHexId::new("welcome", &welcome_id), sequence, "failed to ack Welcome blob chunk: {e}");
+                tracing::warn!(target: "welcome.trace", stage = "chunk_ack_failed", welcome_id = %LogHexId::new("welcome", &welcome_id), seq = sequence, "failed to ack Welcome blob chunk: {e}");
             }
             Err(_) => {
-                tracing::warn!(welcome_id = %LogHexId::new("welcome", &welcome_id), sequence, "Welcome blob chunk ack ran out of its budget");
+                tracing::warn!(target: "welcome.trace", stage = "chunk_ack_budget_spent", welcome_id = %LogHexId::new("welcome", &welcome_id), seq = sequence, "Welcome blob chunk ack ran out of its budget");
             }
         }
-    });
+    };
+    if !state
+        .welcome_ack_tasks
+        .spawn(&welcome_id, sequence, ticket, send)
+    {
+        tracing::debug!(target: "welcome.trace", stage = "chunk_ack_after_shutdown", welcome_id = %welcome_id, seq = sequence);
+    }
 }
 
 #[cfg(test)]
@@ -43174,34 +43210,41 @@ async fn send_welcome_chunk_ack(
 
 async fn handle_welcome_blob_complete(state: &Arc<AppState>, sender: &AgentId, welcome_id: &str) {
     let sender_hex = hex::encode(sender.as_bytes());
-    {
-        let receives = state.pending_welcome_receives.read().await;
+    let receive = {
+        let mut receives = state.pending_welcome_receives.write().await;
         let Some(receive) = receives.get(welcome_id) else {
             return;
         };
         if receive.source != sender_hex {
             return;
         }
-    }
-    let receive = state
-        .pending_welcome_receives
-        .write()
-        .await
-        .remove(welcome_id);
+        // A Complete before every chunk is in ends a stream early, not this
+        // receive: it can be a replaced stream's Complete, still in flight
+        // when the next fetch registered its receive. Keep waiting; the
+        // current stream's chunks and Complete, or the fetch's deadline,
+        // settle it.
+        if receive.received_bytes != receive.byte_len
+            || receive.chunks.len() as u64 != receive.total_chunks
+        {
+            tracing::debug!(
+                target: "welcome.trace",
+                stage = "complete_before_chunks",
+                welcome_id,
+                received = receive.received_bytes,
+                byte_len = receive.byte_len,
+            );
+            if let Some(receive) = receives.get_mut(welcome_id) {
+                receive.ended_early = true;
+            }
+            return;
+        }
+        receives.remove(welcome_id)
+    };
     let Some(receive) = receive else {
         return;
     };
-    if receive.received_bytes != receive.byte_len
-        || receive.chunks.len() as u64 != receive.total_chunks
-    {
-        notify_welcome_waiters(
-            state,
-            welcome_id,
-            Err("incomplete Welcome blob transfer".to_string()),
-        )
-        .await;
-        return;
-    }
+    // Every chunk is in: acks still in flight can no longer help.
+    state.welcome_ack_tasks.release_welcome(welcome_id);
     let mut bytes = Vec::with_capacity(receive.byte_len as usize);
     for sequence in 0..receive.total_chunks {
         let Some(chunk) = receive.chunks.get(&sequence) else {
@@ -44167,6 +44210,7 @@ pub(in crate::server) mod tests {
                 crate::server::routes::named_groups::WELCOME_CHUNK_ACK_PER_GROUP_CAP,
                 crate::server::routes::named_groups::WELCOME_CHUNK_ACK_CAP,
             ),
+            welcome_ack_tasks: crate::server::routes::named_groups::WelcomeAckTasks::new(),
             join_result_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
                 crate::server::routes::named_groups::JOIN_RESULT_FETCH_PER_GROUP_CAP,
                 crate::server::routes::named_groups::JOIN_RESULT_FETCH_HANDLER_CAP,
@@ -56217,6 +56261,7 @@ pub(in crate::server) mod tests {
                 total_chunks,
                 chunks: BTreeMap::new(),
                 received_bytes: 0,
+                ended_early: false,
             },
         );
         let (tx, rx) = oneshot::channel();
@@ -56323,8 +56368,11 @@ pub(in crate::server) mod tests {
         };
         let receive_state = Arc::clone(&joiner);
         let receive_bytes = bytes.clone();
-        let received =
-            fetch_treekem_welcome_via(&joiner, &group_id, &welcome_ref, move |source, request| {
+        let received = fetch_treekem_welcome_via(
+            &joiner,
+            &group_id,
+            &welcome_ref,
+            move |source, request, _| {
                 let state = Arc::clone(&receive_state);
                 let welcome_id = welcome_id.clone();
                 let receive_bytes = receive_bytes.clone();
@@ -56349,9 +56397,10 @@ pub(in crate::server) mod tests {
                         "timed out after 1 retries over 24.0s".to_string(),
                     ))
                 }
-            })
-            .await
-            .map_err(anyhow::Error::msg)?;
+            },
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
         assert_eq!(received, bytes);
         assert!(joiner.pending_welcome_receives.read().await.is_empty());
         assert!(joiner.pending_welcome_waiters.read().await.is_empty());
@@ -56635,7 +56684,7 @@ pub(in crate::server) mod tests {
             &joiner,
             &group_id,
             &welcome_ref,
-            move |_, _| {
+            move |_, _, _| {
                 let state = Arc::clone(&send_state);
                 let bytes = send_bytes.clone();
                 let id = send_id.clone();
@@ -56689,7 +56738,7 @@ pub(in crate::server) mod tests {
             &joiner,
             &group_id,
             &welcome_ref,
-            move |_, _| {
+            move |_, _, _| {
                 let times = Arc::clone(&send_times);
                 let state = Arc::clone(&send_state);
                 let id = send_id.clone();

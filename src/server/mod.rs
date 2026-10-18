@@ -1190,6 +1190,7 @@ pub async fn serve_with_options(
             crate::server::routes::named_groups::WELCOME_CHUNK_ACK_PER_GROUP_CAP,
             crate::server::routes::named_groups::WELCOME_CHUNK_ACK_CAP,
         ),
+        welcome_ack_tasks: crate::server::routes::named_groups::WelcomeAckTasks::new(),
         join_result_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
             crate::server::routes::named_groups::JOIN_RESULT_FETCH_PER_GROUP_CAP,
             crate::server::routes::named_groups::JOIN_RESULT_FETCH_HANDLER_CAP,
@@ -2962,6 +2963,9 @@ pub async fn serve_with_options(
             .take()
             .unwrap_or_default();
         bg_tasks.extend(welcome_streams.into_values());
+        // Closing the joiner's ChunkAck registry under its own lock: an ack
+        // the listener hands over after this spawns nothing.
+        bg_tasks.extend(state.welcome_ack_tasks.close());
         bg_tasks.extend(std::mem::take(&mut *state.directory_tasks.write().await).into_values());
         // Keep abort handles so stragglers can be aborted after the grace window.
         // Fix C (issue #116): on the timeout path, AWAIT the aborts too — keep the

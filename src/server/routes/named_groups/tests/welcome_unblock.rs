@@ -90,8 +90,11 @@ async fn welcome_completes_while_chunk_ack_receipts_never_arrive() -> anyhow::Re
     let listener_state = Arc::clone(&joiner);
     let listener_done = Arc::new(AtomicBool::new(false));
     let done = Arc::clone(&listener_done);
-    let fetched =
-        fetch_treekem_welcome_via(&joiner, &group_id, &welcome_ref, move |source, request| {
+    let fetched = fetch_treekem_welcome_via(
+        &joiner,
+        &group_id,
+        &welcome_ref,
+        move |source, request, _| {
             let state = Arc::clone(&listener_state);
             let frames = frames.clone();
             let done = Arc::clone(&done);
@@ -109,9 +112,10 @@ async fn welcome_completes_while_chunk_ack_receipts_never_arrive() -> anyhow::Re
                 });
                 Ok(())
             }
-        })
-        .await
-        .map_err(anyhow::Error::msg)?;
+        },
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
 
     assert_eq!(fetched, bytes, "the joiner assembles the exact Welcome");
     // The paused clock moves only in millisecond ticks between polls.
@@ -121,22 +125,21 @@ async fn welcome_completes_while_chunk_ack_receipts_never_arrive() -> anyhow::Re
     );
     tokio::task::yield_now().await;
     assert!(listener_done.load(Ordering::SeqCst));
-    assert_eq!(
-        gate.started.load(Ordering::SeqCst),
-        2,
-        "each chunk was acked"
+    assert!(
+        gate.started.load(Ordering::SeqCst) <= 2,
+        "one ack per chunk"
     );
-    assert_eq!(joiner.welcome_chunk_ack_admission.in_flight(), 2);
-
-    // Every parked send ends within its budget.
-    tokio::time::sleep(WELCOME_CHUNK_ACK_BUDGET).await;
-    chunk_acks_settle(&joiner).await;
+    // The assembled Welcome released its acks still waiting on receipts.
+    assert_eq!(joiner.welcome_ack_tasks.in_flight(), 0);
+    assert_eq!(joiner.welcome_chunk_ack_admission.in_flight(), 0);
     unpark_chunk_acks(&welcome_ref.welcome_id);
     Ok(())
 }
 
 /// The ack sends the listener spawns are bounded: a group gets at most its
-/// share, a re-sent chunk included (it is acked again, not coalesced).
+/// share. A stalled burst never blocks a restream: a chunk received again
+/// releases its earlier ack's slot and is acked again, and the end of the
+/// fetch releases them all. Each send also ends within its budget.
 #[tokio::test]
 async fn chunk_ack_sends_are_bounded_and_end_within_their_budget() -> anyhow::Result<()> {
     let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
@@ -145,55 +148,194 @@ async fn chunk_ack_sends_are_bounded_and_end_within_their_budget() -> anyhow::Re
     let group_id = "e2".repeat(32);
     let chunks = WELCOME_CHUNK_ACK_PER_GROUP_CAP + 4;
     let (_bytes, welcome_ref, frames) = staged_welcome(&owner, &group_id, chunks);
-    let gate = park_chunk_acks(&welcome_ref.welcome_id);
-    joiner.pending_welcome_receives.write().await.insert(
-        welcome_ref.welcome_id.clone(),
-        PendingWelcomeReceive {
-            group_id: group_id.clone(),
-            source: welcome_ref.source.clone(),
-            byte_len: welcome_ref.byte_len,
-            total_chunks: chunks as u64,
-            chunks: BTreeMap::new(),
-            received_bytes: 0,
-        },
-    );
+    let welcome_id = welcome_ref.welcome_id.clone();
+    let gate = park_chunk_acks(&welcome_id);
+    let register = || PendingWelcomeReceive {
+        group_id: group_id.clone(),
+        source: welcome_ref.source.clone(),
+        byte_len: welcome_ref.byte_len,
+        total_chunks: chunks as u64,
+        chunks: BTreeMap::new(),
+        received_bytes: 0,
+        ended_early: false,
+    };
+    joiner
+        .pending_welcome_receives
+        .write()
+        .await
+        .insert(welcome_id.clone(), register());
     tokio::time::pause();
 
     let chunk_frames: Vec<_> = frames
         .into_iter()
         .filter(|frame| matches!(frame, WelcomeBlobMessage::Chunk { .. }))
         .collect();
-    // The first chunk twice (an owner restream), then every chunk.
-    for frame in std::iter::once(chunk_frames[0].clone()).chain(chunk_frames) {
-        tokio::time::timeout(
-            Duration::from_millis(1),
-            dispatch_welcome_blob_message(&joiner, &owner_id, frame),
-        )
-        .await
-        .expect("a chunk never holds the Welcome listener");
-    }
-    tokio::task::yield_now().await;
+    let deliver = |frames: Vec<WelcomeBlobMessage>| {
+        let joiner = Arc::clone(&joiner);
+        async move {
+            for frame in frames {
+                tokio::time::timeout(
+                    Duration::from_millis(1),
+                    dispatch_welcome_blob_message(&joiner, &owner_id, frame),
+                )
+                .await
+                .expect("a chunk never holds the Welcome listener");
+            }
+            tokio::task::yield_now().await;
+        }
+    };
+    let share = WELCOME_CHUNK_ACK_PER_GROUP_CAP;
 
+    deliver(chunk_frames.clone()).await;
     assert_eq!(
         gate.started.load(Ordering::SeqCst),
-        WELCOME_CHUNK_ACK_PER_GROUP_CAP,
-        "the group's share caps the acks, the re-sent chunk's included"
+        share,
+        "the share caps the acks"
     );
-    assert_eq!(
-        joiner.welcome_chunk_ack_admission.in_flight(),
-        WELCOME_CHUNK_ACK_PER_GROUP_CAP
-    );
+    assert_eq!(joiner.welcome_ack_tasks.in_flight(), share);
+    assert_eq!(joiner.welcome_chunk_ack_admission.in_flight(), share);
     let stored = joiner
         .pending_welcome_receives
         .read()
         .await
-        .get(&welcome_ref.welcome_id)
+        .get(&welcome_id)
         .map(|receive| receive.chunks.len());
     assert_eq!(stored, Some(chunks), "every chunk is kept, acked or not");
 
+    // The owner restreams while the first acks are stuck: each re-received
+    // chunk's ack replaces its predecessor, so the restream is acked.
+    deliver(chunk_frames[..share].to_vec()).await;
+    assert_eq!(
+        gate.started.load(Ordering::SeqCst),
+        2 * share,
+        "the restream's acks went out"
+    );
+    assert_eq!(joiner.welcome_ack_tasks.in_flight(), share);
+    assert_eq!(joiner.welcome_chunk_ack_admission.in_flight(), share);
+
+    // The fetch ends: its acks are released at once.
+    cleanup_welcome_fetch_state(&joiner, &welcome_id).await;
+    assert_eq!(joiner.welcome_ack_tasks.in_flight(), 0);
+    assert_eq!(joiner.welcome_chunk_ack_admission.in_flight(), 0);
+
+    // A new fetch's acks: each send still ends within its budget.
+    joiner
+        .pending_welcome_receives
+        .write()
+        .await
+        .insert(welcome_id.clone(), register());
+    deliver(chunk_frames[..2].to_vec()).await;
+    assert_eq!(joiner.welcome_ack_tasks.in_flight(), 2);
     tokio::time::sleep(WELCOME_CHUNK_ACK_BUDGET).await;
     chunk_acks_settle(&joiner).await;
-    unpark_chunk_acks(&welcome_ref.welcome_id);
+    assert_eq!(joiner.welcome_ack_tasks.in_flight(), 0);
+    unpark_chunk_acks(&welcome_id);
+    Ok(())
+}
+
+/// A Complete that arrives before every chunk (a replaced stream's, or one
+/// whose chunk was lost) never fails the fetch: the receive stays, the
+/// fetch asks again at its next attempt although bytes had arrived, and the
+/// restream assembles the Welcome.
+#[tokio::test]
+async fn an_early_complete_never_fails_the_fetch() -> anyhow::Result<()> {
+    let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+    let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+    let owner_id = owner.agent.agent_id();
+    let group_id = "e6".repeat(32);
+    let (bytes, welcome_ref, frames) = staged_welcome(&owner, &group_id, 2);
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let sends = Arc::new(AtomicUsize::new(0));
+    let sent = Arc::clone(&sends);
+    let listener_state = Arc::clone(&joiner);
+
+    let fetched = tokio::time::timeout(
+        Duration::from_secs(60),
+        fetch_treekem_welcome_via(&joiner, &group_id, &welcome_ref, move |_, _, _| {
+            let state = Arc::clone(&listener_state);
+            let attempt = sent.fetch_add(1, Ordering::SeqCst);
+            // The first stream loses its last chunk; the restream is whole.
+            let frames: Vec<_> = if attempt == 0 {
+                let (complete, rest) = frames.split_last().expect("frames");
+                let mut early = rest[..rest.len() - 1].to_vec();
+                early.push(complete.clone());
+                early
+            } else {
+                frames.clone()
+            };
+            async move {
+                tokio::spawn(async move {
+                    for frame in frames {
+                        dispatch_welcome_blob_message(&state, &owner_id, frame).await;
+                    }
+                });
+                Ok(())
+            }
+        }),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("the fetch never settled"))?
+    .map_err(anyhow::Error::msg)?;
+
+    assert_eq!(fetched, bytes);
+    assert_eq!(
+        sends.load(Ordering::SeqCst),
+        2,
+        "the early end prompted a retry"
+    );
+    assert!(started.elapsed() < WELCOME_FETCH_UNDER_GUARD_TIMEOUT);
+    Ok(())
+}
+
+/// A fetch that joins one already in flight sends its first FetchRequest
+/// as the retry it is (`first` is false), so it takes the gossip inbox; a
+/// fetch of its own sends its first one as first.
+#[tokio::test]
+async fn joining_a_fetch_in_flight_sends_its_first_request_as_a_retry() -> anyhow::Result<()> {
+    let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+    let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+    let group_id = "e7".repeat(32);
+    let (_bytes, welcome_ref, _frames) = staged_welcome(&owner, &group_id, 1);
+    tokio::time::pause();
+    let schedule = [Duration::ZERO, Duration::from_millis(10)];
+    let firsts = Arc::new(StdMutex::new(Vec::new()));
+    let fetch = |state: Arc<AppState>| {
+        let firsts = Arc::clone(&firsts);
+        let welcome_ref = welcome_ref.clone();
+        let group_id = group_id.clone();
+        async move {
+            fetch_treekem_welcome_via_schedule(
+                &state,
+                &group_id,
+                &welcome_ref,
+                move |_, _, first| {
+                    firsts.lock().expect("firsts").push(first);
+                    std::future::ready(Ok(()))
+                },
+                &schedule,
+                Duration::from_millis(50),
+            )
+            .await
+        }
+    };
+
+    // Its own fetch: the first scheduled request is first, the retry is not.
+    let own = fetch(Arc::clone(&joiner)).await;
+    assert!(own.is_err(), "nothing streams in this test");
+    assert_eq!(*firsts.lock().expect("firsts"), vec![true, false]);
+
+    // Joining: another fetch already registered this receive.
+    firsts.lock().expect("firsts").clear();
+    let in_flight = fetch(Arc::clone(&joiner));
+    let joined = fetch(Arc::clone(&joiner));
+    let (_, _) = tokio::join!(in_flight, joined);
+    let recorded = firsts.lock().expect("firsts").clone();
+    assert_eq!(
+        recorded.iter().filter(|first| **first).count(),
+        1,
+        "only the fetch that registered the receive sends a first request: {recorded:?}"
+    );
     Ok(())
 }
 
@@ -214,7 +356,7 @@ async fn late_fetch_request_receipt_keeps_the_pending_receive() -> anyhow::Resul
     let welcome_id = welcome_ref.welcome_id.clone();
     let fetched = tokio::time::timeout(
         Duration::from_secs(300),
-        fetch_treekem_welcome_via(&joiner, &group_id, &welcome_ref, move |_, _| {
+        fetch_treekem_welcome_via(&joiner, &group_id, &welcome_ref, move |_, _, _| {
             let state = Arc::clone(&listener_state);
             let frames = frames.clone();
             let welcome_id = welcome_id.clone();
@@ -273,7 +415,7 @@ async fn fetch_ends_at_its_deadline_while_a_request_is_outstanding() -> anyhow::
 
     let result = tokio::time::timeout(
         Duration::from_secs(300),
-        fetch_treekem_welcome_via(&joiner, &group_id, &welcome_ref, move |_, _| {
+        fetch_treekem_welcome_via(&joiner, &group_id, &welcome_ref, move |_, _, _| {
             sent.fetch_add(1, Ordering::SeqCst);
             std::future::pending::<std::result::Result<(), WelcomeFetchSendError>>()
         }),
