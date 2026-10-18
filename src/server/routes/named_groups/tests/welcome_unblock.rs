@@ -157,7 +157,7 @@ async fn chunk_ack_sends_are_bounded_and_end_within_their_budget() -> anyhow::Re
         total_chunks: chunks as u64,
         chunks: BTreeMap::new(),
         received_bytes: 0,
-        ended_early: false,
+        ended_early: None,
     };
     joiner
         .pending_welcome_receives
@@ -521,7 +521,7 @@ async fn welcome_control_frames_take_raw_quic_over_a_live_connection() -> anyhow
     connected(true);
     let fetched = send_welcome_fetch_request(&joiner, &owner_id, &request, true).await;
     assert!(fetched.is_ok(), "{fetched:?}");
-    let acked = send_welcome_blob_message(&joiner, &owner_id, &ack)
+    let acked = send_welcome_blob_message(&joiner, &owner_id, &ack, None)
         .await
         .map_err(anyhow::Error::msg)?;
     assert!(matches!(acked.path, x0x::dm::DmPath::RawQuic));
@@ -547,7 +547,7 @@ async fn welcome_control_frames_take_raw_quic_over_a_live_connection() -> anyhow
             .await
             .is_err()
     );
-    assert!(send_welcome_blob_message(&joiner, &owner_id, &ack)
+    assert!(send_welcome_blob_message(&joiner, &owner_id, &ack, None)
         .await
         .is_err());
     assert_eq!(raw_frames_to(&joiner, &owner).len(), 2, "no raw send since");
@@ -555,5 +555,156 @@ async fn welcome_control_frames_take_raw_quic_over_a_live_connection() -> anyhow
     joiner
         .agent
         .set_pinned_standin_strict_resolution_for_testing(false);
+    Ok(())
+}
+
+/// A chunk that completes a receive after an early Complete is assembled
+/// at once: no other Complete may follow it.
+#[tokio::test]
+async fn a_late_chunk_after_an_early_complete_is_assembled() -> anyhow::Result<()> {
+    let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+    let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+    let owner_id = owner.agent.agent_id();
+    let group_id = "e8".repeat(32);
+    let (bytes, welcome_ref, frames) = staged_welcome(&owner, &group_id, 2);
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let sends = Arc::new(AtomicUsize::new(0));
+    let sent = Arc::clone(&sends);
+    let listener_state = Arc::clone(&joiner);
+
+    let fetched = tokio::time::timeout(
+        Duration::from_secs(60),
+        fetch_treekem_welcome_via(&joiner, &group_id, &welcome_ref, move |_, _, _| {
+            sent.fetch_add(1, Ordering::SeqCst);
+            let state = Arc::clone(&listener_state);
+            // Offer, chunk 0 and the Complete; chunk 1 is a second late.
+            let (offer, chunk0, chunk1, complete) = (
+                frames[0].clone(),
+                frames[1].clone(),
+                frames[2].clone(),
+                frames[3].clone(),
+            );
+            async move {
+                tokio::spawn(async move {
+                    for frame in [offer, chunk0, complete] {
+                        dispatch_welcome_blob_message(&state, &owner_id, frame).await;
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    dispatch_welcome_blob_message(&state, &owner_id, chunk1).await;
+                });
+                Ok(())
+            }
+        }),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("the fetch never settled"))?
+    .map_err(anyhow::Error::msg)?;
+
+    assert_eq!(fetched, bytes);
+    assert_eq!(sends.load(Ordering::SeqCst), 1, "no re-ask was needed");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    Ok(())
+}
+
+/// A stale Complete (a replaced stream's) ahead of a slow but healthy
+/// restream never makes the fetch ask again: bytes arriving after the
+/// early Complete show the stream is delivering, and asking again would
+/// make the owner replace it.
+#[tokio::test]
+async fn a_stale_complete_never_aborts_a_healthy_restream() -> anyhow::Result<()> {
+    let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+    let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+    let owner_id = owner.agent.agent_id();
+    let group_id = "e9".repeat(32);
+    let (bytes, welcome_ref, frames) = staged_welcome(&owner, &group_id, 2);
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let sends = Arc::new(AtomicUsize::new(0));
+    let sent = Arc::clone(&sends);
+    let listener_state = Arc::clone(&joiner);
+
+    let fetched = tokio::time::timeout(
+        Duration::from_secs(60),
+        fetch_treekem_welcome_via(&joiner, &group_id, &welcome_ref, move |_, _, _| {
+            sent.fetch_add(1, Ordering::SeqCst);
+            let state = Arc::clone(&listener_state);
+            let frames = frames.clone();
+            async move {
+                tokio::spawn(async move {
+                    let complete = frames[3].clone();
+                    // The replaced stream's Complete lands first.
+                    dispatch_welcome_blob_message(&state, &owner_id, complete).await;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    for frame in &frames[..2] {
+                        dispatch_welcome_blob_message(&state, &owner_id, frame.clone()).await;
+                    }
+                    tokio::time::sleep(Duration::from_secs(6)).await;
+                    for frame in &frames[2..] {
+                        dispatch_welcome_blob_message(&state, &owner_id, frame.clone()).await;
+                    }
+                });
+                Ok(())
+            }
+        }),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("the fetch never settled"))?
+    .map_err(anyhow::Error::msg)?;
+
+    assert_eq!(fetched, bytes);
+    assert_eq!(
+        sends.load(Ordering::SeqCst),
+        1,
+        "the healthy restream was left alone"
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(8) && elapsed < Duration::from_secs(9),
+        "{elapsed:?}"
+    );
+    Ok(())
+}
+
+/// Leaving, deleting or losing a group releases its Welcome acks at once.
+#[tokio::test]
+async fn the_group_purge_releases_its_welcome_acks() -> anyhow::Result<()> {
+    let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+    let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+    let owner_id = owner.agent.agent_id();
+    let group_id = "ea".repeat(32);
+    let (_bytes, welcome_ref, frames) = staged_welcome(&owner, &group_id, 3);
+    let gate = park_chunk_acks(&welcome_ref.welcome_id);
+    joiner.pending_welcome_receives.write().await.insert(
+        welcome_ref.welcome_id.clone(),
+        PendingWelcomeReceive {
+            group_id: group_id.clone(),
+            source: welcome_ref.source.clone(),
+            byte_len: welcome_ref.byte_len,
+            total_chunks: 3,
+            chunks: BTreeMap::new(),
+            received_bytes: 0,
+            ended_early: None,
+        },
+    );
+    for frame in frames
+        .into_iter()
+        .filter(|frame| matches!(frame, WelcomeBlobMessage::Chunk { .. }))
+    {
+        dispatch_welcome_blob_message(&joiner, &owner_id, frame).await;
+    }
+    tokio::task::yield_now().await;
+    assert_eq!(gate.started.load(Ordering::SeqCst), 3);
+    assert_eq!(joiner.welcome_ack_tasks.in_flight(), 3);
+
+    wipe_local_group_crypto_material(&joiner, &group_id, None, "test").await;
+    assert!(joiner.pending_welcome_receives.read().await.is_empty());
+    assert_eq!(joiner.welcome_ack_tasks.in_flight(), 0);
+    assert_eq!(joiner.welcome_chunk_ack_admission.in_flight(), 0);
+    unpark_chunk_acks(&welcome_ref.welcome_id);
     Ok(())
 }

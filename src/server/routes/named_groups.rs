@@ -20,7 +20,7 @@ pub(in crate::server) use seat_cert_fetch::{
     handle_group_cert_fetch_request, handle_group_cert_fetch_response, publish_group_cert_fetch,
     CertEvidenceStamp, GROUP_CERT_FETCH_DOMAIN, GROUP_CERT_FETCH_RESPONSE_DOMAIN,
 };
-pub(in crate::server) use welcome_acks::WelcomeAckTasks;
+pub(in crate::server) use welcome_acks::{AckPath as WelcomeAckPath, WelcomeAckTasks};
 
 mod requester_offer;
 pub(in crate::server) use requester_offer::{
@@ -979,9 +979,11 @@ pub(in crate::server) struct PendingWelcomeReceive {
     chunks: BTreeMap<u64, Vec<u8>>,
     received_bytes: u64,
     /// A Complete arrived before every chunk: a stream ended early (a
-    /// replaced stream's Complete, or a chunk lost on the way). The fetch's
-    /// next scheduled attempt asks again even if bytes arrived meanwhile.
-    ended_early: bool,
+    /// replaced stream's Complete, or a chunk lost on the way). Holds the
+    /// bytes received then. The fetch's next scheduled attempt asks again
+    /// unless bytes arrived since, which means a stream is still delivering;
+    /// a late chunk that completes the receive assembles it.
+    ended_early: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -22823,6 +22825,10 @@ async fn wipe_local_group_crypto_material(
             !drop
         });
     }
+    // The purged receives' acks can no longer help them.
+    for welcome_id in &welcome_ids {
+        state.welcome_ack_tasks.release_welcome(welcome_id);
+    }
     if !welcome_ids.is_empty() {
         // r5 (G4): abort, then AWAIT, every stream (outside the map lock).
         let aborted: Vec<tokio::task::JoinHandle<()>> = {
@@ -42109,13 +42115,58 @@ fn welcome_blob_payload(msg: &WelcomeBlobMessage) -> std::result::Result<Vec<u8>
     Ok(payload)
 }
 
+/// The preferred path of a Welcome control frame, for the logs.
+fn welcome_control_path(direct: bool) -> &'static str {
+    if direct {
+        "raw_quic"
+    } else {
+        "gossip_inbox"
+    }
+}
+
+/// One info line per joiner control frame, naming the path it prefers, so
+/// a slow join leaves a trace of how its FetchRequests and acks travelled.
+fn log_welcome_control_send(msg: &WelcomeBlobMessage, path: &'static str) {
+    let (kind, welcome_id, seq) = match msg {
+        WelcomeBlobMessage::FetchRequest { welcome_id, .. } => ("fetch_request", welcome_id, None),
+        WelcomeBlobMessage::ChunkAck {
+            welcome_id,
+            sequence,
+        } => ("chunk_ack", welcome_id, Some(*sequence)),
+        WelcomeBlobMessage::Offer { welcome_id, .. } => ("offer", welcome_id, None),
+        WelcomeBlobMessage::Chunk {
+            welcome_id,
+            sequence,
+            ..
+        } => ("chunk", welcome_id, Some(*sequence)),
+        WelcomeBlobMessage::Complete { welcome_id } => ("complete", welcome_id, None),
+    };
+    tracing::info!(
+        target: "welcome.trace",
+        stage = "control_frame_send",
+        kind,
+        welcome_id = %welcome_id,
+        seq,
+        path,
+        "Welcome control frame sent"
+    );
+}
+
+/// Send a joiner control frame (a ChunkAck). `path`, when given, records
+/// the path chosen for the ack registry.
 async fn send_welcome_blob_message(
     state: &Arc<AppState>,
     agent_id: &AgentId,
     msg: &WelcomeBlobMessage,
+    path: Option<&std::sync::OnceLock<&'static str>>,
 ) -> std::result::Result<x0x::dm::DmReceipt, String> {
     let payload = welcome_blob_payload(msg)?;
     let direct = state.agent.has_live_direct_connection(agent_id).await;
+    let chosen = welcome_control_path(direct);
+    if let Some(path) = path {
+        let _ = path.set(chosen);
+    }
+    log_welcome_control_send(msg, chosen);
     state
         .agent
         .send_direct_with_config(agent_id, payload, welcome_blob_send_config(msg, direct))
@@ -42155,6 +42206,7 @@ async fn send_welcome_fetch_request(
 ) -> std::result::Result<(), WelcomeFetchSendError> {
     let payload = welcome_blob_payload(request).map_err(WelcomeFetchSendError::Failed)?;
     let direct = first && state.agent.has_live_direct_connection(agent_id).await;
+    log_welcome_control_send(request, welcome_control_path(direct));
     state
         .agent
         .send_direct_with_config(agent_id, payload, welcome_blob_send_config(request, direct))
@@ -42290,7 +42342,7 @@ where
                         total_chunks,
                         chunks: BTreeMap::new(),
                         received_bytes: 0,
-                        ended_early: false,
+                        ended_early: None,
                     },
                 );
                 true
@@ -42341,15 +42393,19 @@ where
                 .write()
                 .await
                 .get_mut(&welcome_ref.welcome_id)
-                .map_or((0, false), |receive| {
-                    (
-                        receive.received_bytes,
-                        std::mem::take(&mut receive.ended_early),
-                    )
+                .map_or((0, None), |receive| {
+                    (receive.received_bytes, receive.ended_early.take())
                 });
             let progressed = progress_bytes > last_progress_bytes;
             last_progress_bytes = last_progress_bytes.max(progress_bytes);
-            if progressed && !ended_early {
+            // After an early Complete, only bytes that arrived since show a
+            // stream still delivering; asking again then would make the owner
+            // replace a healthy restream.
+            let delivering = match ended_early {
+                Some(bytes_then) => progress_bytes > bytes_then,
+                None => progressed,
+            };
+            if delivering {
                 tracing::debug!(
                     target: "welcome.trace",
                     stage = "fetch_retry_stream_progress",
@@ -42365,7 +42421,7 @@ where
                 group_id,
                 welcome_id = %welcome_ref.welcome_id,
                 attempt,
-                ended_early,
+                ended_early = ended_early.is_some(),
             );
         }
         if should_send_fetch || attempt > 0 {
@@ -43099,9 +43155,17 @@ async fn handle_welcome_blob_chunk(
         receive.received_bytes = receive.received_bytes.saturating_add(decoded.len() as u64);
         receive.chunks.insert(sequence, decoded);
     }
+    // A Complete already came, early: this chunk may be the last one it
+    // was missing, and no other Complete may follow.
+    let assemble = receive.ended_early.is_some()
+        && receive.received_bytes == receive.byte_len
+        && receive.chunks.len() as u64 == receive.total_chunks;
     let group_id = receive.group_id.clone();
     drop(receives);
     tracing::debug!(target: "welcome.trace", stage = "chunk_recv", welcome_id = %welcome_id, seq = sequence);
+    if assemble {
+        handle_welcome_blob_complete(state, sender, &welcome_id).await;
+    }
     spawn_welcome_chunk_ack(state, sender, &group_id, welcome_id, sequence);
 }
 
@@ -43143,32 +43207,36 @@ fn spawn_welcome_chunk_ack(
     let task_state = Arc::clone(state);
     let owner = *owner;
     let task_welcome = welcome_id.clone();
+    let path: WelcomeAckPath = Arc::new(std::sync::OnceLock::new());
+    let task_path = Arc::clone(&path);
     let send = async move {
         let welcome_id = task_welcome;
         let ack = WelcomeBlobMessage::ChunkAck {
             welcome_id: welcome_id.clone(),
             sequence,
         };
-        match tokio::time::timeout(
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
             WELCOME_CHUNK_ACK_BUDGET,
-            send_welcome_chunk_ack(&task_state, &owner, &ack),
+            send_welcome_chunk_ack(&task_state, &owner, &ack, &task_path),
         )
-        .await
-        {
-            Ok(Ok(())) => {
-                tracing::debug!(target: "welcome.trace", stage = "chunk_ack_sent", welcome_id = %welcome_id, seq = sequence);
+        .await;
+        let path = task_path.get().copied().unwrap_or("undecided");
+        match outcome {
+            Ok(Ok(receipt)) => {
+                tracing::debug!(target: "welcome.trace", stage = "chunk_ack_sent", welcome_id = %welcome_id, seq = sequence, path, delivered = ?receipt);
             }
             Ok(Err(e)) => {
-                tracing::warn!(target: "welcome.trace", stage = "chunk_ack_failed", welcome_id = %LogHexId::new("welcome", &welcome_id), seq = sequence, "failed to ack Welcome blob chunk: {e}");
+                tracing::warn!(target: "welcome.trace", stage = "chunk_ack_failed", welcome_id = %welcome_id, seq = sequence, path, age_ms = started.elapsed().as_millis() as u64, "failed to ack Welcome blob chunk: {e}");
             }
             Err(_) => {
-                tracing::warn!(target: "welcome.trace", stage = "chunk_ack_budget_spent", welcome_id = %LogHexId::new("welcome", &welcome_id), seq = sequence, "Welcome blob chunk ack ran out of its budget");
+                tracing::info!(target: "welcome.trace", stage = "chunk_ack_budget_spent", welcome_id = %welcome_id, seq = sequence, path, "Welcome blob chunk ack ran out of its budget");
             }
         }
     };
     if !state
         .welcome_ack_tasks
-        .spawn(&welcome_id, sequence, ticket, send)
+        .spawn(&welcome_id, sequence, ticket, path, send)
     {
         tracing::debug!(target: "welcome.trace", stage = "chunk_ack_after_shutdown", welcome_id = %welcome_id, seq = sequence);
     }
@@ -43191,7 +43259,8 @@ async fn send_welcome_chunk_ack(
     state: &Arc<AppState>,
     owner: &AgentId,
     ack: &WelcomeBlobMessage,
-) -> std::result::Result<(), String> {
+    path: &std::sync::OnceLock<&'static str>,
+) -> std::result::Result<x0x::dm::DmPath, String> {
     #[cfg(test)]
     if let WelcomeBlobMessage::ChunkAck { welcome_id, .. } = ack {
         let gate = WELCOME_CHUNK_ACK_TEST_GATES
@@ -43203,9 +43272,9 @@ async fn send_welcome_chunk_ack(
             std::future::pending::<()>().await;
         }
     }
-    send_welcome_blob_message(state, owner, ack)
+    send_welcome_blob_message(state, owner, ack, Some(path))
         .await
-        .map(|_| ())
+        .map(|receipt| receipt.path)
 }
 
 async fn handle_welcome_blob_complete(state: &Arc<AppState>, sender: &AgentId, welcome_id: &str) {
@@ -43234,7 +43303,7 @@ async fn handle_welcome_blob_complete(state: &Arc<AppState>, sender: &AgentId, w
                 byte_len = receive.byte_len,
             );
             if let Some(receive) = receives.get_mut(welcome_id) {
-                receive.ended_early = true;
+                receive.ended_early = Some(receive.received_bytes);
             }
             return;
         }
@@ -56342,7 +56411,7 @@ pub(in crate::server) mod tests {
                 total_chunks,
                 chunks: BTreeMap::new(),
                 received_bytes: 0,
-                ended_early: false,
+                ended_early: None,
             },
         );
         let (tx, rx) = oneshot::channel();
