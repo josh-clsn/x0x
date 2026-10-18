@@ -49189,60 +49189,72 @@ pub(in crate::server) mod tests {
         Ok(())
     }
 
-    /// A pair code imported after the contact's signed announcement must not
-    /// wipe what the announcement told us (the UI drills' leaf runs): the
-    /// card carries no addresses, and stamped with our clock it outranked
-    /// the announcement until the contact's next heartbeat.
-    #[tokio::test]
-    async fn card_import_after_a_signed_announcement_keeps_its_addresses() -> Result<()> {
-        let (state, _dir) = secure_endpoint_test_state().await?;
-        let target_id = crate::identity::AgentKeypair::generate()?.agent_id();
-        let announced_machine = crate::identity::MachineId([0x21; 32]);
-        let card_machine = crate::identity::MachineId([0x11; 32]);
-        let addr: std::net::SocketAddr = "203.0.113.7:5483".parse()?;
-        let relay = crate::identity::MachineId([0x31; 32]);
-        let coordinator = crate::identity::MachineId([0x41; 32]);
-        let announced_at = now_millis_u64() / 1000 - 30;
-        state
-            .agent
-            .insert_discovered_agent_for_testing(x0x::DiscoveredAgent {
-                self_name: Some("Alice".to_string()),
-                agent_id: target_id,
-                machine_id: announced_machine,
-                user_id: None,
-                addresses: vec![addr],
-                announced_at,
-                last_seen: announced_at,
-                machine_public_key: Vec::new(),
-                nat_type: None,
-                can_receive_direct: Some(true),
-                is_relay: None,
-                is_coordinator: None,
-                reachable_via: vec![coordinator],
-                relay_candidates: vec![relay],
-                cert_not_after: None,
-                agent_certificate: None,
-                agent_public_key: Vec::new(),
-                cert_digest: None,
-            })
-            .await;
+    /// The contact's signed announcement, as the discovery cache holds it.
+    fn announced_contact(
+        agent_id: crate::identity::AgentId,
+        machine_id: crate::identity::MachineId,
+        addresses: Vec<std::net::SocketAddr>,
+        announced_at: u64,
+    ) -> x0x::DiscoveredAgent {
+        x0x::DiscoveredAgent {
+            self_name: Some("Alice".to_string()),
+            agent_id,
+            machine_id,
+            user_id: None,
+            addresses,
+            announced_at,
+            last_seen: announced_at,
+            machine_public_key: vec![7; 32],
+            nat_type: Some("FullCone".to_string()),
+            can_receive_direct: Some(true),
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: vec![crate::identity::MachineId([0x41; 32])],
+            relay_candidates: vec![crate::identity::MachineId([0x31; 32])],
+            cert_not_after: None,
+            agent_certificate: None,
+            agent_public_key: Vec::new(),
+            cert_digest: None,
+        }
+    }
 
-        // The card names a new machine (a reinstall) and no addresses.
-        let card = x0x::groups::card::AgentCard::new(
-            "Alice".to_string(),
-            &target_id,
-            &hex::encode(card_machine.0),
-        );
-        assert!(card.addresses.is_empty());
+    async fn import_card(state: &Arc<AppState>, card: &x0x::groups::card::AgentCard) -> Result<()> {
         let req: ImportCardRequest = serde_json::from_value(serde_json::json!({
             "card": card.to_link(),
             "trust_level": "known"
         }))
         .context("deserialize ImportCardRequest")?;
-        let response = import_agent_card(State(Arc::clone(&state)), Json(req))
+        let response = import_agent_card(State(Arc::clone(state)), Json(req))
             .await
             .into_response();
-        assert_eq!(response.status(), StatusCode::OK);
+        anyhow::ensure!(response.status() == StatusCode::OK, "import failed");
+        Ok(())
+    }
+
+    /// A pair code imported after the contact's signed announcement must not
+    /// wipe what the announcement told us (the UI drills' leaf runs): the
+    /// card carries no addresses, and stamped with our clock it outranked
+    /// the announcement until the contact's next heartbeat.
+    #[tokio::test]
+    async fn pair_code_import_after_a_signed_announcement_keeps_its_addresses() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let target_id = crate::identity::AgentKeypair::generate()?.agent_id();
+        let machine = crate::identity::MachineId([0x21; 32]);
+        let addr: std::net::SocketAddr = "203.0.113.7:5483".parse()?;
+        let announced_at = now_millis_u64() / 1000 - 30;
+        let announced = announced_contact(target_id, machine, vec![addr], announced_at);
+        state
+            .agent
+            .insert_discovered_agent_for_testing(announced.clone())
+            .await;
+
+        let card = x0x::groups::card::AgentCard::new(
+            "Alice".to_string(),
+            &target_id,
+            &hex::encode(machine.0),
+        );
+        assert!(card.addresses.is_empty());
+        import_card(&state, &card).await?;
 
         let entry = state
             .agent
@@ -49250,37 +49262,98 @@ pub(in crate::server) mod tests {
             .await
             .context("the contact stays discovered")?;
         assert_eq!(entry.addresses, vec![addr], "the announced addresses stay");
-        assert_eq!(entry.reachable_via, vec![coordinator]);
-        assert_eq!(entry.relay_candidates, vec![relay]);
+        assert_eq!(entry.reachable_via, announced.reachable_via);
+        assert_eq!(entry.relay_candidates, announced.relay_candidates);
         assert_eq!(
             entry.announced_at, announced_at,
             "the card is no announcement"
         );
-        assert_eq!(
-            entry.machine_id, card_machine,
-            "the card's machine is taken"
+        assert_eq!(entry.machine_id, machine);
+        let record = state
+            .agent
+            .discovered_machine_for_testing(&machine)
+            .await
+            .context("the announced machine stays")?;
+        assert_eq!(record.addresses, vec![addr]);
+        Ok(())
+    }
+
+    /// A card naming another machine than the contact's announcement never
+    /// pairs one machine's id with the other's addresses: the entry becomes
+    /// the card's, as an observation, and the next signed announcement
+    /// replaces it. The machine it left no longer lists the contact.
+    #[tokio::test]
+    async fn card_for_another_machine_replaces_the_announced_entry_coherently() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let target_id = crate::identity::AgentKeypair::generate()?.agent_id();
+        let announced_machine = crate::identity::MachineId([0x21; 32]);
+        let card_machine = crate::identity::MachineId([0x11; 32]);
+        let announced_addr: std::net::SocketAddr = "203.0.113.7:5483".parse()?;
+        let card_addr: std::net::SocketAddr = "198.51.100.4:5483".parse()?;
+        let announced_at = now_millis_u64() / 1000 - 30;
+        let announced = announced_contact(
+            target_id,
+            announced_machine,
+            vec![announced_addr],
+            announced_at,
         );
-        let machine = state
+        state
+            .agent
+            .insert_discovered_agent_for_testing(announced.clone())
+            .await;
+
+        let mut card = x0x::groups::card::AgentCard::new(
+            "Alice".to_string(),
+            &target_id,
+            &hex::encode(card_machine.0),
+        );
+        card.addresses = vec![card_addr.to_string()];
+        import_card(&state, &card).await?;
+
+        let entry = state
+            .agent
+            .discovered_agent_for_testing(&target_id)
+            .await
+            .context("the contact stays discovered")?;
+        assert_eq!(entry.machine_id, card_machine);
+        assert_eq!(
+            entry.addresses,
+            vec![card_addr],
+            "the card's machine, its addresses"
+        );
+        assert!(entry.reachable_via.is_empty() && entry.relay_candidates.is_empty());
+        assert!(entry.machine_public_key.is_empty() && entry.nat_type.is_none());
+        assert_eq!(entry.announced_at, 0, "an observation");
+        let left = state
             .agent
             .discovered_machine_for_testing(&announced_machine)
             .await
-            .context("the announced machine stays")?;
-        assert_eq!(machine.addresses, vec![addr]);
+            .context("the announced machine's record stays")?;
+        assert_eq!(left.addresses, vec![announced_addr]);
+        assert!(!left.agent_ids.contains(&target_id), "the contact left it");
+        let card_record = state
+            .agent
+            .discovered_machine_for_testing(&card_machine)
+            .await
+            .context("the card's machine is recorded")?;
+        assert_eq!(card_record.addresses, vec![card_addr]);
 
-        // A later signed announcement is not outranked by the import.
+        // The next signed announcement replaces the card's entry.
         state
             .agent
             .insert_discovered_agent_for_testing(x0x::DiscoveredAgent {
-                addresses: Vec::new(),
                 announced_at: announced_at + 1,
-                ..entry
+                ..announced
             })
             .await;
-        let fresh = state.agent.discovered_agent_for_testing(&target_id).await;
-        assert_eq!(
-            fresh.map(|entry| entry.announced_at),
-            Some(announced_at + 1)
-        );
+        let entry = state
+            .agent
+            .discovered_agent_for_testing(&target_id)
+            .await
+            .context("the contact stays discovered")?;
+        assert_eq!(entry.machine_id, announced_machine);
+        assert_eq!(entry.addresses, vec![announced_addr]);
+        assert_eq!(entry.announced_at, announced_at + 1);
         Ok(())
     }
 
