@@ -3013,6 +3013,18 @@ async fn wp_c_491_seated_pair(
 }
 
 /// Roster projection of `GET /groups/:id/members` no longer seats `agent_id`.
+/// The TreeKEM epoch in a `GET /groups/:id/state` body's
+/// `security_binding` (`treekem:epoch=N[;...]`).
+fn treekem_epoch(state: &Value) -> Option<u64> {
+    state["security_binding"]
+        .as_str()?
+        .split(';')
+        .next()?
+        .strip_prefix("treekem:epoch=")?
+        .parse()
+        .ok()
+}
+
 async fn roster_dropped_bob(node: &AgentInstance, group_id: &str, agent_id: &str) -> bool {
     let info: Value = node
         .get(&format!("/groups/{group_id}/members"))
@@ -3192,6 +3204,11 @@ async fn wp_c_491_restart_rehydrates_roster_clock_after_leave() {
     let bob = &pair.bob;
     let (group_id, bob_group_id, bob_agent_id) =
         wp_c_491_seated_pair(alice, bob, "wp-c-491-restart").await;
+    let pre_leave_epoch = group_state(alice, &group_id)
+        .await
+        .as_ref()
+        .and_then(treekem_epoch)
+        .expect("alice's TreeKEM epoch before the leave");
 
     let leave: Value = bob
         .delete(&format!("/groups/{bob_group_id}"))
@@ -3200,12 +3217,20 @@ async fn wp_c_491_restart_rehydrates_roster_clock_after_leave() {
         .await
         .unwrap();
     assert_eq!(leave["ok"], true, "bob self-leave failed: {leave:?}");
+    // Alice also commits the responsive rekey a self-leave owes (ADR-0014),
+    // after the leave is applied. Capture the state once that has landed,
+    // or the rekey (live or the startup catch-up) moves it past the capture.
     assert!(
         wait_until(Duration::from_secs(30), || async {
             roster_dropped_bob(alice, &group_id, &bob_agent_id).await
+                && group_state(alice, &group_id)
+                    .await
+                    .as_ref()
+                    .and_then(treekem_epoch)
+                    .is_some_and(|epoch| epoch > pre_leave_epoch)
         })
         .await,
-        "alice never applied bob's self-leave before the restart"
+        "alice never applied bob's self-leave and its rekey before the restart"
     );
     let pre_restart = group_state(alice, &group_id)
         .await
@@ -3223,6 +3248,27 @@ async fn wp_c_491_restart_rehydrates_roster_clock_after_leave() {
         .expect("alice group view before restart")["roster_revision"]
         .as_u64()
         .expect("roster_revision on GET /groups/:id");
+
+    // The live view can show the leave before its save completes, and
+    // restart() kills the daemon, so wait for the captured state on disk.
+    let named_groups_path = alice.data_dir().join("named_groups.json");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            tokio::fs::read(&named_groups_path)
+                .await
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .is_some_and(|groups| {
+                    groups.as_object().is_some_and(|groups| {
+                        groups
+                            .values()
+                            .any(|group| group["state_hash"].as_str() == Some(pre_hash.as_str()))
+                    })
+                })
+        })
+        .await,
+        "alice never persisted the post-leave state before the restart"
+    );
 
     alice.restart().await;
 
