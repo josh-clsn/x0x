@@ -17,6 +17,7 @@
 //! effect at the task's next poll.
 
 use super::fair_admission::AdmissionTicket;
+use crate::logging::LogHexId;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::task::JoinHandle;
@@ -42,7 +43,7 @@ impl Entry {
             tracing::info!(
                 target: "welcome.trace",
                 stage = "chunk_ack_aborted",
-                welcome_id,
+                welcome_id = %LogHexId::new("welcome", welcome_id),
                 seq = sequence,
                 path = self.path.get().copied().unwrap_or("undecided"),
                 age_ms = self.started.elapsed().as_millis() as u64,
@@ -140,7 +141,7 @@ impl WelcomeAckTasks {
                 {
                     tracing::error!(
                         target: "welcome.trace",
-                        welcome_id = %id,
+                        welcome_id = %LogHexId::new("welcome", &id),
                         seq = sequence,
                         "Welcome ChunkAck send panicked; its slot was released"
                     );

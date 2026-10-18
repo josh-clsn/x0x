@@ -980,9 +980,11 @@ pub(in crate::server) struct PendingWelcomeReceive {
     received_bytes: u64,
     /// A Complete arrived before every chunk: a stream ended early (a
     /// replaced stream's Complete, or a chunk lost on the way). Holds the
-    /// bytes received then. The fetch's next scheduled attempt asks again
-    /// unless bytes arrived since, which means a stream is still delivering;
-    /// a late chunk that completes the receive assembles it.
+    /// bytes received at the latest early Complete, and stays set: any
+    /// later chunk that completes the receive assembles it, since no other
+    /// Complete may follow. The fetch asks again at a scheduled attempt
+    /// unless bytes arrived since that mark and since its own last check,
+    /// which means a stream is still delivering.
     ended_early: Option<u64>,
 }
 
@@ -42145,7 +42147,7 @@ fn log_welcome_control_send(msg: &WelcomeBlobMessage, path: &'static str) {
         target: "welcome.trace",
         stage = "control_frame_send",
         kind,
-        welcome_id = %welcome_id,
+        welcome_id = %LogHexId::new("welcome", welcome_id),
         seq,
         path,
         "Welcome control frame sent"
@@ -42320,8 +42322,8 @@ where
                 tracing::debug!(
                     target: "welcome.trace",
                     stage = "fetch_join_inflight",
-                    group_id,
-                    welcome_id = %welcome_ref.welcome_id,
+                    group_id = %LogHexId::group(group_id),
+                    welcome_id = %LogHexId::new("welcome", &welcome_ref.welcome_id),
                 );
                 false
             }
@@ -42394,22 +42396,20 @@ where
                 .await
                 .get_mut(&welcome_ref.welcome_id)
                 .map_or((0, None), |receive| {
-                    (receive.received_bytes, receive.ended_early.take())
+                    (receive.received_bytes, receive.ended_early)
                 });
             let progressed = progress_bytes > last_progress_bytes;
             last_progress_bytes = last_progress_bytes.max(progress_bytes);
             // After an early Complete, only bytes that arrived since show a
             // stream still delivering; asking again then would make the owner
             // replace a healthy restream.
-            let delivering = match ended_early {
-                Some(bytes_then) => progress_bytes > bytes_then,
-                None => progressed,
-            };
+            let delivering =
+                progressed && ended_early.is_none_or(|bytes_then| progress_bytes > bytes_then);
             if delivering {
                 tracing::debug!(
                     target: "welcome.trace",
                     stage = "fetch_retry_stream_progress",
-                    welcome_id = %welcome_ref.welcome_id,
+                    welcome_id = %LogHexId::new("welcome", &welcome_ref.welcome_id),
                     attempt,
                     progress_bytes,
                 );
@@ -42418,8 +42418,8 @@ where
             tracing::warn!(
                 target: "welcome.trace",
                 stage = "fetch_retry_stalled",
-                group_id,
-                welcome_id = %welcome_ref.welcome_id,
+                group_id = %LogHexId::group(group_id),
+                welcome_id = %LogHexId::new("welcome", &welcome_ref.welcome_id),
                 attempt,
                 ended_early = ended_early.is_some(),
             );
@@ -42487,8 +42487,8 @@ async fn settle_welcome_fetch_request(
             tracing::warn!(
                 target: "welcome.trace",
                 stage = "fetch_request_receipt_unconfirmed",
-                group_id,
-                welcome_id = %welcome_ref.welcome_id,
+                group_id = %LogHexId::group(group_id),
+                welcome_id = %LogHexId::new("welcome", &welcome_ref.welcome_id),
                 error = %error,
                 "waiting for Welcome despite unconfirmed FetchRequest receipt",
             );
@@ -43200,7 +43200,7 @@ fn spawn_welcome_chunk_ack(
     {
         Ok(ticket) => ticket,
         Err(refusal) => {
-            tracing::debug!(target: "welcome.trace", stage = "chunk_ack_not_admitted", welcome_id = %welcome_id, seq = sequence, ?refusal);
+            tracing::debug!(target: "welcome.trace", stage = "chunk_ack_not_admitted", welcome_id = %LogHexId::new("welcome", &welcome_id), seq = sequence, ?refusal);
             return;
         }
     };
@@ -43224,13 +43224,13 @@ fn spawn_welcome_chunk_ack(
         let path = task_path.get().copied().unwrap_or("undecided");
         match outcome {
             Ok(Ok(receipt)) => {
-                tracing::debug!(target: "welcome.trace", stage = "chunk_ack_sent", welcome_id = %welcome_id, seq = sequence, path, delivered = ?receipt);
+                tracing::debug!(target: "welcome.trace", stage = "chunk_ack_sent", welcome_id = %LogHexId::new("welcome", &welcome_id), seq = sequence, path, delivered = ?receipt);
             }
             Ok(Err(e)) => {
-                tracing::warn!(target: "welcome.trace", stage = "chunk_ack_failed", welcome_id = %welcome_id, seq = sequence, path, age_ms = started.elapsed().as_millis() as u64, "failed to ack Welcome blob chunk: {e}");
+                tracing::warn!(target: "welcome.trace", stage = "chunk_ack_failed", welcome_id = %LogHexId::new("welcome", &welcome_id), seq = sequence, path, age_ms = started.elapsed().as_millis() as u64, "failed to ack Welcome blob chunk: {e}");
             }
             Err(_) => {
-                tracing::info!(target: "welcome.trace", stage = "chunk_ack_budget_spent", welcome_id = %welcome_id, seq = sequence, path, "Welcome blob chunk ack ran out of its budget");
+                tracing::info!(target: "welcome.trace", stage = "chunk_ack_budget_spent", welcome_id = %LogHexId::new("welcome", &welcome_id), seq = sequence, path, "Welcome blob chunk ack ran out of its budget");
             }
         }
     };
@@ -43238,7 +43238,7 @@ fn spawn_welcome_chunk_ack(
         .welcome_ack_tasks
         .spawn(&welcome_id, sequence, ticket, path, send)
     {
-        tracing::debug!(target: "welcome.trace", stage = "chunk_ack_after_shutdown", welcome_id = %welcome_id, seq = sequence);
+        tracing::debug!(target: "welcome.trace", stage = "chunk_ack_after_shutdown", welcome_id = %LogHexId::new("welcome", &welcome_id), seq = sequence);
     }
 }
 
@@ -43298,7 +43298,7 @@ async fn handle_welcome_blob_complete(state: &Arc<AppState>, sender: &AgentId, w
             tracing::debug!(
                 target: "welcome.trace",
                 stage = "complete_before_chunks",
-                welcome_id,
+                welcome_id = %LogHexId::new("welcome", welcome_id),
                 received = receive.received_bytes,
                 byte_len = receive.byte_len,
             );
@@ -49523,6 +49523,61 @@ pub(in crate::server) mod tests {
             addresses().await,
             vec![parse("127.0.0.1:44001"), fresh, announced_addr]
         );
+        Ok(())
+    }
+
+    /// A card keeps at most its first 4 distinct addresses on every branch:
+    /// a contact known only by card, and a card naming another machine.
+    #[tokio::test]
+    async fn every_card_keeps_at_most_four_addresses() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let addrs: Vec<String> = (0..6).map(|i| format!("127.0.0.1:{}", 45000 + i)).collect();
+        let first_four: Vec<std::net::SocketAddr> = addrs[..4]
+            .iter()
+            .map(|a| a.parse().expect("addr"))
+            .collect();
+
+        // A contact known only by card.
+        let card_only = crate::identity::AgentKeypair::generate()?.agent_id();
+        let mut card = x0x::groups::card::AgentCard::new(
+            "Bob".to_string(),
+            &card_only,
+            &hex::encode([0x51; 32]),
+        );
+        card.addresses = addrs.clone();
+        import_card(&state, &card).await?;
+        let entry = state
+            .agent
+            .discovered_agent_for_testing(&card_only)
+            .await
+            .context("the card is recorded")?;
+        assert_eq!(entry.addresses, first_four);
+
+        // A card naming another machine than the announcement.
+        let moved = crate::identity::AgentKeypair::generate()?.agent_id();
+        let announced_at = now_millis_u64() / 1000 - 30;
+        state
+            .agent
+            .insert_discovered_agent_for_testing(announced_contact(
+                moved,
+                crate::identity::MachineId([0x52; 32]),
+                vec!["203.0.113.9:5483".parse()?],
+                announced_at,
+            ))
+            .await;
+        let mut card = x0x::groups::card::AgentCard::new(
+            "Carol".to_string(),
+            &moved,
+            &hex::encode([0x53; 32]),
+        );
+        card.addresses = addrs;
+        import_card(&state, &card).await?;
+        let entry = state
+            .agent
+            .discovered_agent_for_testing(&moved)
+            .await
+            .context("the contact stays discovered")?;
+        assert_eq!(entry.addresses, first_four);
         Ok(())
     }
 

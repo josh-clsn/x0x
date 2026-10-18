@@ -708,3 +708,68 @@ async fn the_group_purge_releases_its_welcome_acks() -> anyhow::Result<()> {
     unpark_chunk_acks(&welcome_ref.welcome_id);
     Ok(())
 }
+
+/// The early-Complete mark stays set past the fetch's scheduled check: a
+/// last chunk that arrives after the check still assembles the Welcome at
+/// once, instead of the fetch waiting out its deadline.
+#[tokio::test]
+async fn a_last_chunk_after_the_check_still_assembles() -> anyhow::Result<()> {
+    let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+    let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+    let owner_id = owner.agent.agent_id();
+    let group_id = "eb".repeat(32);
+    // Offer, three chunks and the Complete.
+    let (bytes, welcome_ref, frames) = staged_welcome(&owner, &group_id, 3);
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let sends = Arc::new(AtomicUsize::new(0));
+    let sent = Arc::clone(&sends);
+    let listener_state = Arc::clone(&joiner);
+
+    let fetched = tokio::time::timeout(
+        Duration::from_secs(60),
+        fetch_treekem_welcome_via(&joiner, &group_id, &welcome_ref, move |_, _, _| {
+            sent.fetch_add(1, Ordering::SeqCst);
+            let state = Arc::clone(&listener_state);
+            let frames = frames.clone();
+            async move {
+                tokio::spawn(async move {
+                    let (offer, chunk0, chunk1, chunk2, complete) = (
+                        frames[0].clone(),
+                        frames[1].clone(),
+                        frames[2].clone(),
+                        frames[3].clone(),
+                        frames[4].clone(),
+                    );
+                    // The Complete overtakes chunks 1 and 2.
+                    for frame in [offer, chunk0, complete] {
+                        dispatch_welcome_blob_message(&state, &owner_id, frame).await;
+                    }
+                    // Chunk 1 before the 5 s check, so it reads "delivering"…
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    dispatch_welcome_blob_message(&state, &owner_id, chunk1).await;
+                    // …and the last chunk after it.
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    dispatch_welcome_blob_message(&state, &owner_id, chunk2).await;
+                });
+                Ok(())
+            }
+        }),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("the fetch never settled"))?
+    .map_err(anyhow::Error::msg)?;
+
+    assert_eq!(fetched, bytes);
+    assert_eq!(
+        sends.load(Ordering::SeqCst),
+        1,
+        "the check saw a stream delivering"
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(7) && elapsed < Duration::from_millis(7_500),
+        "assembled when the last chunk landed: {elapsed:?}"
+    );
+    Ok(())
+}

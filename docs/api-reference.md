@@ -1005,8 +1005,9 @@ machine. Otherwise it dials from the contact's discovery entry, step by step,
 until one step connects:
 
 1. **Loopback addresses**, address-only, keeping a connection only if the
-   far end is the entry's machine. In production only an imported card puts
-   loopback here (for example fetch>it's same-computer link).
+   far end is the entry's machine. This step runs only for an entry that
+   names a machine. In production only an imported card puts loopback here
+   (for example fetch>it's same-computer link).
 2. **Private IPv4 addresses**, peer-verified.
 3. **One dial by machine id** with the whole list as hints. ant-quic ranks
    the hints itself and drops loopback and LAN addresses when any global
@@ -1016,11 +1017,12 @@ until one step connects:
 5. Coordinated hole punching, then a relay.
 
 Signed announcements set the entry. `POST /agent/card/import` adds to it
-without outranking an announcement:
+without outranking an announcement. A card keeps at most its first 4
+distinct addresses, whichever case applies:
 
 - **The card names the announced machine** (or no machine): the card's
-  addresses, deduplicated and at most 4, lead the list, ahead of the
-  announced ones, because the local user just named them. A later card
+  addresses lead the list, ahead of the announced ones, because the local
+  user just named them. A later card
   replaces the earlier card's lead; card addresses never total more than 4.
   The entry keeps its `announced_at`, relay hints and certificate fields.
   The next signed announcement replaces the list.
