@@ -751,6 +751,22 @@ impl DirectMessaging {
         );
     }
 
+    /// Forget `agent_id`'s binding to `machine_id`, both ways, after another
+    /// source moved the agent off that machine. A binding to any other
+    /// machine is left alone.
+    pub(crate) async fn forget_binding(&self, agent_id: &AgentId, machine_id: &MachineId) {
+        {
+            let mut map = self.machine_to_agent.write().await;
+            if map.get(machine_id) == Some(agent_id) {
+                map.remove(machine_id);
+            }
+        }
+        let mut connected = self.connected_agents.write().await;
+        if connected.get(agent_id) == Some(machine_id) {
+            connected.remove(agent_id);
+        }
+    }
+
     /// Look up AgentId from MachineId.
     pub async fn lookup_agent(&self, machine_id: &MachineId) -> Option<AgentId> {
         let map = self.machine_to_agent.read().await;

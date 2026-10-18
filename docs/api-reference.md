@@ -1000,27 +1000,45 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 
 ### What `/agents/connect` dials
 
-`POST /agents/connect` dials the addresses in the contact's discovery entry,
-in order, after reusing any live connection. Signed announcements set that
-entry. `POST /agent/card/import` adds to it without outranking an
-announcement:
+`POST /agents/connect` first reuses a live connection to the contact's
+machine. Otherwise it dials from the contact's discovery entry, step by step,
+until one step connects:
+
+1. **Loopback addresses**, address-only, keeping a connection only if the
+   far end is the entry's machine. In production only an imported card puts
+   loopback here (for example fetch>it's same-computer link).
+2. **Private IPv4 addresses**, peer-verified.
+3. **One dial by machine id** with the whole list as hints. ant-quic ranks
+   the hints itself and drops loopback and LAN addresses when any global
+   address is present.
+4. **Each address in list order**, unless the contact's latest announcement
+   says it cannot receive direct connections (`can_receive_direct: false`).
+5. Coordinated hole punching, then a relay.
+
+Signed announcements set the entry. `POST /agent/card/import` adds to it
+without outranking an announcement:
 
 - **The card names the announced machine** (or no machine): the card's
-  addresses, deduplicated and at most 4, go first in the dial list, ahead of
-  the announced ones, because the local user just named them (for example a
-  same-computer link's loopback address). The entry keeps its
-  `announced_at`, relay hints and certificate fields. The next signed
-  announcement replaces the list.
+  addresses, deduplicated and at most 4, lead the list, ahead of the
+  announced ones, because the local user just named them. A later card
+  replaces the earlier card's lead; card addresses never total more than 4.
+  The entry keeps its `announced_at`, relay hints and certificate fields.
+  The next signed announcement replaces the list.
 - **The card names another machine:** the entry becomes the card's, with
-  its machine id and addresses, no relay hints and `announced_at` 0. It
-  never pairs one machine's id with another machine's addresses. The next
-  signed announcement replaces it.
+  its machine id and addresses, no relay hints and `announced_at` 0. The
+  daemon also forgets the contact's live binding to the machine it left, so
+  a reconnect there cannot pair that machine's id with the card's
+  addresses. The next signed announcement replaces the entry.
 - **No announcement yet:** the card's machine id and addresses are recorded
   with `announced_at` 0, so the first signed announcement replaces them,
   whatever the two clocks say.
 
-Every dial authenticates the machine it reaches, so an address from a card
-can cost dial time but cannot impersonate or rebind a contact.
+Every dial to an entry that names a machine authenticates that machine, so
+an address from a card can cost dial time but cannot impersonate the
+contact. An entry with no machine id (a card that names none, before any
+announcement) is dialed trust-on-first-use: the first machine to answer is
+taken. A card that names another machine does move the entry to that
+machine until the next announcement.
 
 ### Direct send request body
 
