@@ -58200,14 +58200,25 @@ pub(in crate::server) mod tests {
     }
 
     /// Observe actual V3 ingest and blob resolution, not just publish completion.
+    ///
+    /// Re-announces while it waits: a heartbeat built before the marker was
+    /// set can land after the marker's announcement in the same second
+    /// (`announced_at` ties overwrite) and restore the old name, and nothing
+    /// else announces again within the deadline.
     async fn announce_owner_cert_to(observer: &Agent, subject: &Agent) -> Result<()> {
+        const REANNOUNCE_EVERY: Duration = Duration::from_millis(500);
         let cert = subject.agent_certificate().context("owner identity cert")?;
         let digest = x0x::announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()));
         let marker = format!("r1132-owner-{}", rand::random::<u64>());
         subject.set_self_name(Some(marker.clone()));
         subject.announce_identity(true, true).await?;
+        let mut last_announce = tokio::time::Instant::now();
         tokio::time::timeout(Duration::from_secs(20), async {
             loop {
+                if last_announce.elapsed() >= REANNOUNCE_EVERY {
+                    subject.announce_identity(true, true).await?;
+                    last_announce = tokio::time::Instant::now();
+                }
                 let discovered = observer.discovered_agent(subject.agent_id()).await?;
                 if discovered.as_ref().is_some_and(|entry| {
                     entry.self_name.as_deref() == Some(marker.as_str())
