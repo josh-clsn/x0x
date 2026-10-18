@@ -298,6 +298,12 @@ decision**. Two rules protect prior intent:
    trust is `max(existing, requested)`, so a re-import (which defaults to
    `"known"`) cannot downgrade a manually-trusted peer.
 
+The card's discovery hint never outranks the contact's signed announcement.
+An entry that an announcement made keeps its addresses, relay hints and
+`announced_at`; the import takes only the card's machine id. A contact known
+only by card is recorded as an observation (`announced_at` 0), so the next
+signed announcement replaces it, whatever the two clocks say.
+
 For a new contact the requested `trust_level` (default `"known"`) is applied
 as-is. The response includes `trust_change_ignored: true` when the requested
 level conflicted with an existing trust decision and was therefore ignored.
