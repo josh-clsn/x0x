@@ -620,7 +620,7 @@ async fn named_group_join_returns_inline_member_joined() {
         .json()
         .await
         .unwrap();
-    let group_id = create_r["group"]["id"].as_str().unwrap_or("").to_string();
+    let group_id = create_r["group_id"].as_str().unwrap_or("").to_string();
     assert!(!group_id.is_empty(), "create group: {create_r:?}");
 
     let backup_admin = fake_agent_id(0x45);
