@@ -589,19 +589,23 @@ static GENERAL_RAW_STANDIN_DELIVERIES: std::sync::LazyLock<
 
 /// Test builds: the next ACKed raw sends of these agents fail as a zombie
 /// connection's do (the receive ACK never comes while the connection still
-/// reads as connected), one per queued delay, each after its delay.
+/// reads as connected), one per queued delay, each after its delay. A
+/// `true` flag makes the failure the remote's backpressure refusal instead.
 #[cfg(test)]
+#[allow(clippy::type_complexity)]
 static INJECTED_ZOMBIE_ACK_FAILURES: std::sync::LazyLock<
     std::sync::Mutex<
         std::collections::HashMap<
             identity::AgentId,
-            std::collections::VecDeque<std::time::Duration>,
+            std::collections::VecDeque<(std::time::Duration, bool)>,
         >,
     >,
 > = std::sync::LazyLock::new(Default::default);
 
 #[cfg(test)]
-fn take_injected_zombie_ack_failure(agent: &identity::AgentId) -> Option<std::time::Duration> {
+fn take_injected_zombie_ack_failure(
+    agent: &identity::AgentId,
+) -> Option<(std::time::Duration, bool)> {
     INJECTED_ZOMBIE_ACK_FAILURES
         .lock()
         .ok()
@@ -10008,14 +10012,21 @@ impl Agent {
             // against the new generation. The reissue does not race again;
             // a healthy peer should converge in a single supersede cycle.
             #[cfg(test)]
-            let zombie = take_injected_zombie_ack_failure(&self.identity.agent_id());
+            let injected = take_injected_zombie_ack_failure(&self.identity.agent_id());
             #[cfg(not(test))]
-            let zombie: Option<std::time::Duration> = None;
-            if let Some(delay) = zombie {
+            let injected: Option<(std::time::Duration, bool)> = None;
+            if let Some((delay, backpressured)) = injected {
                 tokio::time::sleep(delay).await;
-                Err(error::NetworkError::ConnectionFailed(
-                    "send_with_receive_ack failed: injected zombie (test)".to_string(),
-                ))
+                Err(if backpressured {
+                    error::NetworkError::RemoteReceiveBackpressured(
+                        "Remote receive pipeline rejected payload: Backpressured (test)"
+                            .to_string(),
+                    )
+                } else {
+                    error::NetworkError::ConnectionFailed(
+                        "send_with_receive_ack failed: injected zombie (test)".to_string(),
+                    )
+                })
             } else {
                 self.send_ack_racing_replaced(
                     network.as_ref(),
@@ -10102,7 +10113,15 @@ impl Agent {
                 // fast path and takes the X0X-0031/0033
                 // send-readiness repair (fresh dial) instead of re-sending
                 // into the same dead connection until the caller's deadline.
-                if receive_ack_timeout.is_some() && network.is_connected(&ant_peer_id).await {
+                // A backpressure refusal is an answer from a live receiver,
+                // not a zombie: never tear its connection down or resend
+                // into it.
+                let refused_by_live_peer =
+                    matches!(e, error::NetworkError::RemoteReceiveBackpressured(_));
+                if receive_ack_timeout.is_some()
+                    && !refused_by_live_peer
+                    && network.is_connected(&ant_peer_id).await
+                {
                     match network.disconnect(&ant_peer_id).await {
                         Ok(()) => {
                             *zombie_window = ack_window_end;
@@ -10844,7 +10863,20 @@ impl Agent {
     #[cfg(test)]
     pub(crate) fn inject_zombie_ack_failures_for_testing(&self, delays: &[std::time::Duration]) {
         if let Ok(mut failures) = INJECTED_ZOMBIE_ACK_FAILURES.lock() {
-            failures.insert(self.identity.agent_id(), delays.iter().copied().collect());
+            failures.insert(
+                self.identity.agent_id(),
+                delays.iter().map(|delay| (*delay, false)).collect(),
+            );
+        }
+    }
+
+    /// Test seam: this agent's next ACKed raw send is refused by the
+    /// remote's receive pipeline (backpressure) after `delay`. Test builds
+    /// only.
+    #[cfg(test)]
+    pub(crate) fn inject_backpressure_ack_failure_for_testing(&self, delay: std::time::Duration) {
+        if let Ok(mut failures) = INJECTED_ZOMBIE_ACK_FAILURES.lock() {
+            failures.insert(self.identity.agent_id(), [(delay, true)].into());
         }
     }
 
@@ -26049,7 +26081,8 @@ mod tests {
     /// resends inside the same send, on a metered leaf too, within ONE more
     /// receive-ACK window counted from the end of its first: the payload
     /// arrives once and the send succeeds instead of failing over to its
-    /// caller's next retry. A send without a zombie keeps its one window.
+    /// caller's next retry. A send without a zombie keeps its one window,
+    /// and a backpressure refusal is never taken for one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn zombie_teardown_redials_and_resends_within_the_send() {
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -26148,6 +26181,16 @@ mod tests {
         dropper.await.expect("dropper");
         assert!(result.is_err());
         assert!(took >= delay && took < delay + slack, "{took:?}");
+        assert!(tokio::time::timeout(quiet, bob_rx.recv()).await.is_err());
+
+        // 5. A backpressure refusal is a live peer's answer: the connection
+        //    stays up and nothing is resent into it.
+        connect().await;
+        alice.inject_backpressure_ack_failure_for_testing(delay);
+        let (result, took) = send(b"backpressured", window).await;
+        assert!(result.is_err());
+        assert!(took >= delay && took < delay + slack, "{took:?}");
+        assert!(alice_network.is_connected(&bob_peer).await, "not torn down");
         assert!(tokio::time::timeout(quiet, bob_rx.recv()).await.is_err());
     }
 
