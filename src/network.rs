@@ -3932,7 +3932,7 @@ impl NetworkNode {
     /// Latch the mesh quiesced (see the [`Self::mesh_quiesced`] field docs
     /// for exactly what the latch gates).
     ///
-    /// Transitions are epoch-ordered under [`Self::mesh_transitions`] so a
+    /// Transitions are epoch-ordered under `Self::mesh_transitions` so a
     /// stale mesh-on command can never undo a newer quiesce (see
     /// [`Self::unlatch_mesh_if_current`]). Returns `Some(epoch)` when this
     /// call performed the false→true transition — the caller owns spawning

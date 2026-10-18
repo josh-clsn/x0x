@@ -13424,7 +13424,7 @@ impl Agent {
     ///   outbound dial gate and break demand DMs and the re-join dial);
     ///   the latch itself gates the proactive-reconnect path instead;
     /// - a tracked re-sweep task disconnects any peer that reappears (e.g.
-    ///   via a demand dial) every [`QUIESCE_RESWEEP_SECS`] while the latch
+    ///   via a demand dial) every `QUIESCE_RESWEEP_SECS` while the latch
     ///   holds;
     /// - leaf-mode gates already stop announcement and proactive redials;
     /// - contacts still return via explicit demand (per-send dials — the DM
