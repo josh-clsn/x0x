@@ -758,11 +758,62 @@ async fn apply_metadata_event_endpoint_rejects_invalid_event() {
 }
 
 /// `GET /groups/:id/join-result/:member` must answer `404` with the distinct
-/// `join_result_not_staged` reason when nothing is staged, so a relay caller
-/// polls with backoff instead of relaying a welcome-less event.
+/// `join_result_not_staged` reason when the group is known and the member
+/// is seated but nothing is staged, so a relay caller polls with backoff
+/// instead of relaying a welcome-less event.
 #[tokio::test]
 #[ignore]
 async fn join_result_inline_get_404_when_not_staged() {
+    let d = daemon().await;
+    // A direct add-by-agent_id seats the member Active without a join, so
+    // the serving guard passes and no join-result is staged for it.
+    let create_r: Value = authed_client(&d)
+        .post(d.url("/groups"))
+        .json(&serde_json::json!({
+            "name": "Join Result Group",
+            "description": "",
+            "display_name": "Owner",
+            "preset": "public_open"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let gid = create_r["group_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(!gid.is_empty(), "create public_open group: {create_r:?}");
+    let member = fake_agent_id(0x46);
+    let add_r: Value = authed_client(&d)
+        .post(d.url(&format!("/groups/{gid}/members")))
+        .json(&serde_json::json!({ "agent_id": member, "display_name": "Seated" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(add_r["ok"], true, "add member response: {add_r:?}");
+
+    let r = authed_client(&d)
+        .get(d.url(&format!("/groups/{gid}/join-result/{member}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["reason"], "join_result_not_staged", "body: {body:?}");
+}
+
+/// `GET /groups/:id/join-result/:member` for a group this node holds no
+/// record of answers `404` with `group_unknown`, distinct from
+/// `join_result_not_staged`.
+#[tokio::test]
+#[ignore]
+async fn join_result_inline_get_404_when_group_unknown() {
     let d = daemon().await;
     let gid = "cc".repeat(32);
     let member = "dd".repeat(32);
@@ -773,7 +824,7 @@ async fn join_result_inline_get_404_when_not_staged() {
         .unwrap();
     assert_eq!(r.status(), StatusCode::NOT_FOUND);
     let body: Value = r.json().await.unwrap();
-    assert_eq!(body["reason"], "join_result_not_staged", "body: {body:?}");
+    assert_eq!(body["reason"], "group_unknown", "body: {body:?}");
 }
 
 /// `POST /groups/:id/join-result/:member` must reject a malformed
