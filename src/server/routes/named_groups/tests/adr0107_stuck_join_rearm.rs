@@ -5470,8 +5470,18 @@ async fn s8a_rearm_times_out_live_and_the_next_invite_rekeys_after_a_restart() -
         attempt_of(&s.j2, &s.stable).is_some_and(|(_, stored)| stored.is_none()),
         "a re-arm is fetch-only"
     );
+    // Wait for the outcome, not only for the attempt to go: finalize
+    // removes the attempt, persists the pins, and only then records the
+    // outcome, so under load a poll can land in between.
+    let recorded = |state: &AppState| {
+        state
+            .last_join_outcomes
+            .lock()
+            .expect("outcomes")
+            .contains_key(&s.group_key)
+    };
     let ended = tokio::time::timeout(Duration::from_secs(20), async {
-        while attempt_of(&s.j2, &s.stable).is_some_and(|(id, _)| id == first) {
+        while attempt_of(&s.j2, &s.stable).is_some_and(|(id, _)| id == first) || !recorded(&s.j2) {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
