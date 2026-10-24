@@ -442,10 +442,50 @@ async fn get_reports_head_presence_and_round() -> Result<()> {
     );
     assert_eq!(strings(&body["admins"]), vec![owner_hex.clone()]);
     assert_eq!(body["admins_since"], serde_json::json!([]));
-    assert_eq!(body["started_at_ms"], s1.started_at_ms);
-    // A8 fills the presence facts; until then they fail closed.
+    assert_eq!(body["started_at_ms"], s1.presence.started_at_ms());
+    assert_eq!(body["run_id"], s1.presence.run_id());
+    // These daemons hold no verified binding to the owner (no announcement
+    // was exchanged), so no link to it counts.
     assert_eq!(body["connected_admins"], serde_json::json!([]));
-    assert_eq!(body["suspended_since_last_get"], true);
+    assert_eq!(
+        body["suspended_since_last_get"], true,
+        "a first read, with no mark, cannot be vouched for"
+    );
+    let mark = body["presence_mark"].as_str().expect("a presence mark");
+    assert!(mark.starts_with(&format!("{}:", s1.presence.run_id())));
+    let (status, again) = call(
+        s1,
+        Method::GET,
+        &format!(
+            "{}&since_presence_mark={mark}",
+            state_path(group_id, info.state_revision)
+        ),
+        &s1.api_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(
+        again["suspended_since_last_get"],
+        !cfg!(any(target_os = "linux", target_os = "android")),
+        "since its own mark only a platform without a verified pair reads suspended"
+    );
+    let (status, foreign) = call(
+        s1,
+        Method::GET,
+        &format!(
+            "{}&since_presence_mark=00000000000000000000000000000000:0",
+            state_path(group_id, info.state_revision)
+        ),
+        &s1.api_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{foreign}");
+    assert_eq!(
+        foreign["suspended_since_last_get"], true,
+        "another run's mark (a restart) is never vouched for"
+    );
     assert_eq!(body["round"], serde_json::Value::Null);
 
     let (status, opened) = trigger(s1, group_id, serde_json::json!({ "challenge": [] })).await;

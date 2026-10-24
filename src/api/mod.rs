@@ -1454,9 +1454,9 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Get,
         path: "/groups/:id/treekem/catch-up",
         cli_name: "group treekem-state",
-        description: "This daemon's TreeKEM head, the admins of every state applied since a revision, and the open round",
+        description: "This daemon's TreeKEM head, the admins of every state applied since a revision, presence facts, and the open round",
         category: "named-groups",
-        request: RequestSpec::Fields(&[RequestField::query("since_revision", true), RequestField::query("since_state_hash", false)]),
+        request: RequestSpec::Fields(&[RequestField::query("since_revision", true), RequestField::query("since_state_hash", false), RequestField::query("since_presence_mark", false)]),
     },
     EndpointDef {
         method: Method::Post,

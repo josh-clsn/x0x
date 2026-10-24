@@ -5537,6 +5537,7 @@ dependencies = [
  "hyper 0.14.32",
  "if-addrs 0.13.4",
  "libc",
+ "nix",
  "postcard",
  "proptest",
  "rand 0.8.8",

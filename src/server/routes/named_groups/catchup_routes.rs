@@ -508,6 +508,10 @@ pub(in crate::server) struct TreeKemCatchUpStateQuery {
     /// then be that very state for `admins_since_complete`.
     #[serde(default)]
     since_state_hash: Option<String>,
+    /// The `presence_mark` of the reader's previous GET (survivor re-key
+    /// A8): `suspended_since_last_get` is measured from it.
+    #[serde(default)]
+    since_presence_mark: Option<String>,
 }
 
 /// The roster facts the read route reports, read in one go.
@@ -594,12 +598,17 @@ async fn roster_state(
 ///   when it is, `fork_quarantine: {"revision", "no_anchor"}`. Every seal
 ///   is refused while it is, so the engine holds and says the room needs a
 ///   new invite;
-/// - `started_at_ms`: an opaque marker of this daemon run. When it
-///   changes, the daemon restarted. It is not a clock reading: the engine
+/// - `run_id`: 32 hex digits, different on every daemon run: when it
+///   changes, the daemon restarted. `started_at_ms` is the wall clock at
+///   the start, for display only: two runs can share it, and the engine
 ///   must never subtract from it;
-/// - `connected_admins`, `suspended_since_last_get`: presence facts. Task
-///   A8 fills them. Until then they fail closed: nobody connected, and
-///   suspended;
+/// - `connected_admins`: the admins, of the live roster and of every state
+///   since the anchor, this daemon holds a live authenticated link to,
+///   held to the zombie rule after a suspend ([`crate::server::presence_facts`]);
+/// - `suspended_since_last_get`, `presence_mark`: whether this daemon was
+///   suspended or frozen since the GET whose `presence_mark` the reader
+///   passes as `since_presence_mark`. No mark, another run's mark, or a
+///   platform without a verified suspend pair reads `true`;
 /// - `round`: the open round or `null`: `{"round", "asked", "heads",
 ///   "conflicted"}`, where `round` is the challenge the trigger returned,
 ///   `heads` every distinct head recorded (each a verified claim), and
@@ -639,6 +648,23 @@ pub(in crate::server) async fn treekem_catch_up_state(
         if still != (roster.revision, roster.state_hash.clone()) {
             continue;
         }
+        // Presence covers every admin the engine's closure can hold: the
+        // live roster's and those of every state applied since the anchor.
+        // One it does not list is never reported connected.
+        let mut present_over: Vec<String> = roster
+            .admins
+            .iter()
+            .chain(roster.admins_since.states.iter().flatten())
+            .cloned()
+            .collect();
+        present_over.sort();
+        present_over.dedup();
+        let presence = crate::server::presence_facts::report_for(
+            &state,
+            query.since_presence_mark.as_deref(),
+            &present_over,
+        )
+        .await;
         let round = head_rounds::round_view(&state, &id).map(|round| {
             serde_json::json!({
                 "round": round.nonce,
@@ -665,11 +691,11 @@ pub(in crate::server) async fn treekem_catch_up_state(
                 "fork_quarantine": roster.fork_quarantine.map(|(revision, no_anchor)| {
                     serde_json::json!({ "revision": revision, "no_anchor": no_anchor })
                 }),
-                "started_at_ms": state.started_at_ms,
-                // Task A8 fills these from its presence sampler. Until
-                // then they fail closed.
-                "connected_admins": Vec::<String>::new(),
-                "suspended_since_last_get": true,
+                "started_at_ms": state.presence.started_at_ms(),
+                "run_id": state.presence.run_id(),
+                "connected_admins": presence.connected_admins,
+                "suspended_since_last_get": presence.suspended_since_last_get,
+                "presence_mark": presence.presence_mark,
                 "round": round,
             })),
         )

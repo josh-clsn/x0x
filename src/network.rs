@@ -1964,6 +1964,23 @@ async fn disconnect_pool_candidates(
     }
 }
 
+/// Survivor re-key A8: what a live connection to one peer proves.
+///
+/// A connection that outlived its far end (a zombie) still reads as
+/// connected until QUIC's idle timeout or a failed acknowledged send tears
+/// it down, so presence also asks when the connection was made and when the
+/// peer last delivered application data on it.
+#[derive(Debug, Clone, Copy)]
+pub struct LinkLiveness {
+    /// The connection's peer id was proven in its TLS handshake, and the
+    /// connection is live.
+    pub authenticated: bool,
+    /// When the live connection was made.
+    pub connected_at: Instant,
+    /// When the peer last delivered application data, on any connection.
+    pub last_received_at: Option<Instant>,
+}
+
 #[derive(Debug, Clone)]
 pub struct NetworkNode {
     /// ant-quic P2P node (wrapped in `Arc<RwLock>` for shared async access).
@@ -4342,6 +4359,38 @@ impl NetworkNode {
             Some(node) => node.is_connected(peer_id).await,
             None => false,
         }
+    }
+
+    /// Survivor re-key A8: what the live connection to each of `peers`
+    /// proves, from one read of the connection table. A peer with no live
+    /// connection is left out. Never dials.
+    pub async fn link_liveness(
+        &self,
+        peers: &[AntPeerId],
+    ) -> std::collections::HashMap<AntPeerId, LinkLiveness> {
+        let mut links = std::collections::HashMap::new();
+        let Ok(node) = self.require_node().await else {
+            return links;
+        };
+        let live: std::collections::HashMap<AntPeerId, ant_quic::PeerConnection> = node
+            .connected_peers()
+            .await
+            .into_iter()
+            .filter(|conn| peers.contains(&conn.peer_id))
+            .map(|conn| (conn.peer_id, conn))
+            .collect();
+        for (peer_id, conn) in live {
+            let health = node.connection_health(&peer_id).await;
+            links.insert(
+                peer_id,
+                LinkLiveness {
+                    authenticated: conn.authenticated && health.connected,
+                    connected_at: conn.connected_at,
+                    last_received_at: health.last_received_at,
+                },
+            );
+        }
+        links
     }
 
     /// Return the current gossip receive queue depth and max capacity.

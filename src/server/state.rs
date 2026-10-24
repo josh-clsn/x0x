@@ -1267,11 +1267,10 @@ pub(super) struct AppState {
     /// `UPGRADE_FAILED` artifact live (#261).
     pub(super) data_dir: PathBuf,
     pub(super) start_time: Instant,
-    /// Unix milliseconds when this daemon run started (survivor re-key
-    /// A7). An opaque marker of the run, reported by `GET
-    /// /groups/:id/treekem/catch-up`: when it changes, the daemon
-    /// restarted. Not a clock reading anything may subtract from.
-    pub(super) started_at_ms: u64,
+    /// Survivor re-key A8: this run's presence facts (`run_id`,
+    /// `started_at_ms`, the suspend chain), reported by `GET
+    /// /groups/:id/treekem/catch-up`. See [`super::presence_facts`].
+    pub(super) presence: super::presence_facts::PresenceFacts,
     /// Cached transport peer counts served by the auth-exempt `/health`
     /// (issue #600). Refreshed by a background task; the handler only reads
     /// atomics, so the watchdog's liveness probe never touches ant-quic's

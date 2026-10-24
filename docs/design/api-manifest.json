@@ -2604,7 +2604,7 @@
     {
       "category": "named-groups",
       "cli_name": "group treekem-state",
-      "description": "This daemon's TreeKEM head, the admins of every state applied since a revision, and the open round",
+      "description": "This daemon's TreeKEM head, the admins of every state applied since a revision, presence facts, and the open round",
       "method": "GET",
       "path": "/groups/:id/treekem/catch-up",
       "request": {
@@ -2619,6 +2619,12 @@
             "cli": "default",
             "in": "query",
             "name": "since_state_hash",
+            "required": false
+          },
+          {
+            "cli": "default",
+            "in": "query",
+            "name": "since_presence_mark",
             "required": false
           }
         ],

@@ -94,6 +94,11 @@ serde_ignored = "0.1"
 tikv-jemallocator = { version = "0.6", optional = true }
 tikv-jemalloc-ctl = { version = "0.6", optional = true }
 
+# Survivor re-key presence facts: CLOCK_BOOTTIME against CLOCK_MONOTONIC,
+# read through nix's safe API. Already in the lock through ant-quic.
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+nix = { version = "0.29", default-features = false, features = ["time"] }
+
 # Voice adapters (saorsa-webrtc V1.1/V1.2): trait surfaces only — no
 # webrtc-rs, no codecs. `quic-native` matches x0x's transport philosophy.
 [dependencies.saorsa-webrtc-core]

@@ -331,6 +331,22 @@ fn select_pinned_binding(
     })
 }
 
+/// Survivor re-key A8: the machine whose live link may count as `agent`
+/// being present. Only [`select_pinned_binding`]'s live authority names
+/// it: the newer of the verified announcement and the authenticated
+/// binding, refused when its certificate expired. The DM registry, which a
+/// card import also writes, and peer evidence never do, so an agent with no
+/// verified binding is never present.
+fn presence_bound_machine(
+    announced: Option<dm_inbox::AuthenticatedMachineBinding>,
+    attested: Option<dm_inbox::AuthenticatedMachineBinding>,
+    now_secs: u64,
+) -> Option<identity::MachineId> {
+    select_pinned_binding(announced, attested, None, || None, now_secs)
+        .map(|binding| binding.machine)
+        .filter(|machine| machine.0 != [0u8; 32])
+}
+
 impl PinnedMachineSource {
     fn label(self) -> &'static str {
         match self {
@@ -10807,6 +10823,46 @@ impl Agent {
             }
         }
         false
+    }
+
+    /// Survivor re-key A8: the live link to each of `agents` that may count
+    /// as presence. An agent counts only through the machine its verified
+    /// binding names ([`presence_bound_machine`]); one without such a
+    /// binding, or without a live connection to that machine, is left out.
+    /// Never dials.
+    pub(crate) async fn presence_links(
+        &self,
+        agents: &[identity::AgentId],
+    ) -> std::collections::HashMap<identity::AgentId, network::LinkLiveness> {
+        let mut present = std::collections::HashMap::new();
+        let Some(network) = self.network.as_ref() else {
+            return present;
+        };
+        let announced: Vec<_> = {
+            let store = self.announced_machine_bindings.read().await;
+            agents.iter().map(|agent| store.peek(agent)).collect()
+        };
+        let attested: Vec<_> = {
+            let store = self.authenticated_machine_bindings.read().await;
+            agents.iter().map(|agent| store.peek(agent)).collect()
+        };
+        let now_secs = Self::unix_timestamp_secs();
+        let bound: Vec<(identity::AgentId, ant_quic::PeerId)> = agents
+            .iter()
+            .zip(announced.into_iter().zip(attested))
+            .filter_map(|(agent, (announced, attested))| {
+                presence_bound_machine(announced, attested, now_secs)
+                    .map(|machine| (*agent, ant_quic::PeerId(machine.0)))
+            })
+            .collect();
+        let peers: Vec<ant_quic::PeerId> = bound.iter().map(|(_, peer)| *peer).collect();
+        let links = network.link_liveness(&peers).await;
+        for (agent, peer) in bound {
+            if let Some(link) = links.get(&peer) {
+                present.insert(agent, *link);
+            }
+        }
+        present
     }
 
     /// Dial each loopback address in `addresses`, address-only, and keep
@@ -33924,6 +33980,38 @@ async fn r7d_announced_binding_learns_expiry_when_the_certificate_blob_lands() {
         )
         .is_none(),
         "an expired announced binding still resolved"
+    );
+}
+
+/// WHY (survivor re-key A8): a link counts as an admin being present only
+/// through the machine the admin's verified binding names. A card or the
+/// DM registry alone names nothing, and an expired certificate ends it.
+#[tokio::test]
+async fn presence_counts_only_a_verified_unexpired_binding() {
+    let bindings = dm_inbox::AuthenticatedMachineBindings::default();
+    let agent = identity::AgentId([0xa1; 32]);
+    let machine = identity::MachineId([0xb2; 32]);
+    let now = 1_000_000;
+    assert_eq!(presence_bound_machine(None, None, now), None);
+    dm_inbox::record_authenticated_machine_binding_with_expiry(
+        &bindings,
+        agent,
+        machine,
+        now - 10,
+        Some(now + 600),
+    )
+    .await;
+    let binding = bindings.read().await.peek(&agent);
+    assert_eq!(presence_bound_machine(None, binding, now), Some(machine));
+    assert_eq!(presence_bound_machine(binding, None, now), Some(machine));
+    assert_eq!(
+        presence_bound_machine(
+            None,
+            binding,
+            now + 600 + identity::EXPIRY_CLOCK_SKEW_SECS + 1
+        ),
+        None,
+        "an expired binding still counted"
     );
 }
 

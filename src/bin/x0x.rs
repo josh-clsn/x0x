@@ -1683,6 +1683,10 @@ enum GroupSub {
         /// The anchor's state hash: the anchor must be that state.
         #[arg(long)]
         since_state_hash: Option<String>,
+        /// The `presence_mark` of the previous read: suspends are reported
+        /// since it.
+        #[arg(long)]
+        since_presence_mark: Option<String>,
     },
     /// Sign this daemon's head proof for a requester's own signed
     /// challenge (survivor re-key).
@@ -2952,12 +2956,14 @@ async fn run(
                 group_id,
                 since_revision,
                 since_state_hash,
+                since_presence_mark,
             }) => {
                 commands::group::treekem_state(
                     &client,
                     &group_id,
                     since_revision,
                     since_state_hash.as_deref(),
+                    since_presence_mark.as_deref(),
                 )
                 .await
             }

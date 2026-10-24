@@ -45665,7 +45665,7 @@ pub(in crate::server) mod tests {
             api_address: "127.0.0.1:0".parse().expect("valid test API address"),
             data_dir: data_dir.to_path_buf(),
             start_time: Instant::now(),
-            started_at_ms: now_millis_u64(),
+            presence: crate::server::presence_facts::PresenceFacts::system(),
             health_snapshot: Arc::new(crate::server::routes::status::HealthSnapshot::default()),
             broadcast_tx,
             calls: crate::server::routes::calls::new_registry(),
