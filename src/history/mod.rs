@@ -35,6 +35,23 @@ pub use writer::{HistoryCounters, WriterHandle, WRITER_QUEUE_CAPACITY};
 
 pub use reaper::HISTORY_REAPER_INTERVAL_SECS;
 
+/// Run `f` on tokio's blocking pool, or inline on the current-thread
+/// runtime when the W3-H shim is active (#1245). Inline execution stops
+/// blocking-pool wakeups from reordering same-instant ready tasks.
+pub(crate) async fn run_blocking<F, R>(f: F) -> Result<R, tokio::task::JoinError>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    #[cfg(test)]
+    {
+        if std::env::var_os("W3H_SHIM_ACTIVE").as_deref() == Some(std::ffi::OsStr::new("1")) {
+            return Ok(f());
+        }
+    }
+    tokio::task::spawn_blocking(f).await
+}
+
 /// Default whole-database byte budget: 1 GiB (ADR-0023 §6).
 pub const DEFAULT_MAX_BYTES: u64 = 1_073_741_824;
 
@@ -267,7 +284,7 @@ impl HistoryService {
         let _ = self.reaper.await;
         if let Some(writer) = self.writer.take() {
             // Writer drain is blocking (joins an OS thread).
-            let _ = tokio::task::spawn_blocking(move || writer.shutdown()).await;
+            let _ = run_blocking(move || writer.shutdown()).await;
         }
     }
 }

@@ -4,6 +4,8 @@
 //! MachineKeypair, AgentKeypair, UserKeypair, and AgentCertificate types,
 //! enabling persistence of identities across application restarts.
 
+#[cfg(test)]
+use self::w3h_fs as fs;
 use crate::error::{IdentityError, Result};
 use crate::identity::{AgentCertificate, AgentKeypair, MachineKeypair, UserKeypair};
 use crate::revocation::{
@@ -14,7 +16,166 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(test))]
 use tokio::fs;
+
+/// Test-only FS layer for W3-H (#1245): when the entropy/wall-clock shim is
+/// active, read/write/exists/remove/metadata run on the current-thread
+/// runtime instead of `tokio::fs`'s blocking pool, so same-instant task
+/// order is not scrambled by remote wakeups. `read_dir` stays on tokio
+/// (rare on the join path; wrapping its stream type is not worth the
+/// surface). Production builds use `tokio::fs` unchanged.
+#[cfg(test)]
+mod w3h_fs {
+    use std::io;
+    use std::path::Path;
+
+    fn inline() -> bool {
+        std::env::var_os("W3H_SHIM_ACTIVE").as_deref() == Some(std::ffi::OsStr::new("1"))
+    }
+
+    pub async fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
+        if inline() {
+            std::fs::read(path)
+        } else {
+            tokio::fs::read(path).await
+        }
+    }
+
+    pub async fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> io::Result<()> {
+        if inline() {
+            std::fs::write(path, contents)
+        } else {
+            tokio::fs::write(path, contents).await
+        }
+    }
+
+    pub async fn try_exists(path: impl AsRef<Path>) -> io::Result<bool> {
+        if inline() {
+            Ok(path.as_ref().exists())
+        } else {
+            tokio::fs::try_exists(path).await
+        }
+    }
+
+    pub async fn remove_file(path: impl AsRef<Path>) -> io::Result<()> {
+        if inline() {
+            std::fs::remove_file(path)
+        } else {
+            tokio::fs::remove_file(path).await
+        }
+    }
+
+    pub async fn metadata(path: impl AsRef<Path>) -> io::Result<std::fs::Metadata> {
+        if inline() {
+            std::fs::metadata(path)
+        } else {
+            tokio::fs::metadata(path).await
+        }
+    }
+
+    pub async fn create_dir(path: impl AsRef<Path>) -> io::Result<()> {
+        if inline() {
+            std::fs::create_dir(path)
+        } else {
+            tokio::fs::create_dir(path).await
+        }
+    }
+
+    pub async fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
+        if inline() {
+            std::fs::create_dir_all(path)
+        } else {
+            tokio::fs::create_dir_all(path).await
+        }
+    }
+
+    pub async fn remove_dir(path: impl AsRef<Path>) -> io::Result<()> {
+        if inline() {
+            std::fs::remove_dir(path)
+        } else {
+            tokio::fs::remove_dir(path).await
+        }
+    }
+
+    pub async fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
+        if inline() {
+            std::fs::rename(from, to)
+        } else {
+            tokio::fs::rename(from, to).await
+        }
+    }
+
+    pub async fn set_permissions(
+        path: impl AsRef<Path>,
+        perms: std::fs::Permissions,
+    ) -> io::Result<()> {
+        if inline() {
+            std::fs::set_permissions(path, perms)
+        } else {
+            tokio::fs::set_permissions(path, perms).await
+        }
+    }
+
+    pub use tokio::fs::read_dir;
+
+    /// File handle that uses `std::fs` inline under the W3-H shim so durable
+    /// create/write/sync/open do not schedule on the blocking pool (#1245).
+    pub struct File {
+        inner: FileInner,
+    }
+
+    enum FileInner {
+        Std(std::fs::File),
+        Tokio(tokio::fs::File),
+    }
+
+    impl File {
+        pub async fn create(path: impl AsRef<Path>) -> io::Result<Self> {
+            if inline() {
+                Ok(Self {
+                    inner: FileInner::Std(std::fs::File::create(path)?),
+                })
+            } else {
+                Ok(Self {
+                    inner: FileInner::Tokio(tokio::fs::File::create(path).await?),
+                })
+            }
+        }
+
+        pub async fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+            if inline() {
+                Ok(Self {
+                    inner: FileInner::Std(std::fs::File::open(path)?),
+                })
+            } else {
+                Ok(Self {
+                    inner: FileInner::Tokio(tokio::fs::File::open(path).await?),
+                })
+            }
+        }
+
+        pub async fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+            match &mut self.inner {
+                FileInner::Std(file) => {
+                    use std::io::Write;
+                    file.write_all(buf)
+                }
+                FileInner::Tokio(file) => {
+                    use tokio::io::AsyncWriteExt;
+                    file.write_all(buf).await
+                }
+            }
+        }
+
+        pub async fn sync_all(&self) -> io::Result<()> {
+            match &self.inner {
+                FileInner::Std(file) => file.sync_all(),
+                FileInner::Tokio(file) => file.sync_all().await,
+            }
+        }
+    }
+}
 
 /// Serialized keypair representation for storage (legacy v1 format).
 ///
@@ -342,6 +503,9 @@ async fn write_private_bytes_durable_guarded(
     bytes: Vec<u8>,
     _revocation_guard: Option<RevocationWriteGuard>,
 ) -> Result<()> {
+    // Production uses fs::File + AsyncWriteExt; test builds use
+    // w3h_fs::File's inherent write_all (inline under the shim).
+    #[cfg(not(test))]
     use tokio::io::AsyncWriteExt;
 
     let parent = path
@@ -554,7 +718,7 @@ pub async fn machine_keypair_exists() -> bool {
     let Ok(path) = x0x_dir().await else {
         return false;
     };
-    tokio::fs::try_exists(path.join(MACHINE_KEY_FILE))
+    fs::try_exists(path.join(MACHINE_KEY_FILE))
         .await
         .unwrap_or(false)
 }
@@ -604,7 +768,7 @@ pub async fn save_machine_keypair_to<P: AsRef<Path> + Clone>(
 ///
 /// The loaded MachineKeypair, or an error if the file doesn't exist or is invalid
 pub async fn load_machine_keypair_from<P: AsRef<Path>>(path: P) -> Result<MachineKeypair> {
-    let bytes = tokio::fs::read(path).await.map_err(IdentityError::from)?;
+    let bytes = fs::read(path).await.map_err(IdentityError::from)?;
     deserialize_machine_keypair(&bytes)
 }
 
@@ -618,7 +782,7 @@ pub async fn load_machine_keypair_from<P: AsRef<Path>>(path: P) -> Result<Machin
 ///
 /// The loaded AgentKeypair, or an error if the file doesn't exist or is invalid
 pub async fn load_agent_keypair<P: AsRef<Path>>(path: P) -> Result<AgentKeypair> {
-    let bytes = tokio::fs::read(path).await.map_err(IdentityError::from)?;
+    let bytes = fs::read(path).await.map_err(IdentityError::from)?;
     deserialize_agent_keypair(&bytes)
 }
 
@@ -661,7 +825,7 @@ pub async fn agent_keypair_exists() -> bool {
     let Ok(path) = x0x_dir().await else {
         return false;
     };
-    tokio::fs::try_exists(path.join(AGENT_KEY_FILE))
+    fs::try_exists(path.join(AGENT_KEY_FILE))
         .await
         .unwrap_or(false)
 }
@@ -697,7 +861,7 @@ pub async fn save_agent_keypair_to<P: AsRef<Path> + Clone>(
 ///
 /// The loaded AgentKeypair, or an error if the file doesn't exist or is invalid
 pub async fn load_agent_keypair_from<P: AsRef<Path>>(path: P) -> Result<AgentKeypair> {
-    let bytes = tokio::fs::read(path).await.map_err(IdentityError::from)?;
+    let bytes = fs::read(path).await.map_err(IdentityError::from)?;
     deserialize_agent_keypair(&bytes)
 }
 
@@ -758,7 +922,7 @@ pub async fn user_keypair_exists() -> bool {
     let Ok(path) = x0x_dir().await else {
         return false;
     };
-    tokio::fs::try_exists(path.join(USER_KEY_FILE))
+    fs::try_exists(path.join(USER_KEY_FILE))
         .await
         .unwrap_or(false)
 }
@@ -774,7 +938,7 @@ pub async fn save_user_keypair_to<P: AsRef<Path> + Clone>(kp: &UserKeypair, path
 
 /// Load a UserKeypair from the specified file path.
 pub async fn load_user_keypair_from<P: AsRef<Path>>(path: P) -> Result<UserKeypair> {
-    let bytes = tokio::fs::read(path).await.map_err(IdentityError::from)?;
+    let bytes = fs::read(path).await.map_err(IdentityError::from)?;
     deserialize_user_keypair(&bytes)
 }
 
@@ -800,7 +964,7 @@ pub async fn agent_certificate_exists() -> bool {
     let Ok(path) = x0x_dir().await else {
         return false;
     };
-    tokio::fs::try_exists(path.join(AGENT_CERT_FILE))
+    fs::try_exists(path.join(AGENT_CERT_FILE))
         .await
         .unwrap_or(false)
 }
@@ -816,7 +980,7 @@ pub async fn save_agent_certificate_to<P: AsRef<Path> + Clone>(
 
 /// Load an AgentCertificate from the specified file path.
 pub async fn load_agent_certificate_from<P: AsRef<Path>>(path: P) -> Result<AgentCertificate> {
-    let bytes = tokio::fs::read(path).await.map_err(IdentityError::from)?;
+    let bytes = fs::read(path).await.map_err(IdentityError::from)?;
     AgentCertificate::from_storage_bytes(&bytes)
 }
 
@@ -1097,9 +1261,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(REVOCATION_FILE);
         let garbage = b"unreadable v1 revocations\x00\xff";
-        tokio::fs::write(&path, garbage)
-            .await
-            .expect("seed garbage");
+        fs::write(&path, garbage).await.expect("seed garbage");
 
         let mut set = load_revocation_set(Some(dir.path())).await;
         assert!(set.is_empty(), "ADR 0018 load remains fail-open");
@@ -1122,11 +1284,11 @@ mod tests {
         assert!(revocation_persistence_is_blocked(&refused));
         assert!(set.is_agent_revoked(&issuer.agent_id()));
         assert_eq!(
-            tokio::fs::read(&path).await.expect("read original file"),
+            fs::read(&path).await.expect("read original file"),
             garbage,
             "persist must leave unreadable revocations.bin byte-identical"
         );
-        tokio::fs::write(&path, RevocationSet::new().to_bytes().unwrap())
+        fs::write(&path, RevocationSet::new().to_bytes().unwrap())
             .await
             .expect("operator repair");
         save_revocation_set(&set, Some(dir.path()))
@@ -1490,7 +1652,7 @@ mod tests {
         // as a structured Storage error — never a panic, never a silent ok.
         let tmp = tempfile::tempdir().expect("tmpdir");
         let blocker = tmp.path().join("blocker");
-        tokio::fs::write(&blocker, b"x")
+        fs::write(&blocker, b"x")
             .await
             .expect("create blocker file");
         let target = blocker.join("sub").join("secret.key");
@@ -1510,7 +1672,7 @@ mod tests {
         // being trusted on a later load.
         let tmp = tempfile::tempdir().expect("tmpdir");
         let blocker = tmp.path().join("blocker");
-        tokio::fs::write(&blocker, b"x")
+        fs::write(&blocker, b"x")
             .await
             .expect("create blocker file");
         let target = blocker.join("sub").join("secret.key");
@@ -1782,19 +1944,19 @@ mod tests {
         super::write_private_bytes_durable(&path, vec![1, 2, 3, 4])
             .await
             .expect("durable write");
-        let bytes = tokio::fs::read(&path).await.expect("read back");
+        let bytes = fs::read(&path).await.expect("read back");
         assert_eq!(bytes, vec![1, 2, 3, 4]);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = tokio::fs::metadata(&path)
+            let mode = fs::metadata(&path)
                 .await
                 .expect("metadata")
                 .permissions()
                 .mode();
             assert_eq!(mode & 0o777, 0o600, "journal bytes are private");
         }
-        let mut entries = tokio::fs::read_dir(dir.path().join("sub"))
+        let mut entries = fs::read_dir(dir.path().join("sub"))
             .await
             .expect("read_dir");
         while let Some(entry) = entries.next_entry().await.expect("entry") {
@@ -1809,7 +1971,7 @@ mod tests {
         super::write_private_bytes_durable(&path, vec![9])
             .await
             .expect("rewrite");
-        let bytes = tokio::fs::read(&path).await.expect("reread");
+        let bytes = fs::read(&path).await.expect("reread");
         assert_eq!(bytes, vec![9]);
     }
 }

@@ -36,7 +36,8 @@ pub(super) fn spawn(
                 .quarantine_pinned_scopes
                 .store(pinned.len() as u64, Ordering::Relaxed);
             let result =
-                tokio::task::spawn_blocking(move || store.retain_with_pins(&policy, &pinned)).await;
+                crate::history::run_blocking(move || store.retain_with_pins(&policy, &pinned))
+                    .await;
             match result {
                 Ok(Ok(outcome)) => {
                     if outcome.pinned_evicted > 0 {
