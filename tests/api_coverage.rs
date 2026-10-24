@@ -451,6 +451,28 @@ const COVERED: &[CoveredEndpoint] = &[
         "/groups/:id/join-result/:member",
         apply_join_result_endpoint_rejects_invalid_event
     ),
+    // Survivor re-key A7: covered in the named_groups lib tests (router +
+    // auth middleware).
+    covered!(
+        Post,
+        "/groups/:id/treekem/catch-up",
+        trigger_challenges_the_named_admins_and_roster_admins_only
+    ),
+    covered!(
+        Get,
+        "/groups/:id/treekem/catch-up",
+        get_reports_head_presence_and_round
+    ),
+    covered!(
+        Post,
+        "/groups/:id/treekem/head-proof",
+        head_proof_route_refuses_a_departed_requester
+    ),
+    covered!(
+        Post,
+        "/groups/:id/treekem/head-proof/accept",
+        accept_route_records_only_a_proof_for_the_open_round
+    ),
     covered!(
         Get,
         "/groups/:id/requests",
@@ -662,6 +684,11 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
     (
         "src/server/routes/named_groups/tests/owner_mandate.rs",
         include_str!("../src/server/routes/named_groups/tests/owner_mandate.rs"),
+    ),
+    // Survivor re-key A7: the four head routes' coverage.
+    (
+        "src/server/routes/named_groups/tests/catchup_routes.rs",
+        include_str!("../src/server/routes/named_groups/tests/catchup_routes.rs"),
     ),
     // #477: the join-status route's coverage lives in the named_groups
     // lib tests (the wp_b_477 T-matrix: T7 drives the live terminal path).

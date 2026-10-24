@@ -615,6 +615,25 @@ const ROUTE_CLASSIFICATION: &[(&str, RouteClass)] = &[
         "POST /groups/:id/join-result/:member",
         RouteClass::ControlPlane,
     ),
+    // Survivor re-key A7: asking a room's admins where its key stands. They
+    // open a catch-up round, read this daemon's head, sign a head proof, or
+    // record one. None of them seals content or changes the roster: sealing
+    // stays gated on the send path (rows 1, 2, 4 and 6). Refusing them in a
+    // quarantined group would stop the catch-up and the evidence that
+    // resolve a fork, so they are control plane, like the catch-up apply.
+    (
+        "POST /groups/:id/treekem/catch-up",
+        RouteClass::ControlPlane,
+    ),
+    ("GET /groups/:id/treekem/catch-up", RouteClass::ControlPlane),
+    (
+        "POST /groups/:id/treekem/head-proof",
+        RouteClass::ControlPlane,
+    ),
+    (
+        "POST /groups/:id/treekem/head-proof/accept",
+        RouteClass::ControlPlane,
+    ),
     (
         "DELETE /groups/:id/members/:agent_id",
         RouteClass::ControlPlane,

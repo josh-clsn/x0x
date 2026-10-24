@@ -1443,6 +1443,38 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         request: RequestSpec::Fields(&[RequestField::body("event_b64", true), RequestField::body_as("sender_agent_id", true, "--sender")]),
     },
     EndpointDef {
+        method: Method::Post,
+        path: "/groups/:id/treekem/catch-up",
+        cli_name: "group treekem-catch-up",
+        description: "Challenge the named agents and the roster admins for where the room's key stands (durable token)",
+        category: "named-groups",
+        request: RequestSpec::Fields(&[RequestField::body("observed_epoch", false), RequestField::body("challenge", true)]),
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/groups/:id/treekem/catch-up",
+        cli_name: "group treekem-state",
+        description: "This daemon's TreeKEM head, the admins of every state applied since a revision, and the open round",
+        category: "named-groups",
+        request: RequestSpec::Fields(&[RequestField::query("since_revision", true)]),
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/groups/:id/treekem/head-proof",
+        cli_name: "group treekem-head-proof",
+        description: "Sign this daemon's head proof for a requester's own signed challenge (durable token)",
+        category: "named-groups",
+        request: RequestSpec::Fields(&[RequestField::body_json_doc("request", true)]),
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/groups/:id/treekem/head-proof/accept",
+        cli_name: "group treekem-head-proof-accept",
+        description: "Record an admin's head proof in this member's open round (durable token)",
+        category: "named-groups",
+        request: RequestSpec::Fields(&[RequestField::body_json_doc("proof", true)]),
+    },
+    EndpointDef {
         method: Method::Get,
         path: "/groups/:id/requests",
         cli_name: "group requests",
@@ -1966,6 +1998,47 @@ pub fn categories() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Survivor re-key A7: the four routes that ask a room's admins where
+    /// its key stands are registered, each with its CLI name.
+    #[test]
+    fn endpoints_registry_lists_the_four_routes() {
+        for (method, path, cli) in [
+            (
+                Method::Post,
+                "/groups/:id/treekem/catch-up",
+                "group treekem-catch-up",
+            ),
+            (
+                Method::Get,
+                "/groups/:id/treekem/catch-up",
+                "group treekem-state",
+            ),
+            (
+                Method::Post,
+                "/groups/:id/treekem/head-proof",
+                "group treekem-head-proof",
+            ),
+            (
+                Method::Post,
+                "/groups/:id/treekem/head-proof/accept",
+                "group treekem-head-proof-accept",
+            ),
+        ] {
+            let entry = ENDPOINTS
+                .iter()
+                .find(|ep| ep.method == method && ep.path == path)
+                .unwrap_or_else(|| panic!("{method} {path} is registered"));
+            assert_eq!(entry.cli_name, cli);
+            assert_eq!(entry.category, "named-groups");
+        }
+        let trigger = find_by_cli_name("group treekem-catch-up").unwrap();
+        let RequestSpec::Fields(fields) = &trigger.request else {
+            panic!("the trigger declares its body fields");
+        };
+        let names: Vec<&str> = fields.iter().map(|f| f.name).collect();
+        assert_eq!(names, ["observed_epoch", "challenge"]);
+    }
 
     #[test]
     fn endpoints_is_not_empty() {

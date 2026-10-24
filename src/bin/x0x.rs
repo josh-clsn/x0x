@@ -1658,6 +1658,44 @@ enum GroupSub {
         #[arg(long)]
         sender: String,
     },
+    /// Challenge the named agents and the roster admins for where the
+    /// room's key stands (survivor re-key).
+    TreekemCatchUp {
+        /// Group ID.
+        group_id: String,
+        /// The highest TreeKEM epoch seen for the room; when ahead of the
+        /// live tree, the daemon catches up.
+        #[arg(long)]
+        observed_epoch: Option<u64>,
+        /// An agent id (64 hex) to challenge; repeat for each.
+        #[arg(long, required = true, value_name = "AGENT")]
+        challenge: Vec<String>,
+    },
+    /// This daemon's TreeKEM head, the admins of every state applied since
+    /// a revision, and the open round (survivor re-key).
+    TreekemState {
+        /// Group ID.
+        group_id: String,
+        /// The anchor revision: admins of every later state are listed.
+        #[arg(long)]
+        since_revision: u64,
+    },
+    /// Sign this daemon's head proof for a requester's own signed
+    /// challenge (survivor re-key).
+    TreekemHeadProof {
+        /// Group ID.
+        group_id: String,
+        /// Path to `{"request": <signed page request>}` JSON, or `-` for stdin.
+        path: String,
+    },
+    /// Record an admin's head proof in this member's open round (survivor
+    /// re-key).
+    TreekemHeadProofAccept {
+        /// Group ID.
+        group_id: String,
+        /// Path to `{"proof": <head proof>}` JSON, or `-` for stdin.
+        path: String,
+    },
     /// List locally known discoverable groups (optionally filtered by query).
     Discover {
         /// Tag or name substring.
@@ -2897,6 +2935,24 @@ async fn run(
             }) => {
                 commands::group::apply_join_result(&client, &group_id, &member, &event_b64, &sender)
                     .await
+            }
+            Some(GroupSub::TreekemCatchUp {
+                group_id,
+                observed_epoch,
+                challenge,
+            }) => {
+                commands::group::treekem_catch_up(&client, &group_id, observed_epoch, &challenge)
+                    .await
+            }
+            Some(GroupSub::TreekemState {
+                group_id,
+                since_revision,
+            }) => commands::group::treekem_state(&client, &group_id, since_revision).await,
+            Some(GroupSub::TreekemHeadProof { group_id, path }) => {
+                commands::group::treekem_head_proof(&client, &group_id, &path).await
+            }
+            Some(GroupSub::TreekemHeadProofAccept { group_id, path }) => {
+                commands::group::treekem_head_proof_accept(&client, &group_id, &path).await
             }
             Some(GroupSub::Discover { q }) => {
                 commands::group::discover(&client, q.as_deref()).await

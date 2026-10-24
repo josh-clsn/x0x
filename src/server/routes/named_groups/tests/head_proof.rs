@@ -747,7 +747,10 @@ async fn a_roster_full_of_admins_does_not_crowd_out_a_named_admin() -> Result<()
         .expect("page request recorder")
         .len();
     assert!(
-        challenge_admins(&cast.s1, group_id, &named).await.is_none(),
+        challenge_admins(&cast.s1, group_id, &named)
+            .await
+            .unwrap_err()
+            == head_rounds::NoRound::SetTooLarge,
         "no round opens rather than leave the named owner out"
     );
     assert!(round_view(&cast.s1, group_id).is_none());

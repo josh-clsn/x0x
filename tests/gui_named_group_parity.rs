@@ -165,6 +165,29 @@ const DEFERRED: &[(Method, &str, &str)] = &[
         "/groups/:id/join-result/:member",
         "engine-A control plane; client apps push bridged join-results, not a browser action",
     ),
+    // Survivor re-key A7: the engine asks a room's admins where its key
+    // stands before it seals. Machine-to-machine; the browser GUI never
+    // seals a TreeKEM room message on its own.
+    (
+        Method::Post,
+        "/groups/:id/treekem/catch-up",
+        "survivor re-key control plane; the engine opens head rounds, not a browser action",
+    ),
+    (
+        Method::Get,
+        "/groups/:id/treekem/catch-up",
+        "survivor re-key control plane; the engine reads the head and round, not a browser action",
+    ),
+    (
+        Method::Post,
+        "/groups/:id/treekem/head-proof",
+        "survivor re-key control plane; an admin's engine signs relayed challenges, not a browser action",
+    ),
+    (
+        Method::Post,
+        "/groups/:id/treekem/head-proof/accept",
+        "survivor re-key control plane; the engine records relayed proofs, not a browser action",
+    ),
 ];
 
 /// One observed `api(...)` call: the first-argument expression text

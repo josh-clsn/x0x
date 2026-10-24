@@ -116,10 +116,11 @@ struct HeadRound {
 
 /// What [`round_view`] reports about a room's open round.
 #[derive(Debug, Clone)]
-#[cfg_attr(not(test), allow(dead_code))] // A7's GET reports it.
 pub(in crate::server) struct RoundView {
     pub(in crate::server) nonce: String,
-    /// On the process monotonic clock: not a freshness age.
+    /// On the process monotonic clock: not a freshness age, and never
+    /// reported (A7's GET leaves it out).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::server) opened_at: Instant,
     pub(in crate::server) asked: BTreeSet<String>,
     /// Every distinct head recorded, by signer, each from a proof that
@@ -229,32 +230,57 @@ pub(in crate::server) fn challenge_set(
 
 /// The round [`challenge_admins`] opened.
 #[derive(Debug, Clone)]
-#[cfg_attr(not(test), allow(dead_code))] // A7's trigger reports it.
 pub(in crate::server) struct OpenedRound {
     pub(in crate::server) nonce: String,
     pub(in crate::server) asked: BTreeSet<String>,
+    /// This member's signed page request carrying the round's challenge,
+    /// as every asked agent was sent it. The engine can carry it to an
+    /// admin over another path (the relay), whose daemon answers it
+    /// through A7's sign route.
+    pub(in crate::server) request: super::TreeKemCatchupRequest,
+}
+
+/// Why [`challenge_admins`] opened no round. Every one holds the room: no
+/// caller may fall back to a smaller set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::server) enum NoRound {
+    /// No such room here, or it is withdrawn.
+    NoRoom,
+    /// This member is not active in the room.
+    NotActive,
+    /// The named agents and the roster admins together are more than
+    /// [`HEAD_PROOF_MAX_ADMINS`].
+    SetTooLarge,
+    /// The challenge counter could not be kept, or is used up.
+    NoCounter,
 }
 
 /// Open a round in `group_id` and send each agent of the
 /// [`challenge_set`] this member's signed page request carrying the round's
-/// new challenge. The sends run on their own task. `None`, and no round,
-/// when this member is not active in the room or the set is too large.
-#[cfg_attr(not(test), allow(dead_code))] // A7's trigger route calls it.
+/// new challenge. The sends run on their own task. No round, and a reason,
+/// when this member is not active in the room, the set is too large or no
+/// counter can be kept.
 pub(in crate::server) async fn challenge_admins(
     state: &Arc<AppState>,
     group_id: &str,
     named: &[String],
-) -> Option<OpenedRound> {
+) -> Result<OpenedRound, NoRound> {
     let me = hex::encode(state.agent.agent_id().as_bytes());
     let (key, roster_admins) = {
         let groups = state.named_groups.read().await;
-        let (key, info) = groups.get_key_value(group_id).or_else(|| {
-            groups
-                .iter()
-                .find(|(_, info)| info.stable_group_id() == group_id)
-        })?;
-        if info.withdrawn || !info.has_active_member(&me) {
-            return None;
+        let (key, info) = groups
+            .get_key_value(group_id)
+            .or_else(|| {
+                groups
+                    .iter()
+                    .find(|(_, info)| info.stable_group_id() == group_id)
+            })
+            .ok_or(NoRound::NoRoom)?;
+        if info.withdrawn {
+            return Err(NoRound::NoRoom);
+        }
+        if !info.has_active_member(&me) {
+            return Err(NoRound::NotActive);
         }
         let admins: Vec<String> = info
             .active_members()
@@ -270,7 +296,7 @@ pub(in crate::server) async fn challenge_admins(
             roster_admins = roster_admins.len(),
             "TreeKEM head: more agents to challenge than a round holds; no round opened, the room holds"
         );
-        return None;
+        return Err(NoRound::SetTooLarge);
     };
     let counter = state
         .treekem_head_counter
@@ -283,10 +309,12 @@ pub(in crate::server) async fn challenge_admins(
             group_id = %LogHexId::group(&key),
             "TreeKEM head: no challenge counter; no round opened, the room holds"
         );
-        return None;
+        return Err(NoRound::NoCounter);
     };
     let nonce = challenge_nonce(counter);
-    let mut request = signed_catchup::page_request(state, &key, None).await?;
+    let mut request = signed_catchup::page_request(state, &key, None)
+        .await
+        .ok_or(NoRound::NoRoom)?;
     request.head_challenge = Some(nonce.clone());
     signed_catchup::sign_page_request(state, &mut request);
     state
@@ -304,10 +332,11 @@ pub(in crate::server) async fn challenge_admins(
         .iter()
         .filter_map(|agent| parse_agent_id_hex(agent).ok())
         .collect();
+    let sent = request.clone();
     tokio::spawn(async move {
         let state = &task_state;
         let _sent = futures::future::join_all(peers.into_iter().map(|peer| {
-            let request = request.clone();
+            let request = sent.clone();
             async move {
                 if let Err(e) = signed_catchup::send_page_request(state, &peer, request).await {
                     tracing::debug!(peer = %LogHexId::agent(&hex::encode(peer.as_bytes())), "head challenge failed: {e}");
@@ -316,7 +345,11 @@ pub(in crate::server) async fn challenge_admins(
         }))
         .await;
     });
-    Some(OpenedRound { nonce, asked })
+    Ok(OpenedRound {
+        nonce,
+        asked,
+        request,
+    })
 }
 
 /// Record `proof`, which arrived for `group_id`, in this member's open
@@ -348,7 +381,6 @@ pub(in crate::server) async fn record_proof(
 }
 
 /// The open round in `group_id` (a room key), with its recorded proofs.
-#[cfg_attr(not(test), allow(dead_code))] // A7's GET reports it.
 pub(in crate::server) fn round_view(state: &AppState, group_id: &str) -> Option<RoundView> {
     let book = state
         .treekem_head_rounds

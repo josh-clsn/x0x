@@ -442,6 +442,88 @@ pub async fn apply_join_result(
     Ok(())
 }
 
+/// `x0x group treekem-catch-up` — POST /groups/:id/treekem/catch-up.
+pub async fn treekem_catch_up(
+    client: &DaemonClient,
+    group_id: &str,
+    observed_epoch: Option<u64>,
+    challenge: &[String],
+) -> Result<()> {
+    client.ensure_running().await?;
+    let mut body = json!({ "challenge": challenge });
+    if let Some(epoch) = observed_epoch {
+        body["observed_epoch"] = json!(epoch);
+    }
+    let resp = client
+        .post(&format!("/groups/{group_id}/treekem/catch-up"), &body)
+        .await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x group treekem-state` — GET /groups/:id/treekem/catch-up.
+pub async fn treekem_state(
+    client: &DaemonClient,
+    group_id: &str,
+    since_revision: u64,
+) -> Result<()> {
+    client.ensure_running().await?;
+    let since = since_revision.to_string();
+    let resp = client
+        .get_query(
+            &format!("/groups/{group_id}/treekem/catch-up"),
+            &[("since_revision", since.as_str())],
+        )
+        .await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// A JSON document from `path`, or from stdin when `path` is `-`.
+fn read_json_doc(path: &str, what: &str) -> Result<Value> {
+    let raw = if path == "-" {
+        use std::io::Read as _;
+        let mut s = String::new();
+        std::io::stdin()
+            .read_to_string(&mut s)
+            .with_context(|| format!("read {what} from stdin"))?;
+        s
+    } else {
+        std::fs::read_to_string(path).with_context(|| format!("read {what} from {path}"))?
+    };
+    serde_json::from_str(&raw).with_context(|| format!("parse {what} JSON"))
+}
+
+/// `x0x group treekem-head-proof` — POST /groups/:id/treekem/head-proof.
+pub async fn treekem_head_proof(client: &DaemonClient, group_id: &str, path: &str) -> Result<()> {
+    client.ensure_running().await?;
+    let body = read_json_doc(path, "head-proof request")?;
+    let resp = client
+        .post(&format!("/groups/{group_id}/treekem/head-proof"), &body)
+        .await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x group treekem-head-proof-accept` — POST
+/// /groups/:id/treekem/head-proof/accept.
+pub async fn treekem_head_proof_accept(
+    client: &DaemonClient,
+    group_id: &str,
+    path: &str,
+) -> Result<()> {
+    client.ensure_running().await?;
+    let body = read_json_doc(path, "head proof")?;
+    let resp = client
+        .post(
+            &format!("/groups/{group_id}/treekem/head-proof/accept"),
+            &body,
+        )
+        .await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
 /// `x0x group cancel-request` — DELETE /groups/:id/requests/:request_id.
 pub async fn cancel_request(client: &DaemonClient, group_id: &str, request_id: &str) -> Result<()> {
     client.ensure_running().await?;

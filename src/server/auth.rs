@@ -361,6 +361,11 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
     if is_engine_a_bridge_path(method, path) {
         return true;
     }
+    // Survivor re-key A7: opening a round, signing a head proof and
+    // recording one act as this daemon's agent.
+    if is_treekem_head_owner_path(method, path) {
+        return true;
+    }
     match *method {
         Method::POST => {
             matches!(
@@ -397,6 +402,28 @@ fn is_engine_a_bridge_path(method: &Method, path: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// Survivor re-key A7, durable token only: `POST
+/// /groups/<id>/treekem/catch-up`, `POST /groups/<id>/treekem/head-proof`
+/// and `POST /groups/<id>/treekem/head-proof/accept`. The `GET` of
+/// `catch-up` is a read, gated on this daemon's seat in the handler's
+/// admission.
+fn is_treekem_head_owner_path(method: &Method, path: &str) -> bool {
+    if *method != Method::POST {
+        return false;
+    }
+    let Some(rest) = path.strip_prefix("/groups/") else {
+        return false;
+    };
+    let segs: Vec<&str> = rest.split('/').collect();
+    matches!(
+        segs.as_slice(),
+        [id, "treekem", "catch-up"]
+            | [id, "treekem", "head-proof"]
+            | [id, "treekem", "head-proof", "accept"]
+            if !id.is_empty()
+    )
 }
 
 /// `true` for the ADR-0070 §3 ACL routes: `/acl/reload`, `/acl/connect`,
@@ -1218,6 +1245,30 @@ mod tests {
             store.refresh(&token, after),
             Err(SessionRefreshError::Unknown)
         );
+    }
+
+    /// Survivor re-key A7: the trigger, sign and accept routes are
+    /// durable-token only at the route layer; the read is not.
+    #[test]
+    fn treekem_head_routes_require_the_durable_token() {
+        let g = "ab".repeat(32);
+        for path in [
+            format!("/groups/{g}/treekem/catch-up"),
+            format!("/groups/{g}/treekem/head-proof"),
+            format!("/groups/{g}/treekem/head-proof/accept"),
+        ] {
+            assert!(requires_durable_owner(&Method::POST, &path), "{path}");
+            assert!(!requires_durable_owner(&Method::PUT, &path), "{path}");
+        }
+        for (method, path) in [
+            (Method::GET, format!("/groups/{g}/treekem/catch-up")),
+            (Method::POST, "/groups//treekem/catch-up".to_string()),
+            (Method::POST, format!("/groups/{g}/treekem")),
+            (Method::POST, format!("/groups/{g}/treekem/head-proof/x")),
+            (Method::POST, format!("/groups/{g}/treekem/catch-up/x")),
+        ] {
+            assert!(!requires_durable_owner(&method, &path), "{method} {path}");
+        }
     }
 
     /// This fork's engine-A relay-bridge doors are durable-token only at

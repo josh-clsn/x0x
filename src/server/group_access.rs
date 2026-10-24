@@ -516,6 +516,32 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
         path: "/groups/:id/join-result/:member",
         level: AccessLevel::OwnerDurable,
     },
+    // Survivor re-key A7: where a room's key stands. The trigger, sign and
+    // accept routes act as this daemon's agent (they open a round, sign a
+    // proof, record one), so they take the durable API token only, at the
+    // auth middleware and again in [`admit_treekem_owner_route`]. The read
+    // needs this daemon's own active seat, whoever the bearer is
+    // ([`admit_treekem_catch_up_state`]).
+    RouteAccess {
+        method: Method::POST,
+        path: "/groups/:id/treekem/catch-up",
+        level: AccessLevel::OwnerDurable,
+    },
+    RouteAccess {
+        method: Method::GET,
+        path: "/groups/:id/treekem/catch-up",
+        level: AccessLevel::Member(MemberState::Active),
+    },
+    RouteAccess {
+        method: Method::POST,
+        path: "/groups/:id/treekem/head-proof",
+        level: AccessLevel::OwnerDurable,
+    },
+    RouteAccess {
+        method: Method::POST,
+        path: "/groups/:id/treekem/head-proof/accept",
+        level: AccessLevel::OwnerDurable,
+    },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/stores",
@@ -1244,6 +1270,56 @@ pub(in crate::server) fn admit_delegate_route<'a>(
     })
 }
 
+// ─────────────────────── admission cores (survivor re-key A7) ────────────
+
+/// `GET /groups/:id/treekem/catch-up` admission: riders 403, a withdrawn
+/// room 409 (`reject_withdrawn_group`), then **this daemon's** active seat,
+/// whoever the bearer is (a durable owner without the seat is refused
+/// too): the route reports this daemon's own key head and admins, which
+/// mean nothing without a seat.
+pub(in crate::server) fn admit_treekem_catch_up_state(
+    info: &x0x::groups::GroupInfo,
+    actor: &ActorContext,
+    local_agent_hex: &str,
+) -> Admission {
+    if matches!(actor, ActorContext::Rider { .. }) {
+        return Err(forbidden("rider tokens cannot read a room's key head"));
+    }
+    if let Some(resp) = reject_withdrawn_group(info) {
+        return Err(resp);
+    }
+    if !info.has_active_member(local_agent_hex) {
+        return Err(membership_required());
+    }
+    Ok(AccessLevel::Member(MemberState::Active))
+}
+
+/// The A7 trigger, sign and accept routes: the durable API token only
+/// (the auth middleware refuses a session bearer first; this is the
+/// defence in depth), then a withdrawn room 409. Whether this daemon may
+/// open a round, sign or record is decided by the head-proof code against
+/// its own roster.
+pub(in crate::server) fn admit_treekem_owner_route(
+    info: &x0x::groups::GroupInfo,
+    actor: &ActorContext,
+) -> Admission {
+    match actor {
+        ActorContext::Owner { durable: true } => {}
+        ActorContext::Owner { durable: false } => {
+            return Err(forbidden(
+                "this route requires the durable API token (not a session token)",
+            ))
+        }
+        ActorContext::Rider { .. } => {
+            return Err(forbidden("rider tokens cannot ask a room's admins"))
+        }
+    }
+    if let Some(resp) = reject_withdrawn_group(info) {
+        return Err(resp);
+    }
+    Ok(AccessLevel::OwnerDurable)
+}
+
 // ─────────────────────── extractor ───────────────────────────────────────
 
 /// The admission result handed to a handler: the resolved access level,
@@ -1405,6 +1481,34 @@ async fn admit_state_commits_route(state: &AppState, id: &str) -> Result<GroupAc
     })
 }
 
+/// The four survivor re-key A7 routes: unknown group 404, then the
+/// route's core. Each handler takes this extractor, so the admission runs
+/// before the body is read.
+async fn admit_treekem_route(
+    state: &AppState,
+    actor: &ActorContext,
+    method: &str,
+    id: &str,
+) -> Result<GroupAccess, Response> {
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let groups = state.named_groups.read().await;
+    let Some(info) = groups.get(id) else {
+        return Err(not_found("group not found").into_response());
+    };
+    let level = if method == "GET" {
+        admit_treekem_catch_up_state(info, actor, &local_hex)
+    } else {
+        admit_treekem_owner_route(info, actor)
+    }
+    .map_err(IntoResponse::into_response)?;
+    Ok(GroupAccess {
+        level,
+        stable_id: info.stable_group_id().to_string(),
+        // These routes act as the daemon's own agent.
+        acting_hex: local_hex,
+    })
+}
+
 /// `GET /groups/:id/requests` — the one S3 route that takes the
 /// extractor: no body argument to keep first, no directory-durability
 /// gate before the lookup, and no actor argument ever (the seat gate
@@ -1474,6 +1578,17 @@ impl FromRequestParts<Arc<AppState>> for GroupAccess {
                 admit_state_commits_route(state.as_ref(), &id).await
             }
             ("GET", "/groups/:id/requests") => admit_join_requests_route(state.as_ref(), &id).await,
+            (
+                method @ ("GET" | "POST"),
+                "/groups/:id/treekem/catch-up"
+                | "/groups/:id/treekem/head-proof"
+                | "/groups/:id/treekem/head-proof/accept",
+            ) => {
+                let Extension(actor) = Extension::<ActorContext>::from_request_parts(parts, state)
+                    .await
+                    .map_err(|rejection| rejection.into_response())?;
+                admit_treekem_route(state.as_ref(), &actor, method, &id).await
+            }
             // Classified routes deliberately left without an arm: the
             // S1 `GET /groups/:id` + `/delegations`, the five S2
             // secure-write handlers, the S3 mutation family, the four
@@ -2068,6 +2183,27 @@ mod tests {
             (
                 Method::POST,
                 "/groups/:id/join-result/:member",
+                AccessLevel::OwnerDurable,
+            ),
+            // Survivor re-key A7: where a room's key stands.
+            (
+                Method::POST,
+                "/groups/:id/treekem/catch-up",
+                AccessLevel::OwnerDurable,
+            ),
+            (
+                Method::GET,
+                "/groups/:id/treekem/catch-up",
+                AccessLevel::Member(MemberState::Active),
+            ),
+            (
+                Method::POST,
+                "/groups/:id/treekem/head-proof",
+                AccessLevel::OwnerDurable,
+            ),
+            (
+                Method::POST,
+                "/groups/:id/treekem/head-proof/accept",
                 AccessLevel::OwnerDurable,
             ),
         ];
@@ -3128,5 +3264,62 @@ mod tests {
         // gates (SignedPublic 400, ban 403, write policy, to_agent).
         let info = delegate_admission(&groups, "del", |_| None).expect("live group admitted");
         assert_eq!(info.stable_group_id(), "del");
+    }
+
+    /// Survivor re-key A7: the read needs this daemon's own active seat
+    /// whoever asks, riders never; the trigger, sign and accept routes take
+    /// the durable token only. A withdrawn room is a 409 on all four.
+    #[test]
+    fn treekem_catch_up_admission_needs_the_daemons_seat_or_the_durable_token() {
+        let seated = group_with_local_seat("tk");
+        let seatless = fixture_group("tk");
+        let local = local_agent_hex();
+        for actor in [durable(), session()] {
+            assert_eq!(
+                admit_treekem_catch_up_state(&seated, &actor, &local).unwrap(),
+                AccessLevel::Member(MemberState::Active)
+            );
+            assert_refusal(
+                admit_treekem_catch_up_state(&seatless, &actor, &local),
+                StatusCode::FORBIDDEN,
+                "active local group membership required",
+                Some("group_membership_required"),
+            );
+        }
+        assert_refusal(
+            admit_treekem_catch_up_state(&seated, &rider(), &local),
+            StatusCode::FORBIDDEN,
+            "rider tokens cannot read a room's key head",
+            None,
+        );
+
+        assert_eq!(
+            admit_treekem_owner_route(&seatless, &durable()).unwrap(),
+            AccessLevel::OwnerDurable
+        );
+        assert_refusal(
+            admit_treekem_owner_route(&seated, &session()),
+            StatusCode::FORBIDDEN,
+            "this route requires the durable API token (not a session token)",
+            None,
+        );
+        assert_refusal(
+            admit_treekem_owner_route(&seated, &rider()),
+            StatusCode::FORBIDDEN,
+            "rider tokens cannot ask a room's admins",
+            None,
+        );
+
+        let mut withdrawn = group_with_local_seat("tk");
+        withdrawn.withdrawn = true;
+        let status = |admission: Admission| admission.map_err(|(status, _)| status);
+        assert_eq!(
+            status(admit_treekem_catch_up_state(&withdrawn, &durable(), &local)),
+            Err(StatusCode::CONFLICT)
+        );
+        assert_eq!(
+            status(admit_treekem_owner_route(&withdrawn, &durable())),
+            Err(StatusCode::CONFLICT)
+        );
     }
 }
