@@ -44,6 +44,7 @@
 use crate::identity::AgentId;
 use crate::mls::{MlsError, Result};
 use saorsa_mls::{
+    treekem::Node,
     treekem_group::{ApplicationCiphertext, TreeKemCommit, TreeKemGroup, TreeKemWelcome},
     CipherSuite, KeyPackage, MemberIdentity,
 };
@@ -209,8 +210,20 @@ impl TreeKemMlsGroup {
     /// # Errors
     /// Returns [`MlsError`] if identity derivation or group creation fails.
     pub fn create(group_id: Vec<u8>, creator: AgentId, seed: &[u8; 32]) -> Result<Self> {
-        let identity = Self::identity_from_seed(seed)?;
-        let inner = TreeKemGroup::create(group_id, identity)
+        Self::create_prepared(group_id, Self::prepare_member(creator, seed)?)
+    }
+
+    /// Create a fresh single-member group whose creator leaf holds exactly
+    /// the KeyPackage bytes `prepared` publishes. ML-DSA signing is
+    /// randomized, so a second [`Self::prepare_member`] call yields other
+    /// bytes for the same keys. A roster that seats these bytes lets every
+    /// joiner match the creator's leaf against the roster's committed hash.
+    ///
+    /// # Errors
+    /// Returns [`MlsError`] if group creation fails.
+    pub fn create_prepared(group_id: Vec<u8>, prepared: PreparedMember) -> Result<Self> {
+        let creator = prepared.agent;
+        let inner = TreeKemGroup::create(group_id, prepared.identity)
             .map_err(|e| MlsError::SaorsaMls(format!("treekem create: {e}")))?;
 
         let mut agent_to_leaf = HashMap::new();
@@ -313,6 +326,26 @@ impl TreeKemMlsGroup {
         })
     }
 
+    /// The KeyPackage of every member in a Welcome's ratchet tree, each
+    /// encoded the way [`PreparedMember::key_package_bytes`] encodes one. A
+    /// package added with [`Self::add_member`] comes back byte for byte, so
+    /// a joiner can match it against a roster's committed hash.
+    ///
+    /// # Errors
+    /// Returns [`MlsError`] if the Welcome or a package does not (re)encode.
+    pub fn welcome_key_packages(welcome: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let welcome: TreeKemWelcome = decode(welcome, "welcome")?;
+        welcome
+            .public_nodes
+            .iter()
+            .flatten()
+            .filter_map(|node| match node {
+                Node::Leaf(leaf) => Some(encode(&leaf.key_package, "key package")),
+                Node::Parent(_) => None,
+            })
+            .collect()
+    }
+
     /// Apply a `Commit` produced by another member (add / remove / rekey).
     ///
     /// # Errors
@@ -387,8 +420,42 @@ impl TreeKemMlsGroup {
     /// still owed without provoking a failed `remove_member_verified`.
     #[must_use]
     pub fn has_leaf_for_key_package(&self, key_package: &[u8]) -> bool {
+        self.leaf_for_key_package(key_package).is_some()
+    }
+
+    /// The live leaf whose stable public keys match `key_package`, or `None`
+    /// when no live leaf does or the bytes do not decode. Unlike
+    /// [`Self::leaf_of`], this resolves any member: pass the roster's
+    /// KeyPackage for that member.
+    #[must_use]
+    pub fn leaf_for_key_package(&self, key_package: &[u8]) -> Option<u32> {
         decode::<KeyPackage>(key_package, "expected member key package")
-            .is_ok_and(|kp| self.inner.find_leaf_by_key_package(&kp).is_some())
+            .ok()
+            .and_then(|kp| self.inner.find_leaf_by_key_package(&kp))
+    }
+
+    /// The leaf this instance has recorded for `agent`: its own leaf and the
+    /// members it added itself. A member added by another daemon is never
+    /// recorded here, so `None` does not mean "not a member". Resolve other
+    /// members with [`Self::leaf_for_key_package`].
+    #[must_use]
+    pub fn leaf_of(&self, agent: &AgentId) -> Option<u32> {
+        self.agent_to_leaf.get(agent).copied()
+    }
+
+    /// The committer leaf an encoded commit names, or `None` when the bytes
+    /// do not decode.
+    ///
+    /// The value read here is a claim. `commit_tbs` signs it, and
+    /// [`Self::process_commit`] checks that signature against the key
+    /// package at this leaf, and that the UpdatePath rotates this same leaf,
+    /// before it changes anything. So a commit that names leaf `n` and then
+    /// processes was signed by leaf `n`'s key.
+    #[must_use]
+    pub fn committer_leaf_of(commit: &[u8]) -> Option<u32> {
+        decode::<TreeKemCommit>(commit, "commit")
+            .ok()
+            .map(|commit| commit.committer_leaf)
     }
 
     fn remove_leaf_for_member(&mut self, member: AgentId, leaf: u32) -> Result<Vec<u8>> {
@@ -942,6 +1009,117 @@ mod tests {
             b"after bob left",
             "the rekey must not lock out the members who stayed"
         );
+    }
+
+    /// The committer leaf read from the bytes is the leaf whose key signed
+    /// them: the creator's add, a joiner's own update and a removal each
+    /// name their sealer.
+    #[test]
+    fn committer_leaf_of_names_the_sealing_leaf() {
+        let (alice_id, bob_id, carol_id) = (agent(1), agent(2), agent(3));
+        let mut alice =
+            TreeKemMlsGroup::create(b"committer".to_vec(), alice_id, &seed(1)).expect("create");
+        let bob_prepared = TreeKemMlsGroup::prepare_member(bob_id, &seed(2)).expect("prepare");
+        let bob_add = alice
+            .add_member(bob_id, bob_prepared.key_package_bytes())
+            .expect("add bob");
+        let mut bob =
+            TreeKemMlsGroup::join_from_welcome(bob_prepared, &bob_add.welcome).expect("bob joins");
+        let carol = TreeKemMlsGroup::prepare_member(carol_id, &seed(3)).expect("prepare");
+        let carol_kp = carol.key_package_bytes().to_vec();
+        let carol_add = alice.add_member(carol_id, &carol_kp).expect("add carol");
+        bob.process_commit(&carol_add.commit).expect("bob follows");
+
+        let alice_leaf = alice.leaf_of(&alice_id).expect("own leaf");
+        let bob_leaf = bob.leaf_of(&bob_id).expect("own leaf");
+        assert_ne!(alice_leaf, bob_leaf);
+        assert_eq!(
+            TreeKemMlsGroup::committer_leaf_of(&bob_add.commit),
+            Some(alice_leaf)
+        );
+        let bob_update = bob.update().expect("bob rotates");
+        assert_eq!(
+            TreeKemMlsGroup::committer_leaf_of(&bob_update),
+            Some(bob_leaf)
+        );
+        let removal = alice
+            .remove_member_verified(carol_id, &carol_kp)
+            .expect("remove carol");
+        assert_eq!(
+            TreeKemMlsGroup::committer_leaf_of(&removal),
+            Some(alice_leaf)
+        );
+        assert_eq!(TreeKemMlsGroup::committer_leaf_of(b"not a commit"), None);
+    }
+
+    /// `leaf_of` knows only this instance's own leaf and the members it
+    /// added. A KeyPackage resolves any member's leaf, as the roster does.
+    #[test]
+    fn leaf_of_is_local_and_leaf_for_key_package_is_not() {
+        let (alice_id, bob_id) = (agent(1), agent(2));
+        let alice_kp = TreeKemMlsGroup::prepare_member(alice_id, &seed(1))
+            .expect("alice package")
+            .key_package_bytes()
+            .to_vec();
+        let mut alice =
+            TreeKemMlsGroup::create(b"leaf-of".to_vec(), alice_id, &seed(1)).expect("create");
+        let bob_prepared = TreeKemMlsGroup::prepare_member(bob_id, &seed(2)).expect("prepare");
+        let bob_kp = bob_prepared.key_package_bytes().to_vec();
+        let bob_add = alice.add_member(bob_id, &bob_kp).expect("add bob");
+        let bob = TreeKemMlsGroup::join_from_welcome(bob_prepared, &bob_add.welcome).expect("join");
+
+        assert_eq!(alice.leaf_of(&bob_id), alice.leaf_for_key_package(&bob_kp));
+        assert_eq!(bob.leaf_of(&alice_id), None, "a joiner never learns this");
+        assert_eq!(
+            bob.leaf_for_key_package(&alice_kp),
+            alice.leaf_of(&alice_id),
+            "a re-derived package finds the creator's leaf on any member"
+        );
+        assert_eq!(bob.leaf_for_key_package(b"not a key package"), None);
+
+        alice
+            .remove_member_verified(bob_id, &bob_kp)
+            .expect("remove bob");
+        assert_eq!(alice.leaf_of(&bob_id), None);
+        assert_eq!(alice.leaf_for_key_package(&bob_kp), None);
+    }
+
+    /// A joiner reads every member's package from its Welcome: the members
+    /// added by `add_member` byte for byte, and the creator byte for byte
+    /// only when the group was built from the prepared identity.
+    #[test]
+    fn welcome_key_packages_return_the_seated_bytes() {
+        let (alice_id, bob_id, carol_id) = (agent(1), agent(2), agent(3));
+        let alice_prepared = TreeKemMlsGroup::prepare_member(alice_id, &seed(1)).expect("alice");
+        let alice_kp = alice_prepared.key_package_bytes().to_vec();
+        let mut alice = TreeKemMlsGroup::create_prepared(b"welcome-kps".to_vec(), alice_prepared)
+            .expect("create");
+        let bob = TreeKemMlsGroup::prepare_member(bob_id, &seed(2)).expect("bob");
+        let bob_kp = bob.key_package_bytes().to_vec();
+        alice.add_member(bob_id, &bob_kp).expect("add bob");
+        let carol = TreeKemMlsGroup::prepare_member(carol_id, &seed(3)).expect("carol");
+        let carol_kp = carol.key_package_bytes().to_vec();
+        let carol_add = alice.add_member(carol_id, &carol_kp).expect("add carol");
+
+        let packages = TreeKemMlsGroup::welcome_key_packages(&carol_add.welcome).expect("read");
+        assert_eq!(packages.len(), 3);
+        for expected in [&alice_kp, &bob_kp, &carol_kp] {
+            assert!(
+                packages.contains(expected),
+                "a seated package comes back exactly"
+            );
+        }
+
+        let legacy_creator_kp = TreeKemMlsGroup::prepare_member(alice_id, &seed(1))
+            .expect("re-derived")
+            .key_package_bytes()
+            .to_vec();
+        assert_ne!(
+            legacy_creator_kp, alice_kp,
+            "signing is randomized: a second preparation is other bytes"
+        );
+        assert!(!packages.contains(&legacy_creator_kp));
+        assert!(TreeKemMlsGroup::welcome_key_packages(b"not a welcome").is_err());
     }
 
     /// The rekey is driven off "is this KeyPackage still on a live leaf", so

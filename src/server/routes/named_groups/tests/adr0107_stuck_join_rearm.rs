@@ -17,7 +17,7 @@ use super::*;
 
 const OWNER_SEED: [u8; 32] = [0x07; 32];
 
-fn hex_of(state: &AppState) -> String {
+pub(super) fn hex_of(state: &AppState) -> String {
     hex::encode(state.agent.agent_id().as_bytes())
 }
 
@@ -138,7 +138,7 @@ async fn staged(
         .cloned()
 }
 
-fn welcome_id_of(event: &NamedGroupMetadataEvent) -> Option<String> {
+pub(super) fn welcome_id_of(event: &NamedGroupMetadataEvent) -> Option<String> {
     match event {
         NamedGroupMetadataEvent::MemberAdded {
             welcome_ref: Some(reference),
@@ -155,7 +155,7 @@ fn revision_of(event: &NamedGroupMetadataEvent) -> Option<u64> {
 // #1166 S5: join-state PROBE (asserts the #447/#458 label), not
 // admission.
 #[allow(clippy::disallowed_methods)]
-async fn local_state(joiner: &AppState, group_key: &str) -> &'static str {
+pub(super) async fn local_state(joiner: &AppState, group_key: &str) -> &'static str {
     let info = joiner.named_groups.read().await.get(group_key).cloned();
     match info {
         Some(info) => local_join_membership_state(joiner, &info, &hex_of(joiner)).await,
@@ -163,7 +163,7 @@ async fn local_state(joiner: &AppState, group_key: &str) -> &'static str {
     }
 }
 
-async fn keyed(joiner: &AppState, group_key: &str) -> bool {
+pub(super) async fn keyed(joiner: &AppState, group_key: &str) -> bool {
     joiner.treekem_groups.read().await.contains_key(group_key)
 }
 
@@ -355,7 +355,7 @@ async fn pull_welcome_through_guarded_stream(
 /// Replace the served result's Welcome reference with the bytes the joiner
 /// pulled through the real guarded transfer (the join-result apply path's
 /// own pull uses the direct-message transport, which fails in process).
-async fn with_pulled_welcome(
+pub(super) async fn with_pulled_welcome(
     authority: &Arc<AppState>,
     joiner: &Arc<AppState>,
     stable: &str,
@@ -402,7 +402,7 @@ async fn with_pulled_welcome(
     }
 }
 
-async fn deliver(
+pub(super) async fn deliver(
     joiner: &Arc<AppState>,
     sender: &AgentId,
     result: JoinResultMessage,
@@ -412,29 +412,29 @@ async fn deliver(
         .await;
 }
 
-struct Fixture {
-    dir: std::path::PathBuf,
-    authority: Arc<AppState>,
-    authority_id: AgentId,
-    group_key: String,
-    stable: String,
+pub(super) struct Fixture {
+    pub(super) dir: std::path::PathBuf,
+    pub(super) authority: Arc<AppState>,
+    pub(super) authority_id: AgentId,
+    pub(super) group_key: String,
+    pub(super) stable: String,
     /// The invite base both first invites carried (r).
-    base: u64,
-    j1: Arc<AppState>,
-    j2: Arc<AppState>,
-    j2_kp: (Vec<u8>, Vec<u8>),
-    j1_attempt: String,
-    j2_attempt: String,
+    pub(super) base: u64,
+    pub(super) j1: Arc<AppState>,
+    pub(super) j2: Arc<AppState>,
+    pub(super) j2_kp: (Vec<u8>, Vec<u8>),
+    pub(super) j1_attempt: String,
+    pub(super) j2_attempt: String,
     /// J1's sealed add at r+1, as the authority staged it.
-    j1_add: NamedGroupMetadataEvent,
+    pub(super) j1_add: NamedGroupMetadataEvent,
     /// J2's sealed add at r+2 (Welcome by reference), as staged.
-    j2_add: NamedGroupMetadataEvent,
+    pub(super) j2_add: NamedGroupMetadataEvent,
 }
 
 /// Two Home devices join through the REAL route with two invites minted from
 /// the same base r; the authority seals both through its REAL `MemberJoined`
 /// apply (r+1 for J1, r+2 for J2), staging each join result and Welcome.
-async fn build(dir: &std::path::Path) -> anyhow::Result<Fixture> {
+pub(super) async fn build(dir: &std::path::Path) -> anyhow::Result<Fixture> {
     let authority = super::super::super::home::tests::owned_state(dir, OWNER_SEED).await?;
     super::super::super::home::provision_home(&authority).await;
     let owner = authority

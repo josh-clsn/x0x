@@ -41,6 +41,14 @@ pub(super) async fn two_member_treekem_group() -> Result<LeaveFixture> {
         group_id.clone(),
     );
     info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+    // Group creation seats the creator's package (`create_named_group`), so
+    // every member can tie the creator's commits to its leaf (survivor
+    // re-key A2).
+    let admin_package = x0x::mls::TreeKemMlsGroup::prepare_member(admin_id, &seed)?;
+    info.set_member_treekem_key_package(
+        &hex::encode(admin_id.as_bytes()),
+        base64::engine::general_purpose::STANDARD.encode(admin_package.key_package_bytes()),
+    );
     info.add_member(
         member_hex.clone(),
         x0x::groups::GroupRole::Member,
@@ -127,7 +135,9 @@ pub(super) async fn wait_until(mut ready: impl FnMut() -> bool) {
 /// A1 sealed it: the legacy `treekem:epoch=<n>` binding, which names no
 /// TreeKEM bytes. Every seal site now names them, so only this fixture still
 /// makes the legacy form.
-async fn legacy_bound_removal(fixture: &LeaveFixture) -> Result<NamedGroupMetadataEvent> {
+pub(super) async fn legacy_bound_removal(
+    fixture: &LeaveFixture,
+) -> Result<NamedGroupMetadataEvent> {
     let state = &fixture.state;
     let admin_hex = hex::encode(state.agent.agent_id().as_bytes());
     let member_hex = hex::encode(fixture.member_id.as_bytes());
@@ -497,7 +507,7 @@ async fn catchup_legacy_binding_stays_with_the_author() -> Result<()> {
 }
 
 /// The leaver's own signed roster-only leave, as it publishes it.
-async fn signed_self_leave(fixture: &LeaveFixture) -> Result<NamedGroupMetadataEvent> {
+pub(super) async fn signed_self_leave(fixture: &LeaveFixture) -> Result<NamedGroupMetadataEvent> {
     let member_hex = hex::encode(fixture.member_id.as_bytes());
     let groups = fixture.state.named_groups.read().await;
     let mut leaving = groups.get(&fixture.group_id).cloned().expect("group");
