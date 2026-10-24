@@ -24,7 +24,13 @@ pub(super) async fn two_member_treekem_group() -> Result<LeaveFixture> {
     let admin_id = state.agent.agent_id();
     let group_id_bytes = hex::decode(&group_id)?;
     let seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
-    let mut admin_group = x0x::mls::TreeKemMlsGroup::create(group_id_bytes, admin_id, &seed)?;
+    // As `create_named_group` does: the creator's leaf and its roster seat
+    // hold the same KeyPackage bytes (survivor re-key A2).
+    let admin_package = x0x::mls::TreeKemMlsGroup::prepare_member(admin_id, &seed)?;
+    let admin_package_b64 =
+        base64::engine::general_purpose::STANDARD.encode(admin_package.key_package_bytes());
+    let mut admin_group =
+        x0x::mls::TreeKemMlsGroup::create_prepared(group_id_bytes, admin_package)?;
     let member_kp = x0x::identity::AgentKeypair::generate()?;
     let member_id = member_kp.agent_id();
     let member_hex = hex::encode(member_id.as_bytes());
@@ -41,14 +47,7 @@ pub(super) async fn two_member_treekem_group() -> Result<LeaveFixture> {
         group_id.clone(),
     );
     info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
-    // Group creation seats the creator's package (`create_named_group`), so
-    // every member can tie the creator's commits to its leaf (survivor
-    // re-key A2).
-    let admin_package = x0x::mls::TreeKemMlsGroup::prepare_member(admin_id, &seed)?;
-    info.set_member_treekem_key_package(
-        &hex::encode(admin_id.as_bytes()),
-        base64::engine::general_purpose::STANDARD.encode(admin_package.key_package_bytes()),
-    );
+    info.set_member_treekem_key_package(&hex::encode(admin_id.as_bytes()), admin_package_b64);
     info.add_member(
         member_hex.clone(),
         x0x::groups::GroupRole::Member,

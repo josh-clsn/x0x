@@ -149,14 +149,18 @@ pub(in crate::server) async fn peers(State(state): State<Arc<AppState>>) -> impl
 /// count.
 pub(in crate::server) async fn mesh_join(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let agent = Arc::clone(&state.agent);
+    let sweep_state = Arc::clone(&state);
     // Capture the request time HERE, not inside the spawned task: a
     // /mesh/quiesce that lands between this handler returning and the
     // task's first poll must win, or a stale join would silently undo a
     // fresh mesh-off on a metered link.
     let requested_at_epoch = agent.mesh_transition_epoch();
     tokio::spawn(async move {
-        if let Err(e) = agent.dial_bootstrap_superseding(requested_at_epoch).await {
-            tracing::error!("mesh join failed: {e}");
+        match agent.dial_bootstrap_superseding(requested_at_epoch).await {
+            // Survivor re-key A2: KeyPackages held by hash alone can be
+            // requested now.
+            Ok(()) => super::request_hash_only_treekem_key_packages(&sweep_state).await,
+            Err(e) => tracing::error!("mesh join failed: {e}"),
         }
     });
     (

@@ -49,6 +49,7 @@ async fn staged_self_leave(
         &leaver_hex,
         base64::engine::general_purpose::STANDARD.encode(&leaver_kp),
     );
+    seat_treekem_package(&mut info, local, &local_seed)?;
     // The self-leave exactly as a remaining member applies it: roster-only,
     // no TreeKEM commit, epoch untouched.
     info.remove_member(&leaver_hex, Some(leaver_hex.clone()));
@@ -155,6 +156,7 @@ async fn a_pending_joiner_with_a_key_package_is_never_a_rekey_candidate() -> Res
     let pending_kp = prepared.key_package_bytes().to_vec();
 
     let mut info = treekem_metadata_group_info(local, group_id, group_id);
+    seat_treekem_package(&mut info, local, &local_seed)?;
     let local_hex = hex::encode(local.as_bytes());
     info.add_member(
         pending_hex.clone(),

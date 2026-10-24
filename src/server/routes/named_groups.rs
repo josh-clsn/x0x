@@ -7187,6 +7187,7 @@ async fn process_treekem_commit_after_crypto_recheck(
                         group_id,
                         vec![actor_hex.to_string()],
                     );
+                    committer_leaf::pull_again_after_package(state, group_id, expected_epoch).await;
                     tracing::info!(
                         group_id = %LogHexId::group(group_id),
                         actor = %LogHexId::agent(actor_hex),
@@ -11116,7 +11117,9 @@ async fn apply_targeted_member_key_package(
             );
             return false;
         };
-        if member.treekem_key_package_b64.is_some() {
+        // Bytes that do not hash to the anchor are stale: replace them below,
+        // or the committer-leaf rule would wait on this member forever.
+        if current_member_treekem_key_package(member).is_some() {
             return true;
         }
         match member.treekem_key_package_hash.as_deref() {
@@ -15412,6 +15415,13 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     // Genuine replay / no new KeyPackage: no-op, consume nothing.
                     return ApplyMetadataResult::REJECTED;
                 }
+                if !committer_leaf::sealer_seat_commits_package(&info, &local_agent_hex) {
+                    let _ = committer_leaf::sealer_package_uncommitted(
+                        &resolved_group_key,
+                        "returning-member re-key",
+                    );
+                    return ApplyMetadataResult::REJECTED;
+                }
 
                 let signing_kp = state.agent.identity().agent_keypair();
                 let now_ms = now_millis_u64();
@@ -16198,6 +16208,13 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     Ok(id) => id,
                     Err(_) => return ApplyMetadataResult::REJECTED,
                 };
+                if !committer_leaf::sealer_seat_commits_package(&next, &local_agent_hex) {
+                    let _ = committer_leaf::sealer_package_uncommitted(
+                        &resolved_group_key,
+                        "invite add",
+                    );
+                    return ApplyMetadataResult::REJECTED;
+                }
                 let group = {
                     let map = state.treekem_groups.read().await;
                     map.get(&resolved_group_key).cloned()
@@ -22395,6 +22412,9 @@ async fn add_treekem_named_group_member(
         if let Err(e) = group_access::admin_route_gate(info, &actor_hex) {
             return e;
         }
+        if !committer_leaf::sealer_seat_commits_package(info, &actor_hex) {
+            return committer_leaf::sealer_package_uncommitted(&id, "add");
+        }
         if info.has_member(&agent_hex) {
             return (
                 StatusCode::CONFLICT,
@@ -24081,6 +24101,9 @@ async fn remove_treekem_named_group_member(
         if let Err(e) = group_access::admin_route_gate(info, &local_agent_hex) {
             return e;
         }
+        if !committer_leaf::sealer_seat_commits_package(info, &local_agent_hex) {
+            return committer_leaf::sealer_package_uncommitted(&id, "remove");
+        }
         if !info.has_member(&agent_id_hex) {
             return (
                 StatusCode::NOT_FOUND,
@@ -24335,6 +24358,12 @@ async fn reconcile_treekem_self_leave_rekeys(
         if info.designated_rekey_committer().as_deref() != Some(local_agent_hex.as_str()) {
             return 0;
         }
+        if !info.treekem_leaf_holders_not_active().is_empty()
+            && !committer_leaf::sealer_seat_commits_package(info, &local_agent_hex)
+        {
+            let _ = committer_leaf::sealer_package_uncommitted(group_key, "post-leave rekey");
+            return 0;
+        }
         info.treekem_leaf_holders_not_active()
     };
     if holders.is_empty() {
@@ -24516,6 +24545,13 @@ async fn reconcile_treekem_self_leave_rekeys(
         rotated = rotated.saturating_add(1);
     }
     rotated
+}
+
+/// Survivor re-key A2: once the mesh is up, ask for every KeyPackage this
+/// member holds by hash alone, so an earlier member's first commit is not
+/// refused for want of it.
+pub(in crate::server) async fn request_hash_only_treekem_key_packages(state: &Arc<AppState>) {
+    committer_leaf::request_hash_only_key_packages(state).await;
 }
 
 /// Startup half of the ADR-0014 §4 lazy catch-up: sweep every group for
@@ -24781,6 +24817,16 @@ async fn owner_certified_seal_with_eviction(
     // operation — no re-evaluation, so mid-operation grace expiry cannot
     // grow the set.
     let mut failed_queue = verdict.failed();
+    if !failed_queue.is_empty() {
+        let groups = state.named_groups.read().await;
+        if let Some(info) = groups.get(id) {
+            if !committer_leaf::sealer_seat_commits_package(info, local_hex) {
+                return Some(Err(committer_leaf::sealer_package_uncommitted(
+                    id, "eviction",
+                )));
+            }
+        }
+    }
 
     loop {
         if failed_queue.is_empty() {
@@ -27814,6 +27860,9 @@ async fn ban_treekem_group_member(
         if let Err(e) = group_access::admin_route_gate(info, &caller_hex) {
             return e;
         }
+        if !committer_leaf::sealer_seat_commits_package(info, &caller_hex) {
+            return committer_leaf::sealer_package_uncommitted(&id, "ban");
+        }
         // ADR-0016 R2: friendly pre-check before any TreeKEM work begins.
         if let Some(resp) = last_admin_precheck(info, |g| g.ban_member(&agent_id_hex, None)) {
             return resp;
@@ -29032,6 +29081,9 @@ async fn approve_treekem_join_request(
         // #1166 S5: the admin pair absorbed into the chokepoint core.
         if let Err(e) = group_access::admin_route_gate(info, &caller_hex) {
             return e;
+        }
+        if !committer_leaf::sealer_seat_commits_package(info, &caller_hex) {
+            return committer_leaf::sealer_package_uncommitted(&id, "approve");
         }
         let Some(req) = info.join_requests.get(&request_id) else {
             return not_found("request not found");
@@ -54611,6 +54663,23 @@ pub(in crate::server) mod tests {
         info
     }
 
+    /// Seat `agent`'s TreeKEM package from `seed`, as group creation and
+    /// every add do: a member whose seat commits none cannot seal a TreeKEM
+    /// commit (survivor re-key A2).
+    fn seat_treekem_package(
+        info: &mut x0x::groups::GroupInfo,
+        agent: AgentId,
+        seed: &[u8; 32],
+    ) -> Result<()> {
+        let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(agent, seed)?;
+        info.set_member_treekem_key_package(
+            &hex::encode(agent.as_bytes()),
+            BASE64.encode(prepared.key_package_bytes()),
+        );
+        info.recompute_state_hash();
+        Ok(())
+    }
+
     pub(in crate::server) struct MemberJoinedTreeKemFixture {
         pub(in crate::server) state: Arc<AppState>,
         pub(in crate::server) _dir: tempfile::TempDir,
@@ -54802,6 +54871,7 @@ pub(in crate::server) mod tests {
         let witness_hex = hex::encode(witness_id.as_bytes());
         let witness_seed = agent_treekem_seed(witness.agent.as_ref(), &group_id_bytes);
         let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(witness_id, &witness_seed)?;
+        let witness_package = BASE64.encode(prepared.key_package_bytes());
         let (welcome, epoch) = {
             let mut owner_group = fixture.group.lock().await;
             let add = owner_group.add_member(witness_id, prepared.key_package_bytes())?;
@@ -54814,11 +54884,12 @@ pub(in crate::server) mod tests {
                 .get_mut(&fixture.group_id)
                 .expect("owner fixture retains group");
             info.add_member(
-                witness_hex,
+                witness_hex.clone(),
                 x0x::groups::GroupRole::Member,
                 Some(hex::encode(fixture.state.agent.agent_id().as_bytes())),
                 None,
             );
+            info.set_member_treekem_key_package(&witness_hex, witness_package);
             info.secret_epoch = epoch;
             info.security_binding = Some(format!("treekem:epoch={epoch}"));
             info.recompute_state_hash();
@@ -55264,8 +55335,13 @@ pub(in crate::server) mod tests {
         let group_id_bytes = hex::decode(group_id)?;
         let authority = AgentId([0x54; 32]);
         let authority_hex = hex::encode(authority.as_bytes());
+        // As `create_named_group` does: the creator's leaf and its roster
+        // seat hold the same KeyPackage bytes, so the commit passes the
+        // committer-leaf rule and reaches the withdrawn recheck.
+        let authority_package = x0x::mls::TreeKemMlsGroup::prepare_member(authority, &[0x54; 32])?;
+        let authority_package_b64 = BASE64.encode(authority_package.key_package_bytes());
         let mut author_group =
-            x0x::mls::TreeKemMlsGroup::create(group_id_bytes.clone(), authority, &[0x54; 32])?;
+            x0x::mls::TreeKemMlsGroup::create_prepared(group_id_bytes.clone(), authority_package)?;
         let local_seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
         let local_prepared =
             x0x::mls::TreeKemMlsGroup::prepare_member(state.agent.agent_id(), &local_seed)?;
@@ -55286,13 +55362,7 @@ pub(in crate::server) mod tests {
         let add = author_group.add_member(member, prepared.key_package_bytes())?;
         let expected_epoch = author_group.epoch();
         let mut info = treekem_metadata_group_info(authority, group_id, group_id);
-        // The creator's package, as group creation seats it, so the commit
-        // passes the committer-leaf rule and reaches the withdrawn recheck.
-        let authority_package = x0x::mls::TreeKemMlsGroup::prepare_member(authority, &[0x54; 32])?;
-        info.set_member_treekem_key_package(
-            &authority_hex,
-            BASE64.encode(authority_package.key_package_bytes()),
-        );
+        info.set_member_treekem_key_package(&authority_hex, authority_package_b64);
         let local_hex = hex::encode(state.agent.agent_id().as_bytes());
         info.add_member(
             local_hex,
@@ -61771,7 +61841,9 @@ pub(in crate::server) mod tests {
             x0x::groups::GroupMember::new_member(w_hex, None, Some(o_hex.clone()), 1),
         );
         a_info.set_member_role(&a_hex, x0x::groups::GroupRole::Admin);
-        a_info.recompute_state_hash();
+        // A joined with its own package, as every member does.
+        let a_seed = agent_treekem_seed(a_state.agent.as_ref(), &hex::decode(&group_id)?);
+        seat_treekem_package(&mut a_info, a_state.agent.agent_id(), &a_seed)?;
         a_state
             .named_groups
             .write()
@@ -64359,6 +64431,7 @@ pub(in crate::server) mod tests {
             .await
             .insert(group_id.to_string(), Arc::clone(&group));
         let mut info = treekem_metadata_group_info(inviter, group_id, group_id);
+        seat_treekem_package(&mut info, inviter, &seed)?;
         let now_ms = now_millis_u64();
         let joiner_keypair = x0x::identity::AgentKeypair::generate()?;
         let joiner_id = joiner_keypair.agent_id();

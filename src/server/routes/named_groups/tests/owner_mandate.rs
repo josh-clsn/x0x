@@ -1990,6 +1990,7 @@ async fn treekem_direct_add_mints_epoch_bound_mandate_peer_applies() -> Result<(
         owner_certified_policy(&owner_kp),
     );
     info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+    seat_treekem_package(&mut info, authority.agent.agent_id(), &creator_seed)?;
     info.shared_secret = None;
     info.secret_epoch = initial_epoch;
     info.security_binding = Some(format!("treekem:epoch={initial_epoch}"));

@@ -10,9 +10,12 @@
 
 use super::{
     current_member_treekem_key_package, join_result_key, request_member_key_package_catchup,
-    AppState, NamedGroupMetadataEvent,
+    spawn_treekem_epoch_ahead_catchup, AppState, NamedGroupMetadataEvent,
 };
 use crate as x0x;
+use crate::logging::LogHexId;
+use axum::http::StatusCode;
+use axum::Json;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -112,6 +115,128 @@ pub(super) fn request_key_packages(state: &Arc<AppState>, group_id: &str, member
     });
 }
 
+/// The active members of `info`, other than `local_hex`, whose package
+/// this member holds by its committed hash alone: neither the roster nor
+/// the recovery cache has bytes that match.
+pub(super) async fn hash_only_seats(
+    state: &AppState,
+    group_key: &str,
+    info: &x0x::groups::GroupInfo,
+    local_hex: &str,
+) -> Vec<String> {
+    let group_ids = [
+        group_key,
+        info.stable_group_id(),
+        info.mls_group_id.as_str(),
+    ];
+    let mut hash_only = Vec::new();
+    for (member_hex, seat) in &info.members_v2 {
+        if !seat.is_active()
+            || member_hex.eq_ignore_ascii_case(local_hex)
+            || current_member_treekem_key_package(seat).is_some()
+        {
+            continue;
+        }
+        let Some(hash) = seat.treekem_key_package_hash.as_deref() else {
+            continue;
+        };
+        if cached_package_matching(state, &group_ids, member_hex, hash)
+            .await
+            .is_none()
+        {
+            hash_only.push(member_hex.clone());
+        }
+    }
+    hash_only
+}
+
+/// Ask for every package this member holds by hash alone, in every TreeKEM
+/// group it is active in. Run once the mesh is up, at startup and after a
+/// deferred mesh join: a member that joined before survivor re-key A2 holds
+/// earlier members this way, and their first commit would otherwise be
+/// refused until the package arrived.
+pub(super) async fn request_hash_only_key_packages(state: &Arc<AppState>) {
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let groups: Vec<(String, x0x::groups::GroupInfo)> = state
+        .named_groups
+        .read()
+        .await
+        .iter()
+        .filter(|(_, info)| {
+            !info.withdrawn
+                && info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+                && info.has_active_member(&local_hex)
+        })
+        .map(|(key, info)| (key.clone(), info.clone()))
+        .collect();
+    for (group_key, info) in groups {
+        let hash_only = hash_only_seats(state, &group_key, &info, &local_hex).await;
+        if !hash_only.is_empty() {
+            tracing::info!(
+                group_id = %LogHexId::group(&group_key),
+                members = hash_only.len(),
+                "requesting TreeKEM KeyPackages held by hash alone"
+            );
+        }
+        request_key_packages(state, &group_key, hash_only);
+    }
+}
+
+/// After a commit was refused for a package this member did not hold: pull
+/// the group's missed commits again once the package can have landed. The
+/// epoch-ahead catch-up asks the other members round by round, one throttle
+/// window apart, until this member reaches `epoch`, so the refused event
+/// comes back without waiting on its sealer's resend. A task that is
+/// already running for the group covers it; starting another would count
+/// every refusal during its rounds as new traffic.
+pub(super) async fn pull_again_after_package(state: &Arc<AppState>, group_key: &str, epoch: u64) {
+    if state
+        .treekem_epoch_ahead_targets
+        .lock()
+        .await
+        .contains_key(group_key)
+    {
+        return;
+    }
+    spawn_treekem_epoch_ahead_catchup(state, group_key, epoch);
+}
+
+/// Whether this member may seal a TreeKEM commit in `info`. Receivers tie a
+/// commit to its sealer's leaf through the KeyPackage hash the sealer's own
+/// seat commits. With none (a group made before 2026-07-11), every other
+/// member refuses the commit while this member moves on, and the group
+/// splits.
+pub(super) fn sealer_seat_commits_package(info: &x0x::groups::GroupInfo, local_hex: &str) -> bool {
+    info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem
+        || info
+            .members_v2
+            .get(local_hex)
+            .is_some_and(|seat| seat.treekem_key_package_hash.is_some())
+}
+
+/// The plain explanation a refused seal gives.
+pub(super) const SEALER_PACKAGE_UNCOMMITTED: &str = "this member's seat commits no TreeKEM key package (the group was made before 2026-07-11), so no other member can accept a key change it makes; nothing was changed, and the group must be made again to add or remove members";
+
+/// Log a refused seal at WARN and return the route's error.
+pub(super) fn sealer_package_uncommitted(
+    group_id: &str,
+    what: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    tracing::warn!(
+        group_id = %LogHexId::group(group_id),
+        what,
+        "refusing to seal a TreeKEM commit: {SEALER_PACKAGE_UNCOMMITTED}"
+    );
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "ok": false,
+            "error": "sealer_key_package_uncommitted",
+            "detail": SEALER_PACKAGE_UNCOMMITTED,
+        })),
+    )
+}
+
 /// True the first time this process refuses `actor_hex` in `group_id` for
 /// a seat with no committed package, so that refusal is logged loudly once
 /// rather than on every delivery.
@@ -199,6 +324,30 @@ mod tests {
         assert_eq!(
             committer_is_actor(&alice_group, &bob_update, b"not a package"),
             Err(CommitterLeafRefusal::ActorHasNoLeaf)
+        );
+    }
+
+    #[test]
+    fn a_sealer_needs_its_own_committed_package_only_on_the_treekem_plane() {
+        let (sealer, _) = member(1);
+        let sealer_hex = hex::encode(sealer.as_bytes());
+        let mut info = x0x::groups::GroupInfo::new(
+            "seal".to_string(),
+            String::new(),
+            sealer,
+            hex::encode([0x5b; 16]),
+        );
+        assert!(
+            sealer_seat_commits_package(&info, &sealer_hex),
+            "the shared-secret plane has no leaves to tie"
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        assert!(!sealer_seat_commits_package(&info, &sealer_hex));
+        assert!(!sealer_seat_commits_package(&info, "not-a-member"));
+        info.set_member_treekem_key_package_hash(&sealer_hex, "ab".repeat(32));
+        assert!(
+            sealer_seat_commits_package(&info, &sealer_hex),
+            "a committed hash is enough: receivers fetch the bytes"
         );
     }
 

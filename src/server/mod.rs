@@ -82,9 +82,10 @@ use routes::{
     reconcile_treekem_self_leave_rekeys_all_groups, recover_home_suite_sidecar_journals,
     recover_treekem_named_journals, reject_join_request, reject_unverified_direct_public_message,
     relay_diagnostics, remove_mls_member, remove_named_group_member,
-    replay_pending_causal_approvals, requester_offer_step, respawn_unconverged_join_polls,
-    restore_treekem_groups, revoke_contact, run_fallback_github_poll, run_gossip_update_listener,
-    run_startup_update_check, save_named_groups_checked, save_named_groups_checked_unlocked,
+    replay_pending_causal_approvals, request_hash_only_treekem_key_packages, requester_offer_step,
+    respawn_unconverged_join_polls, restore_treekem_groups, revoke_contact,
+    run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
+    save_named_groups_checked, save_named_groups_checked_unlocked,
     save_predecessor_relay_outbox_unlocked, seal_group_state, secure_group_decrypt,
     secure_group_encrypt, secure_group_reseal, secure_open_envelope_adversarial,
     send_group_public_message, set_group_display_name, shutdown_handler,
@@ -1800,6 +1801,7 @@ pub async fn serve_with_options(
     bg_tasks.push(tokio::spawn(async move {
         reconcile_treekem_self_leave_rekeys_all_groups(&leave_rekey_state).await;
     }));
+    let key_package_sweep_state = Arc::clone(&state);
     bg_tasks.push(tokio::spawn(async move {
         // Infra (gossip runtime + listeners) always starts, even when the
         // mesh dial is deferred: a quiesced embedder still serves every
@@ -1815,6 +1817,9 @@ pub async fn serve_with_options(
         match join_agent.dial_bootstrap().await {
             Ok(()) => {
                 tracing::info!("Network joined");
+                // Survivor re-key A2: ask for the KeyPackages this member
+                // holds by hash alone, now that requests can leave.
+                request_hash_only_treekem_key_packages(&key_package_sweep_state).await;
                 if rendezvous_enabled {
                     if let Err(e) = join_agent.advertise_identity(rendezvous_validity_ms).await {
                         tracing::warn!("Initial rendezvous advertisement failed: {e}");

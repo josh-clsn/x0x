@@ -10,9 +10,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use super::epoch_ahead_catchup::{
-    catchup_relay_fixture, encrypt, legacy_bound_removal, live_epoch, live_treekem_group,
-    published_removal_event, signed_self_leave, swap_treekem_commit, wait_until, CatchupRelay,
-    LeaveFixture,
+    catchup_relay_fixture, catchup_request_from, encrypt, legacy_bound_removal, live_epoch,
+    live_treekem_group, published_removal_event, signed_self_leave, swap_treekem_commit,
+    two_member_treekem_group, wait_until, CatchupRelay, LeaveFixture,
 };
 use super::*;
 
@@ -491,5 +491,194 @@ async fn a_member_who_joined_by_invite_applies_the_creators_first_removal() -> R
         state.shutdown_notify.send_replace(true);
         state.agent.shutdown().await;
     }
+    Ok(())
+}
+
+/// Strip the victim's copy of the admin's package, keeping its committed
+/// hash: the roster of a member who joined before survivor re-key A2.
+async fn victim_holds_the_admin_by_hash(cast: &CatchupRelay) {
+    let admin = admin_hex(cast);
+    let mut groups = cast.victim_state.named_groups.write().await;
+    let info = groups.get_mut(&cast.fixture.group_id).expect("group");
+    let hash_before = info.state_hash.clone();
+    let seat = info.members_v2.get_mut(&admin).expect("admin seat");
+    seat.treekem_key_package_b64 = None;
+    assert!(seat.treekem_key_package_hash.is_some());
+    info.recompute_state_hash();
+    assert_eq!(info.state_hash, hash_before, "the hash alone is committed");
+}
+
+/// The page of missed commits the admin serves to the victim, through the
+/// real serve path.
+async fn admin_page_for_victim(cast: &CatchupRelay) -> Result<TreeKemCatchupResponse> {
+    let group_id = &cast.fixture.group_id;
+    let victim_id = cast.victim_state.agent.agent_id();
+    let request = {
+        let groups = cast.victim_state.named_groups.read().await;
+        catchup_request_from(groups.get(group_id).expect("group"), group_id, &victim_id)
+    };
+    handle_treekem_catchup_request(&cast.fixture.state, &victim_id, true, request).await;
+    let served = cast
+        .fixture
+        .state
+        .named_group_test_recorders
+        .catchup_responses
+        .lock()
+        .expect("catch-up recorder")
+        .last()
+        .cloned()
+        .expect("the admin serves a page");
+    Ok(serde_json::from_slice(&served)?)
+}
+
+/// Fix round 1 (I-1): a member holding the admin's package by hash alone
+/// refuses the admin's removal, and the refusal itself starts what heals
+/// it. The epoch-ahead catch-up starts, the admin's package arrives through
+/// the real catch-up response handler, and the next page of missed commits
+/// installs the removal. The admin never sends the removal again.
+#[tokio::test]
+async fn a_refused_removal_heals_by_catch_up_without_a_resend() -> Result<()> {
+    let mut cast = catchup_relay_fixture().await?;
+    let group_id = cast.fixture.group_id.clone();
+    let admin_id = cast.fixture.state.agent.agent_id();
+    let victim_id = cast.victim_state.agent.agent_id();
+    victim_holds_the_admin_by_hash(&cast).await;
+    cast.victim_state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let genuine = genuine_removal(&cast).await;
+    let refused =
+        apply_named_group_metadata_event(&cast.victim_state, genuine, admin_id, true, None).await;
+    assert!(
+        !refused.accepted,
+        "the first delivery is refused: {refused:?}"
+    );
+    let pulling = || {
+        cast.victim_state
+            .treekem_epoch_ahead_targets
+            .try_lock()
+            .is_ok_and(|targets| targets.contains_key(&group_id))
+    };
+    wait_until(&pulling).await;
+    assert!(pulling(), "the refusal starts the epoch-ahead catch-up");
+
+    // A page that lands before the package is refused again.
+    let early = admin_page_for_victim(&cast).await?;
+    assert!(!early.events.is_empty(), "the page carries the removal");
+    handle_treekem_catchup_response(&cast.victim_state, &admin_id, true, early).await;
+    assert_eq!(
+        live_epoch(&cast.victim_state, &group_id).await,
+        cast.epoch_before
+    );
+
+    // The package, as the admin's #398 lane serves it.
+    let request = TreeKemCatchupRequest {
+        message_type: "treekem_catchup_request".to_string(),
+        group_id: group_id.clone(),
+        requester_agent_id: hex::encode(victim_id.as_bytes()),
+        from_revision: 0,
+        from_treekem_epoch: 0,
+        current_state_hash: String::new(),
+        missing_prev_state_hash: None,
+        target_member_id: Some(admin_hex(&cast)),
+        limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+        signed_by: None,
+    };
+    let package = member_keyed_treekem_catchup_response(
+        &cast.fixture.state,
+        std::slice::from_ref(&group_id),
+        &request,
+    )
+    .await
+    .expect("the admin serves its package");
+    assert!(package.target_member_key_package_b64.is_some());
+    handle_treekem_catchup_response(&cast.victim_state, &admin_id, true, package).await;
+
+    // The next round's page installs the removal.
+    let page = admin_page_for_victim(&cast).await?;
+    handle_treekem_catchup_response(&cast.victim_state, &admin_id, true, page).await;
+    victim_follows_the_admin(&mut cast, b"healed without a resend").await?;
+    cast.shutdown().await;
+    Ok(())
+}
+
+/// Fix round 1 (I-1): once the mesh is up, a member asks for every package
+/// it holds by hash alone, and only those.
+#[tokio::test]
+async fn the_mesh_sweep_asks_for_each_package_held_by_hash_alone() -> Result<()> {
+    let cast = catchup_relay_fixture().await?;
+    let group_id = cast.fixture.group_id.clone();
+    let admin = admin_hex(&cast);
+    victim_holds_the_admin_by_hash(&cast).await;
+    request_hash_only_treekem_key_packages(&cast.victim_state).await;
+    let asked_for = |member: &str| {
+        let prefix = format!("{group_id}:member:{member}:");
+        cast.victim_state
+            .treekem_catchup_throttle
+            .try_read()
+            .is_ok_and(|throttle| throttle.keys().any(|k| k.starts_with(&prefix)))
+    };
+    wait_until(|| asked_for(&admin)).await;
+    assert!(asked_for(&admin), "the admin's package is requested");
+    for held in [
+        hex::encode(cast.member_b.as_bytes()),
+        hex::encode(cast.fixture.member_id.as_bytes()),
+    ] {
+        assert!(!asked_for(&held), "a package already held is not requested");
+    }
+    cast.shutdown().await;
+    Ok(())
+}
+
+/// Fix round 1 (I-2): a member whose own seat commits no package (a group
+/// made before 2026-07-11) refuses to seal. Receivers would refuse its
+/// commit and the group would split while the admin saw success. The route
+/// says why, and nothing changes.
+#[tokio::test]
+async fn a_sealer_whose_seat_commits_no_package_refuses_to_seal() -> Result<()> {
+    let fixture = two_member_treekem_group().await?;
+    let state = &fixture.state;
+    let group_id = &fixture.group_id;
+    let admin = hex::encode(state.agent.agent_id().as_bytes());
+    let member_hex = hex::encode(fixture.member_id.as_bytes());
+    {
+        let mut groups = state.named_groups.write().await;
+        let info = groups.get_mut(group_id).expect("group");
+        let seat = info.members_v2.get_mut(&admin).expect("admin seat");
+        seat.treekem_key_package_b64 = None;
+        seat.treekem_key_package_hash = None;
+        info.recompute_state_hash();
+    }
+    let before = roster(state, group_id).await;
+    let epoch_before = live_epoch(state, group_id).await;
+
+    let response = remove_named_group_member(
+        State(Arc::clone(state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path((group_id.clone(), member_hex.clone())),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "sealer_key_package_uncommitted");
+    assert!(
+        body["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("2026-07-11")),
+        "the error names the limit: {body}"
+    );
+    assert_eq!(live_epoch(state, group_id).await, epoch_before);
+    let after = roster(state, group_id).await;
+    assert_eq!(after.state_hash, before.state_hash);
+    assert!(after.has_active_member(&member_hex));
+    assert!(
+        published_removal_event(state).is_none(),
+        "nothing is published"
+    );
+    state.shutdown_notify.send_replace(true);
+    state.agent.shutdown().await;
     Ok(())
 }

@@ -2577,6 +2577,7 @@ async fn integration_treekem_home_rename_restart_single_announce_end_to_end() ->
         x0x::mls::TreeKemMlsGroup::create(group_id_bytes, owner_agent.agent_id(), &creator_seed)?;
     home_info.secret_epoch = treekem_group.epoch();
     home_info.security_binding = Some(format!("treekem:epoch={}", treekem_group.epoch()));
+    seat_treekem_package(&mut home_info, owner_agent.agent_id(), &creator_seed)?;
     home_info.recompute_state_hash();
     let treekem_group = Arc::new(Mutex::new(treekem_group));
     owner_state
