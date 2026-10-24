@@ -1219,6 +1219,10 @@ pub(super) struct AppState {
     /// Survivor re-key A5: which members this daemon asked about a hole
     /// after its head, per room, and when it may ask each again.
     pub(super) treekem_gap_asks: StdMutex<crate::server::routes::named_groups::GapAsks>,
+    /// Survivor re-key A6: this daemon's open head round per room (the
+    /// nonce, whom it challenged, the proofs recorded), and the head
+    /// proofs it answered per (room, requester) in the current window.
+    pub(super) treekem_head_proofs: StdMutex<crate::server::routes::named_groups::HeadProofs>,
     /// Per-group serialization for authoritative membership mutations. The
     /// owner-side `MemberJoined`→`MemberAdded` add (and every other membership
     /// apply) is a read-modify-write that loads `info`, mutates a clone, mutates

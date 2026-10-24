@@ -1244,6 +1244,7 @@ pub async fn serve_with_options(
         treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
         treekem_package_repulls: std::sync::Mutex::default(),
         treekem_gap_asks: std::sync::Mutex::default(),
+        treekem_head_proofs: std::sync::Mutex::default(),
         group_membership_locks: RwLock::new(HashMap::new()),
         treekem_groups: RwLock::new(treekem_groups),
         treekem_dir,

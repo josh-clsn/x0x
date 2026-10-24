@@ -105,6 +105,9 @@ struct PersistedTreeKemSnapshot {
     agent_to_leaf: Vec<([u8; 32], u32)>,
 }
 
+/// The MLS exporter label of [`TreeKemMlsGroup::epoch_authenticator`].
+pub const EPOCH_AUTHENTICATOR_LABEL: &str = "x0x/treekem-head/v1";
+
 const PERSISTED_SNAPSHOT_VERSION: u8 = 1;
 const PERSISTED_SNAPSHOT_MAGIC: &[u8; 4] = b"XTK1";
 
@@ -519,6 +522,37 @@ impl TreeKemMlsGroup {
     #[must_use]
     pub fn epoch(&self) -> u64 {
         self.inner.epoch()
+    }
+
+    /// The epoch authenticator (survivor re-key A6): 32 bytes from the MLS
+    /// exporter (RFC 9420 section 8.5) under [`EPOCH_AUTHENTICATOR_LABEL`],
+    /// with the group id as its context. Every member at this epoch of this
+    /// tree derives the same bytes. They are one-way, so they reveal nothing
+    /// a member at the epoch does not already hold.
+    ///
+    /// # Errors
+    /// Returns [`MlsError`] if the exporter fails.
+    pub fn epoch_authenticator(&self) -> Result<[u8; 32]> {
+        let exported = self
+            .inner
+            .export_secret(EPOCH_AUTHENTICATOR_LABEL, self.inner.group_id(), 32)
+            .map_err(|e| MlsError::SaorsaMls(format!("treekem export_secret: {e}")))?;
+        <[u8; 32]>::try_from(exported.as_slice()).map_err(|_| {
+            MlsError::MlsOperation(format!(
+                "treekem export_secret returned {} bytes, not 32",
+                exported.len()
+            ))
+        })
+    }
+
+    /// The live epoch and its [`Self::epoch_authenticator`], read together
+    /// from one borrow of the tree, so a caller holding the tree's lock gets
+    /// a pair that cannot be torn.
+    ///
+    /// # Errors
+    /// Returns [`MlsError`] if the exporter fails.
+    pub fn head(&self) -> Result<(u64, [u8; 32])> {
+        Ok((self.epoch(), self.epoch_authenticator()?))
     }
 
     /// The group identifier.
@@ -1148,6 +1182,77 @@ mod tests {
         assert!(
             !alice.has_leaf_for_key_package(b"not a key package"),
             "undecodable bytes are not a live leaf"
+        );
+    }
+
+    /// Survivor re-key A6: three members at one epoch derive the same 32
+    /// bytes, through the standard MLS exporter (RFC 9420 section 8.5) with
+    /// the head label and the group id as its context.
+    #[test]
+    fn every_member_at_an_epoch_derives_the_same_authenticator() {
+        let (alice_id, bob_id, carol_id) = (agent(1), agent(2), agent(3));
+        let mut alice =
+            TreeKemMlsGroup::create(b"head".to_vec(), alice_id, &seed(1)).expect("create");
+        let bob_prepared = TreeKemMlsGroup::prepare_member(bob_id, &seed(2)).expect("bob");
+        let to_bob = alice
+            .add_member(bob_id, bob_prepared.key_package_bytes())
+            .expect("add bob");
+        let mut bob =
+            TreeKemMlsGroup::join_from_welcome(bob_prepared, &to_bob.welcome).expect("bob joins");
+        let carol_prepared = TreeKemMlsGroup::prepare_member(carol_id, &seed(3)).expect("carol");
+        let to_carol = alice
+            .add_member(carol_id, carol_prepared.key_package_bytes())
+            .expect("add carol");
+        bob.process_commit(&to_carol.commit).expect("bob follows");
+        let carol = TreeKemMlsGroup::join_from_welcome(carol_prepared, &to_carol.welcome)
+            .expect("carol joins");
+
+        let (epoch, authenticator) = alice.head().expect("alice's head");
+        assert_eq!(epoch, alice.epoch());
+        assert_eq!(bob.head().expect("bob's head"), (epoch, authenticator));
+        assert_eq!(carol.head().expect("carol's head"), (epoch, authenticator));
+        assert_eq!(
+            alice.epoch_authenticator().expect("authenticator").to_vec(),
+            alice
+                .inner
+                .export_secret(EPOCH_AUTHENTICATOR_LABEL, b"head", 32)
+                .expect("the MLS exporter"),
+            "the authenticator is the MLS exporter over the head label and the group id"
+        );
+        assert_eq!(EPOCH_AUTHENTICATOR_LABEL, "x0x/treekem-head/v1");
+    }
+
+    /// A member that misses a commit keeps the old authenticator, and two
+    /// groups at the same epoch never share one.
+    #[test]
+    fn the_authenticator_follows_the_live_epoch_and_the_group() {
+        let (alice_id, bob_id) = (agent(1), agent(2));
+        let mut alice =
+            TreeKemMlsGroup::create(b"head".to_vec(), alice_id, &seed(1)).expect("create");
+        let bob_prepared = TreeKemMlsGroup::prepare_member(bob_id, &seed(2)).expect("bob");
+        let to_bob = alice
+            .add_member(bob_id, bob_prepared.key_package_bytes())
+            .expect("add bob");
+        let bob =
+            TreeKemMlsGroup::join_from_welcome(bob_prepared, &to_bob.welcome).expect("bob joins");
+        let before = alice.epoch_authenticator().expect("before");
+
+        alice.update().expect("alice moves the epoch on");
+        let after = alice.epoch_authenticator().expect("after");
+        assert_ne!(before, after, "a new epoch has a new authenticator");
+        assert_eq!(
+            bob.epoch_authenticator().expect("bob"),
+            before,
+            "a member that missed the commit still holds the old one"
+        );
+
+        let other = TreeKemMlsGroup::create(b"other".to_vec(), alice_id, &seed(1)).expect("other");
+        let solo = TreeKemMlsGroup::create(b"head".to_vec(), alice_id, &seed(1)).expect("solo");
+        assert_eq!(other.epoch(), solo.epoch());
+        assert_ne!(
+            other.epoch_authenticator().expect("other"),
+            solo.epoch_authenticator().expect("solo"),
+            "another group at the same epoch has another authenticator"
         );
     }
 }

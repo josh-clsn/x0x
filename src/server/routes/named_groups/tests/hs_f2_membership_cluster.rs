@@ -7210,6 +7210,7 @@ async fn forking_catchup_responder_adopts_nothing_under_anchored_gap() -> Result
             signed_by: None,
             target_member_id: None,
             target_member_key_package_b64: None,
+            head_proof: None,
         },
     )
     .await;
@@ -7381,6 +7382,7 @@ async fn forking_catchup_policy_page_leaves_group_state_untouched() -> Result<()
             signed_by: None,
             target_member_id: None,
             target_member_key_package_b64: None,
+            head_proof: None,
         },
     )
     .await;
@@ -7656,6 +7658,7 @@ async fn honest_multicommit_gap_converges_page_by_page_under_gate() -> Result<()
                 signed_by: None,
                 target_member_id: None,
                 target_member_key_package_b64: None,
+                head_proof: None,
             },
         )
         .await;
@@ -7704,6 +7707,7 @@ async fn honest_multicommit_gap_converges_page_by_page_under_gate() -> Result<()
             signed_by: None,
             target_member_id: None,
             target_member_key_package_b64: None,
+            head_proof: None,
         },
     )
     .await;
@@ -7880,6 +7884,7 @@ async fn stale_record_in_one_group_does_not_block_another() -> Result<()> {
             signed_by: None,
             target_member_id: None,
             target_member_key_package_b64: None,
+            head_proof: None,
         },
     )
     .await;

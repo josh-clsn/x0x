@@ -46,6 +46,7 @@ async fn unverified_page(
             target_member_id: None,
             target_member_key_package_b64: None,
             signed_by: None,
+            head_proof: None,
         },
     )
     .await;
@@ -672,6 +673,7 @@ async fn forged_hole_reports_spend_nothing() -> Result<()> {
         target_member_id: None,
         target_member_key_package_b64: None,
         signed_by: None,
+        head_proof: None,
     };
     let real = s2_hole_report(&cast).await;
     // S2's real signature moved onto another hole.
