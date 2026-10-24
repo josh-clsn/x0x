@@ -29,10 +29,9 @@ use super::routes::named_groups::RequesterOfferObligation;
 use super::routes::public_group_bootstrap_outbox::PublicGroupBootstrapObligation;
 use super::routes::{
     ExpectedJoinResultInviter, FileChunkAckSlot, JoinRefusalSignLimiter, LastJoinOutcome,
-    ListenerRegistration, NamedGroupMetadataEvent, ParkedRoleUpdate, PendingCausalApproval,
-    PendingJoinAttempt, PendingJoinRefusal, PendingJoinResult, PendingTreeKemMetadataEvent,
-    PendingWelcome, PendingWelcomeReceive, PredecessorRelayObligation, RestSubscription,
-    WelcomeFetchWaiter,
+    ListenerRegistration, ParkedRoleUpdate, PendingCausalApproval, PendingJoinAttempt,
+    PendingJoinRefusal, PendingJoinResult, PendingTreeKemMetadataEvent, PendingWelcome,
+    PendingWelcomeReceive, PredecessorRelayObligation, RestSubscription, WelcomeFetchWaiter,
 };
 use super::sse::SseEvent;
 use super::ws::{SharedTopicState, WsOutboundStats, WsSession};
@@ -1193,9 +1192,10 @@ pub(super) struct AppState {
     /// and obligation save complete.
     pub(super) pending_listener_admission:
         Mutex<Option<crate::server::routes::named_groups::PendingListenerAdmission>>,
-    /// Bounded per-group log of locally authored/applied TreeKEM membership
-    /// events used to satisfy explicit catch-up requests.
-    pub(super) treekem_event_log: RwLock<HashMap<String, VecDeque<NamedGroupMetadataEvent>>>,
+    /// Bounded per-group log of the commit-bearing events this member
+    /// authored or applied, used to satisfy explicit catch-up requests. Kept
+    /// on disk under `treekem/event-log/` (survivor re-key A4).
+    pub(super) treekem_event_log: RwLock<crate::server::routes::named_groups::EventLog>,
     /// Bounded member-keyed cache of verified TreeKEM key-package-bearing
     /// `MemberJoined` recovery records. It retains inviter-authority-attested
     /// records and independently witnessed provisional records under the same

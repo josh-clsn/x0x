@@ -83,7 +83,7 @@ The signed roster commit covers its group id and revision, the previous state ha
 
 ## Consequences
 
-- A member who was away gets a removal, ban, add, rename, policy, role or unban change from any member that holds it. A4 must keep every commit-bearing kind in the catch-up log (today only the TreeKEM membership kinds are logged), so that a member can also serve the non-TreeKEM ones.
+- A member who was away gets a removal, ban, add, rename, policy, role or unban change from any member that holds it. A4 (`T-catchup-log-on-disk`) keeps every commit-bearing kind in the catch-up log, on disk, so a member can serve the non-TreeKEM ones too.
 - The engine-A doors no longer apply a legacy-bound TreeKEM event or a join-request lifecycle event. A device on the old pin that relays its legacy events through the relay log is stranded by them; this joins the A1 flag day (every device moves at the pin flip, B1).
 - On the engine-A doors, a shared-secret-plane add applies without its display name and KeyPackage hash. TreeKEM groups, which are what Noetic uses, are unaffected.
 - The A0 shortcut (`transport_sender == author`) is gone. On a verified transport, the author still delivers its own legacy-bound events.

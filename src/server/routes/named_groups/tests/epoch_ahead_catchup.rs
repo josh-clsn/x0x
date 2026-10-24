@@ -314,6 +314,7 @@ pub(super) async fn deliver_catchup(
             target_member_key_package_b64: None,
             signed_by: None,
             responder_state_hash: None,
+            log_evicted_through: None,
         },
     )
     .await;
@@ -627,6 +628,11 @@ pub(super) struct SurvivorRelay {
 }
 
 impl SurvivorRelay {
+    /// S2's data directory, for a restart (survivor re-key A4).
+    pub(super) fn s2_dir(&self) -> &std::path::Path {
+        self._s2_dir.path()
+    }
+
     pub(super) async fn shutdown(self) {
         for state in [&self.s1, &self.s2, &self.fixture.state] {
             state.shutdown_notify.send_replace(true);

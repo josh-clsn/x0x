@@ -300,8 +300,8 @@ async fn build_back_to_back(dir: &std::path::Path) -> Result<BackToBack> {
         .insert(group_key.clone(), next.clone());
     // The live seal path (`add_treekem_named_group_member`) logs every
     // sealed MemberAdded in the in-memory TreeKEM event log.
-    remember_treekem_membership_event(&authority, &add_j1.event).await;
-    remember_treekem_membership_event(&authority, &add_j2.event).await;
+    remember_commit_bearing_event(&authority, &add_j1.event).await;
+    remember_commit_bearing_event(&authority, &add_j2.event).await;
 
     // Exactly what the authority serves J2's FetchRequest from the stub
     // revision: stage_join_result's v2 owner attestation plus
@@ -417,6 +417,7 @@ fn catchup_page(s: &BackToBack) -> TreeKemCatchupResponse {
         events: vec![s.add_j1.event.clone(), s.add_j2.event.clone()],
         truncated: false,
         responder_state_hash: None,
+        log_evicted_through: None,
         signed_by: None,
         target_member_id: None,
         target_member_key_package_b64: None,
@@ -526,6 +527,7 @@ async fn issue1139_catchup_page_converges_second_joiner() -> Result<()> {
         events: vec![s.add_j1.event.clone()],
         truncated: false,
         responder_state_hash: None,
+        log_evicted_through: None,
         signed_by: None,
         target_member_id: None,
         target_member_key_package_b64: None,

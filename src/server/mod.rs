@@ -1026,6 +1026,14 @@ pub async fn serve_with_options(
     // groups immediately. Done with `named_groups` still owned (it is moved
     // into the RwLock below).
     let treekem_groups = restore_treekem_groups(&named_groups, agent.as_ref(), &treekem_dir).await;
+    // Survivor re-key A4: reseed the catch-up log from disk, keeping only
+    // rooms this member still serves.
+    let treekem_event_log = crate::server::routes::named_groups::load_event_log(
+        &treekem_dir,
+        &named_groups,
+        &hex::encode(agent.agent_id().as_bytes()),
+    )
+    .await;
 
     // ADR-0036: load the daemon self-profile (names) and enforce the owner
     // singleton — an install whose recorded owner differs from the user key
@@ -1230,7 +1238,7 @@ pub async fn serve_with_options(
         join_result_staging_path,
         join_result_staging_persistence_lock: Mutex::new(()),
         join_result_pins_persistence_lock: Mutex::new(()),
-        treekem_event_log: RwLock::new(HashMap::new()),
+        treekem_event_log: RwLock::new(treekem_event_log),
         treekem_member_key_packages,
         treekem_catchup_throttle: RwLock::new(HashMap::new()),
         treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),

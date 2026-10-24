@@ -8,7 +8,12 @@
 
 mod committer_leaf;
 mod control_blob;
+mod event_log_store;
 pub(in crate::server) use committer_leaf::PackageRepulls;
+use event_log_store::{
+    commit_bearing_event_frontier, commit_bearing_event_sort_key, remember_commit_bearing_event,
+};
+pub(in crate::server) use event_log_store::{load_event_log, EventLog};
 mod fair_admission;
 mod join_result_pins;
 mod seat_cert_fetch;
@@ -84,7 +89,6 @@ const NAMED_GROUP_METADATA_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 
 const TREEKEM_PENDING_EVENTS_PER_GROUP_CAP: usize = 64;
 
-const TREEKEM_EVENT_LOG_PER_GROUP_CAP: usize = 128;
 /// #1139: the most intervening membership events a join result carries.
 /// A larger gap falls back to TreeKEM catch-up (today's path).
 pub(in crate::server) const JOIN_RESULT_INTERVENING_EVENT_CAP: usize = 8;
@@ -1205,6 +1209,12 @@ pub(in crate::server) struct TreeKemCatchupResponse {
     /// hint (#1337).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     responder_state_hash: Option<String>,
+    /// Survivor re-key A4: the responder's log no longer holds the events
+    /// at or below this revision, which it dropped to stay within a cap.
+    /// Set, with no events, when the requester is behind it: a page from
+    /// this responder would have a hole. Old peers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    log_evicted_through: Option<u64>,
     /// #398: which member `target_member_key_package_b64` belongs to — an
     /// echo of the request's `target_member_id`. `#[serde(default)]` keeps
     /// responses from old daemons parseable and old daemons ignore it.
@@ -7975,33 +7985,6 @@ async fn should_queue_treekem_membership_event(
     treekem_state_frontier_gap_reason(info, event, local_agent_hex, local_epoch)
 }
 
-async fn remember_treekem_membership_event(state: &AppState, event: &NamedGroupMetadataEvent) {
-    let Some(frontier) = treekem_membership_event_frontier(event) else {
-        return;
-    };
-    {
-        let groups = state.named_groups.read().await;
-        if has_withdrawn_group_record(&groups, frontier.group_id) {
-            return;
-        }
-    }
-    let mut logs = state.treekem_event_log.write().await;
-    let log = logs.entry(frontier.group_id.to_string()).or_default();
-    if let Some(key) = treekem_membership_event_key(event) {
-        if log
-            .iter()
-            .filter_map(treekem_membership_event_key)
-            .any(|existing| existing == key)
-        {
-            return;
-        }
-    }
-    log.push_back(event.clone());
-    while log.len() > TREEKEM_EVENT_LOG_PER_GROUP_CAP {
-        log.pop_front();
-    }
-}
-
 /// Extract the member-keyed cache entry (`join_result_key`, event) from a
 /// key-package-bearing `MemberJoined`. Returns `None` for non-`MemberJoined`
 /// events or those without an embedded key package. Used by
@@ -10604,7 +10587,7 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
                     refresh_group_card_cache_from_info(state, group_id, info).await;
                 }
             }
-            remember_treekem_membership_event(state, &pending.event).await;
+            remember_commit_bearing_event(state, &pending.event).await;
             tracing::info!(
                 group_id = %LogHexId::group(group_id),
                 request_id = %pending.request_id,
@@ -10756,6 +10739,7 @@ async fn member_keyed_treekem_catchup_response(
         events: event.into_iter().collect(),
         truncated: false,
         responder_state_hash: None,
+        log_evicted_through: None,
         target_member_id: Some(target_member_id.clone()),
         target_member_key_package_b64,
         signed_by,
@@ -10981,25 +10965,45 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         }
         throttle.insert(serve_throttle_key, tokio::time::Instant::now());
     }
-    let mut events = {
+    // Survivor re-key A4: every commit-bearing event this member applied,
+    // after a restart too, ordered by signed revision. A requester behind
+    // the revision this log dropped to stay within a cap would get a page
+    // with a hole in it, so it gets none, and is told why.
+    let (mut events, log_evicted_through) = {
         let logs = state.treekem_event_log.read().await;
+        let evicted_through = logs
+            .evicted_through(&log_keys)
+            .filter(|through| request.from_revision < *through);
         let mut events = Vec::new();
-        for key in &log_keys {
-            if let Some(logged) = logs.get(key) {
-                events.extend(logged.iter().cloned());
+        if evicted_through.is_none() {
+            for key in &log_keys {
+                if let Some(logged) = logs.get(key) {
+                    events.extend(
+                        logged
+                            .iter()
+                            .filter(|event| {
+                                commit_bearing_event_frontier(event).is_some_and(|frontier| {
+                                    frontier.revision > request.from_revision
+                                        || frontier.epoch > request.from_treekem_epoch
+                                })
+                            })
+                            .cloned(),
+                    );
+                }
             }
         }
-        events
-            .into_iter()
-            .filter(|event| {
-                treekem_membership_event_frontier(event).is_some_and(|frontier| {
-                    frontier.revision > request.from_revision
-                        || frontier.epoch.unwrap_or_default() > request.from_treekem_epoch
-                })
-            })
-            .collect::<Vec<_>>()
+        (events, evicted_through)
     };
-    events.sort_by_key(treekem_membership_event_sort_key);
+    if let Some(through) = log_evicted_through {
+        tracing::warn!(
+            group_id = %LogHexId::group(&request.group_id),
+            requester = %sender_hex,
+            from_revision = request.from_revision,
+            evicted_through = through,
+            "TreeKEM catch-up: this member's log no longer reaches back to the requester's revision; no page served"
+        );
+    }
+    events.sort_by_key(commit_bearing_event_sort_key);
     let truncated = events.len() > request.limit.min(TREEKEM_CATCHUP_RESPONSE_EVENT_CAP);
     events.truncate(request.limit.min(TREEKEM_CATCHUP_RESPONSE_EVENT_CAP));
     let response = TreeKemCatchupResponse {
@@ -11008,6 +11012,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         events,
         truncated,
         responder_state_hash: Some(saved_head),
+        log_evicted_through,
         target_member_id: None,
         target_member_key_package_b64: None,
         signed_by: None,
@@ -11306,8 +11311,16 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         return;
     }
     let was_truncated = response.truncated;
+    if let Some(through) = response.log_evicted_through {
+        tracing::info!(
+            group_id = %LogHexId::group(&response.group_id),
+            sender = %LogHexId::agent(&sender_hex),
+            evicted_through = through,
+            "TreeKEM catch-up: the responder's log no longer reaches back to this member's revision"
+        );
+    }
     let mut events = response.events;
-    events.sort_by_key(treekem_membership_event_sort_key);
+    events.sort_by_key(commit_bearing_event_sort_key);
 
     // #846: while the durable owner-anchored gap record is ARMED (the
     // owner attested a stale-base gap and the current state has not yet
@@ -13581,7 +13594,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             *replay_group_id = Some(resolved_group_key.clone());
             save_mls_groups(state).await;
-            remember_treekem_membership_event(state, &event_for_log).await;
+            remember_commit_bearing_event(state, &event_for_log).await;
             ApplyMetadataResult::ACCEPTED_EXIT
         }
         NamedGroupMetadataEvent::MemberRemoved {
@@ -13674,7 +13687,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     return ApplyMetadataResult::REJECTED;
                 }
                 refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
-                remember_treekem_membership_event(state, &event_for_log).await;
+                remember_commit_bearing_event(state, &event_for_log).await;
                 tracing::debug!(
                     target: "treekem.trace",
                     stage = "rekey_own_removal_applied_as_link",
@@ -13888,7 +13901,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             *replay_group_id = Some(resolved_group_key.clone());
             save_mls_groups(state).await;
-            remember_treekem_membership_event(state, &event_for_log).await;
+            remember_commit_bearing_event(state, &event_for_log).await;
             let _ =
                 prune_treekem_cache_member(state, &resolved_group_key, &agent_id, "member_removed")
                     .await;
@@ -14037,6 +14050,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
+            remember_commit_bearing_event(state, &event_for_log).await;
             *replay_group_id = Some(resolved_group_key.clone());
             ApplyMetadataResult::ACCEPTED_CONTINUE
         }
@@ -14130,6 +14144,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
+            remember_commit_bearing_event(state, &event_for_log).await;
             *replay_group_id = Some(resolved_group_key.clone());
             ApplyMetadataResult::ACCEPTED_CONTINUE
         }
@@ -14316,12 +14331,12 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             );
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             *replay_group_id = Some(resolved_group_key.clone());
-            remember_treekem_membership_event(state, &event_for_log).await;
+            remember_commit_bearing_event(state, &event_for_log).await;
             if banned_self {
                 // Issue #376: a ban is a departure, and the only one that keeps
                 // its roster entry — the Banned tombstone must stay visible to
                 // the user and to the rejoin path. Wipe after the card-cache
-                // refresh and `remember_treekem_membership_event` above, both of
+                // refresh and `remember_commit_bearing_event` above, both of
                 // which would otherwise re-seed what this clears. Because the
                 // roster entry survives, the #363 `no_local_group` catch-up
                 // refusal never fires here, so clearing the retained history is
@@ -14332,7 +14347,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 // and re-seed `group_card_cache` for the group. That is bounded
                 // and holds no key material, and the event log is NOT re-seeded
                 // because replay applies with `allow_queue = false`, which skips
-                // `remember_treekem_membership_event`.
+                // `remember_commit_bearing_event`.
                 wipe_local_group_crypto_material(
                     state,
                     &resolved_group_key,
@@ -14401,6 +14416,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
+            remember_commit_bearing_event(state, &event_for_log).await;
             *replay_group_id = Some(resolved_group_key.clone());
             ApplyMetadataResult::ACCEPTED_CONTINUE
         }
@@ -14526,6 +14542,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             }
             // ADR 0028: a JoinRequestCreated just advanced the group state.
             // Drain queued approvals that may now have their predecessor.
+            remember_commit_bearing_event(state, &event_for_log).await;
             *replay_group_id = Some(resolved_group_key.clone());
             // Finding B: return the pre-mutation group state so the relay
             // listener can roll back the request if obligation admission
@@ -14818,7 +14835,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             }
             *replay_group_id = Some(resolved_group_key.clone());
             if allow_queue {
-                remember_treekem_membership_event(state, &event_for_log).await;
+                remember_commit_bearing_event(state, &event_for_log).await;
             }
             // ADR 0028: a successful JoinRequestApproved advanced the group
             // state. Drain queued approvals — a multi-request batch may have
@@ -14884,6 +14901,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             ) {
                 return ApplyMetadataResult::REJECTED;
             }
+            remember_commit_bearing_event(state, &event_for_log).await;
             *replay_group_id = Some(resolved_group_key.clone());
             ApplyMetadataResult::ACCEPTED_CONTINUE
         }
@@ -14934,6 +14952,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             ) {
                 return ApplyMetadataResult::REJECTED;
             }
+            remember_commit_bearing_event(state, &event_for_log).await;
             *replay_group_id = Some(resolved_group_key.clone());
             ApplyMetadataResult::ACCEPTED_CONTINUE
         }
@@ -15011,6 +15030,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
+            remember_commit_bearing_event(state, &event_for_log).await;
             *replay_group_id = Some(resolved_group_key.clone());
             ApplyMetadataResult::ACCEPTED_CONTINUE
         }
@@ -15924,9 +15944,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 .await;
 
                 publish_named_group_metadata_event(state, &metadata_topic, &removed_event).await;
-                remember_treekem_membership_event(state, &removed_event).await;
+                remember_commit_bearing_event(state, &removed_event).await;
                 publish_named_group_metadata_event(state, &metadata_topic, &added_event).await;
-                remember_treekem_membership_event(state, &added_event).await;
+                remember_commit_bearing_event(state, &added_event).await;
                 spawn_named_group_event_delivery_to_active_members(
                     state,
                     &next,
@@ -15968,6 +15988,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         commit: Some(commit3),
                     };
                     publish_named_group_metadata_event(state, &metadata_topic, &role_event).await;
+                    remember_commit_bearing_event(state, &role_event).await;
                     spawn_named_group_event_delivery_to_active_members(
                         state,
                         &next,
@@ -16554,7 +16575,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             )
             .await;
             publish_named_group_metadata_event(state, &metadata_topic, &event).await;
-            remember_treekem_membership_event(state, &event).await;
+            remember_commit_bearing_event(state, &event).await;
             spawn_named_group_event_delivery_to_active_members(
                 state,
                 &next,
@@ -22369,6 +22390,7 @@ pub(in crate::server) async fn add_named_group_member(
     };
 
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    remember_commit_bearing_event(&state, &event).await;
     if bootstrap_group.policy.confidentiality == x0x::groups::GroupConfidentiality::SignedPublic {
         spawn_public_group_bootstrap_delivery(&state);
     }
@@ -22700,7 +22722,7 @@ async fn add_treekem_named_group_member(
     )
     .await;
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
-    remember_treekem_membership_event(&state, &event).await;
+    remember_commit_bearing_event(&state, &event).await;
     spawn_named_group_event_delivery_to_active_members(
         &state,
         &next,
@@ -22953,6 +22975,7 @@ pub(in crate::server) async fn remove_named_group_member(
     if !drop_initial_volley(&event) {
         publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     }
+    remember_commit_bearing_event(&state, &event).await;
     // ADR 0030 §5: the removal is committed, so the bootstrap debt to this
     // member no longer exists.
     cancel_public_group_bootstrap_obligations_for_removal(&state, &agent_id_hex, &delivery_roster)
@@ -23532,9 +23555,11 @@ async fn wipe_local_group_crypto_material(
         }
     }
     {
+        // Survivor re-key A4: the disk copy goes under the same lock, so an
+        // append racing this wipe cannot bring the room's directory back.
         let mut event_log = state.treekem_event_log.write().await;
         for alias in &aliases {
-            event_log.remove(alias);
+            event_log.wipe_room(alias).await;
         }
     }
     {
@@ -24068,11 +24093,11 @@ async fn leave_treekem_group(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
-    remember_treekem_membership_event(&state, &event).await;
+    remember_commit_bearing_event(&state, &event).await;
     spawn_named_group_event_delivery_to_active_members(&state, &delivery_roster, &event, &[]);
     // Issue #376: the teardown above is keyed by the local group id and leaves
     // the stable-id-keyed material behind — including the membership event log
-    // `remember_treekem_membership_event` just re-appended this leave to. Wipe
+    // `remember_commit_bearing_event` may just have re-appended this leave to. Wipe
     // last, after the event is published and handed to delivery: each
     // per-recipient send is a detached task holding its own `Arc<Agent>` and a
     // pre-serialized payload, so the task aborts here cannot cancel it.
@@ -24296,7 +24321,7 @@ async fn remove_treekem_named_group_member(
     if !drop_initial_volley(&event) {
         publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     }
-    remember_treekem_membership_event(&state, &event).await;
+    remember_commit_bearing_event(&state, &event).await;
     if !drop_initial_volley(&event) {
         spawn_named_group_event_delivery_to_active_members(
             &state,
@@ -24545,7 +24570,7 @@ async fn reconcile_treekem_self_leave_rekeys(
             commit: Some(commit),
         };
         publish_named_group_metadata_event(state, &metadata_topic, &event).await;
-        remember_treekem_membership_event(state, &event).await;
+        remember_commit_bearing_event(state, &event).await;
         // Deliberately not delivered to the departed member: they left
         // voluntarily and their local state is already torn down.
         spawn_named_group_event_delivery_to_active_members(state, &next, &event, &[]);
@@ -25191,6 +25216,7 @@ async fn owner_certified_seal_with_eviction(
                 (commit, event, metadata_topic, delivery_roster)
             };
             drop(guard);
+            remember_commit_bearing_event(state, &event).await;
             if !drop_initial_volley(&event) {
                 publish_named_group_metadata_event(state, &metadata_topic, &event).await;
                 spawn_named_group_event_delivery_to_active_members(
@@ -25314,6 +25340,7 @@ async fn owner_certified_seal_with_eviction(
                 buffered_envelopes,
             )
         };
+        remember_commit_bearing_event(state, &event).await;
         if !drop_initial_volley(&event) {
             publish_named_group_metadata_event(state, &metadata_topic, &event).await;
             spawn_named_group_event_delivery_to_active_members(
@@ -27411,6 +27438,7 @@ pub(in crate::server) async fn update_named_group(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    remember_commit_bearing_event(&state, &event).await;
     spawn_named_group_event_delivery_to_active_members(&state, &delivery_roster, &event, &[]);
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
@@ -27549,6 +27577,7 @@ pub(in crate::server) async fn update_group_policy(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    remember_commit_bearing_event(&state, &event).await;
     spawn_named_group_event_delivery_to_active_members(&state, &delivery_roster, &event, &[]);
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
@@ -27663,6 +27692,7 @@ pub(in crate::server) async fn update_member_role(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    remember_commit_bearing_event(&state, &event).await;
     spawn_named_group_event_delivery_to_active_members(&state, &delivery_roster, &event, &[]);
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
@@ -27831,6 +27861,7 @@ pub(in crate::server) async fn ban_group_member(
     if !drop_initial_volley(&event) {
         publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     }
+    remember_commit_bearing_event(&state, &event).await;
     // #344: a lost `MemberBanned` leaves the banned peer holding its roster
     // entry and key material exactly like a lost removal — the banned member
     // has no reason to poll for what it cannot see coming. Bounded resend.
@@ -28043,7 +28074,7 @@ async fn ban_treekem_group_member(
     if !drop_initial_volley(&event) {
         publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     }
-    remember_treekem_membership_event(&state, &event).await;
+    remember_commit_bearing_event(&state, &event).await;
     if !drop_initial_volley(&event) {
         spawn_named_group_event_delivery_to_active_members(
             &state,
@@ -28140,6 +28171,7 @@ pub(in crate::server) async fn unban_group_member(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    remember_commit_bearing_event(&state, &event).await;
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (
@@ -29054,6 +29086,7 @@ pub(in crate::server) async fn approve_join_request(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    remember_commit_bearing_event(&state, &event).await;
 
     // Direct + delayed delivery of the signed JoinRequestApproved to every
     // non-local active member (the already-present witnesses) AND the new
@@ -29325,7 +29358,7 @@ async fn approve_treekem_join_request(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
-    remember_treekem_membership_event(&state, &event).await;
+    remember_commit_bearing_event(&state, &event).await;
     spawn_named_group_event_delivery_to_active_members(
         &state,
         &next,
@@ -29447,6 +29480,7 @@ pub(in crate::server) async fn reject_join_request(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    remember_commit_bearing_event(&state, &event).await;
     spawn_named_group_event_delivery(&state, &requester_hex, &event);
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
@@ -41883,7 +41917,7 @@ async fn apply_rekey_self_removal_link_checked(
     ) {
         return Err("persist_not_durable");
     }
-    remember_treekem_membership_event(state, event).await;
+    remember_commit_bearing_event(state, event).await;
     Ok(())
 }
 
@@ -44598,6 +44632,7 @@ pub(in crate::server) mod tests {
     mod committer_leaf;
     mod engine_a_apply_gate;
     mod epoch_ahead_catchup;
+    mod event_log_store;
     mod fork_quarantine;
     mod genesis_kp_catchup_398;
     mod home_control_payload_size;
@@ -45259,6 +45294,13 @@ pub(in crate::server) mod tests {
             &named_groups,
         )
         .await?;
+        // Survivor re-key A4: mirror daemon startup.
+        let treekem_event_log = load_event_log(
+            &treekem_dir,
+            &named_groups,
+            &hex::encode(agent.agent_id().as_bytes()),
+        )
+        .await;
         // ADR-0041 Tier-1: mirror daemon startup — owned agents get the
         // SyncV1 acceptor + store under `<data_dir>/sync`.
         let owner_sync = if agent.identity().user_keypair().is_some() {
@@ -45407,7 +45449,7 @@ pub(in crate::server) mod tests {
             join_result_staging_persistence_lock: Mutex::new(()),
             join_result_pins_persistence_lock: Mutex::new(()),
             treekem_member_key_packages,
-            treekem_event_log: RwLock::new(HashMap::new()),
+            treekem_event_log: RwLock::new(treekem_event_log),
             treekem_catchup_throttle: RwLock::new(HashMap::new()),
             treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
             treekem_package_repulls: std::sync::Mutex::default(),
@@ -58797,6 +58839,7 @@ pub(in crate::server) mod tests {
             events: Vec::new(),
             truncated: false,
             responder_state_hash: None,
+            log_evicted_through: None,
             target_member_id: None,
             target_member_key_package_b64: None,
             signed_by: None,
@@ -60215,7 +60258,7 @@ pub(in crate::server) mod tests {
             .insert(group_id.clone(), info);
 
         // Both surfaces are keyed by the STABLE group id — see
-        // `remember_treekem_membership_event` and
+        // `remember_commit_bearing_event` and
         // `queue_treekem_membership_event`, which key on the event's group id.
         // That is exactly why a roster-keyed piecemeal teardown misses them.
         let retained = NamedGroupMetadataEvent::MemberAdded {
@@ -63565,6 +63608,7 @@ pub(in crate::server) mod tests {
             events: vec![fixture.event.clone()],
             truncated: false,
             responder_state_hash: None,
+            log_evicted_through: None,
             target_member_id: None,
             target_member_key_package_b64: None,
             signed_by: None,
