@@ -1970,9 +1970,21 @@ async fn slice2_persisted_record_derives_grace_under_slice3() -> Result<()> {
 /// negative arm documents exactly that regression class: a mandate whose
 /// declared epoch disagrees with the event's treekem_epoch is refused
 /// even though the signature itself is honest owner-key material.
-#[tokio::test]
-async fn treekem_direct_add_mints_epoch_bound_mandate_peer_applies() -> Result<()> {
-    let (authority, _dir, owner_kp) = owner_authority_state().await?;
+/// An owner-certified TreeKEM group whose authority holds the owner key,
+/// and the `MemberAdded` its direct-add route published, with its mandate.
+struct TreeKemOwnerAdd {
+    authority: Arc<AppState>,
+    _dir: tempfile::TempDir,
+    owner_kp: UserKeypair,
+    group_id: String,
+    base_before: x0x::groups::GroupInfo,
+    published: NamedGroupMetadataEvent,
+    initial_epoch: u64,
+    joiner_hex: String,
+}
+
+async fn treekem_owner_certified_direct_add() -> Result<TreeKemOwnerAdd> {
+    let (authority, dir, owner_kp) = owner_authority_state().await?;
     let group_id = "5e".repeat(32);
     let group_id_bytes = hex::decode(&group_id)?;
     let creator_seed = agent_treekem_seed(authority.agent.as_ref(), &group_id_bytes);
@@ -2094,6 +2106,53 @@ async fn treekem_direct_add_mints_epoch_bound_mandate_peer_applies() -> Result<(
             _ => None,
         })
         .expect("published TreeKEM MemberAdded");
+    Ok(TreeKemOwnerAdd {
+        authority,
+        _dir: dir,
+        owner_kp,
+        group_id,
+        base_before,
+        published,
+        initial_epoch,
+        joiner_hex,
+    })
+}
+
+/// A fresh peer holding `base` as its roster.
+async fn peer_with(
+    base: &x0x::groups::GroupInfo,
+    group_id: &str,
+) -> Result<(Arc<AppState>, tempfile::TempDir)> {
+    let dir = tempfile::tempdir()?;
+    let agent = Arc::new(
+        Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key(AgentKeypair::generate()?)
+            .with_peer_cache_disabled()
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await?,
+    );
+    let peer = secure_endpoint_test_state_at(dir.path(), agent).await?;
+    peer.named_groups
+        .write()
+        .await
+        .insert(group_id.to_string(), base.clone());
+    Ok((peer, dir))
+}
+
+#[tokio::test]
+async fn treekem_direct_add_mints_epoch_bound_mandate_peer_applies() -> Result<()> {
+    let TreeKemOwnerAdd {
+        authority,
+        _dir,
+        owner_kp,
+        group_id,
+        base_before,
+        published,
+        initial_epoch,
+        joiner_hex,
+    } = treekem_owner_certified_direct_add().await?;
     let (actor_field, mandate, commit, event_epoch) = match &published {
         NamedGroupMetadataEvent::MemberAdded {
             actor,
@@ -2177,9 +2236,10 @@ async fn treekem_direct_add_mints_epoch_bound_mandate_peer_applies() -> Result<(
     );
 
     // Negative arm: an honestly owner-signed mandate whose declared epoch
-    // disagrees with the event's treekem_epoch must refuse as
-    // owner_mandate_invalid on a fresh peer (state byte-identical) — the
-    // exact regression class a wrong epoch at the mint site would ship.
+    // disagrees with the event's treekem_epoch must refuse on a fresh peer
+    // (state byte-identical). Swapped in after the seal, it is not the
+    // mandate the add's binding names (survivor re-key A3 review I-1), so
+    // the binding refuses it before the mandate check reads it.
     let peer2_dir = tempfile::tempdir()?;
     let peer2_agent = Arc::new(
         Agent::builder()
@@ -2256,12 +2316,81 @@ async fn treekem_direct_add_mints_epoch_bound_mandate_peer_applies() -> Result<(
             .await;
     assert!(
         !result.accepted,
-        "declared_epoch != treekem_epoch must refuse as owner_mandate_invalid"
+        "a mandate the binding does not name must refuse"
     );
     let after = serde_json::to_string(&live_record(peer2.as_ref(), &group_id).await)?;
     assert_eq!(before, after, "refusal leaves the record byte-identical");
     let row = diag_row(peer2.as_ref(), &group_id).await;
-    assert_eq!(row.counters.owner_mandate_invalid, 1);
+    assert_eq!(
+        row.counters.owner_mandate_invalid, 0,
+        "refused at the binding, before the mandate is read"
+    );
+    Ok(())
+}
+
+/// Survivor re-key A3 review I-1: an owner-certified add's binding names
+/// its owner mandate. A deliverer that strips the mandate no longer gets a
+/// receiver to warn-accept the add as one with no mandate, and the full
+/// copy from the author still applies and records the capability.
+#[tokio::test]
+async fn a_copy_of_an_add_without_its_owner_mandate_is_refused() -> Result<()> {
+    let add = treekem_owner_certified_direct_add().await?;
+    let author = add.authority.agent.agent_id();
+    let deliverer = AgentKeypair::generate()?.agent_id();
+    let actor = match &add.published {
+        NamedGroupMetadataEvent::MemberAdded {
+            actor,
+            owner_mandate: Some(_),
+            ..
+        } => actor.clone(),
+        _ => panic!("an owner-certified add carries its mandate"),
+    };
+    let mut stripped = add.published.clone();
+    if let NamedGroupMetadataEvent::MemberAdded { owner_mandate, .. } = &mut stripped {
+        *owner_mandate = None;
+    }
+
+    // Any member's copy with the mandate names its bytes; without it, it
+    // does not, whoever delivers it and whatever the transport.
+    let admit = super::super::signer_delivery::admit;
+    assert!(admit(add.published.clone(), &deliverer, true).is_some());
+    assert!(admit(add.published.clone(), &author, true).is_some());
+    assert!(admit(stripped.clone(), &deliverer, true).is_none());
+    assert!(admit(stripped.clone(), &deliverer, false).is_none());
+
+    // The stripped copy reaches the receiver first. It applies nothing,
+    // even as the author's own (the binding names the mandate), so it
+    // cannot leave the authority in the permissive tier.
+    let (peer, _peer_dir) = peer_with(&add.base_before, &add.group_id).await?;
+    let before = serde_json::to_string(&live_record(peer.as_ref(), &add.group_id).await)?;
+    let refused =
+        apply_named_group_metadata_event_inner(&peer, stripped, author, true, false, None).await;
+    assert!(!refused.accepted, "the stripped copy is refused");
+    let after = serde_json::to_string(&live_record(peer.as_ref(), &add.group_id).await)?;
+    assert_eq!(before, after, "and changes nothing");
+    let row = diag_row(peer.as_ref(), &add.group_id).await;
+    assert_eq!(row.counters.owner_mandate_absent, 0, "never warn-accepted");
+
+    let applied = apply_named_group_metadata_event_inner(
+        &peer,
+        add.published.clone(),
+        author,
+        true,
+        false,
+        None,
+    )
+    .await;
+    assert!(
+        applied.accepted,
+        "the author's full copy applies: {applied:?}"
+    );
+    let live = live_record(peer.as_ref(), &add.group_id).await;
+    assert!(
+        live.mandate_capability
+            .get(&actor)
+            .is_some_and(|capability| capability.first_seen_ms > 0),
+        "and records the authority as Capable"
+    );
     Ok(())
 }
 

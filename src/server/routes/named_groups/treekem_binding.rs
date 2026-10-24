@@ -121,17 +121,28 @@ pub(super) fn empty_extras_digest() -> Option<String> {
         .map(|bytes| digest_hex(&bytes))
 }
 
-/// An add's extras (F-2): the display name, the KeyPackage hash and the
-/// Welcome. `JoinRequestApproved` carries no display name.
+/// An add's extras (F-2): the display name, the KeyPackage hash, the
+/// Welcome, and the owner mandate when the add carries one (A3 review I-1).
+/// So a deliverer cannot strip the mandate from an owner-certified add, and
+/// the receiver never warn-accepts it as absent. An add with no mandate
+/// keeps A1's digest. `JoinRequestApproved` carries no display name and no
+/// mandate.
 pub(super) fn add_extras_digest(
     display_name: Option<&str>,
     key_package_hash: Option<&str>,
     welcome: Option<&WelcomeContent>,
+    owner_mandate: Option<&crate::groups::OwnerMandate>,
 ) -> Option<String> {
     let welcome = welcome.map(|welcome| (welcome.id.as_str(), welcome.byte_len));
-    postcard::to_stdvec(&(display_name, key_package_hash, welcome))
-        .ok()
-        .map(|bytes| digest_hex(&bytes))
+    let bytes = match owner_mandate {
+        None => postcard::to_stdvec(&(display_name, key_package_hash, welcome)).ok()?,
+        Some(mandate) => {
+            let mandate = digest_hex(&postcard::to_stdvec(mandate).ok()?);
+            postcard::to_stdvec(&(display_name, key_package_hash, welcome, mandate.as_str()))
+                .ok()?
+        }
+    };
+    Some(digest_hex(&bytes))
 }
 
 /// The binding a seal writes: upstream's [`treekem_commit_binding`], which
@@ -268,11 +279,13 @@ mod tests {
     #[test]
     fn an_add_binding_names_its_extras() {
         let welcome = WelcomeContent::of_bytes(b"welcome");
-        let extras = add_extras_digest(Some("Mom"), Some("kp"), Some(&welcome)).expect("extras");
+        let extras =
+            add_extras_digest(Some("Mom"), Some("kp"), Some(&welcome), None).expect("extras");
         let sealed = treekem_bytes_binding(5, b"commit", &extras);
         let parsed = parse_treekem_binding(&sealed).expect("parses");
         assert!(add_binding_names_bytes(&parsed, 5, b"commit", &extras));
-        let renamed = add_extras_digest(Some("Mallory"), Some("kp"), Some(&welcome)).expect("x");
+        let renamed =
+            add_extras_digest(Some("Mallory"), Some("kp"), Some(&welcome), None).expect("x");
         assert!(!add_binding_names_bytes(&parsed, 5, b"commit", &renamed));
         let upstream = format!("treekem:epoch=5:commit={}", digest_hex(b"commit"));
         let parsed = parse_treekem_binding(&upstream).expect("parses");

@@ -30,7 +30,7 @@ An add with a recovery record keeps its suffix after that: `...:extras=<d>;membe
 
 | Event | Extras tuple |
 |---|---|
-| `MemberAdded` (direct add, invite add, re-key add) | `(display_name, treekem_key_package_hash, welcome)` |
+| `MemberAdded` (direct add, invite add, re-key add) | `(display_name, treekem_key_package_hash, welcome)`, or, when the add carries an owner mandate, `(display_name, treekem_key_package_hash, welcome, blake3 of the postcard of the mandate)` (A3 review I-1) |
 | `JoinRequestApproved` | `(None, treekem_key_package_hash, welcome)`: the event has no display name |
 | `MemberRemoved` (admin removal, post-leave rekey, OwnerCertified eviction, re-key removal) | `()` |
 | `MemberBanned` | `()` |
@@ -75,7 +75,7 @@ At every site: take a rollback snapshot, mutate the tree, set the binding from t
 | direct add | `add_treekem_named_group_member` |
 | join approval | `approve_treekem_join_request` |
 
-The owner mandate is still minted immediately before the seal. It signs the previous head, the roster, the policy, the metadata and the declared epoch, not the binding, so binding first changes nothing it covers.
+The owner mandate is minted before the binding is written, so the binding can name it (A3 review I-1). It signs the previous head, the roster, the policy, the metadata and the declared epoch, not the binding, so minting it first changes nothing it covers.
 
 The creator's recovery binding at group creation (`treekem:epoch=<n>;member-recovery=<hash>`) is unchanged: it has no TreeKEM commit and no event that carries one.
 

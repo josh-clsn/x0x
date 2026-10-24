@@ -8178,8 +8178,9 @@ fn treekem_removal_binding_covers_commit(
 }
 
 /// An add's binding: it names the add's TreeKEM commit and its extras (the
-/// display name, KeyPackage hash and Welcome the event carries), then keeps
-/// the recovery record's suffix.
+/// display name, KeyPackage hash, Welcome and owner mandate the event
+/// carries), then keeps the recovery record's suffix. The mandate is minted
+/// first, so the seal can name it.
 fn treekem_add_security_binding(
     epoch: u64,
     commit: &[u8],
@@ -8187,12 +8188,14 @@ fn treekem_add_security_binding(
     key_package_hash: Option<&str>,
     welcome: &[u8],
     recovery: &NamedGroupMetadataEvent,
+    owner_mandate: Option<&x0x::groups::OwnerMandate>,
 ) -> Option<String> {
     let hash = member_joined_recovery_record_hash(recovery)?;
     let extras = add_extras_digest(
         display_name,
         key_package_hash,
         Some(&WelcomeContent::of_bytes(welcome)),
+        owner_mandate,
     )?;
     Some(format!(
         "{};{MEMBER_JOINED_RECOVERY_BINDING_PREFIX}{hash}",
@@ -8215,6 +8218,7 @@ fn treekem_add_binding_admits(
     key_package_hash: Option<&str>,
     welcome_b64: Option<&str>,
     welcome_ref: Option<&WelcomeRef>,
+    owner_mandate: Option<&x0x::groups::OwnerMandate>,
 ) -> bool {
     let Some(binding) = signed.security_binding.as_deref() else {
         return true;
@@ -8234,8 +8238,13 @@ fn treekem_add_binding_admits(
     let Ok(welcome) = WelcomeContent::of_event(welcome_b64, welcome_ref) else {
         return false;
     };
-    add_extras_digest(display_name, key_package_hash, welcome.as_ref())
-        .is_some_and(|extras| add_binding_names_bytes(&parsed, epoch, &commit_bytes, &extras))
+    add_extras_digest(
+        display_name,
+        key_package_hash,
+        welcome.as_ref(),
+        owner_mandate,
+    )
+    .is_some_and(|extras| add_binding_names_bytes(&parsed, epoch, &commit_bytes, &extras))
 }
 
 fn canonical_member_joined_recovery_bytes(
@@ -12891,6 +12900,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     treekem_key_package_hash.as_deref(),
                     welcome_b64.as_deref(),
                     welcome_ref.as_ref(),
+                    owner_mandate.as_ref(),
                 ) {
                     tracing::warn!(
                         group_id = %LogHexId::group(&resolved_group_key),
@@ -14639,6 +14649,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     Some(package_hash.as_str()),
                     welcome_b64.as_deref(),
                     welcome_ref.as_ref(),
+                    None,
                 ) {
                     tracing::warn!(
                         group_id = %LogHexId::group(&resolved_group_key),
@@ -15736,31 +15747,11 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     .members_v2
                     .get(&member_agent_id)
                     .and_then(|member| member.treekem_key_package_hash.clone());
-                let add_binding = treekem_add_security_binding(
-                    expected2,
-                    &out.commit,
-                    display_name.as_deref(),
-                    rekey_package_hash.as_deref(),
-                    &out.welcome,
-                    &rekey_recovery,
-                );
-                if guard.epoch() != expected2 || add_binding.is_none() {
-                    rollback_treekem_group_after_failed_install(
-                        state,
-                        &resolved_group_key,
-                        &info,
-                        &rollback_snapshot,
-                        &mut guard,
-                        "member_rekey_add",
-                    );
-                    return ApplyMetadataResult::REJECTED;
-                }
-                next.security_binding = add_binding;
                 // ADR-0064 §1a: mint the owner mandate at the ADD's
                 // PRE-MUTATION point — `next` already holds the re-admitted
                 // seat, `expected2` is the TreeKEM epoch the terminal
                 // `MemberAdded` carries, and nothing is sealed or persisted
-                // yet. An owner-axis group whose re-key event carries no
+                // yet; the add's binding names it (A3 review I-1). An owner-axis group whose re-key event carries no
                 // mandate is refused by every enforcing member, and the
                 // refusal is silent to the returning member: it never gets
                 // its seat back.
@@ -15775,6 +15766,27 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     now_ms,
                 )
                 .await;
+                let add_binding = treekem_add_security_binding(
+                    expected2,
+                    &out.commit,
+                    display_name.as_deref(),
+                    rekey_package_hash.as_deref(),
+                    &out.welcome,
+                    &rekey_recovery,
+                    rekey_owner_mandate.as_ref(),
+                );
+                if guard.epoch() != expected2 || add_binding.is_none() {
+                    rollback_treekem_group_after_failed_install(
+                        state,
+                        &resolved_group_key,
+                        &info,
+                        &rollback_snapshot,
+                        &mut guard,
+                        "member_rekey_add",
+                    );
+                    return ApplyMetadataResult::REJECTED;
+                }
+                next.security_binding = add_binding;
                 let commit2 =
                     match seal_commit_owner_certified(state, &mut next, signing_kp, now_ms).await {
                         Ok(c) => c,
@@ -16312,6 +16324,22 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     .members_v2
                     .get(&member_agent_id)
                     .and_then(|member| member.treekem_key_package_hash.clone());
+                // ADR-0064 slice 2: mint the owner mandate at the
+                // pre-mutation point — `next` holds the seat-write and
+                // the epoch is the TreeKEM epoch the terminal will
+                // carry; still nothing is sealed, mutated or persisted.
+                // The add's binding names it (A3 review I-1).
+                owner_mandate = mint_owner_mandate_for_seat(
+                    state,
+                    &next,
+                    expected_epoch,
+                    &member_agent_id,
+                    &inviter_agent_id,
+                    &invite_secret,
+                    owner_certified_admission.as_ref(),
+                    now_ms,
+                )
+                .await;
                 let binding = treekem_add_security_binding(
                     expected_epoch,
                     &out.commit,
@@ -16319,6 +16347,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     package_hash.as_deref(),
                     &out.welcome,
                     recovery,
+                    owner_mandate.as_ref(),
                 );
                 if guard.epoch() != expected_epoch || binding.is_none() {
                     rollback_treekem_group_after_failed_install(
@@ -16332,21 +16361,6 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     return ApplyMetadataResult::REJECTED;
                 }
                 next.security_binding = binding;
-                // ADR-0064 slice 2: mint the owner mandate at the
-                // pre-mutation point — `next` holds the seat-write and
-                // the epoch is the TreeKEM epoch the terminal will
-                // carry; still nothing is sealed, mutated or persisted.
-                owner_mandate = mint_owner_mandate_for_seat(
-                    state,
-                    &next,
-                    expected_epoch,
-                    &member_agent_id,
-                    &inviter_agent_id,
-                    &invite_secret,
-                    owner_certified_admission.as_ref(),
-                    now_ms,
-                )
-                .await;
                 let commit =
                     match seal_commit_owner_certified(state, &mut next, signing_kp, now_ms).await {
                         Ok(commit) => commit,
@@ -22583,6 +22597,20 @@ async fn add_treekem_named_group_member(
         .members_v2
         .get(&agent_hex)
         .and_then(|member| member.treekem_key_package_hash.clone());
+    // ADR-0064 slice 3 (round-2 advisory A1): the TreeKEM sibling of the
+    // GSS direct-add mint — declared epoch is the epoch this add's TreeKEM
+    // commit will carry. The add's binding names it (A3 review I-1).
+    let owner_mandate = mint_owner_mandate_for_seat(
+        state.as_ref(),
+        &next,
+        treekem_epoch,
+        &agent_hex,
+        &actor_hex,
+        "",
+        owner_certified_admission.as_ref(),
+        now_ms,
+    )
+    .await;
     let binding = treekem_add_security_binding(
         treekem_epoch,
         &out.commit,
@@ -22590,6 +22618,7 @@ async fn add_treekem_named_group_member(
         package_hash.as_deref(),
         &out.welcome,
         &direct_recovery_original,
+        owner_mandate.as_ref(),
     );
     if guard.epoch() != treekem_epoch || binding.is_none() {
         rollback_treekem_group_after_failed_install(
@@ -22608,20 +22637,6 @@ async fn add_treekem_named_group_member(
         );
     }
     next.security_binding = binding;
-    // ADR-0064 slice 3 (round-2 advisory A1): the TreeKEM sibling of the
-    // GSS direct-add mint — declared epoch is the epoch this add's TreeKEM
-    // commit will carry.
-    let owner_mandate = mint_owner_mandate_for_seat(
-        state.as_ref(),
-        &next,
-        treekem_epoch,
-        &agent_hex,
-        &actor_hex,
-        "",
-        owner_certified_admission.as_ref(),
-        now_ms,
-    )
-    .await;
     let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await {
         Ok(c) => c,
         Err(e) => {
@@ -29265,6 +29280,7 @@ async fn approve_treekem_join_request(
         package_hash.as_deref(),
         &out.welcome,
         &approval_recovery_original,
+        None,
     );
     if guard.epoch() != treekem_epoch || binding.is_none() {
         rollback_treekem_group_after_failed_install(

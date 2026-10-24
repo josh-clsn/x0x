@@ -1330,6 +1330,7 @@ fn a_malformed_treekem_add_binding_is_refused() {
                 None,
                 None,
                 None,
+                None,
                 None
             ),
             "{malformed}"
@@ -1339,6 +1340,7 @@ fn a_malformed_treekem_add_binding_is_refused() {
         &with_binding("gss:epoch=5"),
         5,
         &commit_b64,
+        None,
         None,
         None,
         None,

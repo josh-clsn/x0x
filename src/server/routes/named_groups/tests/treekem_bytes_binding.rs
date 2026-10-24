@@ -22,12 +22,22 @@ fn empty_extras() -> String {
     digest(&postcard::to_stdvec(&()).expect("postcard"))
 }
 
+/// An add's extras. An add that carries an owner mandate also names the
+/// mandate's digest (A3 review I-1).
 fn add_extras(
     display_name: Option<&str>,
     key_package_hash: Option<&str>,
     welcome: Option<(&str, u64)>,
+    owner_mandate: Option<&x0x::groups::OwnerMandate>,
 ) -> String {
-    digest(&postcard::to_stdvec(&(display_name, key_package_hash, welcome)).expect("postcard"))
+    let bytes = match owner_mandate {
+        None => postcard::to_stdvec(&(display_name, key_package_hash, welcome)),
+        Some(mandate) => {
+            let mandate = digest(&postcard::to_stdvec(mandate).expect("postcard"));
+            postcard::to_stdvec(&(display_name, key_package_hash, welcome, mandate.as_str()))
+        }
+    };
+    digest(&bytes.expect("postcard"))
 }
 
 fn bytes_binding(epoch: u64, commit: &[u8], extras: &str) -> String {
@@ -92,17 +102,19 @@ fn welcome_identity(
 /// The binding an add must seal, before its recovery suffix.
 pub(super) fn expected_add_binding(event: &NamedGroupMetadataEvent) -> String {
     let (epoch, commit) = treekem_payload(event);
-    let (display_name, key_package_hash, welcome) = match event {
+    let (display_name, key_package_hash, welcome, owner_mandate) = match event {
         NamedGroupMetadataEvent::MemberAdded {
             display_name,
             treekem_key_package_hash,
             treekem_welcome_b64,
             welcome_ref,
+            owner_mandate,
             ..
         } => (
             display_name.clone(),
             treekem_key_package_hash.clone(),
             welcome_identity(treekem_welcome_b64.as_ref(), welcome_ref.as_ref()),
+            owner_mandate.as_ref(),
         ),
         NamedGroupMetadataEvent::JoinRequestApproved {
             treekem_key_package_hash,
@@ -113,6 +125,7 @@ pub(super) fn expected_add_binding(event: &NamedGroupMetadataEvent) -> String {
             None,
             treekem_key_package_hash.clone(),
             welcome_identity(treekem_welcome_b64.as_ref(), welcome_ref.as_ref()),
+            None,
         ),
         other => panic!("not an add: {other:?}"),
     };
@@ -120,6 +133,7 @@ pub(super) fn expected_add_binding(event: &NamedGroupMetadataEvent) -> String {
         display_name.as_deref(),
         key_package_hash.as_deref(),
         welcome.as_ref().map(|(id, len)| (id.as_str(), *len)),
+        owner_mandate,
     );
     bytes_binding(epoch, &commit, &extras)
 }

@@ -144,15 +144,19 @@ fn non_author_copy_names_its_bytes(event: &NamedGroupMetadataEvent) -> bool {
             treekem_key_package_hash,
             treekem_welcome_b64,
             welcome_ref,
+            owner_mandate,
             ..
         } => add_names_its_bytes(
             binding,
             treekem_commit_b64.as_deref(),
             *treekem_epoch,
-            display_name.as_deref(),
-            treekem_key_package_hash.as_deref(),
-            treekem_welcome_b64.as_deref(),
-            welcome_ref.as_ref(),
+            AddExtras {
+                display_name: display_name.as_deref(),
+                key_package_hash: treekem_key_package_hash.as_deref(),
+                welcome_b64: treekem_welcome_b64.as_deref(),
+                welcome_ref: welcome_ref.as_ref(),
+                owner_mandate: owner_mandate.as_ref(),
+            },
         ),
         NamedGroupMetadataEvent::JoinRequestApproved {
             treekem_commit_b64,
@@ -165,23 +169,32 @@ fn non_author_copy_names_its_bytes(event: &NamedGroupMetadataEvent) -> bool {
             binding,
             treekem_commit_b64.as_deref(),
             *treekem_epoch,
-            None,
-            treekem_key_package_hash.as_deref(),
-            treekem_welcome_b64.as_deref(),
-            welcome_ref.as_ref(),
+            AddExtras {
+                display_name: None,
+                key_package_hash: treekem_key_package_hash.as_deref(),
+                welcome_b64: treekem_welcome_b64.as_deref(),
+                welcome_ref: welcome_ref.as_ref(),
+                owner_mandate: None,
+            },
         ),
         _ => true,
     }
+}
+
+/// The fields an add's extras digest covers, as this copy carries them.
+struct AddExtras<'a> {
+    display_name: Option<&'a str>,
+    key_package_hash: Option<&'a str>,
+    welcome_b64: Option<&'a str>,
+    welcome_ref: Option<&'a super::WelcomeRef>,
+    owner_mandate: Option<&'a crate::groups::OwnerMandate>,
 }
 
 fn add_names_its_bytes(
     binding: Option<super::treekem_binding::TreeKemBinding<'_>>,
     commit_b64: Option<&str>,
     epoch: Option<u64>,
-    display_name: Option<&str>,
-    key_package_hash: Option<&str>,
-    welcome_b64: Option<&str>,
-    welcome_ref: Option<&super::WelcomeRef>,
+    extras: AddExtras<'_>,
 ) -> bool {
     let (commit_b64, epoch) = match (commit_b64, epoch) {
         (None, None) => return true,
@@ -194,11 +207,16 @@ fn add_names_its_bytes(
     let Ok(bytes) = BASE64.decode(commit_b64) else {
         return false;
     };
-    let Ok(welcome) = WelcomeContent::of_event(welcome_b64, welcome_ref) else {
+    let Ok(welcome) = WelcomeContent::of_event(extras.welcome_b64, extras.welcome_ref) else {
         return false;
     };
-    add_extras_digest(display_name, key_package_hash, welcome.as_ref())
-        .is_some_and(|extras| add_binding_names_bytes(&binding, epoch, &bytes, &extras))
+    add_extras_digest(
+        extras.display_name,
+        extras.key_package_hash,
+        welcome.as_ref(),
+        extras.owner_mandate,
+    )
+    .is_some_and(|digest| add_binding_names_bytes(&binding, epoch, &bytes, &digest))
 }
 
 /// A copy its author did not deliver keeps only what its signer bound. An

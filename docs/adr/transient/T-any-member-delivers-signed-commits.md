@@ -63,7 +63,7 @@ The signed roster commit covers its group id and revision, the previous state ha
 | | `actor` (`added_by`) | Must be the verified signer. |
 | | `revision` | Capped. |
 | | `certificate_b64` | Covered: its digest is in the roster root, and bytes that contradict it are not installed. |
-| | `owner_mandate` | Signed by the owner and verified. A deliverer can only withhold it, which is the same as withholding the event (the arm warn-accepts for an authority never seen with a mandate, else refuses, retryable). |
+| | `owner_mandate` | TreeKEM plane: its digest is in the extras (A3 review I-1), so a copy without the mandate it was sealed with is refused, from any deliverer and from the author alike. The receiver never warn-accepts it as absent, and the author's full copy still applies and records the capability. Shared-secret plane: no binding slot, so a deliverer can strip it and the arm warn-accepts an authority not yet seen with a mandate (known limit; Noetic rooms are TreeKEM). |
 | | `member_joined_recovery`, `member_recovery_history` | Each entry carries the authority's attestation and is verified (`verify_authority_attested_member_joined_recovery`). A deliverer can only drop entries. |
 | | `roster_certificates_b64` | Each entry is installed only when it hashes to a committed seat digest and verifies under the group owner. |
 | `MemberRemoved` | `actor` (`removed_by`) | Must be the verified signer. |
@@ -86,9 +86,10 @@ The signed roster commit covers its group id and revision, the previous state ha
 - A member who was away gets a removal, ban, add, rename, policy, role or unban change from any member that holds it. A4 (`T-catchup-log-on-disk`) keeps every commit-bearing kind in the catch-up log, on disk, so a member can serve the non-TreeKEM ones too.
 - The engine-A doors no longer apply a legacy-bound TreeKEM event or a join-request lifecycle event. A device on the old pin that relays its legacy events through the relay log is stranded by them; this joins the A1 flag day (every device moves at the pin flip, B1).
 - On the engine-A doors, a shared-secret-plane add applies without its display name and KeyPackage hash. TreeKEM groups, which are what Noetic uses, are unaffected.
-- The A0 shortcut (`transport_sender == author`) is gone. On a verified transport, the author still delivers its own legacy-bound events.
+- The A0 shortcut (`transport_sender == author`) is kept, but only for a verified transport (`signer_delivery.rs`, `catchup_apply_sender`). On it, the author still delivers its own legacy-bound events. A claimed sender gets nothing from it.
 
 ## Validation
 
 - `named_groups/signer_delivery.rs` unit tests: the signer from any member, a forged actor, a tampered commit, TreeKEM bytes from a non-author, the lifecycle kinds, field dropping.
 - `named_groups/tests/signer_delivery.rs`: `a_survivor_delivers_a_ban`, `a_survivor_delivers_an_add`, `a_survivor_delivers_a_rename_policy_role_and_unban`, `a_legacy_bound_add_from_a_non_author_is_refused`, `a_forged_actor_field_authorises_nothing`, `join_request_lifecycle_stays_author_only`, `a_non_author_copy_applies_no_unbound_field`, the four engine-A door tests, `a_removal_whose_commit_keeps_the_target_is_refused`, and the two A2 m-4 route tests.
+- `named_groups/tests/owner_mandate.rs`: `a_copy_of_an_add_without_its_owner_mandate_is_refused` (review I-1).
