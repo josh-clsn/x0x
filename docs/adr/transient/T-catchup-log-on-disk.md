@@ -31,12 +31,13 @@ Each is logged where it is applied (the apply arm, after the durable persist) an
 - The group key is the event's `group_id`, as the in-memory map uses it. Every path component is a hex digest, a zero-padded number or a fixed kind name (`named_group_metadata_event_kind`). Nothing a peer sends becomes part of a path.
 - The digest in the name separates two events that share a revision, an epoch and a kind. In memory one commit is logged once: the dedup key is the kind, the revision, the epoch, the signer and the commit's state hash.
 - A room's `evicted-through` file holds the highest revision it lost (below).
-- An event over 512 KiB (`EVENT_DISK_LIMIT_BYTES`) is kept in memory only. In its place an empty `<revision:020>-<epoch:020>-<kind>-<digest>.memory-only` marker is written, so that after a restart the room records the revision as lost. Typical sizes: a Welcome-bearing add is 40-52 KiB; one carrying a full 32-certificate roster sidecar is about 360 KiB.
+- An event over 512 KiB (`EVENT_LIMIT_BYTES`) is not kept at all, in memory or on disk, and its revision is recorded as lost at once (A4 re-review I-4: holding it in memory let one admin grow a phone's memory by up to about 1 GiB per room). Typical sizes: a Welcome-bearing add is 40-52 KiB; one carrying a full 32-certificate roster sidecar is about 360 KiB. So a room holds at most 128 × 512 KiB = 64 MiB, in memory and on disk.
 
 ### Writes
 
 - The file is written to `.<name>.<pid>.tmp` created at mode 0600, synced, renamed into place, and then the directory is synced. A newly created room directory (mode 0700) is also synced into `event-log/`. Directory syncs use `sync_dir_contents`, a no-op off unix, so Windows does not report every append as failed.
-- A failed write logs and keeps the event in memory, so it still serves until the next restart.
+- A failed event write logs, does not keep the event, and records its revision as lost, so this member's pages agree with what a restart would hold.
+- A failed write of the `evicted-through` record logs and holds in memory, so pages say so at once. An eviction whose record did not reach disk leaves the event's file in place, so a restart serves the event again rather than skip it unannounced.
 - File work runs on the blocking pool, and inline under the W3-H shim (#1245), like `storage`'s file layer.
 
 ### Locking
@@ -52,9 +53,9 @@ So an append that races a wipe either is removed by it or finds the room gone. I
 
 ### Caps
 
-- **Per room: 128 events.** Past it, the lowest revision goes. With the per-event limit, a room puts at most 64 MiB on disk.
+- **Per room: 128 events.** Past it, the lowest revision goes. With the per-event limit, a room holds at most 64 MiB.
 - **Daemon-wide: 256 MiB on disk.** Past it, the room with the most bytes on disk gives up its lowest revision (between equal rooms, the one whose oldest event is older), and each eviction is logged at warn. So a busy or hostile room cannot push out a quieter room's history: it is evicted first (A4 review I-2). Bounds before this change: 128 events per room in memory, with no total.
-- **The gap.** Each eviction, and each memory-only event lost to a restart, raises the room's `evicted-through`. The new value is written down before the event's file is removed, so a crash in between never leaves a hole unrecorded. A request whose `from_revision` is below it would get a page with a hole, which the requester can never link. It gets no events, and the new additive response field `log_evicted_through` says why. Old peers ignore the field. A requester at or past it is served as before.
+- **The gap.** Each eviction, each event too large to keep, and each event whose write failed raises the room's `evicted-through`. The new value is written down before the event's file is removed, so a crash in between never leaves a hole unrecorded. A request whose `from_revision` is below it would get a page with a hole, which the requester can never link. It gets no events, and the new additive response field `log_evicted_through` says why. Old peers ignore the field. A requester at or past it is served as before.
 
 ### Startup
 
@@ -62,7 +63,6 @@ So an append that races a wipe either is removed by it or finds the room gone. I
 
 - The directory of an unknown, withdrawn, banned or inactive room is removed.
 - A file whose bytes do not parse as an event whose own name, group and room directory match is skipped, logged and removed, so it is logged once. A leftover temp file is removed. An entry that cannot be read at all is skipped and logged; the rest still loads.
-- Memory-only markers raise `evicted-through` to their revision, which is written down, and are then removed.
 - An `evicted-through` file that does not read back fails safe: every revision below the oldest one still held counts as lost.
 - It keeps the rooms the append check accepts in which the local agent has a row. A Removed row is kept: it is a returning device between its re-key removal and its add, and dropping its log there would leave the add it logs next with nothing before it, a hole. Every other departure drops the row (and wipes), and a banned row is refused. A room the local agent has no row in (inactive) is removed.
 - Append order is not on disk, so the files' modification times stand in for it. The caps are enforced again.
@@ -79,12 +79,16 @@ For the D5 offer, present it as a stopgap for L1 until S5, not as the design. An
 - **a versioned on-disk format** (ADR 0085, `0088:125`). Today a file a newer daemon wrote with an unknown event variant does not parse on an older one, which removes it, so a downgrade empties the log. A `event-log/v1/` directory would fix both;
 - **an answer to the overlap with `commit_log`**, the signed commits members already persist in `named_groups.json`, which S5 plans to serve from (`0111:48`). This log repeats the events around those commits.
 
+### Not done: pages that link to the requester's head (for A5)
+
+A served page could also be checked against the requester's head: serve it only when its first event's commit links to `current_state_hash` at `from_revision + 1`. That would catch a hole from any cause, not only the ones recorded in `evicted-through`. It is left for A5 for two reasons. The page filter also serves events at or below `from_revision` whose TreeKEM epoch is ahead of the requester's, which sort first and do not link. And the receiver's pending queue (#492) holds a gapped event until its predecessor arrives from another member, so a gapped page is not useless today. A5 reworks the response path for unverified transports, and is the place to decide both.
+
 ## Consequences
 
 - A survivor that restarted can still bring a member who missed a removal, a rename or any other commit up to date.
 - `handle_treekem_catchup_request` filters on the signed commit revision. Before, it compared the event's unsigned roster revision with the requester's state revision, which are different clocks.
 - Disk use grows by up to 256 MiB in total, and at most 64 MiB per room.
-- Memory use is unchanged in shape: up to 128 events per room, as before. An event over the per-event limit stays in memory, as every event did before.
+- Memory use is bounded: up to 128 events of at most 512 KiB per room. Before this change the in-memory log had no per-event bound.
 - File I/O runs under the log's write lock: one file sync and one directory sync per logged commit, two more per eviction. That briefly holds catch-up serves and, where an apply arm logs, the membership lock.
 - A stripped copy that lands first is the copy that is logged and served after restarts (the dedup key does not cover the payload). Since A1 and I-1 that matters only on the shared-secret plane, where a non-author add arrives without its display name, KeyPackage hash or owner mandate.
 - The new response field is additive. Nothing on the requester acts on it yet beyond a log line. A later task can use it to ask another member.
@@ -95,10 +99,11 @@ For the D5 offer, present it as a stopgap for L1 until S5, not as the design. An
 - `per_room_and_daemon_wide_caps_hold`
 - `two_events_sharing_revision_epoch_and_kind_both_persist`
 - `files_are_0600_and_a_torn_write_is_skipped`
-- `event_log_load_drops_unknown_withdrawn_banned_and_inactive_groups`
+- `event_log_load_drops_unknown_withdrawn_banned_and_no_local_row_groups`
 - `every_kind_with_a_commit_has_a_frontier`
 - `a_flooding_room_cannot_evict_another_rooms_events`
-- `an_event_over_the_limit_stays_in_memory_and_a_restart_records_its_loss`
+- `a_flood_of_oversized_events_keeps_nothing_and_records_the_loss`
+- `a_failed_record_of_a_loss_holds_in_memory_and_keeps_the_file`
 - `an_unreadable_record_of_losses_fails_safe`
 - `appends_need_the_room_present_unwithdrawn_and_not_banned`
 
