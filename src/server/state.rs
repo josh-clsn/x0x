@@ -1210,6 +1210,12 @@ pub(super) struct AppState {
     /// task runs; each later observation updates the entry.
     pub(super) treekem_epoch_ahead_targets:
         Mutex<HashMap<String, crate::server::routes::named_groups::EpochAheadTarget>>,
+    /// Survivor re-key A2/A3: per group key, the TreeKEM epoch a refusal for
+    /// a missing KeyPackage last pulled again for. A later refusal at that
+    /// epoch waits for the package rather than pulling again; the package's
+    /// arrival pulls once more.
+    pub(super) treekem_package_repulls:
+        StdMutex<crate::server::routes::named_groups::PackageRepulls>,
     /// Per-group serialization for authoritative membership mutations. The
     /// owner-side `MemberJoined`→`MemberAdded` add (and every other membership
     /// apply) is a read-modify-write that loads `info`, mutates a clone, mutates

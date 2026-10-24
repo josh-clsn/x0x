@@ -618,16 +618,16 @@ async fn catchup_third_party_relays_a_digest_bound_rekey() -> Result<()> {
 
 /// The owner, one survivor that saw the removal (S2) and one that did not
 /// (S1). Every daemon's tree uses its own agent seed.
-struct SurvivorRelay {
-    fixture: LeaveFixture,
-    s2: Arc<AppState>,
+pub(super) struct SurvivorRelay {
+    pub(super) fixture: LeaveFixture,
+    pub(super) s2: Arc<AppState>,
     _s2_dir: tempfile::TempDir,
-    s1: Arc<AppState>,
+    pub(super) s1: Arc<AppState>,
     _s1_dir: tempfile::TempDir,
 }
 
 impl SurvivorRelay {
-    async fn shutdown(self) {
+    pub(super) async fn shutdown(self) {
         for state in [&self.s1, &self.s2, &self.fixture.state] {
             state.shutdown_notify.send_replace(true);
             state.agent.shutdown().await;
@@ -635,7 +635,7 @@ impl SurvivorRelay {
     }
 }
 
-async fn survivor_relay_fixture() -> Result<SurvivorRelay> {
+pub(super) async fn survivor_relay_fixture() -> Result<SurvivorRelay> {
     let mut fixture = two_member_treekem_group().await?;
     let (s2, s2_dir) = secure_endpoint_test_state().await?;
     let (s1, s1_dir) = secure_endpoint_test_state().await?;
@@ -701,7 +701,11 @@ async fn survivor_relay_fixture() -> Result<SurvivorRelay> {
     })
 }
 
-async fn roster_head(state: &AppState, group_id: &str, member_hex: &str) -> (u64, String, bool) {
+pub(super) async fn roster_head(
+    state: &AppState,
+    group_id: &str,
+    member_hex: &str,
+) -> (u64, String, bool) {
     let groups = state.named_groups.read().await;
     let info = groups.get(group_id).expect("group");
     (

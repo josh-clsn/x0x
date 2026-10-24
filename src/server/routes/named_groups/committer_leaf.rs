@@ -17,7 +17,7 @@ use crate::logging::LogHexId;
 use axum::http::StatusCode;
 use axum::Json;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 /// Why a commit was not tied to its actor's leaf. Every case refuses.
@@ -50,10 +50,11 @@ impl CommitterLeafRefusal {
     }
 }
 
-/// The actor's KeyPackage bytes, checked against the hash `info` commits
-/// to: the roster's copy, else this member's cached recovery record for the
-/// actor under any of the group's ids.
-pub(super) async fn actor_committed_key_package(
+/// A member's KeyPackage bytes, checked against the hash `info` commits
+/// to: the roster's copy, else this member's cached recovery record for it
+/// under any of the group's ids. Used for a commit's actor and for the
+/// member a removal or ban takes out.
+pub(super) async fn member_committed_key_package(
     state: &AppState,
     group_ids: &[&str],
     info: &x0x::groups::GroupInfo,
@@ -100,9 +101,20 @@ async fn cached_package_matching(
     None
 }
 
+/// How many members the startup sweep asks for each package: the member's
+/// adder first when it is active, then the others in roster order. Any one
+/// holder is enough, and a refused commit still asks every member.
+pub(in crate::server) const KEY_PACKAGE_SWEEP_CANDIDATES: usize = 4;
+
 /// Ask peers for the packages of `members`, which this member holds by
 /// hash alone. The #398 lane serves them and checks each against the hash.
-pub(super) fn request_key_packages(state: &Arc<AppState>, group_id: &str, members: Vec<String>) {
+/// Each request goes to at most `max_candidates` active members.
+pub(super) fn request_key_packages(
+    state: &Arc<AppState>,
+    group_id: &str,
+    members: Vec<String>,
+    max_candidates: usize,
+) {
     if members.is_empty() {
         return;
     }
@@ -110,7 +122,7 @@ pub(super) fn request_key_packages(state: &Arc<AppState>, group_id: &str, member
     let group_id = group_id.to_string();
     tokio::spawn(async move {
         for member in members {
-            request_member_key_package_catchup(&state, &group_id, &member).await;
+            request_member_key_package_catchup(&state, &group_id, &member, max_candidates).await;
         }
     });
 }
@@ -178,7 +190,47 @@ pub(super) async fn request_hash_only_key_packages(state: &Arc<AppState>) {
                 "requesting TreeKEM KeyPackages held by hash alone"
             );
         }
-        request_key_packages(state, &group_key, hash_only);
+        request_key_packages(state, &group_key, hash_only, KEY_PACKAGE_SWEEP_CANDIDATES);
+    }
+}
+
+/// Run [`request_hash_only_key_packages`] in its own task, so its caller
+/// (the startup join, before its rendezvous advertisement) never waits on
+/// the roster.
+pub(super) fn spawn_hash_only_key_package_sweep(state: &Arc<AppState>) {
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        request_hash_only_key_packages(&state).await;
+    });
+}
+
+/// Per group key, the TreeKEM epoch that a refusal for a missing KeyPackage
+/// last pulled the group's commits again for (A2 re-review r-1). Without it
+/// a page refused after the pull's rounds ended would start another, and a
+/// member that can serve the event but not the package would keep a group
+/// polling. An entry lives until the group's next package lands.
+#[derive(Debug, Default)]
+pub(in crate::server) struct PackageRepulls {
+    pulled: HashMap<String, u64>,
+}
+
+impl PackageRepulls {
+    /// Note a refusal at `epoch`. True when nothing was pulled again for
+    /// this epoch, or a later one, since the group's last package landed.
+    pub(super) fn note_refusal(&mut self, group_key: &str, epoch: u64) -> bool {
+        match self.pulled.get(group_key) {
+            Some(&pulled) if pulled >= epoch => false,
+            _ => {
+                self.pulled.insert(group_key.to_string(), epoch);
+                true
+            }
+        }
+    }
+
+    /// A package landed for the group: the refused epoch to pull again for,
+    /// once.
+    pub(super) fn take_landed(&mut self, group_key: &str) -> Option<u64> {
+        self.pulled.remove(group_key)
     }
 }
 
@@ -186,19 +238,40 @@ pub(super) async fn request_hash_only_key_packages(state: &Arc<AppState>) {
 /// the group's missed commits again once the package can have landed. The
 /// epoch-ahead catch-up asks the other members round by round, one throttle
 /// window apart, until this member reaches `epoch`, so the refused event
-/// comes back without waiting on its sealer's resend. A task that is
-/// already running for the group covers it; starting another would count
-/// every refusal during its rounds as new traffic.
+/// comes back without waiting on its sealer's resend. It pulls once per
+/// refused epoch ([`PackageRepulls`]); the package's arrival pulls once
+/// more ([`pull_again_now_a_package_landed`]). A task that is already
+/// running for the group covers it; starting another would count every
+/// refusal during its rounds as new traffic.
 pub(super) async fn pull_again_after_package(state: &Arc<AppState>, group_key: &str, epoch: u64) {
-    if state
-        .treekem_epoch_ahead_targets
+    let first = state
+        .treekem_package_repulls
         .lock()
-        .await
-        .contains_key(group_key)
+        .unwrap_or_else(PoisonError::into_inner)
+        .note_refusal(group_key, epoch);
+    if !first
+        || state
+            .treekem_epoch_ahead_targets
+            .lock()
+            .await
+            .contains_key(group_key)
     {
         return;
     }
     spawn_treekem_epoch_ahead_catchup(state, group_key, epoch);
+}
+
+/// A KeyPackage landed for `group_key`: pull again, once, for the epoch a
+/// refusal was waiting on.
+pub(super) fn pull_again_now_a_package_landed(state: &Arc<AppState>, group_key: &str) {
+    let epoch = state
+        .treekem_package_repulls
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take_landed(group_key);
+    if let Some(epoch) = epoch {
+        spawn_treekem_epoch_ahead_catchup(state, group_key, epoch);
+    }
 }
 
 /// Whether this member may seal a TreeKEM commit in `info`. Receivers tie a
@@ -348,6 +421,22 @@ mod tests {
         assert!(
             sealer_seat_commits_package(&info, &sealer_hex),
             "a committed hash is enough: receivers fetch the bytes"
+        );
+    }
+
+    #[test]
+    fn a_refused_epoch_is_pulled_again_once_until_its_package_lands() {
+        let mut repulls = PackageRepulls::default();
+        assert!(repulls.note_refusal("g", 5), "the first refusal pulls");
+        assert!(!repulls.note_refusal("g", 5), "the same epoch waits");
+        assert!(!repulls.note_refusal("g", 4), "an earlier epoch waits");
+        assert!(repulls.note_refusal("other", 5), "groups are apart");
+        assert!(repulls.note_refusal("g", 6), "a later epoch pulls");
+        assert_eq!(repulls.take_landed("g"), Some(6), "the package pulls once");
+        assert_eq!(repulls.take_landed("g"), None);
+        assert!(
+            repulls.note_refusal("g", 6),
+            "after it landed, a refusal pulls"
         );
     }
 

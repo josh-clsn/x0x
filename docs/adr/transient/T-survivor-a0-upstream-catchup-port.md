@@ -28,7 +28,7 @@ Port the subset below, byte-close to upstream, so the next crossing can drop it.
 | #1449, #1464 | `treekem_epoch_ahead_targets`; the throttle on `tokio::time::Instant` | `state.rs`, `mod.rs` |
 | #1449 | `case_1427.rs` (631 lines, byte-identical) and its `mod` line | `src/server/w3h/` |
 | #1337 | `treekem_commit_binding`, `treekem_removal_binding_covers_commit` (23 lines) | `named_groups.rs` |
-| #1337 | `verified_catchup_member_removed_author`, `catchup_may_apply_removed_as_author` (49 lines) | `named_groups.rs` |
+| #1337 | `verified_catchup_member_removed_author`, `catchup_may_apply_removed_as_author` (49 lines; replaced in A3 by `signer_delivery`, see `T-any-member-delivers-signed-commits`) | `named_groups.rs` |
 | #1337 | the `MemberRemoved` apply check (upstream :13685-13697, 13 lines) and the signed binding it keeps (upstream :13699, :13716) | `named_groups.rs` |
 | #1337 | `responder_state_hash` on `TreeKemCatchupResponse`, filled with the saved head on a page and `None` on a KeyPackage reply | `named_groups.rs` |
 

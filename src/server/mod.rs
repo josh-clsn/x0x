@@ -82,28 +82,27 @@ use routes::{
     reconcile_treekem_self_leave_rekeys_all_groups, recover_home_suite_sidecar_journals,
     recover_treekem_named_journals, reject_join_request, reject_unverified_direct_public_message,
     relay_diagnostics, remove_mls_member, remove_named_group_member,
-    replay_pending_causal_approvals, request_hash_only_treekem_key_packages, requester_offer_step,
-    respawn_unconverged_join_polls, restore_treekem_groups, revoke_contact,
-    run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
-    save_named_groups_checked, save_named_groups_checked_unlocked,
+    replay_pending_causal_approvals, requester_offer_step, respawn_unconverged_join_polls,
+    restore_treekem_groups, revoke_contact, run_fallback_github_poll, run_gossip_update_listener,
+    run_startup_update_check, save_named_groups_checked, save_named_groups_checked_unlocked,
     save_predecessor_relay_outbox_unlocked, seal_group_state, secure_group_decrypt,
     secure_group_encrypt, secure_group_reseal, secure_open_envelope_adversarial,
     send_group_public_message, set_group_display_name, shutdown_handler,
     spawn_directory_resubscribe, spawn_global_discovery_listener,
-    spawn_global_public_message_listener, spawn_listed_to_contacts_listener,
-    state_sync_diagnostics, status, store_named_group_info, streams_diagnostics, subscribe,
-    transport_diagnostics, unban_group_member, unenroll_device, unpin_machine, unsubscribe,
-    update_contact, update_group_policy, update_member_role, update_named_group, update_profile,
-    update_task, withdraw_group_state, AtomicWriteOutcome, ControlBlobMessage, ControlBlobState,
-    JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent, PendingListenerAdmission,
-    PredecessorRelayObligation, PublicGroupBootstrap, SelfPublishedReleaseManifests,
-    StartupUpdateCheckRuntime, TreeKemCatchupRequest, TreeKemCatchupResponse,
-    CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
-    DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
-    GROUP_PREDECESSOR_RELAY_DM_PREFIX, GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE,
-    KV_STORE_DELTA_DM_PREFIX,
+    spawn_global_public_message_listener, spawn_hash_only_treekem_key_package_sweep,
+    spawn_listed_to_contacts_listener, state_sync_diagnostics, status, store_named_group_info,
+    streams_diagnostics, subscribe, transport_diagnostics, unban_group_member, unenroll_device,
+    unpin_machine, unsubscribe, update_contact, update_group_policy, update_member_role,
+    update_named_group, update_profile, update_task, withdraw_group_state, AtomicWriteOutcome,
+    ControlBlobMessage, ControlBlobState, JoinResultMessage, KvStoreDirectDelta,
+    NamedGroupMetadataEvent, PendingListenerAdmission, PredecessorRelayObligation,
+    PublicGroupBootstrap, SelfPublishedReleaseManifests, StartupUpdateCheckRuntime,
+    TreeKemCatchupRequest, TreeKemCatchupResponse, CAUSAL_ENVELOPE_MAX_BYTES,
+    CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
+    CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
+    DIRECTORY_RESUBSCRIBE_JITTER_MS, GROUP_PREDECESSOR_RELAY_DM_PREFIX,
+    GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE, KV_STORE_DELTA_DM_PREFIX,
 };
 use sse::{direct_events_sse, events_sse, peer_events_handler, presence_events, SseEvent};
 pub use state::{
@@ -1235,6 +1234,7 @@ pub async fn serve_with_options(
         treekem_member_key_packages,
         treekem_catchup_throttle: RwLock::new(HashMap::new()),
         treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
+        treekem_package_repulls: std::sync::Mutex::default(),
         group_membership_locks: RwLock::new(HashMap::new()),
         treekem_groups: RwLock::new(treekem_groups),
         treekem_dir,
@@ -1818,8 +1818,9 @@ pub async fn serve_with_options(
             Ok(()) => {
                 tracing::info!("Network joined");
                 // Survivor re-key A2: ask for the KeyPackages this member
-                // holds by hash alone, now that requests can leave.
-                request_hash_only_treekem_key_packages(&key_package_sweep_state).await;
+                // holds by hash alone, now that requests can leave. Spawned,
+                // so a large roster never delays the advertisement below.
+                spawn_hash_only_treekem_key_package_sweep(&key_package_sweep_state);
                 if rendezvous_enabled {
                     if let Err(e) = join_agent.advertise_identity(rendezvous_validity_ms).await {
                         tracing::warn!("Initial rendezvous advertisement failed: {e}");

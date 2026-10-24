@@ -8,9 +8,11 @@
 
 mod committer_leaf;
 mod control_blob;
+pub(in crate::server) use committer_leaf::PackageRepulls;
 mod fair_admission;
 mod join_result_pins;
 mod seat_cert_fetch;
+mod signer_delivery;
 mod treekem_binding;
 mod welcome_acks;
 mod welcome_key_packages;
@@ -7160,6 +7162,8 @@ async fn install_joined_treekem_group_after_crypto_recheck(
     Ok(())
 }
 
+/// Install a TreeKEM commit from a membership event. `departing_hex` names
+/// the member a removal or ban takes out: its leaf must be blank afterwards.
 #[allow(clippy::too_many_arguments)]
 async fn process_treekem_commit_after_crypto_recheck(
     state: &Arc<AppState>,
@@ -7167,13 +7171,26 @@ async fn process_treekem_commit_after_crypto_recheck(
     info: &x0x::groups::GroupInfo,
     group: Arc<tokio::sync::Mutex<x0x::mls::TreeKemMlsGroup>>,
     actor_hex: &str,
+    departing_hex: Option<&str>,
     commit_bytes: &[u8],
     expected_epoch: u64,
     reason: &str,
 ) -> anyhow::Result<()> {
     // Survivor re-key A2: the commit must come from the actor's own leaf.
     let group_ids = [group_id, info.stable_group_id(), info.mls_group_id.as_str()];
-    let actor_key_package = match committer_leaf::actor_committed_key_package(
+    // Survivor re-key A3 (A2 review m-1): a removal's commit must take its
+    // target out. A legacy binding names no bytes, so without this the
+    // actor's other commit at the same epoch would pass every other check.
+    // A target whose package this member does not hold is not checked.
+    let departing_key_package = match departing_hex {
+        Some(departing) => {
+            committer_leaf::member_committed_key_package(state, &group_ids, info, departing)
+                .await
+                .ok()
+        }
+        None => None,
+    };
+    let actor_key_package = match committer_leaf::member_committed_key_package(
         state, &group_ids, info, actor_hex,
     )
     .await
@@ -7186,6 +7203,7 @@ async fn process_treekem_commit_after_crypto_recheck(
                         state,
                         group_id,
                         vec![actor_hex.to_string()],
+                        usize::MAX,
                     );
                     committer_leaf::pull_again_after_package(state, group_id, expected_epoch).await;
                     tracing::info!(
@@ -7248,6 +7266,26 @@ async fn process_treekem_commit_after_crypto_recheck(
         anyhow::bail!(
             "TreeKEM commit advanced to unexpected epoch {actual_epoch}, expected {expected_epoch}"
         );
+    }
+    if departing_key_package
+        .as_deref()
+        .is_some_and(|package| guard.leaf_for_key_package(package).is_some())
+    {
+        rollback_treekem_group_after_failed_install(
+            state,
+            group_id,
+            info,
+            &rollback_snapshot,
+            &mut guard,
+            reason,
+        );
+        tracing::warn!(
+            group_id = %LogHexId::group(group_id),
+            actor = %LogHexId::agent(actor_hex),
+            reason,
+            "refusing TreeKEM commit: the member it removes still holds a leaf"
+        );
+        anyhow::bail!("TreeKEM commit refused: departing_leaf_not_blank");
     }
     if let Err(e) =
         persist_treekem_and_named_groups_atomic_with_info(state, group_id, info.clone(), &guard)
@@ -8183,7 +8221,8 @@ fn treekem_add_security_binding(
 /// names bytes must name exactly the commit and extras this copy carries,
 /// so whoever hands the add on cannot rename the member or swap its
 /// KeyPackage hash or Welcome (F-2). An add sealed before survivor re-key A1
-/// names none and still applies from its author.
+/// names none and still applies from its author (A3: from no one else). A
+/// TreeKEM binding that is none of the written forms is refused.
 #[allow(clippy::too_many_arguments)]
 fn treekem_add_binding_admits(
     signed: &x0x::groups::state_commit::GroupStateCommit,
@@ -8198,7 +8237,10 @@ fn treekem_add_binding_admits(
         return true;
     };
     let Some(parsed) = parse_treekem_binding(binding) else {
-        return !binding.contains(":commit=");
+        // A TreeKEM binding that is none of the written forms is refused.
+        // Another plane's binding names no TreeKEM bytes: as a legacy one, it
+        // applies only from its author (A3).
+        return !binding.starts_with("treekem:");
     };
     if parsed.commit.is_none() {
         return true;
@@ -9422,7 +9464,7 @@ async fn resolve_member_treekem_kp_for_removal_locked(
     let bg_group = group_id.to_string();
     let bg_member = agent_id_hex.to_string();
     tokio::spawn(async move {
-        request_member_key_package_catchup(&bg_state, &bg_group, &bg_member).await;
+        request_member_key_package_catchup(&bg_state, &bg_group, &bg_member, usize::MAX).await;
     });
     Err((
         StatusCode::FAILED_DEPENDENCY,
@@ -11092,7 +11134,7 @@ async fn apply_targeted_member_key_package(
     let received_hash = blake3::hash(kp_b64.as_bytes()).to_hex().to_string();
     let membership_lock = group_membership_lock(state, group_id).await;
     let _membership_guard = membership_lock.lock().await;
-    let stored = {
+    let (stored, key) = {
         let mut groups = state.named_groups.write().await;
         let key = if groups.contains_key(group_id) {
             group_id.to_string()
@@ -11122,7 +11164,7 @@ async fn apply_targeted_member_key_package(
         if current_member_treekem_key_package(member).is_some() {
             return true;
         }
-        match member.treekem_key_package_hash.as_deref() {
+        let stored = match member.treekem_key_package_hash.as_deref() {
             Some(anchor) if anchor.eq_ignore_ascii_case(&received_hash) => {
                 info.set_member_treekem_key_package(member_agent_id, kp_b64.to_string());
                 true
@@ -11143,7 +11185,8 @@ async fn apply_targeted_member_key_package(
                 );
                 false
             }
-        }
+        };
+        (stored, key)
     };
     if stored {
         if let Err(error) = save_named_groups_checked(state).await {
@@ -11154,6 +11197,8 @@ async fn apply_targeted_member_key_package(
             member = %LogHexId::agent(member_agent_id),
             "#398: stored roster-fallback KeyPackage for targeted member"
         );
+        // A commit refused for want of this package is pulled again now.
+        committer_leaf::pull_again_now_a_package_landed(state, &key);
     }
     stored
 }
@@ -11295,14 +11340,19 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         let recovery_event = member_joined_kp_cache_entry(&event)
             .map(|(_, ev)| ev)
             .filter(|ev| verify_authority_attested_member_joined_recovery(&response_info, ev));
-        // A survivor may relay a signed removal. The transport sender
-        // is that survivor. The author is the verified commit signer.
-        // T-self-leave-catchup-author. The actor field is not authority.
-        // A third party may supply TreeKEM bytes only when the signed
-        // binding names those bytes. T-self-leave-relay-commit-binding.
-        let apply_sender = verified_catchup_member_removed_author(&event)
-            .filter(|author| catchup_may_apply_removed_as_author(&event, sender, author))
-            .unwrap_or(*sender);
+        // Survivor re-key A3: any member may hand on a signed commit. It
+        // applies as its verified signer, and a copy its author did not
+        // deliver must name its TreeKEM bytes and keeps only bound fields.
+        let kind = named_group_metadata_event_kind(&event);
+        let Some((apply_sender, event)) = signer_delivery::admit(event, sender, verified) else {
+            tracing::warn!(
+                group_id = %LogHexId::group(&response.group_id),
+                sender = %LogHexId::agent(&sender_hex),
+                event = kind,
+                "refusing a served event: no verified signer, a forged actor, or TreeKEM bytes its binding does not name"
+            );
+            continue;
+        };
         apply_named_group_metadata_event(state, event, apply_sender, true, None).await;
         if let Some(ev) = recovery_event {
             apply_recovered_member_key_package(state, &ev).await;
@@ -11364,58 +11414,6 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         );
         request_treekem_catchup_page(state, &response.group_id, sender).await;
     }
-}
-
-fn verified_catchup_member_removed_author(
-    event: &NamedGroupMetadataEvent,
-) -> Option<x0x::identity::AgentId> {
-    let NamedGroupMetadataEvent::MemberRemoved { actor, commit, .. } = event else {
-        return None;
-    };
-    let commit = commit.as_ref()?;
-    if actor != &commit.committed_by {
-        return None;
-    }
-    commit.verify_structure().ok()?;
-    parse_agent_id_hex(&commit.committed_by).ok()
-}
-
-/// A third-party relay may apply a removal as its signer only when the
-/// signed binding authenticates the attached TreeKEM bytes. The legacy
-/// `treekem:epoch=<n>` form does not. The authenticated author may still
-/// deliver that form.
-fn catchup_may_apply_removed_as_author(
-    event: &NamedGroupMetadataEvent,
-    transport_sender: &x0x::identity::AgentId,
-    author: &x0x::identity::AgentId,
-) -> bool {
-    if transport_sender == author {
-        return true;
-    }
-    let NamedGroupMetadataEvent::MemberRemoved {
-        treekem_commit_b64,
-        treekem_epoch,
-        commit,
-        ..
-    } = event
-    else {
-        return false;
-    };
-    let Some(commit) = commit.as_ref() else {
-        return false;
-    };
-    let (Some(commit_b64), Some(epoch)) = (treekem_commit_b64.as_ref(), *treekem_epoch) else {
-        // A roster-only leave has no TreeKEM payload for a relay to swap.
-        return treekem_commit_b64.is_none() && treekem_epoch.is_none();
-    };
-    let Ok(commit_bytes) = BASE64.decode(commit_b64) else {
-        return false;
-    };
-    commit
-        .security_binding
-        .as_deref()
-        .and_then(parse_treekem_binding)
-        .is_some_and(|binding| removal_binding_names_bytes(&binding, epoch, &commit_bytes))
 }
 
 async fn request_treekem_catchup_page(state: &Arc<AppState>, group_id: &str, peer: &AgentId) {
@@ -11666,7 +11664,7 @@ async fn request_treekem_catchup_round(
         }
         // Owner and admins first: they sign membership commits, and only
         // the signer can deliver a removal whose binding is the legacy
-        // `treekem:epoch=<n>` form (`catchup_may_apply_removed_as_author`).
+        // `treekem:epoch=<n>` form (`signer_delivery::catchup_apply_sender`).
         let mut candidates: Vec<(bool, AgentId)> = info
             .active_members()
             .filter(|member| !member.agent_id.eq_ignore_ascii_case(&local_agent_hex))
@@ -11760,10 +11758,13 @@ fn epoch_ahead_catchup_peers(
 /// member's recorded inviter (`added_by`) and the group's other active
 /// members; the request is throttled per `{group}:member:{member}:{peer}` with
 /// the same 5 s window as the revision-gap catch-up.
+/// Ask up to `max_candidates` active members for `member_agent_id`'s
+/// KeyPackage: its adder first, then the others.
 async fn request_member_key_package_catchup(
     state: &Arc<AppState>,
     group_id: &str,
     member_agent_id: &str,
+    max_candidates: usize,
 ) {
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     let (from_revision, from_epoch, current_state_hash, candidates) = {
@@ -11780,11 +11781,15 @@ async fn request_member_key_package_catchup(
         }
         // Prefer the inviter (it authored the join), then fall back to every
         // other active member — any node that applied the MemberJoined has the
-        // cached package.
+        // cached package. A removed or banned adder is never asked: the
+        // request would tell it this member's revision and epoch.
         let mut candidate_hexes: Vec<String> = info
             .members_v2
             .get(member_agent_id)
             .and_then(|m| m.added_by.clone())
+            .filter(|adder| {
+                !adder.eq_ignore_ascii_case(&local_agent_hex) && info.has_active_member(adder)
+            })
             .into_iter()
             .collect();
         for (aid, m) in &info.members_v2 {
@@ -11795,6 +11800,7 @@ async fn request_member_key_package_catchup(
                 candidate_hexes.push(aid.clone());
             }
         }
+        candidate_hexes.truncate(max_candidates);
         (
             info.state_revision,
             info.secret_epoch,
@@ -13458,7 +13464,12 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to install TreeKEM snapshot after MemberAdded Welcome: {e}");
                         return ApplyMetadataResult::REJECTED;
                     }
-                    committer_leaf::request_key_packages(state, &resolved_group_key, hash_only);
+                    committer_leaf::request_key_packages(
+                        state,
+                        &resolved_group_key,
+                        hash_only,
+                        usize::MAX,
+                    );
                 } else {
                     let group = {
                         let map = state.treekem_groups.read().await;
@@ -13471,6 +13482,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                             &next,
                             group,
                             &actor,
+                            None,
                             &commit_bytes,
                             epoch,
                             "member_added_commit",
@@ -13850,6 +13862,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     &next,
                     group,
                     &actor,
+                    Some(agent_id.as_str()),
                     &commit_bytes,
                     _epoch,
                     "member_removed_commit",
@@ -13999,7 +14012,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 held_gss_guard,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
-                    next.policy_revision = revision.max(next.policy_revision);
+                    // Not signed: capped to one step, as the roster revision is.
+                    next.policy_revision = adopt_roster_revision(next.policy_revision, revision);
                     next.policy = policy.clone();
                     if next.policy.discoverability != x0x::groups::GroupDiscoverability::Hidden
                         && next.discovery_card_topic.is_none()
@@ -14240,6 +14254,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     &next,
                     group,
                     &actor,
+                    Some(agent_id.as_str()),
                     &commit_bytes,
                     epoch,
                     "member_banned_commit",
@@ -14734,7 +14749,12 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to install joined TreeKEM snapshot: {e}");
                         return ApplyMetadataResult::REJECTED;
                     }
-                    committer_leaf::request_key_packages(state, &resolved_group_key, hash_only);
+                    committer_leaf::request_key_packages(
+                        state,
+                        &resolved_group_key,
+                        hash_only,
+                        usize::MAX,
+                    );
                 } else {
                     let group = {
                         let map = state.treekem_groups.read().await;
@@ -14749,6 +14769,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         &next,
                         group,
                         &actor,
+                        None,
                         &commit_bytes,
                         _epoch,
                         "join_request_approved_commit",
@@ -24549,9 +24570,10 @@ async fn reconcile_treekem_self_leave_rekeys(
 
 /// Survivor re-key A2: once the mesh is up, ask for every KeyPackage this
 /// member holds by hash alone, so an earlier member's first commit is not
-/// refused for want of it.
-pub(in crate::server) async fn request_hash_only_treekem_key_packages(state: &Arc<AppState>) {
-    committer_leaf::request_hash_only_key_packages(state).await;
+/// refused for want of it. It runs in its own task (A3, from A2 re-review
+/// r-6), so the caller never waits on the roster.
+pub(in crate::server) fn spawn_hash_only_treekem_key_package_sweep(state: &Arc<AppState>) {
+    committer_leaf::spawn_hash_only_key_package_sweep(state);
 }
 
 /// Startup half of the ADR-0014 §4 lazy catch-up: sweep every group for
@@ -37794,6 +37816,32 @@ pub(in crate::server) async fn apply_group_metadata_event(
             reason,
         );
     }
+    // Survivor re-key A3 (A1 review I-1): `sender` is the caller's claim.
+    // The original MemberJoined is checked against it by the joiner's own
+    // signature. Every other event applies as its verified signer, as a copy
+    // its author did not deliver: its TreeKEM bytes must be named by its
+    // binding, and the join-request lifecycle, which stays with its author,
+    // cannot come this way.
+    let (sender, event) = if matches!(event, NamedGroupMetadataEvent::MemberJoined { .. }) {
+        (sender, event)
+    } else {
+        let reason = if signer_delivery::author_only(&event) {
+            "author_only_event_needs_verified_sender"
+        } else {
+            "needs_verified_signer_and_named_tree_bytes"
+        };
+        match signer_delivery::admit(event, &sender, false) {
+            Some(admitted) => admitted,
+            None => {
+                return api_error_with_reason(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "the local-apply endpoint applies an event as its verified signer only, \
+                     and only when its binding names any TreeKEM bytes it carries",
+                    reason,
+                );
+            }
+        }
+    };
     tracing::debug!(
         target: "treekem.trace",
         stage = "apply_metadata_event_endpoint",
@@ -38016,6 +38064,17 @@ pub(in crate::server) async fn apply_join_result_endpoint(
                 "join-result must be MemberAdded".to_owned(),
             );
         }
+    };
+    // Survivor re-key A3 (A1 review I-1): `sender` is the caller's claim, so
+    // the result applies as its verified signer, as a copy its author did not
+    // deliver: its binding must name its TreeKEM bytes and Welcome.
+    let Some((sender, event)) = signer_delivery::admit(event, &sender, false) else {
+        return api_error_with_reason(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a relayed join result applies only as its verified signer, and only when its \
+             binding names its TreeKEM bytes and Welcome",
+            "needs_verified_signer_and_named_tree_bytes",
+        );
     };
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     if member_agent_id != local_agent_hex {
@@ -44560,6 +44619,7 @@ pub(in crate::server) mod tests {
     mod requester_offer;
     mod sec377_dm_verified_gate;
     mod self_leave_rekey;
+    mod signer_delivery;
     mod treekem_bytes_binding;
     mod welcome_unblock;
     mod wp_c;
@@ -45350,6 +45410,7 @@ pub(in crate::server) mod tests {
             treekem_event_log: RwLock::new(HashMap::new()),
             treekem_catchup_throttle: RwLock::new(HashMap::new()),
             treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
+            treekem_package_repulls: std::sync::Mutex::default(),
             group_membership_locks: RwLock::new(HashMap::new()),
             treekem_groups: RwLock::new(HashMap::new()),
             treekem_dir,
@@ -55403,6 +55464,7 @@ pub(in crate::server) mod tests {
             &next,
             Arc::clone(&group),
             &hex::encode(authority.as_bytes()),
+            None,
             &add.commit,
             expected_epoch,
             "test_treekem_commit_lost_race",

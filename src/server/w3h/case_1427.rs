@@ -13,7 +13,7 @@
 //! signal V gets is store traffic from epoch e+1: the signer writes one
 //! key, then nothing more. A removal whose binding is the legacy
 //! `treekem:epoch=<n>` form can only be delivered by its signer
-//! (`catchup_may_apply_removed_as_author`).
+//! (`signer_delivery::catchup_apply_sender`).
 //!
 //! Two arms, the same scenario:
 //! - plain: nodes O (owner, the signer), B, V and R, all reachable. This

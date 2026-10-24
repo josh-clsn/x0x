@@ -159,7 +159,7 @@ pub(in crate::server) async fn mesh_join(State(state): State<Arc<AppState>>) -> 
         match agent.dial_bootstrap_superseding(requested_at_epoch).await {
             // Survivor re-key A2: KeyPackages held by hash alone can be
             // requested now.
-            Ok(()) => super::request_hash_only_treekem_key_packages(&sweep_state).await,
+            Ok(()) => super::spawn_hash_only_treekem_key_package_sweep(&sweep_state),
             Err(e) => tracing::error!("mesh join failed: {e}"),
         }
     });
