@@ -1,37 +1,40 @@
-//! Head proofs (survivor re-key A6, `docs/adr/transient/T-treekem-head-proof.md`).
+//! Head proofs: the wire, the signature, and the answer (survivor re-key
+//! A6, `docs/adr/transient/T-treekem-head-proof.md`).
 //!
 //! A member that was away asks each admin of its room where the room's key
-//! stands, with a fresh nonce. An admin's daemon answers with a **head
-//! proof**: the live TreeKEM tree's epoch and epoch authenticator, signed
-//! with its agent key over the nonce, the requester, the group and the
-//! signer. The member compares the proof with its own tree (the engine's
-//! verdict, plan task C3), so a proof is worth only what the live tree
-//! says. Nothing else on the catch-up wire (`responder_state_hash`, a
-//! request's `current_state_hash`) is evidence of freshness.
+//! stands, with a fresh challenge (`head_rounds.rs`). An admin's daemon
+//! answers with a **head proof**: the live TreeKEM tree's epoch and epoch
+//! authenticator, signed with its agent key over the challenge, the
+//! requester, the group and the signer. The member compares the proof with
+//! its own tree (the engine's verdict, plan task C3), so a proof is worth
+//! only what the live tree says. Nothing else on the catch-up wire
+//! (`responder_state_hash`, a request's `current_state_hash`) is evidence
+//! of freshness.
 //!
 //! - **Who signs.** Only a daemon that is an active admin on its own
-//!   roster, and only for a requester that is active there.
+//!   roster, and only for a requester that is active there, both before and
+//!   after it reads the tree.
 //! - **What it signs.** The epoch and authenticator, read together under
 //!   the tree's lock ([`x0x::mls::TreeKemMlsGroup::head`]).
 //! - **When.** A challenge rides on a signed page request
-//!   (`head_challenge`). It is answered before the #378 page throttle, with
-//!   its own limit of [`HEAD_PROOFS_PER_WINDOW`] per [`HEAD_PROOF_WINDOW`]
-//!   per (group, requester), so a page served a moment earlier never stops
-//!   the proof.
-//! - **What a member records.** A proof that verifies, for itself, in this
-//!   group, from a signer it asked, under its open round's nonce, within
-//!   [`HEAD_ROUND_DEADLINE`] of the round opening.
+//!   (`head_challenge`). It is answered before the #378 page throttle.
+//!   Challenges are ordered per requester ([`challenge_counter`]): an older
+//!   one is refused and the latest one is answered once and then from
+//!   cache, neither of them charged. Only a newer one is charged, at most
+//!   [`HEAD_PROOFS_PER_WINDOW`] per [`HEAD_PROOF_WINDOW`] per (group,
+//!   requester). So a replayed challenge never spends the requester's
+//!   answers.
 
 use super::{
     build_catchup_signer, catchup_signer_matches, named_group_direct_delivery_config,
-    parse_agent_id_hex, signed_catchup, spawn_treekem_epoch_ahead_catchup, AppState, CatchupSigner,
+    signed_catchup, spawn_treekem_epoch_ahead_catchup, AppState, CatchupSigner,
     TreeKemCatchupResponse,
 };
 use crate as x0x;
 use crate::identity::AgentId;
 use crate::logging::LogHexId;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock, PoisonError};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -42,22 +45,20 @@ pub(in crate::server) const HEAD_PROOF_DOMAIN: &str = "x0x/treekem-head-proof/v1
 /// The head proof format this daemon signs and accepts.
 pub(in crate::server) const HEAD_PROOF_VERSION: u32 = 1;
 
-/// How many challenges one requester may have answered per group in one
-/// [`HEAD_PROOF_WINDOW`]. Each costs an ML-DSA-65 signature (about 1 ms).
+/// How many newer challenges one requester may have answered per group in
+/// one [`HEAD_PROOF_WINDOW`]. Each costs an ML-DSA-65 signature (about
+/// 1 ms).
 pub(in crate::server) const HEAD_PROOFS_PER_WINDOW: usize = 12;
 
 /// The window of [`HEAD_PROOFS_PER_WINDOW`].
 pub(in crate::server) const HEAD_PROOF_WINDOW: Duration = Duration::from_secs(60);
 
-/// How long after a round opens its proofs are recorded.
-pub(in crate::server) const HEAD_ROUND_DEADLINE: Duration = Duration::from_secs(60);
-
-/// The most admins a proof names. A room with more is not answered.
+/// The most admins a proof names, and the most agents a round challenges.
+/// A room with more is not answered, and no round is opened in it.
 pub(in crate::server) const HEAD_PROOF_MAX_ADMINS: usize = 512;
 
-/// Above this many (group, requester) entries, a new answer first drops
-/// the entries with nothing inside the window.
-const HEAD_PROOF_LIMIT_PRUNE_AT: usize = 1024;
+/// How many hex digits open a challenge with its counter.
+const CHALLENGE_COUNTER_HEX: usize = 16;
 
 /// Test-only: when set to exactly `1`, this daemon signs its head proofs
 /// with the live epoch plus one and a random authenticator. The rig plays a
@@ -98,7 +99,8 @@ pub(in crate::server) struct HeadClaim {
     pub(in crate::server) security_binding: Option<String>,
     /// The signer's roster revision. Information only.
     pub(in crate::server) state_revision: u64,
-    /// The active admins on the signer's roster, sorted, no repeats.
+    /// The active admins on the signer's roster, sorted, no repeats. The
+    /// signer is one of them.
     pub(in crate::server) admins: Vec<String>,
     /// The signer's agent id (lowercase hex). The carried key must derive it.
     pub(in crate::server) signer: String,
@@ -112,7 +114,7 @@ pub(in crate::server) struct HeadProof {
     pub(in crate::server) signed_by: CatchupSigner,
 }
 
-fn is_agent_hex(value: &str) -> bool {
+pub(super) fn is_agent_hex(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
@@ -127,6 +129,33 @@ fn authenticator_bytes(value: &str) -> Option<[u8; 32]> {
 
 fn nonce_ok(nonce: &str) -> bool {
     !nonce.is_empty() && nonce.len() <= signed_catchup::HEAD_CHALLENGE_MAX_BYTES
+}
+
+/// A challenge: the requester's counter as 16 lowercase hex digits, then
+/// 32 random bytes as hex (80 characters).
+pub(in crate::server) fn challenge_nonce(counter: u64) -> String {
+    format!(
+        "{counter:0width$x}{}",
+        hex::encode(rand::random::<[u8; 32]>()),
+        width = CHALLENGE_COUNTER_HEX
+    )
+}
+
+/// The counter a challenge opens with, when it is one: at most
+/// [`signed_catchup::HEAD_CHALLENGE_MAX_BYTES`] long, 16 lowercase hex
+/// digits, then at least one more byte.
+pub(in crate::server) fn challenge_counter(nonce: &str) -> Option<u64> {
+    if !nonce_ok(nonce) || nonce.len() <= CHALLENGE_COUNTER_HEX {
+        return None;
+    }
+    let digits = nonce.get(..CHALLENGE_COUNTER_HEX)?;
+    if !digits
+        .bytes()
+        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return None;
+    }
+    u64::from_str_radix(digits, 16).ok()
 }
 
 impl HeadClaim {
@@ -175,7 +204,8 @@ impl HeadClaim {
         Some(input)
     }
 
-    /// Whether every field is in its one canonical form.
+    /// Whether every field is in its one canonical form, and the signer
+    /// names itself an admin (a proof that does not is self-contradictory).
     fn well_formed(&self) -> bool {
         self.version == HEAD_PROOF_VERSION
             && is_agent_hex(&self.requester)
@@ -184,6 +214,7 @@ impl HeadClaim {
             && self.admins.len() <= HEAD_PROOF_MAX_ADMINS
             && self.admins.iter().all(|admin| is_agent_hex(admin))
             && self.admins.windows(2).all(|pair| pair[0] < pair[1])
+            && self.admins.binary_search(&self.signer).is_ok()
     }
 }
 
@@ -223,9 +254,11 @@ pub(in crate::server) fn sign_claim_with(
 /// Why a challenge got no proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::server) enum Refusal {
-    /// The challenge is empty or longer than
-    /// [`signed_catchup::HEAD_CHALLENGE_MAX_BYTES`].
+    /// The challenge is not a counter-prefixed nonce ([`challenge_counter`]).
     BadChallenge,
+    /// The requester has since sent a newer challenge (a replay, or one that
+    /// got no proof the first time). Not charged.
+    StaleChallenge,
     /// This daemon has no live roster or tree for the room.
     NoRoom,
     /// The requester is not an active member on this daemon's roster.
@@ -238,6 +271,105 @@ pub(in crate::server) enum Refusal {
     Unavailable,
 }
 
+/// What [`HeadAnswers::admit`] decides for a challenge.
+#[derive(Debug, Clone)]
+enum Admission {
+    /// A newer challenge, now charged: answer it.
+    Fresh,
+    /// The latest challenge again: its proof, if it got one.
+    Repeat(Option<Box<HeadProof>>),
+    /// An older challenge, or another one with the latest counter.
+    Stale,
+    /// A newer challenge over the limit.
+    Limited,
+}
+
+/// One requester's challenges in one room, at this daemon.
+#[derive(Debug, Default)]
+struct Answered {
+    /// When each charged challenge in the current window came.
+    stamps: VecDeque<Instant>,
+    /// The latest challenge charged: its counter and nonce.
+    latest: Option<(u64, String)>,
+    /// The proof the latest challenge got.
+    proof: Option<HeadProof>,
+}
+
+/// Per daemon, per (room, requester): the challenges answered. Entries are
+/// made only for requesters active on this daemon's roster, and go with
+/// the room.
+#[derive(Debug, Default)]
+pub(in crate::server) struct HeadAnswers {
+    answered: HashMap<(String, String), Answered>,
+}
+
+impl HeadAnswers {
+    /// Decide on `requester`'s challenge `nonce`, whose counter is
+    /// `counter`, in `key`. Only a newer challenge within the limit is
+    /// charged, and it becomes the latest.
+    fn admit(
+        &mut self,
+        key: &str,
+        requester: &str,
+        nonce: &str,
+        counter: u64,
+        now: Instant,
+    ) -> Admission {
+        let entry = self
+            .answered
+            .entry((key.to_string(), requester.to_string()))
+            .or_default();
+        if let Some((latest, latest_nonce)) = &entry.latest {
+            if counter < *latest {
+                return Admission::Stale;
+            }
+            if counter == *latest {
+                return if latest_nonce == nonce {
+                    Admission::Repeat(entry.proof.clone().map(Box::new))
+                } else {
+                    Admission::Stale
+                };
+            }
+        }
+        while entry
+            .stamps
+            .front()
+            .is_some_and(|first| now.saturating_duration_since(*first) >= HEAD_PROOF_WINDOW)
+        {
+            entry.stamps.pop_front();
+        }
+        if entry.stamps.len() >= HEAD_PROOFS_PER_WINDOW {
+            return Admission::Limited;
+        }
+        entry.stamps.push_back(now);
+        entry.latest = Some((counter, nonce.to_string()));
+        entry.proof = None;
+        Admission::Fresh
+    }
+
+    /// Keep `proof` as the answer to `requester`'s latest challenge, if
+    /// `nonce` is still the latest.
+    fn remember(&mut self, key: &str, requester: &str, nonce: &str, proof: &HeadProof) {
+        if let Some(entry) = self
+            .answered
+            .get_mut(&(key.to_string(), requester.to_string()))
+        {
+            if entry
+                .latest
+                .as_ref()
+                .is_some_and(|(_, latest)| latest == nonce)
+            {
+                entry.proof = Some(proof.clone());
+            }
+        }
+    }
+
+    /// Drop the room `alias`.
+    pub(in crate::server) fn wipe(&mut self, alias: &str) {
+        self.answered.retain(|(key, _), _| key != alias);
+    }
+}
+
 /// The roster facts a proof carries, read in one go.
 struct RosterHead {
     key: String,
@@ -247,9 +379,22 @@ struct RosterHead {
     security_binding: Option<String>,
     admins: Vec<String>,
     local_is_admin: bool,
+    requester_active: bool,
 }
 
-async fn roster_head(state: &AppState, group_id: &str) -> Option<RosterHead> {
+impl RosterHead {
+    /// The facts that must not move while the tree is read.
+    fn settled(&self) -> (u64, &str, bool, bool) {
+        (
+            self.state_revision,
+            &self.state_hash,
+            self.local_is_admin,
+            self.requester_active,
+        )
+    }
+}
+
+async fn roster_head(state: &AppState, group_id: &str, requester: &str) -> Option<RosterHead> {
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
     let (key, info) = groups.get_key_value(group_id).or_else(|| {
@@ -278,6 +423,7 @@ async fn roster_head(state: &AppState, group_id: &str) -> Option<RosterHead> {
             && info
                 .caller_role(&local_hex)
                 .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin)),
+        requester_active: is_agent_hex(requester) && info.has_active_member(requester),
     })
 }
 
@@ -319,54 +465,71 @@ pub(in crate::server) async fn answer_challenge_with(
     requester_epoch: u64,
     inflate: bool,
 ) -> Result<HeadProof, Refusal> {
-    if !nonce_ok(nonce) {
-        return Err(Refusal::BadChallenge);
-    }
+    let counter = challenge_counter(nonce).ok_or(Refusal::BadChallenge)?;
     let requester = requester.to_ascii_lowercase();
-    let key = {
-        let groups = state.named_groups.read().await;
-        let (key, info) = groups
-            .get_key_value(group_id)
-            .or_else(|| {
-                groups
-                    .iter()
-                    .find(|(_, info)| info.stable_group_id() == group_id)
-            })
-            .ok_or(Refusal::NoRoom)?;
-        if info.withdrawn {
-            return Err(Refusal::NoRoom);
-        }
-        if !is_agent_hex(&requester) || !info.has_active_member(&requester) {
-            return Err(Refusal::RequesterNotActive);
-        }
-        key.clone()
-    };
-    if !state
-        .treekem_head_proofs
+    let gate = roster_head(state, group_id, &requester)
+        .await
+        .ok_or(Refusal::NoRoom)?;
+    if !gate.requester_active {
+        return Err(Refusal::RequesterNotActive);
+    }
+    let key = gate.key;
+    let admission = state
+        .treekem_head_answers
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .allow_answer(&key, &requester, Instant::now())
-    {
-        return Err(Refusal::Limited);
+        .admit(&key, &requester, nonce, counter, Instant::now());
+    match admission {
+        Admission::Fresh => {}
+        Admission::Repeat(Some(proof)) => return Ok(*proof),
+        Admission::Repeat(None) | Admission::Stale => return Err(Refusal::StaleChallenge),
+        Admission::Limited => return Err(Refusal::Limited),
     }
-    let tree = state
-        .treekem_groups
-        .read()
-        .await
-        .get(&key)
-        .cloned()
-        .ok_or(Refusal::NoRoom)?;
-    let mut ahead_noted = false;
     for _ in 0..HEAD_READ_ATTEMPTS {
-        let roster = roster_head(state, &key).await.ok_or(Refusal::NoRoom)?;
+        let roster = roster_head(state, &key, &requester)
+            .await
+            .ok_or(Refusal::NoRoom)?;
+        if !roster.requester_active {
+            return Err(Refusal::RequesterNotActive);
+        }
+        #[cfg(test)]
+        {
+            let hook = state
+                .named_group_test_recorders
+                .head_answer_before_tree_read
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some((entered, release)) = hook {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
+        // The tree is looked up on every attempt: a Welcome or re-join can
+        // replace it.
+        let tree = state
+            .treekem_groups
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .ok_or(Refusal::NoRoom)?;
         // The epoch and the authenticator come from one borrow of the live
         // tree, under its lock, so they cannot be torn.
         let (epoch, authenticator) = {
             let guard = tree.lock().await;
             guard.head().map_err(|_| Refusal::Unavailable)?
         };
-        if requester_epoch > epoch && !ahead_noted {
-            ahead_noted = true;
+        // The roster must not have moved while the tree was read: the
+        // requester still active, this daemon still an admin, the same head.
+        let still = roster_head(state, &key, &requester)
+            .await
+            .ok_or(Refusal::NoRoom)?;
+        if still.settled() != roster.settled() {
+            continue;
+        }
+        // Every path below returns, so this runs once per challenge.
+        if requester_epoch > epoch {
             tracing::info!(
                 group_id = %LogHexId::group(&key),
                 requester = %LogHexId::agent(&requester),
@@ -382,18 +545,7 @@ pub(in crate::server) async fn answer_challenge_with(
         if roster.admins.len() > HEAD_PROOF_MAX_ADMINS {
             return Err(Refusal::Unavailable);
         }
-        // The roster's facts are information only, but they must belong to
-        // the head the tree reports: read again, and retry if they moved.
-        let still = roster_head(state, &key).await.ok_or(Refusal::NoRoom)?;
-        if (
-            still.state_revision,
-            &still.state_hash,
-            still.local_is_admin,
-        ) != (roster.state_revision, &roster.state_hash, true)
-        {
-            continue;
-        }
-        return sign_head(
+        let proof = sign_head(
             state,
             roster,
             &requester,
@@ -402,7 +554,13 @@ pub(in crate::server) async fn answer_challenge_with(
             authenticator,
             inflate,
         )
-        .ok_or(Refusal::Unavailable);
+        .ok_or(Refusal::Unavailable)?;
+        state
+            .treekem_head_answers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remember(&key, &requester, nonce, &proof);
+        return Ok(proof);
     }
     Err(Refusal::Unavailable)
 }
@@ -439,6 +597,23 @@ fn sign_head(
     };
     let signed_by = build_catchup_signer(state, &claim.sign_input()?)?;
     Some(HeadProof { claim, signed_by })
+}
+
+/// The direct-message size a page and its proof must fit together.
+pub(in crate::server) fn page_and_proof_cap(state: &AppState) -> usize {
+    #[cfg(test)]
+    {
+        let cap = state
+            .named_group_test_recorders
+            .page_and_proof_cap
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if cap > 0 {
+            return cap;
+        }
+    }
+    #[cfg(not(test))]
+    let _ = state;
+    x0x::dm::MAX_PAYLOAD_BYTES
 }
 
 /// A response that carries only `proof`: the page itself was throttled,
@@ -494,279 +669,6 @@ pub(in crate::server) async fn send_proof_only(
         .await
     {
         tracing::warn!(group_id = %LogHexId::group(group_id), requester = %LogHexId::agent(&hex::encode(requester.as_bytes())), "failed to send a head proof: {e}");
-    }
-}
-
-/// Why a proof was not recorded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::server) enum NotRecorded {
-    /// No such room here, or no open round in it.
-    NoRound,
-    /// The proof answers another challenge.
-    OtherNonce,
-    /// The proof came after [`HEAD_ROUND_DEADLINE`].
-    Late,
-    /// The proof is for another group or another requester.
-    NotForThisRound,
-    /// This member did not challenge the signer in this round.
-    NotAsked,
-    /// The proof is malformed or its signature does not verify.
-    BadSignature,
-}
-
-/// An open round: one nonce, the agents it challenged, and the proofs they
-/// returned, one per signer (the latest).
-#[derive(Debug, Clone)]
-pub(in crate::server) struct HeadRound {
-    pub(in crate::server) nonce: String,
-    pub(in crate::server) opened_at: Instant,
-    pub(in crate::server) asked: BTreeSet<String>,
-    proofs: BTreeMap<String, HeadProof>,
-}
-
-/// What [`round_view`] reports about a room's open round.
-#[derive(Debug, Clone)]
-#[cfg_attr(not(test), allow(dead_code))] // A7's GET reports it.
-pub(in crate::server) struct RoundView {
-    pub(in crate::server) nonce: String,
-    pub(in crate::server) opened_at: Instant,
-    pub(in crate::server) asked: BTreeSet<String>,
-    pub(in crate::server) proofs: Vec<HeadProof>,
-}
-
-/// Per daemon: each room's open round, and the answers given to each
-/// (room, requester) in the current window.
-#[derive(Debug, Default)]
-pub(in crate::server) struct HeadProofs {
-    rounds: HashMap<String, HeadRound>,
-    answered: HashMap<(String, String), VecDeque<Instant>>,
-}
-
-impl HeadProofs {
-    /// Whether `requester` may have another challenge in `key` answered
-    /// now, and if so, count it.
-    fn allow_answer(&mut self, key: &str, requester: &str, now: Instant) -> bool {
-        if self.answered.len() >= HEAD_PROOF_LIMIT_PRUNE_AT {
-            self.answered.retain(|_, stamps| {
-                stamps
-                    .back()
-                    .is_some_and(|last| now.saturating_duration_since(*last) < HEAD_PROOF_WINDOW)
-            });
-        }
-        let stamps = self
-            .answered
-            .entry((key.to_string(), requester.to_string()))
-            .or_default();
-        while stamps
-            .front()
-            .is_some_and(|first| now.saturating_duration_since(*first) >= HEAD_PROOF_WINDOW)
-        {
-            stamps.pop_front();
-        }
-        if stamps.len() >= HEAD_PROOFS_PER_WINDOW {
-            return false;
-        }
-        stamps.push_back(now);
-        true
-    }
-
-    /// Open a round in `key`, replacing any open one and its proofs.
-    fn open_round(&mut self, key: &str, nonce: String, asked: BTreeSet<String>, now: Instant) {
-        self.rounds.insert(
-            key.to_string(),
-            HeadRound {
-                nonce,
-                opened_at: now,
-                asked,
-                proofs: BTreeMap::new(),
-            },
-        );
-    }
-
-    /// Record `proof` in the open round of `key`, whose stable group id is
-    /// `stable_group_id`, for this member `me`.
-    fn record(
-        &mut self,
-        key: &str,
-        stable_group_id: &str,
-        me: &str,
-        proof: HeadProof,
-        now: Instant,
-    ) -> Result<(), NotRecorded> {
-        let round = self.rounds.get_mut(key).ok_or(NotRecorded::NoRound)?;
-        if proof.claim.nonce != round.nonce {
-            return Err(NotRecorded::OtherNonce);
-        }
-        if now.saturating_duration_since(round.opened_at) > HEAD_ROUND_DEADLINE {
-            return Err(NotRecorded::Late);
-        }
-        if proof.claim.group_id != stable_group_id || proof.claim.requester != me {
-            return Err(NotRecorded::NotForThisRound);
-        }
-        if !round.asked.contains(&proof.claim.signer) {
-            return Err(NotRecorded::NotAsked);
-        }
-        if !verify(&proof) {
-            return Err(NotRecorded::BadSignature);
-        }
-        round.proofs.insert(proof.claim.signer.clone(), proof);
-        Ok(())
-    }
-
-    /// Drop the room `alias`: its round and its answer counts.
-    pub(in crate::server) fn wipe(&mut self, alias: &str) {
-        self.rounds.remove(alias);
-        self.answered.retain(|(key, _), _| key != alias);
-    }
-}
-
-/// The agents a round challenges: every agent the engine `named` (its
-/// anchored admin set), plus every active admin on this member's roster,
-/// never this member itself. A named admin stays in the set even when this
-/// member's roster no longer lists it: a stale commit applied here may
-/// have removed it, and only its answer can show that.
-pub(in crate::server) fn challenge_set(
-    named: &[String],
-    roster_admins: &[String],
-    me: &str,
-) -> BTreeSet<String> {
-    let mut asked: BTreeSet<String> = roster_admins
-        .iter()
-        .map(|admin| admin.to_ascii_lowercase())
-        .filter(|admin| is_agent_hex(admin))
-        .collect();
-    for agent in named
-        .iter()
-        .map(|agent| agent.to_ascii_lowercase())
-        .filter(|agent| is_agent_hex(agent))
-    {
-        if asked.len() >= HEAD_PROOF_MAX_ADMINS {
-            break;
-        }
-        asked.insert(agent);
-    }
-    asked.remove(me);
-    asked
-}
-
-/// The round [`challenge_admins`] opened.
-#[derive(Debug, Clone)]
-#[cfg_attr(not(test), allow(dead_code))] // A7's trigger reports it.
-pub(in crate::server) struct OpenedRound {
-    pub(in crate::server) nonce: String,
-    pub(in crate::server) asked: BTreeSet<String>,
-}
-
-/// Open a round in `group_id` and send each agent of the
-/// [`challenge_set`] this member's signed page request carrying the round's
-/// fresh nonce. `None` when this member is not active in the room.
-#[cfg_attr(not(test), allow(dead_code))] // A7's trigger route calls it.
-pub(in crate::server) async fn challenge_admins(
-    state: &Arc<AppState>,
-    group_id: &str,
-    named: &[String],
-) -> Option<OpenedRound> {
-    let me = hex::encode(state.agent.agent_id().as_bytes());
-    let (key, roster_admins) = {
-        let groups = state.named_groups.read().await;
-        let (key, info) = groups.get_key_value(group_id).or_else(|| {
-            groups
-                .iter()
-                .find(|(_, info)| info.stable_group_id() == group_id)
-        })?;
-        if info.withdrawn || !info.has_active_member(&me) {
-            return None;
-        }
-        let admins: Vec<String> = info
-            .active_members()
-            .filter(|member| member.role.at_least(x0x::groups::GroupRole::Admin))
-            .map(|member| member.agent_id.clone())
-            .collect();
-        (key.clone(), admins)
-    };
-    let asked = challenge_set(named, &roster_admins, &me);
-    let nonce = hex::encode(rand::random::<[u8; 32]>());
-    let mut request = signed_catchup::page_request(state, &key, None).await?;
-    request.head_challenge = Some(nonce.clone());
-    signed_catchup::sign_page_request(state, &mut request);
-    state
-        .treekem_head_proofs
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .open_round(&key, nonce.clone(), asked.clone(), Instant::now());
-    tracing::info!(
-        group_id = %LogHexId::group(&key),
-        asked = asked.len(),
-        "TreeKEM head: challenging the room's admins"
-    );
-    let _sent = futures::future::join_all(asked.iter().filter_map(|agent| {
-        let peer = parse_agent_id_hex(agent).ok()?;
-        let request = request.clone();
-        let key = &key;
-        Some(async move {
-            if let Err(e) = signed_catchup::send_page_request(state, &peer, request).await {
-                tracing::debug!(group_id = %LogHexId::group(key), peer = %LogHexId::agent(&hex::encode(peer.as_bytes())), "head challenge failed: {e}");
-            }
-        })
-    }))
-    .await;
-    Some(OpenedRound { nonce, asked })
-}
-
-/// Record `proof`, which arrived for `group_id`, in this member's open
-/// round there. The transport and the claimed sender play no part: the
-/// proof is checked against its own signer's key.
-pub(in crate::server) async fn record_proof(
-    state: &AppState,
-    group_id: &str,
-    proof: HeadProof,
-) -> Result<(), NotRecorded> {
-    let me = hex::encode(state.agent.agent_id().as_bytes());
-    let (key, stable_group_id) = {
-        let groups = state.named_groups.read().await;
-        let (key, info) = groups
-            .get_key_value(group_id)
-            .or_else(|| {
-                groups
-                    .iter()
-                    .find(|(_, info)| info.stable_group_id() == group_id)
-            })
-            .ok_or(NotRecorded::NoRound)?;
-        (key.clone(), info.stable_group_id().to_string())
-    };
-    state
-        .treekem_head_proofs
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .record(&key, &stable_group_id, &me, proof, Instant::now())
-}
-
-/// The open round in `group_id` (a room key), with its recorded proofs.
-#[cfg_attr(not(test), allow(dead_code))] // A7's GET reports it.
-pub(in crate::server) fn round_view(state: &AppState, group_id: &str) -> Option<RoundView> {
-    let book = state
-        .treekem_head_proofs
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    book.rounds.get(group_id).map(|round| RoundView {
-        nonce: round.nonce.clone(),
-        opened_at: round.opened_at,
-        asked: round.asked.clone(),
-        proofs: round.proofs.values().cloned().collect(),
-    })
-}
-
-/// Move the open round's opening `by` into the past, for a deadline test.
-#[cfg(test)]
-pub(in crate::server) fn backdate_round(state: &AppState, group_id: &str, by: Duration) {
-    let mut book = state
-        .treekem_head_proofs
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    if let Some(round) = book.rounds.get_mut(group_id) {
-        if let Some(earlier) = Instant::now().checked_sub(by) {
-            round.opened_at = earlier;
-        }
     }
 }
 
@@ -892,131 +794,91 @@ mod tests {
         assert!(!verify(&sign_claim_with(&admin, long)));
         let empty = claim(&agent_hex(&admin), &requester, "");
         assert!(!verify(&sign_claim_with(&admin, empty)));
+        // Review m-2: a signer that does not name itself an admin.
+        let mut not_listed = claim(&agent_hex(&admin), &requester, "n");
+        not_listed.admins = vec!["0".repeat(64)];
+        assert!(!verify(&sign_claim_with(&admin, not_listed)));
     }
 
     #[test]
-    fn a_round_records_only_its_own_nonce_requester_group_and_asked_signers_in_time() {
-        let admin = crate::identity::AgentKeypair::generate().unwrap();
-        let other = crate::identity::AgentKeypair::generate().unwrap();
-        let me = "b".repeat(64);
-        let now = Instant::now();
-        let mut book = HeadProofs::default();
-        let proof = |keypair: &crate::identity::AgentKeypair, nonce: &str| {
-            sign_claim_with(keypair, claim(&agent_hex(keypair), &me, nonce))
-        };
+    fn a_challenge_opens_with_its_counter() {
+        let nonce = challenge_nonce(0x1234);
+        assert_eq!(nonce.len(), 80);
+        assert!(nonce.len() <= signed_catchup::HEAD_CHALLENGE_MAX_BYTES);
+        assert_eq!(challenge_counter(&nonce), Some(0x1234));
         assert_eq!(
-            book.record("k", "group", &me, proof(&admin, "n"), now),
-            Err(NotRecorded::NoRound)
+            challenge_counter(&challenge_nonce(u64::MAX)),
+            Some(u64::MAX)
         );
-        book.open_round(
-            "k",
-            "n".to_string(),
-            BTreeSet::from([agent_hex(&admin)]),
-            now,
-        );
-        assert_eq!(
-            book.record("k", "group", &me, proof(&admin, "m"), now),
-            Err(NotRecorded::OtherNonce)
-        );
-        assert_eq!(
-            book.record("k", "other", &me, proof(&admin, "n"), now),
-            Err(NotRecorded::NotForThisRound)
-        );
-        assert_eq!(
-            book.record("k", "group", &"c".repeat(64), proof(&admin, "n"), now),
-            Err(NotRecorded::NotForThisRound)
-        );
-        assert_eq!(
-            book.record("k", "group", &me, proof(&other, "n"), now),
-            Err(NotRecorded::NotAsked)
-        );
-        let mut tampered = proof(&admin, "n");
-        tampered.claim.treekem_epoch += 1;
-        assert_eq!(
-            book.record("k", "group", &me, tampered, now),
-            Err(NotRecorded::BadSignature)
-        );
-        assert_eq!(
-            book.record(
-                "k",
-                "group",
-                &me,
-                proof(&admin, "n"),
-                now + HEAD_ROUND_DEADLINE + Duration::from_millis(1)
-            ),
-            Err(NotRecorded::Late)
-        );
-        assert_eq!(
-            book.record(
-                "k",
-                "group",
-                &me,
-                proof(&admin, "n"),
-                now + HEAD_ROUND_DEADLINE
-            ),
-            Ok(())
-        );
-        assert_eq!(book.rounds["k"].proofs.len(), 1);
-
-        book.open_round(
-            "k",
-            "n2".to_string(),
-            BTreeSet::from([agent_hex(&admin)]),
-            now,
-        );
-        assert!(
-            book.rounds["k"].proofs.is_empty(),
-            "a new round starts empty"
-        );
-        assert_eq!(
-            book.record("k", "group", &me, proof(&admin, "n"), now),
-            Err(NotRecorded::OtherNonce)
-        );
-        book.wipe("k");
-        assert!(book.rounds.is_empty());
-    }
-
-    #[test]
-    fn a_requester_has_twelve_answers_a_minute_per_room() {
-        let now = Instant::now();
-        let mut book = HeadProofs::default();
-        for _ in 0..HEAD_PROOFS_PER_WINDOW {
-            assert!(book.allow_answer("k", "r", now));
+        assert_ne!(challenge_nonce(1), challenge_nonce(1), "the tail is random");
+        for bad in [
+            "",
+            "0000000000000001",
+            "000000000000000G-tail",
+            "000000000000000A-tail",
+            "fresh-nonce",
+        ] {
+            assert_eq!(challenge_counter(bad), None, "{bad:?}");
         }
-        assert!(!book.allow_answer("k", "r", now));
-        assert!(!book.allow_answer("k", "r", now + Duration::from_secs(59)));
-        assert!(book.allow_answer("k", "s", now), "per requester");
-        assert!(book.allow_answer("j", "r", now), "per room");
+        let too_long = format!("{}{}", "0".repeat(16), "x".repeat(200));
+        assert_eq!(challenge_counter(&too_long), None);
+    }
+
+    #[test]
+    fn only_a_newer_challenge_is_charged_and_the_latest_is_answered_from_cache() {
+        let keypair = crate::identity::AgentKeypair::generate().unwrap();
+        let now = Instant::now();
+        let mut book = HeadAnswers::default();
+        let first = challenge_nonce(10);
+        assert!(matches!(
+            book.admit("k", "r", &first, 10, now),
+            Admission::Fresh
+        ));
+        assert!(matches!(
+            book.admit("k", "r", &first, 10, now),
+            Admission::Repeat(None)
+        ));
+        let proof = sign_claim_with(&keypair, claim(&agent_hex(&keypair), "r", &first));
+        book.remember("k", "r", &first, &proof);
+        assert!(matches!(
+            book.admit("k", "r", &first, 10, now),
+            Admission::Repeat(Some(_))
+        ));
+        assert!(matches!(
+            book.admit("k", "r", &challenge_nonce(10), 10, now),
+            Admission::Stale
+        ));
+        assert!(matches!(
+            book.admit("k", "r", &challenge_nonce(9), 9, now),
+            Admission::Stale
+        ));
+        // Replays charge nothing: eleven newer challenges still fit.
+        for counter in 11..22 {
+            assert!(matches!(
+                book.admit("k", "r", &challenge_nonce(counter), counter, now),
+                Admission::Fresh
+            ));
+        }
+        assert!(matches!(
+            book.admit("k", "r", &challenge_nonce(30), 30, now),
+            Admission::Limited
+        ));
         assert!(
-            book.allow_answer("k", "r", now + HEAD_PROOF_WINDOW),
-            "the oldest answer leaves the window"
+            matches!(
+                book.admit("k", "r", &challenge_nonce(30), 30, now + HEAD_PROOF_WINDOW),
+                Admission::Fresh
+            ),
+            "a limited challenge did not become the latest"
         );
+        assert!(matches!(
+            book.admit("k", "s", &challenge_nonce(1), 1, now),
+            Admission::Fresh
+        ));
+        assert!(matches!(
+            book.admit("j", "r", &challenge_nonce(1), 1, now),
+            Admission::Fresh
+        ));
         book.wipe("k");
         assert!(book.answered.keys().all(|(key, _)| key != "k"));
-
-        let mut big = HeadProofs::default();
-        for n in 0..HEAD_PROOF_LIMIT_PRUNE_AT {
-            big.allow_answer("k", &n.to_string(), now);
-        }
-        big.allow_answer("k", "late", now + HEAD_PROOF_WINDOW);
-        assert_eq!(big.answered.len(), 1, "stale entries are dropped");
-    }
-
-    #[test]
-    fn the_challenge_set_is_the_named_agents_and_the_roster_admins_but_never_me() {
-        let me = "a".repeat(64);
-        let roster = vec!["b".repeat(64), me.clone()];
-        let named = vec![
-            "C".repeat(64),
-            "b".repeat(64),
-            "not hex".to_string(),
-            me.clone(),
-        ];
-        let asked = challenge_set(&named, &roster, &me);
-        assert_eq!(
-            asked.into_iter().collect::<Vec<_>>(),
-            vec!["b".repeat(64), "c".repeat(64)]
-        );
-        assert!(challenge_set(&[], std::slice::from_ref(&me), &me).is_empty());
     }
 }

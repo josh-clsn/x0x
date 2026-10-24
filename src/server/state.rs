@@ -1219,10 +1219,14 @@ pub(super) struct AppState {
     /// Survivor re-key A5: which members this daemon asked about a hole
     /// after its head, per room, and when it may ask each again.
     pub(super) treekem_gap_asks: StdMutex<crate::server::routes::named_groups::GapAsks>,
+    /// Survivor re-key A6: per (room, requester), the latest challenge
+    /// this daemon answered, its proof, and the answers in the current
+    /// window.
+    pub(super) treekem_head_answers: StdMutex<crate::server::routes::named_groups::HeadAnswers>,
     /// Survivor re-key A6: this daemon's open head round per room (the
-    /// nonce, whom it challenged, the proofs recorded), and the head
-    /// proofs it answered per (room, requester) in the current window.
-    pub(super) treekem_head_proofs: StdMutex<crate::server::routes::named_groups::HeadProofs>,
+    /// nonce, whom it challenged, the proofs recorded), and its challenge
+    /// counter.
+    pub(super) treekem_head_rounds: StdMutex<crate::server::routes::named_groups::HeadRounds>,
     /// Per-group serialization for authoritative membership mutations. The
     /// owner-side `MemberJoined`→`MemberAdded` add (and every other membership
     /// apply) is a read-modify-write that loads `info`, mutates a clone, mutates
@@ -1415,6 +1419,16 @@ pub(super) struct NamedGroupTestRecorders {
     /// Survivor re-key A5: every page request this daemon sent, as
     /// `(peer hex, exact payload)`, recorded before the send.
     pub(super) catchup_page_requests: StdMutex<Vec<(String, Vec<u8>)>>,
+    /// Survivor re-key A6: when set, `head_proof::answer_challenge` signals
+    /// the first `Notify` after its first roster read and waits on the
+    /// second before it reads the tree, so a test can change the roster in
+    /// between.
+    pub(super) head_answer_before_tree_read:
+        StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    /// Survivor re-key A6: when non-zero, the direct-message cap a page and
+    /// its head proof must fit together, in place of
+    /// `x0x::dm::MAX_PAYLOAD_BYTES`.
+    pub(super) page_and_proof_cap: std::sync::atomic::AtomicUsize,
     /// Survivor re-key A1: the next `seal_commit_owner_certified` fails, so
     /// a test can check the tree is rolled back after a mutate-then-seal.
     pub(super) seal_force_err: std::sync::atomic::AtomicBool,

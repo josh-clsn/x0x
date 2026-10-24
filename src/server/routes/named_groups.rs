@@ -18,7 +18,9 @@ use event_log_store::{
 pub(in crate::server) use event_log_store::{load_event_log, EventLog};
 mod fair_admission;
 mod head_proof;
-pub(in crate::server) use head_proof::HeadProofs;
+mod head_rounds;
+pub(in crate::server) use head_proof::HeadAnswers;
+pub(in crate::server) use head_rounds::HeadRounds;
 mod join_result_pins;
 mod seat_cert_fetch;
 mod signed_catchup;
@@ -11084,7 +11086,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     };
     // A page and a proof that do not fit one direct message go apart.
     let payload = match head_proof {
-        Some(proof) if payload.len() > x0x::dm::MAX_PAYLOAD_BYTES => {
+        Some(proof) if payload.len() > head_proof::page_and_proof_cap(state) => {
             head_proof::send_proof_only(state, sender, &request.group_id, proof).await;
             let mut response = response;
             response.head_proof = None;
@@ -11355,7 +11357,7 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     let mut response = response;
     if let Some(proof) = response.head_proof.take() {
         let signer = proof.claim.signer.clone();
-        let recorded = head_proof::record_proof(state, &response.group_id, proof).await;
+        let recorded = head_rounds::record_proof(state, &response.group_id, proof).await;
         tracing::debug!(
             group_id = %LogHexId::group(&response.group_id),
             signer = %LogHexId::agent(&signer),
@@ -23746,12 +23748,17 @@ async fn wipe_local_group_crypto_material(
         }
     }
     {
-        let mut head_proofs = state
-            .treekem_head_proofs
+        let mut head_answers = state
+            .treekem_head_answers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut head_rounds = state
+            .treekem_head_rounds
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for alias in &aliases {
-            head_proofs.wipe(alias);
+            head_answers.wipe(alias);
+            head_rounds.wipe(alias);
         }
     }
     {
@@ -45643,7 +45650,8 @@ pub(in crate::server) mod tests {
             treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
             treekem_package_repulls: std::sync::Mutex::default(),
             treekem_gap_asks: std::sync::Mutex::default(),
-            treekem_head_proofs: std::sync::Mutex::default(),
+            treekem_head_answers: std::sync::Mutex::default(),
+            treekem_head_rounds: std::sync::Mutex::default(),
             group_membership_locks: RwLock::new(HashMap::new()),
             treekem_groups: RwLock::new(HashMap::new()),
             treekem_dir,
