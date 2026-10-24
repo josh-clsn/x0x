@@ -13,21 +13,27 @@
 //!   hole. When the first event it holds past the head is later than that,
 //!   it serves nothing and says so in `log_evicted_through`, the field it
 //!   already sets when its log dropped those events.
-//! - **A requester asks other members** when a page leaves it behind a
-//!   hole: the responder said so, or (an older responder) the page carried
-//!   a commit past the one its head needs. It asks the active members it
-//!   has not asked about this head, admins first, at most
-//!   [`GAP_ASK_PEERS`] at a time and each member once per head, so a hole
-//!   no member can fill ends the asking.
+//! - **A requester asks other members** when a member it can authenticate
+//!   reports a hole after its head: a signed (or transport-verified)
+//!   `log_evicted_through` past the head, or, over a verified transport, an
+//!   older responder's page that carried a commit past the one the head
+//!   needs. It asks active members, admins first, at most [`GAP_ASK_PEERS`]
+//!   at a time. A member asked about a head is asked about it again only
+//!   after a window that doubles each time ([`gap_ask_window`]), so a
+//!   member that was away is asked again, and a hole no member can fill
+//!   costs a few requests per member, spread out.
 
 use super::{
     commit_bearing_event_frontier, commit_bearing_event_sort_key, parse_agent_id_hex,
-    request_treekem_catchup_page, AppState, NamedGroupMetadataEvent,
+    signed_catchup, AppState, NamedGroupMetadataEvent, TREEKEM_CATCHUP_THROTTLE,
 };
 use crate as x0x;
 use crate::identity::AgentId;
 use crate::logging::LogHexId;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, PoisonError};
+use std::time::Duration;
+use tokio::time::Instant;
 
 /// The most members one hole makes a requester ask at once.
 pub(super) const GAP_ASK_PEERS: usize = 3;
@@ -117,11 +123,112 @@ pub(super) fn served_revisions(events: &[NamedGroupMetadataEvent]) -> Vec<u64> {
     events.iter().filter_map(revision_of).collect()
 }
 
-fn gap_ask_key(group_key: &str, peer: &AgentId, revision: u64, epoch: u64) -> String {
-    format!(
-        "gap-ask:{group_key}:{}:{revision}:{epoch}",
-        hex::encode(peer.as_bytes())
-    )
+/// The longest a requester waits before asking a member about the same
+/// head again: the window doubles from [`TREEKEM_CATCHUP_THROTTLE`] up to
+/// this.
+pub(super) const GAP_ASK_MAX_WINDOW: Duration = Duration::from_secs(320);
+
+/// How long after its `attempts`-th ask about one head a member may be
+/// asked again.
+pub(super) fn gap_ask_window(attempts: u32) -> Duration {
+    let doublings = attempts.saturating_sub(1).min(6);
+    TREEKEM_CATCHUP_THROTTLE
+        .saturating_mul(1 << doublings)
+        .min(GAP_ASK_MAX_WINDOW)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PeerAsk {
+    attempts: u32,
+    /// When this member may be asked about the head again.
+    next: Instant,
+}
+
+#[derive(Debug, Default)]
+struct RoomAsks {
+    /// The head (revision, epoch) the asks are about.
+    head: (u64, u64),
+    peers: HashMap<AgentId, PeerAsk>,
+}
+
+/// Which members a requester asked about a hole after its head, and when it
+/// may ask each again (A5 review I-2). One entry per room and member: a new
+/// head starts the room afresh, and a wipe drops it.
+#[derive(Debug, Default)]
+pub(in crate::server) struct GapAsks {
+    rooms: HashMap<String, RoomAsks>,
+}
+
+impl GapAsks {
+    /// Up to [`GAP_ASK_PEERS`] of `candidates` (in preference order) that
+    /// may be asked about `head` at `now`. Each is reserved for one window.
+    pub(super) fn choose(
+        &mut self,
+        room: &str,
+        head: (u64, u64),
+        candidates: &[AgentId],
+        now: Instant,
+    ) -> Vec<AgentId> {
+        let asks = self.rooms.entry(room.to_string()).or_default();
+        if asks.head != head {
+            asks.head = head;
+            asks.peers.clear();
+        }
+        asks.peers.retain(|peer, _| candidates.contains(peer));
+        let chosen: Vec<AgentId> = candidates
+            .iter()
+            .filter(|peer| asks.peers.get(peer).is_none_or(|ask| ask.next <= now))
+            .take(GAP_ASK_PEERS)
+            .copied()
+            .collect();
+        for peer in &chosen {
+            let ask = asks.peers.entry(*peer).or_insert(PeerAsk {
+                attempts: 0,
+                next: now,
+            });
+            ask.attempts = ask.attempts.saturating_add(1);
+            ask.next = now + gap_ask_window(ask.attempts);
+        }
+        chosen
+    }
+
+    /// The request to `peer` was handed to the transport at `now`: its
+    /// window runs from here.
+    pub(super) fn sent(&mut self, room: &str, head: (u64, u64), peer: &AgentId, now: Instant) {
+        if let Some(ask) = self
+            .rooms
+            .get_mut(room)
+            .filter(|asks| asks.head == head)
+            .and_then(|asks| asks.peers.get_mut(peer))
+        {
+            ask.next = now + gap_ask_window(ask.attempts);
+        }
+    }
+
+    /// No request went to `peer`: give back its reservation.
+    pub(super) fn not_sent(&mut self, room: &str, head: (u64, u64), peer: &AgentId) {
+        if let Some(asks) = self.rooms.get_mut(room).filter(|asks| asks.head == head) {
+            if let Some(ask) = asks.peers.get_mut(peer) {
+                ask.attempts = ask.attempts.saturating_sub(1);
+                if ask.attempts == 0 {
+                    asks.peers.remove(peer);
+                }
+            }
+        }
+    }
+
+    /// Whether no member of `room` is reserved or waiting.
+    #[cfg(test)]
+    pub(in crate::server) fn is_empty_for(&self, room: &str) -> bool {
+        self.rooms
+            .get(room)
+            .is_none_or(|asks| asks.peers.is_empty())
+    }
+
+    /// Forget a room (it was wiped).
+    pub(in crate::server) fn wipe(&mut self, room: &str) {
+        self.rooms.remove(room);
+    }
 }
 
 /// Ask other members for the commits after this member's head, in a task
@@ -177,24 +284,17 @@ async fn ask_another_member(state: &Arc<AppState>, group_key: &str) {
                 .collect::<Vec<_>>(),
         )
     };
-    let chosen: Vec<AgentId> = {
-        let mut asked = state.treekem_catchup_throttle.write().await;
-        let chosen: Vec<AgentId> = candidates
-            .into_iter()
-            .filter(|peer| !asked.contains_key(&gap_ask_key(&key, peer, revision, epoch)))
-            .take(GAP_ASK_PEERS)
-            .collect();
-        let now = tokio::time::Instant::now();
-        for peer in &chosen {
-            asked.insert(gap_ask_key(&key, peer, revision, epoch), now);
-        }
-        chosen
-    };
+    let head = (revision, epoch);
+    let chosen = state
+        .treekem_gap_asks
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .choose(&key, head, &candidates, Instant::now());
     if chosen.is_empty() {
         tracing::debug!(
             group_id = %LogHexId::group(&key),
             revision,
-            "TreeKEM catch-up: every member was asked about this head; waiting for new traffic"
+            "TreeKEM catch-up: every member was asked about this head within its window"
         );
         return;
     }
@@ -202,13 +302,29 @@ async fn ask_another_member(state: &Arc<AppState>, group_key: &str) {
         group_id = %LogHexId::group(&key),
         revision,
         asking = chosen.len(),
-        "TreeKEM catch-up: a page left a hole after this member's head; asking other members"
+        "TreeKEM catch-up: a member reported a hole after this member's head; asking other members"
     );
-    let _sent = futures::future::join_all(
-        chosen
-            .iter()
-            .map(|peer| request_treekem_catchup_page(state, &key, peer)),
-    )
+    let _sent = futures::future::join_all(chosen.iter().map(|peer| {
+        let key = &key;
+        async move {
+            let Some(request) = signed_catchup::page_request(state, key, None).await else {
+                state
+                    .treekem_gap_asks
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .not_sent(key, head, peer);
+                return;
+            };
+            if let Err(e) = signed_catchup::send_page_request(state, peer, request).await {
+                tracing::debug!(group_id = %LogHexId::group(key), peer = %LogHexId::agent(&hex::encode(peer.as_bytes())), "hole catch-up request failed: {e}");
+            }
+            state
+                .treekem_gap_asks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .sent(key, head, peer, Instant::now());
+        }
+    }))
     .await;
 }
 
@@ -288,6 +404,70 @@ mod tests {
         let page = serve_page(vec![rename_at(4), rename_at(5)], 5, None, 1);
         assert!(page.events.is_empty());
         assert_eq!(page.gap_through, None);
+    }
+
+    fn peer(byte: u8) -> AgentId {
+        AgentId([byte; 32])
+    }
+
+    #[test]
+    fn a_member_asked_about_a_hole_is_asked_again_after_a_doubling_window() {
+        let mut asks = GapAsks::default();
+        let candidates: Vec<AgentId> = (1..=4).map(peer).collect();
+        let t0 = Instant::now();
+        let first = asks.choose("g", (5, 2), &candidates, t0);
+        assert_eq!(first, candidates[..GAP_ASK_PEERS].to_vec());
+        for p in &first {
+            asks.sent("g", (5, 2), p, t0);
+        }
+        assert_eq!(
+            asks.choose("g", (5, 2), &candidates, t0),
+            vec![peer(4)],
+            "the next report asks the member not yet asked"
+        );
+        asks.sent("g", (5, 2), &peer(4), t0);
+        let early = t0 + gap_ask_window(1) - Duration::from_millis(1);
+        assert!(asks.choose("g", (5, 2), &candidates, early).is_empty());
+        let later = t0 + gap_ask_window(1);
+        let again = asks.choose("g", (5, 2), &candidates, later);
+        assert_eq!(again, candidates[..GAP_ASK_PEERS].to_vec(), "asked again");
+        for p in &again {
+            asks.sent("g", (5, 2), p, later);
+        }
+        assert!(
+            asks.choose("g", (5, 2), &candidates[..1], later + gap_ask_window(1))
+                .is_empty(),
+            "the second window is twice as long"
+        );
+        assert_eq!(
+            asks.choose("g", (5, 2), &candidates[..1], later + gap_ask_window(2)),
+            vec![peer(1)]
+        );
+        assert_eq!(
+            asks.choose("g", (6, 2), &candidates, later),
+            candidates[..GAP_ASK_PEERS].to_vec(),
+            "a new head starts afresh"
+        );
+    }
+
+    #[test]
+    fn a_reservation_with_no_request_is_given_back() {
+        let mut asks = GapAsks::default();
+        let candidates = vec![peer(1)];
+        let t0 = Instant::now();
+        assert_eq!(asks.choose("g", (1, 1), &candidates, t0), candidates);
+        asks.not_sent("g", (1, 1), &peer(1));
+        assert!(asks.is_empty_for("g"));
+        assert_eq!(asks.choose("g", (1, 1), &candidates, t0), candidates);
+        asks.wipe("g");
+        assert!(asks.is_empty_for("g"));
+    }
+
+    #[test]
+    fn the_window_doubles_up_to_its_cap() {
+        assert_eq!(gap_ask_window(1), TREEKEM_CATCHUP_THROTTLE);
+        assert_eq!(gap_ask_window(2), TREEKEM_CATCHUP_THROTTLE * 2);
+        assert_eq!(gap_ask_window(u32::MAX), GAP_ASK_MAX_WINDOW);
     }
 
     #[test]

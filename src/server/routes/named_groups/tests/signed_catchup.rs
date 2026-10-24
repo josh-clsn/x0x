@@ -9,8 +9,10 @@
 
 use super::super::catchup_page_gap::GAP_ASK_PEERS;
 use super::super::signed_catchup::{
-    page_request, page_request_signed, sign_page_request, sign_page_request_with,
+    page_request, page_request_signed, sign_gap_report_with, sign_page_request,
+    sign_page_request_with,
 };
+use super::super::wipe_local_group_crypto_material;
 use super::epoch_ahead_catchup::{
     catchup_relay_fixture, catchup_request_from, deliver_catchup, encrypt, group_is_quarantined,
     legacy_bound_removal, live_epoch, live_treekem_group, published_removal_event, roster_head,
@@ -539,78 +541,270 @@ async fn an_event_at_or_below_the_requesters_revision_is_never_served() -> Resul
     Ok(())
 }
 
+/// The hole report S2 really serves S1 when S2's log lost the removal:
+/// signed, with no events.
+async fn s2_hole_report(cast: &SurvivorRelay) -> TreeKemCatchupResponse {
+    let request = page_request(&cast.s1, &cast.fixture.group_id, None)
+        .await
+        .expect("a request");
+    let report = served_page(&cast.s2, &cast.s1.agent.agent_id(), request, false)
+        .await
+        .expect("S2 answers");
+    assert!(report.events.is_empty());
+    assert!(report.signed_by.is_some(), "S2 signs its hole report");
+    report
+}
+
+/// The peers `state` asked, in order, once `count` requests went out.
+async fn asked_peers(state: &AppState, count: usize) -> Vec<String> {
+    wait_until(|| page_requests(state).len() >= count).await;
+    page_requests(state)
+        .into_iter()
+        .map(|(peer, _)| peer)
+        .collect()
+}
+
 #[tokio::test]
 async fn a_hole_after_the_head_asks_another_member() -> Result<()> {
     let mut cast = survivor_relay_fixture().await?;
-    let group_id = cast.fixture.group_id.clone();
-    removal_s1_missed(&cast).await;
+    let removal = removal_s1_missed(&cast).await;
+    rename_s1_missed(&cast).await;
+    s2_log_without(&cast, &removal).await;
     let owner_id = cast.fixture.state.agent.agent_id();
     let owner_hex = hex_id(&owner_id);
     let s1_id = cast.s1.agent.agent_id();
     let s2_id = cast.s2.agent.agent_id();
     let head = s1_head(&cast).await.0;
+    let report = s2_hole_report(&cast).await;
+    assert_eq!(report.log_evicted_through, Some(head + 1));
 
-    // S2 says its log does not reach back to S1's head.
-    handle_treekem_catchup_response(
-        &cast.s1,
-        &s2_id,
-        false,
-        TreeKemCatchupResponse {
-            message_type: "treekem_catchup_response".to_string(),
-            group_id: group_id.clone(),
-            events: Vec::new(),
-            truncated: false,
-            responder_state_hash: None,
-            log_evicted_through: Some(head + 1),
-            target_member_id: None,
-            target_member_key_package_b64: None,
-            signed_by: None,
-        },
-    )
-    .await;
-    wait_until(|| {
-        page_requests(&cast.s1)
-            .iter()
-            .any(|(peer, _)| *peer == owner_hex)
-    })
-    .await;
-    let asked = page_requests(&cast.s1);
-    assert!(asked.len() <= GAP_ASK_PEERS);
-    let (_, to_owner) = asked
-        .iter()
+    // S1 cannot verify S2, and S2 signed its report.
+    handle_treekem_catchup_response(&cast.s1, &s2_id, false, report.clone()).await;
+    // S1's roster still holds the owner, R and S2: one batch asks them all.
+    let asked = asked_peers(&cast.s1, GAP_ASK_PEERS).await;
+    assert_eq!(asked.len(), GAP_ASK_PEERS);
+    assert_eq!(asked[0], owner_hex, "the admin is asked first");
+    let (_, to_owner) = page_requests(&cast.s1)
+        .into_iter()
         .find(|(peer, _)| *peer == owner_hex)
-        .cloned()
         .expect("S1 asks the owner");
     assert!(page_request_signed(&to_owner));
     assert_eq!(to_owner.from_revision, head);
 
-    // The same hole at the same head asks nobody again.
-    handle_treekem_catchup_response(
-        &cast.s1,
-        &s2_id,
-        true,
-        TreeKemCatchupResponse {
-            message_type: "treekem_catchup_response".to_string(),
-            group_id: group_id.clone(),
-            events: Vec::new(),
-            truncated: false,
-            responder_state_hash: None,
-            log_evicted_through: Some(head + 1),
-            target_member_id: None,
-            target_member_key_package_b64: None,
-            signed_by: None,
-        },
-    )
-    .await;
+    // The same report at the same head, inside every window, asks nobody.
+    handle_treekem_catchup_response(&cast.s1, &s2_id, false, report).await;
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert_eq!(page_requests(&cast.s1).len(), asked.len());
 
-    // The owner answers the request it was sent, and S1 heals.
-    let page = served_page(&cast.fixture.state, &s1_id, to_owner, false)
+    // The owner answers what it was sent, page by page, and S1 heals.
+    let mut request = to_owner;
+    for _ in 0..2 {
+        let page = served_page(&cast.fixture.state, &s1_id, request, false)
+            .await
+            .expect("the owner serves S1");
+        handle_treekem_catchup_response(&cast.s1, &owner_id, false, page).await;
+        request = match page_requests(&cast.s1)
+            .into_iter()
+            .rev()
+            .find(|(peer, _)| *peer == owner_hex)
+        {
+            Some((_, next)) => next,
+            None => break,
+        };
+    }
+    s1_follows_the_owner(&mut cast, b"another member filled the hole").await?;
+    cast.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_second_hole_report_asks_the_next_batch_admins_first() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let group_id = cast.fixture.group_id.clone();
+    let removal = removal_s1_missed(&cast).await;
+    rename_s1_missed(&cast).await;
+    s2_log_without(&cast, &removal).await;
+    // Three more members on S1's roster: six candidates in all.
+    {
+        let mut groups = cast.s1.named_groups.write().await;
+        let info = groups.get_mut(&group_id).expect("group");
+        for _ in 0..3 {
+            let id = hex_id(&x0x::identity::AgentKeypair::generate()?.agent_id());
+            info.add_member(id, x0x::groups::GroupRole::Member, None, None);
+        }
+    }
+    let owner_hex = hex_id(&cast.fixture.state.agent.agent_id());
+    let report = s2_hole_report(&cast).await;
+    let s2_id = cast.s2.agent.agent_id();
+    handle_treekem_catchup_response(&cast.s1, &s2_id, false, report.clone()).await;
+    let first = asked_peers(&cast.s1, GAP_ASK_PEERS).await;
+    assert_eq!(first.len(), GAP_ASK_PEERS);
+    assert_eq!(first[0], owner_hex, "the admin is asked first");
+    handle_treekem_catchup_response(&cast.s1, &s2_id, false, report).await;
+    let both = asked_peers(&cast.s1, 2 * GAP_ASK_PEERS).await;
+    assert_eq!(both.len(), 2 * GAP_ASK_PEERS);
+    let second = &both[GAP_ASK_PEERS..];
+    assert!(
+        second.iter().all(|peer| !first.contains(peer)),
+        "the second report asks the members the first did not: {first:?} then {second:?}"
+    );
+    cast.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn forged_hole_reports_spend_nothing() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let group_id = cast.fixture.group_id.clone();
+    let removal = removal_s1_missed(&cast).await;
+    rename_s1_missed(&cast).await;
+    s2_log_without(&cast, &removal).await;
+    let s2_id = cast.s2.agent.agent_id();
+    let s1_hex = hex_id(&cast.s1.agent.agent_id());
+    let stranger = x0x::identity::AgentKeypair::generate()?;
+    let unsigned = TreeKemCatchupResponse {
+        message_type: "treekem_catchup_response".to_string(),
+        group_id: group_id.clone(),
+        events: Vec::new(),
+        truncated: false,
+        responder_state_hash: None,
+        log_evicted_through: Some(u64::MAX),
+        target_member_id: None,
+        target_member_key_package_b64: None,
+        signed_by: None,
+    };
+    let real = s2_hole_report(&cast).await;
+    // S2's real signature moved onto another hole.
+    let mut moved = real.clone();
+    moved.log_evicted_through = Some(u64::MAX);
+    // A stranger's genuine signature on its own report.
+    let stranger_signed = TreeKemCatchupResponse {
+        signed_by: sign_gap_report_with(&stranger, &group_id, &s1_hex, u64::MAX),
+        ..unsigned.clone()
+    };
+    for _ in 0..4 {
+        handle_treekem_catchup_response(&cast.s1, &s2_id, false, unsigned.clone()).await;
+        handle_treekem_catchup_response(&cast.s1, &s2_id, false, moved.clone()).await;
+        handle_treekem_catchup_response(
+            &cast.s1,
+            &stranger.agent_id(),
+            false,
+            stranger_signed.clone(),
+        )
+        .await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        page_requests(&cast.s1).is_empty(),
+        "no forged report asks anyone"
+    );
+    assert!(
+        cast.s1
+            .treekem_gap_asks
+            .lock()
+            .expect("gap asks")
+            .is_empty_for(&group_id),
+        "and none reserves a member"
+    );
+
+    // The real report still asks.
+    handle_treekem_catchup_response(&cast.s1, &s2_id, false, real).await;
+    assert_eq!(
+        asked_peers(&cast.s1, GAP_ASK_PEERS).await.len(),
+        GAP_ASK_PEERS
+    );
+    cast.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_replayed_request_cannot_cut_the_requester_off() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let group_id = cast.fixture.group_id.clone();
+    removal_s1_missed(&cast).await;
+    let s1_id = cast.s1.agent.agent_id();
+    let signed = page_request(&cast.s1, &group_id, None)
+        .await
+        .expect("a request");
+
+    // R holds S1's signed request (S1 still counts R a member) and replays
+    // it to S2, claiming S1, asking for an empty page.
+    let mut empty = signed.clone();
+    empty.limit = 0;
+    assert!(
+        served_page(&cast.s2, &s1_id, empty, false).await.is_none(),
+        "a changed limit breaks the signature"
+    );
+    // The genuine replay only sends S1 its own real page.
+    let replayed = served_page(&cast.s2, &s1_id, signed.clone(), false)
+        .await
+        .expect("a replay of the genuine request is served, to S1");
+    assert_eq!(replayed.events.len(), 1, "the page carries the removal");
+
+    // A request its own requester signed for zero events still gets one.
+    let mut zero = signed;
+    zero.limit = 0;
+    sign_page_request(&cast.s1, &mut zero);
+    let page = served_page(&cast.fixture.state, &s1_id, zero, false)
         .await
         .expect("the owner serves S1");
-    handle_treekem_catchup_response(&cast.s1, &owner_id, false, page).await;
-    s1_follows_the_owner(&mut cast, b"another member filled the hole").await?;
+    assert_eq!(page.events.len(), 1, "limit 0 is served as 1");
+    cast.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_room_wipe_drops_its_catchup_throttle_and_hole_asks() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let group_id = cast.fixture.group_id.clone();
+    let other = "ef".repeat(16);
+    let now = tokio::time::Instant::now();
+    {
+        let mut throttle = cast.s1.treekem_catchup_throttle.write().await;
+        for key in [
+            format!("{group_id}:peer:1:1"),
+            format!("serve:{group_id}:peer:1:1"),
+            format!("{group_id}:mk-serve:a:b"),
+            format!("{other}:peer:1:1"),
+            format!("serve:{other}:peer:1:1"),
+            format!("{group_id}x:peer:1:1"),
+        ] {
+            throttle.insert(key, now);
+        }
+    }
+    let peer = cast.s2.agent.agent_id();
+    for room in [&group_id, &other] {
+        let chosen =
+            cast.s1
+                .treekem_gap_asks
+                .lock()
+                .expect("gap asks")
+                .choose(room, (1, 1), &[peer], now);
+        assert_eq!(chosen, vec![peer]);
+    }
+    wipe_local_group_crypto_material(&cast.s1, &group_id, None, "test").await;
+    let mut kept: Vec<String> = cast
+        .s1
+        .treekem_catchup_throttle
+        .read()
+        .await
+        .keys()
+        .cloned()
+        .collect();
+    kept.sort();
+    let mut want = vec![
+        format!("{other}:peer:1:1"),
+        format!("serve:{other}:peer:1:1"),
+        format!("{group_id}x:peer:1:1"),
+    ];
+    want.sort();
+    assert_eq!(kept, want);
+    let (wiped, kept_other) = {
+        let asks = cast.s1.treekem_gap_asks.lock().expect("gap asks");
+        (asks.is_empty_for(&group_id), !asks.is_empty_for(&other))
+    };
+    assert!(wiped, "the wiped room's hole asks are gone");
+    assert!(kept_other, "another room's are kept");
     cast.shutdown().await;
     Ok(())
 }
@@ -641,4 +835,21 @@ async fn a_page_from_an_older_responder_that_skips_a_commit_asks_another_member(
     );
     cast.shutdown().await;
     Ok(())
+}
+
+#[test]
+fn a_large_catchup_throttle_drops_expired_keys_on_the_next_stamp() {
+    let now = tokio::time::Instant::now();
+    let Some(old) = now.checked_sub(std::time::Duration::from_secs(2 * 60 * 60)) else {
+        return;
+    };
+    let mut throttle = HashMap::new();
+    for n in 0..1100 {
+        throttle.insert(format!("g:old:{n}"), old);
+    }
+    throttle.insert("g:recent".to_string(), now);
+    stamp_catchup_throttle(&mut throttle, "g:new".to_string(), now);
+    let mut kept: Vec<&String> = throttle.keys().collect();
+    kept.sort();
+    assert_eq!(kept, vec!["g:new", "g:recent"]);
 }
