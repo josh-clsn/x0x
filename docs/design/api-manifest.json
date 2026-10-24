@@ -2595,7 +2595,7 @@
             "cli": "default",
             "in": "body",
             "name": "challenge",
-            "required": true
+            "required": false
           }
         ],
         "kind": "fields"
@@ -2614,6 +2614,12 @@
             "in": "query",
             "name": "since_revision",
             "required": true
+          },
+          {
+            "cli": "default",
+            "in": "query",
+            "name": "since_state_hash",
+            "required": false
           }
         ],
         "kind": "fields"

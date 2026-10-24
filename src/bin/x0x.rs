@@ -1667,8 +1667,9 @@ enum GroupSub {
         /// live tree, the daemon catches up.
         #[arg(long)]
         observed_epoch: Option<u64>,
-        /// An agent id (64 hex) to challenge; repeat for each.
-        #[arg(long, required = true, value_name = "AGENT")]
+        /// An agent id (64 hex) to challenge; repeat for each. None: only
+        /// the roster's admins are challenged.
+        #[arg(long, value_name = "AGENT")]
         challenge: Vec<String>,
     },
     /// This daemon's TreeKEM head, the admins of every state applied since
@@ -1679,6 +1680,9 @@ enum GroupSub {
         /// The anchor revision: admins of every later state are listed.
         #[arg(long)]
         since_revision: u64,
+        /// The anchor's state hash: the anchor must be that state.
+        #[arg(long)]
+        since_state_hash: Option<String>,
     },
     /// Sign this daemon's head proof for a requester's own signed
     /// challenge (survivor re-key).
@@ -2947,7 +2951,16 @@ async fn run(
             Some(GroupSub::TreekemState {
                 group_id,
                 since_revision,
-            }) => commands::group::treekem_state(&client, &group_id, since_revision).await,
+                since_state_hash,
+            }) => {
+                commands::group::treekem_state(
+                    &client,
+                    &group_id,
+                    since_revision,
+                    since_state_hash.as_deref(),
+                )
+                .await
+            }
             Some(GroupSub::TreekemHeadProof { group_id, path }) => {
                 commands::group::treekem_head_proof(&client, &group_id, &path).await
             }

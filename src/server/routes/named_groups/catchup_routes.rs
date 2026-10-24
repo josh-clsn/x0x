@@ -17,9 +17,18 @@
 //!   reached the engine over another path, under the same rules as one
 //!   that arrives over x0x.
 //!
-//! Every refusal carries a machine `reason` and a `retry`: `later` (hold;
-//! the same request may succeed later) or `never` (hold; this request will
-//! not succeed as it is).
+//! **Every non-2xx answer is a hold.** A refusal these handlers produce
+//! carries a machine `reason` and a `retry` hint ([`Retry`]); the
+//! admission refusals (unknown group 404, bearer 403, withdrawn 409) and
+//! axum's own extractor rejections (400/422, plain text) carry neither,
+//! and are holds too. The hints mean:
+//!
+//! - `later`: hold; the **same request** may succeed if sent again later;
+//! - `new_round`: hold; this request is spent and will never succeed, but
+//!   a **new round** (a fresh challenge from the requester's next trigger)
+//!   may succeed later;
+//! - `never`: hold; neither helps until something about the room changes
+//!   (a member, a role, the plane), or the request is malformed.
 
 use super::head_proof::{self, HeadProof, Refusal, SignedChallenge};
 use super::head_rounds::{self, NoRound, NotRecorded};
@@ -40,12 +49,15 @@ use std::sync::Arc;
 /// the roster moved while it read the tree.
 const STATE_READ_ATTEMPTS: usize = 3;
 
-/// Whether a refused request may succeed later as it is.
+/// What a refused request's sender may do next. Every refusal is a hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::server) enum Retry {
-    /// Hold; the same request may succeed later.
+    /// The same request may succeed if sent again later.
     Later,
-    /// Hold; this request will not succeed as it is.
+    /// This request is spent; a new round, with a fresh challenge, may
+    /// succeed later.
+    NewRound,
+    /// Nothing succeeds until something about the room changes.
     Never,
 }
 
@@ -53,6 +65,7 @@ impl Retry {
     fn as_str(self) -> &'static str {
         match self {
             Retry::Later => "later",
+            Retry::NewRound => "new_round",
             Retry::Never => "never",
         }
     }
@@ -105,19 +118,22 @@ impl Refused {
     }
 }
 
-const NOT_A_TREEKEM_ROOM: Refused = Refused::new(
-    StatusCode::CONFLICT,
-    "not_a_treekem_room",
-    Retry::Never,
-    "this room has no TreeKEM tree on this daemon",
-);
-
-const UNAVAILABLE: Refused = Refused::new(
-    StatusCode::SERVICE_UNAVAILABLE,
-    "unavailable",
-    Retry::Later,
-    "the room's roster kept moving while its head was read",
-);
+/// The refusal when this daemon holds no TreeKEM tree for the room, on
+/// every route. A room on the TreeKEM plane whose tree is not installed
+/// yet (a Welcome pending, a re-join in flight) may have one later; a room
+/// on another plane never will.
+pub(in crate::server) fn not_a_treekem_room(treekem_plane: bool) -> Refused {
+    Refused::new(
+        StatusCode::CONFLICT,
+        "not_a_treekem_room",
+        if treekem_plane {
+            Retry::Later
+        } else {
+            Retry::Never
+        },
+        "this daemon holds no TreeKEM tree for the room",
+    )
+}
 
 /// The refusal for a challenge [`head_proof::answer_challenge`] did not
 /// answer.
@@ -135,22 +151,22 @@ pub(in crate::server) fn sign_refusal(refusal: Refusal) -> Refused {
             Retry::Never,
             "the requester has since sent a newer challenge, or this one got no proof",
         ),
-        Refusal::NoRoom => Refused::new(
-            StatusCode::CONFLICT,
-            "not_a_treekem_room",
-            Retry::Later,
-            "this daemon holds no live roster or tree for the room",
-        ),
+        // Refused before the challenge was charged. The route has already
+        // seen this room's tree, so it is a room on the TreeKEM plane.
+        Refusal::NoRoom => not_a_treekem_room(true),
         Refusal::RequesterNotActive => Refused::new(
             StatusCode::FORBIDDEN,
             "requester_not_active",
             Retry::Never,
             "the requester is not an active member on this daemon's roster",
         ),
+        // A limited challenge still becomes the latest, so this request is
+        // refused as stale from now on; the requester's next round may be
+        // answered once the window frees.
         Refusal::Limited => Refused::new(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
-            Retry::Later,
+            Retry::NewRound,
             "the requester used up its answers for this window",
         ),
         Refusal::NotAnAdmin => Refused::new(
@@ -159,12 +175,14 @@ pub(in crate::server) fn sign_refusal(refusal: Refusal) -> Refused {
             Retry::Never,
             "this daemon is not an active admin of the room",
         ),
+        // Always after the challenge was charged: it is spent.
         Refusal::Unavailable => Refused::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "unavailable",
-            Retry::Later,
-            "signing failed, or the roster kept moving while it was read",
+            Retry::NewRound,
+            "signing failed, or the room moved or went away while it was read",
         ),
+        // The cached proof is re-sent to the same request after the window.
         Refusal::RepeatTooSoon => Refused::new(
             StatusCode::TOO_MANY_REQUESTS,
             "repeat_too_soon",
@@ -202,8 +220,28 @@ pub(in crate::server) fn no_round_refusal(reason: NoRound) -> Refused {
             Retry::Later,
             "the challenge counter could not be kept; no round opened",
         ),
+        NoRound::NoSignature => Refused::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "challenge_not_signed",
+            Retry::Later,
+            "this member's challenge could not be signed; no round opened",
+        ),
+        NoRound::TooSoon => Refused::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "round_too_soon",
+            Retry::Later,
+            "a round opened in this room moments ago; it stays open",
+        ),
     }
 }
+
+/// The GET's refusal when the roster kept moving across every read.
+const STATE_UNAVAILABLE: Refused = Refused::new(
+    StatusCode::SERVICE_UNAVAILABLE,
+    "unavailable",
+    Retry::Later,
+    "the room's roster kept moving while its head was read",
+);
 
 /// The machine reason a proof was not recorded.
 pub(in crate::server) fn not_recorded_reason(reason: NotRecorded) -> &'static str {
@@ -217,8 +255,32 @@ pub(in crate::server) fn not_recorded_reason(reason: NotRecorded) -> &'static st
     }
 }
 
-/// The admins of every state this daemon applied after `since_revision`,
-/// oldest first, each sorted, and whether that list is complete.
+/// The admins of every state applied after an anchor ([`admins_since`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::server) struct AdminsSince {
+    /// Each state's active admins, oldest state first, each sorted.
+    pub(in crate::server) states: Vec<Vec<String>>,
+    /// Whether no state after the anchor can be missing.
+    pub(in crate::server) complete: bool,
+    /// The states name more distinct admins than a round could challenge:
+    /// `states` is left empty and `complete` false, so the engine holds
+    /// (it could not open a round for them anyway).
+    pub(in crate::server) too_large: bool,
+}
+
+impl AdminsSince {
+    fn incomplete() -> Self {
+        Self {
+            states: Vec::new(),
+            complete: false,
+            too_large: false,
+        }
+    }
+}
+
+/// The admins of every state this daemon applied after the anchor
+/// `(since_revision, since_state_hash)`, oldest first, each sorted, and
+/// whether that list is complete.
 ///
 /// They come from the room's retained commits (#111, `GroupInfo::
 /// commit_log`): every commit this daemon sealed or applied is retained,
@@ -226,43 +288,59 @@ pub(in crate::server) fn not_recorded_reason(reason: NotRecorded) -> &'static st
 /// roster. A4's catch-up log holds the events, whose signed commits name
 /// only a roster root, so it cannot say who the admins of a state were.
 ///
-/// Complete only when nothing after `since_revision` can be missing: the
-/// first retained state after it links by its signed `prev_state_hash` to
-/// the retained state at or before it, or, when none is retained (the
-/// room's first commit, or the log was trimmed), is revision
-/// `since_revision + 1`, so no state can sit between them (revisions only
-/// grow); each later state links to the one before; every roster
-/// re-derives its commit's signed roster root; and the last one is the
-/// live roster. Otherwise the engine must hold.
+/// Complete only when nothing after the anchor can be missing: the first
+/// retained state after it links by its signed `prev_state_hash` to the
+/// retained state at or before it, or, when none is retained (the room's
+/// first commit, or the log was trimmed), is revision `since_revision + 1`,
+/// so no state can sit between them (revisions only grow); each later
+/// state links to the one before; every roster re-derives its commit's
+/// signed roster root; and the last one is the live roster. When the
+/// engine gives the anchor's `since_state_hash`, the anchor must also be
+/// that state: the retained base's hash, or the first state's
+/// `prev_state_hash`, or the live hash when nothing was applied since (A7
+/// review m-3). Otherwise the engine must hold.
 pub(in crate::server) fn admins_since(
     info: &x0x::groups::GroupInfo,
     since_revision: u64,
-) -> (Vec<Vec<String>>, bool) {
+    since_state_hash: Option<&str>,
+) -> AdminsSince {
+    let anchored_at = |hash: Option<&str>| since_state_hash.is_none_or(|want| hash == Some(want));
     if since_revision > info.state_revision {
-        return (Vec::new(), false);
+        return AdminsSince::incomplete();
     }
     if since_revision == info.state_revision {
-        return (Vec::new(), true);
+        return AdminsSince {
+            states: Vec::new(),
+            complete: anchored_at(Some(info.state_hash.as_str())),
+            too_large: false,
+        };
     }
     let log = &info.commit_log;
     let after: Vec<_> = log
         .iter()
         .filter(|retained| retained.commit.revision > since_revision)
         .collect();
-    let admins = after
-        .iter()
-        .map(|retained| {
-            retained
-                .roster
-                .iter()
-                .filter(|(_, member)| {
-                    member.state == x0x::groups::GroupMemberState::Active
-                        && member.role.at_least(x0x::groups::GroupRole::Admin)
-                })
-                .map(|(agent, _)| agent.to_ascii_lowercase())
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    let mut union = std::collections::BTreeSet::new();
+    let mut states = Vec::with_capacity(after.len());
+    for retained in &after {
+        let admins: Vec<String> = retained
+            .roster
+            .iter()
+            .filter(|(_, member)| {
+                member.state == x0x::groups::GroupMemberState::Active
+                    && member.role.at_least(x0x::groups::GroupRole::Admin)
+            })
+            .map(|(agent, _)| agent.to_ascii_lowercase())
+            .collect();
+        union.extend(admins.iter().cloned());
+        if union.len() > head_proof::HEAD_PROOF_MAX_ADMINS {
+            return AdminsSince {
+                too_large: true,
+                ..AdminsSince::incomplete()
+            };
+        }
+        states.push(admins);
+    }
     let base = log
         .iter()
         .rev()
@@ -270,8 +348,12 @@ pub(in crate::server) fn admins_since(
     let reaches_back = match (base, after.first()) {
         (Some(base), Some(first)) => {
             first.commit.prev_state_hash.as_deref() == Some(base.commit.state_hash.as_str())
+                && anchored_at(Some(base.commit.state_hash.as_str()))
         }
-        (None, Some(first)) => first.commit.revision == since_revision.saturating_add(1),
+        (None, Some(first)) => {
+            first.commit.revision == since_revision.saturating_add(1)
+                && anchored_at(first.commit.prev_state_hash.as_deref())
+        }
         (_, None) => false,
     };
     let linked = after.windows(2).all(|pair| {
@@ -283,18 +365,26 @@ pub(in crate::server) fn admins_since(
     let reaches_head = after.last().is_some_and(|last| {
         last.commit.revision == info.state_revision && last.commit.state_hash == info.state_hash
     });
-    (admins, reaches_back && linked && consistent && reaches_head)
+    AdminsSince {
+        states,
+        complete: reaches_back && linked && consistent && reaches_head,
+        too_large: false,
+    }
 }
 
 /// Re-run the route's admission under this handler's own read of the room
 /// (the `/members` pattern), and resolve whether it has a tree.
+///
+/// The trigger passes `hold`, so its `not_a_treekem_room` carries the hold
+/// body like every other refusal it produces.
 async fn admitted_tree(
     state: &AppState,
     id: &str,
     actor: &ActorContext,
     read: bool,
+    hold: bool,
 ) -> Result<Arc<tokio::sync::Mutex<x0x::mls::TreeKemMlsGroup>>, Response> {
-    {
+    let treekem_plane = {
         let local_hex = hex::encode(state.agent.agent_id().as_bytes());
         let groups = state.named_groups.read().await;
         let Some(info) = groups.get(id) else {
@@ -306,14 +396,17 @@ async fn admitted_tree(
             admit_treekem_owner_route(info, actor)
         };
         admission.map_err(IntoResponse::into_response)?;
-    }
-    state
-        .treekem_groups
-        .read()
-        .await
-        .get(id)
-        .cloned()
-        .ok_or_else(|| NOT_A_TREEKEM_ROOM.respond())
+        info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+    };
+    let tree = state.treekem_groups.read().await.get(id).cloned();
+    tree.ok_or_else(|| {
+        let refused = not_a_treekem_room(treekem_plane);
+        if hold {
+            refused.respond_hold()
+        } else {
+            refused.respond()
+        }
+    })
 }
 
 /// `POST /groups/:id/treekem/catch-up`.
@@ -324,7 +417,9 @@ pub(in crate::server) struct TreeKemCatchUpTriggerRequest {
     #[serde(default)]
     observed_epoch: Option<u64>,
     /// The engine's anchored admin set (C3), as 64-hex agent ids. Each is
-    /// challenged, with every admin on this daemon's roster.
+    /// challenged, with every admin on this daemon's roster. Absent or
+    /// empty, only the roster's admins are.
+    #[serde(default)]
     challenge: Vec<String>,
 }
 
@@ -336,6 +431,11 @@ pub(in crate::server) struct TreeKemCatchUpTriggerRequest {
 /// `catching_up` whether `observed_epoch` started the epoch-ahead
 /// catch-up. When no round opens, a refusal with `"round": null` and
 /// `"hold": true`: the room holds, and no smaller round is ever opened.
+/// Such a refusal also closes the room's previous round, so the GET never
+/// reports a round asked of fewer agents than the engine named (A7 review
+/// m-6), except `round_too_soon`, which leaves the round opened moments
+/// ago in place. A room opens at most one round per
+/// [`head_rounds::ROUND_MIN_GAP`] (A7 review m-5).
 pub(in crate::server) async fn treekem_catch_up_trigger(
     State(state): State<Arc<AppState>>,
     Extension(actor): Extension<ActorContext>,
@@ -345,6 +445,13 @@ pub(in crate::server) async fn treekem_catch_up_trigger(
     _access: GroupAccess,
     Json(body): Json<TreeKemCatchUpTriggerRequest>,
 ) -> Response {
+    let tree = match admitted_tree(&state, &id, &actor, false, true).await {
+        Ok(tree) => tree,
+        Err(response) => {
+            head_rounds::close_round(&state, &id);
+            return response;
+        }
+    };
     let named: Option<Vec<String>> = body
         .challenge
         .iter()
@@ -354,6 +461,7 @@ pub(in crate::server) async fn treekem_catch_up_trigger(
         })
         .collect();
     let Some(named) = named else {
+        head_rounds::close_round(&state, &id);
         return Refused::new(
             StatusCode::BAD_REQUEST,
             "bad_challenge_agent",
@@ -362,10 +470,6 @@ pub(in crate::server) async fn treekem_catch_up_trigger(
         )
         .respond_hold();
     };
-    let tree = match admitted_tree(&state, &id, &actor, false).await {
-        Ok(tree) => tree,
-        Err(response) => return response,
-    };
     let live_epoch = tree.lock().await.epoch();
     let catching_up = body
         .observed_epoch
@@ -373,7 +477,7 @@ pub(in crate::server) async fn treekem_catch_up_trigger(
     if let Some(observed) = body.observed_epoch.filter(|_| catching_up) {
         spawn_treekem_epoch_ahead_catchup(&state, &id, observed);
     }
-    match head_rounds::challenge_admins(&state, &id, &named).await {
+    match head_rounds::challenge_admins(&state, &id, &named, head_rounds::ROUND_MIN_GAP).await {
         Ok(opened) => (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({
@@ -385,7 +489,12 @@ pub(in crate::server) async fn treekem_catch_up_trigger(
             })),
         )
             .into_response(),
-        Err(reason) => no_round_refusal(reason).respond_hold(),
+        Err(reason) => {
+            if reason != NoRound::TooSoon {
+                head_rounds::close_round(&state, &id);
+            }
+            no_round_refusal(reason).respond_hold()
+        }
     }
 }
 
@@ -395,6 +504,10 @@ pub(in crate::server) struct TreeKemCatchUpStateQuery {
     /// The revision of the engine's anchor: `admins_since` lists the admins
     /// of every state applied after it.
     since_revision: u64,
+    /// The anchor's state hash, when the engine kept it: the anchor must
+    /// then be that very state for `admins_since_complete`.
+    #[serde(default)]
+    since_state_hash: Option<String>,
 }
 
 /// The roster facts the read route reports, read in one go.
@@ -404,19 +517,39 @@ struct RosterState {
     state_hash: String,
     security_binding: Option<String>,
     admins: Vec<String>,
-    admins_since: Vec<Vec<String>>,
-    admins_since_complete: bool,
+    admins_since: AdminsSince,
+    /// The fork-quarantine marker's wire fields, `(revision, no_anchor)`,
+    /// when the room is quarantined. Its forensic snapshot stays private.
+    fork_quarantine: Option<(u64, bool)>,
+}
+
+/// The roster's revision and hash, admitted again: the second read that
+/// checks the roster did not move while the tree was read.
+async fn roster_head(
+    state: &AppState,
+    id: &str,
+    actor: &ActorContext,
+) -> Result<(u64, String), Response> {
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let groups = state.named_groups.read().await;
+    let Some(info) = groups.get(id) else {
+        return Err(super::not_found("group not found").into_response());
+    };
+    admit_treekem_catch_up_state(info, actor, &local_hex).map_err(IntoResponse::into_response)?;
+    Ok((info.state_revision, info.state_hash.clone()))
 }
 
 async fn roster_state(
     state: &AppState,
     id: &str,
     actor: &ActorContext,
-    since_revision: u64,
+    query: &TreeKemCatchUpStateQuery,
 ) -> Result<RosterState, Response> {
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
-    let Some(info) = groups.get(id) else {
+    // #732: this read feeds the quarantine report, so it resolves both
+    // spellings (the extractor already required the direct key).
+    let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, id) else {
         return Err(super::not_found("group not found").into_response());
     };
     admit_treekem_catch_up_state(info, actor, &local_hex).map_err(IntoResponse::into_response)?;
@@ -427,15 +560,21 @@ async fn roster_state(
         .collect();
     admins.sort();
     admins.dedup();
-    let (admins_since, admins_since_complete) = admins_since(info, since_revision);
     Ok(RosterState {
         group_id: info.stable_group_id().to_string(),
         revision: info.state_revision,
         state_hash: info.state_hash.clone(),
         security_binding: info.security_binding.clone(),
         admins,
-        admins_since,
-        admins_since_complete,
+        admins_since: admins_since(
+            info,
+            query.since_revision,
+            query.since_state_hash.as_deref(),
+        ),
+        fork_quarantine: info
+            .fork_quarantine
+            .as_ref()
+            .map(|marker| (marker.revision, marker.no_anchor)),
     })
 }
 
@@ -444,11 +583,17 @@ async fn roster_state(
 ///
 /// - `epoch`, `epoch_authenticator`: the live tree's, from one borrow under
 ///   its lock;
-/// - `security_binding`, `revision`, `admins` (sorted): this daemon's
-///   roster, unchanged while the tree was read;
+/// - `security_binding`, `revision`, `state_hash`, `admins` (sorted):
+///   this daemon's roster, unchanged while the tree was read;
 /// - `admins_since`: the admins of every state applied after `r`, oldest
 ///   first ([`admins_since`]); `admins_since_complete` is false when one
-///   may be missing, and the engine must then hold;
+///   may be missing, and the engine must then hold; `admins_since_too_large`
+///   is true (with an empty list) when they name more admins than a round
+///   holds, which is a hold too;
+/// - `fork_quarantined`: whether the room is fork-quarantined here, and
+///   when it is, `fork_quarantine: {"revision", "no_anchor"}`. Every seal
+///   is refused while it is, so the engine holds and says the room needs a
+///   new invite;
 /// - `started_at_ms`: an opaque marker of this daemon run. When it
 ///   changes, the daemon restarted. It is not a clock reading: the engine
 ///   must never subtract from it;
@@ -472,11 +617,11 @@ pub(in crate::server) async fn treekem_catch_up_state(
     _access: GroupAccess,
 ) -> Response {
     for _ in 0..STATE_READ_ATTEMPTS {
-        let roster = match roster_state(&state, &id, &actor, query.since_revision).await {
+        let roster = match roster_state(&state, &id, &actor, &query).await {
             Ok(roster) => roster,
             Err(response) => return response,
         };
-        let tree = match admitted_tree(&state, &id, &actor, true).await {
+        let tree = match admitted_tree(&state, &id, &actor, true, false).await {
             Ok(tree) => tree,
             Err(response) => return response,
         };
@@ -485,13 +630,13 @@ pub(in crate::server) async fn treekem_catch_up_state(
             guard.head()
         };
         let Ok((epoch, authenticator)) = head else {
-            return UNAVAILABLE.respond();
+            return STATE_UNAVAILABLE.respond();
         };
-        let still = match roster_state(&state, &id, &actor, query.since_revision).await {
+        let still = match roster_head(&state, &id, &actor).await {
             Ok(still) => still,
             Err(response) => return response,
         };
-        if (still.revision, &still.state_hash) != (roster.revision, &roster.state_hash) {
+        if still != (roster.revision, roster.state_hash.clone()) {
             continue;
         }
         let round = head_rounds::round_view(&state, &id).map(|round| {
@@ -511,9 +656,15 @@ pub(in crate::server) async fn treekem_catch_up_state(
                 "epoch_authenticator": hex::encode(authenticator),
                 "security_binding": roster.security_binding,
                 "revision": roster.revision,
+                "state_hash": roster.state_hash,
                 "admins": roster.admins,
-                "admins_since": roster.admins_since,
-                "admins_since_complete": roster.admins_since_complete,
+                "admins_since": roster.admins_since.states,
+                "admins_since_complete": roster.admins_since.complete,
+                "admins_since_too_large": roster.admins_since.too_large,
+                "fork_quarantined": roster.fork_quarantine.is_some(),
+                "fork_quarantine": roster.fork_quarantine.map(|(revision, no_anchor)| {
+                    serde_json::json!({ "revision": revision, "no_anchor": no_anchor })
+                }),
                 "started_at_ms": state.started_at_ms,
                 // Task A8 fills these from its presence sampler. Until
                 // then they fail closed.
@@ -524,7 +675,7 @@ pub(in crate::server) async fn treekem_catch_up_state(
         )
             .into_response();
     }
-    UNAVAILABLE.respond()
+    STATE_UNAVAILABLE.respond()
 }
 
 /// `POST /groups/:id/treekem/head-proof`.
@@ -540,8 +691,9 @@ pub(in crate::server) struct TreeKemHeadProofRequest {
 /// for a requester's own signed challenge. `200 {"ok": true, "proof"}`.
 /// Refusals: `400` `no_challenge`, `challenge_not_signed`, `bad_challenge`,
 /// `group_mismatch`; `403` `requester_not_active`; `409` `not_an_admin`,
-/// `stale_challenge`, `not_a_treekem_room`; `429` `rate_limited`,
-/// `repeat_too_soon`; `503` `unavailable` ([`sign_refusal`]).
+/// `stale_challenge`, `not_a_treekem_room`; `429` `rate_limited`
+/// (`new_round`), `repeat_too_soon` (`later`); `503` `unavailable`
+/// (`new_round`) ([`sign_refusal`]).
 pub(in crate::server) async fn treekem_head_proof_sign(
     State(state): State<Arc<AppState>>,
     Extension(actor): Extension<ActorContext>,
@@ -551,7 +703,7 @@ pub(in crate::server) async fn treekem_head_proof_sign(
     _access: GroupAccess,
     Json(body): Json<TreeKemHeadProofRequest>,
 ) -> Response {
-    if let Err(response) = admitted_tree(&state, &id, &actor, false).await {
+    if let Err(response) = admitted_tree(&state, &id, &actor, false, false).await {
         return response;
     }
     let request = body.request;
@@ -625,7 +777,7 @@ pub(in crate::server) async fn treekem_head_proof_accept(
     _access: GroupAccess,
     Json(body): Json<TreeKemHeadProofAcceptRequest>,
 ) -> Response {
-    if let Err(response) = admitted_tree(&state, &id, &actor, false).await {
+    if let Err(response) = admitted_tree(&state, &id, &actor, false, false).await {
         return response;
     }
     let body = match head_rounds::record_proof(&state, &id, body.proof).await {
@@ -677,15 +829,21 @@ mod tests {
             ),
             (StatusCode::FORBIDDEN, "requester_not_active")
         );
-        // Hold and retry later, as against never.
-        for later in [
-            Refusal::Limited,
-            Refusal::RepeatTooSoon,
-            Refusal::Unavailable,
-            Refusal::NoRoom,
-        ] {
+        // The hint says what can succeed next (A7 review m-2): the same
+        // request, only a new round, or nothing until the room changes.
+        for later in [Refusal::RepeatTooSoon, Refusal::NoRoom] {
             assert_eq!(pick(later).retry, Retry::Later, "{later:?}");
         }
+        for spent in [Refusal::Limited, Refusal::Unavailable] {
+            assert_eq!(pick(spent).retry, Retry::NewRound, "{spent:?}");
+        }
+        assert_eq!(not_a_treekem_room(true).retry, Retry::Later);
+        assert_eq!(not_a_treekem_room(false).retry, Retry::Never);
+        assert_eq!(
+            pick(Refusal::NoRoom).reason,
+            not_a_treekem_room(true).reason,
+            "one reason on every route"
+        );
         for never in [
             Refusal::BadChallenge,
             Refusal::StaleChallenge,
@@ -700,8 +858,14 @@ mod tests {
             NoRound::NotActive,
             NoRound::SetTooLarge,
             NoRound::NoCounter,
+            NoRound::NoSignature,
+            NoRound::TooSoon,
         ]
         .map(no_round_refusal);
+        assert_eq!(
+            no_round_refusal(NoRound::TooSoon).status,
+            StatusCode::TOO_MANY_REQUESTS
+        );
         let mut reasons: Vec<&str> = rounds.iter().map(|r| r.reason).collect();
         reasons.sort_unstable();
         reasons.dedup();
@@ -743,9 +907,9 @@ mod tests {
         info.set_member_role(&other, GroupRole::Member);
         info.seal_commit(&keypair, 4).unwrap();
 
-        let (admins, complete) = admins_since(&info, base);
+        let since = admins_since(&info, base, None);
         assert_eq!(
-            admins,
+            since.states,
             vec![
                 vec![owner.clone()],
                 vec![owner.clone(), other.clone()],
@@ -753,43 +917,88 @@ mod tests {
             ],
             "the admin who came and went in between is reported"
         );
-        assert!(complete);
-        assert_eq!(admins_since(&info, info.state_revision), (Vec::new(), true));
-        assert_eq!(
-            admins_since(&info, info.state_revision + 1),
-            (Vec::new(), false),
+        assert!(since.complete && !since.too_large);
+        let complete = |info: &x0x::groups::GroupInfo, hash: Option<&str>| {
+            admins_since(info, base, hash).complete
+        };
+        let none = AdminsSince {
+            states: Vec::new(),
+            complete: true,
+            too_large: false,
+        };
+        assert_eq!(admins_since(&info, info.state_revision, None), none);
+        assert!(
+            !admins_since(&info, info.state_revision + 1, None).complete,
             "an anchor ahead of this roster is not something it can vouch for"
         );
+
+        // The anchor's identity (A7 review m-3).
+        let base_hash = info.commit_log[0].commit.state_hash.clone();
+        assert!(complete(&info, Some(&base_hash)));
+        assert!(
+            !complete(&info, Some("another state at that revision")),
+            "the anchor must be this daemon's state, not only its revision"
+        );
+        assert!(admins_since(&info, info.state_revision, Some(&info.state_hash)).complete);
+        assert!(!admins_since(&info, info.state_revision, Some("other")).complete);
 
         // Trimmed down to the state right after the anchor: nothing can be
         // missing, since revisions only grow.
         let mut trimmed = info.clone();
         trimmed.commit_log.remove(0);
-        assert_eq!(admins_since(&trimmed, base), admins_since(&info, base));
+        assert_eq!(admins_since(&trimmed, base, None), since);
+        assert!(
+            complete(&trimmed, Some(&base_hash)),
+            "linked by its prev hash"
+        );
+        assert!(!complete(&trimmed, Some("other")));
         // Trimmed past it: the first state after the anchor is gone.
         trimmed.commit_log.remove(0);
-        assert!(!admins_since(&trimmed, base).1);
+        assert!(!complete(&trimmed, None));
         // The first retained state after the anchor does not follow it.
         let mut forked = info.clone();
         if let Some(first) = forked.commit_log.get_mut(1) {
             first.commit.prev_state_hash = Some("another".to_string());
         }
-        assert!(!admins_since(&forked, base).1);
+        assert!(!complete(&forked, None));
         // A retained state is missing in between.
         let mut holed = info.clone();
         holed.commit_log.remove(2);
-        assert!(!admins_since(&holed, base).1);
+        assert!(!complete(&holed, None));
         // A retained roster no longer matches its signed root.
         let mut corrupt = info.clone();
         if let Some(last) = corrupt.commit_log.last_mut() {
             last.roster.remove(&owner);
         }
-        assert!(!admins_since(&corrupt, base).1);
+        assert!(!complete(&corrupt, None));
         // The live roster moved past the last retained state.
         let mut moved = info.clone();
         moved.add_member("03".repeat(32), GroupRole::Admin, None, None);
         moved.recompute_state_hash();
-        assert!(!admins_since(&moved, base).1);
+        assert!(!complete(&moved, None));
+    }
+
+    /// A7 review m-4: states naming more admins than a round holds are not
+    /// listed; the answer says so, and the engine holds.
+    #[test]
+    fn admins_since_too_large_to_challenge_is_a_hold() {
+        use x0x::groups::GroupRole;
+        let keypair = x0x::identity::AgentKeypair::generate().unwrap();
+        let mut info = x0x::groups::GroupInfo::new(
+            "room".to_string(),
+            String::new(),
+            x0x::identity::AgentId([1; 32]),
+            "ccdd".repeat(8),
+        );
+        let base = info.seal_commit(&keypair, 1).unwrap().revision;
+        for n in 0..=head_proof::HEAD_PROOF_MAX_ADMINS {
+            info.add_member(format!("{:064x}", n + 1000), GroupRole::Admin, None, None);
+        }
+        info.seal_commit(&keypair, 2).unwrap();
+        let since = admins_since(&info, base, None);
+        assert!(since.too_large);
+        assert!(!since.complete);
+        assert!(since.states.is_empty());
     }
 
     #[test]

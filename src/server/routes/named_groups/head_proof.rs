@@ -265,7 +265,9 @@ pub(in crate::server) enum Refusal {
     /// The requester has since sent a newer challenge (a replay, or one that
     /// got no proof the first time). Not charged.
     StaleChallenge,
-    /// This daemon has no live roster or tree for the room.
+    /// This daemon has no live roster or tree for the room. Refused before
+    /// the challenge is charged, so the same challenge may be answered
+    /// later.
     NoRoom,
     /// The requester is not an active member on this daemon's roster.
     RequesterNotActive,
@@ -273,7 +275,10 @@ pub(in crate::server) enum Refusal {
     Limited,
     /// This daemon is not an active admin on its own roster.
     NotAnAdmin,
-    /// Signing failed, or the roster kept moving while it was read.
+    /// Signing failed, the roster kept moving while it was read, or the
+    /// room went away while it was read. Always after the challenge was
+    /// charged and made the latest, so this challenge is spent: only the
+    /// requester's next one can be answered.
     Unavailable,
     /// The latest challenge again, inside the window since its proof was
     /// last re-sent. Not charged, and nothing is sent.
@@ -553,7 +558,7 @@ async fn answer_fresh(
     for _ in 0..HEAD_READ_ATTEMPTS {
         let roster = roster_head(state, key, requester)
             .await
-            .ok_or(Refusal::NoRoom)?;
+            .ok_or(Refusal::Unavailable)?;
         if !roster.requester_active {
             return Err(Refusal::RequesterNotActive);
         }
@@ -578,7 +583,7 @@ async fn answer_fresh(
             .await
             .get(key)
             .cloned()
-            .ok_or(Refusal::NoRoom)?;
+            .ok_or(Refusal::Unavailable)?;
         // The epoch and the authenticator come from one borrow of the live
         // tree, under its lock, so they cannot be torn.
         let (epoch, authenticator) = {
@@ -589,7 +594,7 @@ async fn answer_fresh(
         // requester still active, this daemon still an admin, the same head.
         let still = roster_head(state, key, requester)
             .await
-            .ok_or(Refusal::NoRoom)?;
+            .ok_or(Refusal::Unavailable)?;
         if still.settled() != roster.settled() {
             continue;
         }

@@ -38,6 +38,13 @@ use tokio::time::Instant;
 /// How long after a round opens its proofs are recorded.
 pub(in crate::server) const HEAD_ROUND_DEADLINE: Duration = Duration::from_secs(60);
 
+/// The least time between two rounds a room's trigger route opens. One
+/// proof can make the engine name up to 511 agents (its anchored closure
+/// grows from proofs' admin lists), and each round sends every one of them
+/// a signed request naming this member and the room, so the trigger must
+/// not let that repeat faster than this (A7 review m-5).
+pub(in crate::server) const ROUND_MIN_GAP: Duration = Duration::from_secs(5);
+
 /// The most distinct heads kept per signer in one round.
 pub(in crate::server) const HEADS_PER_SIGNER: usize = 4;
 
@@ -137,6 +144,30 @@ pub(in crate::server) struct HeadRounds {
 }
 
 impl HeadRounds {
+    /// Whether a round opened in `key` less than `min_gap` before `now`.
+    fn opened_within(&self, key: &str, now: Instant, min_gap: Duration) -> bool {
+        self.rounds
+            .get(key)
+            .is_some_and(|round| now.saturating_duration_since(round.opened_at) < min_gap)
+    }
+
+    /// Open a round in `key`, replacing any open one and its proofs, unless
+    /// one opened less than `min_gap` ago. Returns whether it opened.
+    fn try_open_round(
+        &mut self,
+        key: &str,
+        nonce: String,
+        asked: BTreeSet<String>,
+        now: Instant,
+        min_gap: Duration,
+    ) -> bool {
+        if self.opened_within(key, now, min_gap) {
+            return false;
+        }
+        self.open_round(key, nonce, asked, now);
+        true
+    }
+
     /// Open a round in `key`, replacing any open one and its proofs.
     fn open_round(&mut self, key: &str, nonce: String, asked: BTreeSet<String>, now: Instant) {
         self.rounds.insert(
@@ -253,17 +284,25 @@ pub(in crate::server) enum NoRound {
     SetTooLarge,
     /// The challenge counter could not be kept, or is used up.
     NoCounter,
+    /// This member's page request could not be signed: every admin would
+    /// refuse it.
+    NoSignature,
+    /// A round opened in this room less than the caller's minimum gap ago.
+    /// That round stays open.
+    TooSoon,
 }
 
 /// Open a round in `group_id` and send each agent of the
 /// [`challenge_set`] this member's signed page request carrying the round's
 /// new challenge. The sends run on their own task. No round, and a reason,
-/// when this member is not active in the room, the set is too large or no
-/// counter can be kept.
+/// when this member is not active in the room, the set is too large, no
+/// counter can be kept, the request cannot be signed, or a round opened
+/// less than `min_gap` ago (the trigger route passes [`ROUND_MIN_GAP`]).
 pub(in crate::server) async fn challenge_admins(
     state: &Arc<AppState>,
     group_id: &str,
     named: &[String],
+    min_gap: Duration,
 ) -> Result<OpenedRound, NoRound> {
     let me = hex::encode(state.agent.agent_id().as_bytes());
     let (key, roster_admins) = {
@@ -298,6 +337,15 @@ pub(in crate::server) async fn challenge_admins(
         );
         return Err(NoRound::SetTooLarge);
     };
+    // Checked before a counter is spent, and again when the round opens.
+    let too_soon = state
+        .treekem_head_rounds
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .opened_within(&key, Instant::now(), min_gap);
+    if too_soon {
+        return Err(NoRound::TooSoon);
+    }
     let counter = state
         .treekem_head_counter
         .lock()
@@ -317,11 +365,21 @@ pub(in crate::server) async fn challenge_admins(
         .ok_or(NoRound::NoRoom)?;
     request.head_challenge = Some(nonce.clone());
     signed_catchup::sign_page_request(state, &mut request);
-    state
+    if request.signed_by.is_none() {
+        tracing::warn!(
+            group_id = %LogHexId::group(&key),
+            "TreeKEM head: the challenge could not be signed; no round opened, the room holds"
+        );
+        return Err(NoRound::NoSignature);
+    }
+    let opened = state
         .treekem_head_rounds
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .open_round(&key, nonce.clone(), asked.clone(), Instant::now());
+        .try_open_round(&key, nonce.clone(), asked.clone(), Instant::now(), min_gap);
+    if !opened {
+        return Err(NoRound::TooSoon);
+    }
     tracing::info!(
         group_id = %LogHexId::group(&key),
         asked = asked.len(),
@@ -378,6 +436,18 @@ pub(in crate::server) async fn record_proof(
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .record(&key, &stable_group_id, &me, proof, Instant::now())
+}
+
+/// Close the open round in `group_id` (a room key), if any, with its
+/// proofs. A trigger that opens no round closes the last one, so nothing
+/// reports a round asked of a smaller set than the engine named (A7 review
+/// m-6).
+pub(in crate::server) fn close_round(state: &AppState, group_id: &str) {
+    state
+        .treekem_head_rounds
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .wipe(group_id);
 }
 
 /// The open round in `group_id` (a room key), with its recorded proofs.
@@ -539,6 +609,28 @@ mod tests {
         );
         book.wipe("k");
         assert!(book.rounds.is_empty());
+    }
+
+    #[test]
+    fn a_room_opens_at_most_one_round_per_gap() {
+        let now = Instant::now();
+        let mut book = HeadRounds::default();
+        let asked = BTreeSet::from(["a".repeat(64)]);
+        assert!(book.try_open_round("k", "n1".into(), asked.clone(), now, ROUND_MIN_GAP));
+        assert!(!book.try_open_round(
+            "k",
+            "n2".into(),
+            asked.clone(),
+            now + ROUND_MIN_GAP / 2,
+            ROUND_MIN_GAP
+        ));
+        assert_eq!(book.rounds["k"].nonce, "n1", "the open round stays");
+        assert!(
+            book.try_open_round("j", "m1".into(), asked.clone(), now, ROUND_MIN_GAP),
+            "per room"
+        );
+        assert!(book.try_open_round("k", "n3".into(), asked, now + ROUND_MIN_GAP, ROUND_MIN_GAP));
+        assert_eq!(book.rounds["k"].nonce, "n3");
     }
 
     #[test]

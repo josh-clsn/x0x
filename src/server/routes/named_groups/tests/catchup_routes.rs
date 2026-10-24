@@ -7,8 +7,10 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use super::super::head_proof::{challenge_nonce, verify, HeadProof};
-use super::super::head_rounds::{next_challenge, round_view};
+use super::super::head_proof::{
+    challenge_nonce, sign_claim_with, verify, HeadClaim, HeadProof, HEAD_PROOF_VERSION,
+};
+use super::super::head_rounds::{backdate_round, next_challenge, round_view, ROUND_MIN_GAP};
 use super::super::signed_catchup::{
     page_request, page_request_signed, sign_page_request, sign_page_request_with,
 };
@@ -291,11 +293,11 @@ async fn trigger_challenges_the_named_admins_and_roster_admins_only() -> Result<
     assert_eq!(body["reason"], "bad_challenge_agent");
     assert_eq!(body["round"], serde_json::Value::Null);
     assert_eq!(body["hold"], true);
-    assert_eq!(
-        round_view(s1, group_id).map(|open| open.nonce),
-        Some(round),
-        "a refused trigger leaves the open round alone"
+    assert!(
+        round_view(s1, group_id).is_none(),
+        "a refused trigger closes the last round (review m-6)"
     );
+    let _ = round;
     cast.shutdown().await;
     Ok(())
 }
@@ -318,6 +320,7 @@ async fn trigger_that_would_ask_too_many_opens_no_round_and_says_hold() -> Resul
         .expect("page request recorder")
         .len();
 
+    backdate_round(s1, group_id, ROUND_MIN_GAP);
     let named: Vec<String> = (0..HEAD_PROOF_MAX_ADMINS_FOR_TESTS)
         .map(|n| format!("{n:064x}"))
         .collect();
@@ -329,11 +332,11 @@ async fn trigger_that_would_ask_too_many_opens_no_round_and_says_hold() -> Resul
     assert_eq!(body["hold"], true);
     assert_eq!(body["round"], serde_json::Value::Null);
     assert_eq!(body["asked"], serde_json::json!([]));
-    assert_eq!(
-        round_view(s1, group_id).map(|open| open.nonce),
-        Some(earlier),
-        "no new round, and no smaller one"
+    assert!(
+        round_view(s1, group_id).is_none(),
+        "no new round, no smaller one, and the earlier round is closed (review m-6)"
     );
+    let _ = earlier;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let sent_after = s1
         .named_group_test_recorders
@@ -368,6 +371,7 @@ async fn trigger_with_an_observed_epoch_starts_the_epoch_ahead_task() -> Result<
     assert_eq!(body["catching_up"], false, "not ahead: no catch-up");
     assert!(s1.treekem_epoch_ahead_targets.lock().await.is_empty());
 
+    backdate_round(s1, group_id, ROUND_MIN_GAP);
     let (status, body) = trigger(
         s1,
         group_id,
@@ -417,6 +421,25 @@ async fn get_reports_head_presence_and_round() -> Result<()> {
         serde_json::json!(info.security_binding)
     );
     assert_eq!(body["revision"], info.state_revision);
+    assert_eq!(body["state_hash"], info.state_hash.as_str());
+    assert_eq!(body["admins_since_complete"], true);
+    assert_eq!(body["admins_since_too_large"], false);
+    let (status, other_anchor) = call(
+        s1,
+        Method::GET,
+        &format!(
+            "{}&since_state_hash=another",
+            state_path(group_id, info.state_revision)
+        ),
+        &s1.api_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        other_anchor["admins_since_complete"], false,
+        "an anchor that is not this daemon's state at that revision holds"
+    );
     assert_eq!(strings(&body["admins"]), vec![owner_hex.clone()]);
     assert_eq!(body["admins_since"], serde_json::json!([]));
     assert_eq!(body["started_at_ms"], s1.started_at_ms);
@@ -749,7 +772,7 @@ async fn head_proof_route_maps_every_refusal_to_its_reason() -> Result<()> {
         limited.expect("the limit is reached"),
         StatusCode::TOO_MANY_REQUESTS,
         "rate_limited",
-        "later",
+        "new_round",
     );
     cast.shutdown().await;
     Ok(())
@@ -782,6 +805,32 @@ async fn accept_route_records_only_a_proof_for_the_open_round() -> Result<()> {
     assert_eq!(body["recorded"], false);
     assert_eq!(body["reason"], "no_round", "S2 opened no round");
 
+    // Over HTTP, each reason a proof is refused for (review m-8).
+    let round = first["round"].as_str().expect("a round").to_string();
+    let stranger = crate::identity::AgentKeypair::generate()?;
+    let stranger_hex = hex_id(&stranger.agent_id());
+    let stranger_claim = |requester: String| HeadClaim {
+        version: HEAD_PROOF_VERSION,
+        group_id: proof.claim.group_id.clone(),
+        requester,
+        nonce: round.clone(),
+        treekem_epoch: proof.claim.treekem_epoch,
+        epoch_authenticator: proof.claim.epoch_authenticator.clone(),
+        security_binding: None,
+        state_revision: 1,
+        admins: vec![stranger_hex.clone()],
+        signer: stranger_hex.clone(),
+    };
+    let unasked = sign_claim_with(&stranger, stranger_claim(hex_id(&s1.agent.agent_id())));
+    let (_, body) = accept(s1, group_id, &unasked).await;
+    assert_eq!(body["reason"], "not_asked", "{body}");
+    let for_s2 = sign_claim_with(&stranger, stranger_claim(hex_id(&cast.s2.agent.agent_id())));
+    let (_, body) = accept(s1, group_id, &for_s2).await;
+    assert_eq!(body["reason"], "not_for_this_round", "{body}");
+    backdate_round(s1, group_id, std::time::Duration::from_secs(61));
+    let (_, body) = accept(s1, group_id, &proof).await;
+    assert_eq!(body["reason"], "late", "{body}");
+
     let (status, second) = trigger(s1, group_id, serde_json::json!({ "challenge": [] })).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{second}");
     let (_, body) = accept(s1, group_id, &proof).await;
@@ -794,6 +843,141 @@ async fn accept_route_records_only_a_proof_for_the_open_round() -> Result<()> {
         .expect("the new round")
         .heads
         .is_empty());
+    cast.shutdown().await;
+    Ok(())
+}
+
+/// A7 review m-5: a room opens at most one round per gap through the
+/// trigger. The round opened moments ago stays open, and the answer is a
+/// hold that may succeed later.
+#[tokio::test]
+async fn trigger_opens_at_most_one_round_per_gap() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let s1 = &cast.s1;
+    let group_id = &cast.fixture.group_id;
+    let (status, body) = trigger(s1, group_id, serde_json::json!({ "challenge": [] })).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let first = body["round"].as_str().expect("a round").to_string();
+
+    let (status, body) = trigger(
+        s1,
+        group_id,
+        serde_json::json!({ "challenge": ["ab".repeat(32)] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["reason"], "round_too_soon");
+    assert_eq!(body["retry"], "later");
+    assert_eq!(body["hold"], true);
+    assert_eq!(body["round"], serde_json::Value::Null);
+    assert_eq!(
+        round_view(s1, group_id).map(|open| open.nonce),
+        Some(first),
+        "the round opened moments ago stays open"
+    );
+    assert!(
+        s1.named_group_test_recorders
+            .catchup_page_requests
+            .lock()
+            .expect("page request recorder")
+            .iter()
+            .all(|(to, _)| *to != "ab".repeat(32)),
+        "nobody named in the refused trigger is challenged"
+    );
+
+    backdate_round(s1, group_id, ROUND_MIN_GAP);
+    let (status, body) = trigger(s1, group_id, serde_json::json!({ "challenge": [] })).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "after the gap: {body}");
+    cast.shutdown().await;
+    Ok(())
+}
+
+/// A7 review m-1 and m-2: a trigger in a room with no tree here is a hold
+/// with the hold body; it may change later only on the TreeKEM plane.
+#[tokio::test]
+async fn trigger_without_a_tree_holds_and_says_whether_it_may_come() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let s1 = &cast.s1;
+    let group_id = &cast.fixture.group_id;
+    s1.treekem_groups.write().await.remove(group_id.as_str());
+    for (plane, retry) in [
+        (x0x::mls::SecureGroupPlane::TreeKem, "later"),
+        (x0x::mls::SecureGroupPlane::Gss, "never"),
+    ] {
+        if let Some(info) = s1.named_groups.write().await.get_mut(group_id.as_str()) {
+            info.secure_plane = plane;
+        }
+        let (status, body) = trigger(s1, group_id, serde_json::json!({ "challenge": [] })).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "not_a_treekem_room");
+        assert_eq!(body["retry"], retry, "{plane:?}");
+        assert_eq!(body["hold"], true);
+        assert_eq!(body["round"], serde_json::Value::Null);
+        let revision = roster(s1, group_id).await.state_revision;
+        let (status, body) = call(
+            s1,
+            Method::GET,
+            &state_path(group_id, revision),
+            &s1.api_token,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "not_a_treekem_room");
+        assert_eq!(body["retry"], retry, "the same hint on every route");
+    }
+    cast.shutdown().await;
+    Ok(())
+}
+
+/// A7 review I-1: the routes run in a fork-quarantined room (ADR-0066
+/// control plane), so the GET says the room is quarantined, with the
+/// marker's wire fields only.
+#[tokio::test]
+async fn get_reports_a_fork_quarantined_room() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let s1 = &cast.s1;
+    let group_id = &cast.fixture.group_id;
+    let revision = roster(s1, group_id).await.state_revision;
+    let body = read_state(s1, group_id, revision).await;
+    assert_eq!(body["fork_quarantined"], false);
+    assert_eq!(body["fork_quarantine"], serde_json::Value::Null);
+
+    {
+        let mut groups = s1.named_groups.write().await;
+        let info = groups.get_mut(group_id.as_str()).expect("group");
+        let header = info.terminal_commit_header();
+        info.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: 9,
+            state_hash: info.state_hash.clone(),
+            committed_by: "87".repeat(32),
+            observed_at_ms: 1_788_091_300_000,
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: header.clone(),
+                conflicting_commit: header,
+                classification: None,
+            },
+            no_anchor: true,
+        });
+    }
+    let body = read_state(s1, group_id, revision).await;
+    assert_eq!(body["fork_quarantined"], true, "{body}");
+    assert_eq!(
+        body["fork_quarantine"],
+        serde_json::json!({ "revision": 9, "no_anchor": true }),
+        "the wire fields only: no snapshot, no committer"
+    );
+    assert_eq!(
+        body["epoch"],
+        live_epoch(s1, group_id).await,
+        "still a head"
+    );
+
+    if let Some(info) = s1.named_groups.write().await.get_mut(group_id.as_str()) {
+        info.fork_quarantine = None;
+    }
+    let body = read_state(s1, group_id, revision).await;
+    assert_eq!(body["fork_quarantined"], false);
     cast.shutdown().await;
     Ok(())
 }

@@ -1448,7 +1448,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group treekem-catch-up",
         description: "Challenge the named agents and the roster admins for where the room's key stands (durable token)",
         category: "named-groups",
-        request: RequestSpec::Fields(&[RequestField::body("observed_epoch", false), RequestField::body("challenge", true)]),
+        request: RequestSpec::Fields(&[RequestField::body("observed_epoch", false), RequestField::body("challenge", false)]),
     },
     EndpointDef {
         method: Method::Get,
@@ -1456,7 +1456,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group treekem-state",
         description: "This daemon's TreeKEM head, the admins of every state applied since a revision, and the open round",
         category: "named-groups",
-        request: RequestSpec::Fields(&[RequestField::query("since_revision", true)]),
+        request: RequestSpec::Fields(&[RequestField::query("since_revision", true), RequestField::query("since_state_hash", false)]),
     },
     EndpointDef {
         method: Method::Post,

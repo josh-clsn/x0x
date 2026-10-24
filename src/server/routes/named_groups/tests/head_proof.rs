@@ -340,9 +340,14 @@ async fn a_proof_verifies_only_for_its_signer_key_requester_nonce_and_group() ->
 
     // S1 records only a proof whose signer it asked, for itself, in this
     // group, under its round's nonce.
-    let round = challenge_admins(&cast.s1, &cast.fixture.group_id, &[])
-        .await
-        .expect("S1 opens a round");
+    let round = challenge_admins(
+        &cast.s1,
+        &cast.fixture.group_id,
+        &[],
+        std::time::Duration::ZERO,
+    )
+    .await
+    .expect("S1 opens a round");
     // Fetched once: a repeat of the same challenge is re-sent at most once
     // a window.
     let genuine = owner_proof(&cast, &round.nonce).await;
@@ -380,7 +385,7 @@ async fn a_replayed_proof_for_another_nonce_is_not_recorded() -> Result<()> {
     let cast = survivor_relay_fixture().await?;
     let group_id = &cast.fixture.group_id;
     let old = owner_proof(&cast, &next_challenge(&cast.s1).await).await;
-    let first = challenge_admins(&cast.s1, group_id, &[])
+    let first = challenge_admins(&cast.s1, group_id, &[], std::time::Duration::ZERO)
         .await
         .expect("S1 opens a round");
     deliver_proof(&cast, old).await;
@@ -398,7 +403,7 @@ async fn a_replayed_proof_for_another_nonce_is_not_recorded() -> Result<()> {
     );
 
     // A new round replaces the old one, and the old round's proof is a replay.
-    let second = challenge_admins(&cast.s1, group_id, &[])
+    let second = challenge_admins(&cast.s1, group_id, &[], std::time::Duration::ZERO)
         .await
         .expect("S1 opens another round");
     assert_ne!(second.nonce, first.nonce, "every round has a fresh nonce");
@@ -416,7 +421,7 @@ async fn a_replayed_proof_for_another_nonce_is_not_recorded() -> Result<()> {
 async fn a_proof_after_the_round_deadline_is_not_recorded() -> Result<()> {
     let cast = survivor_relay_fixture().await?;
     let group_id = &cast.fixture.group_id;
-    let round = challenge_admins(&cast.s1, group_id, &[])
+    let round = challenge_admins(&cast.s1, group_id, &[], std::time::Duration::ZERO)
         .await
         .expect("S1 opens a round");
     let answer = owner_proof(&cast, &round.nonce).await;
@@ -451,7 +456,7 @@ async fn a_challenge_right_after_a_page_request_still_gets_a_proof() -> Result<(
         "the same page inside the window is throttled (#378)"
     );
 
-    let round = challenge_admins(&cast.s1, group_id, &[])
+    let round = challenge_admins(&cast.s1, group_id, &[], std::time::Duration::ZERO)
         .await
         .expect("S1 opens a round");
     let challenge = sent_challenge(&cast.s1, &hex_id(&owner.agent.agent_id()), &round.nonce)
@@ -596,7 +601,7 @@ async fn a_stale_roster_admin_commit_does_not_remove_an_anchor_admin_from_the_ch
         info.remove_member(&owner_hex, Some(r_hex.clone()));
         assert!(!info.has_active_member(&owner_hex));
     }
-    let roster_only = challenge_admins(&cast.s1, group_id, &[])
+    let roster_only = challenge_admins(&cast.s1, group_id, &[], std::time::Duration::ZERO)
         .await
         .expect("S1 opens a round");
     assert_eq!(
@@ -605,9 +610,14 @@ async fn a_stale_roster_admin_commit_does_not_remove_an_anchor_admin_from_the_ch
         "the roster alone names only R"
     );
 
-    let anchored = challenge_admins(&cast.s1, group_id, &[owner_hex.clone(), r_hex.clone()])
-        .await
-        .expect("S1 opens a round");
+    let anchored = challenge_admins(
+        &cast.s1,
+        group_id,
+        &[owner_hex.clone(), r_hex.clone()],
+        std::time::Duration::ZERO,
+    )
+    .await
+    .expect("S1 opens a round");
     let mut expected = vec![owner_hex.clone(), r_hex.clone()];
     expected.sort();
     assert_eq!(
@@ -747,7 +757,7 @@ async fn a_roster_full_of_admins_does_not_crowd_out_a_named_admin() -> Result<()
         .expect("page request recorder")
         .len();
     assert!(
-        challenge_admins(&cast.s1, group_id, &named)
+        challenge_admins(&cast.s1, group_id, &named, std::time::Duration::ZERO)
             .await
             .unwrap_err()
             == head_rounds::NoRound::SetTooLarge,
@@ -774,7 +784,7 @@ async fn a_roster_full_of_admins_does_not_crowd_out_a_named_admin() -> Result<()
             info.set_member_role(sybil, x0x::groups::GroupRole::Member);
         }
     }
-    let round = challenge_admins(&cast.s1, group_id, &named)
+    let round = challenge_admins(&cast.s1, group_id, &named, std::time::Duration::ZERO)
         .await
         .expect("S1 opens a round");
     assert!(round.asked.contains(&owner_hex), "the owner is asked");
@@ -932,7 +942,7 @@ async fn two_heads_from_one_signer_in_a_round_are_both_kept() -> Result<()> {
     let owner = &cast.fixture.state;
     let group_id = &cast.fixture.group_id;
     let owner_hex = hex_id(&owner.agent.agent_id());
-    let round = challenge_admins(&cast.s1, group_id, &[])
+    let round = challenge_admins(&cast.s1, group_id, &[], std::time::Duration::ZERO)
         .await
         .expect("S1 opens a round");
     let at_e = owner_proof(&cast, &round.nonce).await;
