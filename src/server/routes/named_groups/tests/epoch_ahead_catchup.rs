@@ -337,7 +337,8 @@ async fn relayed_removal_rejects_another_members_treekem_commit() -> Result<()> 
     let epoch_before = cast.epoch_before;
     assert_eq!(
         live_epoch(&cast.victim_state, &cast.fixture.group_id).await,
-        epoch_before
+        epoch_before,
+        "setup: the victim starts at the pre-rekey epoch"
     );
     let genuine = digest_bound_removal(&cast.fixture).await?;
     let genuine_hash = named_group_metadata_event_commit(&genuine)
