@@ -1191,6 +1191,11 @@ pub(in crate::server) struct TreeKemCatchupResponse {
     group_id: String,
     events: Vec<NamedGroupMetadataEvent>,
     truncated: bool,
+    /// Saved membership head of the responder. Absent on a KeyPackage reply
+    /// and on an old peer. Unsigned, so nothing here trusts it beyond a
+    /// hint (#1337).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    responder_state_hash: Option<String>,
     /// #398: which member `target_member_key_package_b64` belongs to — an
     /// echo of the request's `target_member_id`. `#[serde(default)]` keeps
     /// responses from old daemons parseable and old daemons ignore it.
@@ -8064,6 +8069,29 @@ fn treekem_recovery_security_binding(
     ))
 }
 
+/// Signed binding for a TreeKEM removal. The digest is inside `security_binding`,
+/// which the roster commit signs. A relay cannot swap the TreeKEM bytes.
+fn treekem_commit_binding(epoch: u64, commit: &[u8]) -> String {
+    let digest = blake3::hash(commit).to_hex();
+    format!("treekem:epoch={epoch}:commit={digest}")
+}
+
+/// `treekem:epoch=<n>` is the shipped admin removal. It does not name the
+/// TreeKEM bytes. A self-leave rekey seals [`treekem_commit_binding`].
+fn treekem_removal_binding_covers_commit(
+    signed: &x0x::groups::state_commit::GroupStateCommit,
+    epoch: u64,
+    commit_bytes: &[u8],
+) -> bool {
+    let Some(binding) = signed.security_binding.as_deref() else {
+        return false;
+    };
+    if binding == treekem_commit_binding(epoch, commit_bytes) {
+        return true;
+    }
+    binding == format!("treekem:epoch={epoch}")
+}
+
 fn canonical_member_joined_recovery_bytes(
     event: &NamedGroupMetadataEvent,
     authority_agent_id: &str,
@@ -9427,7 +9455,7 @@ async fn request_treekem_catchup_for_gap(
             {
                 continue;
             }
-            throttle.insert(throttle_key, Instant::now());
+            throttle.insert(throttle_key, tokio::time::Instant::now());
         }
         let request = TreeKemCatchupRequest {
             message_type: "treekem_catchup_request".to_string(),
@@ -10562,6 +10590,7 @@ async fn member_keyed_treekem_catchup_response(
         group_id: request.group_id.clone(),
         events: event.into_iter().collect(),
         truncated: false,
+        responder_state_hash: None,
         target_member_id: Some(target_member_id.clone()),
         target_member_key_package_b64,
         signed_by,
@@ -10638,6 +10667,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
                     .get(&sender_hex)
                     .is_some_and(|member| !member.is_active()),
                 keys,
+                info.state_hash.clone(),
             ))
         } else {
             None
@@ -10648,7 +10678,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     // — only the withdrawn-tombstone path wipes it — so a roster-less log is a
     // departed node's residue, with no authority over the group's membership
     // history. Remaining members are backfilled by live members instead.
-    let Some((authorized, sender_departed, log_keys)) = group_authority else {
+    let Some((authorized, sender_departed, log_keys, saved_head)) = group_authority else {
         tracing::warn!(
             group_id = %LogHexId::group(&request.group_id),
             requester = %sender_hex,
@@ -10709,7 +10739,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         {
             return;
         }
-        throttle.insert(throttle_key, Instant::now());
+        throttle.insert(throttle_key, tokio::time::Instant::now());
     }
     if let Some(mut response) =
         member_keyed_treekem_catchup_response(state, &log_keys, &request).await
@@ -10784,7 +10814,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
             );
             return;
         }
-        throttle.insert(serve_throttle_key, Instant::now());
+        throttle.insert(serve_throttle_key, tokio::time::Instant::now());
     }
     let mut events = {
         let logs = state.treekem_event_log.read().await;
@@ -10812,6 +10842,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         group_id: request.group_id.clone(),
         events,
         truncated,
+        responder_state_hash: Some(saved_head),
         target_member_id: None,
         target_member_key_package_b64: None,
         signed_by: None,
@@ -10823,6 +10854,10 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
             return;
         }
     };
+    #[cfg(test)]
+    if let Ok(mut recorded) = state.named_group_test_recorders.catchup_responses.lock() {
+        recorded.push(payload.clone());
+    }
     if let Err(e) = state
         .agent
         .send_direct_with_config(sender, payload, named_group_direct_delivery_config())
@@ -11135,7 +11170,15 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         let recovery_event = member_joined_kp_cache_entry(&event)
             .map(|(_, ev)| ev)
             .filter(|ev| verify_authority_attested_member_joined_recovery(&response_info, ev));
-        apply_named_group_metadata_event(state, event, *sender, true, None).await;
+        // A survivor may relay a signed removal. The transport sender
+        // is that survivor. The author is the verified commit signer.
+        // T-self-leave-catchup-author. The actor field is not authority.
+        // A third party may supply TreeKEM bytes only when the signed
+        // binding names those bytes. T-self-leave-relay-commit-binding.
+        let apply_sender = verified_catchup_member_removed_author(&event)
+            .filter(|author| catchup_may_apply_removed_as_author(&event, sender, author))
+            .unwrap_or(*sender);
+        apply_named_group_metadata_event(state, event, apply_sender, true, None).await;
         if let Some(ev) = recovery_event {
             apply_recovered_member_key_package(state, &ev).await;
         }
@@ -11198,7 +11241,69 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     }
 }
 
+fn verified_catchup_member_removed_author(
+    event: &NamedGroupMetadataEvent,
+) -> Option<x0x::identity::AgentId> {
+    let NamedGroupMetadataEvent::MemberRemoved { actor, commit, .. } = event else {
+        return None;
+    };
+    let commit = commit.as_ref()?;
+    if actor != &commit.committed_by {
+        return None;
+    }
+    commit.verify_structure().ok()?;
+    parse_agent_id_hex(&commit.committed_by).ok()
+}
+
+/// A third-party relay may apply a removal as its signer only when the
+/// signed binding authenticates the attached TreeKEM bytes. The legacy
+/// `treekem:epoch=<n>` form does not. The authenticated author may still
+/// deliver that form.
+fn catchup_may_apply_removed_as_author(
+    event: &NamedGroupMetadataEvent,
+    transport_sender: &x0x::identity::AgentId,
+    author: &x0x::identity::AgentId,
+) -> bool {
+    if transport_sender == author {
+        return true;
+    }
+    let NamedGroupMetadataEvent::MemberRemoved {
+        treekem_commit_b64,
+        treekem_epoch,
+        commit,
+        ..
+    } = event
+    else {
+        return false;
+    };
+    let Some(commit) = commit.as_ref() else {
+        return false;
+    };
+    let (Some(commit_b64), Some(epoch)) = (treekem_commit_b64.as_ref(), *treekem_epoch) else {
+        // A roster-only leave has no TreeKEM payload for a relay to swap.
+        return treekem_commit_b64.is_none() && treekem_epoch.is_none();
+    };
+    let Ok(commit_bytes) = BASE64.decode(commit_b64) else {
+        return false;
+    };
+    commit.security_binding.as_deref()
+        == Some(treekem_commit_binding(epoch, &commit_bytes).as_str())
+}
+
 async fn request_treekem_catchup_page(state: &Arc<AppState>, group_id: &str, peer: &AgentId) {
+    #[cfg(test)]
+    {
+        if state
+            .named_group_test_recorders
+            .catchup_page_force_ok
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            if let Ok(mut recorded) = state.named_group_test_recorders.catchup_responses.lock() {
+                recorded.push(group_id.as_bytes().to_vec());
+            }
+            return;
+        }
+    }
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     let (from_revision, from_epoch, current_state_hash) = {
         let groups = state.named_groups.read().await;
@@ -11241,6 +11346,284 @@ async fn request_treekem_catchup_page(state: &Arc<AppState>, group_id: &str, pee
     {
         tracing::debug!(group_id = %group_id, peer = %hex::encode(peer.as_bytes()), "paged TreeKEM catch-up request failed: {e}");
     }
+}
+
+/// Most other active members one epoch-ahead round asks (#1427).
+const TREEKEM_EPOCH_AHEAD_CATCHUP_PEERS: usize = 3;
+
+/// Fewest rounds one epoch-ahead target runs, one throttle window apart
+/// (#1427). A target runs more rounds until it has asked every candidate.
+const TREEKEM_EPOCH_AHEAD_CATCHUP_ROUNDS: usize = 6;
+
+/// #1427: traffic at a later TreeKEM epoch than the local live group shows
+/// that this member missed a membership commit. The metadata topic stops
+/// redelivery after its schedule, and a member with no later membership
+/// event never reaches the gap catch-up. Ask other active members for a
+/// catch-up page on the existing request path. The response handler
+/// applies the served commits with all its usual checks.
+///
+/// One task runs per group. It holds the highest epoch observed for the
+/// group, and a count of observations, in
+/// `AppState::treekem_epoch_ahead_targets`. A later observation while the
+/// task runs raises that target and starts the task's round count again,
+/// so a late answer for an older epoch does not end the recovery of a
+/// newer one. Each round asks the members asked least recently (see
+/// [`epoch_ahead_catchup_peers`]), one throttle window apart. The task
+/// runs at least [`TREEKEM_EPOCH_AHEAD_CATCHUP_ROUNDS`] rounds, and
+/// continues until every candidate was asked once (ADR 0088 L1: any one
+/// reachable holder is enough). Each such round asks at least one
+/// candidate not yet asked, so the round count is bounded. An observation
+/// can come from a holder that was offline when an earlier round asked
+/// it. So a round that finds a new observation starts a new pass: the
+/// task then continues until it has asked every candidate again. When the
+/// rounds end without the target, an observation after the start of the
+/// last round starts a new cycle of rounds. Without new traffic, the task
+/// stops after one cycle.
+pub(in crate::server) fn spawn_treekem_epoch_ahead_catchup(
+    state: &Arc<AppState>,
+    group_id: &str,
+    observed_epoch: u64,
+) {
+    let task_state = Arc::clone(state);
+    let group_id = group_id.to_string();
+    // Fork: no #1269 detached-task registry. The task ends at shutdown, as
+    // upstream's drain aborts it, so it never holds `AppState` past it.
+    let mut shutdown = state.shutdown_notify.subscribe();
+    if *shutdown.borrow() {
+        return;
+    }
+    tokio::spawn(async move {
+        tokio::select! {
+            () = request_treekem_catchup_for_epoch_ahead(&task_state, &group_id, observed_epoch) => {}
+            _ = shutdown.wait_for(|stopping| *stopping) => {}
+        }
+    });
+}
+
+async fn request_treekem_catchup_for_epoch_ahead(
+    state: &Arc<AppState>,
+    group_id: &str,
+    observed_epoch: u64,
+) {
+    let key = {
+        let groups = state.named_groups.read().await;
+        let Some(key) = groups
+            .get_key_value(group_id)
+            .map(|(key, _)| key)
+            .or_else(|| {
+                groups
+                    .iter()
+                    .find(|(_, info)| info.stable_group_id() == group_id)
+                    .map(|(key, _)| key)
+            })
+        else {
+            return;
+        };
+        key.clone()
+    };
+    if !note_epoch_ahead_observation(
+        &mut *state.treekem_epoch_ahead_targets.lock().await,
+        &key,
+        observed_epoch,
+    ) {
+        // The running task picks up the observation.
+        return;
+    }
+    let mut target = observed_epoch;
+    // Observations the current round covers.
+    let mut covered = 0;
+    let mut renew = false;
+    let mut asked = HashSet::new();
+    // When the current pass over the candidates started.
+    let mut since = tokio::time::Instant::now();
+    let mut round = 0;
+    loop {
+        if round > 0 {
+            tokio::time::sleep(TREEKEM_CATCHUP_THROTTLE).await;
+        }
+        let latest = state
+            .treekem_epoch_ahead_targets
+            .lock()
+            .await
+            .get(&key)
+            .copied()
+            .unwrap_or(EpochAheadTarget {
+                epoch: target,
+                observations: covered,
+            });
+        let renewed = std::mem::take(&mut renew) || latest.epoch > target;
+        if renewed {
+            target = target.max(latest.epoch);
+            round = 0;
+        }
+        if renewed || latest.observations > covered {
+            asked.clear();
+            since = tokio::time::Instant::now();
+        }
+        covered = latest.observations;
+        let outcome =
+            request_treekem_catchup_round(state, &key, target, round, since, &mut asked).await;
+        round += 1;
+        let more = outcome
+            .is_some_and(|all_asked| round < TREEKEM_EPOCH_AHEAD_CATCHUP_ROUNDS || !all_asked);
+        if more {
+            continue;
+        }
+        let mut targets = state.treekem_epoch_ahead_targets.lock().await;
+        let latest = targets.get(&key).copied();
+        // A later epoch, or (when the rounds ran out before the target) a
+        // new observation since this round started, starts a new cycle.
+        if latest.is_some_and(|latest| {
+            latest.epoch > target || (outcome.is_some() && latest.observations > covered)
+        }) {
+            renew = true;
+            continue;
+        }
+        targets.remove(&key);
+        return;
+    }
+}
+
+/// #1427: the epoch-ahead traffic seen for one group while its catch-up
+/// task runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::server) struct EpochAheadTarget {
+    /// The highest TreeKEM epoch observed.
+    pub(in crate::server) epoch: u64,
+    /// How many observations arrived after the first one, at any epoch.
+    pub(in crate::server) observations: u64,
+}
+
+/// Records one epoch-ahead observation for `key`. Returns `true` when no
+/// task runs for the group, so the caller must run one.
+fn note_epoch_ahead_observation(
+    targets: &mut HashMap<String, EpochAheadTarget>,
+    key: &str,
+    observed_epoch: u64,
+) -> bool {
+    if let Some(target) = targets.get_mut(key) {
+        target.epoch = target.epoch.max(observed_epoch);
+        target.observations = target.observations.saturating_add(1);
+        return false;
+    }
+    targets.insert(
+        key.to_string(),
+        EpochAheadTarget {
+            epoch: observed_epoch,
+            observations: 0,
+        },
+    );
+    true
+}
+
+/// One round of [`request_treekem_catchup_for_epoch_ahead`]. Returns
+/// `None` when no later round is needed: this member left the group or
+/// reached `target_epoch`. Otherwise returns whether every candidate is in
+/// `asked`. A candidate goes into `asked` when this round asks it, or when
+/// another request asked it at or after `since`.
+async fn request_treekem_catchup_round(
+    state: &Arc<AppState>,
+    group_id: &str,
+    target_epoch: u64,
+    round: usize,
+    since: tokio::time::Instant,
+    asked: &mut HashSet<AgentId>,
+) -> Option<bool> {
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let (key, from_revision, from_epoch, peers) = {
+        let groups = state.named_groups.read().await;
+        let (key, info) = groups.get_key_value(group_id)?;
+        if info.withdrawn || !info.has_active_member(&local_agent_hex) {
+            return None;
+        }
+        // Owner and admins first: they sign membership commits, and only
+        // the signer can deliver a removal whose binding is the legacy
+        // `treekem:epoch=<n>` form (`catchup_may_apply_removed_as_author`).
+        let mut candidates: Vec<(bool, AgentId)> = info
+            .active_members()
+            .filter(|member| !member.agent_id.eq_ignore_ascii_case(&local_agent_hex))
+            .filter_map(|member| {
+                parse_agent_id_hex(&member.agent_id)
+                    .ok()
+                    .map(|peer| (!member.role.at_least(x0x::groups::GroupRole::Admin), peer))
+            })
+            .collect();
+        // `false` sorts first, so admins lead.
+        candidates.sort_by_key(|(not_admin, peer)| (*not_admin, peer.0));
+        let mut seen = HashSet::new();
+        candidates.retain(|(_, peer)| seen.insert(*peer));
+        let peers: Vec<AgentId> = candidates.into_iter().map(|(_, peer)| peer).collect();
+        (key.clone(), info.state_revision, info.secret_epoch, peers)
+    };
+    let local_epoch = current_treekem_epoch(state, &key).await?;
+    if target_epoch <= local_epoch {
+        return None;
+    }
+    tracing::info!(
+        round,
+        group_id = %LogHexId::group(&key),
+        local_epoch,
+        target_epoch,
+        "TreeKEM traffic is ahead of the local epoch; requesting catch-up"
+    );
+    let throttle_key =
+        |peer: &AgentId| format!("{key}:{}:{from_revision}:{from_epoch}", hex::encode(peer.0));
+    let chosen = {
+        let mut throttle = state.treekem_catchup_throttle.write().await;
+        // Peers this task has not asked go first. A new local revision or
+        // epoch changes every throttle key, and without this the rotation
+        // would start again from the first peers.
+        let (fresh, repeat): (Vec<AgentId>, Vec<AgentId>) = peers
+            .iter()
+            .copied()
+            .partition(|peer| !asked.contains(peer));
+        let chosen = epoch_ahead_catchup_peers([fresh, repeat].concat(), |peer| {
+            throttle.get(&throttle_key(peer)).copied()
+        });
+        let now = tokio::time::Instant::now();
+        for peer in &chosen {
+            throttle.insert(throttle_key(peer), now);
+        }
+        // Chosen peers were stamped now, so they pass the `since` filter.
+        asked.extend(peers.iter().copied().filter(|peer| {
+            throttle
+                .get(&throttle_key(peer))
+                .is_some_and(|last| *last >= since)
+        }));
+        chosen
+    };
+    // Send to the chosen peers together. A send to an offline peer runs
+    // until its DM timeouts end, and in series it would hold back the
+    // next round, which asks the peers that can answer.
+    let _sent = futures::future::join_all(
+        chosen
+            .iter()
+            .map(|peer| request_treekem_catchup_page(state, &key, peer)),
+    )
+    .await;
+    Some(peers.iter().all(|peer| asked.contains(peer)))
+}
+
+/// #1427: the peers one epoch-ahead round asks. `candidates` is in
+/// preference order. A peer asked inside the throttle window is skipped.
+/// The rest are taken least recently asked first (never asked before
+/// asked), so a later round moves past offline or stale peers to the next
+/// members instead of asking the same few again.
+fn epoch_ahead_catchup_peers(
+    candidates: Vec<AgentId>,
+    last_asked: impl Fn(&AgentId) -> Option<tokio::time::Instant>,
+) -> Vec<AgentId> {
+    let mut open: Vec<(Option<tokio::time::Instant>, AgentId)> = candidates
+        .into_iter()
+        .map(|peer| (last_asked(&peer), peer))
+        .filter(|(last, _)| last.is_none_or(|last| last.elapsed() >= TREEKEM_CATCHUP_THROTTLE))
+        .collect();
+    // Stable: ties keep the preference order.
+    open.sort_by_key(|(last, _)| *last);
+    open.into_iter()
+        .take(TREEKEM_EPOCH_AHEAD_CATCHUP_PEERS)
+        .map(|(_, peer)| peer)
+        .collect()
 }
 
 /// Issue #205: ask peers that witnessed a member's join for that member's
@@ -11307,7 +11690,7 @@ async fn request_member_key_package_catchup(
             {
                 continue;
             }
-            throttle.insert(throttle_key, Instant::now());
+            throttle.insert(throttle_key, tokio::time::Instant::now());
         }
         let request = TreeKemCatchupRequest {
             message_type: "treekem_catchup_request".to_string(),
@@ -13147,6 +13530,19 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             } else {
                 None
             };
+            if let Some((commit_b64, epoch)) = treekem_payload.as_ref() {
+                let Ok(commit_bytes) = BASE64.decode(commit_b64) else {
+                    return ApplyMetadataResult::REJECTED;
+                };
+                if !treekem_removal_binding_covers_commit(&commit, *epoch, &commit_bytes) {
+                    tracing::warn!(
+                        group_id = %LogHexId::group(&resolved_group_key),
+                        "rejecting TreeKEM removal: the signed roster commit does not bind these commit bytes"
+                    );
+                    return ApplyMetadataResult::REJECTED;
+                }
+            }
+            let signed_binding = commit.security_binding.clone();
             let current = info.clone();
             let Ok(next) = apply_stateful_event_with_evidence(
                 state,
@@ -13162,7 +13558,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     next.remove_member(&agent_id, Some(actor.clone()));
                     if let Some((_, epoch)) = treekem_payload.as_ref() {
                         next.secret_epoch = *epoch;
-                        next.security_binding = Some(format!("treekem:epoch={epoch}"));
+                        next.security_binding = signed_binding.clone();
                     } else if let Some(secret_epoch) = secret_epoch {
                         let old_epoch = next.secret_epoch;
                         next.secret_epoch = secret_epoch;
@@ -29238,7 +29634,7 @@ async fn treekem_group_encrypt_for_actor(
 /// does not invalidate the already-recovered plaintext).
 #[cfg(test)]
 async fn treekem_group_decrypt(
-    state: &AppState,
+    state: &Arc<AppState>,
     group_id_hex: &str,
     stable_group_id: Option<&str>,
     ciphertext_b64: &str,
@@ -29248,7 +29644,7 @@ async fn treekem_group_decrypt(
 }
 
 async fn treekem_group_decrypt_for_actor(
-    state: &AppState,
+    state: &Arc<AppState>,
     group_id_hex: &str,
     stable_group_id: Option<&str>,
     ciphertext_b64: &str,
@@ -29310,6 +29706,12 @@ async fn treekem_group_decrypt_for_actor(
     let plaintext = match guard.decrypt_message(&ciphertext) {
         Ok(p) => p,
         Err(e) => {
+            // #1427: a ciphertext from a later epoch means a missed commit.
+            if let Some(observed) = x0x::mls::TreeKemMlsGroup::ciphertext_epoch(&ciphertext)
+                .filter(|observed| *observed > guard.epoch())
+            {
+                spawn_treekem_epoch_ahead_catchup(state, group_id_hex, observed);
+            }
             return bad_request(format!("treekem decrypt failed: {e}"));
         }
     };
@@ -29644,7 +30046,7 @@ pub(in crate::server) async fn secure_group_decrypt(
         let stable_group_id = info.stable_group_id().to_string();
         drop(groups);
         return treekem_group_decrypt_for_actor(
-            state.as_ref(),
+            &state,
             &id,
             Some(&stable_group_id),
             &req.ciphertext_b64,
@@ -40880,7 +41282,7 @@ async fn handle_join_result_message_bound(
                 {
                     return;
                 }
-                throttle.insert(throttle_key, Instant::now());
+                throttle.insert(throttle_key, tokio::time::Instant::now());
             }
             // #447: the joiner is still polling — its certificate evidence
             // may have resolved since the last volley rejection (async blob
@@ -43502,6 +43904,7 @@ pub(in crate::server) mod tests {
     mod adr0107_stuck_join_rearm;
     mod cache_hardening_followup;
     mod engine_a_apply_gate;
+    mod epoch_ahead_catchup;
     mod fork_quarantine;
     mod genesis_kp_catchup_398;
     mod home_control_payload_size;
@@ -44311,6 +44714,7 @@ pub(in crate::server) mod tests {
             treekem_member_key_packages,
             treekem_event_log: RwLock::new(HashMap::new()),
             treekem_catchup_throttle: RwLock::new(HashMap::new()),
+            treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
             group_membership_locks: RwLock::new(HashMap::new()),
             treekem_groups: RwLock::new(HashMap::new()),
             treekem_dir,
@@ -57663,6 +58067,7 @@ pub(in crate::server) mod tests {
             group_id: "aa".to_string(),
             events: Vec::new(),
             truncated: false,
+            responder_state_hash: None,
             target_member_id: None,
             target_member_key_package_b64: None,
             signed_by: None,
@@ -62428,6 +62833,7 @@ pub(in crate::server) mod tests {
             group_id: fixture.stable_group_id.clone(),
             events: vec![fixture.event.clone()],
             truncated: false,
+            responder_state_hash: None,
             target_member_id: None,
             target_member_key_package_b64: None,
             signed_by: None,

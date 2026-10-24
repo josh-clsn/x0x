@@ -344,6 +344,7 @@ async fn response_gate_applies_signed_kp_without_touching_events() -> Result<()>
             commit: None,
         }],
         truncated: false,
+        responder_state_hash: None,
         target_member_id: Some(creator_hex.clone()),
         target_member_key_package_b64: Some(FAKE_KP_B64.to_string()),
         signed_by: None,

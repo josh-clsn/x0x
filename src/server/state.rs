@@ -1202,8 +1202,14 @@ pub(super) struct AppState {
     /// global count/byte limits, and owns lifecycle pruning, serialized
     /// persistence, dirty retry state, and diagnostics.
     pub(super) treekem_member_key_packages: super::routes::TreeKemMemberKeyPackageCache,
-    /// Anti-spam throttle for outbound catch-up requests.
-    pub(super) treekem_catchup_throttle: RwLock<HashMap<String, Instant>>,
+    /// Anti-spam throttle for outbound catch-up requests. It runs on the
+    /// runtime clock, as the catch-up rounds do (#1427).
+    pub(super) treekem_catchup_throttle: RwLock<HashMap<String, tokio::time::Instant>>,
+    /// #1427: per group key, the epoch-ahead traffic seen while an
+    /// epoch-ahead catch-up task runs for that group. An entry means one
+    /// task runs; each later observation updates the entry.
+    pub(super) treekem_epoch_ahead_targets:
+        Mutex<HashMap<String, crate::server::routes::named_groups::EpochAheadTarget>>,
     /// Per-group serialization for authoritative membership mutations. The
     /// owner-side `MemberJoined`→`MemberAdded` add (and every other membership
     /// apply) is a read-modify-write that loads `info`, mutates a clone, mutates
@@ -1387,6 +1393,12 @@ pub(super) struct NamedGroupTestRecorders {
     /// ADR 0107 (r6): seconds added to the stream seam's clock, to land a
     /// certificate expiry between the pre-phase and the seam.
     pub(super) seam_clock_skew_secs: std::sync::atomic::AtomicU64,
+    /// #1427 epoch-ahead catch-up: tests that want a page send to count as
+    /// delivered set this. Production builds omit the recorders.
+    pub(super) catchup_page_force_ok: std::sync::atomic::AtomicBool,
+    /// Pages `handle_treekem_catchup_request` built, including a cold log,
+    /// and the group ids of page requests the force-ok seam counted.
+    pub(super) catchup_responses: StdMutex<Vec<Vec<u8>>>,
 }
 
 #[cfg(test)]
