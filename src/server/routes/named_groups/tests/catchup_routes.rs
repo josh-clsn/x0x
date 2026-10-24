@@ -447,6 +447,7 @@ async fn get_reports_head_presence_and_round() -> Result<()> {
     // These daemons hold no verified binding to the owner (no announcement
     // was exchanged), so no link to it counts.
     assert_eq!(body["connected_admins"], serde_json::json!([]));
+    assert_eq!(body["admin_links"], serde_json::json!({}));
     assert_eq!(
         body["suspended_since_last_get"], true,
         "a first read, with no mark, cannot be vouched for"
@@ -465,9 +466,13 @@ async fn get_reports_head_presence_and_round() -> Result<()> {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{again}");
+    // Real clocks and no sampler here: this reads suspended if more than
+    // 15 s pass between the two GETs (a loaded runner, a host suspend), or
+    // when the runner is a VM. Read a red run with that in mind.
+    let vm = !crate::server::presence_facts::PresenceFacts::system().verified();
     assert_eq!(
         again["suspended_since_last_get"],
-        !cfg!(any(target_os = "linux", target_os = "android")),
+        vm || !cfg!(any(target_os = "linux", target_os = "android")),
         "since its own mark only a platform without a verified pair reads suspended"
     );
     let (status, foreign) = call(

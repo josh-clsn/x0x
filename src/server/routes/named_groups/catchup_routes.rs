@@ -605,6 +605,9 @@ async fn roster_state(
 /// - `connected_admins`: the admins, of the live roster and of every state
 ///   since the anchor, this daemon holds a live authenticated link to,
 ///   held to the zombie rule after a suspend ([`crate::server::presence_facts`]);
+///   `admin_links` maps each of them to its link id, which changes when
+///   the link drops and comes back, so a link that is not continuous
+///   between two reads shows;
 /// - `suspended_since_last_get`, `presence_mark`: whether this daemon was
 ///   suspended or frozen since the GET whose `presence_mark` the reader
 ///   passes as `since_presence_mark`. No mark, another run's mark, or a
@@ -694,6 +697,7 @@ pub(in crate::server) async fn treekem_catch_up_state(
                 "started_at_ms": state.presence.started_at_ms(),
                 "run_id": state.presence.run_id(),
                 "connected_admins": presence.connected_admins,
+                "admin_links": presence.admin_links,
                 "suspended_since_last_get": presence.suspended_since_last_get,
                 "presence_mark": presence.presence_mark,
                 "round": round,

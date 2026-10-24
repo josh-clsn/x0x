@@ -1979,6 +1979,10 @@ pub struct LinkLiveness {
     pub connected_at: Instant,
     /// When the peer last delivered application data, on any connection.
     pub last_received_at: Option<Instant>,
+    /// The live connection's ant-quic generation. ant-quic draws it from
+    /// one process-wide counter, so a link that dropped and came back has
+    /// a new one: the link's id within this run.
+    pub generation: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -4387,6 +4391,7 @@ impl NetworkNode {
                     authenticated: conn.authenticated && health.connected,
                     connected_at: conn.connected_at,
                     last_received_at: health.last_received_at,
+                    generation: health.generation,
                 },
             );
         }
