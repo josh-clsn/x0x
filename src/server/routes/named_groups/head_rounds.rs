@@ -6,9 +6,11 @@
 //!   member. A named agent is never left out: when the whole set would be
 //!   larger than [`HEAD_PROOF_MAX_ADMINS`], no round opens at all, so the
 //!   room holds (A6 review C-1).
-//! - **The challenge.** A counter that only grows (at least the wall clock
-//!   in milliseconds), then 32 random bytes, so an admin can refuse a
-//!   replayed older challenge without charging it (A6 review I-1).
+//! - **The challenge.** A counter that only grows, then 32 random bytes,
+//!   so an admin can refuse a replayed older challenge without charging it
+//!   (A6 review I-1). The counter is at least the wall clock in
+//!   milliseconds, and it is kept on disk ([`HeadCounter`]), so it never
+//!   goes back, whatever the clock does across a restart.
 //! - **What is recorded.** A proof that verifies, for this member, in this
 //!   room, from a signer it challenged, under the open round's nonce,
 //!   within [`HEAD_ROUND_DEADLINE`] of the round opening. Every distinct
@@ -21,11 +23,14 @@
 //! while a device sleeps. It is not a freshness age: the engine measures
 //! the round deadline and the time to live on its sleep-inclusive clock.
 
-use super::head_proof::{challenge_nonce, is_agent_hex, verify, HeadProof, HEAD_PROOF_MAX_ADMINS};
+use super::head_proof::{
+    challenge_nonce, is_agent_hex, verify, HeadClaim, HeadProof, HEAD_PROOF_MAX_ADMINS,
+};
 use super::{now_millis_u64, parse_agent_id_hex, signed_catchup, AppState};
 use crate as x0x;
 use crate::logging::LogHexId;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -53,14 +58,59 @@ pub(in crate::server) enum NotRecorded {
     BadSignature,
 }
 
+/// The file, under the TreeKEM directory, that holds the last challenge
+/// counter this daemon used.
+const HEAD_COUNTER_FILE: &str = "head-challenge-counter";
+
+/// This daemon's challenge counter: the last one used, kept on disk so it
+/// never goes back (A6 re-review m-r1).
+#[derive(Debug)]
+pub(in crate::server) struct HeadCounter {
+    last: u64,
+    path: PathBuf,
+}
+
+/// The counter kept under `treekem_dir`. A missing or unreadable file
+/// starts from zero, so the next counter is the wall clock.
+pub(in crate::server) async fn load_head_counter(treekem_dir: &Path) -> HeadCounter {
+    let path = treekem_dir.join(HEAD_COUNTER_FILE);
+    let last = match tokio::fs::read_to_string(&path).await {
+        Ok(text) => text.trim().parse::<u64>().unwrap_or_else(|_| {
+            tracing::warn!(path = %path.display(), "TreeKEM head: the challenge counter file does not parse; starting from the clock");
+            0
+        }),
+        Err(_) => 0,
+    };
+    HeadCounter { last, path }
+}
+
+impl HeadCounter {
+    /// The next counter: above the last one and at least `now_ms`, written
+    /// to disk (atomically and durably) before it is used. `None` when it
+    /// cannot be written or the counter is used up: then no round opens.
+    async fn next(&mut self, now_ms: u64) -> Option<u64> {
+        let next = self.last.checked_add(1)?.max(now_ms);
+        if let Err(e) =
+            x0x::storage::write_private_bytes_durable(&self.path, next.to_string().into_bytes())
+                .await
+        {
+            tracing::warn!(path = %self.path.display(), "TreeKEM head: could not keep the challenge counter: {e}");
+            return None;
+        }
+        self.last = next;
+        Some(next)
+    }
+}
+
 /// An open round: one nonce, the agents it challenged, and the distinct
-/// heads each signer returned.
+/// heads each signer returned. A head is kept as its claim once its proof
+/// verified (A6 re-review m-r2).
 #[derive(Debug, Clone)]
 struct HeadRound {
     nonce: String,
     opened_at: Instant,
     asked: BTreeSet<String>,
-    proofs: BTreeMap<String, Vec<HeadProof>>,
+    heads: BTreeMap<String, Vec<HeadClaim>>,
     conflicted: BTreeSet<String>,
 }
 
@@ -72,28 +122,20 @@ pub(in crate::server) struct RoundView {
     /// On the process monotonic clock: not a freshness age.
     pub(in crate::server) opened_at: Instant,
     pub(in crate::server) asked: BTreeSet<String>,
-    /// Every distinct head recorded, by signer.
-    pub(in crate::server) proofs: Vec<HeadProof>,
+    /// Every distinct head recorded, by signer, each from a proof that
+    /// verified. A signer listed in `conflicted` never counts as a match.
+    pub(in crate::server) heads: Vec<HeadClaim>,
     /// Signers that signed more than one head in this round.
     pub(in crate::server) conflicted: BTreeSet<String>,
 }
 
-/// Per daemon: each room's open round, and the counter its challenges
-/// carry.
+/// Per daemon: each room's open round.
 #[derive(Debug, Default)]
 pub(in crate::server) struct HeadRounds {
     rounds: HashMap<String, HeadRound>,
-    counter: u64,
 }
 
 impl HeadRounds {
-    /// A new challenge: its counter is above every earlier one, and at
-    /// least `now_ms`, so it stays above them after a restart too.
-    fn next_nonce(&mut self, now_ms: u64) -> String {
-        self.counter = self.counter.saturating_add(1).max(now_ms);
-        challenge_nonce(self.counter)
-    }
-
     /// Open a round in `key`, replacing any open one and its proofs.
     fn open_round(&mut self, key: &str, nonce: String, asked: BTreeSet<String>, now: Instant) {
         self.rounds.insert(
@@ -102,7 +144,7 @@ impl HeadRounds {
                 nonce,
                 opened_at: now,
                 asked,
-                proofs: BTreeMap::new(),
+                heads: BTreeMap::new(),
                 conflicted: BTreeSet::new(),
             },
         );
@@ -134,24 +176,25 @@ impl HeadRounds {
         if !verify(&proof) {
             return Err(NotRecorded::BadSignature);
         }
-        let signer = proof.claim.signer.clone();
-        let heads = round.proofs.entry(signer.clone()).or_default();
-        let head = |p: &HeadProof| (p.claim.treekem_epoch, p.claim.epoch_authenticator.clone());
-        if heads.iter().any(|kept| head(kept) == head(&proof)) {
+        let claim = proof.claim;
+        let signer = claim.signer.clone();
+        let heads = round.heads.entry(signer.clone()).or_default();
+        let head = |c: &HeadClaim| (c.treekem_epoch, c.epoch_authenticator.clone());
+        if heads.iter().any(|kept| head(kept) == head(&claim)) {
             return Ok(());
         }
         if !heads.is_empty() {
             round.conflicted.insert(signer);
         }
         if heads.len() < HEADS_PER_SIGNER {
-            heads.push(proof);
+            heads.push(claim);
         } else if let Some(lowest) = heads
             .iter_mut()
-            .min_by_key(|kept| kept.claim.treekem_epoch)
-            .filter(|kept| kept.claim.treekem_epoch < proof.claim.treekem_epoch)
+            .min_by_key(|kept| kept.treekem_epoch)
+            .filter(|kept| kept.treekem_epoch < claim.treekem_epoch)
         {
             // Full: the highest epochs are the evidence that holds a room.
-            *lowest = proof;
+            *lowest = claim;
         }
         Ok(())
     }
@@ -229,11 +272,20 @@ pub(in crate::server) async fn challenge_admins(
         );
         return None;
     };
-    let nonce = state
-        .treekem_head_rounds
+    let counter = state
+        .treekem_head_counter
         .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .next_nonce(now_millis_u64());
+        .await
+        .next(now_millis_u64())
+        .await;
+    let Some(counter) = counter else {
+        tracing::warn!(
+            group_id = %LogHexId::group(&key),
+            "TreeKEM head: no challenge counter; no round opened, the room holds"
+        );
+        return None;
+    };
+    let nonce = challenge_nonce(counter);
     let mut request = signed_catchup::page_request(state, &key, None).await?;
     request.head_challenge = Some(nonce.clone());
     signed_catchup::sign_page_request(state, &mut request);
@@ -306,19 +358,22 @@ pub(in crate::server) fn round_view(state: &AppState, group_id: &str) -> Option<
         nonce: round.nonce.clone(),
         opened_at: round.opened_at,
         asked: round.asked.clone(),
-        proofs: round.proofs.values().flatten().cloned().collect(),
+        heads: round.heads.values().flatten().cloned().collect(),
         conflicted: round.conflicted.clone(),
     })
 }
 
 /// This member's next challenge, as a round would carry it.
 #[cfg(test)]
-pub(in crate::server) fn next_challenge(state: &AppState) -> String {
-    state
-        .treekem_head_rounds
+pub(in crate::server) async fn next_challenge(state: &AppState) -> String {
+    let counter = state
+        .treekem_head_counter
         .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .next_nonce(now_millis_u64())
+        .await
+        .next(now_millis_u64())
+        .await
+        .expect("a challenge counter");
+    challenge_nonce(counter)
 }
 
 /// Move the open round's opening `by` into the past, for a deadline test.
@@ -434,7 +489,7 @@ mod tests {
             ),
             Ok(())
         );
-        assert_eq!(book.rounds["k"].proofs.len(), 1);
+        assert_eq!(book.rounds["k"].heads.len(), 1);
 
         book.open_round(
             "k",
@@ -443,7 +498,7 @@ mod tests {
             now,
         );
         assert!(
-            book.rounds["k"].proofs.is_empty(),
+            book.rounds["k"].heads.is_empty(),
             "a new round starts empty"
         );
         assert_eq!(
@@ -472,9 +527,9 @@ mod tests {
         assert_eq!(book.record("k", "group", &me, earlier.clone(), now), Ok(()));
         assert_eq!(book.record("k", "group", &me, earlier, now), Ok(()));
         let round = &book.rounds["k"];
-        let epochs: Vec<u64> = round.proofs[&agent_hex(&admin)]
+        let epochs: Vec<u64> = round.heads[&agent_hex(&admin)]
             .iter()
-            .map(|p| p.claim.treekem_epoch)
+            .map(|c| c.treekem_epoch)
             .collect();
         assert_eq!(
             epochs,
@@ -488,24 +543,44 @@ mod tests {
             let head = proof_at(&admin, &me, "n", epoch, &byte.repeat(32));
             assert_eq!(book.record("k", "group", &me, head, now), Ok(()));
         }
-        let mut epochs: Vec<u64> = book.rounds["k"].proofs[&agent_hex(&admin)]
+        let mut epochs: Vec<u64> = book.rounds["k"].heads[&agent_hex(&admin)]
             .iter()
-            .map(|p| p.claim.treekem_epoch)
+            .map(|c| c.treekem_epoch)
             .collect();
         epochs.sort_unstable();
         assert_eq!(epochs, vec![8, 9, 10, 11]);
     }
 
-    #[test]
-    fn challenges_only_grow() {
-        let mut book = HeadRounds::default();
-        let first = super::super::head_proof::challenge_counter(&book.next_nonce(1_000)).unwrap();
-        let second = super::super::head_proof::challenge_counter(&book.next_nonce(1_000)).unwrap();
-        let after_a_clock_step_back =
-            super::super::head_proof::challenge_counter(&book.next_nonce(10)).unwrap();
-        assert_eq!(first, 1_000);
-        assert_eq!(second, 1_001);
-        assert_eq!(after_a_clock_step_back, 1_002);
+    #[tokio::test]
+    async fn the_challenge_counter_only_grows_across_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut counter = load_head_counter(dir.path()).await;
+        assert_eq!(counter.next(1_000).await, Some(1_000));
+        assert_eq!(counter.next(1_000).await, Some(1_001));
+        // A restart with the clock stepped far back.
+        let mut restarted = load_head_counter(dir.path()).await;
+        assert_eq!(restarted.next(10).await, Some(1_002));
+        assert_eq!(
+            tokio::fs::read_to_string(dir.path().join(HEAD_COUNTER_FILE))
+                .await
+                .unwrap(),
+            "1002"
+        );
+        tokio::fs::write(dir.path().join(HEAD_COUNTER_FILE), "garbage")
+            .await
+            .unwrap();
+        assert_eq!(
+            load_head_counter(dir.path()).await.next(500).await,
+            Some(500)
+        );
+        tokio::fs::write(dir.path().join(HEAD_COUNTER_FILE), u64::MAX.to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            load_head_counter(dir.path()).await.next(500).await,
+            None,
+            "a used-up counter opens no round"
+        );
     }
 
     #[test]

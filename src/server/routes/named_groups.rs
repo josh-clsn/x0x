@@ -20,7 +20,7 @@ mod fair_admission;
 mod head_proof;
 mod head_rounds;
 pub(in crate::server) use head_proof::HeadAnswers;
-pub(in crate::server) use head_rounds::HeadRounds;
+pub(in crate::server) use head_rounds::{load_head_counter, HeadCounter, HeadRounds};
 mod join_result_pins;
 mod seat_cert_fetch;
 mod signed_catchup;
@@ -10976,30 +10976,25 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     // member-keyed serve (#205) returns above this point, so multi-member key-
     // package recovery — many distinct targets at one frontier — is unaffected.
     // Survivor re-key A6: a head challenge is answered here, before the
-    // #378 throttle, under its own limit per (group, requester). Only an
-    // active requester is answered, and only an active admin signs; the
+    // #378 throttle, under its own limit per (group, requester). Only a
+    // challenge the requester signed counts, whatever the transport; only
+    // an active requester is answered, and only an active admin signs; the
     // requester's epoch, when ahead, starts this daemon's own catch-up.
-    let head_proof = match request.head_challenge.as_deref() {
-        Some(nonce) if authorized && !sender_departed => match head_proof::answer_challenge(
-            state,
-            &request.group_id,
-            &sender_hex,
-            nonce,
-            request.from_treekem_epoch,
-        )
-        .await
-        {
-            Ok(proof) => Some(proof),
-            Err(refusal) => {
-                tracing::debug!(
-                    group_id = %LogHexId::group(&request.group_id),
-                    requester = %sender_hex,
-                    ?refusal,
-                    "TreeKEM head challenge answered without a proof"
-                );
-                None
+    let head_proof = match head_proof::SignedChallenge::from_request(&request) {
+        Some(challenge) if authorized && !sender_departed => {
+            match head_proof::answer_challenge(state, &challenge).await {
+                Ok(proof) => Some(proof),
+                Err(refusal) => {
+                    tracing::debug!(
+                        group_id = %LogHexId::group(&request.group_id),
+                        requester = %sender_hex,
+                        ?refusal,
+                        "TreeKEM head challenge answered without a proof"
+                    );
+                    None
+                }
             }
-        },
+        }
         _ => None,
     };
     let serve_throttle_key = format!(
@@ -45497,6 +45492,7 @@ pub(in crate::server) mod tests {
             &hex::encode(agent.agent_id().as_bytes()),
         )
         .await;
+        let treekem_head_counter = load_head_counter(&treekem_dir).await;
         // ADR-0041 Tier-1: mirror daemon startup — owned agents get the
         // SyncV1 acceptor + store under `<data_dir>/sync`.
         let owner_sync = if agent.identity().user_keypair().is_some() {
@@ -45652,6 +45648,7 @@ pub(in crate::server) mod tests {
             treekem_gap_asks: std::sync::Mutex::default(),
             treekem_head_answers: std::sync::Mutex::default(),
             treekem_head_rounds: std::sync::Mutex::default(),
+            treekem_head_counter: Mutex::new(treekem_head_counter),
             group_membership_locks: RwLock::new(HashMap::new()),
             treekem_groups: RwLock::new(HashMap::new()),
             treekem_dir,

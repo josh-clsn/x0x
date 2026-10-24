@@ -1034,6 +1034,9 @@ pub async fn serve_with_options(
         &hex::encode(agent.agent_id().as_bytes()),
     )
     .await;
+    // Survivor re-key A6: the head challenge counter never goes back.
+    let treekem_head_counter =
+        crate::server::routes::named_groups::load_head_counter(&treekem_dir).await;
 
     // ADR-0036: load the daemon self-profile (names) and enforce the owner
     // singleton — an install whose recorded owner differs from the user key
@@ -1246,6 +1249,7 @@ pub async fn serve_with_options(
         treekem_gap_asks: std::sync::Mutex::default(),
         treekem_head_answers: std::sync::Mutex::default(),
         treekem_head_rounds: std::sync::Mutex::default(),
+        treekem_head_counter: Mutex::new(treekem_head_counter),
         group_membership_locks: RwLock::new(HashMap::new()),
         treekem_groups: RwLock::new(treekem_groups),
         treekem_dir,

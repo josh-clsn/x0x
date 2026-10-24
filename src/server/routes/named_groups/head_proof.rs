@@ -17,13 +17,15 @@
 //! - **What it signs.** The epoch and authenticator, read together under
 //!   the tree's lock ([`x0x::mls::TreeKemMlsGroup::head`]).
 //! - **When.** A challenge rides on a signed page request
-//!   (`head_challenge`). It is answered before the #378 page throttle.
-//!   Challenges are ordered per requester ([`challenge_counter`]): an older
-//!   one is refused and the latest one is answered once and then from
-//!   cache, neither of them charged. Only a newer one is charged, at most
-//!   [`HEAD_PROOFS_PER_WINDOW`] per [`HEAD_PROOF_WINDOW`] per (group,
-//!   requester). So a replayed challenge never spends the requester's
-//!   answers.
+//!   (`head_challenge`), and is answered only as a [`SignedChallenge`]: one
+//!   its requester signed, whatever the transport or route. It is answered
+//!   before the #378 page throttle. Challenges are ordered per requester
+//!   ([`challenge_counter`]): a newer one always becomes the latest, so
+//!   every older one is refused uncharged; the latest one again is re-sent
+//!   its proof from cache at most once per [`HEAD_PROOF_REPEAT_WINDOW`];
+//!   only newer ones are charged, at most [`HEAD_PROOFS_PER_WINDOW`] per
+//!   [`HEAD_PROOF_WINDOW`] per (group, requester). So a replayed challenge
+//!   delays the requester by at most one window.
 
 use super::{
     build_catchup_signer, catchup_signer_matches, named_group_direct_delivery_config,
@@ -52,6 +54,10 @@ pub(in crate::server) const HEAD_PROOFS_PER_WINDOW: usize = 12;
 
 /// The window of [`HEAD_PROOFS_PER_WINDOW`].
 pub(in crate::server) const HEAD_PROOF_WINDOW: Duration = Duration::from_secs(60);
+
+/// How often the proof of a requester's latest challenge is re-sent when
+/// that challenge comes again.
+pub(in crate::server) const HEAD_PROOF_REPEAT_WINDOW: Duration = super::TREEKEM_CATCHUP_THROTTLE;
 
 /// The most admins a proof names, and the most agents a round challenges.
 /// A room with more is not answered, and no round is opened in it.
@@ -269,6 +275,35 @@ pub(in crate::server) enum Refusal {
     NotAnAdmin,
     /// Signing failed, or the roster kept moving while it was read.
     Unavailable,
+    /// The latest challenge again, inside the window since its proof was
+    /// last re-sent. Not charged, and nothing is sent.
+    RepeatTooSoon,
+}
+
+/// A head challenge its requester signed: built only from a page request
+/// whose signature verifies for its claimed requester over the group, the
+/// requester, the head and the challenge (A5's page-request signature). So
+/// only the requester itself can move its floor at an admin (A6 re-review
+/// N-2), whatever the transport or the route.
+#[derive(Debug, Clone)]
+pub(in crate::server) struct SignedChallenge {
+    group_id: String,
+    requester: String,
+    nonce: String,
+    requester_epoch: u64,
+}
+
+impl SignedChallenge {
+    /// The challenge `request` carries, when its requester signed it.
+    pub(in crate::server) fn from_request(request: &super::TreeKemCatchupRequest) -> Option<Self> {
+        let nonce = request.head_challenge.clone()?;
+        signed_catchup::page_request_signed(request).then(|| Self {
+            group_id: request.group_id.clone(),
+            requester: request.requester_agent_id.to_ascii_lowercase(),
+            nonce,
+            requester_epoch: request.from_treekem_epoch,
+        })
+    }
 }
 
 /// What [`HeadAnswers::admit`] decides for a challenge.
@@ -278,6 +313,8 @@ enum Admission {
     Fresh,
     /// The latest challenge again: its proof, if it got one.
     Repeat(Option<Box<HeadProof>>),
+    /// The latest challenge again, too soon after its last re-send.
+    RepeatTooSoon,
     /// An older challenge, or another one with the latest counter.
     Stale,
     /// A newer challenge over the limit.
@@ -293,6 +330,8 @@ struct Answered {
     latest: Option<(u64, String)>,
     /// The proof the latest challenge got.
     proof: Option<HeadProof>,
+    /// When that proof was last re-sent for a repeat.
+    last_repeat: Option<Instant>,
 }
 
 /// Per daemon, per (room, requester): the challenges answered. Entries are
@@ -305,8 +344,11 @@ pub(in crate::server) struct HeadAnswers {
 
 impl HeadAnswers {
     /// Decide on `requester`'s challenge `nonce`, whose counter is
-    /// `counter`, in `key`. Only a newer challenge within the limit is
-    /// charged, and it becomes the latest.
+    /// `counter`, in `key`. A newer challenge always becomes the latest,
+    /// so every older one is refused from then on, but it is charged only
+    /// within the limit (A6 re-review I-1b). The latest one again is
+    /// re-sent its proof at most once per [`HEAD_PROOF_REPEAT_WINDOW`]
+    /// (N-1), uncharged.
     fn admit(
         &mut self,
         key: &str,
@@ -324,11 +366,19 @@ impl HeadAnswers {
                 return Admission::Stale;
             }
             if counter == *latest {
-                return if latest_nonce == nonce {
-                    Admission::Repeat(entry.proof.clone().map(Box::new))
-                } else {
-                    Admission::Stale
+                if latest_nonce != nonce {
+                    return Admission::Stale;
+                }
+                let Some(proof) = entry.proof.clone() else {
+                    return Admission::Repeat(None);
                 };
+                if entry.last_repeat.is_some_and(|last| {
+                    now.saturating_duration_since(last) < HEAD_PROOF_REPEAT_WINDOW
+                }) {
+                    return Admission::RepeatTooSoon;
+                }
+                entry.last_repeat = Some(now);
+                return Admission::Repeat(Some(Box::new(proof)));
             }
         }
         while entry
@@ -338,12 +388,13 @@ impl HeadAnswers {
         {
             entry.stamps.pop_front();
         }
+        entry.latest = Some((counter, nonce.to_string()));
+        entry.proof = None;
+        entry.last_repeat = None;
         if entry.stamps.len() >= HEAD_PROOFS_PER_WINDOW {
             return Admission::Limited;
         }
         entry.stamps.push_back(now);
-        entry.latest = Some((counter, nonce.to_string()));
-        entry.proof = None;
         Admission::Fresh
     }
 
@@ -431,43 +482,34 @@ async fn roster_head(state: &AppState, group_id: &str, requester: &str) -> Optio
 /// when the roster moved while it read the tree.
 const HEAD_READ_ATTEMPTS: usize = 3;
 
-/// Answer `requester`'s challenge `nonce` in `group_id` with this daemon's
-/// signed head proof. `requester_epoch` is the epoch the requester holds:
-/// when it is ahead of the live tree, this daemon starts its own epoch-ahead
-/// catch-up, whether or not it is an admin.
+/// Answer `challenge` with this daemon's signed head proof. The
+/// requester's signed epoch, when ahead of the live tree, makes this daemon
+/// start its own epoch-ahead catch-up, whether or not it is an admin.
 ///
 /// The page serve (`handle_treekem_catchup_request`) calls this after its
-/// gates, before its #378 throttle. The A7 route calls it too.
+/// gates, before its #378 throttle. The A7 route calls it too, with a
+/// challenge it can only build from the requester's signed request.
 pub(in crate::server) async fn answer_challenge(
     state: &Arc<AppState>,
-    group_id: &str,
-    requester: &str,
-    nonce: &str,
-    requester_epoch: u64,
+    challenge: &SignedChallenge,
 ) -> Result<HeadProof, Refusal> {
-    answer_challenge_with(
-        state,
-        group_id,
-        requester,
-        nonce,
-        requester_epoch,
-        inflate_knob(),
-    )
-    .await
+    answer_challenge_with(state, challenge, inflate_knob()).await
 }
 
 /// [`answer_challenge`], with [`INFLATE_KNOB`]'s effect given as `inflate`.
 pub(in crate::server) async fn answer_challenge_with(
     state: &Arc<AppState>,
-    group_id: &str,
-    requester: &str,
-    nonce: &str,
-    requester_epoch: u64,
+    challenge: &SignedChallenge,
     inflate: bool,
 ) -> Result<HeadProof, Refusal> {
+    let SignedChallenge {
+        group_id,
+        requester,
+        nonce,
+        requester_epoch,
+    } = challenge;
     let counter = challenge_counter(nonce).ok_or(Refusal::BadChallenge)?;
-    let requester = requester.to_ascii_lowercase();
-    let gate = roster_head(state, group_id, &requester)
+    let gate = roster_head(state, group_id, requester)
         .await
         .ok_or(Refusal::NoRoom)?;
     if !gate.requester_active {
@@ -478,15 +520,38 @@ pub(in crate::server) async fn answer_challenge_with(
         .treekem_head_answers
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .admit(&key, &requester, nonce, counter, Instant::now());
+        .admit(&key, requester, nonce, counter, Instant::now());
     match admission {
         Admission::Fresh => {}
         Admission::Repeat(Some(proof)) => return Ok(*proof),
         Admission::Repeat(None) | Admission::Stale => return Err(Refusal::StaleChallenge),
+        Admission::RepeatTooSoon => return Err(Refusal::RepeatTooSoon),
         Admission::Limited => return Err(Refusal::Limited),
     }
+    let answered = answer_fresh(state, &key, requester, nonce, *requester_epoch, inflate).await;
+    if let Err(refusal) = answered {
+        // A6 re-review m-r3: this challenge was charged and is now the
+        // latest, so a repeat of it is refused as stale.
+        tracing::debug!(
+            group_id = %LogHexId::group(&key),
+            requester = %LogHexId::agent(requester),
+            ?refusal,
+            "a charged head challenge got no proof; a repeat of it will be refused as stale"
+        );
+    }
+    answered
+}
+
+async fn answer_fresh(
+    state: &Arc<AppState>,
+    key: &str,
+    requester: &str,
+    nonce: &str,
+    requester_epoch: u64,
+    inflate: bool,
+) -> Result<HeadProof, Refusal> {
     for _ in 0..HEAD_READ_ATTEMPTS {
-        let roster = roster_head(state, &key, &requester)
+        let roster = roster_head(state, key, requester)
             .await
             .ok_or(Refusal::NoRoom)?;
         if !roster.requester_active {
@@ -511,7 +576,7 @@ pub(in crate::server) async fn answer_challenge_with(
             .treekem_groups
             .read()
             .await
-            .get(&key)
+            .get(key)
             .cloned()
             .ok_or(Refusal::NoRoom)?;
         // The epoch and the authenticator come from one borrow of the live
@@ -522,7 +587,7 @@ pub(in crate::server) async fn answer_challenge_with(
         };
         // The roster must not have moved while the tree was read: the
         // requester still active, this daemon still an admin, the same head.
-        let still = roster_head(state, &key, &requester)
+        let still = roster_head(state, key, requester)
             .await
             .ok_or(Refusal::NoRoom)?;
         if still.settled() != roster.settled() {
@@ -531,13 +596,13 @@ pub(in crate::server) async fn answer_challenge_with(
         // Every path below returns, so this runs once per challenge.
         if requester_epoch > epoch {
             tracing::info!(
-                group_id = %LogHexId::group(&key),
-                requester = %LogHexId::agent(&requester),
+                group_id = %LogHexId::group(key),
+                requester = %LogHexId::agent(requester),
                 local_epoch = epoch,
                 requester_epoch,
                 "a member that challenged this daemon holds a later epoch; catching up"
             );
-            spawn_treekem_epoch_ahead_catchup(state, &key, requester_epoch);
+            spawn_treekem_epoch_ahead_catchup(state, key, requester_epoch);
         }
         if !roster.local_is_admin {
             return Err(Refusal::NotAnAdmin);
@@ -548,7 +613,7 @@ pub(in crate::server) async fn answer_challenge_with(
         let proof = sign_head(
             state,
             roster,
-            &requester,
+            requester,
             nonce,
             epoch,
             authenticator,
@@ -559,7 +624,7 @@ pub(in crate::server) async fn answer_challenge_with(
             .treekem_head_answers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remember(&key, &requester, nonce, &proof);
+            .remember(key, requester, nonce, &proof);
         return Ok(proof);
     }
     Err(Refusal::Unavailable)
@@ -859,17 +924,26 @@ mod tests {
                 Admission::Fresh
             ));
         }
+        let thirty = challenge_nonce(30);
         assert!(matches!(
-            book.admit("k", "r", &challenge_nonce(30), 30, now),
+            book.admit("k", "r", &thirty, 30, now),
             Admission::Limited
         ));
         assert!(
             matches!(
-                book.admit("k", "r", &challenge_nonce(30), 30, now + HEAD_PROOF_WINDOW),
-                Admission::Fresh
+                book.admit("k", "r", &challenge_nonce(25), 25, now + HEAD_PROOF_WINDOW),
+                Admission::Stale
             ),
-            "a limited challenge did not become the latest"
+            "a limited newer challenge still raised the floor"
         );
+        assert!(matches!(
+            book.admit("k", "r", &thirty, 30, now + HEAD_PROOF_WINDOW),
+            Admission::Repeat(None)
+        ));
+        assert!(matches!(
+            book.admit("k", "r", &challenge_nonce(31), 31, now + HEAD_PROOF_WINDOW),
+            Admission::Fresh
+        ));
         assert!(matches!(
             book.admit("k", "s", &challenge_nonce(1), 1, now),
             Admission::Fresh
@@ -880,5 +954,73 @@ mod tests {
         ));
         book.wipe("k");
         assert!(book.answered.keys().all(|(key, _)| key != "k"));
+    }
+
+    #[test]
+    fn the_latest_proof_is_re_sent_at_most_once_a_window() {
+        let keypair = crate::identity::AgentKeypair::generate().unwrap();
+        let now = Instant::now();
+        let mut book = HeadAnswers::default();
+        let nonce = challenge_nonce(5);
+        assert!(matches!(
+            book.admit("k", "r", &nonce, 5, now),
+            Admission::Fresh
+        ));
+        let proof = sign_claim_with(&keypair, claim(&agent_hex(&keypair), "r", &nonce));
+        book.remember("k", "r", &nonce, &proof);
+        assert!(matches!(
+            book.admit("k", "r", &nonce, 5, now),
+            Admission::Repeat(Some(_))
+        ));
+        assert!(matches!(
+            book.admit("k", "r", &nonce, 5, now + HEAD_PROOF_REPEAT_WINDOW / 2),
+            Admission::RepeatTooSoon
+        ));
+        assert!(matches!(
+            book.admit("k", "r", &nonce, 5, now + HEAD_PROOF_REPEAT_WINDOW),
+            Admission::Repeat(Some(_))
+        ));
+    }
+
+    /// A6 re-review I-1b: an admin that forgot S (a restart, or it was
+    /// offline while S ran rounds) faces a replayer holding 30 of S's
+    /// challenges above its floor. S's newest arrives after the twelfth:
+    /// it is limited, but it fences off the rest, and S's next challenge
+    /// after one window is answered.
+    #[test]
+    fn a_replayed_stock_of_old_challenges_delays_the_requester_at_most_one_window() {
+        let now = Instant::now();
+        let mut book = HeadAnswers::default();
+        let stock: Vec<(u64, String)> = (1..=30).map(|c| (c, challenge_nonce(c))).collect();
+        for (counter, nonce) in &stock[..HEAD_PROOFS_PER_WINDOW] {
+            assert!(matches!(
+                book.admit("k", "s", nonce, *counter, now),
+                Admission::Fresh
+            ));
+        }
+        let newest = challenge_nonce(100);
+        assert!(matches!(
+            book.admit("k", "s", &newest, 100, now),
+            Admission::Limited
+        ));
+        for (counter, nonce) in &stock[HEAD_PROOFS_PER_WINDOW..] {
+            assert!(
+                matches!(
+                    book.admit("k", "s", nonce, *counter, now + HEAD_PROOF_WINDOW),
+                    Admission::Stale
+                ),
+                "the rest of the stock is fenced off"
+            );
+        }
+        assert!(matches!(
+            book.admit(
+                "k",
+                "s",
+                &challenge_nonce(101),
+                101,
+                now + HEAD_PROOF_WINDOW
+            ),
+            Admission::Fresh
+        ));
     }
 }

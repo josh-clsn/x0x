@@ -1227,6 +1227,9 @@ pub(super) struct AppState {
     /// nonce, whom it challenged, the proofs recorded), and its challenge
     /// counter.
     pub(super) treekem_head_rounds: StdMutex<crate::server::routes::named_groups::HeadRounds>,
+    /// Survivor re-key A6: this daemon's challenge counter, kept on disk
+    /// under [`Self::treekem_dir`] so it never goes back.
+    pub(super) treekem_head_counter: Mutex<crate::server::routes::named_groups::HeadCounter>,
     /// Per-group serialization for authoritative membership mutations. The
     /// owner-side `MemberJoined`→`MemberAdded` add (and every other membership
     /// apply) is a read-modify-write that loads `info`, mutates a clone, mutates

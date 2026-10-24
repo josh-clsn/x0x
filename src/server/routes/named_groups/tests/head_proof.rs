@@ -10,7 +10,7 @@
 
 use super::super::head_proof::{
     answer_challenge, answer_challenge_with, challenge_nonce, sign_claim_with, verify, HeadProof,
-    Refusal, HEAD_PROOFS_PER_WINDOW,
+    Refusal, SignedChallenge, HEAD_PROOFS_PER_WINDOW,
 };
 use super::super::head_rounds::{
     self, challenge_admins, next_challenge, record_proof, round_view, NotRecorded,
@@ -35,6 +35,12 @@ async fn challenge(
     request.head_challenge = Some(nonce.to_string());
     sign_page_request(requester, &mut request);
     request
+}
+
+/// `requester`'s signed challenge `nonce`, as an admin takes it.
+async fn signed(requester: &Arc<AppState>, group_id: &str, nonce: &str) -> SignedChallenge {
+    SignedChallenge::from_request(&challenge(requester, group_id, nonce).await)
+        .expect("the requester signed its challenge")
 }
 
 /// The last response `server` sent for `request`, if any.
@@ -108,13 +114,7 @@ async fn authenticator_hex(state: &AppState, group_id: &str) -> String {
 /// The proofs S1's open round holds, by signer.
 fn s1_recorded(cast: &SurvivorRelay) -> Vec<String> {
     round_view(&cast.s1, &cast.fixture.group_id)
-        .map(|round| {
-            round
-                .proofs
-                .iter()
-                .map(|proof| proof.claim.signer.clone())
-                .collect()
-        })
+        .map(|round| round.heads.iter().map(|head| head.signer.clone()).collect())
         .unwrap_or_default()
 }
 
@@ -152,7 +152,7 @@ async fn authenticator_is_read_from_the_live_tree() -> Result<()> {
     let cast = survivor_relay_fixture().await?;
     let owner = &cast.fixture.state;
     let group_id = &cast.fixture.group_id;
-    let first = owner_proof(&cast, &next_challenge(&cast.s1)).await;
+    let first = owner_proof(&cast, &next_challenge(&cast.s1).await).await;
     assert_eq!(first.claim.treekem_epoch, live_epoch(owner, group_id).await);
     assert_eq!(
         first.claim.epoch_authenticator,
@@ -170,7 +170,7 @@ async fn authenticator_is_read_from_the_live_tree() -> Result<()> {
         let mut guard = group.lock().await;
         guard.update()?;
     }
-    let second = owner_proof(&cast, &next_challenge(&cast.s1)).await;
+    let second = owner_proof(&cast, &next_challenge(&cast.s1).await).await;
     assert_eq!(second.claim.treekem_epoch, first.claim.treekem_epoch + 1);
     assert_eq!(
         second.claim.epoch_authenticator,
@@ -200,7 +200,7 @@ async fn an_admin_answers_a_challenge_with_a_signed_proof() -> Result<()> {
     let owner_hex = hex_id(&cast.fixture.state.agent.agent_id());
     let s1_hex = hex_id(&cast.s1.agent.agent_id());
     let info = roster(&cast.fixture.state, &cast.fixture.group_id).await;
-    let nonce = next_challenge(&cast.s1);
+    let nonce = next_challenge(&cast.s1).await;
     let proof = owner_proof(&cast, &nonce).await;
     assert!(verify(&proof), "the proof verifies");
     assert_eq!(proof.claim.version, 1);
@@ -213,13 +213,10 @@ async fn an_admin_answers_a_challenge_with_a_signed_proof() -> Result<()> {
     assert_eq!(proof.claim.security_binding, info.security_binding);
 
     // The A7 route signs through the same function.
-    let another = next_challenge(&cast.s1);
+    let another = next_challenge(&cast.s1).await;
     let direct = answer_challenge(
         &cast.fixture.state,
-        &cast.fixture.group_id,
-        &s1_hex,
-        &another,
-        0,
+        &signed(&cast.s1, &cast.fixture.group_id, &another).await,
     )
     .await
     .expect("the owner signs");
@@ -233,7 +230,7 @@ async fn an_admin_answers_a_challenge_with_a_signed_proof() -> Result<()> {
 async fn a_non_admin_answers_without_a_proof() -> Result<()> {
     let cast = survivor_relay_fixture().await?;
     let group_id = &cast.fixture.group_id;
-    let request = challenge(&cast.s1, group_id, &next_challenge(&cast.s1)).await;
+    let request = challenge(&cast.s1, group_id, &next_challenge(&cast.s1).await).await;
     let page = served(&cast.s2, &cast.s1.agent.agent_id(), request, false)
         .await
         .expect("S2 still serves the page");
@@ -243,10 +240,7 @@ async fn a_non_admin_answers_without_a_proof() -> Result<()> {
     );
     let refused = answer_challenge(
         &cast.s2,
-        group_id,
-        &hex_id(&cast.s1.agent.agent_id()),
-        &next_challenge(&cast.s1),
-        0,
+        &signed(&cast.s1, group_id, &next_challenge(&cast.s1).await).await,
     )
     .await;
     assert!(matches!(refused, Err(Refusal::NotAnAdmin)), "{refused:?}");
@@ -283,7 +277,9 @@ async fn a_departed_requester_gets_no_proof() -> Result<()> {
             "a removed member gets no page and no proof (verified: {verified})"
         );
     }
-    let refused = answer_challenge(owner, group_id, &r_hex, &r_nonce, 0).await;
+    assert_eq!(request.head_challenge.as_deref(), Some(r_nonce.as_str()));
+    let r_challenge = SignedChallenge::from_request(&request).expect("R signed its challenge");
+    let refused = answer_challenge(owner, &r_challenge).await;
     assert!(
         matches!(refused, Err(Refusal::RequesterNotActive)),
         "{refused:?}"
@@ -297,7 +293,7 @@ type Mutation<'a> = Box<dyn Fn(&mut HeadProof) + 'a>;
 #[tokio::test]
 async fn a_proof_verifies_only_for_its_signer_key_requester_nonce_and_group() -> Result<()> {
     let cast = survivor_relay_fixture().await?;
-    let proof = owner_proof(&cast, &next_challenge(&cast.s1)).await;
+    let proof = owner_proof(&cast, &next_challenge(&cast.s1).await).await;
     assert!(verify(&proof));
     let s2_hex = hex_id(&cast.s2.agent.agent_id());
     let mutations: Vec<(&str, Mutation<'_>)> = vec![
@@ -347,7 +343,10 @@ async fn a_proof_verifies_only_for_its_signer_key_requester_nonce_and_group() ->
     let round = challenge_admins(&cast.s1, &cast.fixture.group_id, &[])
         .await
         .expect("S1 opens a round");
-    let mut stranger_claim = owner_proof(&cast, &round.nonce).await.claim;
+    // Fetched once: a repeat of the same challenge is re-sent at most once
+    // a window.
+    let genuine = owner_proof(&cast, &round.nonce).await;
+    let mut stranger_claim = genuine.claim.clone();
     stranger_claim.signer = hex_id(&stranger.agent_id());
     assert_eq!(
         record_proof(
@@ -358,13 +357,12 @@ async fn a_proof_verifies_only_for_its_signer_key_requester_nonce_and_group() ->
         .await,
         Err(NotRecorded::NotAsked)
     );
-    let mut for_s2 = owner_proof(&cast, &round.nonce).await;
+    let mut for_s2 = genuine.clone();
     for_s2.claim.requester = s2_hex.clone();
     assert_eq!(
         record_proof(&cast.s1, &cast.fixture.group_id, for_s2).await,
         Err(NotRecorded::NotForThisRound)
     );
-    let genuine = owner_proof(&cast, &round.nonce).await;
     assert_eq!(
         record_proof(&cast.s1, &cast.fixture.group_id, genuine).await,
         Ok(())
@@ -381,7 +379,7 @@ async fn a_proof_verifies_only_for_its_signer_key_requester_nonce_and_group() ->
 async fn a_replayed_proof_for_another_nonce_is_not_recorded() -> Result<()> {
     let cast = survivor_relay_fixture().await?;
     let group_id = &cast.fixture.group_id;
-    let old = owner_proof(&cast, &next_challenge(&cast.s1)).await;
+    let old = owner_proof(&cast, &next_challenge(&cast.s1).await).await;
     let first = challenge_admins(&cast.s1, group_id, &[])
         .await
         .expect("S1 opens a round");
@@ -483,7 +481,7 @@ async fn a_requester_gets_at_most_twelve_proofs_a_minute() -> Result<()> {
     let mut proofs = 0;
     for n in 0..=HEAD_PROOFS_PER_WINDOW {
         let _ = n;
-        let request = challenge(&cast.s1, group_id, &next_challenge(&cast.s1)).await;
+        let request = challenge(&cast.s1, group_id, &next_challenge(&cast.s1).await).await;
         if served(owner, &s1_id, request, false)
             .await
             .and_then(|response| response.head_proof)
@@ -493,20 +491,19 @@ async fn a_requester_gets_at_most_twelve_proofs_a_minute() -> Result<()> {
         }
     }
     assert_eq!(proofs, HEAD_PROOFS_PER_WINDOW);
-    let s2_hex = hex_id(&cast.s2.agent.agent_id());
     assert!(
-        answer_challenge(owner, group_id, &s2_hex, &next_challenge(&cast.s2), 0)
-            .await
-            .is_ok(),
+        answer_challenge(
+            owner,
+            &signed(&cast.s2, group_id, &next_challenge(&cast.s2).await).await
+        )
+        .await
+        .is_ok(),
         "the limit is per requester"
     );
     assert!(matches!(
         answer_challenge(
             owner,
-            group_id,
-            &hex_id(&s1_id),
-            &next_challenge(&cast.s1),
-            0
+            &signed(&cast.s1, group_id, &next_challenge(&cast.s1).await).await
         )
         .await,
         Err(Refusal::Limited)
@@ -537,7 +534,7 @@ async fn a_challenge_from_ahead_starts_the_responders_epoch_ahead_catch_up() -> 
     assert!(ahead > behind, "S2 is ahead of S1");
     assert!(cast.s1.treekem_epoch_ahead_targets.lock().await.is_empty());
 
-    let request = challenge(&cast.s2, group_id, &next_challenge(&cast.s2)).await;
+    let request = challenge(&cast.s2, group_id, &next_challenge(&cast.s2).await).await;
     assert_eq!(request.from_treekem_epoch, ahead);
     let _ = served(&cast.s1, &cast.s2.agent.agent_id(), request, false).await;
     // The catch-up runs as its own task, which notes its target first.
@@ -626,7 +623,7 @@ async fn a_stale_roster_admin_commit_does_not_remove_an_anchor_admin_from_the_ch
     assert_eq!(open.nonce, anchored.nonce);
     assert_eq!(open.asked, anchored.asked);
     assert!(open.opened_at <= tokio::time::Instant::now());
-    assert!(open.proofs.is_empty());
+    assert!(open.heads.is_empty());
     cast.shutdown().await;
     Ok(())
 }
@@ -638,21 +635,20 @@ async fn an_inflating_admin_signs_the_next_epoch_and_a_random_authenticator() ->
     let cast = survivor_relay_fixture().await?;
     let owner = &cast.fixture.state;
     let group_id = &cast.fixture.group_id;
-    let s1_hex = hex_id(&cast.s1.agent.agent_id());
     let honest = answer_challenge_with(
         owner,
-        group_id,
-        &s1_hex,
-        &next_challenge(&cast.s1),
-        0,
+        &signed(&cast.s1, group_id, &next_challenge(&cast.s1).await).await,
         false,
     )
     .await
     .expect("an honest proof");
-    let inflated =
-        answer_challenge_with(owner, group_id, &s1_hex, &next_challenge(&cast.s1), 0, true)
-            .await
-            .expect("an inflated proof");
+    let inflated = answer_challenge_with(
+        owner,
+        &signed(&cast.s1, group_id, &next_challenge(&cast.s1).await).await,
+        true,
+    )
+    .await
+    .expect("an inflated proof");
     assert!(verify(&inflated), "it is signed like any other");
     assert_eq!(inflated.claim.treekem_epoch, honest.claim.treekem_epoch + 1);
     assert_ne!(
@@ -793,29 +789,33 @@ async fn a_replayed_old_challenge_does_not_spend_the_requesters_answers() -> Res
     let owner = &cast.fixture.state;
     let group_id = &cast.fixture.group_id;
     let s1_id = cast.s1.agent.agent_id();
-    let old = challenge(&cast.s1, group_id, &next_challenge(&cast.s1)).await;
+    let old = challenge(&cast.s1, group_id, &next_challenge(&cast.s1).await).await;
     assert!(proof_for(owner, &s1_id, old.clone()).await.is_some());
-    let current = challenge(&cast.s1, group_id, &next_challenge(&cast.s1)).await;
+    let current = challenge(&cast.s1, group_id, &next_challenge(&cast.s1).await).await;
     let answered = proof_for(owner, &s1_id, current.clone())
         .await
         .expect("the current challenge is answered");
 
+    let again = proof_for(owner, &s1_id, current.clone())
+        .await
+        .expect("the latest challenge is answered again");
+    assert_eq!(
+        again.signed_by.signature_b64, answered.signed_by.signature_b64,
+        "from cache, not signed again"
+    );
     for _ in 0..=HEAD_PROOFS_PER_WINDOW {
         assert!(
             proof_for(owner, &s1_id, old.clone()).await.is_none(),
             "an older challenge is refused"
         );
-        let again = proof_for(owner, &s1_id, current.clone())
-            .await
-            .expect("the latest challenge is answered again");
-        assert_eq!(
-            again.signed_by.signature_b64, answered.signed_by.signature_b64,
-            "from cache, not signed again"
+        assert!(
+            proof_for(owner, &s1_id, current.clone()).await.is_none(),
+            "and the latest is not re-sent again inside the window"
         );
     }
     let mut fresh = 0;
     for _ in 0..HEAD_PROOFS_PER_WINDOW {
-        let request = challenge(&cast.s1, group_id, &next_challenge(&cast.s1)).await;
+        let request = challenge(&cast.s1, group_id, &next_challenge(&cast.s1).await).await;
         if proof_for(owner, &s1_id, request).await.is_some() {
             fresh += 1;
         }
@@ -841,7 +841,7 @@ async fn an_old_challenge_from_before_a_re_invite_spends_nothing() -> Result<()>
     let owner_hex = hex_id(&owner.agent.agent_id());
     let s1_id = cast.s1.agent.agent_id();
     let s1_hex = hex_id(&s1_id);
-    let old = challenge(&cast.s1, group_id, &next_challenge(&cast.s1)).await;
+    let old = challenge(&cast.s1, group_id, &next_challenge(&cast.s1).await).await;
     assert!(proof_for(owner, &s1_id, old.clone()).await.is_some());
     {
         let mut groups = owner.named_groups.write().await;
@@ -856,7 +856,7 @@ async fn an_old_challenge_from_before_a_re_invite_spends_nothing() -> Result<()>
         );
         assert!(info.has_active_member(&s1_hex), "S1 is back");
     }
-    let newer = challenge(&cast.s1, group_id, &next_challenge(&cast.s1)).await;
+    let newer = challenge(&cast.s1, group_id, &next_challenge(&cast.s1).await).await;
     assert!(proof_for(owner, &s1_id, newer.clone()).await.is_some());
     for _ in 0..=HEAD_PROOFS_PER_WINDOW {
         assert!(proof_for(owner, &s1_id, old.clone()).await.is_none());
@@ -873,7 +873,7 @@ async fn an_old_challenge_from_before_a_re_invite_spends_nothing() -> Result<()>
     }
     let mut fresh = 0;
     for _ in 0..HEAD_PROOFS_PER_WINDOW {
-        let request = challenge(&cast.s1, group_id, &next_challenge(&cast.s1)).await;
+        let request = challenge(&cast.s1, group_id, &next_challenge(&cast.s1).await).await;
         if proof_for(owner, &s1_id, request).await.is_some() {
             fresh += 1;
         }
@@ -892,7 +892,7 @@ async fn the_same_challenge_twice_is_answered_once() -> Result<()> {
     let owner = &cast.fixture.state;
     let group_id = &cast.fixture.group_id;
     let s1_id = cast.s1.agent.agent_id();
-    let request = challenge(&cast.s1, group_id, &next_challenge(&cast.s1)).await;
+    let request = challenge(&cast.s1, group_id, &next_challenge(&cast.s1).await).await;
     let first = proof_for(owner, &s1_id, request.clone())
         .await
         .expect("answered");
@@ -906,7 +906,7 @@ async fn the_same_challenge_twice_is_answered_once() -> Result<()> {
     );
     let mut fresh = 0;
     for _ in 0..HEAD_PROOFS_PER_WINDOW {
-        let request = challenge(&cast.s1, group_id, &next_challenge(&cast.s1)).await;
+        let request = challenge(&cast.s1, group_id, &next_challenge(&cast.s1).await).await;
         if proof_for(owner, &s1_id, request).await.is_some() {
             fresh += 1;
         }
@@ -948,11 +948,7 @@ async fn two_heads_from_one_signer_in_a_round_are_both_kept() -> Result<()> {
     deliver_proof(&cast, at_e.clone()).await;
     deliver_proof(&cast, at_e.clone()).await;
     let view = round_view(&cast.s1, group_id).expect("S1's round");
-    let mut epochs: Vec<u64> = view
-        .proofs
-        .iter()
-        .map(|proof| proof.claim.treekem_epoch)
-        .collect();
+    let mut epochs: Vec<u64> = view.heads.iter().map(|head| head.treekem_epoch).collect();
     epochs.sort_unstable();
     assert_eq!(
         epochs,
@@ -979,12 +975,10 @@ async fn a_requester_removed_while_the_head_is_read_gets_no_proof() -> Result<()
         .head_answer_before_tree_read
         .lock()
         .expect("hook") = Some((Arc::clone(&entered), Arc::clone(&release)));
-    let nonce = next_challenge(&cast.s2);
+    let challenge = signed(&cast.s2, &group_id, &next_challenge(&cast.s2).await).await;
     let answer = {
         let owner = Arc::clone(&owner);
-        let group_id = group_id.clone();
-        let s2_hex = s2_hex.clone();
-        tokio::spawn(async move { answer_challenge(&owner, &group_id, &s2_hex, &nonce, 0).await })
+        tokio::spawn(async move { answer_challenge(&owner, &challenge).await })
     };
     tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
         .await
@@ -1024,7 +1018,12 @@ async fn a_page_and_a_proof_too_large_for_one_message_go_apart() -> Result<()> {
         .lock()
         .expect("catch-up recorder")
         .len();
-    let request = challenge(&cast.s1, &cast.fixture.group_id, &next_challenge(&cast.s1)).await;
+    let request = challenge(
+        &cast.s1,
+        &cast.fixture.group_id,
+        &next_challenge(&cast.s1).await,
+    )
+    .await;
     handle_treekem_catchup_request(owner, &s1_id, false, request).await;
     let sent: Vec<TreeKemCatchupResponse> = owner
         .named_group_test_recorders
@@ -1041,6 +1040,126 @@ async fn a_page_and_a_proof_too_large_for_one_message_go_apart() -> Result<()> {
     assert!(
         sent[1].head_proof.is_none(),
         "the page goes without the proof"
+    );
+    cast.shutdown().await;
+    Ok(())
+}
+
+/// A6 re-review N-1: replaying S1's current challenge makes the owner
+/// re-send its proof at most once a window, so the owner is no reflector.
+#[tokio::test]
+async fn a_replayed_current_challenge_is_re_sent_at_most_once_a_window() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let owner = &cast.fixture.state;
+    let group_id = &cast.fixture.group_id;
+    let s1_id = cast.s1.agent.agent_id();
+    let current = challenge(&cast.s1, group_id, &next_challenge(&cast.s1).await).await;
+    assert!(proof_for(owner, &s1_id, current.clone()).await.is_some());
+    let before = owner
+        .named_group_test_recorders
+        .catchup_responses
+        .lock()
+        .expect("catch-up recorder")
+        .len();
+    let mut re_sent = 0;
+    for _ in 0..50 {
+        if proof_for(owner, &s1_id, current.clone()).await.is_some() {
+            re_sent += 1;
+        }
+    }
+    assert_eq!(re_sent, 1, "one re-send inside the window");
+    let sent = owner
+        .named_group_test_recorders
+        .catchup_responses
+        .lock()
+        .expect("catch-up recorder")
+        .len()
+        - before;
+    assert_eq!(sent, 1, "and nothing else goes out (the page is throttled)");
+    cast.shutdown().await;
+    Ok(())
+}
+
+/// A6 re-review I-1b: the owner forgot S1 (a restart, or it was away while
+/// S1 ran rounds). A replayer holding 20 of S1's challenges above the
+/// owner's floor spends the window, but S1's newest, limited, fences off
+/// the rest of the stock: a delay of one window, not stock / 12.
+#[tokio::test]
+async fn a_replayed_stock_of_old_challenges_is_fenced_off_by_the_requesters_newest() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let owner = &cast.fixture.state;
+    let group_id = &cast.fixture.group_id;
+    let s1_id = cast.s1.agent.agent_id();
+    let mut stock = Vec::new();
+    for _ in 0..20 {
+        stock.push(challenge(&cast.s1, group_id, &next_challenge(&cast.s1).await).await);
+    }
+    let newest = challenge(&cast.s1, group_id, &next_challenge(&cast.s1).await).await;
+    for request in &stock[..HEAD_PROOFS_PER_WINDOW] {
+        assert!(proof_for(owner, &s1_id, request.clone()).await.is_some());
+    }
+    let newest_challenge = SignedChallenge::from_request(&newest).expect("signed");
+    assert!(matches!(
+        answer_challenge(owner, &newest_challenge).await,
+        Err(Refusal::Limited)
+    ));
+    for request in &stock[HEAD_PROOFS_PER_WINDOW..] {
+        let refused = answer_challenge(
+            owner,
+            &SignedChallenge::from_request(request).expect("signed"),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(Refusal::StaleChallenge)),
+            "the rest of the stock is fenced off: {refused:?}"
+        );
+    }
+    cast.shutdown().await;
+    Ok(())
+}
+
+/// A6 re-review N-2: only a challenge S1 signed can move S1's floor at the
+/// owner. An unsigned all-`f` counter, one signed by another key, and one
+/// swapped into S1's signed request all leave it where it was.
+#[tokio::test]
+async fn an_unsigned_or_forged_challenge_cannot_move_the_floor() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let owner = &cast.fixture.state;
+    let group_id = &cast.fixture.group_id;
+    let s1_id = cast.s1.agent.agent_id();
+    let all_f = format!("{}{}", "f".repeat(16), "ab".repeat(32));
+
+    let mut unsigned = page_request(&cast.s1, group_id, None)
+        .await
+        .expect("S1's head");
+    unsigned.head_challenge = Some(all_f.clone());
+    unsigned.signed_by = None;
+    assert!(SignedChallenge::from_request(&unsigned).is_none());
+    let page = served(owner, &s1_id, unsigned, true)
+        .await
+        .expect("a verified page request is still served");
+    assert!(
+        page.head_proof.is_none(),
+        "but its challenge is not answered"
+    );
+
+    let mut forged = page_request(&cast.s1, group_id, None)
+        .await
+        .expect("S1's head");
+    forged.head_challenge = Some(all_f.clone());
+    sign_page_request_with(&x0x::identity::AgentKeypair::generate()?, &mut forged);
+    assert!(SignedChallenge::from_request(&forged).is_none());
+    let _ = served(owner, &s1_id, forged, true).await;
+
+    let mut swapped = challenge(&cast.s1, group_id, &next_challenge(&cast.s1).await).await;
+    swapped.head_challenge = Some(all_f);
+    assert!(SignedChallenge::from_request(&swapped).is_none());
+    let _ = served(owner, &s1_id, swapped, true).await;
+
+    let real = challenge(&cast.s1, group_id, &next_challenge(&cast.s1).await).await;
+    assert!(
+        proof_for(owner, &s1_id, real).await.is_some(),
+        "S1's own next challenge is still answered"
     );
     cast.shutdown().await;
     Ok(())
