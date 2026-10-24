@@ -56,7 +56,8 @@ The tests live in `src/server/routes/named_groups/tests/epoch_ahead_catchup.rs` 
 
 - From #1449 and #1464, unchanged in name and assertion: `epoch_ahead_ciphertext_requests_catchup_and_converges`, `epoch_ahead_store_record_requests_catchup`, `epoch_ahead_catchup_window_runs_on_the_runtime_clock`, `epoch_ahead_catchup_rotates_past_unanswered_peers`, `single_epoch_ahead_observation_reaches_the_fourth_ranked_signer`, `newer_epoch_observation_survives_a_late_older_epoch_page`, `same_epoch_observation_in_the_last_round_asks_again`, `same_epoch_observation_in_the_penultimate_round_asks_the_holder_again`, `single_epoch_ahead_observation_asks_every_candidate`. Two tests build their request through a helper, `catchup_request_from`, in place of upstream's inline literal, because the fork's request has one more field (`signed_by: None`). The `metadata_publish_force_ok` lines are dropped.
 - From #1337: `catchup_legacy_binding_stays_with_the_author`, unchanged. `relayed_removal_rejects_another_members_treekem_commit` keeps its relay assertions. Upstream gets its digest-bound removal from the post-leave rekey, which is not ported, so the fixture's `digest_bound_removal` seals that removal directly. The self-leave steps before it are dropped.
-- `catchup_third_party_relays_a_digest_bound_rekey` moves to Task A1.
+- `catchup_third_party_relays_a_digest_bound_rekey` moved to Task A1, which ports it into the same file. It differs from upstream in two places: the fixture's leaver keypair is a field (`LeaveFixture::member_kp`), and the test waits for the post-leave rekey to publish, because the fork runs that rekey in its own task. The `metadata_publish_force_ok` line is dropped.
+- After A1 every fork seal names its bytes, so `relayed_removal_rejects_another_members_treekem_commit` takes its removal from the real admin route, and the fixture helper `digest_bound_removal` is gone. `catchup_legacy_binding_stays_with_the_author` now gets its legacy removal from `legacy_bound_removal`, which seals `treekem:epoch=<n>` as a pre-A1 daemon would. See `T-treekem-bytes-binding-everywhere`.
 
 ## A0b: what `case_1427` needs at the pin
 
@@ -73,6 +74,8 @@ Hand-applied parts of `4b0f927e`:
 - **`history`.** `run_blocking` is upstream's. It replaces `spawn_blocking` at the fork's two equivalent sites: the writer shutdown and the reaper's `retain_with_pins`. Upstream's `purge_admitted` and `trim` sites do not exist in the fork.
 - **`storage.rs`.** The test-only `w3h_fs` module is upstream's, byte for byte, with the same `#[cfg(test)]`/`#[cfg(not(test))]` switch between `w3h_fs` and `tokio::fs`. Every `tokio::fs::` call in the fork's file (19) goes through `fs::`, as upstream routes all of its own. The fork's file lacks most of upstream's functions, so it has fewer call sites.
 
+Ported later, in A1: upstream's `storage.rs` test `write_private_bytes_durable_is_inline_when_shim_env_set` with its `W3hShimEnvGuard` (byte-identical), and the `tokio::fs::File` wording in the `write_private_bytes_durable_guarded` comment, which A0b's blanket `tokio::fs::` rewrite had shortened.
+
 Not ported:
 
 - `93dd602a` (#1266), the GSS refresh hook's weak state. `8f0f8018` names it as its GSS twin. The fork's `gss_kv_refresh` (`stores.rs:1512`) still captures a strong `Arc<AppState>`, so a daemon that opened a GSS group store has the same hold after a stop. `case_1427` opens only TreeKEM stores.
@@ -83,8 +86,8 @@ Not ported:
 ## Consequences
 
 - A member whose traffic shows a later epoch asks the owner and admins first, then the other members, until every candidate has been asked.
-- A third party's catch-up copy of a removal applies as its signer only under a binding that names the TreeKEM bytes. Every fork seal site still uses the legacy `treekem:epoch=<n>` binding until Task A1, so today only a removal's author can deliver it.
-- The returning-member re-key link branch of the `MemberRemoved` apply has no upstream counterpart. It still writes the legacy binding and runs no binding check. Task A1 must cover it.
+- A third party's catch-up copy of a removal applies as its signer only under a binding that names the TreeKEM bytes. Since Task A1 every fork seal names them (`T-treekem-bytes-binding-everywhere`); a legacy `treekem:epoch=<n>` removal from an older daemon stays with its author.
+- The returning-member re-key link branch of the `MemberRemoved` apply has no upstream counterpart. Task A1 gave it, and the held result's link, the binding check and the signed binding.
 
 ## Validation
 

@@ -10,6 +10,7 @@ mod control_blob;
 mod fair_admission;
 mod join_result_pins;
 mod seat_cert_fetch;
+mod treekem_binding;
 mod welcome_acks;
 pub(in crate::server) use control_blob::{
     handle_control_blob_message, ControlBlobMessage, ControlBlobState,
@@ -19,6 +20,10 @@ pub(in crate::server) use seat_cert_fetch::{
     cert_evidence_deadline_elapsed, clear_cert_evidence_stamps, clear_cert_evidence_stamps_for,
     handle_group_cert_fetch_request, handle_group_cert_fetch_response, publish_group_cert_fetch,
     CertEvidenceStamp, GROUP_CERT_FETCH_DOMAIN, GROUP_CERT_FETCH_RESPONSE_DOMAIN,
+};
+use treekem_binding::{
+    add_binding_names_bytes, add_extras_digest, parse_treekem_binding, removal_binding_names_bytes,
+    treekem_bytes_binding, treekem_removal_bytes_binding, WelcomeContent,
 };
 pub(in crate::server) use welcome_acks::{AckPath as WelcomeAckPath, WelcomeAckTasks};
 
@@ -8076,20 +8081,83 @@ fn treekem_commit_binding(epoch: u64, commit: &[u8]) -> String {
     format!("treekem:epoch={epoch}:commit={digest}")
 }
 
-/// `treekem:epoch=<n>` is the shipped admin removal. It does not name the
-/// TreeKEM bytes. A self-leave rekey seals [`treekem_commit_binding`].
+/// `treekem:epoch=<n>` is a removal sealed before survivor re-key A1. It
+/// does not name the TreeKEM bytes. Every seal now names them
+/// ([`treekem_removal_bytes_binding`]); a binding that names bytes must name
+/// these.
 fn treekem_removal_binding_covers_commit(
     signed: &x0x::groups::state_commit::GroupStateCommit,
     epoch: u64,
     commit_bytes: &[u8],
 ) -> bool {
-    let Some(binding) = signed.security_binding.as_deref() else {
+    let Some(binding) = signed
+        .security_binding
+        .as_deref()
+        .and_then(parse_treekem_binding)
+    else {
         return false;
     };
-    if binding == treekem_commit_binding(epoch, commit_bytes) {
+    if binding.commit.is_some() {
+        return removal_binding_names_bytes(&binding, epoch, commit_bytes);
+    }
+    binding.epoch == epoch && binding.recovery.is_none()
+}
+
+/// An add's binding: it names the add's TreeKEM commit and its extras (the
+/// display name, KeyPackage hash and Welcome the event carries), then keeps
+/// the recovery record's suffix.
+fn treekem_add_security_binding(
+    epoch: u64,
+    commit: &[u8],
+    display_name: Option<&str>,
+    key_package_hash: Option<&str>,
+    welcome: &[u8],
+    recovery: &NamedGroupMetadataEvent,
+) -> Option<String> {
+    let hash = member_joined_recovery_record_hash(recovery)?;
+    let extras = add_extras_digest(
+        display_name,
+        key_package_hash,
+        Some(&WelcomeContent::of_bytes(welcome)),
+    )?;
+    Some(format!(
+        "{};{MEMBER_JOINED_RECOVERY_BINDING_PREFIX}{hash}",
+        treekem_bytes_binding(epoch, commit, &extras)
+    ))
+}
+
+/// Whether a TreeKEM add may apply under its signed binding. A binding that
+/// names bytes must name exactly the commit and extras this copy carries,
+/// so whoever hands the add on cannot rename the member or swap its
+/// KeyPackage hash or Welcome (F-2). An add sealed before survivor re-key A1
+/// names none and still applies from its author.
+#[allow(clippy::too_many_arguments)]
+fn treekem_add_binding_admits(
+    signed: &x0x::groups::state_commit::GroupStateCommit,
+    epoch: u64,
+    commit_b64: &str,
+    display_name: Option<&str>,
+    key_package_hash: Option<&str>,
+    welcome_b64: Option<&str>,
+    welcome_ref: Option<&WelcomeRef>,
+) -> bool {
+    let Some(binding) = signed.security_binding.as_deref() else {
+        return true;
+    };
+    let Some(parsed) = parse_treekem_binding(binding) else {
+        return !binding.contains(":commit=");
+    };
+    if parsed.commit.is_none() {
         return true;
     }
-    binding == format!("treekem:epoch={epoch}")
+    let Ok(commit_bytes) = BASE64.decode(commit_b64) else {
+        return false;
+    };
+    let Ok(welcome) = WelcomeContent::of_event(welcome_b64, welcome_ref) else {
+        return false;
+    };
+    add_extras_digest(display_name, key_package_hash, welcome.as_ref())
+        .is_some_and(|extras| add_binding_names_bytes(&parsed, epoch, &commit_bytes, &extras))
 }
 
 fn canonical_member_joined_recovery_bytes(
@@ -8200,16 +8268,17 @@ fn verify_recovery_attestation_structure(event: &NamedGroupMetadataEvent) -> boo
     let Some(recovery_hash) = member_joined_recovery_record_hash(event) else {
         return false;
     };
-    let expected_binding = format!("{MEMBER_JOINED_RECOVERY_BINDING_PREFIX}{recovery_hash}");
     if !authority_agent_id.eq_ignore_ascii_case(inviter_agent_id)
         || authority_commit.verify_structure().is_err()
         || !authority_commit
             .committed_by
             .eq_ignore_ascii_case(authority_agent_id)
-        || !authority_commit
+        || authority_commit
             .security_binding
             .as_deref()
-            .is_some_and(|binding| binding.split(';').any(|part| part == expected_binding))
+            .and_then(parse_treekem_binding)
+            .and_then(|binding| binding.recovery)
+            != Some(recovery_hash.as_str())
         || !(authority_commit.group_id == *group_id
             || stable_group_id.as_deref() == Some(authority_commit.group_id.as_str()))
     {
@@ -8268,7 +8337,6 @@ fn verify_authority_attested_member_joined_recovery(
     let Some(recovery_hash) = member_joined_recovery_record_hash(event) else {
         return false;
     };
-    let expected_binding = format!("{MEMBER_JOINED_RECOVERY_BINDING_PREFIX}{recovery_hash}");
     let member_authenticated = verify_member_joined_key_package_event(event);
     let authority_only_attestation = matches!(
         event,
@@ -8315,10 +8383,12 @@ fn verify_authority_attested_member_joined_recovery(
         || !authority_commit
             .committed_by
             .eq_ignore_ascii_case(authority_agent_id)
-        || !authority_commit
+        || authority_commit
             .security_binding
             .as_deref()
-            .is_some_and(|binding| binding.split(';').any(|part| part == expected_binding))
+            .and_then(parse_treekem_binding)
+            .and_then(|binding| binding.recovery)
+            != Some(recovery_hash.as_str())
         || authority_commit.group_id != info.stable_group_id()
         || !(group_id == &info.mls_group_id
             || group_id == info.stable_group_id()
@@ -11286,8 +11356,11 @@ fn catchup_may_apply_removed_as_author(
     let Ok(commit_bytes) = BASE64.decode(commit_b64) else {
         return false;
     };
-    commit.security_binding.as_deref()
-        == Some(treekem_commit_binding(epoch, &commit_bytes).as_str())
+    commit
+        .security_binding
+        .as_deref()
+        .and_then(parse_treekem_binding)
+        .is_some_and(|binding| removal_binding_names_bytes(&binding, epoch, &commit_bytes))
 }
 
 async fn request_treekem_catchup_page(state: &Arc<AppState>, group_id: &str, peer: &AgentId) {
@@ -12735,6 +12808,24 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             } else {
                 None
             };
+            if let Some((commit_b64, welcome_b64, welcome_ref, epoch)) = treekem_payload.as_ref() {
+                if !treekem_add_binding_admits(
+                    &commit,
+                    *epoch,
+                    commit_b64,
+                    display_name.as_deref(),
+                    treekem_key_package_hash.as_deref(),
+                    welcome_b64.as_deref(),
+                    welcome_ref.as_ref(),
+                ) {
+                    tracing::warn!(
+                        group_id = %LogHexId::group(&resolved_group_key),
+                        member = %LogHexId::agent(&agent_id),
+                        "rejecting TreeKEM add: the signed binding does not name this copy's bytes and fields"
+                    );
+                    return ApplyMetadataResult::REJECTED;
+                }
+            }
             let current = info.clone();
             let mut next = match apply_stateful_event_with_evidence(
                 state,
@@ -13463,10 +13554,24 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             {
                 // The same TreeKEM payload requirement as the ordinary admin
                 // removal below: a removal without its tree commit is one no
-                // other member adopts, so this device must not either.
-                if treekem_commit_b64.is_none() || treekem_epoch.is_none() {
+                // other member adopts, so this device must not either. Nor
+                // one whose signed binding names other bytes: this device
+                // logs the removal and may serve it on catch-up.
+                let (Some(commit_b64), Some(epoch)) = (treekem_commit_b64.as_ref(), treekem_epoch)
+                else {
+                    return ApplyMetadataResult::REJECTED;
+                };
+                let Ok(commit_bytes) = BASE64.decode(commit_b64) else {
+                    return ApplyMetadataResult::REJECTED;
+                };
+                if !treekem_removal_binding_covers_commit(&commit, epoch, &commit_bytes) {
+                    tracing::warn!(
+                        group_id = %LogHexId::group(&resolved_group_key),
+                        "rejecting re-key removal link: the signed roster commit does not bind these commit bytes"
+                    );
                     return ApplyMetadataResult::REJECTED;
                 }
+                let signed_binding = commit.security_binding.clone();
                 let current = info.clone();
                 let Ok(next) = apply_stateful_event_with_evidence(
                     state,
@@ -13481,10 +13586,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         next.roster_revision =
                             adopt_roster_revision(next.roster_revision, revision);
                         next.remove_member(&agent_id, Some(actor.clone()));
-                        if let Some(epoch) = treekem_epoch {
-                            next.secret_epoch = epoch;
-                            next.security_binding = Some(format!("treekem:epoch={epoch}"));
-                        }
+                        next.secret_epoch = epoch;
+                        next.security_binding = signed_binding.clone();
                     },
                 )
                 .await
@@ -13984,6 +14087,15 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             } else {
                 None
             };
+            if let Some((commit_b64, epoch)) = treekem_payload.as_ref() {
+                let Ok(commit_bytes) = BASE64.decode(commit_b64) else {
+                    return banned_reject("treekem_commit_b64_decode", &resolved_group_key);
+                };
+                if !treekem_removal_binding_covers_commit(&commit, *epoch, &commit_bytes) {
+                    return banned_reject("treekem_binding_mismatch", &resolved_group_key);
+                }
+            }
+            let signed_binding = commit.security_binding.clone();
             let current = info.clone();
             let Ok(mut next) = apply_stateful_event_with_evidence(
                 state,
@@ -13999,7 +14111,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     next.ban_member(&agent_id, Some(actor.clone()));
                     if let Some((_, epoch)) = treekem_payload.as_ref() {
                         next.secret_epoch = *epoch;
-                        next.security_binding = Some(format!("treekem:epoch={epoch}"));
+                        next.security_binding = signed_binding.clone();
                     } else if let Some(secret_epoch) = secret_epoch {
                         let old_epoch = next.secret_epoch;
                         next.secret_epoch = secret_epoch;
@@ -14421,6 +14533,26 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             } else {
                 None
             };
+            if let Some((commit_b64, welcome_b64, welcome_ref, epoch, package_hash)) =
+                treekem_payload.as_ref()
+            {
+                if !treekem_add_binding_admits(
+                    &commit,
+                    *epoch,
+                    commit_b64,
+                    None,
+                    Some(package_hash.as_str()),
+                    welcome_b64.as_deref(),
+                    welcome_ref.as_ref(),
+                ) {
+                    tracing::warn!(
+                        group_id = %LogHexId::group(&resolved_group_key),
+                        member = %LogHexId::agent(&requester_agent_id),
+                        "rejecting TreeKEM approval: the signed binding does not name this copy's bytes and fields"
+                    );
+                    return ApplyMetadataResult::REJECTED;
+                }
+            }
             let request_key_package_b64 = req_snapshot.treekem_key_package_b64.clone();
             let current = info.clone();
             let Ok(next) = apply_stateful_event_with_evidence(
@@ -15343,11 +15475,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     }
                 };
 
-                // Seal BOTH state commits BEFORE mutating the live TreeKEM
-                // tree. seal_commit is fallible (signing); doing both seals
-                // first means the only fallible steps left between the two
-                // live tree mutations are the mutations themselves, and those
-                // roll back from the snapshot above.
+                // Survivor re-key A1: each commit names its TreeKEM bytes, so
+                // the tree moves first. Remove, bind and seal; then add, bind
+                // and seal. Every failure after the first mutation restores
+                // the snapshot above.
                 let expected1 = guard.epoch().saturating_add(1);
                 let expected2 = expected1.saturating_add(1);
 
@@ -15356,14 +15487,45 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     .get(&member_agent_id)
                     .map(|member| member.role);
                 // Commit 1: a REAL removal of the member, sealed at epoch +1
-                // with the plain epoch binding — exactly the state every
-                // other member's ordinary `MemberRemoved` arm computes, so
-                // the whole group follows the remove + add pair through the
-                // normal apply path.
+                // under a binding that names its bytes — exactly the state
+                // every other member's ordinary `MemberRemoved` arm computes,
+                // so the whole group follows the remove + add pair through
+                // the normal apply path.
                 next.roster_revision = next.roster_revision.saturating_add(1);
                 next.remove_member(&member_agent_id, Some(inviter_agent_id.clone()));
                 next.secret_epoch = expected1;
-                next.security_binding = Some(format!("treekem:epoch={expected1}"));
+                let tk_remove = match guard.remove_member_verified(member_id, &stored_kp_bytes) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        rollback_treekem_group_after_failed_install(
+                            state,
+                            &resolved_group_key,
+                            &info,
+                            &rollback_snapshot,
+                            &mut guard,
+                            "member_rekey_remove",
+                        );
+                        tracing::warn!(
+                            group_id = %LogHexId::group(&resolved_group_key),
+                            member = %LogHexId::agent(&member_agent_id),
+                            "MemberJoined re-key: remove_member_verified failed: {e}"
+                        );
+                        return ApplyMetadataResult::REJECTED;
+                    }
+                };
+                let removal_binding = treekem_removal_bytes_binding(expected1, &tk_remove);
+                if guard.epoch() != expected1 || removal_binding.is_none() {
+                    rollback_treekem_group_after_failed_install(
+                        state,
+                        &resolved_group_key,
+                        &info,
+                        &rollback_snapshot,
+                        &mut guard,
+                        "member_rekey_remove",
+                    );
+                    return ApplyMetadataResult::REJECTED;
+                }
+                next.security_binding = removal_binding;
                 // ADR-0038: an owner-axis group refuses a PLAIN seal, so both
                 // re-key commits go through the ordinary-commit wrapper — it
                 // is exactly `seal_commit` on every other admission axis.
@@ -15371,6 +15533,14 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     match seal_commit_owner_certified(state, &mut next, signing_kp, now_ms).await {
                         Ok(c) => c,
                         Err(e) => {
+                            rollback_treekem_group_after_failed_install(
+                                state,
+                                &resolved_group_key,
+                                &info,
+                                &rollback_snapshot,
+                                &mut guard,
+                                "member_rekey_remove_seal",
+                            );
                             tracing::warn!(
                                 group_id = %LogHexId::group(&resolved_group_key),
                                 member = %LogHexId::agent(&member_agent_id),
@@ -15409,6 +15579,14 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 .await;
                 if let Some(cert) = rekey_owner_certified_admission.clone() {
                     if next.set_member_certificate(&member_agent_id, cert).is_err() {
+                        rollback_treekem_group_after_failed_install(
+                            state,
+                            &resolved_group_key,
+                            &info,
+                            &rollback_snapshot,
+                            &mut guard,
+                            "member_rekey_certificate",
+                        );
                         tracing::warn!(
                             group_id = %LogHexId::group(&resolved_group_key),
                             member = %LogHexId::agent(&member_agent_id),
@@ -15417,12 +15595,50 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         return ApplyMetadataResult::REJECTED;
                     }
                 }
-                next.secret_epoch = expected2;
-                let Some(binding) = treekem_recovery_security_binding(expected2, &rekey_recovery)
-                else {
-                    return ApplyMetadataResult::REJECTED;
+                let out = match guard.add_member(member_id, &new_kp_bytes) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        rollback_treekem_group_after_failed_install(
+                            state,
+                            &resolved_group_key,
+                            &info,
+                            &rollback_snapshot,
+                            &mut guard,
+                            "member_rekey_add",
+                        );
+                        tracing::warn!(
+                            group_id = %LogHexId::group(&resolved_group_key),
+                            member = %LogHexId::agent(&member_agent_id),
+                            "MemberJoined re-key: add_member failed: {e}"
+                        );
+                        return ApplyMetadataResult::REJECTED;
+                    }
                 };
-                next.security_binding = Some(binding);
+                next.secret_epoch = expected2;
+                let rekey_package_hash = next
+                    .members_v2
+                    .get(&member_agent_id)
+                    .and_then(|member| member.treekem_key_package_hash.clone());
+                let add_binding = treekem_add_security_binding(
+                    expected2,
+                    &out.commit,
+                    display_name.as_deref(),
+                    rekey_package_hash.as_deref(),
+                    &out.welcome,
+                    &rekey_recovery,
+                );
+                if guard.epoch() != expected2 || add_binding.is_none() {
+                    rollback_treekem_group_after_failed_install(
+                        state,
+                        &resolved_group_key,
+                        &info,
+                        &rollback_snapshot,
+                        &mut guard,
+                        "member_rekey_add",
+                    );
+                    return ApplyMetadataResult::REJECTED;
+                }
+                next.security_binding = add_binding;
                 // ADR-0064 §1a: mint the owner mandate at the ADD's
                 // PRE-MUTATION point — `next` already holds the re-admitted
                 // seat, `expected2` is the TreeKEM epoch the terminal
@@ -15446,6 +15662,14 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     match seal_commit_owner_certified(state, &mut next, signing_kp, now_ms).await {
                         Ok(c) => c,
                         Err(e) => {
+                            rollback_treekem_group_after_failed_install(
+                                state,
+                                &resolved_group_key,
+                                &info,
+                                &rollback_snapshot,
+                                &mut guard,
+                                "member_rekey_add_seal",
+                            );
                             tracing::warn!(
                                 group_id = %LogHexId::group(&resolved_group_key),
                                 member = %LogHexId::agent(&member_agent_id),
@@ -15476,6 +15700,14 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     match seal_commit_owner_certified(state, &mut next, signing_kp, now_ms).await {
                         Ok(c) => role_commit = Some((next.roster_revision, role, c)),
                         Err(e) => {
+                            rollback_treekem_group_after_failed_install(
+                                state,
+                                &resolved_group_key,
+                                &info,
+                                &rollback_snapshot,
+                                &mut guard,
+                                "member_rekey_role_seal",
+                            );
                             tracing::warn!(
                                 group_id = %LogHexId::group(&resolved_group_key),
                                 member = %LogHexId::agent(&member_agent_id),
@@ -15484,62 +15716,6 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                             return ApplyMetadataResult::REJECTED;
                         }
                     }
-                }
-
-                // Now mutate the live TreeKEM tree back-to-back: remove the
-                // stale leaf (epoch +1) then add the fresh KeyPackage
-                // (epoch +2). Any failure restores the pre-re-key snapshot.
-                let tk_remove = match guard.remove_member_verified(member_id, &stored_kp_bytes) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(
-                            group_id = %LogHexId::group(&resolved_group_key),
-                            member = %LogHexId::agent(&member_agent_id),
-                            "MemberJoined re-key: remove_member_verified failed: {e}"
-                        );
-                        return ApplyMetadataResult::REJECTED;
-                    }
-                };
-                if guard.epoch() != expected1 {
-                    rollback_treekem_group_after_failed_install(
-                        state,
-                        &resolved_group_key,
-                        &info,
-                        &rollback_snapshot,
-                        &mut guard,
-                        "member_rekey_remove",
-                    );
-                    return ApplyMetadataResult::REJECTED;
-                }
-                let out = match guard.add_member(member_id, &new_kp_bytes) {
-                    Ok(o) => o,
-                    Err(e) => {
-                        rollback_treekem_group_after_failed_install(
-                            state,
-                            &resolved_group_key,
-                            &info,
-                            &rollback_snapshot,
-                            &mut guard,
-                            "member_rekey_add",
-                        );
-                        tracing::warn!(
-                            group_id = %LogHexId::group(&resolved_group_key),
-                            member = %LogHexId::agent(&member_agent_id),
-                            "MemberJoined re-key: add_member failed: {e}"
-                        );
-                        return ApplyMetadataResult::REJECTED;
-                    }
-                };
-                if guard.epoch() != expected2 {
-                    rollback_treekem_group_after_failed_install(
-                        state,
-                        &resolved_group_key,
-                        &info,
-                        &rollback_snapshot,
-                        &mut guard,
-                        "member_rekey_add",
-                    );
-                    return ApplyMetadataResult::REJECTED;
                 }
 
                 // Persist ONCE after both commits, then expose the roster.
@@ -15979,14 +16155,58 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 };
                 let mut guard = group.lock().await;
                 let expected_epoch = guard.epoch().saturating_add(1);
-                let Some(binding) = recovery_original
-                    .as_ref()
-                    .and_then(|event| treekem_recovery_security_binding(expected_epoch, event))
-                else {
+                let Some(recovery) = recovery_original.as_ref() else {
                     return ApplyMetadataResult::REJECTED;
                 };
-                next.security_binding = Some(binding);
                 next.secret_epoch = expected_epoch;
+                // Survivor re-key A1: snapshot, add to the tree, bind the
+                // bytes, then seal. Every failure after the add rolls back.
+                let rollback_snapshot = match guard.to_snapshot_bytes() {
+                    Ok(snapshot) => snapshot,
+                    Err(e) => {
+                        tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), member = %LogHexId::agent(&member_agent_id), "MemberJoined: failed to snapshot TreeKEM group before add: {e}");
+                        return ApplyMetadataResult::REJECTED;
+                    }
+                };
+                let out = match guard.add_member(member_id, kp_bytes) {
+                    Ok(out) => out,
+                    Err(e) => {
+                        rollback_treekem_group_after_failed_install(
+                            state,
+                            &resolved_group_key,
+                            &info,
+                            &rollback_snapshot,
+                            &mut guard,
+                            "member_joined_add",
+                        );
+                        tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), member = %LogHexId::agent(&member_agent_id), "MemberJoined: TreeKEM add_member failed: {e}");
+                        return ApplyMetadataResult::REJECTED;
+                    }
+                };
+                let package_hash = next
+                    .members_v2
+                    .get(&member_agent_id)
+                    .and_then(|member| member.treekem_key_package_hash.clone());
+                let binding = treekem_add_security_binding(
+                    expected_epoch,
+                    &out.commit,
+                    display_name.as_deref(),
+                    package_hash.as_deref(),
+                    &out.welcome,
+                    recovery,
+                );
+                if guard.epoch() != expected_epoch || binding.is_none() {
+                    rollback_treekem_group_after_failed_install(
+                        state,
+                        &resolved_group_key,
+                        &info,
+                        &rollback_snapshot,
+                        &mut guard,
+                        "member_joined_add",
+                    );
+                    return ApplyMetadataResult::REJECTED;
+                }
+                next.security_binding = binding;
                 // ADR-0064 slice 2: mint the owner mandate at the
                 // pre-mutation point — `next` holds the seat-write and
                 // the epoch is the TreeKEM epoch the terminal will
@@ -16006,6 +16226,14 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     match seal_commit_owner_certified(state, &mut next, signing_kp, now_ms).await {
                         Ok(commit) => commit,
                         Err(e) => {
+                            rollback_treekem_group_after_failed_install(
+                                state,
+                                &resolved_group_key,
+                                &info,
+                                &rollback_snapshot,
+                                &mut guard,
+                                "member_joined_seal",
+                            );
                             tracing::warn!(
                                 group_id = %LogHexId::group(&resolved_group_key),
                                 member = %LogHexId::agent(&member_agent_id),
@@ -16028,31 +16256,6 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                             return ApplyMetadataResult::REJECTED;
                         }
                     };
-                let rollback_snapshot = match guard.to_snapshot_bytes() {
-                    Ok(snapshot) => snapshot,
-                    Err(e) => {
-                        tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), member = %LogHexId::agent(&member_agent_id), "MemberJoined: failed to snapshot TreeKEM group before add: {e}");
-                        return ApplyMetadataResult::REJECTED;
-                    }
-                };
-                let out = match guard.add_member(member_id, kp_bytes) {
-                    Ok(out) => out,
-                    Err(e) => {
-                        tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), member = %LogHexId::agent(&member_agent_id), "MemberJoined: TreeKEM add_member failed: {e}");
-                        return ApplyMetadataResult::REJECTED;
-                    }
-                };
-                if guard.epoch() != expected_epoch {
-                    rollback_treekem_group_after_failed_install(
-                        state,
-                        &resolved_group_key,
-                        &info,
-                        &rollback_snapshot,
-                        &mut guard,
-                        "member_joined_add",
-                    );
-                    return ApplyMetadataResult::REJECTED;
-                }
                 if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
                     state,
                     &resolved_group_key,
@@ -22214,14 +22417,67 @@ async fn add_treekem_named_group_member(
         }
     }
     next.secret_epoch = treekem_epoch;
-    let Some(binding) = treekem_recovery_security_binding(treekem_epoch, &direct_recovery_original)
-    else {
+    // Survivor re-key A1: snapshot, add to the tree, bind the bytes, then
+    // seal. Every failure after the add rolls back.
+    let rollback_snapshot = match guard.to_snapshot_bytes() {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    serde_json::json!({ "ok": false, "error": format!("TreeKEM snapshot failed: {e}") }),
+                ),
+            );
+        }
+    };
+    let out = match guard.add_member(agent_id, &kp_bytes) {
+        Ok(out) => out,
+        Err(e) => {
+            rollback_treekem_group_after_failed_install(
+                &state,
+                &id,
+                &next,
+                &rollback_snapshot,
+                &mut guard,
+                "direct_add_member",
+            );
+            return (
+                StatusCode::CONFLICT,
+                Json(
+                    serde_json::json!({ "ok": false, "error": format!("TreeKEM add_member failed: {e}") }),
+                ),
+            );
+        }
+    };
+    let package_hash = next
+        .members_v2
+        .get(&agent_hex)
+        .and_then(|member| member.treekem_key_package_hash.clone());
+    let binding = treekem_add_security_binding(
+        treekem_epoch,
+        &out.commit,
+        req.display_name.as_deref(),
+        package_hash.as_deref(),
+        &out.welcome,
+        &direct_recovery_original,
+    );
+    if guard.epoch() != treekem_epoch || binding.is_none() {
+        rollback_treekem_group_after_failed_install(
+            &state,
+            &id,
+            &next,
+            &rollback_snapshot,
+            &mut guard,
+            "direct_add_epoch",
+        );
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": "failed to bind recovery record" })),
+            Json(
+                serde_json::json!({ "ok": false, "error": "TreeKEM epoch did not advance as expected" }),
+            ),
         );
-    };
-    next.security_binding = Some(binding);
+    }
+    next.security_binding = binding;
     // ADR-0064 slice 3 (round-2 advisory A1): the TreeKEM sibling of the
     // GSS direct-add mint — declared epoch is the epoch this add's TreeKEM
     // commit will carry.
@@ -22239,6 +22495,14 @@ async fn add_treekem_named_group_member(
     let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await {
         Ok(c) => c,
         Err(e) => {
+            rollback_treekem_group_after_failed_install(
+                &state,
+                &id,
+                &next,
+                &rollback_snapshot,
+                &mut guard,
+                "direct_add_seal",
+            );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
@@ -22252,6 +22516,14 @@ async fn add_treekem_named_group_member(
     ) {
         Ok(attested) => attested,
         Err(e) => {
+            rollback_treekem_group_after_failed_install(
+                &state,
+                &id,
+                &next,
+                &rollback_snapshot,
+                &mut guard,
+                "direct_add_attest",
+            );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(
@@ -22260,28 +22532,17 @@ async fn add_treekem_named_group_member(
             );
         }
     };
-    let out = match guard.add_member(agent_id, &kp_bytes) {
-        Ok(out) => out,
-        Err(e) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(
-                    serde_json::json!({ "ok": false, "error": format!("TreeKEM add_member failed: {e}") }),
-                ),
-            );
-        }
-    };
-    if guard.epoch() != treekem_epoch {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(
-                serde_json::json!({ "ok": false, "error": "TreeKEM epoch did not advance as expected" }),
-            ),
-        );
-    }
     if let Err(e) =
         persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await
     {
+        rollback_treekem_group_after_failed_install(
+            &state,
+            &id,
+            &next,
+            &rollback_snapshot,
+            &mut guard,
+            "direct_add_persist",
+        );
         tracing::error!(group_id = %LogHexId::group(&id), "failed to persist TreeKEM snapshot after direct add: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -23811,19 +24072,31 @@ async fn remove_treekem_named_group_member(
     let revision = next.roster_revision;
     next.remove_member(&agent_id_hex, Some(local_agent_hex.clone()));
     next.secret_epoch = treekem_epoch;
-    next.security_binding = Some(format!("treekem:epoch={treekem_epoch}"));
-    let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await {
-        Ok(c) => c,
+    // Survivor re-key A1: snapshot, mutate the tree, bind the commit bytes,
+    // then seal. Every failure after the mutation restores the snapshot.
+    let rollback_snapshot = match guard.to_snapshot_bytes() {
+        Ok(snapshot) => snapshot,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("TreeKEM snapshot failed: {e}")
+                })),
             );
         }
     };
     let treekem_commit = match guard.remove_member_verified(target_agent, &target_kp_bytes) {
         Ok(commit) => commit,
         Err(e) => {
+            rollback_treekem_group_after_failed_install(
+                &state,
+                &id,
+                &next,
+                &rollback_snapshot,
+                &mut guard,
+                "admin_remove_member",
+            );
             return (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
@@ -23833,7 +24106,16 @@ async fn remove_treekem_named_group_member(
             );
         }
     };
-    if guard.epoch() != treekem_epoch {
+    let binding = treekem_removal_bytes_binding(treekem_epoch, &treekem_commit);
+    if guard.epoch() != treekem_epoch || binding.is_none() {
+        rollback_treekem_group_after_failed_install(
+            &state,
+            &id,
+            &next,
+            &rollback_snapshot,
+            &mut guard,
+            "admin_remove_epoch",
+        );
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -23842,6 +24124,24 @@ async fn remove_treekem_named_group_member(
             })),
         );
     }
+    next.security_binding = binding;
+    let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await {
+        Ok(c) => c,
+        Err(e) => {
+            rollback_treekem_group_after_failed_install(
+                &state,
+                &id,
+                &next,
+                &rollback_snapshot,
+                &mut guard,
+                "admin_remove_seal",
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+            );
+        }
+    };
     // ADR 0107 (review r2): inside this removal's critical section, stop
     // every in-flight egress of the member's join artifacts BEFORE the
     // removal commits, then drop what stays staged AFTER it.
@@ -23850,6 +24150,14 @@ async fn remove_treekem_named_group_member(
         persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await;
     purge_join_artifacts_if_ineligible(&state, &id, &agent_id_hex).await;
     if let Err(e) = persisted {
+        rollback_treekem_group_after_failed_install(
+            &state,
+            &id,
+            &next,
+            &rollback_snapshot,
+            &mut guard,
+            "admin_remove_persist",
+        );
         tracing::error!(group_id = %LogHexId::group(&id), "failed to persist TreeKEM snapshot after removal: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -24009,14 +24317,13 @@ async fn reconcile_treekem_self_leave_rekeys(
         let revision = next.roster_revision;
         next.remove_member(&departed_hex, Some(local_agent_hex.clone()));
         next.secret_epoch = treekem_epoch;
-        next.security_binding = Some(format!("treekem:epoch={treekem_epoch}"));
-        let commit = match next.seal_commit(signing_kp, now_millis_u64()) {
-            Ok(c) => c,
+        // Survivor re-key A1: snapshot, mutate, bind the bytes, then seal.
+        let rollback_snapshot = match guard.to_snapshot_bytes() {
+            Ok(snapshot) => snapshot,
             Err(e) => {
                 tracing::warn!(
                     group_id = %LogHexId::group(group_key),
-                    member = %LogHexId::agent(&departed_hex),
-                    "self-leave rekey seal failed: {e}"
+                    "self-leave rekey snapshot failed: {e}"
                 );
                 continue;
             }
@@ -24024,6 +24331,14 @@ async fn reconcile_treekem_self_leave_rekeys(
         let treekem_commit = match guard.remove_member_verified(departed_agent, &kp_bytes) {
             Ok(commit) => commit,
             Err(e) => {
+                rollback_treekem_group_after_failed_install(
+                    state,
+                    group_key,
+                    &next,
+                    &rollback_snapshot,
+                    &mut guard,
+                    "self_leave_rekey_remove",
+                );
                 tracing::warn!(
                     group_id = %LogHexId::group(group_key),
                     member = %LogHexId::agent(&departed_hex),
@@ -24032,13 +24347,42 @@ async fn reconcile_treekem_self_leave_rekeys(
                 continue;
             }
         };
-        if guard.epoch() != treekem_epoch {
+        let binding = treekem_removal_bytes_binding(treekem_epoch, &treekem_commit);
+        if guard.epoch() != treekem_epoch || binding.is_none() {
+            rollback_treekem_group_after_failed_install(
+                state,
+                group_key,
+                &next,
+                &rollback_snapshot,
+                &mut guard,
+                "self_leave_rekey_epoch",
+            );
             tracing::error!(
                 group_id = %LogHexId::group(group_key),
                 "self-leave rekey epoch did not advance as expected"
             );
             continue;
         }
+        next.security_binding = binding;
+        let commit = match next.seal_commit(signing_kp, now_millis_u64()) {
+            Ok(c) => c,
+            Err(e) => {
+                rollback_treekem_group_after_failed_install(
+                    state,
+                    group_key,
+                    &next,
+                    &rollback_snapshot,
+                    &mut guard,
+                    "self_leave_rekey_seal",
+                );
+                tracing::warn!(
+                    group_id = %LogHexId::group(group_key),
+                    member = %LogHexId::agent(&departed_hex),
+                    "self-leave rekey seal failed: {e}"
+                );
+                continue;
+            }
+        };
         if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
             state,
             group_key,
@@ -24047,6 +24391,14 @@ async fn reconcile_treekem_self_leave_rekeys(
         )
         .await
         {
+            rollback_treekem_group_after_failed_install(
+                state,
+                group_key,
+                &next,
+                &rollback_snapshot,
+                &mut guard,
+                "self_leave_rekey_persist",
+            );
             tracing::error!(
                 group_id = %LogHexId::group(group_key),
                 "failed to persist TreeKEM snapshot after self-leave rekey: {e}"
@@ -24600,15 +24952,14 @@ async fn owner_certified_seal_with_eviction(
                 let revision = next.roster_revision;
                 next.remove_member(&evict_hex, Some(local_hex.to_string()));
                 next.secret_epoch = treekem_epoch;
-                next.security_binding = Some(format!("treekem:epoch={treekem_epoch}"));
-                // No-prune seal: the remaining failing members (if any) get
-                // their OWN transitions on the next loop iteration.
-                let commit = match next.seal_commit_evicting(signing_kp, now_ms) {
-                    Ok(commit) => commit,
+                // Survivor re-key A1: snapshot, mutate, bind the bytes, then
+                // seal; every failure after the mutation rolls back.
+                let rollback_snapshot = match guard.to_snapshot_bytes() {
+                    Ok(snapshot) => snapshot,
                     Err(e) => {
                         return Some(Err(api_error(
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("seal failed: {e}"),
+                            format!("TreeKEM snapshot failed: {e}"),
                         )))
                     }
                 };
@@ -24616,18 +24967,55 @@ async fn owner_certified_seal_with_eviction(
                     match guard.remove_member_verified(target_agent, &target_kp_bytes) {
                         Ok(commit) => commit,
                         Err(e) => {
+                            rollback_treekem_group_after_failed_install(
+                                state,
+                                id,
+                                info,
+                                &rollback_snapshot,
+                                &mut guard,
+                                "owner_cert_eviction_remove",
+                            );
                             return Some(Err(api_error(
                                 StatusCode::CONFLICT,
                                 format!("TreeKEM remove_member failed: {e}"),
-                            )))
+                            )));
                         }
                     };
-                if guard.epoch() != treekem_epoch {
+                let binding = treekem_removal_bytes_binding(treekem_epoch, &treekem_commit);
+                if guard.epoch() != treekem_epoch || binding.is_none() {
+                    rollback_treekem_group_after_failed_install(
+                        state,
+                        id,
+                        info,
+                        &rollback_snapshot,
+                        &mut guard,
+                        "owner_cert_eviction_epoch",
+                    );
                     return Some(Err(api_error(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "TreeKEM epoch did not advance as expected",
                     )));
                 }
+                next.security_binding = binding;
+                // No-prune seal: the remaining failing members (if any) get
+                // their OWN transitions on the next loop iteration.
+                let commit = match next.seal_commit_evicting(signing_kp, now_ms) {
+                    Ok(commit) => commit,
+                    Err(e) => {
+                        rollback_treekem_group_after_failed_install(
+                            state,
+                            id,
+                            info,
+                            &rollback_snapshot,
+                            &mut guard,
+                            "owner_cert_eviction_seal",
+                        );
+                        return Some(Err(api_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("seal failed: {e}"),
+                        )));
+                    }
+                };
                 let event = NamedGroupMetadataEvent::MemberRemoved {
                     group_id: next.stable_group_id().to_string(),
                     revision,
@@ -24651,6 +25039,14 @@ async fn owner_certified_seal_with_eviction(
                         .await;
                 purge_join_artifacts_if_ineligible(state, id, &evict_hex).await;
                 if let Err(e) = persisted {
+                    rollback_treekem_group_after_failed_install(
+                        state,
+                        id,
+                        &delivery_roster,
+                        &rollback_snapshot,
+                        &mut guard,
+                        "owner_cert_eviction_persist",
+                    );
                     tracing::error!(group_id = %id, "failed to persist TreeKEM snapshot after eviction: {e}");
                     return Some(Err(api_error(
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -25774,6 +26170,16 @@ pub(in crate::server) async fn seal_commit_owner_certified(
     signing_kp: &crate::identity::AgentKeypair,
     now_ms: u64,
 ) -> Result<x0x::groups::GroupStateCommit, x0x::groups::state_commit::ApplyError> {
+    #[cfg(test)]
+    if state
+        .named_group_test_recorders
+        .seal_force_err
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(x0x::groups::state_commit::ApplyError::Invariant(
+            "test seam: forced seal failure".to_string(),
+        ));
+    }
     // Round-4: ONE verdict for the whole operation; the seal consumes the
     // SAME instance — no second evaluation, no fresh clock read. Ordinary
     // seals require an ALL-CLEAN roster: Failed members direct to the
@@ -27390,19 +27796,29 @@ async fn ban_treekem_group_member(
     let revision = next.roster_revision;
     next.ban_member(&agent_id_hex, Some(caller_hex.clone()));
     next.secret_epoch = treekem_epoch;
-    next.security_binding = Some(format!("treekem:epoch={treekem_epoch}"));
-    let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await {
-        Ok(c) => c,
+    // Survivor re-key A1: snapshot, mutate, bind the bytes, then seal.
+    let rollback_snapshot = match guard.to_snapshot_bytes() {
+        Ok(snapshot) => snapshot,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+                Json(
+                    serde_json::json!({ "ok": false, "error": format!("TreeKEM snapshot failed: {e}") }),
+                ),
             );
         }
     };
     let treekem_commit = match guard.remove_member_verified(target_agent, &target_kp_bytes) {
         Ok(commit) => commit,
         Err(e) => {
+            rollback_treekem_group_after_failed_install(
+                &state,
+                &id,
+                &next,
+                &rollback_snapshot,
+                &mut guard,
+                "ban_remove_member",
+            );
             return (
                 StatusCode::CONFLICT,
                 Json(
@@ -27411,7 +27827,16 @@ async fn ban_treekem_group_member(
             );
         }
     };
-    if guard.epoch() != treekem_epoch {
+    let binding = treekem_removal_bytes_binding(treekem_epoch, &treekem_commit);
+    if guard.epoch() != treekem_epoch || binding.is_none() {
+        rollback_treekem_group_after_failed_install(
+            &state,
+            &id,
+            &next,
+            &rollback_snapshot,
+            &mut guard,
+            "ban_epoch",
+        );
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(
@@ -27419,6 +27844,24 @@ async fn ban_treekem_group_member(
             ),
         );
     }
+    next.security_binding = binding;
+    let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await {
+        Ok(c) => c,
+        Err(e) => {
+            rollback_treekem_group_after_failed_install(
+                &state,
+                &id,
+                &next,
+                &rollback_snapshot,
+                &mut guard,
+                "ban_seal",
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+            );
+        }
+    };
     // ADR 0107 (review r2): inside this ban's critical section, stop every
     // in-flight egress of the member's join artifacts BEFORE the ban
     // commits, then drop what stays staged AFTER it.
@@ -27427,6 +27870,14 @@ async fn ban_treekem_group_member(
         persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await;
     purge_join_artifacts_if_ineligible(&state, &id, &agent_id_hex).await;
     if let Err(e) = persisted {
+        rollback_treekem_group_after_failed_install(
+            &state,
+            &id,
+            &next,
+            &rollback_snapshot,
+            &mut guard,
+            "ban_persist",
+        );
         tracing::error!(group_id = %LogHexId::group(&id), "failed to persist TreeKEM snapshot after ban: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -28601,19 +29052,73 @@ async fn approve_treekem_join_request(
     };
     next.set_member_treekem_key_package(&requester_hex, BASE64.encode(&kp_bytes));
     next.secret_epoch = treekem_epoch;
-    let Some(binding) =
-        treekem_recovery_security_binding(treekem_epoch, &approval_recovery_original)
-    else {
+    // Survivor re-key A1: snapshot, add to the tree, bind the bytes, then
+    // seal. Every failure after the add rolls back.
+    let rollback_snapshot = match guard.to_snapshot_bytes() {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("TreeKEM snapshot failed: {e}"),
+            );
+        }
+    };
+    let out = match guard.add_member(requester_id, &kp_bytes) {
+        Ok(out) => out,
+        Err(e) => {
+            rollback_treekem_group_after_failed_install(
+                &state,
+                &id,
+                &next,
+                &rollback_snapshot,
+                &mut guard,
+                "approval_add_member",
+            );
+            return api_error(
+                StatusCode::CONFLICT,
+                format!("TreeKEM add_member failed: {e}"),
+            );
+        }
+    };
+    let package_hash = next
+        .members_v2
+        .get(&requester_hex)
+        .and_then(|member| member.treekem_key_package_hash.clone());
+    let binding = treekem_add_security_binding(
+        treekem_epoch,
+        &out.commit,
+        None,
+        package_hash.as_deref(),
+        &out.welcome,
+        &approval_recovery_original,
+    );
+    if guard.epoch() != treekem_epoch || binding.is_none() {
+        rollback_treekem_group_after_failed_install(
+            &state,
+            &id,
+            &next,
+            &rollback_snapshot,
+            &mut guard,
+            "approval_epoch",
+        );
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to bind recovery record",
+            "TreeKEM epoch did not advance as expected",
         );
-    };
-    next.security_binding = Some(binding);
+    }
+    next.security_binding = binding;
     let revision = next.roster_revision;
     let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await {
         Ok(c) => c,
         Err(e) => {
+            rollback_treekem_group_after_failed_install(
+                &state,
+                &id,
+                &next,
+                &rollback_snapshot,
+                &mut guard,
+                "approval_seal",
+            );
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("seal failed: {e}"),
@@ -28625,30 +29130,31 @@ async fn approve_treekem_join_request(
         {
             Ok(recovery) => recovery,
             Err(e) => {
+                rollback_treekem_group_after_failed_install(
+                    &state,
+                    &id,
+                    &next,
+                    &rollback_snapshot,
+                    &mut guard,
+                    "approval_attest",
+                );
                 return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("recovery attestation failed: {e}"),
                 );
             }
         };
-    let out = match guard.add_member(requester_id, &kp_bytes) {
-        Ok(out) => out,
-        Err(e) => {
-            return api_error(
-                StatusCode::CONFLICT,
-                format!("TreeKEM add_member failed: {e}"),
-            );
-        }
-    };
-    if guard.epoch() != treekem_epoch {
-        return api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "TreeKEM epoch did not advance as expected",
-        );
-    }
     if let Err(e) =
         persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await
     {
+        rollback_treekem_group_after_failed_install(
+            &state,
+            &id,
+            &next,
+            &rollback_snapshot,
+            &mut guard,
+            "approval_persist",
+        );
         tracing::error!(group_id = %LogHexId::group(&id), "failed to persist TreeKEM snapshot after approval: {e}");
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -41103,6 +41609,7 @@ async fn apply_rekey_self_removal_link_checked(
         revision,
         actor,
         agent_id: removed_agent,
+        treekem_commit_b64: Some(commit_b64),
         treekem_epoch: Some(epoch),
         commit: Some(commit),
         ..
@@ -41110,6 +41617,13 @@ async fn apply_rekey_self_removal_link_checked(
     else {
         return Err("not_a_removal");
     };
+    let Ok(commit_bytes) = BASE64.decode(commit_b64) else {
+        return Err("treekem_commit_b64_decode");
+    };
+    if !treekem_removal_binding_covers_commit(commit, *epoch, &commit_bytes) {
+        return Err("binding_does_not_name_bytes");
+    }
+    let signed_binding = commit.security_binding.clone();
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     let sender_hex = hex::encode(sender.as_bytes());
     if !is_rekey_self_removal_link(event, Some(&local_hex)) || *actor != sender_hex {
@@ -41171,7 +41685,7 @@ async fn apply_rekey_self_removal_link_checked(
             next.roster_revision = adopt_roster_revision(next.roster_revision, *revision);
             next.remove_member(removed_agent, Some(actor.clone()));
             next.secret_epoch = *epoch;
-            next.security_binding = Some(format!("treekem:epoch={epoch}"));
+            next.security_binding = signed_binding;
         },
     )
     .await
@@ -43926,6 +44440,7 @@ pub(in crate::server) mod tests {
     mod requester_offer;
     mod sec377_dm_verified_gate;
     mod self_leave_rekey;
+    mod treekem_bytes_binding;
     mod welcome_unblock;
     mod wp_c;
     fn fake_group_state_commit(

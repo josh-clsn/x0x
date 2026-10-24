@@ -3562,3 +3562,205 @@ async fn the_ban_response_carries_the_event_that_departs_the_banned_device() -> 
     );
     Ok(())
 }
+
+fn wa_signed_binding(event: &NamedGroupMetadataEvent) -> String {
+    named_group_metadata_event_commit(event)
+        .and_then(|commit| commit.security_binding.clone())
+        .expect("signed binding")
+}
+
+fn wa_published_for(
+    s: &BackToBack,
+    member_hex: &str,
+    kind: &str,
+) -> Option<NamedGroupMetadataEvent> {
+    wa_published(s)
+        .into_iter()
+        .map(|(_, e)| e)
+        .find(|e| match e {
+            NamedGroupMetadataEvent::MemberRemoved {
+                agent_id,
+                treekem_commit_b64: Some(_),
+                ..
+            } => kind == "removed" && agent_id == member_hex,
+            NamedGroupMetadataEvent::MemberAdded {
+                agent_id,
+                treekem_commit_b64: Some(_),
+                ..
+            } => kind == "added" && agent_id == member_hex,
+            NamedGroupMetadataEvent::MemberBanned {
+                agent_id,
+                treekem_commit_b64: Some(_),
+                ..
+            } => kind == "banned" && agent_id == member_hex,
+            _ => false,
+        })
+}
+
+/// Survivor re-key A1: the returning-member re-key (its removal and its
+/// add), the OwnerCertified eviction and the ban each seal a binding that
+/// names their TreeKEM bytes.
+#[tokio::test]
+async fn ban_add_eviction_and_rekey_removal_seal_the_digest_binding() -> Result<()> {
+    use super::treekem_bytes_binding::{expected_add_binding, expected_removal_binding};
+
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let j1_hex = hex::encode(s.j1.agent.agent_id().as_bytes());
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+
+    wa_clear_published(&s);
+    let r = wa_stuck_keyless(&s).await?;
+    anyhow::ensure!(r.treekem, "precondition: J2 re-keyed with keys: {r}");
+    let removal = wa_published_for(&s, &j2_hex, "removed").context("re-key removal")?;
+    assert_eq!(
+        wa_signed_binding(&removal),
+        expected_removal_binding(&removal),
+        "the re-key removal names its bytes"
+    );
+    let add = wa_published_for(&s, &j2_hex, "added").context("re-key add")?;
+    let binding = wa_signed_binding(&add);
+    let (bytes_part, suffix) = binding.split_once(';').context("recovery suffix")?;
+    assert_eq!(
+        bytes_part,
+        expected_add_binding(&add),
+        "the re-key add names its bytes"
+    );
+    assert!(suffix.starts_with("member-recovery="), "got {binding}");
+
+    // J1 revokes its own certificate; the owner's explicit seal evicts it.
+    wa_clear_published(&s);
+    let cert = s
+        ._authority
+        .named_groups
+        .read()
+        .await
+        .get(&s.group_key)
+        .and_then(|info| info.members_v2.get(&j1_hex).cloned())
+        .and_then(|member| member.certificate)
+        .context("J1's seat certificate")?;
+    let j1_kp = s.j1.agent.identity().agent_keypair();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let record = x0x::revocation::RevocationRecord::sign(
+        x0x::revocation::RevokedSubject::Agent(j1_kp.agent_id()),
+        j1_kp.public_key(),
+        j1_kp.secret_key(),
+        now,
+        Some("survivor re-key A1 eviction".to_string()),
+    )?;
+    s._authority
+        .agent
+        .revocation_set()
+        .write()
+        .await
+        .verify_and_insert(record, Some(&cert))?;
+    let sealed = seal_group_state(
+        State(Arc::clone(&s._authority)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(s.group_key.clone()),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(sealed).await?;
+    assert_eq!(status, StatusCode::OK, "the seal evicts J1: {body}");
+    let eviction = wa_published_for(&s, &j1_hex, "removed").context("eviction")?;
+    assert_eq!(
+        wa_signed_binding(&eviction),
+        expected_removal_binding(&eviction),
+        "the eviction names its bytes"
+    );
+
+    wa_clear_published(&s);
+    let banned = ban_group_member(
+        State(Arc::clone(&s._authority)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path((s.group_key.clone(), j2_hex.clone())),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(banned).await?;
+    assert_eq!(status, StatusCode::OK, "the owner bans J2: {body}");
+    let ban = wa_published_for(&s, &j2_hex, "banned").context("ban")?;
+    assert_eq!(
+        wa_signed_binding(&ban),
+        expected_removal_binding(&ban),
+        "the ban names its bytes"
+    );
+    Ok(())
+}
+
+fn wa_swap_removal_bytes(event: &NamedGroupMetadataEvent) -> NamedGroupMetadataEvent {
+    let mut swapped = event.clone();
+    if let NamedGroupMetadataEvent::MemberRemoved {
+        treekem_commit_b64, ..
+    } = &mut swapped
+    {
+        *treekem_commit_b64 = Some(BASE64.encode(b"not the re-key removal's commit"));
+    }
+    swapped
+}
+
+/// Survivor re-key A1, device side: the re-key removal of this device is
+/// taken as a chain step only with the bytes its signed binding names, on
+/// both receive paths (the `MemberRemoved` arm and the held result's link).
+#[tokio::test]
+async fn the_rekey_link_checks_the_bytes_its_removal_names() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let (_attempt, _terminal, carried) = wa_held_rekey(&s).await?;
+    let removal = carried.first().cloned().context("removal")?;
+    let before = wa_head(&s.j2, &s).await;
+    let swapped = wa_swap_removal_bytes(&removal);
+    let refused =
+        apply_named_group_metadata_event(&s.j2, swapped, s.authority_id, false, None).await;
+    assert!(!refused.accepted, "swapped bytes are refused: {refused:?}");
+    assert_eq!(wa_head(&s.j2, &s).await, before, "nothing applied");
+    let taken = apply_named_group_metadata_event(&s.j2, removal, s.authority_id, false, None).await;
+    assert!(
+        taken.accepted && !taken.should_exit,
+        "the genuine removal is a chain step: {taken:?}"
+    );
+    assert_ne!(wa_head(&s.j2, &s).await, before);
+
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let (attempt_id, terminal, carried) = wa_held_rekey(&s).await?;
+    let terminal_revision = named_group_metadata_event_commit(&terminal).map(|c| c.revision);
+    let before = wa_head(&s.j2, &s).await;
+    let link = |events: Vec<NamedGroupMetadataEvent>| {
+        let s = &s;
+        let attempt = attempt_id.clone();
+        async move {
+            super::super::apply_join_result_intervening_events_for(
+                &s.j2,
+                &s.authority_id,
+                true,
+                &s.stable_group_id,
+                terminal_revision,
+                Some(attempt.as_str()),
+                events,
+                true,
+            )
+            .await;
+            wa_head(&s.j2, s).await
+        }
+    };
+    let mut swapped = carried.clone();
+    if let Some(first) = swapped.first_mut() {
+        *first = wa_swap_removal_bytes(first);
+    }
+    assert_eq!(
+        link(swapped).await,
+        before,
+        "the link refuses swapped bytes"
+    );
+    assert_ne!(
+        link(carried).await,
+        before,
+        "the genuine link still applies (positive control)"
+    );
+    Ok(())
+}

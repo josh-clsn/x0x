@@ -8,16 +8,17 @@
 
 use super::*;
 
-struct LeaveFixture {
-    state: Arc<AppState>,
+pub(super) struct LeaveFixture {
+    pub(super) state: Arc<AppState>,
     _dir: tempfile::TempDir,
-    group_id: String,
-    member_id: x0x::identity::AgentId,
-    member_key_package: Vec<u8>,
-    leaver_group: x0x::mls::TreeKemMlsGroup,
+    pub(super) group_id: String,
+    pub(super) member_kp: x0x::identity::AgentKeypair,
+    pub(super) member_id: x0x::identity::AgentId,
+    pub(super) member_key_package: Vec<u8>,
+    pub(super) leaver_group: x0x::mls::TreeKemMlsGroup,
 }
 
-async fn two_member_treekem_group() -> Result<LeaveFixture> {
+pub(super) async fn two_member_treekem_group() -> Result<LeaveFixture> {
     let group_id = "cd".repeat(16);
     let (state, dir) = secure_endpoint_test_state().await?;
     let admin_id = state.agent.agent_id();
@@ -68,13 +69,14 @@ async fn two_member_treekem_group() -> Result<LeaveFixture> {
         state,
         _dir: dir,
         group_id,
+        member_kp,
         member_id,
         member_key_package: kp_bytes,
         leaver_group,
     })
 }
 
-async fn live_treekem_group(
+pub(super) async fn live_treekem_group(
     state: &AppState,
     group_id: &str,
 ) -> Arc<tokio::sync::Mutex<x0x::mls::TreeKemMlsGroup>> {
@@ -84,19 +86,19 @@ async fn live_treekem_group(
     group
 }
 
-async fn live_epoch(state: &AppState, group_id: &str) -> u64 {
+pub(super) async fn live_epoch(state: &AppState, group_id: &str) -> u64 {
     let group = live_treekem_group(state, group_id).await;
     let guard = group.lock().await;
     guard.epoch()
 }
 
-async fn encrypt(state: &AppState, group_id: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
+pub(super) async fn encrypt(state: &AppState, group_id: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
     let group = live_treekem_group(state, group_id).await;
     let mut guard = group.lock().await;
     Ok(guard.encrypt_message(plaintext)?)
 }
 
-fn published_removal_event(state: &AppState) -> Option<NamedGroupMetadataEvent> {
+pub(super) fn published_removal_event(state: &AppState) -> Option<NamedGroupMetadataEvent> {
     let published = state
         .named_group_test_recorders
         .publish_bytes
@@ -114,17 +116,18 @@ fn published_removal_event(state: &AppState) -> Option<NamedGroupMetadataEvent> 
     })
 }
 
-async fn wait_until(mut ready: impl FnMut() -> bool) {
+pub(super) async fn wait_until(mut ready: impl FnMut() -> bool) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while !ready() && std::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 
-/// The admin's removal of the leaver, sealed with the binding that names its
-/// TreeKEM bytes. Upstream's post-leave rekey (#1337) seals this form, and
-/// that rekey is not ported. No fork seal site names the bytes before A1.
-async fn digest_bound_removal(fixture: &LeaveFixture) -> Result<NamedGroupMetadataEvent> {
+/// The admin's removal of the leaver as a daemon from before survivor re-key
+/// A1 sealed it: the legacy `treekem:epoch=<n>` binding, which names no
+/// TreeKEM bytes. Every seal site now names them, so only this fixture still
+/// makes the legacy form.
+async fn legacy_bound_removal(fixture: &LeaveFixture) -> Result<NamedGroupMetadataEvent> {
     let state = &fixture.state;
     let admin_hex = hex::encode(state.agent.agent_id().as_bytes());
     let member_hex = hex::encode(fixture.member_id.as_bytes());
@@ -142,7 +145,7 @@ async fn digest_bound_removal(fixture: &LeaveFixture) -> Result<NamedGroupMetada
     let revision = next.roster_revision;
     next.remove_member(&member_hex, Some(admin_hex.clone()));
     next.secret_epoch = treekem_epoch;
-    next.security_binding = Some(treekem_commit_binding(treekem_epoch, &treekem_commit));
+    next.security_binding = Some(format!("treekem:epoch={treekem_epoch}"));
     let commit = next.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
     state
         .named_groups
@@ -161,21 +164,21 @@ async fn digest_bound_removal(fixture: &LeaveFixture) -> Result<NamedGroupMetada
     })
 }
 
-struct CatchupRelay {
-    fixture: LeaveFixture,
-    victim_state: Arc<AppState>,
+pub(super) struct CatchupRelay {
+    pub(super) fixture: LeaveFixture,
+    pub(super) victim_state: Arc<AppState>,
     _victim_dir: tempfile::TempDir,
-    member_b: x0x::identity::AgentId,
-    member_b_group: x0x::mls::TreeKemMlsGroup,
-    attacker_commit: Vec<u8>,
-    epoch_before: u64,
+    pub(super) member_b: x0x::identity::AgentId,
+    pub(super) member_b_group: x0x::mls::TreeKemMlsGroup,
+    pub(super) attacker_commit: Vec<u8>,
+    pub(super) epoch_before: u64,
 }
 
 impl CatchupRelay {
     /// Stop both states, so nothing outlives the test. The fork has no
     /// detached-task drain (#1269): the shutdown signal ends a running
     /// epoch-ahead catch-up task.
-    async fn shutdown(self) {
+    pub(super) async fn shutdown(self) {
         for state in [&self.victim_state, &self.fixture.state] {
             state.shutdown_notify.send_replace(true);
             state.agent.shutdown().await;
@@ -183,7 +186,7 @@ impl CatchupRelay {
     }
 }
 
-async fn catchup_relay_fixture() -> Result<CatchupRelay> {
+pub(super) async fn catchup_relay_fixture() -> Result<CatchupRelay> {
     let mut fixture = two_member_treekem_group().await?;
     let member_b_kp = x0x::identity::AgentKeypair::generate()?;
     let member_b = member_b_kp.agent_id();
@@ -269,7 +272,10 @@ async fn catchup_relay_fixture() -> Result<CatchupRelay> {
     })
 }
 
-fn swap_treekem_commit(event: &NamedGroupMetadataEvent, commit: &[u8]) -> NamedGroupMetadataEvent {
+pub(super) fn swap_treekem_commit(
+    event: &NamedGroupMetadataEvent,
+    commit: &[u8],
+) -> NamedGroupMetadataEvent {
     let mut relayed = event.clone();
     if let NamedGroupMetadataEvent::MemberRemoved {
         treekem_commit_b64, ..
@@ -280,7 +286,7 @@ fn swap_treekem_commit(event: &NamedGroupMetadataEvent, commit: &[u8]) -> NamedG
     relayed
 }
 
-async fn deliver_catchup(
+pub(super) async fn deliver_catchup(
     state: &Arc<AppState>,
     sender: &x0x::identity::AgentId,
     group_id: &str,
@@ -304,12 +310,12 @@ async fn deliver_catchup(
     .await;
 }
 
-async fn group_is_quarantined(state: &AppState, group_id: &str) -> bool {
+pub(super) async fn group_is_quarantined(state: &AppState, group_id: &str) -> bool {
     let groups = state.named_groups.read().await;
     groups.get(group_id).expect("group").is_fork_quarantined()
 }
 
-fn catchup_request_from(
+pub(super) fn catchup_request_from(
     info: &x0x::groups::GroupInfo,
     group_id: &str,
     requester: &x0x::identity::AgentId,
@@ -340,7 +346,20 @@ async fn relayed_removal_rejects_another_members_treekem_commit() -> Result<()> 
         epoch_before,
         "setup: the victim starts at the pre-rekey epoch"
     );
-    let genuine = digest_bound_removal(&cast.fixture).await?;
+    let member_hex = hex::encode(cast.fixture.member_id.as_bytes());
+    let removed = remove_named_group_member(
+        State(Arc::clone(&cast.fixture.state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path((cast.fixture.group_id.clone(), member_hex)),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        removed.status(),
+        StatusCode::OK,
+        "the admin remove route must seal"
+    );
+    let genuine = published_removal_event(&cast.fixture.state).expect("digest-bound removal");
     let genuine_hash = named_group_metadata_event_commit(&genuine)
         .expect("signed commit")
         .state_hash
@@ -402,25 +421,13 @@ async fn relayed_removal_rejects_another_members_treekem_commit() -> Result<()> 
     Ok(())
 }
 
-/// The admin remove route still seals `treekem:epoch=N`. A third party
-/// cannot relay those bytes, substituted or genuine. The author can.
+/// A removal sealed under `treekem:epoch=N` (a daemon from before survivor
+/// re-key A1). A third party cannot relay those bytes, substituted or
+/// genuine. The author can.
 #[tokio::test]
 async fn catchup_legacy_binding_stays_with_the_author() -> Result<()> {
     let mut cast = catchup_relay_fixture().await?;
-    let member_hex = hex::encode(cast.fixture.member_id.as_bytes());
-    let response = remove_named_group_member(
-        State(Arc::clone(&cast.fixture.state)),
-        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
-        Path((cast.fixture.group_id.clone(), member_hex)),
-    )
-    .await
-    .into_response();
-    assert_eq!(
-        response.status(),
-        StatusCode::OK,
-        "the admin remove route must seal"
-    );
-    let genuine = published_removal_event(&cast.fixture.state).expect("legacy removal");
+    let genuine = legacy_bound_removal(&cast.fixture).await?;
     let binding = named_group_metadata_event_commit(&genuine)
         .expect("signed commit")
         .security_binding
@@ -428,7 +435,7 @@ async fn catchup_legacy_binding_stays_with_the_author() -> Result<()> {
         .expect("legacy binding");
     assert!(
         binding.starts_with("treekem:epoch=") && !binding.contains(":commit="),
-        "the admin remove route must keep the legacy binding, got {binding}"
+        "setup: the fixture seals the legacy binding, got {binding}"
     );
     let substituted = swap_treekem_commit(&genuine, &cast.attacker_commit);
     deliver_catchup(
@@ -484,6 +491,292 @@ async fn catchup_legacy_binding_stays_with_the_author() -> Result<()> {
             .decrypt_message(&ciphertext)
             .is_err(),
         "the removed member must not read the author's new ciphertext"
+    );
+    cast.shutdown().await;
+    Ok(())
+}
+
+/// The leaver's own signed roster-only leave, as it publishes it.
+async fn signed_self_leave(fixture: &LeaveFixture) -> Result<NamedGroupMetadataEvent> {
+    let member_hex = hex::encode(fixture.member_id.as_bytes());
+    let groups = fixture.state.named_groups.read().await;
+    let mut leaving = groups.get(&fixture.group_id).cloned().expect("group");
+    drop(groups);
+    leaving.roster_revision = leaving.roster_revision.saturating_add(1);
+    let revision = leaving.roster_revision;
+    leaving.remove_member(&member_hex, Some(member_hex.clone()));
+    let commit = leaving.seal_commit(&fixture.member_kp, now_millis_u64())?;
+    Ok(NamedGroupMetadataEvent::MemberRemoved {
+        group_id: fixture.group_id.clone(),
+        revision,
+        actor: member_hex.clone(),
+        agent_id: member_hex,
+        treekem_commit_b64: None,
+        treekem_epoch: None,
+        secret_epoch: None,
+        commit: Some(commit),
+    })
+}
+
+/// A digest-bound rekey can be relayed. Substituted bytes cannot.
+/// Upstream #1337; the fork's post-leave rekey runs in its own task, so the
+/// test waits for it to publish.
+#[tokio::test]
+async fn catchup_third_party_relays_a_digest_bound_rekey() -> Result<()> {
+    let mut cast = catchup_relay_fixture().await?;
+    let leave = signed_self_leave(&cast.fixture).await?;
+    let applied = apply_named_group_metadata_event(
+        &cast.fixture.state,
+        leave.clone(),
+        cast.fixture.member_id,
+        true,
+        None,
+    )
+    .await;
+    assert!(
+        applied.accepted,
+        "the admin must seal the leave: {applied:?}"
+    );
+    deliver_catchup(
+        &cast.victim_state,
+        &cast.member_b,
+        &cast.fixture.group_id,
+        leave,
+    )
+    .await;
+    assert_eq!(
+        live_epoch(&cast.victim_state, &cast.fixture.group_id).await,
+        cast.epoch_before,
+        "the roster leave must not advance the epoch"
+    );
+    wait_until(|| published_removal_event(&cast.fixture.state).is_some()).await;
+    let genuine = published_removal_event(&cast.fixture.state).expect("digest rekey");
+    let binding = named_group_metadata_event_commit(&genuine)
+        .expect("signed commit")
+        .security_binding
+        .clone()
+        .expect("digest binding");
+    assert!(
+        binding.contains(":commit="),
+        "the self-leave rekey must name the TreeKEM digest, got {binding}"
+    );
+    let substituted = swap_treekem_commit(&genuine, &cast.attacker_commit);
+    deliver_catchup(
+        &cast.victim_state,
+        &cast.member_b,
+        &cast.fixture.group_id,
+        substituted,
+    )
+    .await;
+    assert_eq!(
+        live_epoch(&cast.victim_state, &cast.fixture.group_id).await,
+        cast.epoch_before,
+        "a substituted digest relay must not install"
+    );
+    assert!(
+        !group_is_quarantined(&cast.victim_state, &cast.fixture.group_id).await,
+        "a rejected digest relay must not quarantine the group"
+    );
+    deliver_catchup(
+        &cast.victim_state,
+        &cast.member_b,
+        &cast.fixture.group_id,
+        genuine,
+    )
+    .await;
+    assert_eq!(
+        live_epoch(&cast.victim_state, &cast.fixture.group_id).await,
+        live_epoch(&cast.fixture.state, &cast.fixture.group_id).await,
+        "a third party must relay the genuine digest-bound rekey"
+    );
+    let ciphertext = encrypt(&cast.fixture.state, &cast.fixture.group_id, b"digest-epoch").await?;
+    let victim_opened = {
+        let group = live_treekem_group(&cast.victim_state, &cast.fixture.group_id).await;
+        let mut guard = group.lock().await;
+        guard.decrypt_message(&ciphertext)?
+    };
+    assert_eq!(victim_opened, b"digest-epoch");
+    assert!(
+        cast.fixture
+            .leaver_group
+            .decrypt_message(&ciphertext)
+            .is_err(),
+        "the leaver must not read the relayed epoch"
+    );
+    cast.shutdown().await;
+    Ok(())
+}
+
+/// The owner, one survivor that saw the removal (S2) and one that did not
+/// (S1). Every daemon's tree uses its own agent seed.
+struct SurvivorRelay {
+    fixture: LeaveFixture,
+    s2: Arc<AppState>,
+    _s2_dir: tempfile::TempDir,
+    s1: Arc<AppState>,
+    _s1_dir: tempfile::TempDir,
+}
+
+impl SurvivorRelay {
+    async fn shutdown(self) {
+        for state in [&self.s1, &self.s2, &self.fixture.state] {
+            state.shutdown_notify.send_replace(true);
+            state.agent.shutdown().await;
+        }
+    }
+}
+
+async fn survivor_relay_fixture() -> Result<SurvivorRelay> {
+    let mut fixture = two_member_treekem_group().await?;
+    let (s2, s2_dir) = secure_endpoint_test_state().await?;
+    let (s1, s1_dir) = secure_endpoint_test_state().await?;
+    let group_id_bytes = hex::decode(&fixture.group_id)?;
+    let admin_hex = hex::encode(fixture.state.agent.agent_id().as_bytes());
+    let mut joined: Vec<(Arc<AppState>, x0x::mls::TreeKemMlsGroup, Vec<u8>)> = Vec::new();
+    for state in [&s2, &s1] {
+        let id = state.agent.agent_id();
+        let seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+        let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(id, &seed)?;
+        let package = prepared.key_package_bytes().to_vec();
+        let added = {
+            let group = live_treekem_group(&fixture.state, &fixture.group_id).await;
+            let mut guard = group.lock().await;
+            guard.add_member(id, &package)?
+        };
+        fixture.leaver_group.process_commit(&added.commit)?;
+        for (_, tree, _) in &mut joined {
+            tree.process_commit(&added.commit)?;
+        }
+        let tree = x0x::mls::TreeKemMlsGroup::join_from_welcome(prepared, &added.welcome)?;
+        joined.push((Arc::clone(state), tree, package));
+    }
+    let epoch = live_epoch(&fixture.state, &fixture.group_id).await;
+    let shared = {
+        let mut groups = fixture.state.named_groups.write().await;
+        let info = groups.get_mut(&fixture.group_id).expect("group");
+        for (state, _, package) in &joined {
+            let hex_id = hex::encode(state.agent.agent_id().as_bytes());
+            info.add_member(
+                hex_id.clone(),
+                x0x::groups::GroupRole::Member,
+                Some(admin_hex.clone()),
+                None,
+            );
+            info.set_member_treekem_key_package(
+                &hex_id,
+                base64::engine::general_purpose::STANDARD.encode(package),
+            );
+        }
+        info.secret_epoch = epoch;
+        info.security_binding = Some(format!("treekem:epoch={epoch}"));
+        info.recompute_state_hash();
+        info.clone()
+    };
+    for (state, tree, _) in joined {
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(fixture.group_id.clone(), shared.clone());
+        state.treekem_groups.write().await.insert(
+            fixture.group_id.clone(),
+            Arc::new(tokio::sync::Mutex::new(tree)),
+        );
+    }
+    Ok(SurvivorRelay {
+        fixture,
+        s2,
+        _s2_dir: s2_dir,
+        s1,
+        _s1_dir: s1_dir,
+    })
+}
+
+async fn roster_head(state: &AppState, group_id: &str, member_hex: &str) -> (u64, String, bool) {
+    let groups = state.named_groups.read().await;
+    let info = groups.get(group_id).expect("group");
+    (
+        info.state_revision,
+        info.state_hash.clone(),
+        info.has_active_member(member_hex),
+    )
+}
+
+/// The owner removes R. S2 applies it. S1 was away: it asks only S2, and
+/// the page S2 serves brings S1 to the owner's epoch and roster.
+#[tokio::test]
+async fn a_survivor_relays_an_admin_removal_by_catch_up() -> Result<()> {
+    let mut cast = survivor_relay_fixture().await?;
+    let owner = &cast.fixture.state;
+    let group_id = &cast.fixture.group_id;
+    let owner_id = owner.agent.agent_id();
+    let s1_id = cast.s1.agent.agent_id();
+    let s2_id = cast.s2.agent.agent_id();
+    let epoch_before = live_epoch(&cast.s1, group_id).await;
+    let removed_hex = hex::encode(cast.fixture.member_id.as_bytes());
+    let response = remove_named_group_member(
+        State(Arc::clone(owner)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path((group_id.clone(), removed_hex.clone())),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK, "the owner removes R");
+    let removal = published_removal_event(owner).expect("the owner publishes the removal");
+    let applied = apply_named_group_metadata_event(&cast.s2, removal, owner_id, true, None).await;
+    assert!(applied.accepted, "S2 applies the removal: {applied:?}");
+    let owner_epoch = live_epoch(owner, group_id).await;
+    assert_eq!(live_epoch(&cast.s2, group_id).await, owner_epoch);
+    assert_eq!(
+        live_epoch(&cast.s1, group_id).await,
+        epoch_before,
+        "S1 missed the removal"
+    );
+
+    let request = {
+        let groups = cast.s1.named_groups.read().await;
+        let info = groups.get(group_id).expect("group on S1");
+        catchup_request_from(info, group_id, &s1_id)
+    };
+    handle_treekem_catchup_request(&cast.s2, &s1_id, true, request).await;
+    let served = cast
+        .s2
+        .named_group_test_recorders
+        .catchup_responses
+        .lock()
+        .expect("catch-up recorder")
+        .last()
+        .cloned()
+        .expect("S2 serves a catch-up page");
+    let page: TreeKemCatchupResponse = serde_json::from_slice(&served)?;
+    assert!(!page.events.is_empty(), "the page carries the removal");
+    handle_treekem_catchup_response(&cast.s1, &s2_id, true, page).await;
+
+    assert_eq!(
+        live_epoch(&cast.s1, group_id).await,
+        owner_epoch,
+        "S1 reaches the owner's epoch from S2 alone"
+    );
+    let owner_head = roster_head(owner, group_id, &removed_hex).await;
+    assert!(!owner_head.2, "R is gone on the owner");
+    assert_eq!(
+        roster_head(&cast.s1, group_id, &removed_hex).await,
+        owner_head,
+        "S1's roster is the owner's"
+    );
+    let ciphertext = encrypt(owner, group_id, b"after-removal").await?;
+    let opened = {
+        let group = live_treekem_group(&cast.s1, group_id).await;
+        let mut guard = group.lock().await;
+        guard.decrypt_message(&ciphertext)?
+    };
+    assert_eq!(opened, b"after-removal");
+    assert!(
+        cast.fixture
+            .leaver_group
+            .decrypt_message(&ciphertext)
+            .is_err(),
+        "R must not read the new epoch"
     );
     cast.shutdown().await;
     Ok(())
