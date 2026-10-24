@@ -14552,7 +14552,6 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             }
             // ADR 0028: a JoinRequestCreated just advanced the group state.
             // Drain queued approvals that may now have their predecessor.
-            remember_commit_bearing_event(state, &event_for_log).await;
             *replay_group_id = Some(resolved_group_key.clone());
             // Finding B: return the pre-mutation group state so the relay
             // listener can roll back the request if obligation admission
@@ -14963,7 +14962,6 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             ) {
                 return ApplyMetadataResult::REJECTED;
             }
-            remember_commit_bearing_event(state, &event_for_log).await;
             *replay_group_id = Some(resolved_group_key.clone());
             ApplyMetadataResult::ACCEPTED_CONTINUE
         }

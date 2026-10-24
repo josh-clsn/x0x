@@ -247,21 +247,34 @@ async fn event_log_holds_every_commit_bearing_kind() -> Result<()> {
         "and all of it is on disk"
     );
 
-    // The join-request lifecycle carries a commit too, so the store holds it.
+    // The join-request lifecycle carries a commit too. An admin's
+    // rejection is logged. A request and its cancellation come from a
+    // requester who never serves catch-up, and apply only from it, so no
+    // member logs them (A4 review I-2).
+    let requester = hex_id(&newcomer(0x72)?.0);
+    let signed = named_group_metadata_event_commit(&events[0]).cloned();
     let created = NamedGroupMetadataEvent::JoinRequestCreated {
         group_id: group_id.clone(),
         request_id: "request".to_string(),
-        requester_agent_id: hex_id(&newcomer(0x72)?.0),
+        requester_agent_id: requester.clone(),
         message: None,
         ts: 1,
         requester_kem_public_key_b64: None,
         treekem_key_package_b64: None,
-        commit: named_group_metadata_event_commit(&events[0]).cloned(),
+        commit: signed.clone(),
+    };
+    let rejected = NamedGroupMetadataEvent::JoinRequestRejected {
+        group_id: group_id.clone(),
+        request_id: "request".to_string(),
+        actor: hex_id(&owner.agent.agent_id()),
+        requester_agent_id: requester,
+        commit: signed,
     };
     remember_commit_bearing_event(&cast.s2, &created).await;
-    assert!(logged_kinds(&cast.s2, &group_id)
-        .await
-        .contains("join_request_created"));
+    remember_commit_bearing_event(&cast.s2, &rejected).await;
+    let kinds = logged_kinds(&cast.s2, &group_id).await;
+    assert!(kinds.contains("join_request_rejected"));
+    assert!(!kinds.contains("join_request_created"));
     restarted.shutdown_notify.send_replace(true);
     cast.shutdown().await;
     Ok(())

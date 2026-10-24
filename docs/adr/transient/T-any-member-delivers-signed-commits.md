@@ -63,7 +63,7 @@ The signed roster commit covers its group id and revision, the previous state ha
 | | `actor` (`added_by`) | Must be the verified signer. |
 | | `revision` | Capped. |
 | | `certificate_b64` | Covered: its digest is in the roster root, and bytes that contradict it are not installed. |
-| | `owner_mandate` | TreeKEM plane: its digest is in the extras (A3 review I-1), so a copy without the mandate it was sealed with is refused, from any deliverer and from the author alike. The receiver never warn-accepts it as absent, and the author's full copy still applies and records the capability. Shared-secret plane: no binding slot, so a deliverer can strip it and the arm warn-accepts an authority not yet seen with a mandate (known limit; Noetic rooms are TreeKEM). |
+| | `owner_mandate` | TreeKEM plane: its digest is in the extras (A3 review I-1), so a copy without the mandate it was sealed with is refused, from any deliverer and from the author alike. The receiver never warn-accepts it as absent, and the author's full copy still applies and records the capability. Shared-secret plane: no binding slot, so a deliverer can strip it and the arm warn-accepts an authority not yet seen with a mandate (known limit; Noetic rooms are TreeKEM). Since A4 the stripped copy, if it lands first, is also the one logged and served after restarts. |
 | | `member_joined_recovery`, `member_recovery_history` | Each entry carries the authority's attestation and is verified (`verify_authority_attested_member_joined_recovery`). A deliverer can only drop entries. |
 | | `roster_certificates_b64` | Each entry is installed only when it hashes to a committed seat digest and verifies under the group owner. |
 | `MemberRemoved` | `actor` (`removed_by`) | Must be the verified signer. |

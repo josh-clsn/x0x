@@ -12,19 +12,20 @@
 //! - A file is written to a temp file at mode 0600, synced, renamed into
 //!   place, and then its directory is synced.
 //! - A room keeps at most [`ROOM_CAP`] events, and the daemon at most
-//!   [`DISK_CAP_BYTES`]. Past either cap the oldest event goes, and the room
-//!   records the highest revision it dropped. A requester who needs a
-//!   dropped event gets no page and is told why.
+//!   [`DISK_CAP_BYTES`] on disk, taken from the largest room first. An event
+//!   over [`EVENT_DISK_LIMIT_BYTES`] is kept in memory only. Whenever an
+//!   event goes, the room records the highest revision it lost. A requester
+//!   who needs a lost event gets no page and is told why.
 //! - Every change runs under the `treekem_event_log` write lock. An append
-//!   re-checks under that lock that the room is still live, so an append
+//!   re-checks under that lock that the room is still there, so an append
 //!   racing a wipe cannot bring the room's directory back.
 //!
 //! Lock order: `treekem_event_log`, then `named_groups`.
 
 use super::{
     has_withdrawn_group_record, named_group_metadata_event_commit,
-    named_group_metadata_event_group_id, named_group_metadata_event_kind, AppState,
-    NamedGroupMetadataEvent,
+    named_group_metadata_event_group_id, named_group_metadata_event_kind, sync_dir_contents,
+    AppState, NamedGroupMetadataEvent,
 };
 use crate as x0x;
 use crate::logging::LogHexId;
@@ -37,12 +38,21 @@ use std::time::SystemTime;
 pub(in crate::server) const EVENT_LOG_DIR: &str = "event-log";
 /// The most events one room keeps.
 pub(in crate::server) const ROOM_CAP: usize = 128;
-/// The most bytes the log keeps across every room.
+/// The most bytes the log keeps on disk across every room.
 pub(in crate::server) const DISK_CAP_BYTES: u64 = 256 * 1024 * 1024;
-/// A room's record of the highest revision it dropped.
+/// The largest event written to disk. A Welcome-bearing add is about
+/// 40-52 KiB, and one carrying a full roster-certificate sidecar (32
+/// certificates) about 360 KiB. A larger event is kept in memory only, so
+/// one room can put at most `ROOM_CAP` times this, 64 MiB, on disk.
+pub(in crate::server) const EVENT_DISK_LIMIT_BYTES: u64 = 512 * 1024;
+/// A room's record of the highest revision it lost.
 const EVICTED_THROUGH_FILE: &str = "evicted-through";
+/// The marker of an event kept in memory only. It names the revision a
+/// restart loses.
+const MEMORY_ONLY_SUFFIX: &str = ".memory-only";
 const ROOM_DIR_HEX_LEN: usize = 32;
 const EVENT_DIGEST_HEX_LEN: usize = 16;
+const REVISION_DIGITS: usize = 20;
 
 /// Where a commit-bearing event sits in its room's signed chain.
 pub(in crate::server) struct CommitBearingFrontier<'a> {
@@ -80,6 +90,19 @@ fn treekem_epoch_of(event: &NamedGroupMetadataEvent) -> Option<u64> {
     }
 }
 
+/// A join request and its cancellation are authored by the requester, who
+/// is not a member and never serves catch-up. They apply only from their
+/// author (A3), so no member's copy can help another member: they are not
+/// logged. A stranger could otherwise fill the log of any request-access
+/// room with them.
+fn logged_kind(event: &NamedGroupMetadataEvent) -> bool {
+    !matches!(
+        event,
+        NamedGroupMetadataEvent::JoinRequestCreated { .. }
+            | NamedGroupMetadataEvent::JoinRequestCancelled { .. }
+    )
+}
+
 /// How a served page orders its events: by signed revision, then epoch.
 pub(in crate::server) fn commit_bearing_event_sort_key(
     event: &NamedGroupMetadataEvent,
@@ -110,13 +133,31 @@ pub(in crate::server) fn room_dir_name(group_key: &str) -> String {
     name
 }
 
-fn event_file_name(frontier: &CommitBearingFrontier<'_>, bytes: &[u8]) -> String {
+fn event_file_stem(frontier: &CommitBearingFrontier<'_>, bytes: &[u8]) -> String {
     let mut digest = blake3::hash(bytes).to_hex().to_string();
     digest.truncate(EVENT_DIGEST_HEX_LEN);
     format!(
-        "{:020}-{:020}-{}-{digest}.json",
-        frontier.revision, frontier.epoch, frontier.kind
+        "{:0width$}-{:020}-{}-{digest}",
+        frontier.revision,
+        frontier.epoch,
+        frontier.kind,
+        width = REVISION_DIGITS
     )
+}
+
+fn event_file_name(frontier: &CommitBearingFrontier<'_>, bytes: &[u8]) -> String {
+    format!("{}.json", event_file_stem(frontier, bytes))
+}
+
+/// The revision a file name starts with.
+fn revision_of_name(name: &str) -> Option<u64> {
+    let digits = name.get(..REVISION_DIGITS)?;
+    if !digits.bytes().all(|byte| byte.is_ascii_digit())
+        || name.as_bytes().get(REVISION_DIGITS) != Some(&b'-')
+    {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 fn is_room_dir_name(name: &str) -> bool {
@@ -126,11 +167,12 @@ fn is_room_dir_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-/// One event's file.
+/// One logged event: its file, or its memory-only marker.
 struct Stored {
     key: String,
+    /// Bytes on disk; 0 for an event kept in memory only.
     bytes: u64,
-    /// Append order across every room. The disk cap drops the lowest.
+    /// Append order across every room.
     seq: u64,
     revision: u64,
 }
@@ -140,6 +182,7 @@ struct Room {
     /// By file name, which orders by revision and then epoch.
     files: BTreeMap<String, Stored>,
     evicted_through: Option<u64>,
+    bytes: u64,
 }
 
 /// The catch-up log: the events in memory, which the serve path reads, and
@@ -182,7 +225,8 @@ impl std::ops::DerefMut for EventLog {
 }
 
 impl EventLog {
-    /// The highest revision any of `room_keys` dropped to stay within a cap.
+    /// The highest revision any of `room_keys` lost: dropped to stay within
+    /// a cap, or kept in memory only before a restart.
     pub(in crate::server) fn evicted_through(&self, room_keys: &[String]) -> Option<u64> {
         room_keys
             .iter()
@@ -208,7 +252,7 @@ impl EventLog {
     }
 
     /// Log `event`, which this member applied or authored. The caller holds
-    /// the write lock and has checked that the room is live.
+    /// the write lock and has checked that the room is still there.
     async fn append(&mut self, event: &NamedGroupMetadataEvent) {
         let Some(frontier) = commit_bearing_event_frontier(event) else {
             return;
@@ -233,12 +277,26 @@ impl EventLog {
                 return;
             }
         };
-        let name = event_file_name(&frontier, &bytes);
         let revision = frontier.revision;
         let len = bytes.len() as u64;
+        let on_disk = len <= EVENT_DISK_LIMIT_BYTES;
+        let name = if on_disk {
+            event_file_name(&frontier, &bytes)
+        } else {
+            format!("{}{MEMORY_ONLY_SUFFIX}", event_file_stem(&frontier, &bytes))
+        };
+        if !on_disk {
+            tracing::info!(
+                group_id = %LogHexId::group(&room_key),
+                bytes = len,
+                limit = EVENT_DISK_LIMIT_BYTES,
+                "catch-up log: event over the per-event limit is kept in memory only"
+            );
+        }
         if let Some(dir) = self.room_dir(&room_key) {
             let file = name.clone();
-            if let Err(error) = run_blocking(move || write_durable(&dir, &file, &bytes)).await {
+            let contents = if on_disk { bytes } else { Vec::new() };
+            if let Err(error) = run_blocking(move || write_durable(&dir, &file, &contents)).await {
                 // It still serves from memory until the next restart.
                 tracing::warn!(
                     group_id = %LogHexId::group(&room_key),
@@ -253,20 +311,19 @@ impl EventLog {
             .push_back(event.clone());
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
-        self.stored
-            .entry(room_key.clone())
-            .or_default()
-            .files
-            .insert(
-                name,
-                Stored {
-                    key,
-                    bytes: len,
-                    seq,
-                    revision,
-                },
-            );
-        self.total_bytes = self.total_bytes.saturating_add(len);
+        let disk_bytes = if on_disk { len } else { 0 };
+        let room = self.stored.entry(room_key.clone()).or_default();
+        room.files.insert(
+            name,
+            Stored {
+                key,
+                bytes: disk_bytes,
+                seq,
+                revision,
+            },
+        );
+        room.bytes = room.bytes.saturating_add(disk_bytes);
+        self.total_bytes = self.total_bytes.saturating_add(disk_bytes);
         self.enforce_room_cap(&room_key).await;
         self.enforce_disk_cap().await;
     }
@@ -279,38 +336,43 @@ impl EventLog {
         {
             self.evict_oldest(room_key).await;
         }
-        // Events placed in memory without a file (tests do) still count.
+        // Only tests place events in memory without a record. They count
+        // too, and their loss is recorded like any other.
+        let mut lost = None;
         if let Some(events) = self.rooms.get_mut(room_key) {
             while events.len() > ROOM_CAP {
                 let oldest = events
                     .iter()
                     .enumerate()
                     .min_by_key(|(_, event)| commit_bearing_event_sort_key(event))
-                    .map(|(index, _)| index);
-                match oldest {
-                    Some(index) => {
-                        events.remove(index);
-                    }
-                    None => break,
-                }
+                    .map(|(index, event)| (index, commit_bearing_event_sort_key(event).0));
+                let Some((index, revision)) = oldest else {
+                    break;
+                };
+                events.remove(index);
+                lost = lost.max(Some(revision));
             }
+        }
+        if let Some(revision) = lost {
+            self.record_lost(room_key, revision).await;
         }
     }
 
+    /// While over the daemon-wide cap, drop from the room with the most
+    /// bytes on disk, so one busy room cannot push out another room's
+    /// history.
     async fn enforce_disk_cap(&mut self) {
         while self.total_bytes > self.disk_cap {
-            let oldest = self
+            let largest = self
                 .stored
                 .iter()
-                .filter_map(|(room_key, room)| {
-                    room.files
-                        .values()
-                        .next()
-                        .map(|stored| (stored.seq, room_key))
+                .filter(|(_, room)| room.bytes > 0)
+                .max_by_key(|(_, room)| {
+                    let oldest = room.files.values().next().map_or(u64::MAX, |s| s.seq);
+                    (room.bytes, std::cmp::Reverse(oldest))
                 })
-                .min()
-                .map(|(_, room_key)| room_key.clone());
-            let Some(room_key) = oldest else {
+                .map(|(room_key, _)| room_key.clone());
+            let Some(room_key) = largest else {
                 break;
             };
             if let Some(revision) = self.evict_oldest(&room_key).await {
@@ -318,35 +380,50 @@ impl EventLog {
                     group_id = %LogHexId::group(&room_key),
                     revision,
                     cap_bytes = self.disk_cap,
-                    "catch-up log: over the daemon-wide cap, dropped the oldest event"
+                    "catch-up log: over the daemon-wide cap, dropped the largest room's oldest event"
                 );
             }
         }
     }
 
-    /// Drop `room_key`'s lowest-revision event, in memory and on disk, and
-    /// record its revision as dropped. Returns that revision.
+    /// Raise `room_key`'s lost revision to at least `revision`, and write it
+    /// down. Returns the new value.
+    async fn record_lost(&mut self, room_key: &str, revision: u64) -> u64 {
+        let room = self.stored.entry(room_key.to_string()).or_default();
+        let through = room
+            .evicted_through
+            .map_or(revision, |through| through.max(revision));
+        room.evicted_through = Some(through);
+        if let Some(dir) = self.room_dir(room_key) {
+            let marker = through.to_string().into_bytes();
+            if let Err(error) =
+                run_blocking(move || write_durable(&dir, EVICTED_THROUGH_FILE, &marker)).await
+            {
+                tracing::warn!(
+                    group_id = %LogHexId::group(room_key),
+                    "catch-up log: recording a lost revision failed: {error}"
+                );
+            }
+        }
+        through
+    }
+
+    /// Drop `room_key`'s lowest-revision event, in memory and on disk. Its
+    /// revision is recorded as lost before its file goes, so a crash in
+    /// between never leaves a hole unrecorded. Returns that revision.
     async fn evict_oldest(&mut self, room_key: &str) -> Option<u64> {
         let room = self.stored.get_mut(room_key)?;
         let (name, stored) = room.files.pop_first()?;
-        let evicted_through = room
-            .evicted_through
-            .map_or(stored.revision, |through| through.max(stored.revision));
-        room.evicted_through = Some(evicted_through);
+        room.bytes = room.bytes.saturating_sub(stored.bytes);
         self.total_bytes = self.total_bytes.saturating_sub(stored.bytes);
         if let Some(events) = self.rooms.get_mut(room_key) {
             events.retain(|event| {
                 commit_bearing_event_frontier(event).is_none_or(|f| dedup_key(&f) != stored.key)
             });
         }
+        self.record_lost(room_key, stored.revision).await;
         if let Some(dir) = self.room_dir(room_key) {
-            let marker = evicted_through.to_string().into_bytes();
-            let result = run_blocking(move || {
-                remove_if_present(&dir.join(&name))?;
-                write_durable(&dir, EVICTED_THROUGH_FILE, &marker)
-            })
-            .await;
-            if let Err(error) = result {
+            if let Err(error) = run_blocking(move || remove_if_present(&dir.join(&name))).await {
                 tracing::warn!(
                     group_id = %LogHexId::group(room_key),
                     "catch-up log: dropping an event from disk failed: {error}"
@@ -361,8 +438,7 @@ impl EventLog {
     pub(in crate::server) async fn wipe_room(&mut self, room_key: &str) {
         self.rooms.remove(room_key);
         if let Some(room) = self.stored.remove(room_key) {
-            let bytes: u64 = room.files.values().map(|stored| stored.bytes).sum();
-            self.total_bytes = self.total_bytes.saturating_sub(bytes);
+            self.total_bytes = self.total_bytes.saturating_sub(room.bytes);
         }
         if let Some(dir) = self.room_dir(room_key) {
             if let Err(error) = run_blocking(move || remove_dir_if_present(&dir)).await {
@@ -375,25 +451,47 @@ impl EventLog {
     }
 }
 
-/// Whether this member may log or serve `group_id`: the room exists under
-/// that key or alias, no record of it is withdrawn, and the local agent is
-/// an active member who is not banned.
-pub(in crate::server) fn event_log_room_is_live(
+fn find_room<'a>(
+    groups: &'a HashMap<String, x0x::groups::GroupInfo>,
+    group_id: &str,
+) -> Option<&'a x0x::groups::GroupInfo> {
+    groups.get(group_id).or_else(|| {
+        groups
+            .values()
+            .find(|info| info.stable_group_id() == group_id || info.mls_group_id == group_id)
+    })
+}
+
+/// Whether this member may log an event of `group_id`: the room is in the
+/// local roster under that key or alias, no record of it is withdrawn, and
+/// the local agent is not banned from it.
+///
+/// It does not require the local agent to be active. A returning device
+/// applies the re-key removal of itself just before its add re-seats it,
+/// and a joiner applies the events its join result carries before its own
+/// add. Both must log them, or they serve pages with a hole. Every
+/// departure drops the room from the roster, tombstones it or bans the
+/// local agent before it wipes the log, so this check still keeps a wiped
+/// room's directory from coming back.
+pub(in crate::server) fn event_log_room_accepts(
     groups: &HashMap<String, x0x::groups::GroupInfo>,
     group_id: &str,
     local_agent_hex: &str,
 ) -> bool {
-    let info = groups.get(group_id).or_else(|| {
-        groups
-            .values()
-            .find(|info| info.stable_group_id() == group_id || info.mls_group_id == group_id)
-    });
-    info.is_some_and(|info| local_member_is_live(info, local_agent_hex))
+    find_room(groups, group_id)
+        .is_some_and(|info| !info.withdrawn && !info.is_banned(local_agent_hex))
         && !has_withdrawn_group_record(groups, group_id)
 }
 
+/// Whether a restart keeps a room's log: as for an append, and the local
+/// agent has a row in the room. A Removed row is kept: it is a returning
+/// device between its re-key removal and its add, and dropping its log
+/// there would leave the add it logs next with nothing before it. Every
+/// other departure drops the row, and a ban is refused.
 fn local_member_is_live(info: &x0x::groups::GroupInfo, local_agent_hex: &str) -> bool {
-    !info.withdrawn && !info.is_banned(local_agent_hex) && info.has_active_member(local_agent_hex)
+    !info.withdrawn
+        && !info.is_banned(local_agent_hex)
+        && info.members_v2.contains_key(local_agent_hex)
 }
 
 /// Log a commit-bearing event this member applied or authored, so it can
@@ -402,7 +500,7 @@ pub(in crate::server) async fn remember_commit_bearing_event(
     state: &AppState,
     event: &NamedGroupMetadataEvent,
 ) {
-    if commit_bearing_event_frontier(event).is_none() {
+    if commit_bearing_event_frontier(event).is_none() || !logged_kind(event) {
         return;
     }
     let group_id = named_group_metadata_event_group_id(event);
@@ -413,7 +511,7 @@ pub(in crate::server) async fn remember_commit_bearing_event(
     // removes it, or this check sees the room gone.
     {
         let groups = state.named_groups.read().await;
-        if !event_log_room_is_live(&groups, group_id, &local_agent_hex) {
+        if !event_log_room_accepts(&groups, group_id, &local_agent_hex) {
             return;
         }
     }
@@ -455,6 +553,10 @@ struct LoadedRoom {
     key: String,
     events: Vec<LoadedEvent>,
     evicted_through: Option<u64>,
+    /// The `evicted-through` file did not read back.
+    marker_corrupt: bool,
+    /// Memory-only markers: their events did not survive the restart.
+    lost: Vec<(PathBuf, u64)>,
 }
 
 #[derive(Default)]
@@ -462,12 +564,15 @@ struct LoadReport {
     rooms: Vec<LoadedRoom>,
     dropped_rooms: usize,
     skipped: Vec<PathBuf>,
+    unreadable: Vec<(PathBuf, io::Error)>,
 }
 
 /// Load the log at startup, keeping only live rooms (`live_room_dirs`).
-/// A room of an unknown, withdrawn, banned or inactive group is removed.
+/// A room of an unknown, withdrawn or banned group, or one the local agent
+/// has no row in, is removed.
 /// A file that does not read back as the event its name describes is
-/// skipped, logged and removed, so it is logged once.
+/// skipped, logged and removed, so it is logged once. An entry that cannot
+/// be read at all is skipped and logged, and the rest still loads.
 pub(in crate::server) async fn load_event_log(
     treekem_dir: &Path,
     groups: &HashMap<String, x0x::groups::GroupInfo>,
@@ -492,7 +597,13 @@ pub(in crate::server) async fn load_event_log(
     for path in &report.skipped {
         tracing::warn!(
             path = %path.display(),
-            "catch-up log: skipped and removed a file that does not read back as its event"
+            "catch-up log: skipped and removed a file that does not read back"
+        );
+    }
+    for (path, error) in &report.unreadable {
+        tracing::warn!(
+            path = %path.display(),
+            "catch-up log: skipped an entry that cannot be read: {error}"
         );
     }
     if report.dropped_rooms > 0 {
@@ -508,10 +619,12 @@ pub(in crate::server) async fn load_event_log(
     // Append order is not kept on disk: the files' times stand in for it.
     let mut order: Vec<(SystemTime, String, String)> = Vec::new();
     let mut duplicates: Vec<(String, String)> = Vec::new();
+    let mut lost: Vec<(String, u64, Vec<PathBuf>)> = Vec::new();
     for room in report.rooms {
         let stored = log.stored.entry(room.key.clone()).or_default();
         stored.evicted_through = room.evicted_through;
         let events = log.rooms.entry(room.key.clone()).or_default();
+        let mut lowest: Option<u64> = None;
         for loaded in room.events {
             let Some(frontier) = commit_bearing_event_frontier(&loaded.event) else {
                 continue;
@@ -522,6 +635,8 @@ pub(in crate::server) async fn load_event_log(
                 continue;
             }
             let revision = frontier.revision;
+            lowest = Some(lowest.map_or(revision, |held| held.min(revision)));
+            stored.bytes = stored.bytes.saturating_add(loaded.bytes);
             log.total_bytes = log.total_bytes.saturating_add(loaded.bytes);
             order.push((loaded.modified, room.key.clone(), loaded.name.clone()));
             stored.files.insert(
@@ -535,6 +650,22 @@ pub(in crate::server) async fn load_event_log(
             );
             events.push_back(loaded.event);
         }
+        // Memory-only events did not survive the restart. And if the record
+        // of what was lost does not read back, fail safe: count every
+        // revision below the oldest one still held as lost.
+        let from_markers = room.lost.iter().map(|(_, revision)| *revision).max();
+        let from_corrupt = if room.marker_corrupt {
+            lowest.map(|revision| revision.saturating_sub(1))
+        } else {
+            None
+        };
+        let through = room.evicted_through.max(from_markers).max(from_corrupt);
+        let markers: Vec<PathBuf> = room.lost.into_iter().map(|(path, _)| path).collect();
+        if let Some(through) = through {
+            if Some(through) != room.evicted_through || !markers.is_empty() {
+                lost.push((room.key.clone(), through, markers));
+            }
+        }
     }
     order.sort();
     for (seq, (_, room_key, name)) in (0u64..).zip(order) {
@@ -546,6 +677,16 @@ pub(in crate::server) async fn load_event_log(
             stored.seq = seq;
         }
         log.next_seq = seq.saturating_add(1);
+    }
+    for (room_key, through, markers) in lost {
+        log.record_lost(&room_key, through).await;
+        let _ = run_blocking(move || {
+            for marker in markers {
+                remove_if_present(&marker)?;
+            }
+            Ok(())
+        })
+        .await;
     }
     for (room_key, name) in duplicates {
         if let Some(dir) = log.room_dir(&room_key) {
@@ -564,82 +705,127 @@ fn load_sync(root: &Path, live: &HashMap<String, String>) -> io::Result<LoadRepo
     create_private_dir(root)?;
     let mut report = LoadReport::default();
     for entry in std::fs::read_dir(root)? {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                report.unreadable.push((root.to_path_buf(), error));
+                continue;
+            }
+        };
         let Some(dir_name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        if !entry.file_type()?.is_dir() || !is_room_dir_name(&dir_name) {
+        let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+        if !is_dir || !is_room_dir_name(&dir_name) {
             continue;
         }
         let Some(room_key) = live.get(&dir_name) else {
-            remove_dir_if_present(&entry.path())?;
-            report.dropped_rooms += 1;
+            match remove_dir_if_present(&entry.path()) {
+                Ok(()) => report.dropped_rooms += 1,
+                Err(error) => report.unreadable.push((entry.path(), error)),
+            }
             continue;
         };
-        let mut room = LoadedRoom {
-            key: room_key.clone(),
-            events: Vec::new(),
-            evicted_through: None,
-        };
-        for file in std::fs::read_dir(entry.path())? {
-            let file = file?;
-            let path = file.path();
-            let Some(name) = file.file_name().to_str().map(str::to_string) else {
-                continue;
-            };
-            if !file.file_type()?.is_file() {
-                continue;
-            }
-            if name.starts_with('.') && name.ends_with(".tmp") {
-                // A write that never reached its rename.
-                remove_if_present(&path)?;
-                continue;
-            }
-            if name == EVICTED_THROUGH_FILE {
-                match std::fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|text| text.trim().parse::<u64>().ok())
-                {
-                    Some(through) => room.evicted_through = Some(through),
-                    None => {
-                        remove_if_present(&path)?;
-                        report.skipped.push(path);
-                    }
-                }
-                continue;
-            }
-            if !name.ends_with(".json") {
-                continue;
-            }
-            let bytes = std::fs::read(&path)?;
-            let event = serde_json::from_slice::<NamedGroupMetadataEvent>(&bytes)
-                .ok()
-                .filter(|event| {
-                    commit_bearing_event_frontier(event).is_some_and(|frontier| {
-                        frontier.group_id == room_key.as_str()
-                            && event_file_name(&frontier, &bytes) == name
-                    })
-                });
-            let Some(event) = event else {
-                remove_if_present(&path)?;
-                report.skipped.push(path);
-                continue;
-            };
-            let modified = file
-                .metadata()
-                .and_then(|meta| meta.modified())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            room.events.push(LoadedEvent {
-                name,
-                event,
-                bytes: bytes.len() as u64,
-                modified,
-            });
+        match load_room(&entry.path(), room_key, &mut report) {
+            Ok(room) => report.rooms.push(room),
+            Err(error) => report.unreadable.push((entry.path(), error)),
         }
-        room.events.sort_by(|a, b| a.name.cmp(&b.name));
-        report.rooms.push(room);
     }
     Ok(report)
+}
+
+fn load_room(dir: &Path, room_key: &str, report: &mut LoadReport) -> io::Result<LoadedRoom> {
+    let mut room = LoadedRoom {
+        key: room_key.to_string(),
+        events: Vec::new(),
+        evicted_through: None,
+        marker_corrupt: false,
+        lost: Vec::new(),
+    };
+    for file in std::fs::read_dir(dir)? {
+        let file = match file {
+            Ok(file) => file,
+            Err(error) => {
+                report.unreadable.push((dir.to_path_buf(), error));
+                continue;
+            }
+        };
+        let path = file.path();
+        let Some(name) = file.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !file.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        if let Err(error) = load_entry(&path, &name, room_key, &mut room, report) {
+            report.unreadable.push((path, error));
+        }
+    }
+    room.events.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(room)
+}
+
+fn load_entry(
+    path: &Path,
+    name: &str,
+    room_key: &str,
+    room: &mut LoadedRoom,
+    report: &mut LoadReport,
+) -> io::Result<()> {
+    if name.starts_with('.') && name.ends_with(".tmp") {
+        // A write that never reached its rename.
+        return remove_if_present(path);
+    }
+    if name == EVICTED_THROUGH_FILE {
+        match std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| text.trim().parse::<u64>().ok())
+        {
+            Some(through) => room.evicted_through = Some(through),
+            None => {
+                room.marker_corrupt = true;
+                remove_if_present(path)?;
+                report.skipped.push(path.to_path_buf());
+            }
+        }
+        return Ok(());
+    }
+    if name.ends_with(MEMORY_ONLY_SUFFIX) {
+        match revision_of_name(name) {
+            Some(revision) => room.lost.push((path.to_path_buf(), revision)),
+            None => {
+                remove_if_present(path)?;
+                report.skipped.push(path.to_path_buf());
+            }
+        }
+        return Ok(());
+    }
+    if !name.ends_with(".json") {
+        return Ok(());
+    }
+    let bytes = std::fs::read(path)?;
+    let event = serde_json::from_slice::<NamedGroupMetadataEvent>(&bytes)
+        .ok()
+        .filter(|event| {
+            commit_bearing_event_frontier(event).is_some_and(|frontier| {
+                frontier.group_id == room_key && event_file_name(&frontier, &bytes) == name
+            })
+        });
+    let Some(event) = event else {
+        remove_if_present(path)?;
+        report.skipped.push(path.to_path_buf());
+        return Ok(());
+    };
+    let modified = std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    room.events.push(LoadedEvent {
+        name: name.to_string(),
+        event,
+        bytes: bytes.len() as u64,
+        modified,
+    });
+    Ok(())
 }
 
 /// Run blocking file work off the runtime. Under the W3-H shim (#1245) it
@@ -670,9 +856,16 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
 }
 
 /// Write `bytes` to `dir/name`: a temp file at mode 0600, synced, renamed
-/// into place, and then the directory synced.
+/// into place, and then the directory synced. A directory created here is
+/// also synced into its parent. Directory syncs are a no-op off unix
+/// (`sync_dir_contents`).
 fn write_durable(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
-    create_private_dir(dir)?;
+    if !dir.is_dir() {
+        create_private_dir(dir)?;
+        if let Some(parent) = dir.parent() {
+            sync_dir_contents(parent)?;
+        }
+    }
     let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -689,7 +882,7 @@ fn write_durable(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(error);
     }
-    std::fs::File::open(dir)?.sync_all()
+    sync_dir_contents(dir)
 }
 
 fn remove_if_present(path: &Path) -> io::Result<()> {
@@ -711,6 +904,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
 
     const ADMIN: &str = "admin";
@@ -827,7 +1021,8 @@ mod tests {
             std::fs::read_to_string(root.join(room_dir_name(&room)).join(EVICTED_THROUGH_FILE));
         assert_eq!(marker.unwrap(), "2", "the dropped revision is on disk");
 
-        // The daemon-wide cap drops the oldest event across every room.
+        // The daemon-wide cap drops from the largest room; between equal rooms,
+        // the one whose oldest event is older.
         let other_room = "b".repeat(64);
         let mut log = on_disk(&dir.path().join("second"));
         let one = serde_json::to_vec(&at_revision(&room, 1)).unwrap().len() as u64;
@@ -844,7 +1039,7 @@ mod tests {
         assert_eq!(
             revisions(&log, &room),
             vec![2],
-            "the oldest event of all went"
+            "the oldest of the two equal rooms gives up its oldest event"
         );
         assert_eq!(revisions(&log, &other_room), vec![1, 2]);
         assert_eq!(room_files(&dir.path().join("second"), &room).len(), 1);
@@ -889,15 +1084,18 @@ mod tests {
         let room_dir = root.join(room_dir_name(&room));
         let files = room_files(&root, &room);
         assert_eq!(files.len(), 2);
-        for name in &files {
-            let mode = std::fs::metadata(room_dir.join(name))
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o600, "{name}");
+        #[cfg(unix)]
+        {
+            for name in &files {
+                let mode = std::fs::metadata(room_dir.join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o600, "{name}");
+            }
+            let dir_mode = std::fs::metadata(&room_dir).unwrap().permissions().mode();
+            assert_eq!(dir_mode & 0o777, 0o700);
         }
-        let dir_mode = std::fs::metadata(&room_dir).unwrap().permissions().mode();
-        assert_eq!(dir_mode & 0o777, 0o700);
         assert!(!files.iter().any(|name| name.contains('/')));
         assert_eq!(room_dir_name(&room).len(), 32);
 
@@ -946,7 +1144,12 @@ mod tests {
         );
         info.ban_member(&local_hex, Some(hex::encode(other().as_bytes())));
         groups.insert(banned.clone(), info);
-        let mut info = group(&inactive, other());
+        // Inactive: the local agent has no row in the room.
+        groups.insert(inactive.clone(), group(&inactive, other()));
+        // Mid re-key: the local agent's row is Removed until its add lands.
+        let rekeying = "6".repeat(64);
+        log.append(&at_revision(&rekeying, 1)).await;
+        let mut info = group(&rekeying, other());
         info.add_member(
             local_hex.clone(),
             x0x::groups::GroupRole::Member,
@@ -954,10 +1157,15 @@ mod tests {
             None,
         );
         info.remove_member(&local_hex, Some(hex::encode(other().as_bytes())));
-        groups.insert(inactive.clone(), info);
+        groups.insert(rekeying.clone(), info);
 
         let reloaded = load_event_log(dir.path(), &groups, &local_hex).await;
         assert_eq!(revisions(&reloaded, &live), vec![1]);
+        assert_eq!(
+            revisions(&reloaded, &rekeying),
+            vec![1],
+            "a device mid re-key keeps its log"
+        );
         for room in [&unknown, &withdrawn, &banned, &inactive] {
             assert!(reloaded.get(room).is_none(), "{room} is not loaded");
             assert!(
@@ -1015,5 +1223,127 @@ mod tests {
             commit: None,
         };
         assert!(commit_bearing_event_frontier(&unsigned).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_flooding_room_cannot_evict_another_rooms_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(EVENT_LOG_DIR);
+        let quiet = "f".repeat(64);
+        let busy = "0".repeat(64);
+        let one = serde_json::to_vec(&at_revision(&quiet, 1)).unwrap().len() as u64;
+        let mut log = on_disk(&root);
+        log.set_disk_cap(one * 8);
+        log.append(&at_revision(&quiet, 1)).await;
+        log.append(&at_revision(&quiet, 2)).await;
+        for revision in 1..=64 {
+            log.append(&at_revision(&busy, revision)).await;
+        }
+        assert!(log.disk_bytes() <= one * 8);
+        assert_eq!(
+            revisions(&log, &quiet),
+            vec![1, 2],
+            "the quiet room keeps its history"
+        );
+        assert_eq!(log.evicted_through(std::slice::from_ref(&quiet)), None);
+        assert_eq!(room_files(&root, &quiet).len(), 2);
+        assert!(log.evicted_through(std::slice::from_ref(&busy)).is_some());
+    }
+
+    #[tokio::test]
+    async fn an_event_over_the_limit_stays_in_memory_and_a_restart_records_its_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(EVENT_LOG_DIR);
+        let room = "9".repeat(64);
+        let big_name = "x".repeat(usize::try_from(EVENT_DISK_LIMIT_BYTES).unwrap() + 1);
+        let big = rename(&room, 2, &big_name, "state-2");
+        let mut log = on_disk(&root);
+        log.append(&at_revision(&room, 1)).await;
+        log.append(&big).await;
+        log.append(&at_revision(&room, 3)).await;
+        assert_eq!(
+            revisions(&log, &room),
+            vec![1, 2, 3],
+            "it serves until a restart"
+        );
+        assert_eq!(room_files(&root, &room).len(), 2, "but it is not written");
+        assert!(log.disk_bytes() < EVENT_DISK_LIMIT_BYTES);
+        assert_eq!(log.evicted_through(std::slice::from_ref(&room)), None);
+
+        let mut groups = HashMap::new();
+        groups.insert(room.clone(), group(&room, local()));
+        let reloaded = load_event_log(dir.path(), &groups, &hex::encode(local().as_bytes())).await;
+        assert_eq!(revisions(&reloaded, &room), vec![1, 3]);
+        assert_eq!(
+            reloaded.evicted_through(std::slice::from_ref(&room)),
+            Some(2),
+            "after a restart, a requester below it is told the log has a hole"
+        );
+        let again = load_event_log(dir.path(), &groups, &hex::encode(local().as_bytes())).await;
+        assert_eq!(again.evicted_through(std::slice::from_ref(&room)), Some(2));
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_record_of_losses_fails_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(EVENT_LOG_DIR);
+        let room = "8".repeat(64);
+        let mut log = on_disk(&root);
+        for revision in 5..=7 {
+            log.append(&at_revision(&room, revision)).await;
+        }
+        let marker = root.join(room_dir_name(&room)).join(EVICTED_THROUGH_FILE);
+        std::fs::write(&marker, b"not a number").unwrap();
+        let mut groups = HashMap::new();
+        groups.insert(room.clone(), group(&room, local()));
+        let reloaded = load_event_log(dir.path(), &groups, &hex::encode(local().as_bytes())).await;
+        assert_eq!(revisions(&reloaded, &room), vec![5, 6, 7]);
+        assert_eq!(
+            reloaded.evicted_through(std::slice::from_ref(&room)),
+            Some(4),
+            "everything below the oldest held revision counts as lost"
+        );
+    }
+
+    #[test]
+    fn appends_need_the_room_present_unwithdrawn_and_not_banned() {
+        let local_hex = hex::encode(local().as_bytes());
+        let other_hex = hex::encode(other().as_bytes());
+        let id = "7".repeat(64);
+        let with = |info: x0x::groups::GroupInfo| {
+            let mut groups = HashMap::new();
+            groups.insert(id.clone(), info);
+            groups
+        };
+        assert!(event_log_room_accepts(
+            &with(group(&id, local())),
+            &id,
+            &local_hex
+        ));
+        let mut removed = group(&id, other());
+        removed.add_member(
+            local_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            None,
+            None,
+        );
+        removed.remove_member(&local_hex, Some(other_hex.clone()));
+        assert!(
+            event_log_room_accepts(&with(removed), &id, &local_hex),
+            "a returning device mid re-key still logs its own removal"
+        );
+        let mut banned = group(&id, other());
+        banned.add_member(
+            local_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            None,
+            None,
+        );
+        banned.ban_member(&local_hex, Some(other_hex));
+        assert!(!event_log_room_accepts(&with(banned), &id, &local_hex));
+        let mut withdrawn = group(&id, local());
+        withdrawn.withdrawn = true;
+        assert!(!event_log_room_accepts(&with(withdrawn), &id, &local_hex));
+        assert!(!event_log_room_accepts(&HashMap::new(), &id, &local_hex));
     }
 }

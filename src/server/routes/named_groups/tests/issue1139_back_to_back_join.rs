@@ -3766,3 +3766,184 @@ async fn the_rekey_link_checks_the_bytes_its_removal_names() -> Result<()> {
     );
     Ok(())
 }
+
+/// Survivor re-key A4: the page `server`'s catch-up responder serves
+/// `requester` from `(from_revision, from_epoch)`.
+async fn a4_served_page(
+    server: &Arc<AppState>,
+    requester: &Arc<AppState>,
+    group_key: &str,
+    from_revision: u64,
+    from_epoch: u64,
+) -> TreeKemCatchupResponse {
+    let requester_id = requester.agent.agent_id();
+    let request = TreeKemCatchupRequest {
+        message_type: "treekem_catchup_request".to_string(),
+        group_id: group_key.to_string(),
+        requester_agent_id: hex::encode(requester_id.as_bytes()),
+        from_revision,
+        from_treekem_epoch: from_epoch,
+        current_state_hash: String::new(),
+        missing_prev_state_hash: None,
+        target_member_id: None,
+        limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+        signed_by: None,
+    };
+    let before = server
+        .named_group_test_recorders
+        .catchup_responses
+        .lock()
+        .expect("catch-up recorder")
+        .len();
+    handle_treekem_catchup_request(server, &requester_id, true, request).await;
+    let recorded = server
+        .named_group_test_recorders
+        .catchup_responses
+        .lock()
+        .expect("catch-up recorder");
+    let bytes = recorded
+        .get(before..)
+        .and_then(|sent| sent.last())
+        .expect("a page");
+    serde_json::from_slice(bytes).expect("a catch-up page")
+}
+
+/// The returning member J2 serves the re-key removal at r+1, then its own
+/// add at r+2: no hole, so a member that missed both converges from J2.
+async fn a4_j2_serves_its_rekey_link_and_add(s: &BackToBack) -> Result<()> {
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    let removal = wa_published_for(s, &j2_hex, "removed").context("re-key removal")?;
+    let add = wa_published_for(s, &j2_hex, "added").context("re-key add")?;
+    let link = named_group_metadata_event_commit(&removal).context("signed")?;
+    let seat = named_group_metadata_event_commit(&add).context("signed")?;
+    anyhow::ensure!(seat.revision == link.revision + 1, "precondition: r+1, r+2");
+    let NamedGroupMetadataEvent::MemberRemoved {
+        treekem_epoch: Some(link_epoch),
+        ..
+    } = &removal
+    else {
+        anyhow::bail!("the re-key removal carries its epoch");
+    };
+
+    let first = a4_served_page(
+        &s.j2,
+        &s.j1,
+        &s.group_key,
+        link.revision - 1,
+        link_epoch.saturating_sub(1),
+    )
+    .await;
+    assert!(first.log_evicted_through.is_none());
+    assert_eq!(first.events.len(), 1, "one event a page");
+    assert_eq!(
+        named_group_metadata_event_commit(&first.events[0]).map(|c| c.state_hash.clone()),
+        Some(link.state_hash.clone()),
+        "J2 serves its own re-key removal first"
+    );
+    let second = a4_served_page(&s.j2, &s.j1, &s.group_key, link.revision, *link_epoch).await;
+    assert_eq!(
+        second
+            .events
+            .first()
+            .and_then(named_group_metadata_event_commit)
+            .map(|c| c.state_hash.clone()),
+        Some(seat.state_hash.clone()),
+        "then its add"
+    );
+    Ok(())
+}
+
+/// Survivor re-key A4 review I-1: the link that removes this device just
+/// before its add re-seats it (the join-result path) is logged, though the
+/// device is not an active member at that moment.
+#[tokio::test]
+async fn a4_the_returning_member_serves_the_link_it_took_from_its_join_result() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    wa_clear_published(&s);
+    let r = wa_stuck_keyless(&s).await?;
+    anyhow::ensure!(r.treekem, "precondition: J2 re-keyed with keys: {r}");
+    a4_j2_serves_its_rekey_link_and_add(&s).await
+}
+
+/// The same, when the removal reaches the device first, on its own (the
+/// apply-arm path), and the join result follows.
+#[tokio::test]
+async fn a4_the_returning_member_serves_the_link_it_took_from_gossip() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    super::super::finalize_join_attempt(
+        &s.j2,
+        &s.group_key,
+        &s.stable_group_id,
+        &j2_hex,
+        &s.j2_attempt,
+        super::super::JoinAttemptOutcome::TimedOut,
+        super::super::JoinFinalizeGuard::Unlocked,
+    )
+    .await;
+    wa_clear_published(&s);
+    let r = wa_fresh_invite_round_trip_with(&s, &s.j2, false).await?;
+    let (attempt_id, terminal, carried) = r.held.clone().context("held result")?;
+    let removal = carried.first().cloned().context("the re-key removal")?;
+    let gossip =
+        apply_named_group_metadata_event(&s.j2, removal, s.authority_id, false, None).await;
+    anyhow::ensure!(gossip.accepted, "precondition: the link applies");
+    let from = wa_head(&s.j2, &s).await.0;
+    let terminal_revision = named_group_metadata_event_commit(&terminal)
+        .map(|c| c.revision)
+        .context("terminal commit")?;
+    let info = s
+        ._authority
+        .named_groups
+        .read()
+        .await
+        .get(&s.group_key)
+        .cloned()
+        .context("authority group")?;
+    super::super::handle_join_result_message_bound(
+        &s.j2,
+        &s.authority_id,
+        true,
+        JoinResultMessage::Result {
+            event: Box::new(terminal),
+            chain: intervening_chain_from(&info, from, terminal_revision),
+            head_attestation: None,
+            roster_certificates_b64: Vec::new(),
+            intervening_events: carried,
+            signed_by: None,
+        },
+        Some(attempt_id.as_str()),
+    )
+    .await;
+    anyhow::ensure!(wa_state(&s.j2, &s.group_key).await == "active");
+    a4_j2_serves_its_rekey_link_and_add(&s).await
+}
+
+/// A joiner logs the events its join result carries, as well as its own
+/// add, so it can serve them on catch-up.
+#[tokio::test]
+async fn a4_a_joiner_logs_the_events_its_join_result_carries() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    deliver_j2_result(&s).await;
+    anyhow::ensure!(join_state(&s.j2, &s.group_key).await == "active");
+    let logged: Vec<String> = {
+        let logs = s.j2.treekem_event_log.read().await;
+        logs.values()
+            .flatten()
+            .filter_map(named_group_metadata_event_commit)
+            .map(|c| c.state_hash.clone())
+            .collect()
+    };
+    assert!(
+        logged.contains(&s.add_j1.commit.state_hash),
+        "the carried r+1 add is logged"
+    );
+    assert!(
+        logged.contains(&s.add_j2.commit.state_hash),
+        "and J2's own add"
+    );
+    Ok(())
+}
