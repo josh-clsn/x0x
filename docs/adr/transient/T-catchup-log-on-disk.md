@@ -79,9 +79,9 @@ For the D5 offer, present it as a stopgap for L1 until S5, not as the design. An
 - **a versioned on-disk format** (ADR 0085, `0088:125`). Today a file a newer daemon wrote with an unknown event variant does not parse on an older one, which removes it, so a downgrade empties the log. A `event-log/v1/` directory would fix both;
 - **an answer to the overlap with `commit_log`**, the signed commits members already persist in `named_groups.json`, which S5 plans to serve from (`0111:48`). This log repeats the events around those commits.
 
-### Not done: pages that link to the requester's head (for A5)
+### Pages that link to the requester's head: done in A5
 
-A served page could also be checked against the requester's head: serve it only when its first event's commit links to `current_state_hash` at `from_revision + 1`. That would catch a hole from any cause, not only the ones recorded in `evicted-through`. It is left for A5 for two reasons. The page filter also serves events at or below `from_revision` whose TreeKEM epoch is ahead of the requester's, which sort first and do not link. And the receiver's pending queue (#492) holds a gapped event until its predecessor arrives from another member, so a gapped page is not useless today. A5 reworks the response path for unverified transports, and is the place to decide both.
+A5 (`T-signed-catchup-pages`) settles this. A page starts at `from_revision + 1` and stops at the first hole; events at or below the requester's revision are never served, whatever their epoch; and a log that cannot serve the commit after the requester's head serves nothing and sets `log_evicted_through`. The requester asks other members when a page leaves it behind a hole, and still hands a gapped event to the #492 queue.
 
 ## Consequences
 
@@ -91,7 +91,7 @@ A served page could also be checked against the requester's head: serve it only 
 - Memory use is bounded: up to 128 events of at most 512 KiB per room. Before this change the in-memory log had no per-event bound.
 - File I/O runs under the log's write lock: one file sync and one directory sync per logged commit, two more per eviction. That briefly holds catch-up serves and, where an apply arm logs, the membership lock.
 - A stripped copy that lands first is the copy that is logged and served after restarts (the dedup key does not cover the payload). Since A1 and I-1 that matters only on the shared-secret plane, where a non-author add arrives without its display name, KeyPackage hash or owner mandate.
-- The new response field is additive. Nothing on the requester acts on it yet beyond a log line. A later task can use it to ask another member.
+- The new response field is additive. Since A5 the requester asks other members when it is set past its head (`T-signed-catchup-pages`).
 
 ## Validation
 

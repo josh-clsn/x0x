@@ -1405,6 +1405,9 @@ pub(super) struct NamedGroupTestRecorders {
     /// Pages `handle_treekem_catchup_request` built, including a cold log,
     /// and the group ids of page requests the force-ok seam counted.
     pub(super) catchup_responses: StdMutex<Vec<Vec<u8>>>,
+    /// Survivor re-key A5: every page request this daemon sent, as
+    /// `(peer hex, exact payload)`, recorded before the send.
+    pub(super) catchup_page_requests: StdMutex<Vec<(String, Vec<u8>)>>,
     /// Survivor re-key A1: the next `seal_commit_owner_certified` fails, so
     /// a test can check the tree is rolled back after a mutate-then-seal.
     pub(super) seal_force_err: std::sync::atomic::AtomicBool,

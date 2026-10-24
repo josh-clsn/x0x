@@ -59,6 +59,7 @@ async fn targeted_catchup_serves_roster_fallback_for_genesis_member() -> Result<
         target_member_id: Some(creator_hex.clone()),
         limit: 8,
         signed_by: None,
+        head_challenge: None,
     };
     let response = member_keyed_treekem_catchup_response(&state, &[group_id], &request)
         .await
@@ -104,6 +105,7 @@ async fn targeted_catchup_serves_nothing_without_roster_package() -> Result<()> 
         target_member_id: Some(creator_hex),
         limit: 8,
         signed_by: None,
+        head_challenge: None,
     };
     let response = member_keyed_treekem_catchup_response(&state, &[group_id], &request)
         .await
@@ -228,6 +230,7 @@ async fn targeted_response_carries_valid_signer() -> Result<()> {
         target_member_id: Some(creator_hex.clone()),
         limit: 8,
         signed_by: None,
+        head_challenge: None,
     };
     let response =
         member_keyed_treekem_catchup_response(&state, std::slice::from_ref(&group_id), &request)
@@ -283,6 +286,7 @@ async fn request_gate_admits_signed_and_drops_unsigned_when_unverified() -> Resu
         target_member_id: Some(target.clone()),
         limit: 8,
         signed_by: None,
+        head_challenge: None,
     };
     handle_treekem_catchup_request(&state, &creator, false, request.clone()).await;
     let throttle_key = format!("{group_id}:mk-serve:{creator_hex}:{target}");
@@ -313,9 +317,9 @@ async fn request_gate_admits_signed_and_drops_unsigned_when_unverified() -> Resu
 
 /// Response gate: an unverified-transport targeted response with a valid
 /// signer is admitted into the hash-anchored KeyPackage apply — the full
-/// phone-side heal in miniature — and, per the #377 posture, leaves no
-/// trace of membership-event processing (`targeted_only` returns before
-/// the events loop; the pending-event queue stays empty).
+/// phone-side heal in miniature — and its events apply only as their
+/// verified commit signer (survivor re-key A5): this unsigned rename has
+/// none, so nothing applies and the pending-event queue stays empty.
 #[tokio::test]
 async fn response_gate_applies_signed_kp_without_touching_events() -> Result<()> {
     let (state, _dir) = secure_endpoint_test_state().await?;

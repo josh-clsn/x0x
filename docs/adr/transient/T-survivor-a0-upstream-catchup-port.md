@@ -41,7 +41,7 @@ Port the subset below, byte-close to upstream, so the next crossing can drop it.
 | request handler | `saved_head` from upstream's authority tuple | a fourth element on the fork's `group_authority` tuple | The fork's handler has its own shape (#363, #384). |
 | throttle | upstream changes two insert sites | the same two, plus the fork's `mk-serve`, `serve:` and `jr-serve` inserts (3 lines) | The map's value type changed; the fork has three more writers. |
 | `responder_state_hash` doc comment | names the startup self-leave seal | says the field is an unsigned hint | That seal is not ported. |
-| `request_treekem_catchup_page` | returns `bool`; the test seam parks on `detached_send_test_seam` | returns `()`; the seam returns early | `bool` and the retry it feeds are #1337's fence; the park seam is not in the fork. |
+| `request_treekem_catchup_page` | returns `bool`; the test seam parks on `detached_send_test_seam` | returns `()`; the seam returns early. Since A5 it builds and signs its request through `signed_catchup::page_request` and sends it through `signed_catchup::send_page_request` (`T-signed-catchup-pages`) | `bool` and the retry it feeds are #1337's fence; the park seam is not in the fork. |
 | test recorders | `catchup_page_force_ok`, `catchup_responses` (#1406), `metadata_publish_force_ok` (#1337) | the first two only (+4 lines in the handler, +13 in the page seam) | The fork's metadata publish never fails a route, so the third is not needed. |
 
 ### Left out
