@@ -1230,6 +1230,10 @@ pub(super) struct AppState {
     /// Survivor re-key A6: this daemon's challenge counter, kept on disk
     /// under [`Self::treekem_dir`] so it never goes back.
     pub(super) treekem_head_counter: Mutex<crate::server::routes::named_groups::HeadCounter>,
+    /// Survivor re-key A9: what this daemon owes each survivor of a re-key it
+    /// sealed, kept on disk under [`Self::treekem_dir`] until each survivor
+    /// proves it holds the new epoch. Lock order: this, then `named_groups`.
+    pub(super) rekey_obligations: Mutex<crate::server::routes::named_groups::RekeyObligations>,
     /// Per-group serialization for authoritative membership mutations. The
     /// owner-side `MemberJoined`→`MemberAdded` add (and every other membership
     /// apply) is a read-modify-write that loads `info`, mutates a clone, mutates
@@ -1439,6 +1443,13 @@ pub(super) struct NamedGroupTestRecorders {
     /// Survivor re-key A1: the next `seal_commit_owner_certified` fails, so
     /// a test can check the tree is rolled back after a mutate-then-seal.
     pub(super) seal_force_err: std::sync::atomic::AtomicBool,
+    /// Survivor re-key A9: when set, the obligation worker hands each send
+    /// here instead of to the network.
+    pub(super) rekey_obligation_deliver:
+        StdMutex<Option<crate::server::routes::named_groups::RekeyObligationTestDeliver>>,
+    /// Survivor re-key A9: when set, the survivors the obligation worker
+    /// counts as linked, in place of `is_agent_connected`.
+    pub(super) rekey_obligation_connected: StdMutex<Option<std::collections::HashSet<String>>>,
 }
 
 #[cfg(test)]

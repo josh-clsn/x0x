@@ -790,7 +790,7 @@ fn load_entry(
 
 /// Run blocking file work off the runtime. Under the W3-H shim (#1245) it
 /// runs inline, as `storage`'s file layer does, so task order stays fixed.
-async fn run_blocking<T, F>(work: F) -> io::Result<T>
+pub(super) async fn run_blocking<T, F>(work: F) -> io::Result<T>
 where
     T: Send + 'static,
     F: FnOnce() -> io::Result<T> + Send + 'static,
@@ -819,7 +819,7 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
 /// into place, and then the directory synced. A directory created here is
 /// also synced into its parent. Directory syncs are a no-op off unix
 /// (`sync_dir_contents`).
-fn write_durable(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+pub(super) fn write_durable(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     if !dir.is_dir() {
         create_private_dir(dir)?;
         if let Some(parent) = dir.parent() {

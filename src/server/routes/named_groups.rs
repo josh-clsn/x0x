@@ -27,6 +27,12 @@ mod head_rounds;
 pub(in crate::server) use head_proof::HeadAnswers;
 pub(in crate::server) use head_rounds::{load_head_counter, HeadCounter, HeadRounds};
 mod join_result_pins;
+mod rekey_obligations;
+#[cfg(test)]
+pub(in crate::server) use rekey_obligations::TestDeliver as RekeyObligationTestDeliver;
+pub(in crate::server) use rekey_obligations::{
+    load_rekey_obligations, spawn_worker as spawn_rekey_obligation_worker, RekeyObligations,
+};
 mod seat_cert_fetch;
 mod signed_catchup;
 mod signer_delivery;
@@ -3587,6 +3593,28 @@ fn named_group_event_delivery_future(
     event: &NamedGroupMetadataEvent,
     label: &'static str,
 ) -> Option<impl std::future::Future<Output = ()> + Send + 'static> {
+    let delivery = named_group_event_delivery_result(state, recipient_hex, event, label)?;
+    let requester = recipient_hex.to_string();
+    Some(async move {
+        if let Err(e) = delivery.await {
+            tracing::warn!(
+                requester = %LogHexId::agent(&requester),
+                "failed to {label}-direct-deliver named-group event: {e}"
+            );
+        }
+    })
+}
+
+/// [`named_group_event_delivery_future`], resolving to the send's outcome
+/// instead of logging it (survivor re-key A9: the re-key obligation worker
+/// keeps an obligation whose send failed). `Ok` is the recipient's DM
+/// acknowledgement, not proof that it applied the event.
+pub(in crate::server) fn named_group_event_delivery_result(
+    state: &AppState,
+    recipient_hex: &str,
+    event: &NamedGroupMetadataEvent,
+    label: &'static str,
+) -> Option<impl std::future::Future<Output = Result<(), String>> + Send + 'static> {
     let recipient = match parse_agent_id_hex(recipient_hex) {
         Ok(id) => id,
         Err(e) => {
@@ -3626,9 +3654,8 @@ fn named_group_event_delivery_future(
     let agent = Arc::clone(&state.agent);
     let control_blobs = state.control_blobs.clone();
     let group_id = named_group_metadata_event_group_id(event).to_string();
-    let requester = recipient_hex.to_string();
     Some(async move {
-        let result = if payload.len() > x0x::dm::MAX_PAYLOAD_BYTES {
+        if payload.len() > x0x::dm::MAX_PAYLOAD_BYTES {
             control_blob::send_reference(
                 &control_blobs,
                 &agent,
@@ -3657,12 +3684,6 @@ fn named_group_event_delivery_future(
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string())
-        };
-        if let Err(e) = result {
-            tracing::warn!(
-                requester = %LogHexId::agent(&requester),
-                "failed to {label}-direct-deliver named-group event: {e}"
-            );
         }
     })
 }
@@ -23727,6 +23748,14 @@ async fn wipe_local_group_crypto_material(
         for alias in &aliases {
             event_log.wipe_room(alias).await;
         }
+    }
+    // Survivor re-key A9: the room's obligations go too, in memory and on
+    // disk, under the obligations lock. An `owe` re-checks the roster under
+    // that lock, and the roster already dropped or tombstoned the room, so
+    // none can come back.
+    {
+        let aliases: Vec<String> = aliases.iter().cloned().collect();
+        rekey_obligations::wipe_rooms(state, &aliases).await;
     }
     {
         // Survivor re-key A5 (review m-2): every key names its room first
@@ -44846,6 +44875,7 @@ pub(in crate::server) mod tests {
     mod pr291_restart_marker_matrix;
     mod r17_cert_hydrate;
     mod r19_cert_carry;
+    mod rekey_obligations;
     mod rekey_plane_gate;
     mod requester_offer;
     mod sec377_dm_verified_gate;
@@ -45499,6 +45529,13 @@ pub(in crate::server) mod tests {
         )
         .await;
         let treekem_head_counter = load_head_counter(&treekem_dir).await;
+        // Survivor re-key A9: mirror daemon startup.
+        let rekey_obligations = load_rekey_obligations(
+            &treekem_dir,
+            &named_groups,
+            &hex::encode(agent.agent_id().as_bytes()),
+        )
+        .await;
         // ADR-0041 Tier-1: mirror daemon startup — owned agents get the
         // SyncV1 acceptor + store under `<data_dir>/sync`.
         let owner_sync = if agent.identity().user_keypair().is_some() {
@@ -45655,6 +45692,7 @@ pub(in crate::server) mod tests {
             treekem_head_answers: std::sync::Mutex::default(),
             treekem_head_rounds: std::sync::Mutex::default(),
             treekem_head_counter: Mutex::new(treekem_head_counter),
+            rekey_obligations: Mutex::new(rekey_obligations),
             group_membership_locks: RwLock::new(HashMap::new()),
             treekem_groups: RwLock::new(HashMap::new()),
             treekem_dir,
