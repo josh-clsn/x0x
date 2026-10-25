@@ -5524,7 +5524,9 @@ impl Agent {
     }
 
     /// #674 C2/C3 relay fan-out snapshot (`topics` / `forward_msgs` /
-    /// `lazy_msgs` / `withheld_eager_peers` + per-topic lazy counts).
+    /// `lazy_msgs` / `withheld_eager_peers` + per-topic lazy counts), plus
+    /// the caps consume-only counters (`consume_only`, `consume_only_msgs`,
+    /// `consume_only_msgs_by_topic`).
     ///
     /// Returns `None` when the agent has no gossip runtime. Exposed through
     /// `GET /diagnostics/gossip` as `relay_fanout`, beside
@@ -35394,6 +35396,9 @@ mod peer_connected_handler_integration_tests {
 
 #[cfg(test)]
 mod asymmetric_capability_convergence_tests;
+
+#[cfg(test)]
+mod caps_consume_only_tests;
 
 #[cfg(test)]
 mod legacy_bus_interop_tests;

@@ -381,18 +381,14 @@ impl CapabilityAdvertService {
         periodic: bool,
         #[cfg(test)] observation: Option<Arc<ConvergenceServiceObserver>>,
     ) -> NetworkResult<Self> {
-        let mut subscription = pubsub.subscribe(DM_CAPABILITY_TOPIC.to_string()).await;
+        let [steady_topic, request_topic, response_topic, digest_topic] =
+            crate::dm_capability::CAPS_TOPIC_NAMES;
+        let mut subscription = pubsub.subscribe(steady_topic.to_string()).await;
         // #448: new peers additionally consume the signed digest
         // extension; v0.40.4 peers never subscribe to this topic.
-        let mut digest_subscription = pubsub
-            .subscribe(crate::dm_capability::DM_CAPABILITY_DIGEST_TOPIC.to_string())
-            .await;
-        let mut targeted_response_subscription = pubsub
-            .subscribe(DM_CAPABILITY_TARGETED_RESPONSE_TOPIC.to_string())
-            .await;
-        let mut targeted_request_subscription = pubsub
-            .subscribe(DM_CAPABILITY_TARGETED_REQUEST_TOPIC.to_string())
-            .await;
+        let mut digest_subscription = pubsub.subscribe(digest_topic.to_string()).await;
+        let mut targeted_response_subscription = pubsub.subscribe(response_topic.to_string()).await;
+        let mut targeted_request_subscription = pubsub.subscribe(request_topic.to_string()).await;
         let store_sub = Arc::clone(&store);
         let targeted_store_sub = Arc::clone(&store);
         let self_agent_for_sub = self_agent_id;

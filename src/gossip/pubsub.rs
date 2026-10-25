@@ -308,12 +308,7 @@ static KNOWN_INBOUND_CLASSES: LazyLock<HashMap<TopicId, usize>> = LazyLock::new(
         map.insert(TopicId::from_entity(name.as_bytes()), class);
     };
     add(crate::announce_blob::ANNOUNCE_BLOB_TOPIC, 0);
-    for name in [
-        crate::dm_capability::DM_CAPABILITY_TOPIC,
-        crate::dm_capability::DM_CAPABILITY_TARGETED_REQUEST_TOPIC,
-        crate::dm_capability::DM_CAPABILITY_TARGETED_RESPONSE_TOPIC,
-        crate::dm_capability::DM_CAPABILITY_DIGEST_TOPIC,
-    ] {
+    for name in crate::dm_capability::CAPS_TOPIC_NAMES {
         add(name, 1);
     }
     add(crate::dm_inbox::DM_BUS_TOPIC, 2);
@@ -1437,6 +1432,19 @@ impl PubSubManager {
         // config pass as the Leaf egress thresholds.
         self.relay_fanout
             .set_budget(config.relay_fanout_budget_msgs_per_sec);
+        // Caps consume-only: the daemon resolves the key (unset follows
+        // `leaf_mode`) before this point. A Full node always forwards.
+        let consume_only_topics: Vec<TopicId> = if !self.participation.forwards_passthrough()
+            && config.caps_consume_only == Some(true)
+        {
+            crate::dm_capability::CAPS_TOPIC_NAMES
+                .into_iter()
+                .map(|name| TopicId::from_entity(name.as_bytes()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.relay_fanout.set_consume_only(consume_only_topics);
         let accepted = leaf_egress_config(&self.egress_config);
         if !self.plumtree.configure_leaf_egress(accepted) {
             return Err(NetworkError::NodeCreation(
@@ -1575,7 +1583,10 @@ impl PubSubManager {
     /// `lazy_msgs` and `withheld_eager_peers` mirror sg's meters
     /// (`stage_stats().validator.lazy_forward` global + per topic,
     /// `lazy_ihave_withheld_peers`); `forward_msgs` is x0x-side because sg
-    /// meters only non-default validator verdicts. Byte accounting notes:
+    /// meters only non-default validator verdicts. `consume_only`,
+    /// `consume_only_msgs` and `consume_only_msgs_by_topic` report the caps
+    /// consume-only arm (`[gossip] caps_consume_only`): messages on the
+    /// `x0x/caps/*` topics this Leaf delivered and did not forward. Byte accounting notes:
     /// the IWANT serve path never records publish origin, so
     /// `participation.relay_bytes` systematically understates relay egress
     /// once `LazyForward` is live — read `pubsub_stages.outbound_by_kind`
@@ -1598,7 +1609,23 @@ impl PubSubManager {
             "withheld_eager_peers": stages.lazy_ihave_withheld_peers,
             "lazy_msgs_by_topic": lazy_by_topic,
             "budget_msgs_per_sec": self.relay_fanout.effective_budget(),
+            "consume_only": self.relay_fanout.consume_only_enabled(),
+            "consume_only_msgs": self.relay_fanout.consume_only_msgs(),
+            "consume_only_msgs_by_topic": self.consume_only_msgs_by_topic(),
         })
+    }
+
+    /// Per-topic consume-only `DeliverOnly` counts, keyed by topic name.
+    /// Empty when consume-only is off.
+    fn consume_only_msgs_by_topic(&self) -> std::collections::BTreeMap<&'static str, u64> {
+        crate::dm_capability::CAPS_TOPIC_NAMES
+            .into_iter()
+            .filter_map(|name| {
+                self.relay_fanout
+                    .consume_only_msgs_for(&TopicId::from_entity(name.as_bytes()))
+                    .map(|count| (name, count))
+            })
+            .collect()
     }
 
     /// Outer saorsa-gossip signature policy for `GET /diagnostics/gossip`.
@@ -7550,6 +7577,368 @@ mod tests {
             eager_msgs_2 - eager_msgs_1 >= N,
             "each of the N messages must have been served on IWANT at least once"
         );
+    }
+
+    /// What one caps line-topology run observed at the middle node.
+    struct CapsLineRun {
+        /// Messages the middle node's own subscriber received.
+        delivered_locally: usize,
+        /// Middle node EAGER sends during the run (before any pull).
+        eager_msgs: u64,
+        /// Middle node IHAVE sends during the run, after the flush.
+        ihave_msgs: u64,
+        /// sg `validator.by_topic[topic].deliver_only` delta.
+        deliver_only: u64,
+        /// Messages the downstream peer received from the middle's frames.
+        delivered_downstream: usize,
+        /// The middle node's `relay_fanout` diagnostics after the run.
+        diag: serde_json::Value,
+    }
+
+    const CAPS_LINE_N: u64 = 6;
+
+    fn validator_deliver_only(manager: &PubSubManager, topic_id: TopicId) -> u64 {
+        manager
+            .stage_stats()
+            .validator
+            .by_topic
+            .get(&topic_id.to_string())
+            .map_or(0, |meter| meter.deliver_only)
+    }
+
+    async fn drain_payloads(
+        sub: &mut Subscription,
+        want: usize,
+        wait: Duration,
+    ) -> std::collections::HashSet<String> {
+        let mut got = std::collections::HashSet::new();
+        let deadline = tokio::time::Instant::now() + wait;
+        while got.len() < want && tokio::time::Instant::now() < deadline {
+            if let Ok(Some(message)) =
+                tokio::time::timeout(Duration::from_millis(20), sub.recv()).await
+            {
+                got.insert(String::from_utf8_lossy(&message.payload).into_owned());
+            }
+        }
+        got
+    }
+
+    /// Line topology publisher → middle → downstream, hermetic (the wire is
+    /// the test recorder, as in `relay_fanout_wiring_lazy_relay_preserves_delivery`).
+    /// The middle node subscribes to `topic`, runs `config` through the real
+    /// `configure_egress`, and has the downstream peer as its eager peer.
+    async fn caps_line_run(
+        middle_mode: ParticipationMode,
+        config: GossipConfig,
+        topic: &str,
+    ) -> CapsLineRun {
+        let topic_id = TopicId::from_entity(topic.as_bytes());
+        let publisher =
+            PubSubManager::new(test_node().await, test_signing()).expect("publisher manager");
+        let mut middle = PubSubManager::new_with_participation(
+            test_node().await,
+            test_signing(),
+            None,
+            middle_mode,
+            "caps_line_test",
+        )
+        .expect("middle manager");
+        middle
+            .configure_egress(&config)
+            .await
+            .expect("middle egress config");
+        let downstream = PubSubManager::new(test_node().await, None).expect("downstream manager");
+
+        let pub_peer =
+            saorsa_gossip_transport::GossipTransport::local_peer_id(publisher.transport.as_ref());
+        let mid_peer =
+            saorsa_gossip_transport::GossipTransport::local_peer_id(middle.transport.as_ref());
+        let down_peer =
+            saorsa_gossip_transport::GossipTransport::local_peer_id(downstream.transport.as_ref());
+        for (manager, peers) in [
+            (&publisher, vec![mid_peer]),
+            (&middle, vec![down_peer]),
+            (&downstream, Vec::new()),
+        ] {
+            *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+                peers,
+                sends: Vec::new(),
+            });
+        }
+
+        let _pub_sub = publisher.subscribe(topic.to_string()).await;
+        let mut mid_sub = middle.subscribe(topic.to_string()).await;
+        let mut down_sub = downstream.subscribe(topic.to_string()).await;
+        publisher
+            .set_topic_peers_for_test(topic_id, vec![mid_peer])
+            .await;
+        middle
+            .set_topic_peers_for_test(topic_id, vec![down_peer])
+            .await;
+
+        let (eager_0, _) = kind_meter(&middle, "eager");
+        let (ihave_0, _) = kind_meter(&middle, "ihave");
+        let deliver_only_0 = validator_deliver_only(&middle, topic_id);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut ferried = 0_u64;
+        for i in 0..CAPS_LINE_N {
+            publisher
+                .publish(topic.to_string(), Bytes::from(format!("caps-line-{i}")))
+                .await
+                .expect("publisher publish");
+            loop {
+                for (_peer, bytes) in drain_sends(&publisher) {
+                    middle.handle_incoming(pub_peer, None, bytes).await;
+                    ferried += 1;
+                }
+                if ferried > i {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "publisher frame {i} never reached the recorder"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        // Let the middle node's IHAVE flush (100 ms interval) run.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let middle_frames = drain_sends(&middle);
+
+        let (eager_1, _) = kind_meter(&middle, "eager");
+        let (ihave_1, _) = kind_meter(&middle, "ihave");
+        let deliver_only = validator_deliver_only(&middle, topic_id) - deliver_only_0;
+        let delivered_locally =
+            drain_payloads(&mut mid_sub, CAPS_LINE_N as usize, Duration::from_secs(2))
+                .await
+                .len();
+        for (_peer, bytes) in middle_frames {
+            downstream.handle_incoming(mid_peer, None, bytes).await;
+        }
+        let delivered_downstream = drain_payloads(
+            &mut down_sub,
+            CAPS_LINE_N as usize,
+            Duration::from_millis(500),
+        )
+        .await
+        .len();
+        CapsLineRun {
+            delivered_locally,
+            eager_msgs: eager_1 - eager_0,
+            ihave_msgs: ihave_1 - ihave_0,
+            deliver_only,
+            delivered_downstream,
+            diag: middle.relay_fanout_diagnostics(),
+        }
+    }
+
+    /// The config a `leaf_mode = true` daemon runs with when the key is unset.
+    fn leaf_mode_default_config() -> GossipConfig {
+        let mut config = GossipConfig::default();
+        assert_eq!(config.caps_consume_only, None, "key unset");
+        assert_eq!(config.apply_caps_consume_only(true), None);
+        config
+    }
+
+    /// WHY (`[gossip] caps_consume_only`, the measured 9.8 GB / 22 h of a
+    /// leaf's upload): a metered leaf with the key unset must take every
+    /// caps message from a peer to its own consumers and send none of it
+    /// on — no EAGER and no IHAVE — and the consume-only counter must count
+    /// each one, total and per topic. Before the change the middle node
+    /// eager-forwards all N to the third peer.
+    #[tokio::test]
+    async fn caps_consume_only_leaf_delivers_caps_locally_and_forwards_nothing() {
+        for topic in crate::dm_capability::CAPS_TOPIC_NAMES {
+            let run =
+                caps_line_run(ParticipationMode::Leaf, leaf_mode_default_config(), topic).await;
+            assert_eq!(
+                run.delivered_locally, CAPS_LINE_N as usize,
+                "{topic}: the leaf's own consumers get every caps message"
+            );
+            assert_eq!(run.eager_msgs, 0, "{topic}: no eager forward");
+            assert_eq!(run.ihave_msgs, 0, "{topic}: no IHAVE for others' caps");
+            assert_eq!(
+                run.delivered_downstream, 0,
+                "{topic}: the third peer gets nothing from the leaf"
+            );
+            assert_eq!(
+                run.deliver_only, CAPS_LINE_N,
+                "{topic}: sg DeliverOnly verdicts"
+            );
+            assert_eq!(run.diag["consume_only"], true);
+            assert_eq!(run.diag["consume_only_msgs"], CAPS_LINE_N);
+            let by_topic = run.diag["consume_only_msgs_by_topic"]
+                .as_object()
+                .expect("per-topic counter");
+            assert_eq!(by_topic.len(), 4, "one row per caps topic");
+            for name in crate::dm_capability::CAPS_TOPIC_NAMES {
+                let want = if name == topic { CAPS_LINE_N } else { 0 };
+                assert_eq!(by_topic[name], want, "{topic}: row {name}");
+            }
+        }
+    }
+
+    /// WHY: the explicit key must override `leaf_mode` both ways (false is
+    /// the A/B and escape hatch; true opts a stock Leaf in), and a Full node
+    /// must forward caps exactly as before even when asked not to — the
+    /// backbone carries the tree.
+    #[tokio::test]
+    async fn caps_consume_only_overrides_both_ways_and_full_forwards_as_before() {
+        let topic = crate::dm_capability::DM_CAPABILITY_TARGETED_RESPONSE_TOPIC;
+        let forwards = |run: &CapsLineRun, label: &str| {
+            assert_eq!(run.delivered_locally, CAPS_LINE_N as usize, "{label}");
+            assert_eq!(run.eager_msgs, CAPS_LINE_N, "{label}: eager forward");
+            assert_eq!(run.delivered_downstream, CAPS_LINE_N as usize, "{label}");
+            assert_eq!(run.deliver_only, 0, "{label}");
+            assert_eq!(run.diag["consume_only"], false, "{label}");
+            assert_eq!(run.diag["consume_only_msgs"], 0, "{label}");
+        };
+
+        // leaf_mode on, explicit false.
+        let mut off = GossipConfig {
+            caps_consume_only: Some(false),
+            ..GossipConfig::default()
+        };
+        assert_eq!(off.apply_caps_consume_only(true), None);
+        forwards(
+            &caps_line_run(ParticipationMode::Leaf, off, topic).await,
+            "leaf_mode + explicit false",
+        );
+
+        // A stock Leaf without leaf_mode and without the key: today's behaviour.
+        let mut stock = GossipConfig::default();
+        assert_eq!(stock.apply_caps_consume_only(false), None);
+        forwards(
+            &caps_line_run(ParticipationMode::Leaf, stock, topic).await,
+            "stock leaf",
+        );
+
+        // A stock Leaf that opts in.
+        let mut on = GossipConfig {
+            caps_consume_only: Some(true),
+            ..GossipConfig::default()
+        };
+        assert_eq!(on.apply_caps_consume_only(false), None);
+        let run = caps_line_run(ParticipationMode::Leaf, on, topic).await;
+        assert_eq!(run.delivered_locally, CAPS_LINE_N as usize);
+        assert_eq!((run.eager_msgs, run.ihave_msgs), (0, 0));
+        assert_eq!(run.delivered_downstream, 0);
+        assert_eq!(run.diag["consume_only_msgs"], CAPS_LINE_N);
+
+        // Full: the daemon resolves an explicit true to off (with a warning),
+        // and the pub/sub layer refuses it even if handed `Some(true)`.
+        let mut full = GossipConfig {
+            caps_consume_only: Some(true),
+            relay: true,
+            ..GossipConfig::default()
+        };
+        assert!(full.apply_caps_consume_only(false).is_some());
+        forwards(
+            &caps_line_run(ParticipationMode::Full, full, topic).await,
+            "full, resolved",
+        );
+        forwards(
+            &caps_line_run(
+                ParticipationMode::Full,
+                GossipConfig {
+                    caps_consume_only: Some(true),
+                    relay: true,
+                    ..GossipConfig::default()
+                },
+                topic,
+            )
+            .await,
+            "full, raw Some(true)",
+        );
+    }
+
+    /// WHY: consume-only is scoped to the four caps topics. Every other
+    /// subscribed topic on a consume-only leaf must forward exactly as it
+    /// does on a leaf without the key.
+    #[tokio::test]
+    async fn caps_consume_only_leaves_non_caps_topics_unchanged() {
+        const TOPIC: &str = "x0x.caps.consume.only.control.topic";
+        let mut without = GossipConfig::default();
+        assert_eq!(without.apply_caps_consume_only(false), None);
+        for (label, config) in [
+            ("consume-only leaf", leaf_mode_default_config()),
+            ("leaf without the key", without),
+        ] {
+            let run = caps_line_run(ParticipationMode::Leaf, config, TOPIC).await;
+            assert_eq!(run.delivered_locally, CAPS_LINE_N as usize, "{label}");
+            assert_eq!(run.eager_msgs, CAPS_LINE_N, "{label}: eager forward");
+            assert_eq!(run.delivered_downstream, CAPS_LINE_N as usize, "{label}");
+            assert_eq!(run.deliver_only, 0, "{label}");
+            assert_eq!(run.diag["consume_only_msgs"], 0, "{label}");
+        }
+    }
+
+    /// WHY: consume-only withholds only *others'* caps. The leaf's own
+    /// adverts and targeted responses must still go out eagerly, or nobody
+    /// could learn its DM key or answer its strict sends.
+    #[tokio::test]
+    async fn caps_consume_only_leaf_still_publishes_its_own_caps() {
+        for topic in crate::dm_capability::CAPS_TOPIC_NAMES {
+            let topic_id = TopicId::from_entity(topic.as_bytes());
+            let mut leaf = PubSubManager::new_with_participation(
+                test_node().await,
+                test_signing(),
+                None,
+                ParticipationMode::Leaf,
+                "caps_line_test",
+            )
+            .expect("leaf manager");
+            leaf.configure_egress(&leaf_mode_default_config())
+                .await
+                .expect("leaf egress config");
+            let downstream =
+                PubSubManager::new(test_node().await, None).expect("downstream manager");
+            let leaf_peer =
+                saorsa_gossip_transport::GossipTransport::local_peer_id(leaf.transport.as_ref());
+            let down_peer = saorsa_gossip_transport::GossipTransport::local_peer_id(
+                downstream.transport.as_ref(),
+            );
+            *leaf.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+                peers: vec![down_peer],
+                sends: Vec::new(),
+            });
+            *downstream.transport.recorder.lock().unwrap() =
+                Some(super::super::egress::Recorder::default());
+            let _leaf_sub = leaf.subscribe(topic.to_string()).await;
+            let mut down_sub = downstream.subscribe(topic.to_string()).await;
+            leaf.set_topic_peers_for_test(topic_id, vec![down_peer])
+                .await;
+
+            leaf.publish(topic.to_string(), Bytes::from_static(b"own-caps"))
+                .await
+                .expect("own caps publish");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let mut frames = Vec::new();
+            while frames.is_empty() {
+                frames = drain_sends(&leaf);
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{topic}: own publish never reached the wire"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(frames.iter().all(|(peer, _)| *peer == down_peer));
+            for (_peer, bytes) in frames {
+                downstream.handle_incoming(leaf_peer, None, bytes).await;
+            }
+            let got = drain_payloads(&mut down_sub, 1, Duration::from_secs(2)).await;
+            assert!(
+                got.contains("own-caps"),
+                "{topic}: own caps delivered downstream"
+            );
+            assert_eq!(leaf.relay_fanout_diagnostics()["consume_only"], true);
+            assert_eq!(
+                leaf.relay_fanout_diagnostics()["consume_only_msgs"],
+                0,
+                "{topic}: own publishes skip the verdict"
+            );
+        }
     }
 
     #[tokio::test]

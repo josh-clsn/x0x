@@ -18,6 +18,13 @@
 //!    win: fan-out policy must never *widen* suppression, and a
 //!    `LazyForward` would reintroduce an IHAVE announce for a message
 //!    storm control refused to forward.
+//!
+//!    Next, **consume-only** (`[gossip] caps_consume_only`, on a Leaf): the
+//!    topics in the consume-only set — the four `x0x/caps/*` topics — are
+//!    `DeliverOnly`: delivered to local subscribers, never eager-forwarded
+//!    and never announced by IHAVE. Own publishes skip validators, so the
+//!    node still sends its own adverts and answers. It follows the base
+//!    validators because `DeliverOnly` only narrows.
 //! 2. **C2 — lazy-only for unconsumed topics.** A topic with zero local
 //!    subscribers is never delivered locally anyway; the node's only role
 //!    is relay, and lazy relay is strictly cheaper on the send path. The
@@ -172,6 +179,16 @@ pub(crate) struct RelayFanout {
     /// non-default verdicts (`validator.lazy_forward` / `dropped` /
     /// `deliver_only`), so the eager side of the split lives here.
     forward_msgs: AtomicU64,
+    /// Topics this node consumes but never forwards for others (`[gossip]
+    /// caps_consume_only`): the four caps topics on a consume-only Leaf,
+    /// empty otherwise. Set once before traffic by
+    /// [`RelayFanout::set_consume_only`]. The value counts the
+    /// `DeliverOnly` verdicts returned for that topic; it is kept apart
+    /// from sg's `validator.deliver_only`, which also counts storm
+    /// control's DeliverOnly.
+    consume_only: RwLock<HashMap<TopicId, AtomicU64>>,
+    /// Sum of the per-topic consume-only counts.
+    consume_only_msgs: AtomicU64,
 }
 
 fn read_unpoisoned<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
@@ -191,7 +208,38 @@ impl RelayFanout {
             budget: RwLock::new(super::config::default_relay_fanout_budget()),
             subscribed_topic_ids,
             forward_msgs: AtomicU64::new(0),
+            consume_only: RwLock::new(HashMap::new()),
+            consume_only_msgs: AtomicU64::new(0),
         })
+    }
+
+    /// Replace the consume-only topic set. Inbound messages on these
+    /// topics are delivered locally and never forwarded (no eager
+    /// re-publish, no IHAVE). Own publishes skip validators, so they are
+    /// unaffected. An empty set restores normal relay policy.
+    pub(crate) fn set_consume_only(&self, topics: impl IntoIterator<Item = TopicId>) {
+        *write_unpoisoned(&self.consume_only) = topics
+            .into_iter()
+            .map(|topic| (topic, AtomicU64::new(0)))
+            .collect();
+    }
+
+    /// Whether any topic is consume-only (diagnostics).
+    pub(crate) fn consume_only_enabled(&self) -> bool {
+        !read_unpoisoned(&self.consume_only).is_empty()
+    }
+
+    /// Cumulative `DeliverOnly` verdicts for consume-only topics.
+    pub(crate) fn consume_only_msgs(&self) -> u64 {
+        self.consume_only_msgs.load(Ordering::Relaxed)
+    }
+
+    /// Consume-only `DeliverOnly` verdicts for one topic; `None` when the
+    /// topic is not consume-only.
+    pub(crate) fn consume_only_msgs_for(&self, topic: &TopicId) -> Option<u64> {
+        read_unpoisoned(&self.consume_only)
+            .get(topic)
+            .map(|count| count.load(Ordering::Relaxed))
     }
 
     /// Apply the operator's C3 budget (messages/s; 0 disables the gate).
@@ -339,8 +387,8 @@ impl RelayFanout {
     }
 
     /// The composite verdict for one admitted inbound message. Ordering is
-    /// load-bearing: content suppression wins, then C2 (unconsumed ⇒ lazy),
-    /// then C3 (budgeted eager for consumed topics).
+    /// load-bearing: content suppression wins, then consume-only, then C2
+    /// (unconsumed ⇒ lazy), then C3 (budgeted eager for consumed topics).
     fn verdict(&self, topic: &TopicId, payload: &[u8]) -> ValidationAction {
         // 1. Content validators first; never widen Drop/DeliverOnly.
         let base = read_unpoisoned(&self.base).get(topic).cloned();
@@ -349,6 +397,13 @@ impl RelayFanout {
             if action != ValidationAction::ForwardAndDeliver {
                 return action;
             }
+        }
+        // Consume-only: deliver here, forward nothing. DeliverOnly only
+        // narrows, so it may follow the base verdict.
+        if let Some(count) = read_unpoisoned(&self.consume_only).get(topic) {
+            count.fetch_add(1, Ordering::Relaxed);
+            self.consume_only_msgs.fetch_add(1, Ordering::Relaxed);
+            return ValidationAction::DeliverOnly;
         }
         // 2. C2: nothing here consumes the topic — relay it lazily.
         if !read_unpoisoned(&self.subscribed_topic_ids).contains(topic) {
@@ -736,5 +791,111 @@ mod tests {
             vec![("install", topic), ("clear", topic), ("install", topic)],
             "exactly one coherent install/clear/install lifecycle"
         );
+    }
+
+    fn caps_topic_ids() -> Vec<TopicId> {
+        crate::dm_capability::CAPS_TOPIC_NAMES
+            .into_iter()
+            .map(|name| TopicId::from_entity(name.as_bytes()))
+            .collect()
+    }
+
+    /// Why (`[gossip] caps_consume_only`): a consume-only Leaf must take the
+    /// caps topics as `DeliverOnly` — delivered, never eager-forwarded and
+    /// never IHAVE-announced (LazyForward would still IHAVE, which was ~4.35
+    /// of the measured 9.8 GB). Every other subscribed topic keeps C3 eager,
+    /// and the counter counts exactly the consume-only verdicts.
+    #[test]
+    fn consume_only_caps_topics_are_deliver_only_and_counted() {
+        let subscribed = subscriber_set();
+        let fanout = RelayFanout::new(Arc::clone(&subscribed));
+        fanout.set_budget(0);
+        let caps = caps_topic_ids();
+        let other = TopicId::new([0x51; 32]);
+        for topic in caps.iter().chain([&other]) {
+            write_unpoisoned(&subscribed).insert(*topic);
+        }
+        fanout.set_consume_only(caps.iter().copied());
+        assert!(fanout.consume_only_enabled());
+
+        for topic in &caps {
+            assert_eq!(
+                fanout.verdict(topic, b"caps"),
+                ValidationAction::DeliverOnly
+            );
+        }
+        assert_eq!(
+            fanout.verdict(&other, b"other"),
+            ValidationAction::ForwardAndDeliver,
+            "a non-caps subscribed topic stays on C3 eager"
+        );
+        assert_eq!(fanout.consume_only_msgs(), 4, "one per caps verdict");
+        for topic in &caps {
+            assert_eq!(fanout.consume_only_msgs_for(topic), Some(1));
+        }
+        assert_eq!(fanout.consume_only_msgs_for(&other), None);
+        assert_eq!(fanout.forward_msgs(), 1);
+
+        // Consume-only applies whether or not anything here subscribes: an
+        // unconsumed caps topic is still DeliverOnly, not C2 LazyForward.
+        write_unpoisoned(&subscribed).remove(&caps[0]);
+        assert_eq!(
+            fanout.verdict(&caps[0], b"caps"),
+            ValidationAction::DeliverOnly
+        );
+        assert_eq!(fanout.consume_only_msgs(), 5);
+    }
+
+    /// Why: a base (storm-control) `Drop` must still win over consume-only.
+    /// DeliverOnly would deliver a message storm control refused.
+    #[test]
+    fn consume_only_never_widens_a_base_drop() {
+        let subscribed = subscriber_set();
+        let fanout = RelayFanout::new(Arc::clone(&subscribed));
+        let caps = caps_topic_ids();
+        fanout.set_consume_only(caps.iter().copied());
+        fanout.register_base(caps[0], Arc::new(|_, _| ValidationAction::Drop));
+        assert_eq!(fanout.verdict(&caps[0], b"storm"), ValidationAction::Drop);
+        assert_eq!(
+            fanout.consume_only_msgs(),
+            0,
+            "a dropped message is not counted"
+        );
+    }
+
+    /// Why: with the key off (the Full default and the explicit-`false`
+    /// escape hatch) the caps topics must behave exactly as before — C3
+    /// eager when subscribed, C2 lazy when not — and an emptied set must
+    /// restore that.
+    #[test]
+    fn empty_consume_only_set_changes_nothing() {
+        let subscribed = subscriber_set();
+        let fanout = RelayFanout::new(Arc::clone(&subscribed));
+        fanout.set_budget(0);
+        let caps = caps_topic_ids();
+        assert!(!fanout.consume_only_enabled());
+        assert_eq!(
+            fanout.verdict(&caps[1], b"caps"),
+            ValidationAction::LazyForward,
+            "unsubscribed caps topic stays C2 lazy"
+        );
+        write_unpoisoned(&subscribed).insert(caps[1]);
+        assert_eq!(
+            fanout.verdict(&caps[1], b"caps"),
+            ValidationAction::ForwardAndDeliver
+        );
+
+        fanout.set_consume_only(caps.iter().copied());
+        assert_eq!(
+            fanout.verdict(&caps[1], b"caps"),
+            ValidationAction::DeliverOnly
+        );
+        fanout.set_consume_only(std::iter::empty());
+        assert!(!fanout.consume_only_enabled());
+        assert_eq!(
+            fanout.verdict(&caps[1], b"caps"),
+            ValidationAction::ForwardAndDeliver
+        );
+        assert_eq!(fanout.consume_only_msgs(), 1);
     }
 }

@@ -238,6 +238,49 @@ attestations, delegation and owner-mandate certificates); and QUIC handshake
 verifies in `ant-quic`. Queue
 *age* is not measured — only depth.
 
+## Caps consume-only on a leaf
+
+Every daemon subscribes to the four DM-capability topics (`x0x/caps/v1`,
+`x0x/caps/v1/request/targeted-v2`, `x0x/caps/v1/response/targeted-v2`,
+`x0x/caps/v2/digest`). With `caps_consume_only` on, a Leaf still receives and
+uses every advert, request and response, answers requests for itself and
+publishes its own adverts, but forwards none of the other nodes' caps: no
+eager re-publish and no IHAVE (saorsa-gossip `DeliverOnly`).
+
+```toml
+# x0xd.toml
+leaf_mode = true
+
+[gossip]
+# Unset (the default) follows leaf_mode: on for a metered leaf, off
+# otherwise. Set false to forward caps as before; set true to opt a
+# non-metered Leaf in. Ignored, with a warning, on a Full (relay) node.
+caps_consume_only = false
+```
+
+`GET /diagnostics/gossip` reports it under `relay_fanout`:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:12700/diagnostics/gossip
+# "relay_fanout": {
+#   "consume_only": true,
+#   "consume_only_msgs": 5120,
+#   "consume_only_msgs_by_topic": {
+#     "x0x/caps/v1": 3900,
+#     "x0x/caps/v1/request/targeted-v2": 610,
+#     "x0x/caps/v1/response/targeted-v2": 600,
+#     "x0x/caps/v2/digest": 10
+#   },
+#   ...
+# }
+```
+
+`consume_only_msgs` counts caps messages from peers that this node delivered
+and did not forward. The per-topic object is empty when consume-only is off.
+Inbound caps traffic is unchanged; a cached caps message can still be served
+by the 30 s anti-entropy exchange (`pubsub_stages.outbound_by_kind.anti_entropy`).
+The record is `docs/adr/transient/T-leaf-caps-consume-only.md`.
+
 ## API-unserved watchdog (#384)
 
 The daemon arms a self-probe watchdog at startup: a dedicated OS thread
