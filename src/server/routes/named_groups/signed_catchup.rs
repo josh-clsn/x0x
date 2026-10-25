@@ -191,6 +191,19 @@ pub(super) async fn send_page_request(
     {
         recorded.push((hex::encode(peer.as_bytes()), payload.clone()));
     }
+    #[cfg(test)]
+    {
+        let hold = state
+            .named_group_test_recorders
+            .catchup_page_send_hold
+            .lock()
+            .ok()
+            .and_then(|hold| hold.clone());
+        if let Some(hold) = hold {
+            let _released = hold.acquire().await;
+            return Ok(());
+        }
+    }
     state
         .agent
         .send_direct_with_config(peer, payload, named_group_direct_delivery_config())

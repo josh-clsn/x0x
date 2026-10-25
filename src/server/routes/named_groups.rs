@@ -8,19 +8,25 @@
 
 mod catchup_page_gap;
 mod catchup_routes;
+mod catchup_serve;
 mod committer_leaf;
 mod control_blob;
 mod event_log_store;
+mod gap_catchup;
 pub(in crate::server) use catchup_page_gap::GapAsks;
 pub(in crate::server) use catchup_routes::{
     treekem_catch_up_state, treekem_catch_up_trigger, treekem_head_proof_accept,
     treekem_head_proof_sign,
+};
+pub(in crate::server) use catchup_serve::{
+    dispatch as dispatch_treekem_catchup_request, CatchupServe,
 };
 pub(in crate::server) use committer_leaf::PackageRepulls;
 use event_log_store::{
     commit_bearing_event_frontier, commit_bearing_event_sort_key, remember_commit_bearing_event,
 };
 pub(in crate::server) use event_log_store::{load_event_log, EventLog};
+pub(in crate::server) use gap_catchup::GapCatchups;
 mod fair_admission;
 mod head_proof;
 mod head_rounds;
@@ -9588,7 +9594,9 @@ async fn queue_treekem_membership_event(
             .record_membership_event_queued_revision_gap(group_id);
     }
     tracing::warn!(group_id = %LogHexId::group(&group_id), reason, "queued TreeKEM membership event pending catch-up/replay");
-    request_treekem_catchup_for_gap(state, group_id, &event, peers).await;
+    // Survivor re-key A12: the asks run in the room's flight, never here.
+    // The event is parked above, so a page that lands first still finds it.
+    gap_catchup::spawn(state, group_id, &event, peers);
 }
 
 /// Validate before insertion, eviction, or preparing any catch-up destination.
@@ -9666,16 +9674,15 @@ fn admit_treekem_pending_event(
     Some(peers)
 }
 
+/// Ask each of `asks` (a peer, and the predecessor hash its event named)
+/// for a catch-up page from this member's head, all at once. A peer asked
+/// from the same head inside [`TREEKEM_CATCHUP_THROTTLE`] is skipped.
 async fn request_treekem_catchup_for_gap(
     state: &Arc<AppState>,
     group_id: &str,
-    event: &NamedGroupMetadataEvent,
-    peers: Vec<AgentId>,
+    asks: Vec<(AgentId, Option<String>)>,
 ) {
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
-    let Some(frontier) = treekem_membership_event_frontier(event) else {
-        return;
-    };
     let (from_revision, from_epoch, current_state_hash) = {
         let groups = state.named_groups.read().await;
         let Some(info) = groups.get(group_id) else {
@@ -9690,7 +9697,8 @@ async fn request_treekem_catchup_for_gap(
             info.state_hash.clone(),
         )
     };
-    for peer in peers {
+    let mut sends = Vec::new();
+    for (peer, missing_prev_state_hash) in asks {
         let peer_hex = hex::encode(peer.as_bytes());
         let throttle_key = format!("{group_id}:{peer_hex}:{from_revision}:{from_epoch}");
         {
@@ -9710,7 +9718,7 @@ async fn request_treekem_catchup_for_gap(
             from_revision,
             from_treekem_epoch: from_epoch,
             current_state_hash: current_state_hash.clone(),
-            missing_prev_state_hash: frontier.commit.prev_state_hash.clone(),
+            missing_prev_state_hash,
             target_member_id: None,
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
             signed_by: None,
@@ -9719,10 +9727,15 @@ async fn request_treekem_catchup_for_gap(
         // Survivor re-key A5: signed, for a responder that cannot verify
         // this member's transport.
         signed_catchup::sign_page_request(state, &mut request);
-        if let Err(e) = signed_catchup::send_page_request(state, &peer, request).await {
-            tracing::debug!(group_id = %group_id, peer = %peer_hex, "TreeKEM catch-up request failed: {e}");
-        }
+        sends.push(async move {
+            if let Err(e) = signed_catchup::send_page_request(state, &peer, request).await {
+                tracing::debug!(group_id = %group_id, peer = %peer_hex, "TreeKEM catch-up request failed: {e}");
+            }
+        });
     }
+    // A12: a peer that does not answer costs its own send's timeout, not
+    // every later peer's too.
+    futures::future::join_all(sends).await;
 }
 
 /// Retention for queued TreeKEM metadata events awaiting group install.
@@ -10844,6 +10857,25 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     verified: bool,
     request: TreeKemCatchupRequest,
 ) {
+    #[cfg(test)]
+    {
+        if let Ok(mut started) = state
+            .named_group_test_recorders
+            .catchup_serves_started
+            .lock()
+        {
+            started.push(hex::encode(sender.as_bytes()));
+        }
+        let hold = state
+            .named_group_test_recorders
+            .catchup_serve_hold
+            .lock()
+            .ok()
+            .and_then(|hold| hold.clone());
+        if let Some(hold) = hold {
+            let _released = hold.acquire().await;
+        }
+    }
     if request.message_type != "treekem_catchup_request" {
         return;
     }
@@ -23021,11 +23053,14 @@ async fn add_treekem_named_group_member(
     .await;
     remember_commit_bearing_event(&state, &event).await;
     // Survivor re-key A10: every member the add did not seat is owed it
-    // before the first publish; any the obligations refused get the blind
-    // schedule.
-    let refused =
+    // before the first publish. A12: the member it seats has no join result
+    // to poll, so its Welcome goes on the blind schedule too, past +8 s,
+    // with any member the obligations refused.
+    let mut blind = vec![agent_hex.clone()];
+    blind.extend(
         rekey_obligations::owe_survivors(&state, &id, &next, &[agent_hex.as_str()], &[&event])
-            .await;
+            .await,
+    );
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     spawn_named_group_event_delivery_to_active_members(
         &state,
@@ -23033,16 +23068,7 @@ async fn add_treekem_named_group_member(
         &event,
         std::slice::from_ref(&agent_hex),
     );
-    if !refused.is_empty() {
-        spawn_group_control_event_redelivery(
-            &state,
-            &metadata_topic,
-            &next,
-            &event,
-            &[],
-            Some(&refused),
-        );
-    }
+    spawn_group_control_event_redelivery(&state, &metadata_topic, &next, &event, &[], Some(&blind));
     spawn_named_group_event_delivery_to_active_members(&state, &next, &member_joined_recovery, &[]);
     let recovery_deliveries = state
         .treekem_member_key_packages
@@ -29775,10 +29801,14 @@ async fn approve_treekem_join_request(
     };
     remember_commit_bearing_event(&state, &event).await;
     // Survivor re-key A10: as for any add, every member the approval did
-    // not seat is owed it before the first publish.
-    let refused =
+    // not seat is owed it before the first publish. A12: the requester it
+    // seats has no join result to poll, so its Welcome goes on the blind
+    // schedule too, with any member the obligations refused.
+    let mut blind = vec![requester_hex.clone()];
+    blind.extend(
         rekey_obligations::owe_survivors(&state, &id, &next, &[requester_hex.as_str()], &[&event])
-            .await;
+            .await,
+    );
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     spawn_named_group_event_delivery_to_active_members(
         &state,
@@ -29786,16 +29816,7 @@ async fn approve_treekem_join_request(
         &event,
         std::slice::from_ref(&requester_hex),
     );
-    if !refused.is_empty() {
-        spawn_group_control_event_redelivery(
-            &state,
-            &metadata_topic,
-            &next,
-            &event,
-            &[],
-            Some(&refused),
-        );
-    }
+    spawn_group_control_event_redelivery(&state, &metadata_topic, &next, &event, &[], Some(&blind));
     cache_treekem_member_key_package(
         &state,
         join_result_key(&id, &requester_hex),
@@ -45079,6 +45100,7 @@ pub(in crate::server) mod tests {
     mod adr0068_task_buffer;
     mod adr0107_stuck_join_rearm;
     mod cache_hardening_followup;
+    mod catchup_off_apply;
     mod catchup_routes;
     mod committer_leaf;
     mod engine_a_apply_gate;
@@ -45918,6 +45940,8 @@ pub(in crate::server) mod tests {
             treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
             treekem_package_repulls: std::sync::Mutex::default(),
             treekem_gap_asks: std::sync::Mutex::default(),
+            treekem_gap_catchups: std::sync::Mutex::default(),
+            treekem_catchup_serve: CatchupServe::default(),
             treekem_head_answers: std::sync::Mutex::default(),
             treekem_head_rounds: std::sync::Mutex::default(),
             treekem_head_counter: Mutex::new(treekem_head_counter),

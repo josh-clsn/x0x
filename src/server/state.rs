@@ -1219,6 +1219,12 @@ pub(super) struct AppState {
     /// Survivor re-key A5: which members this daemon asked about a hole
     /// after its head, per room, and when it may ask each again.
     pub(super) treekem_gap_asks: StdMutex<crate::server::routes::named_groups::GapAsks>,
+    /// Survivor re-key A12: the rooms with a gap catch-up in flight, and
+    /// the peers each flight still has to ask.
+    pub(super) treekem_gap_catchups: StdMutex<crate::server::routes::named_groups::GapCatchups>,
+    /// Survivor re-key A12: the catch-up listener's answer slots and each
+    /// requester's waiting requests.
+    pub(super) treekem_catchup_serve: crate::server::routes::named_groups::CatchupServe,
     /// Survivor re-key A6: per (room, requester), the latest challenge
     /// this daemon answered, its proof, and the answers in the current
     /// window.
@@ -1463,6 +1469,18 @@ pub(super) struct NamedGroupTestRecorders {
     /// Survivor re-key A10: every bounded resend schedule started, as
     /// `(event kind, recipients)`.
     pub(super) control_redelivery_recipients: StdMutex<Vec<(&'static str, Vec<String>)>>,
+    /// Survivor re-key A12: when set, `send_page_request` records the
+    /// request and then waits on this semaphore instead of sending, so a
+    /// test plays a peer that does not answer. Closing it releases them.
+    pub(super) catchup_page_send_hold: StdMutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// Survivor re-key A12: gap catch-up flights started.
+    pub(super) gap_catchup_flights: std::sync::atomic::AtomicUsize,
+    /// Survivor re-key A12: the requester of every catch-up request
+    /// `handle_treekem_catchup_request` began to answer, in order.
+    pub(super) catchup_serves_started: StdMutex<Vec<String>>,
+    /// Survivor re-key A12: when set, `handle_treekem_catchup_request` waits
+    /// on this semaphore after recording its start. Closing it releases them.
+    pub(super) catchup_serve_hold: StdMutex<Option<Arc<tokio::sync::Semaphore>>>,
 }
 
 #[cfg(test)]
