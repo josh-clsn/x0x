@@ -15,7 +15,7 @@
 //! `treekem:epoch=<n>` form can only be delivered by its signer
 //! (`signer_delivery::catchup_apply_sender`).
 //!
-//! Two arms, the same scenario:
+//! Three arms, the same scenario:
 //! - plain: nodes O (owner, the signer), B, V and R, all reachable. This
 //!   is the shape the issue reports.
 //! - rotation: nodes O, P, Q, S (owner and three admins), V and R. The
@@ -23,7 +23,17 @@
 //!   candidate order it ranks after the other three admins. Those three go
 //!   off the fabric after V is back and connected to the signer, so the
 //!   first catch-up round reaches nobody. The single write gives one
-//!   observation, so that observation must move on to the signer.
+//!   observation, so that observation must move on to the signer. Since
+//!   survivor re-key A9/A10 the signer owes V the removal and sends it on
+//!   V's return. This arm pins that path: after the hold ends it waits,
+//!   before the write, for V to reach e+1 (nothing else can move it then),
+//!   and requires an obligation send to V.
+//! - rotation with the obligation lost: the rotation arm, with every
+//!   direct named-group event the signer sends V failing in the signer's
+//!   daemon (its initial sends and its obligation sends; the test drop list
+//!   on `named_group_event_delivery_result`, not the fabric, since catch-up
+//!   pages are direct messages too). Only #1427's catch-up can reach V, so
+//!   the case requires at least one page served by the signer.
 //!
 //! From V's restart until the preconditions are witnessed, every
 //! application frame toward V is held (dropped). Only transport links form.
@@ -70,13 +80,17 @@ enum Arm {
     Plain,
     /// The three admins that rank before the signer are down.
     SignerAfterThreeOfflineAdmins,
+    /// As above, with the signer's direct event sends to V lost.
+    SignerWithObligationSendsLost,
 }
 
 impl Arm {
     fn labels(self) -> &'static [&'static str] {
         match self {
             Self::Plain => &["O", "B", "V", "R"],
-            Self::SignerAfterThreeOfflineAdmins => &["O", "P", "Q", "S", "V", "R"],
+            Self::SignerAfterThreeOfflineAdmins | Self::SignerWithObligationSendsLost => {
+                &["O", "P", "Q", "S", "V", "R"]
+            }
         }
     }
 
@@ -84,9 +98,26 @@ impl Arm {
     fn promoted(self) -> &'static [&'static str] {
         match self {
             Self::Plain => &[],
-            Self::SignerAfterThreeOfflineAdmins => &["P", "Q", "S"],
+            Self::SignerAfterThreeOfflineAdmins | Self::SignerWithObligationSendsLost => {
+                &["P", "Q", "S"]
+            }
         }
     }
+}
+
+/// Direct deliveries `label` sent `recipient` with the obligation worker's
+/// label, so far.
+fn obligation_sends(sim: &Sim, label: &str, recipient: &str) -> Result<usize> {
+    let state = sim.state(label)?;
+    let recorded = state
+        .named_group_test_recorders
+        .direct_deliveries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok(recorded
+        .iter()
+        .filter(|(to, _, _, path)| to == recipient && *path == "obligation")
+        .count())
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -358,6 +389,18 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         .await??;
     let metadata = TopicBlock::install(sim, "V", &topic)?;
     let hold = InboundHold::install(sim, "V")?;
+    let v_hex = sim.agent_hex("V")?;
+    if arm == Arm::SignerWithObligationSendsLost {
+        sim.state(signer)?
+            .named_group_test_recorders
+            .direct_delivery_drop
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(v_hex.clone());
+    }
+    // Obligation sends are counted from the removal: one started during the
+    // hold can still land after it.
+    let obligation_before = obligation_sends(sim, signer, &v_hex)?;
     sim.stop("V", RestartMode::Crash).await?;
     metadata.set(true);
     let (status, removed) = sim
@@ -439,7 +482,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         ),
         at(sim),
     );
-    if arm == Arm::SignerAfterThreeOfflineAdmins {
+    if arm != Arm::Plain {
         let order: Vec<&str> = admins.iter().map(|(_, label)| *label).collect();
         receipt.evidence(
             "signer_ranks_after_three_offline_admins",
@@ -450,6 +493,32 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     }
 
     let served_before = served_pages(sim, signer)?;
+    // Before any later-epoch traffic nothing can start a catch-up, the
+    // decoys are off the fabric and the metadata topic toward V is blocked:
+    // only the signer's obligation can bring V to e+1. A page V's own proof
+    // request draws afterwards (survivor re-key fix round I-5) goes out only
+    // once V holds e+1, so it is not evidence either way.
+    let mut moved_before_write = None;
+    if arm == Arm::SignerAfterThreeOfflineAdmins {
+        let moved = sim
+            .until(
+                "V reaches e+1 through the obligation",
+                CATCHUP,
+                async |s: &Sim| epoch_now(s, "V", &group).await.is_ok_and(|v| v > e),
+            )
+            .await;
+        if let Err(error) = &moved {
+            if !expired(error) {
+                anyhow::bail!("{error:#}");
+            }
+        }
+        receipt.note(format!(
+            "before the write: V moved past e={e}: {} at {} us",
+            moved.is_ok(),
+            at(sim)
+        ));
+        moved_before_write = Some(moved.is_ok());
+    }
     // One later-epoch write, then silence: no further traffic restarts a
     // catch-up request.
     let ticks = 1_u32;
@@ -490,7 +559,23 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     let v_epoch = epoch(sim, "V", &group).await?;
     let signer_epoch = epoch(sim, signer, &group).await?;
     let served = served_pages(sim, signer)?.saturating_sub(served_before);
+    let obligation = obligation_sends(sim, signer, &v_hex)?.saturating_sub(obligation_before);
     let caught_up = v_epoch == signer_epoch;
+    let converged_via = if !caught_up {
+        "none"
+    } else if moved_before_write == Some(true) && obligation > 0 {
+        "obligation"
+    } else if served > 0 {
+        "catch_up"
+    } else if obligation > 0 {
+        "obligation"
+    } else {
+        "other"
+    };
+    receipt.note(format!(
+        "converged_via={converged_via} pages served by {signer}={served} \
+         obligation sends {signer}->V since the removal={obligation}"
+    ));
     receipt.note(first_move.unwrap_or_else(|| format!("V never moved past e={e}")));
 
     let mut data_ok = false;
@@ -546,7 +631,13 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         "metadata-topic frames toward V dropped={}",
         metadata.dropped()
     ));
-    let passed = caught_up && data_ok;
+    // Each rotation arm pins the path it exists to cover.
+    let path_ok = match arm {
+        Arm::Plain => true,
+        Arm::SignerAfterThreeOfflineAdmins => converged_via == "obligation",
+        Arm::SignerWithObligationSendsLost => served >= 1,
+    };
+    let passed = caught_up && data_ok && path_ok;
     if !passed {
         receipt.cause(
             "returning member stays at epoch e and the signer serves it no catch-up page",
@@ -610,6 +701,21 @@ async fn w3h_1427_offline_member_reaches_the_epoch_it_missed() -> Result<()> {
         "w3h_1427_offline_member_reaches_the_epoch_it_missed",
         0x1427_0001,
         Arm::Plain,
+        Verdict::Green,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+async fn w3h_1427_catchup_serves_when_the_obligation_sends_are_lost() -> Result<()> {
+    expect(
+        "w3h_1427_catchup_serves_when_the_obligation_sends_are_lost",
+        0x1427_0003,
+        Arm::SignerWithObligationSendsLost,
         Verdict::Green,
     )
     .await
