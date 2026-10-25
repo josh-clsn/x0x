@@ -859,7 +859,7 @@ async fn a_silent_survivor_settles_without_user_traffic() -> Result<()> {
     let held = rekey_obligations::held_rekey(&cast.s2, &removal, &owner_id, true)
         .expect("the author's re-key, verified");
     assert!(
-        !rekey_obligations::prove_held(&cast.s2, held).await,
+        !rekey_obligations::prove_held(&cast.s2, held, true).await,
         "not again within the gap"
     );
     assert!(rekey_obligations::held_rekey(&cast.s2, &removal, &owner_id, false).is_none());
@@ -868,6 +868,88 @@ async fn a_silent_survivor_settles_without_user_traffic() -> Result<()> {
             .is_none(),
         "a copy from someone who did not sign it asks nothing"
     );
+    cast.shutdown().await;
+    Ok(())
+}
+
+/// Fix round 2, N-1: a survivor answers only an active admin author, and
+/// only after an apply that took. A failed apply, a stranger, a removed
+/// member and a demoted admin get nothing and take no slot, so a real
+/// admin's proof right after is still sent.
+#[tokio::test]
+async fn a_held_rekey_is_proved_only_to_an_active_admin_after_an_apply_that_took() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let owner = &cast.fixture.state;
+    let group_id = &cast.fixture.group_id;
+    let owner_id = owner.agent.agent_id();
+    let s2 = &cast.s2;
+    let (r_id, s1_id) = (cast.fixture.member_id, cast.s1.agent.agent_id());
+    let stranger = x0x::identity::AgentKeypair::generate()?.agent_id();
+    let removal = remove(&cast, &r_hex(&cast)).await;
+    let forged_as = |author: &x0x::identity::AgentId| {
+        let mut forged = removal.clone();
+        if let NamedGroupMetadataEvent::MemberRemoved {
+            actor,
+            commit: Some(commit),
+            ..
+        } = &mut forged
+        {
+            *actor = hex_of(author);
+            commit.committed_by = hex_of(author);
+        }
+        forged
+    };
+    let asked = |peer: &x0x::identity::AgentId| -> usize {
+        let peer = hex_of(peer);
+        s2.named_group_test_recorders
+            .catchup_page_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(to, _)| *to == peer)
+            .count()
+    };
+    let held = |event: &NamedGroupMetadataEvent, author: &x0x::identity::AgentId| {
+        rekey_obligations::held_rekey(s2, event, author, true).expect("a signer's direct re-key")
+    };
+
+    // The owner's genuine re-key, but the apply did not take, and S2's
+    // chain does not hold it.
+    assert!(
+        !rekey_obligations::prove_held(s2, held(&removal, &owner_id), false).await,
+        "a failed apply"
+    );
+    // A stranger who signs its own copy.
+    assert!(
+        !rekey_obligations::prove_held(s2, held(&forged_as(&stranger), &stranger), true).await,
+        "a stranger"
+    );
+    applies(s2, owner_id, &removal).await;
+    // R, removed by that very commit.
+    assert!(
+        !rekey_obligations::prove_held(s2, held(&forged_as(&r_id), &r_id), true).await,
+        "a removed member"
+    );
+    // S1, an admin once and demoted since.
+    {
+        let mut groups = s2.named_groups.write().await;
+        let info = groups.get_mut(group_id).expect("group on S2");
+        info.set_member_role(&hex_of(&s1_id), x0x::groups::GroupRole::Admin);
+        info.set_member_role(&hex_of(&s1_id), x0x::groups::GroupRole::Member);
+    }
+    assert!(
+        !rekey_obligations::prove_held(s2, held(&forged_as(&s1_id), &s1_id), true).await,
+        "a demoted admin"
+    );
+    for peer in [&stranger, &r_id, &s1_id] {
+        assert_eq!(asked(peer), 0, "nothing goes to {}", hex_of(peer));
+    }
+
+    // The real admin, right after: no slot was taken. A duplicate of a
+    // commit S2's chain already holds counts as applied.
+    let before = asked(&owner_id);
+    assert!(rekey_obligations::prove_held(s2, held(&removal, &owner_id), false).await);
+    assert_eq!(asked(&owner_id), before + 1, "the owner is answered");
     cast.shutdown().await;
     Ok(())
 }

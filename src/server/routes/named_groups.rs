@@ -12197,7 +12197,7 @@ pub(in crate::server) async fn apply_direct_named_group_metadata_event(
     let held = rekey_obligations::held_rekey(state, &event, &sender, verified);
     let applied = apply_named_group_metadata_event(state, event, sender, verified, None).await;
     if let Some(held) = held {
-        rekey_obligations::spawn_prove_held(state, held);
+        rekey_obligations::spawn_prove_held(state, held, applied.accepted);
     }
     applied
 }

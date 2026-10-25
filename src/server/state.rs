@@ -1455,6 +1455,8 @@ pub(super) struct NamedGroupTestRecorders {
     /// test waits for every settle before it asserts nothing settled.
     pub(super) settles_spawned: std::sync::atomic::AtomicUsize,
     pub(super) settles_finished: std::sync::atomic::AtomicUsize,
+    /// Survivor re-key fix round 2: page requests `prove_held` sent.
+    pub(super) held_proofs_sent: std::sync::atomic::AtomicUsize,
     /// Survivor re-key fix round I-4: recipients `named_group_event_delivery_result`
     /// fails for, as if the send were lost.
     pub(super) direct_delivery_drop: StdMutex<std::collections::HashSet<String>>,

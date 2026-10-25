@@ -515,14 +515,16 @@ impl RekeyObligations {
                     sent.saturating_add(EDGE_FLOOR_MS).max(now_ms)
                 });
                 owed.next_attempt_at_ms = owed.next_attempt_at_ms.min(earliest);
-                // A linked survivor is not the unreachable one the backoff
-                // is for: a send that fails now retries on the first waits,
-                // not at the cap a long absence built up.
-                if owed.state == ObligationState::Owed {
-                    owed.attempt_count = 0;
-                }
                 if earliest == now_ms {
                     edged.insert(key.clone());
+                    // A linked survivor is not the unreachable one the
+                    // backoff is for: a send that fails now retries on the
+                    // first waits, not at the cap a long absence built up.
+                    // Only an edge that fires resets it, so a link that flaps
+                    // inside the floor still climbs (fix round 2, m-N2).
+                    if owed.state == ObligationState::Owed {
+                        owed.attempt_count = 0;
+                    }
                 }
             }
         }
@@ -1106,6 +1108,8 @@ pub(in crate::server) struct HeldRekey {
     group_id: String,
     author: x0x::identity::AgentId,
     epoch: u64,
+    /// The signed commit's state hash, to find it in this daemon's chain.
+    state_hash: String,
 }
 
 /// The survivor side (fix round I-5). An author's obligation to this
@@ -1131,29 +1135,56 @@ pub(in crate::server) fn held_rekey(
         group_id: frontier.group_id.to_string(),
         author: *sender,
         epoch: frontier.epoch,
+        state_hash: commit.state_hash.clone(),
     })
 }
 
 /// [`prove_held`] in its own task, so the listener that applied the event
-/// never waits on it.
-pub(in crate::server) fn spawn_prove_held(state: &Arc<AppState>, held: HeldRekey) {
+/// never waits on it. `applied` is whether the apply accepted the event.
+pub(in crate::server) fn spawn_prove_held(state: &Arc<AppState>, held: HeldRekey, applied: bool) {
     let state = Arc::clone(state);
-    tokio::spawn(async move { prove_held(&state, held).await });
+    tokio::spawn(async move { prove_held(&state, held, applied).await });
 }
 
 /// Send `held`'s author one signed page request from this daemon's head,
-/// when this daemon is an active member of the TreeKEM room, its live tree
-/// is at or past the event's epoch (applied now, or before), and no such
-/// request went for the room in the last [`HELD_PROOF_GAP`].
-pub(in crate::server) async fn prove_held(state: &Arc<AppState>, held: HeldRekey) -> bool {
+/// when all of these hold, and only then take the room's slot:
+/// - this daemon is an active member of the TreeKEM room;
+/// - the event applied: `applied`, or this daemon's chain already holds the
+///   same signed commit from the same signer (it came by gossip first, so
+///   this copy is a duplicate) (fix round 2, N-1);
+/// - after the apply, the author is an active member, not banned, with at
+///   least the Admin role here, so a stranger, a removed member or a
+///   demoted admin learns nothing (N-1);
+/// - this daemon's live tree is at or past the event's epoch;
+/// - no such request went for the room in the last [`HELD_PROOF_GAP`].
+pub(in crate::server) async fn prove_held(
+    state: &Arc<AppState>,
+    held: HeldRekey,
+    applied: bool,
+) -> bool {
     let local = hex::encode(state.agent.agent_id().as_bytes());
+    let author_hex = hex::encode(held.author.as_bytes());
     let Some(group_key) = ({
         let groups = state.named_groups.read().await;
         crate::server::resolve_group_entry_locked(&groups, &held.group_id)
             .filter(|(_, info)| {
+                let held_already = info.commit_log.iter().any(|retained| {
+                    retained.commit.state_hash == held.state_hash
+                        && retained
+                            .commit
+                            .committed_by
+                            .eq_ignore_ascii_case(&author_hex)
+                });
+                let author_admin = info.has_active_member(&author_hex)
+                    && !info.is_banned(&author_hex)
+                    && info
+                        .caller_role(&author_hex)
+                        .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin));
                 !info.withdrawn
                     && info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
                     && info.has_active_member(&local)
+                    && (applied || held_already)
+                    && author_admin
             })
             .map(|(key, _)| key.to_string())
     }) else {
@@ -1179,6 +1210,11 @@ pub(in crate::server) async fn prove_held(state: &Arc<AppState>, held: HeldRekey
     let Some(request) = signed_catchup::page_request(state, &group_key, None).await else {
         return false;
     };
+    #[cfg(test)]
+    state
+        .named_group_test_recorders
+        .held_proofs_sent
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     if let Err(error) = signed_catchup::send_page_request(state, &held.author, request).await {
         tracing::debug!(
             group_id = %LogHexId::group(&group_key),
@@ -1977,6 +2013,10 @@ mod tests {
             store.get(ROOM, &s1).unwrap().next_attempt_at_ms,
             now + MAX_DELAY_MS
         );
+        // An edge inside the floor keeps the count: a flapping link climbs.
+        assert!(store.begin(now, &connected(&[&s1])).is_empty());
+        assert_eq!(store.get(ROOM, &s1).unwrap().attempt_count, 9);
+        assert!(store.begin(now, &none()).is_empty());
         tokio::time::advance(Duration::from_millis(EDGE_FLOOR_MS)).await;
         let now = store.clock.now_ms();
         let attempts = store.begin(now, &connected(&[&s1]));
