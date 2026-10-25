@@ -78,11 +78,15 @@ All notable changes to this project will be documented in this file.
   not name, and for a join-request lifecycle event.
 - **A TreeKEM seal route answers 409 `sealer_key_package_uncommitted`** when this
   daemon's own seat commits no KeyPackage hash (groups made before #220).
-- **A catch-up never blocks an apply, and the catch-up listener answers side by
-  side.** An event ahead of the head is parked and the apply returns; one task
-  per room asks the peers. Requests are answered 4 at a time, one at a time per
-  requester. A member a direct add or an approval seats gets its Welcome on the
-  6 to 60 s resend schedule. See
+- **No catch-up ask blocks an apply or the catch-up listener.** An event ahead
+  of the head is parked and the apply returns; each ask runs in its own task,
+  once per peer and head. A truncated page's follow-up ask runs in its own task
+  too. Parked events also replay when the missing commit lands live. Requests
+  are answered 4 at a time, one at a time per requester, and only a requester
+  the transport or the request's signature proves gets a queue. A member a
+  direct add or an approval seats gets the 6 to 60 s direct resends.
+  `GET /diagnostics/dm` reports `v1_ack_waits`, `v1_ack_wait_ms`,
+  `v1_ack_wait_timeouts` and `v1_ack_wait_timeout_ms`. See
   `docs/adr/transient/T-catchup-off-the-apply-path.md`.
 
 ## [v0.46.4] - 2026-10-06

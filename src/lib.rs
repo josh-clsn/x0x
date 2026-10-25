@@ -8159,7 +8159,8 @@ impl Agent {
                     // `Replaced` for that machine_id rather than serving out
                     // the full backoff window.
                     let lifecycle_hint = self.dm_lifecycle_hint(to).await;
-                    dm_send::send_via_gossip_with_provenance(
+                    let ack_wait_started = std::time::Instant::now();
+                    let sent = dm_send::send_via_gossip_with_provenance(
                         dm_send::DmSendContext {
                             pubsub: std::sync::Arc::clone(runtime.pubsub()),
                             signing: &signing,
@@ -8176,7 +8177,16 @@ impl Agent {
                         &config,
                         lifecycle_hint,
                     )
-                    .await
+                    .await;
+                    // Survivor re-key A12: how long v1 ACK waits cost, and how
+                    // many end without the ACK (`/diagnostics/dm`).
+                    if config.require_gossip_ack && !config.require_durable_app_ack {
+                        self.direct_messaging.record_v1_ack_wait(
+                            dm::millis_since(ack_wait_started),
+                            matches!(sent, Err(dm::DmError::Timeout { .. })),
+                        );
+                    }
+                    sent
                 }
                 None => Err(dm::DmError::LocalGossipUnavailable(
                     "send_direct: no gossip runtime configured".to_string(),

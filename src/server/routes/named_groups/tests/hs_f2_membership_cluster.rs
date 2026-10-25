@@ -5956,13 +5956,18 @@ async fn stale_base_treekem_joiner_owner_anchored_gap_is_not_fork_evidence() -> 
     assert!(queued, "the anchored terminal is queued for TreeKEM replay");
     let authority_hex = hex::encode(stage.authority.agent.agent_id().as_bytes());
     let prefix = format!("{}:{authority_hex}:", stage.group_id);
+    // Survivor re-key A12: the ask is registered before the apply returns;
+    // the bounded wait keeps this independent of that ordering.
     assert!(
-        joiner_state
-            .treekem_catchup_throttle
-            .read()
-            .await
-            .keys()
-            .any(|key| key.starts_with(&prefix)),
+        super::rekey_obligations::eventually(|| async {
+            joiner_state
+                .treekem_catchup_throttle
+                .read()
+                .await
+                .keys()
+                .any(|key| key.starts_with(&prefix))
+        })
+        .await,
         "TreeKEM catch-up was requested from the authority"
     );
     Ok(())

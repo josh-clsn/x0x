@@ -446,6 +446,7 @@ async fn an_unverified_page_asks_for_more_only_after_it_moved_the_head() -> Resu
     };
 
     unverified_page(&cast.s1, &s2_id, &group_id, vec![removal.clone()], true).await;
+    follow_ups_done(&cast.s1).await;
     assert_eq!(
         asked_s2(),
         1,
@@ -455,10 +456,12 @@ async fn an_unverified_page_asks_for_more_only_after_it_moved_the_head() -> Resu
     assert!(page_request_signed(&next), "the next request is signed");
 
     unverified_page(&cast.s1, &s2_id, &group_id, vec![removal], true).await;
+    follow_ups_done(&cast.s1).await;
     assert_eq!(asked_s2(), 1, "a replayed page asks nobody");
 
     let stranger = x0x::identity::AgentKeypair::generate()?.agent_id();
     unverified_page(&cast.s1, &stranger, &group_id, vec![rename], true).await;
+    follow_ups_done(&cast.s1).await;
     assert_eq!(roster(&cast.s1, &group_id).await.name, "Family");
     assert!(
         page_requests(&cast.s1)
@@ -556,6 +559,20 @@ async fn s2_hole_report(cast: &SurvivorRelay) -> TreeKemCatchupResponse {
     report
 }
 
+/// Survivor re-key A12: a truncated page's follow-up ask runs in its own
+/// task. Wait until every follow-up `state` started has returned.
+async fn follow_ups_done(state: &AppState) {
+    wait_until(|| {
+        state
+            .treekem_gap_catchups
+            .lock()
+            .expect("gap catch-ups")
+            .follow_ups_in_flight()
+            == 0
+    })
+    .await;
+}
+
 /// The peers `state` asked, in order, once `count` requests went out.
 async fn asked_peers(state: &AppState, count: usize) -> Vec<String> {
     wait_until(|| page_requests(state).len() >= count).await;
@@ -604,6 +621,7 @@ async fn a_hole_after_the_head_asks_another_member() -> Result<()> {
             .await
             .expect("the owner serves S1");
         handle_treekem_catchup_response(&cast.s1, &owner_id, false, page).await;
+        follow_ups_done(&cast.s1).await;
         request = match page_requests(&cast.s1)
             .into_iter()
             .rev()

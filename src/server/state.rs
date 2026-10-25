@@ -1469,6 +1469,14 @@ pub(super) struct NamedGroupTestRecorders {
     /// Survivor re-key A10: every bounded resend schedule started, as
     /// `(event kind, recipients)`.
     pub(super) control_redelivery_recipients: StdMutex<Vec<(&'static str, Vec<String>)>>,
+    /// Survivor re-key A12 (review m-1): seated-member resend schedules (no
+    /// republish), as `(event kind, recipients)`.
+    pub(super) seated_member_resends: StdMutex<Vec<(&'static str, Vec<String>)>>,
+    /// Survivor re-key A12: every gap ask registered, as `(peer hex, the
+    /// revision it was asked from)`, recorded before the apply returns.
+    pub(super) gap_asks: StdMutex<Vec<(String, u64)>>,
+    /// Survivor re-key A12: follow-up page asks started.
+    pub(super) follow_ups_started: std::sync::atomic::AtomicUsize,
     /// Survivor re-key A12: when set, `send_page_request` records the
     /// request and then waits on this semaphore instead of sending, so a
     /// test plays a peer that does not answer. Closing it releases them.

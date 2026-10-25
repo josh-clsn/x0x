@@ -128,6 +128,14 @@ present (`null` until a v2 ACK has been published). `ack_publish_route_failed`
 is the same counter as `stats.ack_publish_route_failed` and is also present
 at the top level so a Tester can capture both keys on every durable 200/504.
 
+`stats.v1_ack_waits` and `stats.v1_ack_wait_ms` count the sender's
+gossip-inbox sends that waited for a v1 (non-durable) recipient ACK, and the
+milliseconds they took from the first publish to the outcome.
+`stats.v1_ack_wait_timeouts` and `stats.v1_ack_wait_timeout_ms` are the subset
+that ended without the ACK. A leaf recipient's v1 ACK has no Direct hedge, so
+a lost ACK counts here even when the message arrived (survivor re-key A12,
+`docs/adr/transient/T-catchup-off-the-apply-path.md`).
+
 `stats.ack_publish_route_failed` increments when the ACK never left this
 recipient: both first-success hedge routes failed, or the bounded publisher
 could not schedule the job (full queue / stopped worker). Read the pair as:

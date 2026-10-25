@@ -64,21 +64,21 @@ use routes::{
     get_group_public_messages, get_group_state, get_group_state_commits, get_join_result_inline,
     get_kv_value, get_mls_group, get_named_group, get_named_group_members, get_profile,
     get_sync_devices, gossip_diagnostics, group_membership_lock, groups_diagnostics,
-    handle_control_blob_message, handle_file_message, handle_treekem_catchup_response, health,
-    history_diagnostics, history_list, history_message, history_purge, history_scopes,
-    history_search, history_stats, identity_revocations, identity_revoke, import_agent_card,
-    import_group_card, ingest_public_message, introduction, join_group_via_invite, join_kv_store,
-    leave_group, list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys,
-    list_kv_stores, list_machines, list_mls_groups, list_named_groups, list_revocations,
-    list_task_lists, list_tasks, listener_restart_context, load_causal_approval_queue,
-    load_join_result_staging, load_named_groups_merged, load_predecessor_relay_outbox,
-    load_requester_offer_outbox, load_treekem_member_key_packages, machine_for_agent_handler,
-    machines_by_user_handler, mesh_join, mesh_quiesce, migrate_unsplit_home_suite_store_if_needed,
-    mls_decrypt, mls_encrypt, named_group_metadata_event_group_id, named_group_metadata_event_kind,
-    network_status, now_millis_u64, owner_agents, owner_agents_issue, owner_agents_revoke,
-    owner_riders_issue, owner_riders_list, owner_riders_revoke, peer_health_handler, peers,
-    pin_machine, presence, presence_find, presence_foaf, presence_online, presence_status,
-    probe_peer_handler, publish, publish_group_card_to_discovery, put_kv_value, quick_trust,
+    handle_control_blob_message, handle_file_message, health, history_diagnostics, history_list,
+    history_message, history_purge, history_scopes, history_search, history_stats,
+    identity_revocations, identity_revoke, import_agent_card, import_group_card,
+    ingest_public_message, introduction, join_group_via_invite, join_kv_store, leave_group,
+    list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys, list_kv_stores,
+    list_machines, list_mls_groups, list_named_groups, list_revocations, list_task_lists,
+    list_tasks, listener_restart_context, load_causal_approval_queue, load_join_result_staging,
+    load_named_groups_merged, load_predecessor_relay_outbox, load_requester_offer_outbox,
+    load_treekem_member_key_packages, machine_for_agent_handler, machines_by_user_handler,
+    mesh_join, mesh_quiesce, migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
+    named_group_metadata_event_group_id, named_group_metadata_event_kind, network_status,
+    now_millis_u64, owner_agents, owner_agents_issue, owner_agents_revoke, owner_riders_issue,
+    owner_riders_list, owner_riders_revoke, peer_health_handler, peers, pin_machine, presence,
+    presence_find, presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
+    publish_group_card_to_discovery, put_kv_value, quick_trust,
     reconcile_treekem_self_leave_rekeys_all_groups, recover_home_suite_sidecar_journals,
     recover_treekem_named_journals, reject_join_request, reject_unverified_direct_public_message,
     relay_diagnostics, remove_mls_member, remove_named_group_member,
@@ -98,8 +98,7 @@ use routes::{
     withdraw_group_state, AtomicWriteOutcome, ControlBlobMessage, ControlBlobState,
     JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent, PendingListenerAdmission,
     PredecessorRelayObligation, PublicGroupBootstrap, SelfPublishedReleaseManifests,
-    StartupUpdateCheckRuntime, TreeKemCatchupRequest, TreeKemCatchupResponse,
-    CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
+    StartupUpdateCheckRuntime, CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
     CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
     CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
     DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
@@ -2229,39 +2228,17 @@ pub async fn serve_with_options(
 
     // Background TreeKEM catch-up listener — explicit anti-entropy for
     // order-sensitive membership events that arrive before local readiness or
-    // ahead of the local epoch/state frontier.
+    // ahead of the local epoch/state frontier. Survivor re-key A12: requests
+    // are answered side by side (a bounded few at once, one per proven
+    // requester), and a response's follow-up ask runs in its own task, so
+    // this reader waits on no send.
     {
         let catchup_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
             let mut rx = catchup_state.agent.subscribe_direct();
             loop {
                 let Some(msg) = rx.recv().await else { break };
-                if let Ok(request) = serde_json::from_slice::<TreeKemCatchupRequest>(&msg.payload) {
-                    // Survivor re-key A12: answered side by side, a bounded
-                    // few at once and one per requester, so a requester that
-                    // went away holds up neither this reader nor the others.
-                    if request.message_type == "treekem_catchup_request" {
-                        routes::named_groups::dispatch_treekem_catchup_request(
-                            &catchup_state,
-                            msg.sender,
-                            msg.verified,
-                            request,
-                        );
-                    }
-                    continue;
-                }
-                if let Ok(response) = serde_json::from_slice::<TreeKemCatchupResponse>(&msg.payload)
-                {
-                    if response.message_type == "treekem_catchup_response" {
-                        handle_treekem_catchup_response(
-                            &catchup_state,
-                            &msg.sender,
-                            msg.verified,
-                            response,
-                        )
-                        .await;
-                    }
-                }
+                routes::named_groups::on_catchup_direct_message(&catchup_state, &msg).await;
             }
         }));
     }
