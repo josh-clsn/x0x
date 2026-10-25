@@ -8140,13 +8140,17 @@ async fn real_invite_stale_base_gap_is_classified_anchored_and_queued() -> Resul
     assert!(queued, "the anchored terminal is queued for replay");
     let authority_hex = hex::encode(stage.authority.agent.agent_id().as_bytes());
     let prefix = format!("{}:{authority_hex}:", stage.group_id);
+    // Survivor re-key A12: the ask runs in the room's flight, off the apply.
     assert!(
-        joiner_state
-            .treekem_catchup_throttle
-            .read()
-            .await
-            .keys()
-            .any(|k| k.starts_with(&prefix)),
+        super::rekey_obligations::eventually(|| async {
+            joiner_state
+                .treekem_catchup_throttle
+                .read()
+                .await
+                .keys()
+                .any(|k| k.starts_with(&prefix))
+        })
+        .await,
         "TreeKEM catch-up was requested from the authority"
     );
     Ok(())
