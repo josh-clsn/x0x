@@ -120,3 +120,11 @@ A5 (`T-signed-catchup-pages`) settles this. A page starts at `from_revision + 1`
 - `a4_a_joiner_logs_the_events_its_join_result_carries`.
 
 All three failed under the active-member check.
+
+## Measured delta
+
+- **Before:** the log lived in memory only and held four kinds, so a restart emptied it and a member that missed a rename, a policy or a role change could not link a later commit.
+- **After:** every commit-bearing kind is a file under `<data>/treekem/event-log/`, kept across restarts: at most 128 events and 64 MiB per room, 256 MiB in all, none over 512 KiB, with the highest lost revision recorded in `evicted-through`.
+- **Pinned by:** `event_log_survives_restart_and_serves_catchup`, `survivor_who_missed_a_rename_and_a_removal_converges` (failed at the A3 tip), `event_log_holds_every_commit_bearing_kind`, `per_room_and_daemon_wide_caps_hold`, `a_gap_past_the_cap_is_not_served_and_says_so`.
+- **Recorded at A4 (`053a1788`):** `named_groups` 1060 passed, 1 failed (the GSS timing test).
+- **Not `GroupInfo::commit_log`.** This log (`AppState::treekem_event_log`, files under `event-log/`) holds the events that carry commits. `GroupInfo::commit_log` is the #111 retained-commit history, which holds each commit with its roster. `admins_since` and the `prove_held` check read `commit_log`; catch-up serving and the re-key obligation payload read this log.

@@ -20,6 +20,24 @@
     }
   },
   {
+    "method": "GET",
+    "path": "/groups/:id/stores/:app/legacy-imports/:source_id",
+    "cli_name": "group store legacy download",
+    "description": "Download the exact reviewed legacy Wiki/Web snapshot without changing it",
+    "category": "stores",
+    "request": {
+      "fields": [
+        {
+          "cli": "default",
+          "in": "query",
+          "name": "idempotency_key",
+          "required": false
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
     "method": "POST",
     "path": "/shutdown",
     "cli_name": "stop",
@@ -34,6 +52,16 @@
     "path": "/auth/session",
     "cli_name": "auth session",
     "description": "Exchange the durable API token for a short-lived browser session token",
+    "category": "status",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/auth/session/refresh",
+    "cli_name": "auth refresh",
+    "description": "Swap a live session token for a fresh one (12h cap from the original mint)",
     "category": "status",
     "request": {
       "kind": "none"
@@ -806,6 +834,26 @@
     }
   },
   {
+    "method": "POST",
+    "path": "/mesh/join",
+    "cli_name": "mesh join",
+    "description": "Dial the gossip mesh (bootstrap phases)",
+    "category": "network",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/mesh/quiesce",
+    "cli_name": "mesh quiesce",
+    "description": "Disconnect all mesh peers and latch the mesh off until mesh join",
+    "category": "network",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
     "method": "GET",
     "path": "/diagnostics/connectivity",
     "cli_name": "diagnostics connectivity",
@@ -862,7 +910,15 @@
     "description": "Direct-message send/receive counters and per-peer health",
     "category": "network",
     "request": {
-      "kind": "none"
+      "fields": [
+        {
+          "cli": "default",
+          "in": "query",
+          "name": "agent",
+          "required": false
+        }
+      ],
+      "kind": "fields"
     }
   },
   {
@@ -1747,6 +1803,80 @@
   },
   {
     "method": "POST",
+    "path": "/calls",
+    "cli_name": "call",
+    "description": "Ring an agent (audio, optionally video); callee must pass trust and connect-ACL gates",
+    "category": "calls",
+    "request": {
+      "fields": [
+        {
+          "cli": "AGENT_ID",
+          "in": "body",
+          "name": "agent_id",
+          "required": true
+        },
+        {
+          "cli": "default",
+          "in": "body",
+          "name": "video",
+          "required": false
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/calls",
+    "cli_name": "call list",
+    "description": "List calls with gate and lifecycle counters",
+    "category": "calls",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/calls/:id",
+    "cli_name": "call show",
+    "description": "Show one call's lifecycle state",
+    "category": "calls",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/calls/:id/accept",
+    "cli_name": "call accept",
+    "description": "Answer a ringing incoming call",
+    "category": "calls",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/calls/:id/reject",
+    "cli_name": "call reject",
+    "description": "Decline a ringing incoming call",
+    "category": "calls",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/calls/:id/hangup",
+    "cli_name": "call hangup",
+    "description": "End or cancel a call",
+    "category": "calls",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
     "path": "/mls/groups",
     "cli_name": "groups create",
     "description": "Create encrypted group",
@@ -2127,6 +2257,30 @@
   },
   {
     "method": "POST",
+    "path": "/groups/:id/quarantine/clear",
+    "cli_name": "groups quarantine clear",
+    "description": "Manually clear the local fork-quarantine marker (owner-key node clear or --force with --reason)",
+    "category": "named-groups",
+    "request": {
+      "fields": [
+        {
+          "cli": "default",
+          "in": "body",
+          "name": "force",
+          "required": false
+        },
+        {
+          "cli": "--reason",
+          "in": "body",
+          "name": "reason",
+          "required": false
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
+    "method": "POST",
     "path": "/groups/join",
     "cli_name": "group join",
     "description": "Join group via invite (mode=home with --home --owner pins the expected Home owner, #468/#469)",
@@ -2361,6 +2515,154 @@
     "category": "named-groups",
     "request": {
       "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/groups/:id/apply-metadata-event",
+    "cli_name": "group apply-metadata-event",
+    "description": "Apply a relay-delivered group metadata event locally (non-gossip path)",
+    "category": "named-groups",
+    "request": {
+      "fields": [
+        {
+          "cli": "default",
+          "in": "body",
+          "name": "event_b64",
+          "required": true
+        },
+        {
+          "cli": "--sender",
+          "in": "body",
+          "name": "sender_agent_id",
+          "required": true
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/groups/:id/join-result/:member",
+    "cli_name": "group join-result",
+    "description": "Staged authoritative MemberAdded with the TreeKEM Welcome inlined",
+    "category": "named-groups",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/groups/:id/join-result/:member",
+    "cli_name": "group apply-join-result",
+    "description": "Apply a relay-delivered join-result (inline Welcome) into local TreeKEM state",
+    "category": "named-groups",
+    "request": {
+      "fields": [
+        {
+          "cli": "default",
+          "in": "body",
+          "name": "event_b64",
+          "required": true
+        },
+        {
+          "cli": "--sender",
+          "in": "body",
+          "name": "sender_agent_id",
+          "required": true
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/groups/:id/treekem/catch-up",
+    "cli_name": "group treekem-catch-up",
+    "description": "Challenge the named agents and the roster admins for where the room's key stands (durable token)",
+    "category": "named-groups",
+    "request": {
+      "fields": [
+        {
+          "cli": "default",
+          "in": "body",
+          "name": "observed_epoch",
+          "required": false
+        },
+        {
+          "cli": "default",
+          "in": "body",
+          "name": "challenge",
+          "required": false
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/groups/:id/treekem/catch-up",
+    "cli_name": "group treekem-state",
+    "description": "This daemon's TreeKEM head, the admins of every state applied since a revision, presence facts, and the open round",
+    "category": "named-groups",
+    "request": {
+      "fields": [
+        {
+          "cli": "default",
+          "in": "query",
+          "name": "since_revision",
+          "required": true
+        },
+        {
+          "cli": "default",
+          "in": "query",
+          "name": "since_state_hash",
+          "required": false
+        },
+        {
+          "cli": "default",
+          "in": "query",
+          "name": "since_presence_mark",
+          "required": false
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/groups/:id/treekem/head-proof",
+    "cli_name": "group treekem-head-proof",
+    "description": "Sign this daemon's head proof for a requester's own signed challenge (durable token)",
+    "category": "named-groups",
+    "request": {
+      "fields": [
+        {
+          "cli": "json-doc",
+          "in": "body",
+          "name": "request",
+          "required": true
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/groups/:id/treekem/head-proof/accept",
+    "cli_name": "group treekem-head-proof-accept",
+    "description": "Record an admin's head proof in this member's open round (durable token)",
+    "category": "named-groups",
+    "request": {
+      "fields": [
+        {
+          "cli": "json-doc",
+          "in": "body",
+          "name": "proof",
+          "required": true
+        }
+      ],
+      "kind": "fields"
     }
   },
   {
@@ -2791,7 +3093,7 @@
     "method": "POST",
     "path": "/groups/:id/stores",
     "cli_name": "group store create",
-    "description": "Open a group-scoped encrypted store bound to a named secure group (#341); member-gated, group must be MlsEncrypted on the GSS plane",
+    "description": "Open a creator-anchored group store: signed plaintext for SignedPublic, encrypted for MlsEncrypted GSS; current group policy gates writes",
     "category": "stores",
     "request": {
       "fields": [
@@ -2799,6 +3101,40 @@
           "cli": "NAME",
           "in": "body",
           "name": "name",
+          "required": true
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/groups/:id/stores/:app/legacy-imports",
+    "cli_name": "group store legacy imports",
+    "description": "List local legacy Wiki/Web snapshots with durable import and local sync-publication status",
+    "category": "stores",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/groups/:id/stores/:app/legacy-imports/:source_id",
+    "cli_name": "group store legacy import",
+    "description": "Import a reviewed local legacy Wiki/Web snapshot and offer its retained history for shared-space sync",
+    "category": "stores",
+    "request": {
+      "fields": [
+        {
+          "cli": "default",
+          "in": "body",
+          "name": "source_digest",
+          "required": true
+        },
+        {
+          "cli": "default",
+          "in": "body",
+          "name": "idempotency_key",
           "required": true
         }
       ],
@@ -2941,7 +3277,7 @@
     "method": "GET",
     "path": "/upgrade",
     "cli_name": "upgrade",
-    "description": "Daemon-side check for updates over x0x/release manifests (the CLI x0x upgrade is a standalone GitHub updater and does not call this)",
+    "description": "Daemon-side check for updates over x0x/release manifests (CLI x0x upgrade --check reads GitHub directly)",
     "category": "upgrade",
     "request": {
       "kind": "none"
@@ -2951,7 +3287,7 @@
     "method": "POST",
     "path": "/upgrade/apply",
     "cli_name": "upgrade --apply",
-    "description": "Daemon applies the latest verified release manifest with transactional restart (CLI x0x upgrade applies via its standalone GitHub path instead)",
+    "description": "Daemon applies the latest verified release manifest with transactional restart (CLI x0x upgrade --apply refuses and directs callers here)",
     "category": "upgrade",
     "request": {
       "kind": "none"
@@ -3067,6 +3403,166 @@
     "cli_name": "streams",
     "description": "Active forward-stream count + connect-ACL counters",
     "category": "connect",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/acl/connect",
+    "cli_name": "acl connect list",
+    "description": "List connect ACL entries (TOML floor + API-managed) and reload status",
+    "category": "acl",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/acl/connect",
+    "cli_name": "acl connect add",
+    "description": "Add an API-managed connect ACL entry (TOML entry schema as JSON)",
+    "category": "acl",
+    "request": {
+      "kind": "passthrough"
+    }
+  },
+  {
+    "method": "DELETE",
+    "path": "/acl/connect/:id",
+    "cli_name": "acl connect rm",
+    "description": "Remove an API-managed connect ACL entry (floor entries: 409)",
+    "category": "acl",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/acl/exec",
+    "cli_name": "acl exec list",
+    "description": "List exec ACL entries (TOML floor + API-managed) and reload status",
+    "category": "acl",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/acl/exec",
+    "cli_name": "acl exec add",
+    "description": "Add an API-managed exec ACL entry (TOML entry schema as JSON)",
+    "category": "acl",
+    "request": {
+      "kind": "passthrough"
+    }
+  },
+  {
+    "method": "DELETE",
+    "path": "/acl/exec/:id",
+    "cli_name": "acl exec rm",
+    "description": "Remove an API-managed exec ACL entry (floor entries: 409)",
+    "category": "acl",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/acl/reload",
+    "cli_name": "acl reload",
+    "description": "Re-read the connect/exec ACL floors and overlays; rejects keep the last good ACL",
+    "category": "acl",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/grants",
+    "cli_name": "grant list",
+    "description": "List share grants this install's owner issued, with status",
+    "category": "grants",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "POST",
+    "path": "/grants",
+    "cli_name": "grant issue",
+    "description": "Sign a share grant with the owner key, store it, and deliver it by durable DM",
+    "category": "grants",
+    "request": {
+      "fields": [
+        {
+          "cli": "json-doc",
+          "in": "body",
+          "name": "grantee_user",
+          "required": false
+        },
+        {
+          "cli": "json-doc",
+          "in": "body",
+          "name": "grantee_agent",
+          "required": false
+        },
+        {
+          "cli": "json-doc",
+          "in": "body",
+          "name": "agents",
+          "required": true
+        },
+        {
+          "cli": "json-doc",
+          "in": "body",
+          "name": "caps",
+          "required": true
+        },
+        {
+          "cli": "json-doc",
+          "in": "body",
+          "name": "not_before",
+          "required": false
+        },
+        {
+          "cli": "json-doc",
+          "in": "body",
+          "name": "expiry",
+          "required": false
+        },
+        {
+          "cli": "json-doc",
+          "in": "body",
+          "name": "ttl_secs",
+          "required": false
+        },
+        {
+          "cli": "json-doc",
+          "in": "body",
+          "name": "deliver_to",
+          "required": false
+        }
+      ],
+      "kind": "fields"
+    }
+  },
+  {
+    "method": "DELETE",
+    "path": "/grants/:id",
+    "cli_name": "grant revoke",
+    "description": "Revoke a share grant (owner key; gossiped on x0x.revocation.v3)",
+    "category": "grants",
+    "request": {
+      "kind": "none"
+    }
+  },
+  {
+    "method": "GET",
+    "path": "/grants/received",
+    "cli_name": "grant received",
+    "description": "List share grants that name this install as grantee",
+    "category": "grants",
     "request": {
       "kind": "none"
     }

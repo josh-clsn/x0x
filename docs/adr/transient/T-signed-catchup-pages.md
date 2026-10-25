@@ -108,3 +108,10 @@ A signed targeted reply (#398) authenticates its sender, so its hash-anchored Ke
 - `a_large_catchup_throttle_drops_expired_keys_on_the_next_stamp`
 
 Unit tests: `signed_catchup::tests::the_sign_input_names_its_domain_and_every_field`, `a_page_holds_at_least_one_event_and_at_most_the_cap`, and the `catchup_page_gap` page, hole and `GapAsks` window tests.
+
+## Measured delta
+
+- **Before:** a responder dropped every page request it could not verify, and a requester dropped every page it could not verify, so a phone never pulled a missed commit over x0x. An unsigned `limit` let a replay cut a requester off.
+- **After:** a page request carries the requester's ML-DSA-65 key and a signature (domain `x0x/treekem-catchup-page/v1`) over its head, `limit` and challenge. A responder serves a signed request over an unverified transport. A requester applies an unverified page only by each event's signer, and asks another member when a page leaves a hole.
+- **Pinned by:** `unverified_signed_page_request_is_served`, `unverified_unsigned_page_request_is_not`, `a_signed_request_from_a_removed_member_is_refused`, `a_removed_member_impersonating_the_remover_installs_nothing`, `a_hole_after_the_head_asks_another_member`, `a_replayed_request_cannot_cut_the_requester_off` (all in `named_groups/tests/signed_catchup.rs`).
+- **Recorded at A5 (`0234c3c7`):** `named_groups` 1098 passed, 0 failed.

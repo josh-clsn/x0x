@@ -95,3 +95,10 @@ A test-only seam, `NamedGroupTestRecorders::seal_force_err`, fails the next `sea
 
 - New: `named_groups/tests/treekem_bytes_binding.rs` (admin removal, add and approval suffix, renamed add, swapped KeyPackage hash, seal failure), `epoch_ahead_catchup.rs` (`catchup_third_party_relays_a_digest_bound_rekey`, upstream #1337; `a_survivor_relays_an_admin_removal_by_catch_up`), `issue1139_back_to_back_join.rs` (`ban_add_eviction_and_rekey_removal_seal_the_digest_binding`, `the_rekey_link_checks_the_bytes_its_removal_names`), and parser unit tests in `treekem_binding.rs`.
 - `relayed_removal_rejects_another_members_treekem_commit` now takes its removal from the real admin route. `catchup_legacy_binding_stays_with_the_author` seals the legacy form through a fixture, as a pre-A1 daemon would.
+
+## Measured delta
+
+- **Before:** every fork seal wrote `treekem:epoch=<n>`, which names no bytes. Only an event's author could deliver it, and an add's display name, KeyPackage hash and Welcome could be changed in transit.
+- **After:** every seal writes `treekem:epoch=<n>:commit=<blake3>:extras=<blake3>`. A copy with swapped TreeKEM bytes, or with a changed name, KeyPackage hash or Welcome, is refused from any sender.
+- **Pinned by:** `ban_add_eviction_and_rekey_removal_seal_the_digest_binding` (every seal site writes the form), `the_rekey_link_checks_the_bytes_its_removal_names`, `catchup_third_party_relays_a_digest_bound_rekey` (a third party delivers it), and the parser unit tests in `treekem_binding.rs`.
+- **Recorded at A1 (`12d29551`):** `named_groups` 1007 passed, 1 failed (a GSS timing test that passes alone); `case_1427` 24 of 24.

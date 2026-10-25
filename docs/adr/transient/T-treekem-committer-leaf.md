@@ -85,3 +85,10 @@ So every TreeKEM seal site refuses first when the local seat commits no package 
 - No wire change and no flag day of its own. Old daemons produce commits from their own leaf, which pass.
 - A legacy-bound TreeKEM event that carries another leaf's commit is refused at every door, including the two engine-A doors that take a claimed sender. This closes the attack in the A1 review's I-1: a removed member's own commit. It did not close every legacy pairing: a legacy-bound removal could still carry a different genuine commit from the same actor at the same epoch (one rolled back after publishing, or a fork). Since A3 the door also checks that a removal's or ban's commit leaves its target with no leaf, whenever this member holds the target's package (`departing_leaf_not_blank`).
 - The tests are in `named_groups/tests/committer_leaf.rs`, `named_groups/committer_leaf.rs`, `named_groups/welcome_key_packages.rs` and `src/mls/treekem.rs`.
+
+## Measured delta
+
+- **Before:** `process_commit` accepted a commit from any member's leaf, so a member could deliver the actor's event with a commit made from its own leaf, and a removed member could hand a survivor the admin's legacy removal of itself carrying its own commit.
+- **After:** a commit applies only when its committer leaf is the leaf of the actor's committed KeyPackage in the live tree, at every door including the two engine-A doors. A sealer whose own seat commits no package hash refuses to seal (409 `sealer_key_package_uncommitted`).
+- **Pinned by:** `a_commit_from_another_members_leaf_is_refused`, `a_commit_from_the_actors_leaf_applies`, `a_legacy_removal_carrying_the_removed_members_commit_is_refused`, `an_actor_without_a_committed_package_is_refused`, `a_sealer_whose_seat_commits_no_package_refuses_to_seal` (all in `named_groups/tests/committer_leaf.rs`).
+- **Recorded at A2 (`6646bd1c`):** `named_groups` 1023 passed, 1 failed (the GSS timing test); `case_1427` 9 of 9.

@@ -4,6 +4,69 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **A re-key stays owed to every survivor until the survivor proves it holds
+  it (survivor re-key).** When this daemon removes, bans or adds a member, or
+  re-keys after a leave, it records the re-key for each other active member in
+  `<data>/treekem/rekey-obligations.json` and resends until the member proves
+  its head by a signed request, a head-proof challenge, or a message at the
+  new epoch. It survives restarts and absences longer than the old 60 s
+  resend schedule. At most 4 sends run at once; caps are 256 per room and 4096
+  in all. An unreadable file is renamed aside and every other active member of
+  each room this daemon administers is owed the current epoch instead.
+- **A survivor that applies a re-key sends its author a signed page request
+  from its head (survivor re-key).** It does this once per room per 5 s, and
+  only to an active, unbanned admin.
+- **`GET /groups/:id/treekem/catch-up` reports `rekey_obligations`.** The block
+  is `{owed, unproven, room_owed, room_unproven, unreadable_file_set_aside}`.
+- **New routes for asking a room's admins where its key stands.**
+  `POST /groups/:id/treekem/catch-up` opens a round and returns the signed
+  challenge request. `GET` reports the live head and its
+  `epoch_authenticator`, the admins of every state since an anchor
+  (`admins_since`, `admins_since_complete`, `admins_since_too_large`),
+  `fork_quarantined`, `run_id`, `connected_admins`, `admin_links`,
+  `suspended_since_last_get`, `presence_mark` (passed back as
+  `since_presence_mark`) and the open round. `POST .../head-proof` signs a head
+  proof and `POST .../head-proof/accept` records one. The routes are
+  `x0x group treekem-catch-up`, `treekem-state`, `treekem-head-proof` and
+  `treekem-head-proof-accept`. The endpoint registry goes from 206 to 210.
+  Every refusal carries `reason` and `retry` (`later`, `new_round` or `never`).
+- **Epoch-ahead catch-up (ported from upstream #1449 and #1464).** A member
+  whose traffic shows a later epoch asks the owner and admins first, then the
+  other members, until every candidate has been asked.
+
+### Changed
+
+- **Flag day: every TreeKEM seal now names its bytes.** The `security_binding`
+  is `treekem:epoch=<n>:commit=<blake3>:extras=<blake3>`. A daemon at the
+  previous pin refuses a removal, ban or re-key removal sealed this way, so all
+  devices of a room must move together.
+- **Any member can hand on any signed commit.** A removal, ban, add, approval,
+  rename, policy, role or unban change applies as its signer when it arrives
+  from another member, if its binding names its TreeKEM bytes. A legacy-bound
+  event still applies only from its author over a verified transport. A
+  join-request lifecycle event stays with its author.
+- **A TreeKEM commit must come from the committing actor's own leaf.** A commit
+  made from another member's leaf is refused, including a removed member's own
+  commit inside a legacy-bound removal.
+- **A member keeps the commits it applied across a restart.** The catch-up log
+  is on disk under `<data>/treekem/event-log/`: at most 128 events and 64 MiB
+  per room, 256 MiB in all, none over 512 KiB. A requester told the log
+  evicted what it needs is told so.
+- **A phone or resting agent can pull missed commits over x0x.** A page request
+  is signed (`x0x/treekem-catchup-page/v1`), so a responder serves one whose
+  transport is unverified. Pages it receives on an unverified transport apply
+  by their signer, never by the claimed sender.
+- **Admins prove where a room's key stands.** A responder answers a signed
+  challenge with a signed head proof (`x0x/treekem-head-proof/v1`) carrying the
+  epoch authenticator. At most 12 answers a minute per requester and room.
+- **`POST /groups/:id/apply-metadata-event` and `POST /groups/:id/join-result/:member`
+  answer 422 with a `reason`** for an event whose TreeKEM bytes its binding does
+  not name, and for a join-request lifecycle event.
+- **A TreeKEM seal route answers 409 `sealer_key_package_uncommitted`** when this
+  daemon's own seat commits no KeyPackage hash (groups made before #220).
+
 ## [v0.46.4] - 2026-10-06
 
 ### Changed

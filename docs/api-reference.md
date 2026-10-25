@@ -1267,6 +1267,10 @@ helper API.
 | PATCH | `/groups/:id/members/:agent_id/role` | `x0x group set-role <group_id> <agent_id> <role>` | Assign `admin` or `member` (admin-authored) |
 | POST | `/groups/:id/ban/:agent_id` | `x0x group ban <group_id> <agent_id>` | Ban a member (admin-authored) |
 | DELETE | `/groups/:id/ban/:agent_id` | `x0x group unban <group_id> <agent_id>` | Unban a member (admin-authored) |
+| POST | `/groups/:id/treekem/catch-up` | `x0x group treekem-catch-up <group_id> [--observed-epoch <n>] [--challenge <agent>...]` | **Survivor re-key**: open a head-proof round (durable token). See [TreeKEM catch-up, head proofs and re-key obligations](#treekem-catch-up-head-proofs-and-re-key-obligations) |
+| GET | `/groups/:id/treekem/catch-up` | `x0x group treekem-state <group_id> --since-revision <r> [--since-state-hash <h>] [--since-presence-mark <m>]` | **Survivor re-key**: this daemon's TreeKEM head, admins since a revision, fork-quarantine, presence facts, the open round and `rekey_obligations` |
+| POST | `/groups/:id/treekem/head-proof` | `x0x group treekem-head-proof <group_id> <file\|->` (the file holds the request body) | **Survivor re-key**: sign this daemon's head proof for a requester's own signed challenge (durable token) |
+| POST | `/groups/:id/treekem/head-proof/accept` | `x0x group treekem-head-proof-accept <group_id> <file\|->` (the file holds the request body) | **Survivor re-key**: record an admin's head proof in this member's open round (durable token) |
 | GET | `/groups/:id/requests` | `x0x group requests <group_id>` | List join requests (admin-only) |
 | POST | `/groups/:id/requests` | `x0x group request-access <group_id>` | Submit a join request |
 | POST | `/groups/:id/requests/:request_id/approve` | `x0x group approve-request <group_id> <request_id>` | Approve a join request (admin-authored) |
@@ -1711,6 +1715,184 @@ cross-decrypt; ban epoch-advance; post-ban forward secrecy). Convergence
 consideration, not a capability gap. Public encrypted presets
 (`public_request_secure`) and grandfathered groups remain on the legacy **GSS**
 plane. See `docs/primers/groups.md`.
+
+### TreeKEM catch-up, head proofs and re-key obligations
+
+These four routes (`POST` and `GET /groups/:id/treekem/catch-up`,
+`POST /groups/:id/treekem/head-proof`, `POST /groups/:id/treekem/head-proof/accept`)
+let an engine ask a TreeKEM room's admins where the room's key stands before it
+seals. They are registered in `ENDPOINTS` (`src/api/mod.rs`) and the router
+(`src/server/mod.rs`); the registry went from 206 to 210 endpoints with them.
+The design is in `docs/adr/transient/T-treekem-head-proof.md`; the page requests
+they ride on are in `T-signed-catchup-pages.md`.
+
+**Admission.**
+
+- The three `POST` routes need the durable API token. A session token is refused
+  at the auth middleware (`is_treekem_head_owner_path`, `src/server/auth.rs`) and
+  again in the handler (`admit_treekem_owner_route`, `src/server/group_access.rs`).
+  Rider tokens are refused.
+- `GET /groups/:id/treekem/catch-up` accepts a session token, refuses riders, and
+  needs this daemon to be an active member of the room
+  (`admit_treekem_catch_up_state`).
+- All four refuse a withdrawn room with 409 and an unknown room with 404. These
+  admission refusals, and axum's own extractor rejections (400/422, plain text),
+  carry no `retry` field.
+- All four are ADR-0066 control-plane routes: they keep answering in a
+  fork-quarantined room, because catch-up is how a room leaves a fork
+  (`adr0066_coverage_map.rs`).
+
+**`POST /groups/:id/treekem/catch-up`** opens a round. Body:
+`{"observed_epoch": <u64, optional>, "challenge": ["<64-hex agent id>", ...]}`.
+Each id in `challenge` is challenged, with every admin on this daemon's roster,
+and nobody else. An `observed_epoch` ahead of the live tree also starts this
+daemon's epoch-ahead catch-up. `202`:
+
+```json
+{"ok": true, "round": "<challenge>", "asked": ["<agent>", ...],
+ "request": { /* this member's signed page request carrying the challenge */ },
+ "catching_up": false}
+```
+
+`round` is an opaque id the GET reports back. `request` is for the engine to
+carry to an admin over the relay. A room opens at most one round per 5 s
+(`ROUND_MIN_GAP`).
+
+When no round opens, the response is a **hold**: the status below, and a body
+`{"ok": false, "error", "reason", "retry", "round": null, "asked": [], "hold": true}`.
+The room holds, and the trigger never opens a smaller round. A refusal other than
+`round_too_soon` also closes the room's previous round.
+
+**Retry hints.** Every `reason` the four routes produce carries a `retry` field:
+
+| `retry` | Meaning |
+|---|---|
+| `later` | The same request may succeed if sent again later. |
+| `new_round` | This request is spent and never succeeds; a new round (a fresh challenge from the requester's next trigger) may. |
+| `never` | Neither helps until something about the room changes (a member, a role, the plane), or the request is malformed. |
+
+Refusals of the trigger (`no_round_refusal`, `src/server/routes/named_groups/catchup_routes.rs`):
+
+| Status | `reason` | `retry` | When |
+|---|---|---|---|
+| 400 | `bad_challenge_agent` | `never` | an entry of `challenge` is not 64 hex |
+| 404 | `group_not_found` | `never` | no such room |
+| 409 | `not_an_active_member` | `never` | this daemon is not an active member |
+| 409 | `challenge_set_too_large` | `never` | the named agents and the roster admins exceed what a round holds (512) |
+| 409 | `not_a_treekem_room` | `later` on the TreeKEM plane (tree not installed yet), else `never` | this daemon holds no tree for the room |
+| 429 | `round_too_soon` | `later` | a round opened in this room less than 5 s ago; it stays open |
+| 503 | `no_challenge_counter` | `later` | the challenge counter could not be kept on disk |
+| 503 | `challenge_not_signed` | `later` | this member's challenge could not be signed |
+
+**`GET /groups/:id/treekem/catch-up?since_revision=<r>`** reports where this
+daemon's key for the room stands. Query: `since_revision` (required),
+`since_state_hash` (optional: the anchor must then be that very state for
+`admins_since_complete`), `since_presence_mark` (optional, below). `200`:
+
+| Field | Meaning |
+|---|---|
+| `group_id`, `revision`, `state_hash`, `security_binding`, `admins` | this daemon's roster (admins sorted, lowercase hex), unchanged while the tree was read |
+| `epoch`, `epoch_authenticator` | the live tree's epoch and its MLS exporter authenticator (hex), read in one borrow under the tree lock |
+| `admins_since` | the active admins of every state applied after `since_revision`, oldest first, each list sorted |
+| `admins_since_complete` | `false` when a state after the anchor may be missing; the engine must then hold |
+| `admins_since_too_large` | `true` (with `admins_since` empty and `admins_since_complete` false) when those states name more distinct admins than a round can challenge; also a hold |
+| `fork_quarantined`, `fork_quarantine` | whether the room is fork-quarantined here; when it is, `fork_quarantine` is `{"revision", "no_anchor"}`, otherwise `null`. Every seal is refused while it is, so the engine holds and says the room needs a new invite |
+| `run_id` | 32 hex digits, different on every daemon run. When it changes, the daemon restarted |
+| `started_at_ms` | the wall clock at the start, for display only. Two runs can share it; never subtract from it |
+| `connected_admins` | admins (of the live roster and of every state since the anchor), sorted, to which this daemon holds a live authenticated link |
+| `admin_links` | map from each connected admin to its link id (the connection's generation, as a decimal string). A link that dropped and came back between two GETs has a new id |
+| `suspended_since_last_get` | whether this daemon was suspended or frozen since the GET whose `presence_mark` was passed as `since_presence_mark` |
+| `presence_mark` | `"<run_id>:<count>"`; pass it back as `since_presence_mark` on the next GET |
+| `round` | the open round or `null`: `{"round", "asked", "heads", "conflicted"}`. `heads` is every distinct head recorded (each a verified claim, at most 4 per signer); `conflicted` lists the signers with more than one. When the round opened is not reported |
+| `rekey_obligations` | what this daemon still owes survivors of its own re-keys (below) |
+
+`admins_since` comes from the room's retained commits (`GroupInfo::commit_log`,
+issue #111), not from the catch-up event log. It is complete only when the first
+retained state after the anchor links by its signed `prev_state_hash` to the
+anchor, each later state links to the one before, every roster re-derives its
+commit's signed roster root, and the last state is the live roster
+(`admins_since`, `catchup_routes.rs`).
+
+`suspended_since_last_get` is `false` only on a platform with a verified suspend
+pair, when `since_presence_mark` names this run and no suspend or freeze has
+been counted since. No mark, another run's mark, or an unreadable mark reads
+`true`. On a platform with no verified pair it is always `true` and
+`connected_admins` and `admin_links` are empty; the engine stays in TTL mode. The
+daemon keeps no per-reader state, so each reader sees every suspend after its own
+mark. Linux and Android on bare metal are verified; Linux and Android under a
+hypervisor or WSL, macOS, and Windows are TTL-only (`src/server/presence_facts.rs`).
+
+Refusals of the GET: 409 `not_a_treekem_room` (as above, no hold fields), 503
+`unavailable` (`later`: the roster kept moving across three reads, or the tree's
+head could not be read).
+
+**`POST /groups/:id/treekem/head-proof`** signs this daemon's head proof for a
+requester's own signed challenge, as received over another path (the relay).
+Body: `{"request": <the requester's signed page request, as received>}`. It takes
+only the requester's signature over its challenge, so nobody else can move the
+requester's floor. `200 {"ok": true, "proof": {...}}`. Refusals:
+
+| Status | `reason` | `retry` |
+|---|---|---|
+| 400 | `no_challenge` (the request carries no `head_challenge`) | `never` |
+| 400 | `challenge_not_signed` | `never` |
+| 400 | `group_mismatch` (the request names another room) | `never` |
+| 400 | `bad_challenge` (the challenge does not open with a counter) | `never` |
+| 403 | `requester_not_active` | `never` |
+| 409 | `not_an_admin` (this daemon is not an active admin) | `never` |
+| 409 | `stale_challenge` (the requester has since sent a newer challenge) | `never` |
+| 409 | `not_a_treekem_room` | `later` or `never`, as above |
+| 429 | `rate_limited` (12 proofs a minute per requester and room) | `new_round` |
+| 429 | `repeat_too_soon` (the same challenge's proof was sent in the last 5 s) | `later` |
+| 503 | `unavailable` (signing failed, or the room moved while it was read) | `new_round` |
+
+A request signed over its head also settles this daemon's re-key obligation to
+the requester, as far as that head goes (below).
+
+**`POST /groups/:id/treekem/head-proof/accept`** records an admin's proof that
+reached the engine over another path, in this member's open round, under the
+rules of x0x delivery. Body: `{"proof": <HeadProof>}`. Always `200`:
+`{"ok": true, "recorded": true}`, or `{"ok": true, "recorded": false, "reason":
+"<reason>"}` with `reason` one of `no_round`, `other_nonce`, `late` (after the
+60 s round deadline), `not_for_this_round`, `not_asked`, `bad_signature`.
+
+#### `rekey_obligations` (status block)
+
+When this daemon re-keys a room (removal, ban, post-leave re-key, add, approval,
+OwnerCertified eviction, returning-member re-key), it records, for each other
+active member, that the re-key is owed until that member proves it holds it. The
+record is `<data>/treekem/rekey-obligations.json` (`OBLIGATIONS_FILE`). The
+catch-up GET reports:
+
+| Field | Meaning |
+|---|---|
+| `owed` | obligations this daemon holds, all rooms |
+| `unproven` | of those, the ones delivered but not yet proven (`delivered_unproven`) |
+| `room_owed`, `room_unproven` | the same counts for this room |
+| `unreadable_file_set_aside` | `null`, or the name `rekey-obligations.json.unreadable-<ms>` the unreadable file was renamed to at startup. If it could not be renamed the value is `rekey-obligations.json (not set aside: <error>)` and obligations are kept in memory only |
+
+When the file is unreadable, the daemon still starts and owes the current epoch
+to every other active member of each live TreeKEM room it administers. Caps: 256
+obligations per room, 4096 in all. A survivor that was refused for a cap, or
+because the file cannot be written, keeps the older blind redelivery schedule.
+`docs/adr/transient/T-survivor-rekey-obligation.md` has the schedule and what
+settles an obligation.
+
+#### Other changed responses (survivor re-key)
+
+- `409 {"ok": false, "error": "sealer_key_package_uncommitted", "detail"}` on a
+  route that seals a TreeKEM commit (removal, ban, add, approval, eviction,
+  re-key) when this daemon's own seat commits no KeyPackage hash
+  (`committer_leaf.rs`). It affects groups made before #220.
+- `POST /groups/:id/apply-metadata-event` and `POST /groups/:id/join-result/:member`
+  answer `422 {"ok": false, "error", "reason"}` for an event they can no longer
+  apply: `reason` is `needs_verified_signer_and_named_tree_bytes` (a TreeKEM event
+  whose binding does not name its bytes), `author_only_event_needs_verified_sender`
+  (a join-request lifecycle event), or on the first route
+  `recovery_courier_needs_verified_sender`, `secure_share_needs_verified_sender`,
+  `group_card_needs_verified_sender`, `unsigned_event_needs_verified_sender`
+  (`engine_a_apply_refusal`, `signer_delivery::admit`). Their sender is a claim by
+  the caller, so the event applies only as its verified signer.
 
 ## Collaborative task lists
 

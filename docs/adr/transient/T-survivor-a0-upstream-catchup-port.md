@@ -108,3 +108,11 @@ Not ported:
 - w3h: 631 lines plus 1 `mod` line.
 - Tests: 1151 lines in the new file, and 8 `responder_state_hash: None` lines in three existing test files.
 - A0b: `stores.rs` +54/-34 (`8f0f8018`), `lib.rs` +29/-6 (`f7ea0415`), and 476 added and 57 removed lines over 13 files (`4b0f927e`).
+
+## Measured delta
+
+Counts are those the task reports recorded at each commit; the gate at the branch head is in `.superpowers/survivor-rekey/fork-gate.txt`.
+
+- **Before** (fork pin `85bcca31`): a member whose traffic showed a later epoch started no catch-up when no membership event followed, and the #1337 rule for who may deliver a removal was missing. `cargo test -p x0x --lib epoch_ahead_catchup` did not compile (35 errors, all missing ported items).
+- **After** (A0 `051c8730`, A0b `047042c4`): 11 tests in that filter pass. `epoch_ahead_ciphertext_requests_catchup_and_converges` pins the trigger; `catchup_legacy_binding_stays_with_the_author` pins the #1337 rule. `case_1427` (`w3h_1427_*`) went from INFRA at the pin to 20 of 20 GREEN with the shim and 10 of 10 without.
+- No wire format and no public API changed, other than the one field upstream added.

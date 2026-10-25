@@ -93,3 +93,10 @@ The signed roster commit covers its group id and revision, the previous state ha
 - `named_groups/signer_delivery.rs` unit tests: the signer from any member, a forged actor, a tampered commit, TreeKEM bytes from a non-author, the lifecycle kinds, field dropping.
 - `named_groups/tests/signer_delivery.rs`: `a_survivor_delivers_a_ban`, `a_survivor_delivers_an_add`, `a_survivor_delivers_a_rename_policy_role_and_unban`, `a_legacy_bound_add_from_a_non_author_is_refused`, `a_forged_actor_field_authorises_nothing`, `join_request_lifecycle_stays_author_only`, `a_non_author_copy_applies_no_unbound_field`, the four engine-A door tests, `a_removal_whose_commit_keeps_the_target_is_refused`, and the two A2 m-4 route tests.
 - `named_groups/tests/owner_mandate.rs`: `a_copy_of_an_add_without_its_owner_mandate_is_refused` (review I-1).
+
+## Measured delta
+
+- **Before:** only a removal could reach a member through someone other than its author. A ban, add, rename, policy, role change or unban applied only from its author, and the engine-A doors applied a legacy-bound TreeKEM event as the caller's claimed sender.
+- **After:** every commit-bearing kind applies as its verified signer from any member when its binding names its TreeKEM bytes. The engine-A doors apply only as the verified signer and answer 422 with a `reason` otherwise. The join-request lifecycle stays author-only.
+- **Pinned by:** `a_survivor_delivers_a_ban`, `a_survivor_delivers_an_add`, `a_survivor_delivers_a_rename_policy_role_and_unban`, `a_legacy_bound_add_from_a_non_author_is_refused`, `a_forged_actor_field_authorises_nothing`, `join_request_lifecycle_stays_author_only` (all in `named_groups/tests/signer_delivery.rs`).
+- **Recorded at A3 (`9829edcb`):** `named_groups` 1048 passed, 1 failed (the GSS timing test); `case_1427` 6 of 6.

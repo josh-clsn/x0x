@@ -9,7 +9,7 @@ The series must keep these identical; any deviation is a regression, not a move.
 | File | Source command | What it pins |
 |---|---|---|
 | `server-routes.txt` | `x0x routes` | Full endpoint table (method/path/CLI/description) from the registry |
-| `server-routes.json` | `x0x routes --json` | Structured form (135 endpoints) |
+| `server-routes.json` | `x0x routes --json` | Structured form (210 endpoints) |
 
 After each extraction PR, re-run both commands and `diff` against the committed
 files — output must be **byte-identical**.
