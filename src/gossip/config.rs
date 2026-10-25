@@ -130,7 +130,15 @@ pub struct GossipConfig {
     /// warns and ignores a `true` there. Resolved once at startup by
     /// [`Self::apply_caps_consume_only`]; the pub/sub layer acts only on an
     /// explicit `Some(true)` on a Leaf.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// A value that is not a boolean reads as unset (so the `leaf_mode`
+    /// default applies), and the daemon loader warns about it; it never
+    /// stops the daemon.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_lenient_bool"
+    )]
     pub caps_consume_only: Option<bool>,
 
     /// Operator opt-in to Full (pass-through relay) participation.
@@ -164,6 +172,24 @@ fn deserialize_leaf_degree<'de, D: serde::Deserializer<'de>>(
     let value = i64::deserialize(deserializer)?;
     // Preserve out-of-range status until normalization can emit a warning.
     Ok(usize::try_from(value).unwrap_or(13))
+}
+
+/// `Some(b)` for a TOML boolean; `None` (unset) for any other value, so a
+/// mistyped optional switch falls back to its default instead of failing
+/// the whole config.
+fn deserialize_lenient_bool<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<bool>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Lenient {
+        Bool(bool),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Lenient::deserialize(deserializer)? {
+        Lenient::Bool(value) => Some(value),
+        Lenient::Other(_) => None,
+    })
 }
 
 const fn default_leaf_max_eager_degree() -> usize {
@@ -512,6 +538,23 @@ mod tests {
         let mut applied = unset;
         assert_eq!(applied.apply_caps_consume_only(false), None);
         assert_eq!(applied.caps_consume_only, Some(false));
+    }
+
+    /// Why: a mistyped `caps_consume_only` must not fail the whole config
+    /// (a restart loop over an optional switch). It reads as unset, so the
+    /// `leaf_mode` default applies; the daemon loader names the bad value.
+    #[test]
+    fn caps_consume_only_mistyped_value_reads_as_unset() {
+        for text in [
+            "caps_consume_only = \"yes\"",
+            "caps_consume_only = 1",
+            "caps_consume_only = [true]",
+            "caps_consume_only = { on = true }",
+        ] {
+            let parsed: GossipConfig = toml::from_str(text).expect("mistyped value still parses");
+            assert_eq!(parsed.caps_consume_only, None, "{text}");
+            assert!(parsed.resolved_caps_consume_only(true), "{text}");
+        }
     }
 
     /// Why: the backbone must forward caps, so a Full node never goes

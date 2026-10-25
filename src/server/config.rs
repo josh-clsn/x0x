@@ -175,6 +175,11 @@ pub fn warn_ignored_keys(ignored: &[String]) {
 /// therefore fatal at startup and in `--check`, not warn-only.
 pub const PLANE_KEYS: &[&str] = &["network_id", "mdns_enabled"];
 
+/// `(section, key)` booleans that read a mistyped value as unset rather
+/// than failing the parse. Only these are checked for
+/// [`ConfigFindings::ignored_values`].
+const LENIENT_BOOL_KEYS: &[(&str, &str)] = &[("gossip", "caps_consume_only")];
+
 /// Everything the loader found wrong with a daemon config (N7).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ConfigFindings {
@@ -183,6 +188,9 @@ pub struct ConfigFindings {
     pub misplaced_plane_keys: Vec<String>,
     /// Every other key the schema dropped, as dotted paths (#385).
     pub ignored_keys: Vec<String>,
+    /// Recognised keys whose value has the wrong type and was ignored in
+    /// favour of the default, as dotted paths (`gossip.caps_consume_only`).
+    pub ignored_values: Vec<String>,
     /// Root-owned keys placed under a sub-section (0.35.1 cleanup).
     pub misplacements: Vec<SectionMisplacement>,
 }
@@ -193,6 +201,7 @@ impl ConfigFindings {
     pub fn is_clean(&self) -> bool {
         self.misplaced_plane_keys.is_empty()
             && self.ignored_keys.is_empty()
+            && self.ignored_values.is_empty()
             && self.misplacements.is_empty()
     }
 
@@ -230,6 +239,12 @@ impl ConfigFindings {
             lines.push(format!(
                 "config key `{key}` is not a recognised setting and is ignored — \
                  check its name and section against `DaemonConfig` (src/server/state.rs)"
+            ));
+        }
+        for key in &self.ignored_values {
+            lines.push(format!(
+                "config key `{key}` must be true or false; the value is ignored and the \
+                 default applies (for caps_consume_only: follow leaf_mode)"
             ));
         }
         lines
@@ -270,6 +285,17 @@ pub fn analyze(content: &str) -> Result<(DaemonConfig, ConfigFindings), toml::de
         .into_iter()
         .filter(|path| !is_plane_path(path))
         .collect();
+    // Optional switches that read a mistyped value as unset (see
+    // `GossipConfig::caps_consume_only`) must still be named.
+    let ignored_values = LENIENT_BOOL_KEYS
+        .iter()
+        .filter(|(section, key)| {
+            root.get(*section)
+                .and_then(|table| table.get(*key))
+                .is_some_and(|value| !value.is_bool())
+        })
+        .map(|(section, key)| format!("{section}.{key}"))
+        .collect();
     let misplacements = diagnose_section_placement(&root)
         .into_iter()
         .filter(|m| !PLANE_KEYS.contains(&m.key.as_str()))
@@ -279,6 +305,7 @@ pub fn analyze(content: &str) -> Result<(DaemonConfig, ConfigFindings), toml::de
         ConfigFindings {
             misplaced_plane_keys,
             ignored_keys,
+            ignored_values,
             misplacements,
         },
     ))

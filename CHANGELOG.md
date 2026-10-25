@@ -12,7 +12,8 @@ All notable changes to this project will be documented in this file.
   publishes its own adverts, but sends no eager forward and no IHAVE for
   other nodes' caps. Unset follows `leaf_mode`; an explicit `true` or `false`
   overrides it, and a Full node always forwards (an explicit `true` there is
-  ignored with a warning). Caps forwarding was about 85% of a measured leaf's
+  ignored with a warning). A value that is not a boolean is ignored with a
+  warning and the `leaf_mode` default applies. Caps forwarding was about 85% of a measured leaf's
   upload (9.8 of 11.6 GB in 22 h). `GET /diagnostics/gossip` `relay_fanout`
   reports `consume_only`, `consume_only_msgs` and
   `consume_only_msgs_by_topic`. See

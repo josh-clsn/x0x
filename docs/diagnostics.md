@@ -258,6 +258,9 @@ leaf_mode = true
 caps_consume_only = false
 ```
 
+A value that is not `true` or `false` is ignored with a startup warning (and
+an `x0xd --check` finding), and the `leaf_mode` default applies.
+
 `GET /diagnostics/gossip` reports it under `relay_fanout`:
 
 ```bash

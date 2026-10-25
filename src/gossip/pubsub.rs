@@ -1586,8 +1586,10 @@ impl PubSubManager {
     /// meters only non-default validator verdicts. `consume_only`,
     /// `consume_only_msgs` and `consume_only_msgs_by_topic` report the caps
     /// consume-only arm (`[gossip] caps_consume_only`): messages on the
-    /// `x0x/caps/*` topics this Leaf delivered and did not forward. Byte accounting notes:
-    /// the IWANT serve path never records publish origin, so
+    /// `x0x/caps/*` topics this Leaf delivered and did not forward.
+    ///
+    /// Byte accounting notes: the IWANT serve path never records publish
+    /// origin, so
     /// `participation.relay_bytes` systematically understates relay egress
     /// once `LazyForward` is live — read `pubsub_stages.outbound_by_kind`
     /// `eager` (serves) + `ihave` (announces) alongside it. And
@@ -7623,8 +7625,9 @@ mod tests {
         got
     }
 
-    /// Line topology publisher → middle → downstream, hermetic (the wire is
-    /// the test recorder, as in `relay_fanout_wiring_lazy_relay_preserves_delivery`).
+    /// Line topology publisher → middle → downstream, hermetic. The wire is
+    /// the test recorder, as in
+    /// `relay_fanout_wiring_lazy_relay_preserves_delivery`.
     /// The middle node subscribes to `topic`, runs `config` through the real
     /// `configure_egress`, and has the downstream peer as its eager peer.
     async fn caps_line_run(
@@ -7939,6 +7942,239 @@ mod tests {
                 "{topic}: own publishes skip the verdict"
             );
         }
+    }
+
+    /// One node of a hermetic caps mesh: its manager, its peer id and one
+    /// live subscription per caps topic.
+    struct CapsMeshNode {
+        manager: PubSubManager,
+        peer: PeerId,
+        subs: Vec<Subscription>,
+    }
+
+    /// Build a hermetic mesh on the test recorder: every node subscribes to
+    /// all four caps topics, runs its config through the real
+    /// `configure_egress`, and has exactly its `links` neighbours as both
+    /// connected peers and topic peers.
+    async fn caps_mesh(
+        specs: Vec<(ParticipationMode, GossipConfig)>,
+        links: &[(usize, usize)],
+    ) -> Vec<CapsMeshNode> {
+        let mut managers = Vec::new();
+        for (mode, config) in specs {
+            let mut manager = PubSubManager::new_with_participation(
+                test_node().await,
+                test_signing(),
+                None,
+                mode,
+                "caps_mesh_test",
+            )
+            .expect("mesh manager");
+            manager
+                .configure_egress(&config)
+                .await
+                .expect("mesh egress config");
+            let peer =
+                saorsa_gossip_transport::GossipTransport::local_peer_id(manager.transport.as_ref());
+            managers.push((manager, peer));
+        }
+        let neighbours = |i: usize| -> Vec<PeerId> {
+            links
+                .iter()
+                .filter_map(|&(a, b)| match (a == i, b == i) {
+                    (true, _) => Some(managers[b].1),
+                    (_, true) => Some(managers[a].1),
+                    _ => None,
+                })
+                .collect()
+        };
+        let all_neighbours: Vec<Vec<PeerId>> = (0..managers.len()).map(neighbours).collect();
+        let mut nodes = Vec::new();
+        for ((manager, peer), peers) in managers.into_iter().zip(all_neighbours) {
+            *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+                peers: peers.clone(),
+                sends: Vec::new(),
+            });
+            let mut subs = Vec::new();
+            for topic in crate::dm_capability::CAPS_TOPIC_NAMES {
+                subs.push(manager.subscribe(topic.to_string()).await);
+                manager
+                    .set_topic_peers_for_test(TopicId::from_entity(topic.as_bytes()), peers.clone())
+                    .await;
+            }
+            nodes.push(CapsMeshNode {
+                manager,
+                peer,
+                subs,
+            });
+        }
+        nodes
+    }
+
+    /// Ferry every recorded send to the node that owns its destination, as
+    /// the transport would, until the wire has been quiet for 500 ms (five
+    /// IHAVE flushes) or 10 s pass. With `drop_anti_entropy`, the 30 s
+    /// anti-entropy exchange is cut, so only eager and IHAVE/IWANT paths
+    /// remain; its first tick lands at a random point, which would otherwise
+    /// make a "nothing propagates" assertion timing-dependent.
+    async fn pump_caps_mesh(nodes: &[CapsMeshNode], drop_anti_entropy: bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut quiet_since = tokio::time::Instant::now();
+        while tokio::time::Instant::now() < deadline
+            && quiet_since.elapsed() < Duration::from_millis(500)
+        {
+            for node in nodes {
+                for (dest, bytes) in drain_sends(&node.manager) {
+                    quiet_since = tokio::time::Instant::now();
+                    let anti_entropy = peek_pubsub_header(&bytes).is_some_and(|header| {
+                        header.kind == saorsa_gossip_types::MessageKind::AntiEntropy
+                    });
+                    if drop_anti_entropy && anti_entropy {
+                        continue;
+                    }
+                    if let Some(target) = nodes.iter().find(|n| n.peer == dest) {
+                        target.manager.handle_incoming(node.peer, None, bytes).await;
+                        // One frame at a time, as a real link paces them: sg
+                        // gives a relayed Bulk forward one in-flight send per
+                        // peer and skips a forward that finds it taken
+                        // (`outbound_budget_exhausted`), so a back-to-back
+                        // burst would test that budget, not consume-only.
+                        tokio::time::sleep(Duration::from_millis(15)).await;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// `node` publishes `CAPS_LINE_N` messages on each caps topic.
+    async fn publish_caps_from(node: &CapsMeshNode) {
+        for topic in crate::dm_capability::CAPS_TOPIC_NAMES {
+            for i in 0..CAPS_LINE_N {
+                node.manager
+                    .publish(topic.to_string(), Bytes::from(format!("{topic}#{i}")))
+                    .await
+                    .expect("own caps publish");
+            }
+        }
+    }
+
+    /// Per caps topic, how many of `CAPS_LINE_N` payloads `node` received.
+    async fn caps_received(node: &mut CapsMeshNode, wait: Duration) -> Vec<usize> {
+        let mut counts = Vec::new();
+        for sub in &mut node.subs {
+            counts.push(drain_payloads(sub, CAPS_LINE_N as usize, wait).await.len());
+        }
+        counts
+    }
+
+    fn eager_plus_ihave(manager: &PubSubManager) -> u64 {
+        kind_meter(manager, "eager").0 + kind_meter(manager, "ihave").0
+    }
+
+    /// WHY (review F1): the headline claim is that caps still converge
+    /// between consume-only leaves through a Full node. Leaf A and leaf B
+    /// are both consume-only and linked only to Full F. A's own caps must
+    /// reach B on all four topics through F's forwarding, and B must take
+    /// every one under the consume-only verdict. The per-topic counter on B
+    /// is what fails on a revert: delivery alone would pass either way.
+    #[tokio::test]
+    async fn caps_converge_leaf_to_leaf_through_a_full_node() {
+        let full = GossipConfig {
+            relay: true,
+            ..GossipConfig::default()
+        };
+        let mut nodes = caps_mesh(
+            vec![
+                (ParticipationMode::Leaf, leaf_mode_default_config()),
+                (ParticipationMode::Full, full),
+                (ParticipationMode::Leaf, leaf_mode_default_config()),
+            ],
+            &[(0, 1), (1, 2)],
+        )
+        .await;
+        let full_0 = eager_plus_ihave(&nodes[1].manager);
+        let b_0 = eager_plus_ihave(&nodes[2].manager);
+
+        publish_caps_from(&nodes[0]).await;
+        pump_caps_mesh(&nodes, false).await;
+
+        let received = caps_received(&mut nodes[2], Duration::from_secs(2)).await;
+        assert_eq!(
+            received,
+            vec![CAPS_LINE_N as usize; 4],
+            "leaf B gets every caps message leaf A published, through F"
+        );
+        assert!(
+            eager_plus_ihave(&nodes[1].manager) > full_0,
+            "the Full node forwarded"
+        );
+        assert_eq!(
+            eager_plus_ihave(&nodes[2].manager),
+            b_0,
+            "leaf B forwards nothing for others"
+        );
+        let b_diag = nodes[2].manager.relay_fanout_diagnostics();
+        for topic in crate::dm_capability::CAPS_TOPIC_NAMES {
+            assert_eq!(
+                b_diag["consume_only_msgs_by_topic"][topic], CAPS_LINE_N,
+                "{topic}: B took each under the consume-only verdict"
+            );
+        }
+        assert_eq!(
+            nodes[0].manager.relay_fanout_diagnostics()["consume_only_msgs"],
+            0,
+            "A's own publishes skip the verdict"
+        );
+        assert_eq!(
+            nodes[1].manager.relay_fanout_diagnostics()["consume_only"],
+            false
+        );
+    }
+
+    /// WHY (review F1, the documented limit): with no Full node on the path,
+    /// a chain of consume-only leaves A - B - C does not carry A's caps to C.
+    /// B delivers them locally and forwards nothing, eager or IHAVE, so C
+    /// receives none. Only the 30 s anti-entropy exchange can repair it; the
+    /// pump cuts that exchange, so the assertion is about the eager and IHAVE
+    /// paths alone (the residual is documented, not pinned). Before the
+    /// change B eager-forwarded and C got all of them, so this fails on a
+    /// revert.
+    #[tokio::test]
+    async fn caps_do_not_cross_a_chain_of_consume_only_leaves() {
+        let mut nodes = caps_mesh(
+            vec![
+                (ParticipationMode::Leaf, leaf_mode_default_config()),
+                (ParticipationMode::Leaf, leaf_mode_default_config()),
+                (ParticipationMode::Leaf, leaf_mode_default_config()),
+            ],
+            &[(0, 1), (1, 2)],
+        )
+        .await;
+        let b_0 = eager_plus_ihave(&nodes[1].manager);
+
+        publish_caps_from(&nodes[0]).await;
+        pump_caps_mesh(&nodes, true).await;
+
+        assert_eq!(
+            caps_received(&mut nodes[1], Duration::from_secs(2)).await,
+            vec![CAPS_LINE_N as usize; 4],
+            "B, directly linked to A, gets every message"
+        );
+        assert_eq!(
+            caps_received(&mut nodes[2], Duration::from_millis(300)).await,
+            vec![0; 4],
+            "C, behind consume-only B, gets none"
+        );
+        assert_eq!(
+            eager_plus_ihave(&nodes[1].manager),
+            b_0,
+            "B forwards nothing"
+        );
+        assert_eq!(
+            nodes[1].manager.relay_fanout_diagnostics()["consume_only_msgs"],
+            4 * CAPS_LINE_N
+        );
     }
 
     #[tokio::test]

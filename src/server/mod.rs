@@ -726,7 +726,11 @@ pub async fn serve_with_options(
     if let Some(warning) = caps_warning {
         tracing::warn!("{warning}");
     }
-    let caps_consume_only = gossip_config.caps_consume_only == Some(true);
+    tracing::info!(
+        caps_consume_only = gossip_config.caps_consume_only == Some(true),
+        leaf_mode = config.leaf_mode,
+        "resolved [gossip] caps_consume_only"
+    );
 
     let mut builder = Agent::builder()
         .with_network_config(network_config)
@@ -1725,7 +1729,6 @@ pub async fn serve_with_options(
         // frames at the C0 gate before PlumTree can create topic state.
         state.agent.set_leaf_mode(true);
         tracing::info!(
-            caps_consume_only,
             "leaf mode: skipping global discovery, directory shard, \
              global public-message and legacy DM bus subscriptions; not \
              relaying pass-through topics"
@@ -5057,6 +5060,46 @@ mod daemon_gossip_config_tests {
         assert_eq!(
             resolve("[gossip]\ncaps_consume_only = true\n", &full()),
             (Some(false), true)
+        );
+    }
+
+    /// Why: a mistyped `caps_consume_only` value falls back softly to the
+    /// `leaf_mode` default and the loader warns about that key by name. The
+    /// leniency is scoped to this key: a mistyped `leaf_mode` still fails
+    /// the parse as before.
+    #[test]
+    fn a_mistyped_caps_value_warns_and_falls_back_to_leaf_mode() {
+        for (text, want) in [
+            (
+                "leaf_mode = true\n[gossip]\ncaps_consume_only = \"no\"\n",
+                true,
+            ),
+            ("[gossip]\ncaps_consume_only = 1\n", false),
+        ] {
+            let (config, findings) = super::config::analyze(text).expect("still parses");
+            assert_eq!(
+                findings.ignored_values,
+                vec!["gossip.caps_consume_only".to_string()]
+            );
+            assert!(findings.ignored_keys.is_empty(), "{text}");
+            assert!(!findings.is_clean());
+            assert!(findings
+                .warning_lines()
+                .iter()
+                .any(|line| line.contains("gossip.caps_consume_only")
+                    && line.contains("true or false")));
+            let (gossip, warning) = daemon_gossip_config(&config, &leaf());
+            assert_eq!(gossip.caps_consume_only, Some(want), "{text}");
+            assert!(warning.is_none());
+        }
+
+        let (_, clean) =
+            super::config::analyze("leaf_mode = true\n[gossip]\ncaps_consume_only = false\n")
+                .expect("parses");
+        assert!(clean.is_clean(), "a boolean is not reported");
+        assert!(
+            super::config::analyze("leaf_mode = \"yes\"\n").is_err(),
+            "leaf_mode keeps strict parsing"
         );
     }
 
