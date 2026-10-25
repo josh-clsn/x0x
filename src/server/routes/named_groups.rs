@@ -16167,6 +16167,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 )
                 .await;
 
+                remember_commit_bearing_event(state, &removed_event).await;
+                remember_commit_bearing_event(state, &added_event).await;
                 // Survivor re-key A10: every other member is owed both commits
                 // before the first publish. The returning member keeps the
                 // blind schedule (and its Welcome), with any survivor the
@@ -16183,9 +16185,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     .await,
                 );
                 publish_named_group_metadata_event(state, &metadata_topic, &removed_event).await;
-                remember_commit_bearing_event(state, &removed_event).await;
                 publish_named_group_metadata_event(state, &metadata_topic, &added_event).await;
-                remember_commit_bearing_event(state, &added_event).await;
                 spawn_named_group_event_delivery_to_active_members(
                     state,
                     &next,
@@ -16818,6 +16818,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 seated_attempt_id.as_deref(),
             )
             .await;
+            remember_commit_bearing_event(state, &event).await;
             // Survivor re-key A10: a TreeKEM add moves the epoch, so every
             // member it did not seat is owed it before the first publish. Any
             // the obligations refused get the blind schedule.
@@ -16834,7 +16835,6 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 Vec::new()
             };
             publish_named_group_metadata_event(state, &metadata_topic, &event).await;
-            remember_commit_bearing_event(state, &event).await;
             spawn_named_group_event_delivery_to_active_members(
                 state,
                 &next,
@@ -22991,6 +22991,7 @@ async fn add_treekem_named_group_member(
         true,
     )
     .await;
+    remember_commit_bearing_event(&state, &event).await;
     // Survivor re-key A10: every member the add did not seat is owed it
     // before the first publish; any the obligations refused get the blind
     // schedule.
@@ -22998,7 +22999,6 @@ async fn add_treekem_named_group_member(
         rekey_obligations::owe_survivors(&state, &id, &next, &[agent_hex.as_str()], &[&event])
             .await;
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
-    remember_commit_bearing_event(&state, &event).await;
     spawn_named_group_event_delivery_to_active_members(
         &state,
         &next,
@@ -24640,6 +24640,7 @@ async fn remove_treekem_named_group_member(
         secret_epoch: None,
         commit: Some(commit),
     };
+    remember_commit_bearing_event(&state, &event).await;
     // Survivor re-key A10: each survivor is owed this re-key, on disk, before
     // the first publish. The removed member keeps the blind schedule below,
     // with any survivor the obligations refused.
@@ -24651,7 +24652,6 @@ async fn remove_treekem_named_group_member(
     if !drop_initial_volley(&event) {
         publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     }
-    remember_commit_bearing_event(&state, &event).await;
     if !drop_initial_volley(&event) {
         spawn_named_group_event_delivery_to_active_members(
             &state,
@@ -24900,6 +24900,7 @@ async fn reconcile_treekem_self_leave_rekeys(
             secret_epoch: None,
             commit: Some(commit),
         };
+        remember_commit_bearing_event(state, &event).await;
         // Survivor re-key A10: each remaining member is owed this re-key
         // before the first publish. Only those the obligations refused keep
         // the blind schedule's direct sends.
@@ -24912,7 +24913,6 @@ async fn reconcile_treekem_self_leave_rekeys(
         )
         .await;
         publish_named_group_metadata_event(state, &metadata_topic, &event).await;
-        remember_commit_bearing_event(state, &event).await;
         // Deliberately not delivered to the departed member: they left
         // voluntarily and their local state is already torn down.
         spawn_named_group_event_delivery_to_active_members(state, &next, &event, &[]);
@@ -25565,6 +25565,7 @@ async fn owner_certified_seal_with_eviction(
                 (commit, event, metadata_topic, delivery_roster)
             };
             drop(guard);
+            remember_commit_bearing_event(state, &event).await;
             // Survivor re-key A10: each member left seated is owed this
             // re-key before the first publish; any the obligations refused
             // get the blind schedule.
@@ -25576,7 +25577,6 @@ async fn owner_certified_seal_with_eviction(
                 &[&event],
             )
             .await;
-            remember_commit_bearing_event(state, &event).await;
             if !drop_initial_volley(&event) {
                 publish_named_group_metadata_event(state, &metadata_topic, &event).await;
                 spawn_named_group_event_delivery_to_active_members(
@@ -28449,6 +28449,7 @@ async fn ban_treekem_group_member(
         treekem_epoch: Some(treekem_epoch),
         commit: Some(commit),
     };
+    remember_commit_bearing_event(&state, &event).await;
     // Survivor re-key A10: as for a removal, each survivor is owed the ban's
     // re-key before the first publish; the banned member keeps the blind
     // schedule.
@@ -28460,7 +28461,6 @@ async fn ban_treekem_group_member(
     if !drop_initial_volley(&event) {
         publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     }
-    remember_commit_bearing_event(&state, &event).await;
     if !drop_initial_volley(&event) {
         spawn_named_group_event_delivery_to_active_members(
             &state,
@@ -29745,13 +29745,13 @@ async fn approve_treekem_join_request(
             .and_then(|member| member.treekem_key_package_hash.clone()),
         commit: Some(commit),
     };
+    remember_commit_bearing_event(&state, &event).await;
     // Survivor re-key A10: as for any add, every member the approval did
     // not seat is owed it before the first publish.
     let refused =
         rekey_obligations::owe_survivors(&state, &id, &next, &[requester_hex.as_str()], &[&event])
             .await;
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
-    remember_commit_bearing_event(&state, &event).await;
     spawn_named_group_event_delivery_to_active_members(
         &state,
         &next,
