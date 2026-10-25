@@ -9735,13 +9735,56 @@ fn admit_treekem_pending_event(
 /// already covers the install races this replay exists for.
 const PENDING_TREEKEM_EVENT_TTL: Duration = Duration::from_secs(10 * 60);
 
+/// Most passes one replay runs (survivor re-key A12 fix round 2, N-5).
+const TREEKEM_REPLAY_PASSES: usize = 8;
+
+/// Replay the room's parked TreeKEM events, in commit order. A pass that
+/// moved the room's head while events stayed parked runs again: another
+/// replay may have requeued an event while this one was applying its
+/// predecessor (N-5), and nothing else would replay it. Order is the
+/// frontier gate's, unchanged: an event that does not link stays parked.
 async fn replay_pending_treekem_events(state: &Arc<AppState>, group_id: &str) {
+    for _ in 0..TREEKEM_REPLAY_PASSES {
+        let before = treekem_replay_head(state, group_id).await;
+        replay_pending_treekem_events_pass(state, group_id).await;
+        let parked = state
+            .treekem_pending_events
+            .read()
+            .await
+            .get(group_id)
+            .is_some_and(|queue| !queue.is_empty());
+        if !parked || treekem_replay_head(state, group_id).await == before {
+            return;
+        }
+    }
+}
+
+async fn treekem_replay_head(state: &AppState, group_id: &str) -> Option<(u64, String)> {
+    state
+        .named_groups
+        .read()
+        .await
+        .get(group_id)
+        .map(|info| (info.state_revision, info.state_hash.clone()))
+}
+
+async fn replay_pending_treekem_events_pass(state: &Arc<AppState>, group_id: &str) {
     let entries = {
         let mut pending = state.treekem_pending_events.write().await;
         let Some(queue) = pending.get_mut(group_id) else {
             return;
         };
         let mut entries: Vec<_> = queue.drain(..).collect();
+        #[cfg(test)]
+        if let Some(parked) = state
+            .named_group_test_recorders
+            .replay_park_during_pass
+            .lock()
+            .ok()
+            .and_then(|mut parked| parked.take())
+        {
+            queue.push_back(parked);
+        }
         entries.retain(|pending| pending.queued_at.elapsed() < PENDING_TREEKEM_EVENT_TTL);
         entries.sort_by_key(|pending| treekem_membership_event_sort_key(&pending.event));
         entries
@@ -11690,7 +11733,7 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     // its claimed sender for the next page only when the page moved this
     // member's head, and only when that sender is an active member here:
     // the request carries this member's head, which goes to members only.
-    let (head_after, sender_is_member) = {
+    let (head_after, epoch_after, sender_is_member) = {
         let groups = state.named_groups.read().await;
         groups
             .get(&response.group_id)
@@ -11699,8 +11742,12 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                     .values()
                     .find(|info| info.stable_group_id() == response.group_id)
             })
-            .map_or((head_before, false), |info| {
-                (info.state_revision, info.has_active_member(&sender_hex))
+            .map_or((head_before, response_info.secret_epoch, false), |info| {
+                (
+                    info.state_revision,
+                    info.secret_epoch,
+                    info.has_active_member(&sender_hex),
+                )
             })
     };
     let reporter_counts = sender_is_member && (verified || gap_report_signed);
@@ -11719,7 +11766,12 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         );
         // Survivor re-key A12: in its own task, at most one per (room,
         // peer), so this listener reads on while the peer is silent.
-        gap_catchup::spawn_follow_up(state, &response.group_id, *sender);
+        gap_catchup::spawn_follow_up(
+            state,
+            &response.group_id,
+            *sender,
+            (head_after, epoch_after),
+        );
     }
 }
 

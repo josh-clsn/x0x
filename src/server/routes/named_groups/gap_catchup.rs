@@ -21,8 +21,9 @@
 //!   commit they wait for, in commit order.
 //!
 //! A truncated page's follow-up ask goes the same way: in its own task, at
-//! most one in flight per (room, peer), so the catch-up listener that read
-//! the page never waits on it.
+//! most one in flight per (room, peer, head), so the catch-up listener that
+//! read the page never waits on it, and a page that moved the head always
+//! asks for the next one (fix round 2, N-1).
 
 use super::{
     request_treekem_catchup_page, signed_catchup, stamp_catchup_throttle, AppState,
@@ -43,11 +44,11 @@ pub(super) const ASK_TIMEOUT: Duration = Duration::from_secs(30);
 type AskKey = (AgentId, u64, u64);
 
 /// The asks in flight, by room (`named_groups` key), and the follow-up page
-/// asks in flight, by (room, peer).
+/// asks in flight, by (room, peer, head).
 #[derive(Debug, Default)]
 pub(in crate::server) struct GapCatchups {
     rooms: HashMap<String, HashSet<AskKey>>,
-    follow_ups: HashSet<(String, AgentId)>,
+    follow_ups: HashSet<(String, AskKey)>,
 }
 
 /// What [`GapCatchups::begin_ask`] decided.
@@ -107,7 +108,7 @@ fn lock(state: &AppState) -> std::sync::MutexGuard<'_, GapCatchups> {
 /// however it ends.
 enum Registered {
     Ask(String, AskKey),
-    FollowUp(String, AgentId),
+    FollowUp(String, AskKey),
 }
 
 struct EndOnDrop {
@@ -120,8 +121,8 @@ impl Drop for EndOnDrop {
         let mut catchups = lock(&self.state);
         match &self.registered {
             Registered::Ask(room, key) => catchups.end_ask(room, key),
-            Registered::FollowUp(room, peer) => {
-                catchups.follow_ups.remove(&(room.clone(), *peer));
+            Registered::FollowUp(room, key) => {
+                catchups.follow_ups.remove(&(room.clone(), *key));
             }
         }
     }
@@ -233,11 +234,18 @@ impl EndOnDrop {
     }
 }
 
-/// Ask `peer` for the next page in `room`, in its own task, unless a
-/// follow-up to the same peer for the room is still in flight. Returns
-/// whether it started one.
-pub(super) fn spawn_follow_up(state: &Arc<AppState>, room: &str, peer: AgentId) -> bool {
-    if !lock(state).follow_ups.insert((room.to_string(), peer)) {
+/// Ask `peer` for the next page in `room` from `head` (the signed revision
+/// and TreeKEM epoch after the page applied), in its own task, unless the
+/// same follow-up, to the same peer from the same head, is still in flight.
+/// Returns whether it started one.
+pub(super) fn spawn_follow_up(
+    state: &Arc<AppState>,
+    room: &str,
+    peer: AgentId,
+    head: (u64, u64),
+) -> bool {
+    let key = (peer, head.0, head.1);
+    if !lock(state).follow_ups.insert((room.to_string(), key)) {
         return false;
     }
     #[cfg(test)]
@@ -247,7 +255,7 @@ pub(super) fn spawn_follow_up(state: &Arc<AppState>, room: &str, peer: AgentId) 
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let end = EndOnDrop {
         state: Arc::clone(state),
-        registered: Registered::FollowUp(room.to_string(), peer),
+        registered: Registered::FollowUp(room.to_string(), key),
     };
     let room = room.to_string();
     tokio::spawn(async move {

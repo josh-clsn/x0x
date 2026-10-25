@@ -17,6 +17,17 @@
 //!   proves. A request that proves no one is dropped here; the answer would
 //!   refuse it anyway. So a peer that claims another member's id cannot
 //!   touch that member's queue.
+//! - **Unverified requests are rate-limited per machine before the check**
+//!   (fix round 2, N-3): each QUIC-authenticated machine may have
+//!   [`UNVERIFIED_BURST`] signatures checked at once, refilling at
+//!   [`UNVERIFIED_PER_SEC`] a second, so a flood cannot spend this daemon's
+//!   CPU on signature checks.
+//! - **The requester must be on the room's roster** (N-4): an active member,
+//!   or a joiner the room's cached add names, as the answer requires. So a
+//!   self-made identity cannot take waiting space.
+//! - **A waiting request is replaced only by one at least as fresh** (N-2):
+//!   a page from the same or a later (epoch, revision), a challenge with the
+//!   same or a later counter. A replayed older request is dropped.
 //! - at most [`SERVE_SLOTS`] answers run at once;
 //! - a requester has at most one answer running, and at most one request
 //!   waiting per (room, kind): a page, a head challenge, or a member-keyed
@@ -42,11 +53,12 @@
 //! (`rekey_obligations::MAX_IN_FLIGHT`).
 
 use super::{
-    handle_treekem_catchup_request, handle_treekem_catchup_response, member_keyed_request_signed,
-    parse_agent_id_hex, signed_catchup, AppState, TreeKemCatchupRequest, TreeKemCatchupResponse,
+    handle_treekem_catchup_request, handle_treekem_catchup_response, head_proof,
+    member_keyed_request_signed, parse_agent_id_hex, signed_catchup, AppState,
+    NamedGroupMetadataEvent, TreeKemCatchupRequest, TreeKemCatchupResponse,
 };
 use crate::direct::DirectMessage;
-use crate::identity::AgentId;
+use crate::identity::{AgentId, MachineId};
 use crate::logging::LogHexId;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -61,6 +73,26 @@ pub(in crate::server) const PER_PEER_QUEUE: usize = 8;
 pub(in crate::server) const MAX_WAITING_PEERS: usize = 256;
 /// Bytes of requests (as received) that may wait at once.
 pub(in crate::server) const MAX_WAITING_BYTES: usize = 8 * 1024 * 1024;
+/// Unverified requests one machine may have checked at once.
+pub(in crate::server) const UNVERIFIED_BURST: f64 = 16.0;
+/// How many more unverified requests a machine may have checked each second.
+pub(in crate::server) const UNVERIFIED_PER_SEC: f64 = 8.0;
+/// Machines the rate limiter remembers at most.
+const RATE_TABLE_CAP: usize = 4096;
+
+/// One machine's allowance for unverified requests.
+#[derive(Debug, Clone, Copy)]
+struct Bucket {
+    tokens: f64,
+    at: tokio::time::Instant,
+}
+
+impl Bucket {
+    fn refilled(self, now: tokio::time::Instant) -> f64 {
+        let elapsed = now.saturating_duration_since(self.at).as_secs_f64();
+        (self.tokens + elapsed * UNVERIFIED_PER_SEC).min(UNVERIFIED_BURST)
+    }
+}
 
 /// What a waiting request is for: its room, and a page, a head challenge or
 /// a member-keyed fetch for one member.
@@ -89,6 +121,7 @@ struct Queues {
 pub(in crate::server) struct CatchupServe {
     slots: Arc<Semaphore>,
     queues: Mutex<Queues>,
+    rates: Mutex<HashMap<MachineId, Bucket>>,
 }
 
 impl Default for CatchupServe {
@@ -96,6 +129,7 @@ impl Default for CatchupServe {
         Self {
             slots: Arc::new(Semaphore::new(SERVE_SLOTS)),
             queues: Mutex::default(),
+            rates: Mutex::default(),
         }
     }
 }
@@ -143,9 +177,98 @@ fn proven_requester(
         .flatten()
 }
 
+/// Whether `incoming` may take `held`'s waiting place: it is at least as
+/// fresh. A member-keyed fetch replays identically, so it always may.
+fn at_least_as_fresh(incoming: &TreeKemCatchupRequest, held: &TreeKemCatchupRequest) -> bool {
+    if incoming.target_member_id.is_some() {
+        return true;
+    }
+    let order = |request: &TreeKemCatchupRequest| {
+        (
+            request
+                .head_challenge
+                .as_deref()
+                .and_then(head_proof::challenge_counter)
+                .unwrap_or(0),
+            request.from_treekem_epoch,
+            request.from_revision,
+        )
+    };
+    order(incoming) >= order(held)
+}
+
+/// Whether `requester_hex` may ask about `request`'s room here, as the answer
+/// decides it: an active member, or a joiner with no roster entry that the
+/// room's cached add names. A lock another task holds right now leaves the
+/// decision to the answer.
+fn may_ask(state: &AppState, request: &TreeKemCatchupRequest, requester_hex: &str) -> bool {
+    let Ok(groups) = state.named_groups.try_read() else {
+        return true;
+    };
+    let Some((key, info)) = groups.get_key_value(&request.group_id).or_else(|| {
+        groups
+            .iter()
+            .find(|(_, info)| info.stable_group_id() == request.group_id)
+    }) else {
+        return false;
+    };
+    if info.has_active_member(requester_hex) {
+        return true;
+    }
+    if info.members_v2.contains_key(requester_hex) {
+        return false;
+    }
+    let Ok(logs) = state.treekem_event_log.try_read() else {
+        return true;
+    };
+    [
+        request.group_id.as_str(),
+        key.as_str(),
+        info.stable_group_id(),
+    ]
+    .iter()
+    .any(|alias| {
+        logs.get(*alias).is_some_and(|events| {
+            events.iter().any(|event| match event {
+                NamedGroupMetadataEvent::MemberAdded { agent_id, .. } => {
+                    agent_id.eq_ignore_ascii_case(requester_hex)
+                }
+                NamedGroupMetadataEvent::JoinRequestApproved {
+                    requester_agent_id, ..
+                } => requester_agent_id.eq_ignore_ascii_case(requester_hex),
+                _ => false,
+            })
+        })
+    })
+}
+
 impl CatchupServe {
     fn lock(&self) -> std::sync::MutexGuard<'_, Queues> {
         self.queues.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Take one unverified request's check from `machine`'s allowance.
+    fn take_unverified(&self, machine: MachineId, now: tokio::time::Instant) -> bool {
+        let mut rates = self.rates.lock().unwrap_or_else(PoisonError::into_inner);
+        if !rates.contains_key(&machine) && rates.len() >= RATE_TABLE_CAP {
+            rates.retain(|_, bucket| bucket.refilled(now) < UNVERIFIED_BURST);
+            if rates.len() >= RATE_TABLE_CAP {
+                return false;
+            }
+        }
+        let bucket = rates.entry(machine).or_insert(Bucket {
+            tokens: UNVERIFIED_BURST,
+            at: now,
+        });
+        let tokens = bucket.refilled(now);
+        if tokens < 1.0 {
+            bucket.tokens = tokens;
+            bucket.at = now;
+            return false;
+        }
+        bucket.tokens = tokens - 1.0;
+        bucket.at = now;
+        true
     }
 
     fn admit(&self, requester: AgentId, waiting: Waiting) -> Dispatched {
@@ -153,7 +276,9 @@ impl CatchupServe {
         let Queues { peers, bytes } = &mut *queues;
         if let Some(queue) = peers.get_mut(&requester) {
             if let Some(held) = queue.iter_mut().find(|held| held.slot == waiting.slot) {
-                if (*bytes - held.bytes).saturating_add(waiting.bytes) > MAX_WAITING_BYTES {
+                if !at_least_as_fresh(&waiting.request, &held.request)
+                    || (*bytes - held.bytes).saturating_add(waiting.bytes) > MAX_WAITING_BYTES
+                {
                     return Dispatched::Dropped;
                 }
                 *bytes = *bytes - held.bytes + waiting.bytes;
@@ -209,13 +334,25 @@ impl CatchupServe {
         self.slots.available_permits()
     }
 
-    /// The (room, kind) of each request `requester` has waiting (tests).
+    /// The room, kind and revision of each request `requester` has waiting
+    /// (tests).
     #[cfg(test)]
-    pub(in crate::server) fn waiting(&self, requester: &AgentId) -> Option<Vec<Slot>> {
-        self.lock()
-            .peers
-            .get(requester)
-            .map(|queue| queue.iter().map(|waiting| waiting.slot.clone()).collect())
+    pub(in crate::server) fn waiting(
+        &self,
+        requester: &AgentId,
+    ) -> Option<Vec<(String, String, u64)>> {
+        self.lock().peers.get(requester).map(|queue| {
+            queue
+                .iter()
+                .map(|waiting| {
+                    (
+                        waiting.slot.0.clone(),
+                        waiting.slot.1.clone(),
+                        waiting.request.from_revision,
+                    )
+                })
+                .collect()
+        })
     }
 }
 
@@ -242,15 +379,34 @@ impl Drop for EndOnDrop {
 }
 
 /// Hand a catch-up request to its proven requester's task, starting the
-/// task when none runs. `bytes` is the request's size as received. Never
-/// waits.
+/// task when none runs. `machine` is the QUIC-authenticated machine it came
+/// from, and `bytes` its size as received. Never waits.
 pub(in crate::server) fn dispatch(
     state: &Arc<AppState>,
     sender: AgentId,
+    machine: MachineId,
     verified: bool,
     request: TreeKemCatchupRequest,
     bytes: usize,
 ) -> Dispatched {
+    if !verified
+        && !state
+            .treekem_catchup_serve
+            .take_unverified(machine, tokio::time::Instant::now())
+    {
+        tracing::debug!(
+            claimed_sender = %LogHexId::agent(&hex::encode(sender.as_bytes())),
+            "TreeKEM catch-up request dropped: its machine is over the unverified-request rate"
+        );
+        return Dispatched::Dropped;
+    }
+    #[cfg(test)]
+    if !verified {
+        state
+            .named_group_test_recorders
+            .catchup_signature_checks
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
     let Some(requester) = proven_requester(sender, verified, &request) else {
         tracing::debug!(
             claimed_sender = %LogHexId::agent(&hex::encode(sender.as_bytes())),
@@ -258,6 +414,13 @@ pub(in crate::server) fn dispatch(
         );
         return Dispatched::Dropped;
     };
+    if !may_ask(state, &request, &hex::encode(requester.as_bytes())) {
+        tracing::debug!(
+            requester = %LogHexId::agent(&hex::encode(requester.as_bytes())),
+            "TreeKEM catch-up request dropped: the requester is not on the room's roster"
+        );
+        return Dispatched::Dropped;
+    }
     let waiting = Waiting {
         slot: slot_of(&request),
         sender,
@@ -309,7 +472,14 @@ pub(in crate::server) fn dispatch(
 pub(in crate::server) async fn on_direct_message(state: &Arc<AppState>, msg: &DirectMessage) {
     if let Ok(request) = serde_json::from_slice::<TreeKemCatchupRequest>(&msg.payload) {
         if request.message_type == "treekem_catchup_request" {
-            dispatch(state, msg.sender, msg.verified, request, msg.payload.len());
+            dispatch(
+                state,
+                msg.sender,
+                msg.machine_id,
+                msg.verified,
+                request,
+                msg.payload.len(),
+            );
         }
         return;
     }
@@ -412,6 +582,46 @@ mod tests {
         );
         serve.forget(&peer);
         assert_eq!(serve.lock().bytes, 0);
+    }
+
+    #[test]
+    fn an_older_request_never_takes_a_fresher_ones_place() {
+        let serve = CatchupServe::default();
+        let peer = AgentId([5; 32]);
+        assert_eq!(serve.admit(peer, waiting("a", 0, 10)), Dispatched::Started);
+        assert_eq!(serve.admit(peer, waiting("b", 7, 10)), Dispatched::Queued);
+        assert_eq!(serve.admit(peer, waiting("b", 3, 10)), Dispatched::Dropped);
+        assert_eq!(serve.admit(peer, waiting("b", 7, 10)), Dispatched::Replaced);
+        assert_eq!(serve.admit(peer, waiting("b", 9, 10)), Dispatched::Replaced);
+        let mut challenge = request("b", 9);
+        challenge.head_challenge = Some(head_proof::challenge_nonce(4));
+        let mut older = challenge.clone();
+        older.head_challenge = Some(head_proof::challenge_nonce(3));
+        older.from_revision = 20;
+        assert!(at_least_as_fresh(&challenge, &older));
+        assert!(
+            !at_least_as_fresh(&older, &challenge),
+            "the counter decides first"
+        );
+    }
+
+    #[test]
+    fn a_machine_over_its_unverified_allowance_is_refused_until_it_refills() {
+        let serve = CatchupServe::default();
+        let machine = MachineId([6; 32]);
+        let now = tokio::time::Instant::now();
+        for _ in 0..16 {
+            assert!(serve.take_unverified(machine, now));
+        }
+        assert!(!serve.take_unverified(machine, now));
+        assert!(
+            serve.take_unverified(MachineId([7; 32]), now),
+            "another machine"
+        );
+        let later = now + std::time::Duration::from_millis(250);
+        assert!(serve.take_unverified(machine, later), "two refilled");
+        assert!(serve.take_unverified(machine, later));
+        assert!(!serve.take_unverified(machine, later));
     }
 
     #[test]

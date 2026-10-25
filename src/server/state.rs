@@ -1477,6 +1477,14 @@ pub(super) struct NamedGroupTestRecorders {
     pub(super) gap_asks: StdMutex<Vec<(String, u64)>>,
     /// Survivor re-key A12: follow-up page asks started.
     pub(super) follow_ups_started: std::sync::atomic::AtomicUsize,
+    /// Survivor re-key A12 fix round 2 (N-3): unverified catch-up requests
+    /// whose signature `dispatch` went on to check.
+    pub(super) catchup_signature_checks: std::sync::atomic::AtomicUsize,
+    /// Survivor re-key A12 fix round 2 (N-5): an event a replay pushes into
+    /// the room's queue right after it drained it, as a park that lands
+    /// during the replay does.
+    pub(super) replay_park_during_pass:
+        StdMutex<Option<crate::server::routes::named_groups::PendingTreeKemMetadataEvent>>,
     /// Survivor re-key A12: when set, `send_page_request` records the
     /// request and then waits on this semaphore instead of sending, so a
     /// test plays a peer that does not answer. Closing it releases them.

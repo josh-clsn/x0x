@@ -83,7 +83,9 @@ All notable changes to this project will be documented in this file.
   once per peer and head. A truncated page's follow-up ask runs in its own task
   too. Parked events also replay when the missing commit lands live. Requests
   are answered 4 at a time, one at a time per requester, and only a requester
-  the transport or the request's signature proves gets a queue. A member a
+  the transport or the request's signature proves, and the room's roster
+  holds, gets a queue; unverified requests are rate-limited per machine before
+  their signature is checked. A member a
   direct add or an approval seats gets the 6 to 60 s direct resends.
   `GET /diagnostics/dm` reports `v1_ack_waits`, `v1_ack_wait_ms`,
   `v1_ack_wait_timeouts` and `v1_ack_wait_timeout_ms`. See

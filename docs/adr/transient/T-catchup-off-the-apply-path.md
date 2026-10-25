@@ -1,6 +1,6 @@
 # T-catchup-off-the-apply-path: no catch-up ask blocks an apply or the catch-up listener
 
-- **Status:** Proposed (fork tail, survivor re-key A12, with fix round 1).
+- **Status:** Proposed (fork tail, survivor re-key A12, with fix rounds 1 and 2).
 - **Date:** 2026-10-25
 - **Base:** `survivor-rekey` at `042f243f`
 - **Upstream:** none filed. Upstream's apply path asks for a gap catch-up inline in the same way, and its listener answers serially.
@@ -30,11 +30,14 @@ A Noetic leaf agent's drill showed group messages stalling behind membership app
   - An ask that is still in flight from the same head is skipped, even after the 5 s throttle window, so two gaps at one head make one ask per peer.
   - Once the head moves, a later gap asks again at once, even while an older ask waits on a silent peer.
   - A peer that only a later event names is asked at once.
-- **Replay.** Parked events replay in commit order after a page is applied (`handle_treekem_catchup_response`), as before. Since fix round 1 they also replay after a live apply lands a membership commit (`replay_parked_after_live_apply`), so a commit that arrives by gossip or a direct push frees its parked successors without waiting for a page. The replay re-applies each event with every check.
-- **Follow-up asks off the listener.** A truncated page's follow-up ask runs in its own task under `ASK_TIMEOUT`, with at most one in flight per (room, peer). Pages are still applied on the listener, in arrival order.
+- **Replay.** Parked events replay in commit order after a page is applied (`handle_treekem_catchup_response`), as before. Since fix round 1 they also replay after a live apply lands a membership commit (`replay_parked_after_live_apply`), so a commit that arrives by gossip or a direct push frees its parked successors without waiting for a page. The replay re-applies each event with every check. Since fix round 2 (N-5), a replay pass that moved the head while events stayed parked runs again, up to 8 passes: another replay may have requeued an event while this one applied its predecessor. Order is still the frontier gate's.
+- **Follow-up asks off the listener.** A truncated page's follow-up ask runs in its own task under `ASK_TIMEOUT`, with at most one in flight per (room, peer, head after the page). So a page that moved the head always asks for the next one, even while the ask for it is still waiting on its acknowledgement (fix round 2, N-1). A page that moved nothing asks nothing more. Pages are still applied on the listener, in arrival order.
 - **The listener answers side by side, for proven requesters only.**
   - The listener hands each message to `catchup_serve::on_direct_message`. A request goes to `dispatch`, which never waits.
   - **Who gets a queue.** A request queues under the sender if the transport verified that sender. Otherwise it queues under the requester its signature proves: the A5 page-request signature, or the #398 member-keyed one, checked at admission. A request that proves no requester is dropped there; the answer would refuse it anyway. So a peer that claims a member's id cannot touch that member's queue.
+  - **Rate before the check (fix round 2, N-3).** An unverified request is checked only within its QUIC-authenticated machine's allowance: 16 at once, refilling at 8 a second. A flood cannot spend this daemon's CPU on signature checks.
+  - **On the roster (N-4).** The proven requester must be an active member of the room, or a joiner with no roster entry that the room's cached add names, as the answer requires. A self-made identity gets no waiting space.
+  - **Fresher replaces (N-2).** A waiting request is replaced only by one at least as fresh: a page from the same or a later (epoch, revision), a challenge with the same or a later counter. A replay of a member's older signed request is dropped, so a past recipient of its requests cannot displace its fresh one.
   - **Bounds:**
     - at most 4 answers at once (`SERVE_SLOTS`);
     - one answer running per requester;
@@ -79,10 +82,13 @@ A Noetic leaf agent's drill showed group messages stalling behind membership app
   - All three then apply in order.
 - `a_later_gap_asks_the_owner_again_from_the_new_head`: after a page moves the head, a new gap asks the owner from the new head while the old ask still waits.
 - `a_live_apply_of_the_missing_commit_replays_the_parked_one`: the missing removal arrives live, not by a page, and the parked one applies after it.
-- `a_truncated_pages_follow_up_does_not_hold_the_listener`: while the follow-up waits on a silent owner, the listener applies the next page (with no second follow-up to the same peer) and starts answering S2.
+- `catch_up_pages_all_the_way_through_while_follow_ups_wait`: three truncated pages while every follow-up waits on a silent owner. Each page that moved the head asks for the next, S1 reaches the owner's head, a replayed page asks nothing more, and the listener answers a request meanwhile.
+- `an_event_parked_during_a_replay_applies_when_the_replay_moves_the_head`: an event parked right after a replay drained the queue applies in that replay's next pass.
 - `the_listener_answers_requests_side_by_side`: five requesters while no answer can finish. Four run, every slot is taken, and the fifth runs when one frees.
 - `a_flooding_requester_does_not_starve_another`: one requester sends 20 requests, then another sends one. The flooder holds one slot, the other requester is answered, and two slots stay free.
-- `a_forger_cannot_push_out_a_survivors_waiting_request`: unsigned claims and other keys' signatures for a survivor's id are dropped, and the survivor's waiting request stays.
+- `a_forger_cannot_push_out_a_survivors_waiting_request`: unsigned claims, other keys' signatures and a replay of the survivor's own older request are dropped, and the survivor's fresh waiting request stays.
+- `a_machine_flooding_unverified_requests_is_checked_a_burst_at_most`: 100 unverified requests from one machine get about 16 signature checks; another machine's still gets one.
+- `a_requester_off_the_roster_gets_no_place`: a self-signed or transport-verified requester the roster does not hold, and a room this daemon does not hold, get no place.
 - `a_dispatched_answer_is_the_direct_answer`: the page the listener path sends is byte for byte the page a direct call sends.
 - `a_member_an_add_seats_keeps_the_resend_schedule`: a direct add and an approval each give the seated member the direct-send schedule, with no republishing schedule.
 

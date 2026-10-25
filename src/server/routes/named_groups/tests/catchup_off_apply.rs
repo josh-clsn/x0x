@@ -329,7 +329,9 @@ async fn a_live_apply_of_the_missing_commit_replays_the_parked_one() -> Result<(
 
     apply_within_bound(&cast.s1, second.clone(), owner_id).await;
     assert_eq!(parked(&cast.s1, group_id).await, vec![second]);
-    let applied = apply_within_bound(&cast.s1, first, owner_id).await;
+    // This apply also replays the parked removal, so it gets more than the
+    // bound.
+    let applied = apply_named_group_metadata_event(&cast.s1, first, owner_id, true, None).await;
     assert!(applied.accepted, "the first removal applies live");
     assert!(parked(&cast.s1, group_id).await.is_empty());
     s1_follows_the_owner(&cast).await;
@@ -338,19 +340,21 @@ async fn a_live_apply_of_the_missing_commit_replays_the_parked_one() -> Result<(
     Ok(())
 }
 
-/// S1 is two removals behind. The owner's page with the first is truncated,
-/// and S1's follow-up ask to the owner waits on a silent transport. The
-/// listener reads on: it applies the next page (with no second follow-up to
-/// the same peer) and answers S2's request, while the follow-up waits.
+/// S1 is three events behind: two removals and an add. Every page the owner
+/// serves is truncated, and every follow-up ask S1 sends waits on a silent
+/// transport. The listener reads on, and each page that moves S1's head asks
+/// for the next one while the earlier asks still wait (fix round 2, N-1): S1
+/// pages all the way through. A page that does not move the head asks
+/// nothing more, and the listener still answers the owner's request.
 #[tokio::test]
-async fn a_truncated_pages_follow_up_does_not_hold_the_listener() -> Result<()> {
+async fn catch_up_pages_all_the_way_through_while_follow_ups_wait() -> Result<()> {
     let cast = survivor_relay_fixture().await?;
     let owner = &cast.fixture.state;
     let group_id = &cast.fixture.group_id;
     let owner_id = owner.agent.agent_id();
-    let s2_id = cast.s2.agent.agent_id();
     let first = remove(&cast, &hex_of(&cast.fixture.member_id)).await;
-    let second = remove(&cast, &hex_of(&s2_id)).await;
+    let second = remove(&cast, &hex_of(&cast.s2.agent.agent_id())).await;
+    let (newcomer_id, third) = add(&cast, 0x56).await?;
     let hold = silence_peers(&cast.s1);
     let answers = hold_answers(&cast.s1);
     let page = |event: NamedGroupMetadataEvent| {
@@ -380,30 +384,42 @@ async fn a_truncated_pages_follow_up_does_not_hold_the_listener() -> Result<()> 
             .follow_ups_started
             .load(Ordering::SeqCst)
     };
-
-    tokio::time::timeout(BOUND, on_catchup_direct_message(&cast.s1, &page(first)))
-        .await
-        .expect("the listener reads on while the follow-up waits");
-    assert_eq!(follow_ups(), 1, "the next page is asked for");
-    assert_eq!(
+    let in_flight = || {
         cast.s1
             .treekem_gap_catchups
             .lock()
             .unwrap()
-            .follow_ups_in_flight(),
-        1
-    );
-    tokio::time::timeout(BOUND, on_catchup_direct_message(&cast.s1, &page(second)))
-        .await
-        .expect("the next page is applied while the follow-up waits");
-    s1_follows_the_owner(&cast).await;
-    assert_eq!(follow_ups(), 1, "one follow-up per room and peer");
+            .follow_ups_in_flight()
+    };
 
-    let request = page_request(&cast.s2, group_id, None)
+    for (n, event) in [first.clone(), second, third].into_iter().enumerate() {
+        tokio::time::timeout(BOUND, on_catchup_direct_message(&cast.s1, &page(event)))
+            .await
+            .expect("the listener reads on while the follow-ups wait");
+        assert_eq!(follow_ups(), n + 1, "page {} asks for the next", n + 1);
+        assert_eq!(in_flight(), n + 1, "the earlier asks still wait");
+    }
+    s1_follows_the_owner(&cast).await;
+    assert!(
+        roster_head(&cast.s1, group_id, &hex_of(&newcomer_id))
+            .await
+            .2
+    );
+
+    tokio::time::timeout(BOUND, on_catchup_direct_message(&cast.s1, &page(first)))
         .await
-        .expect("S2 asks S1");
+        .expect("a replayed page is read at once");
+    assert_eq!(
+        follow_ups(),
+        3,
+        "a page that moved nothing asks nothing more"
+    );
+
+    let request = page_request(owner, group_id, None)
+        .await
+        .expect("the owner asks S1");
     let asked = x0x::direct::DirectMessage::new_verified(
-        s2_id,
+        owner_id,
         x0x::identity::MachineId([0; 32]),
         serde_json::to_vec(&request).unwrap(),
         true,
@@ -413,10 +429,52 @@ async fn a_truncated_pages_follow_up_does_not_hold_the_listener() -> Result<()> 
         .await
         .expect("a request is dispatched at once");
     assert!(
-        eventually(|| async { answers_started(&cast.s1) == vec![hex_of(&s2_id)] }).await,
-        "S1 answers S2 while its follow-up waits"
+        eventually(|| async { answers_started(&cast.s1) == vec![hex_of(&owner_id)] }).await,
+        "S1 answers while its follow-ups wait"
     );
     answers.close();
+    hold.close();
+    cast.shutdown().await;
+    Ok(())
+}
+
+/// S1 parks the second removal. While the live first removal's replay runs,
+/// the add parks too, after the replay drained the queue, as a park that
+/// lands during another replay does. The replay runs once more, because it
+/// moved the head while an event stayed parked (fix round 2, N-5).
+#[tokio::test]
+async fn an_event_parked_during_a_replay_applies_when_the_replay_moves_the_head() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let owner = &cast.fixture.state;
+    let group_id = &cast.fixture.group_id;
+    let owner_id = owner.agent.agent_id();
+    let first = remove(&cast, &hex_of(&cast.fixture.member_id)).await;
+    let second = remove(&cast, &hex_of(&cast.s2.agent.agent_id())).await;
+    let (newcomer_id, third) = add(&cast, 0x57).await?;
+    let hold = silence_peers(&cast.s1);
+
+    apply_within_bound(&cast.s1, second.clone(), owner_id).await;
+    assert_eq!(parked(&cast.s1, group_id).await, vec![second]);
+    *cast
+        .s1
+        .named_group_test_recorders
+        .replay_park_during_pass
+        .lock()
+        .unwrap() = Some(PendingTreeKemMetadataEvent {
+        event: third,
+        sender: owner_id,
+        queued_at: std::time::Instant::now(),
+    });
+    // This apply also replays two events, so it gets more than the bound.
+    let applied = apply_named_group_metadata_event(&cast.s1, first, owner_id, true, None).await;
+    assert!(applied.accepted);
+    assert!(parked(&cast.s1, group_id).await.is_empty());
+    s1_follows_the_owner(&cast).await;
+    assert!(
+        roster_head(&cast.s1, group_id, &hex_of(&newcomer_id))
+            .await
+            .2
+    );
     hold.close();
     cast.shutdown().await;
     Ok(())
@@ -443,6 +501,28 @@ fn answers_started(state: &AppState) -> Vec<String> {
         .clone()
 }
 
+/// A room `state` knows, with `members` active on its roster.
+async fn room_with(state: &AppState, room: &str, members: &[x0x::identity::AgentId]) {
+    let mut info = x0x::groups::GroupInfo::new(
+        "room".to_string(),
+        String::new(),
+        state.agent.agent_id(),
+        room.to_string(),
+    );
+    for member in members {
+        info.add_member(hex_of(member), x0x::groups::GroupRole::Member, None, None);
+    }
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(room.to_string(), info);
+}
+
+fn room(n: u8) -> String {
+    format!("{n:02x}").repeat(32)
+}
+
 fn bare_request(
     requester: &x0x::identity::AgentId,
     room: &str,
@@ -463,6 +543,8 @@ fn bare_request(
     }
 }
 
+const MACHINE: x0x::identity::MachineId = x0x::identity::MachineId([0; 32]);
+
 fn verified_dispatch(
     state: &Arc<AppState>,
     requester: x0x::identity::AgentId,
@@ -472,6 +554,7 @@ fn verified_dispatch(
     dispatch(
         state,
         requester,
+        MACHINE,
         true,
         bare_request(&requester, room, from_revision),
         1_000,
@@ -487,10 +570,10 @@ async fn the_listener_answers_requests_side_by_side() -> Result<()> {
     let hold = hold_answers(&state);
     let requesters: Vec<x0x::identity::AgentId> =
         (1..=5u8).map(|n| x0x::identity::AgentId([n; 32])).collect();
-    let room = "ab".repeat(16);
+    room_with(&state, &room(0xab), &requesters).await;
     for requester in &requesters {
         assert_eq!(
-            verified_dispatch(&state, *requester, &room, 0),
+            verified_dispatch(&state, *requester, &room(0xab), 0),
             Dispatched::Started
         );
     }
@@ -523,10 +606,13 @@ async fn a_flooding_requester_does_not_starve_another() -> Result<()> {
     let flooder = x0x::identity::AgentId([7; 32]);
     let other = x0x::identity::AgentId([8; 32]);
     for n in 0..20u8 {
-        verified_dispatch(&state, flooder, &format!("{n:02x}").repeat(16), 0);
+        room_with(&state, &room(n), &[flooder, other]).await;
+    }
+    for n in 0..20u8 {
+        verified_dispatch(&state, flooder, &room(n), 0);
     }
     assert_eq!(
-        verified_dispatch(&state, other, &"ab".repeat(16), 0),
+        verified_dispatch(&state, other, &room(0), 0),
         Dispatched::Started
     );
     assert!(eventually(|| async { answers_started(&state).len() >= 2 }).await);
@@ -548,27 +634,46 @@ async fn a_flooding_requester_does_not_starve_another() -> Result<()> {
 
 /// A survivor S has one answer running and one request waiting. A forger
 /// that claims S's id, over a transport that cannot verify it, gets no
-/// place: S's waiting request stays.
+/// place: S's waiting request stays. A replay of S's own older signed
+/// request cannot take its fresher one's place either (N-2).
 #[tokio::test]
 async fn a_forger_cannot_push_out_a_survivors_waiting_request() -> Result<()> {
     let (state, _dir) = secure_endpoint_test_state().await?;
     let hold = hold_answers(&state);
     let survivor = x0x::identity::AgentKeypair::generate()?;
     let survivor_id = survivor.agent_id();
-    let signed = |room: &str| {
-        let mut request = bare_request(&survivor_id, room, 7);
+    let signed = |room: &str, from_revision: u64| {
+        let mut request = bare_request(&survivor_id, room, from_revision);
         sign_page_request_with(&survivor, &mut request);
         request
     };
-    let running = "aa".repeat(16);
-    let waiting_room = "bb".repeat(16);
+    let running = room(0xaa);
+    let waiting_room = room(0xbb);
+    room_with(&state, &running, &[survivor_id]).await;
+    room_with(&state, &waiting_room, &[survivor_id]).await;
+    let machine = |n: u8| x0x::identity::MachineId([n; 32]);
+    let captured = signed(&waiting_room, 7);
     assert_eq!(
-        dispatch(&state, survivor_id, false, signed(&running), 1_000),
+        dispatch(
+            &state,
+            survivor_id,
+            machine(1),
+            false,
+            signed(&running, 7),
+            1_000
+        ),
         Dispatched::Started
     );
     assert!(eventually(|| async { answers_started(&state).len() == 1 }).await);
     assert_eq!(
-        dispatch(&state, survivor_id, false, signed(&waiting_room), 1_000),
+        dispatch(
+            &state,
+            survivor_id,
+            machine(1),
+            false,
+            signed(&waiting_room, 9),
+            1_000
+        ),
         Dispatched::Queued
     );
 
@@ -577,25 +682,119 @@ async fn a_forger_cannot_push_out_a_survivors_waiting_request() -> Result<()> {
         let room = if n % 2 == 0 {
             waiting_room.clone()
         } else {
-            format!("{n:02x}").repeat(16)
+            room(n)
         };
         let mut unsigned = bare_request(&survivor_id, &room, 99);
         assert_eq!(
-            dispatch(&state, survivor_id, false, unsigned.clone(), 1_000),
+            dispatch(
+                &state,
+                survivor_id,
+                machine(100 + n),
+                false,
+                unsigned.clone(),
+                1_000
+            ),
             Dispatched::Dropped,
             "an unsigned claim proves no one"
         );
         sign_page_request_with(&forger, &mut unsigned);
         assert_eq!(
-            dispatch(&state, survivor_id, false, unsigned, 1_000),
+            dispatch(
+                &state,
+                survivor_id,
+                machine(100 + n),
+                false,
+                unsigned,
+                1_000
+            ),
             Dispatched::Dropped,
             "another key's signature does not prove the survivor"
         );
     }
     assert_eq!(
+        dispatch(&state, survivor_id, machine(2), false, captured, 1_000),
+        Dispatched::Dropped,
+        "a replay of the survivor's older request does not take the fresher one's place"
+    );
+    assert_eq!(
         state.treekem_catchup_serve.waiting(&survivor_id),
-        Some(vec![(waiting_room, "page".to_string())]),
-        "the survivor's own request still waits"
+        Some(vec![(waiting_room, "page".to_string(), 9)]),
+        "the survivor's own fresh request still waits"
+    );
+    hold.close();
+    Ok(())
+}
+
+/// A flood of unverified requests from one machine has at most its burst
+/// of signatures checked; another machine's request is still checked
+/// (N-3).
+#[tokio::test]
+async fn a_machine_flooding_unverified_requests_is_checked_a_burst_at_most() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let hold = hold_answers(&state);
+    let member = x0x::identity::AgentKeypair::generate()?;
+    let member_id = member.agent_id();
+    room_with(&state, &room(0xcc), &[member_id]).await;
+    let checks = || {
+        state
+            .named_group_test_recorders
+            .catchup_signature_checks
+            .load(Ordering::SeqCst)
+    };
+    let flooding = x0x::identity::MachineId([9; 32]);
+    for n in 0..100u64 {
+        let mut request = bare_request(&member_id, &room(0xcc), n);
+        sign_page_request_with(&member, &mut request);
+        dispatch(&state, member_id, flooding, false, request, 1_000);
+    }
+    let flood_checks = checks();
+    assert!(
+        (16..=18).contains(&flood_checks),
+        "about one burst checked, not 100: {flood_checks}"
+    );
+    let mut request = bare_request(&member_id, &room(0xcc), 200);
+    sign_page_request_with(&member, &mut request);
+    dispatch(
+        &state,
+        member_id,
+        x0x::identity::MachineId([10; 32]),
+        false,
+        request,
+        1_000,
+    );
+    assert_eq!(checks(), flood_checks + 1, "another machine is checked");
+    hold.close();
+    Ok(())
+}
+
+/// A requester the room's roster does not hold gets no place, whether its
+/// transport is verified or its request is self-signed (N-4).
+#[tokio::test]
+async fn a_requester_off_the_roster_gets_no_place() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let hold = hold_answers(&state);
+    let member = x0x::identity::AgentId([11; 32]);
+    room_with(&state, &room(0xdd), &[member]).await;
+    let sybil = x0x::identity::AgentKeypair::generate()?;
+    let sybil_id = sybil.agent_id();
+    let mut signed = bare_request(&sybil_id, &room(0xdd), 0);
+    sign_page_request_with(&sybil, &mut signed);
+    assert_eq!(
+        dispatch(&state, sybil_id, MACHINE, false, signed, 1_000),
+        Dispatched::Dropped
+    );
+    assert_eq!(
+        verified_dispatch(&state, sybil_id, &room(0xdd), 0),
+        Dispatched::Dropped
+    );
+    assert_eq!(
+        verified_dispatch(&state, member, &room(0xee), 0),
+        Dispatched::Dropped,
+        "a room this daemon does not hold"
+    );
+    assert_eq!(
+        verified_dispatch(&state, member, &room(0xdd), 0),
+        Dispatched::Started
     );
     hold.close();
     Ok(())
@@ -625,7 +824,7 @@ async fn a_dispatched_answer_is_the_direct_answer() -> Result<()> {
     assert_eq!(direct.len(), 1, "the direct call answers");
     owner.treekem_catchup_throttle.write().await.clear();
     let bytes = serde_json::to_vec(&request)?.len();
-    dispatch(owner, s1_id, true, request, bytes);
+    dispatch(owner, s1_id, MACHINE, true, request, bytes);
     assert!(eventually(|| async { responses().len() == 2 }).await);
     assert_eq!(responses()[1], direct[0], "the same page, byte for byte");
     cast.shutdown().await;
