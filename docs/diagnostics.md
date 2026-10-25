@@ -135,7 +135,10 @@ milliseconds they took from the first publish to the outcome.
 that ended without the ACK. A lost ACK counts here even when the message
 arrived. Since survivor re-key A14 a leaf recipient also sends its v1 ACK on
 live Direct, so these should stay low when the sender is connected to it
-(`docs/adr/transient/T-v1-ack-direct-hedge.md`).
+(`docs/adr/transient/T-v1-ack-direct-hedge.md`). `stats.direct_ack_dropped_no_key`
+counts Direct ACK envelopes dropped because no key for their sender was known
+(discovery cache, peer evidence, or the key that verified its capability
+advert).
 
 `stats.ack_publish_route_failed` increments when the ACK never left this
 recipient: both first-success hedge routes failed, or the bounded publisher

@@ -4798,6 +4798,18 @@ fn raw_delivery_from_ingress(
     }
 }
 
+/// Survivor re-key A14: the first of `candidates` that is an ML-DSA key
+/// whose agent id is `sender`, to check a Direct ACK envelope from it.
+fn direct_ack_sender_key(
+    sender: &identity::AgentId,
+    candidates: impl IntoIterator<Item = Option<Vec<u8>>>,
+) -> Option<Vec<u8>> {
+    candidates.into_iter().flatten().find(|key| {
+        ant_quic::MlDsaPublicKey::from_bytes(key)
+            .is_ok_and(|public| identity::AgentId::from_public_key(&public) == *sender)
+    })
+}
+
 async fn dispatch_raw_direct_after_gates(
     dm: &direct::DirectMessaging,
     history_handle: Option<&history::HistoryHandle>,
@@ -16616,6 +16628,7 @@ impl Agent {
             return;
         };
         let evidence = std::sync::Arc::clone(&self.capability_store.evidence);
+        let advert_keys = std::sync::Arc::clone(&self.capability_store);
         let dm = std::sync::Arc::clone(&self.direct_messaging);
         let discovery_cache = std::sync::Arc::clone(&self.identity_discovery_cache);
         let contact_store = std::sync::Arc::clone(&self.contact_store);
@@ -16816,16 +16829,33 @@ impl Agent {
                 // as a user DM. Direct send-ok is not a sender receipt.
                 if let Ok(envelope) = dm::DmEnvelope::from_wire_bytes(&data) {
                     if matches!(envelope.body, dm::DmBody::Ack(_)) {
-                        let sender_public_key = {
+                        // Survivor re-key A14: the sender's key from the
+                        // discovery cache, else peer evidence (whatever the
+                        // transport annotation says), else the key that
+                        // verified its capability advert, the one this
+                        // daemon's own gossip-inbox send used. Each must
+                        // derive to the sender; the envelope signature is
+                        // still checked against it.
+                        let cached = {
                             let cache = discovery_cache.read().await;
                             cache
                                 .get(&sender)
                                 .map(|entry| entry.agent_public_key.clone())
                                 .filter(|key| !key.is_empty())
                         };
-                        let sender_public_key = if sender_public_key.is_none() && evidence_ready && verified {
-                            evidence.usable(sender, machine_id, dm_capability::now_unix_ms()).map(|v| v.announcement.agent_public_key.clone())
-                        } else { sender_public_key };
+                        let from_evidence = (cached.is_none() && evidence_ready)
+                            .then(|| {
+                                evidence
+                                    .usable(sender, machine_id, dm_capability::now_unix_ms())
+                                    .map(|view| view.announcement.agent_public_key.clone())
+                            })
+                            .flatten();
+                        let from_advert = advert_keys.advert_agent_key(&sender);
+                        let sender_public_key =
+                            direct_ack_sender_key(&sender, [cached, from_evidence, from_advert]);
+                        if sender_public_key.is_none() {
+                            dm.record_direct_ack_dropped_no_key();
+                        }
                         if let Some(sender_public_key) = sender_public_key {
                             let inbox = dm_inbox_service.lock().await;
                             if let Some(service) = inbox.as_ref() {

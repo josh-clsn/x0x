@@ -509,6 +509,7 @@ struct DirectDiagnosticsCounters {
     v1_ack_wait_ms: AtomicU64,
     v1_ack_wait_timeouts: AtomicU64,
     v1_ack_wait_timeout_ms: AtomicU64,
+    direct_ack_dropped_no_key: AtomicU64,
     incoming_delivered_to_subscribe: AtomicU64,
     subscriber_channel_lagged: AtomicU64,
     subscriber_events_evicted: AtomicU64,
@@ -611,6 +612,11 @@ pub struct DmDiagnosticsStats {
     pub v1_ack_wait_timeouts: u64,
     #[serde(default)]
     pub v1_ack_wait_timeout_ms: u64,
+    /// Survivor re-key A14: Direct ACK envelopes dropped because no key for
+    /// their sender was known here (discovery cache, peer evidence, or the
+    /// key that verified its capability advert).
+    #[serde(default)]
+    pub direct_ack_dropped_no_key: u64,
     pub incoming_delivered_to_subscribe: u64,
     /// Number of oldest buffered events evicted from slow subscriber queues.
     pub subscriber_events_evicted: u64,
@@ -1153,6 +1159,13 @@ impl DirectMessaging {
         }
     }
 
+    /// Survivor re-key A14: a Direct ACK dropped for want of its sender's key.
+    pub(crate) fn record_direct_ack_dropped_no_key(&self) {
+        self.diagnostics
+            .direct_ack_dropped_no_key
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// #380 leaf-reverse-ACK: Direct hedge outcome counter.
     pub(crate) fn record_ack_direct_hedge(&self, outcome: AckDirectHedgeOutcomeRecord) {
         let counter = match outcome {
@@ -1288,6 +1301,10 @@ impl DirectMessaging {
             v1_ack_wait_timeout_ms: self
                 .diagnostics
                 .v1_ack_wait_timeout_ms
+                .load(Ordering::Relaxed),
+            direct_ack_dropped_no_key: self
+                .diagnostics
+                .direct_ack_dropped_no_key
                 .load(Ordering::Relaxed),
             incoming_delivered_to_subscribe: self
                 .diagnostics

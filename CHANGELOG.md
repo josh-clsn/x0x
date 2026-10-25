@@ -83,14 +83,18 @@ All notable changes to this project will be documented in this file.
   use, in its own task, so a sender whose gossip ACK frame was refused by a
   non-forwarding leaf no longer waits 24 s for a DM that arrived. A catch-up
   answer now frees its slot when it hands its send off (at most 32 sends
-  waiting, 8 per requester). See
+  waiting, 8 per requester). A Direct ACK is checked against the sender's key
+  from the discovery cache, peer evidence, or the advert the send used;
+  `GET /diagnostics/dm` reports `direct_ack_dropped_no_key`. See
   `docs/adr/transient/T-v1-ack-direct-hedge.md`.
 - **A member seated by a direct add or an approved join request is owed its
   seat until it proves it holds it.** The seat rides the re-key obligations
   (durable, 6 s to 15 min backoff, sent at once on reconnect), so a sibling
   device asleep through the first minute is seated when it returns. A retried
   add answers 409 as before, with `"redelivered": true`, and sends the seat
-  again. See `docs/adr/transient/T-seat-obligation.md`.
+  again. The seat's Welcome stays staged past its 24 h TTL while the seat is
+  owed; a seat the catch-up log or the staging lost is re-seated with a
+  commit, at most once a day. See `docs/adr/transient/T-seat-obligation.md`.
 - **No catch-up ask blocks an apply or the catch-up listener.** An event ahead
   of the head is parked and the apply returns; each ask runs in its own task,
   once per peer and head. A truncated page's follow-up ask runs in its own task

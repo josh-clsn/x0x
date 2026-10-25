@@ -37,7 +37,12 @@ async fn leaf(dir: &std::path::Path, name: &str) -> Agent {
         .expect("real Agent setup")
 }
 
-/// WHY (A14): a leaf answers a v1 DM with one eager frame on the sender's
+/// WHY (A14, fix round 1): the sender knows the leaf only by the capability
+/// advert its gossip-inbox send used (a phone: no discovery-cache entry, no
+/// peer evidence), and still checks the leaf's Direct ACK, against the key
+/// that verified that advert.
+///
+/// A leaf answers a v1 DM with one eager frame on the sender's
 /// inbox topic. When that frame is lost (here: dropped at the recipient,
 /// as a non-forwarding leaf bystander drops it), the sender used to wait
 /// 8 s, back off 8 s, resend and wait 8 s more, then fail, although the DM
@@ -111,30 +116,16 @@ async fn a_leaf_v1_ack_reaches_the_sender_over_direct_when_its_gossip_frame_is_l
             .lock()
             .expect("drop list")
             .push(recipient.agent_id());
-        // The sender checks a Direct ACK against the recipient's announced
-        // key, as it would for a member it shares a room with.
-        sender
-            .start_identity_listener()
-            .await
-            .expect("identity listener");
-        let announced = || async {
-            sender
+        // The phone case: the sender has no discovery-cache entry for the
+        // leaf (nothing announced), only the capability it sent with.
+        assert!(
+            !sender
                 .identity_discovery_cache
                 .read()
                 .await
-                .contains_key(&recipient.agent_id())
-        };
-        tokio::time::timeout(PHASE, async {
-            while !announced().await {
-                recipient
-                    .announce_identity(false, false)
-                    .await
-                    .expect("announce");
-                tokio::time::sleep(Duration::from_millis(400)).await;
-            }
-        })
-        .await
-        .expect("the sender learns the recipient's announced key");
+                .contains_key(&recipient.agent_id()),
+            "the sender never heard the leaf announce"
+        );
 
         let before = sender.direct_messaging().diagnostics_snapshot().stats;
         let mut inbox = recipient.subscribe_direct();
@@ -173,6 +164,10 @@ async fn a_leaf_v1_ack_reaches_the_sender_over_direct_when_its_gossip_frame_is_l
         assert_eq!(delivered.sender, sender.agent_id());
 
         let after = sender.direct_messaging().diagnostics_snapshot().stats;
+        assert_eq!(
+            after.direct_ack_dropped_no_key, before.direct_ack_dropped_no_key,
+            "the Direct ACK was checked against the advert's key, not dropped"
+        );
         assert_eq!(after.v1_ack_waits, before.v1_ack_waits + 1);
         assert_eq!(after.v1_ack_wait_timeouts, before.v1_ack_wait_timeouts);
         let wait_ms = after.v1_ack_wait_ms - before.v1_ack_wait_ms;
@@ -192,4 +187,68 @@ async fn a_leaf_v1_ack_reaches_the_sender_over_direct_when_its_gossip_frame_is_l
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
     }
+}
+
+fn keypair_key(keypair: &identity::AgentKeypair) -> Vec<u8> {
+    keypair.public_key().as_bytes().to_vec()
+}
+
+/// A14 fix round 1: a Direct ACK's key is the first candidate that derives
+/// to its sender, wherever it came from; one that derives to anyone else is
+/// never used, and with none the ACK is dropped.
+#[test]
+fn a_direct_ack_key_must_derive_to_its_sender() {
+    let leaf = identity::AgentKeypair::generate().expect("key");
+    let other = identity::AgentKeypair::generate().expect("key");
+    let sender = leaf.agent_id();
+    assert_eq!(
+        direct_ack_sender_key(&sender, [None, None, Some(keypair_key(&leaf))]),
+        Some(keypair_key(&leaf)),
+        "the advert's key alone is enough"
+    );
+    assert_eq!(
+        direct_ack_sender_key(&sender, [None, Some(keypair_key(&leaf)), None]),
+        Some(keypair_key(&leaf)),
+        "peer evidence alone is enough, whatever the transport annotation"
+    );
+    assert_eq!(
+        direct_ack_sender_key(
+            &sender,
+            [Some(keypair_key(&other)), None, Some(keypair_key(&leaf))]
+        ),
+        Some(keypair_key(&leaf)),
+        "a key for another agent is passed over"
+    );
+    assert_eq!(
+        direct_ack_sender_key(
+            &sender,
+            [Some(keypair_key(&other)), Some(vec![1, 2, 3]), None]
+        ),
+        None
+    );
+}
+
+/// The capability store keeps the key that verified an agent's advert,
+/// only when that key is the agent's own, and only while the advert lives.
+#[test]
+fn the_capability_store_keeps_only_an_agents_own_advert_key() {
+    let store = dm_capability::CapabilityStore::new();
+    let leaf = identity::AgentKeypair::generate().expect("key");
+    let other = identity::AgentKeypair::generate().expect("key");
+    let agent = leaf.agent_id();
+    assert!(store.insert(
+        agent,
+        identity::MachineId([3; 32]),
+        dm::DmCapabilities::pending(),
+        dm_capability::now_unix_ms(),
+    ));
+    store.remember_advert_key(agent, &keypair_key(&other));
+    assert_eq!(store.advert_agent_key(&agent), None, "another agent's key");
+    store.remember_advert_key(agent, &keypair_key(&leaf));
+    assert_eq!(store.advert_agent_key(&agent), Some(keypair_key(&leaf)));
+    assert_eq!(
+        store.advert_agent_key(&other.agent_id()),
+        None,
+        "no advert, no key"
+    );
 }
