@@ -72,6 +72,118 @@ fn epoch_of(event: &NamedGroupMetadataEvent) -> u64 {
     }
 }
 
+/// The signed request `state`'s `prove_held` sent to `author`, once sent.
+async fn held_proof(state: &AppState, author: &x0x::identity::AgentId) -> TreeKemCatchupRequest {
+    let author_hex = hex_of(author);
+    assert!(
+        eventually(|| async {
+            state
+                .named_group_test_recorders
+                .held_proofs_sent
+                .load(Ordering::SeqCst)
+                >= 1
+        })
+        .await,
+        "a held proof goes to the author"
+    );
+    let payload = state
+        .named_group_test_recorders
+        .catchup_page_requests
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|(peer, _)| *peer == author_hex)
+        .map(|(_, payload)| payload.clone())
+        .expect("the held proof was recorded");
+    serde_json::from_slice(&payload).expect("a page request")
+}
+
+/// Route the owner's obligation sends: to N through its direct listener
+/// path while `awake`, and to S1 and S2 always.
+fn route_sends(cast: &SurvivorRelay, n: &Sibling, awake: &Arc<AtomicBool>) {
+    let owner_id = cast.fixture.state.agent.agent_id();
+    let (awake, n_state, n_hex) = (Arc::clone(awake), Arc::clone(&n.state), n.hex.clone());
+    let survivors = [Arc::clone(&cast.s1), Arc::clone(&cast.s2)];
+    install_deliver(
+        &cast.fixture.state,
+        Arc::new(move |recipient, event| {
+            let target = if recipient == n_hex {
+                awake.load(Ordering::SeqCst).then(|| Arc::clone(&n_state))
+            } else {
+                survivors
+                    .iter()
+                    .find(|state| hex_of(&state.agent.agent_id()) == recipient)
+                    .cloned()
+            };
+            Box::pin(async move {
+                let Some(target) = target else {
+                    return Err("unreachable".to_string());
+                };
+                let applied =
+                    apply_direct_named_group_metadata_event(&target, event, owner_id, true).await;
+                if applied.accepted {
+                    Ok(())
+                } else {
+                    Err(format!("{applied:?}"))
+                }
+            })
+        }),
+    );
+}
+
+/// The owner's staged Welcome the seat event names.
+fn welcome_id_of(seat: &NamedGroupMetadataEvent) -> String {
+    match seat {
+        NamedGroupMetadataEvent::MemberAdded {
+            welcome_ref: Some(welcome),
+            ..
+        } => welcome.welcome_id.clone(),
+        other => panic!("no Welcome reference: {other:?}"),
+    }
+}
+
+/// Drop `seat` from the owner's catch-up log, as eviction past the room's
+/// 128 events does.
+async fn evict_from_log(state: &AppState, seat: &NamedGroupMetadataEvent) {
+    let mut log = state.treekem_event_log.write().await;
+    for events in log.values_mut() {
+        events.retain(|held| held != seat);
+    }
+}
+
+/// The owner's latest add naming `member`, as published.
+fn latest_add(state: &AppState, member_hex: &str) -> NamedGroupMetadataEvent {
+    super::signer_delivery::published(state, |event| {
+        matches!(event, NamedGroupMetadataEvent::MemberAdded { agent_id, .. } if agent_id == member_hex)
+    })
+    .expect("the add is published")
+}
+
+async fn reseats(state: &AppState) -> u64 {
+    state.rekey_obligations.lock().await.reseats
+}
+
+/// The owner restarts: its staging file and its obligations file are read
+/// back into a fresh memory.
+async fn restart_staging_and_obligations(owner: &Arc<AppState>) {
+    save_join_result_staging(owner)
+        .await
+        .expect("staging written");
+    owner.pending_welcomes.write().await.clear();
+    owner.seat_welcome_pins.lock().unwrap().clear();
+    load_join_result_staging(owner).await;
+    let groups = owner.named_groups.read().await.clone();
+    let loaded = load_rekey_obligations(
+        &owner.treekem_dir,
+        &groups,
+        &hex_of(&owner.agent.agent_id()),
+        &*owner.treekem_event_log.read().await,
+    )
+    .await;
+    *owner.rekey_obligations.lock().await = loaded;
+}
+
 async fn seated(state: &AppState, group_id: &str, member_hex: &str) -> bool {
     state.treekem_groups.read().await.contains_key(group_id)
         && state
@@ -136,8 +248,10 @@ async fn a_sibling_asleep_past_ten_minutes_is_seated_when_it_returns() -> Result
                     let Some(target) = target else {
                         return Err("unreachable".to_string());
                     };
+                    // The direct listener's path, which answers a re-key from
+                    // its author with a signed request (prove_held).
                     let applied =
-                        apply_named_group_metadata_event(&target, event, owner_id, true, None)
+                        apply_direct_named_group_metadata_event(&target, event, owner_id, true)
                             .await;
                     if applied.accepted {
                         Ok(())
@@ -200,14 +314,13 @@ async fn a_sibling_asleep_past_ten_minutes_is_seated_when_it_returns() -> Result
         "delivered, still unproven"
     );
 
-    // N's own request from its new head proves the seat.
-    let request = super::super::signed_catchup::page_request(&n.state, group_id, None)
-        .await
-        .expect("N asks");
-    handle_treekem_catchup_request(owner, &n.id, false, request).await;
+    // Review S-3: N, quiet, proves its seat on its own: the seat came from
+    // its author, so N answered with one signed request from its new head.
+    let proof = held_proof(&n.state, &owner_id).await;
+    handle_treekem_catchup_request(owner, &n.id, false, proof).await;
     assert!(
         eventually(|| async { owed(owner, group_id, &n.hex).await.is_none() }).await,
-        "N's proof settles its seat"
+        "N's own held proof settles its seat"
     );
     cast.shutdown().await;
     Ok(())
@@ -307,7 +420,7 @@ async fn a_retried_add_answers_409_and_redelivers_the_seat() -> Result<()> {
         owed(owner, group_id, &n.hex)
             .await
             .map(|owed| owed.next_attempt_at_ms),
-        Some(0),
+        Some(owner.rekey_obligations.lock().await.clock.now_ms()),
         "the seat obligation is due now"
     );
     cast.shutdown().await;
@@ -335,6 +448,213 @@ async fn the_seat_obligation_survives_restart() -> Result<()> {
         loaded.get(group_id, &n.hex).map(|owed| owed.through_epoch),
         Some(epoch_of(&add))
     );
+    cast.shutdown().await;
+    Ok(())
+}
+
+/// N is away for 25 hours, and the owner restarts in the middle. The seat's
+/// Welcome is pinned while the seat is owed, so it survives both the TTL and
+/// the restart, while an unpinned Welcome as old does not. N comes back and
+/// is seated from the kept Welcome; once its proof settles the seat, the pin
+/// goes.
+#[tokio::test]
+async fn a_member_back_after_25_hours_is_seated_from_the_kept_welcome() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let owner = &cast.fixture.state;
+    let group_id = &cast.fixture.group_id;
+    let owner_id = owner.agent.agent_id();
+    let n = sibling(&cast).await?;
+    let add = direct_add_route(owner, group_id, &n.hex, "Sibling", &n.package_b64).await;
+    let welcome_id = welcome_id_of(&add);
+    assert!(
+        super::super::seat_welcome_pin::pinned(owner, &welcome_id),
+        "the seat pins its Welcome"
+    );
+    assert!(owed(owner, group_id, &n.hex)
+        .await
+        .is_some_and(|owed| owed.seat));
+
+    // An unpinned Welcome as old, for contrast.
+    let control = "c0".repeat(32);
+    let day_and_an_hour = 25 * 60 * 60 * 1000;
+    {
+        let mut welcomes = owner.pending_welcomes.write().await;
+        let mut stale = welcomes.get(&welcome_id).expect("staged").clone();
+        stale.joiner_agent = "ab".repeat(32);
+        welcomes.insert(control.clone(), stale);
+        for pending in welcomes.values_mut() {
+            pending.created_at_ms = pending.created_at_ms.saturating_sub(day_and_an_hour);
+        }
+    }
+    restart_staging_and_obligations(owner).await;
+    {
+        let welcomes = owner.pending_welcomes.read().await;
+        assert!(
+            welcomes.contains_key(&welcome_id),
+            "the pinned Welcome outlives the TTL and the restart"
+        );
+        assert!(
+            !welcomes.contains_key(&control),
+            "an unpinned Welcome as old does not"
+        );
+    }
+    assert!(super::super::seat_welcome_pin::pinned(owner, &welcome_id));
+    assert!(
+        owed(owner, group_id, &n.hex)
+            .await
+            .is_some_and(|owed| owed.seat),
+        "the seat obligation too"
+    );
+
+    let awake = Arc::new(AtomicBool::new(true));
+    route_sends(&cast, &n, &awake);
+    set_connected(owner, &[&n.hex]);
+    rekey_obligations::step(owner).await;
+    assert!(
+        eventually(|| async { seated(&n.state, group_id, &n.hex).await }).await,
+        "N is seated from the kept Welcome"
+    );
+    assert_eq!(live_epoch(&n.state, group_id).await, epoch_of(&add));
+    let proof = held_proof(&n.state, &owner_id).await;
+    handle_treekem_catchup_request(owner, &n.id, false, proof).await;
+    assert!(eventually(|| async { owed(owner, group_id, &n.hex).await.is_none() }).await);
+    rekey_obligations::step(owner).await;
+    assert!(
+        !super::super::seat_welcome_pin::pinned(owner, &welcome_id),
+        "a settled seat unpins its Welcome"
+    );
+    cast.shutdown().await;
+    Ok(())
+}
+
+/// N's seat falls out of the owner's catch-up log (past the room's 128
+/// events). The obligation cannot send it, so the owner re-seats N with a
+/// removal and a fresh add: the survivors are owed both commits and follow
+/// them, and N is owed the new seat with its Welcome pinned. (N lands from
+/// it once its roster reaches the re-seat's base; see the record.)
+#[tokio::test]
+async fn a_seat_the_log_lost_is_re_seated_with_a_commit() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let owner = &cast.fixture.state;
+    let group_id = &cast.fixture.group_id;
+    let n = sibling(&cast).await?;
+    let first = direct_add_route(owner, group_id, &n.hex, "Sibling", &n.package_b64).await;
+    let awake = Arc::new(AtomicBool::new(false));
+    route_sends(&cast, &n, &awake);
+    // The survivors take the add; N is away.
+    skew(owner, 6_000).await;
+    rekey_obligations::step(owner).await;
+    assert!(
+        eventually(|| async {
+            live_epoch(&cast.s1, group_id).await == epoch_of(&first)
+                && live_epoch(&cast.s2, group_id).await == epoch_of(&first)
+                && idle(owner, group_id, &n.hex).await
+        })
+        .await
+    );
+    evict_from_log(owner, &first).await;
+
+    skew(owner, 15_000).await;
+    rekey_obligations::step(owner).await;
+    assert!(
+        eventually(|| async { reseats(owner).await == 1 }).await,
+        "the lost seat is re-seated"
+    );
+    let second = latest_add(owner, &n.hex);
+    let new_epoch = epoch_of(&second);
+    assert_eq!(new_epoch, epoch_of(&first) + 2, "a removal and an add");
+    assert!(
+        owed(owner, group_id, &n.hex)
+            .await
+            .is_some_and(|owed| owed.seat && owed.through_epoch == new_epoch),
+        "N is owed its new seat"
+    );
+    assert!(super::super::seat_welcome_pin::pinned(
+        owner,
+        &welcome_id_of(&second)
+    ));
+    for survivor in [
+        hex_of(&cast.s1.agent.agent_id()),
+        hex_of(&cast.s2.agent.agent_id()),
+    ] {
+        assert_eq!(
+            owed(owner, group_id, &survivor)
+                .await
+                .map(|owed| owed.through_epoch),
+            Some(new_epoch),
+            "survivor {survivor} is owed the re-seat"
+        );
+    }
+    assert!(!seated(&n.state, group_id, &n.hex).await);
+
+    // The survivors take both commits from their obligations.
+    skew(owner, 6_000).await;
+    rekey_obligations::step(owner).await;
+    assert!(
+        eventually(|| async {
+            live_epoch(&cast.s1, group_id).await == new_epoch
+                && live_epoch(&cast.s2, group_id).await == new_epoch
+        })
+        .await,
+        "the survivors follow the re-seat"
+    );
+    cast.shutdown().await;
+    Ok(())
+}
+
+/// A member is re-seated at most once a day: a second lost seat, from the
+/// worker or a retried add, waits. A retried add of a member whose seat the
+/// log lost re-seats it the first time.
+#[tokio::test]
+async fn re_seats_are_limited_to_one_a_day_and_a_retry_may_trigger_one() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let owner = &cast.fixture.state;
+    let group_id = &cast.fixture.group_id;
+    let n = sibling(&cast).await?;
+    let first = direct_add_route(owner, group_id, &n.hex, "Sibling", &n.package_b64).await;
+    evict_from_log(owner, &first).await;
+    let retry = || async {
+        let response = add_named_group_member(
+            State(Arc::clone(owner)),
+            owner_extension(),
+            Path(group_id.clone()),
+            Json(AddNamedGroupMemberRequest {
+                agent_id: n.hex.clone(),
+                display_name: Some("Sibling".to_string()),
+                treekem_key_package_b64: Some(n.package_b64.clone()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        serde_json::from_slice::<serde_json::Value>(&bytes).expect("json")
+    };
+    let body = retry().await;
+    assert_eq!(body["reseated"], true, "the retry re-seats the lost seat");
+    assert_eq!(reseats(owner).await, 1);
+
+    let second = latest_add(owner, &n.hex);
+    evict_from_log(owner, &second).await;
+    let body = retry().await;
+    assert_eq!(body["reseated"], false, "not twice in a day");
+    skew(owner, 6_000).await;
+    rekey_obligations::step(owner).await;
+    assert!(
+        eventually(|| async {
+            owner
+                .named_group_test_recorders
+                .reseats_too_soon
+                .load(Ordering::SeqCst)
+                >= 2
+        })
+        .await,
+        "the worker's re-seat is refused as too soon"
+    );
+    assert_eq!(reseats(owner).await, 1, "the worker waits too");
+    assert_eq!(latest_add(owner, &n.hex), second, "no third seat");
     cast.shutdown().await;
     Ok(())
 }

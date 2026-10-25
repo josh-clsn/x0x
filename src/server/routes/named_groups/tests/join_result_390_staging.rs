@@ -143,6 +143,7 @@ async fn expired_staging_entries_are_not_restored() -> Result<()> {
     };
     let sidecar = JoinResultStagingSidecar {
         version: JOIN_RESULT_STAGING_SIDECAR_VERSION,
+        seat_pinned_welcomes: Vec::new(),
         join_results: HashMap::from([
             ("g:stale".to_string(), entry(stale)),
             ("g:fresh".to_string(), entry(now)),

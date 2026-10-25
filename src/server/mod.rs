@@ -1283,6 +1283,8 @@ pub async fn serve_with_options(
         treekem_gap_asks: std::sync::Mutex::default(),
         treekem_gap_catchups: std::sync::Mutex::default(),
         treekem_catchup_serve: crate::server::routes::named_groups::CatchupServe::default(),
+        seat_welcome_pins: std::sync::Mutex::default(),
+        seat_reseats: std::sync::Mutex::default(),
         treekem_head_answers: std::sync::Mutex::default(),
         treekem_head_rounds: std::sync::Mutex::default(),
         treekem_head_counter: Mutex::new(treekem_head_counter),

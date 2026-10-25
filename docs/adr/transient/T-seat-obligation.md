@@ -30,15 +30,42 @@ A sibling that slept through those sends was never seated and lost every message
 - **A retried add redelivers.** A direct add naming a member already active on the roster still answers 409 "member already present", now with `"redelivered": true`. It also:
   - sends the member the latest `MemberAdded` or `JoinRequestApproved` naming it from the room's catch-up log, at once;
   - makes its seat obligation due at the next step (`rekey_obligations::due_now`).
+- **The seat's Welcome stays staged while the seat is owed (fix round 1).** The direct-add and approval sites mark the obligation as a seat (`RekeyObligation::seat`, on disk) and pin the Welcome it names (`seat_welcome_pin`).
+  - Every Welcome expiry check treats a pinned Welcome as live: the staging prune, the start-up load, the serve and admission checks, and the stream deadlines.
+  - The pins are written in the join-result staging file, so a restart keeps them.
+  - The worker's step drops a pin once no unproven seat names that member in that room: the seat settled, or the member left, or the room was wiped.
+  - The Welcome joins at the seat's epoch however old it is. The joiner's KeyPackage secret is re-derived from its seed, and TreeKEM does not enforce KeyPackage lifetimes.
+  - A proof at or past the seat's epoch clears the seat mark.
+- **An unproven seat goes alone (review S-1).** While the seat is unproven, a send carries the seat event only. A member that holds it asks for the rest itself, and one that never returns costs one event per send.
+- **Re-seat with a commit, the fallback (fix round 1).** When the catch-up log no longer holds the seat, or its Welcome is no longer staged, the seat cannot be sent as it was. The worker (or a 409 retry) re-seats the member instead (`seat_reseat`):
+  - it removes the stale leaf with the member's KeyPackage from the roster (derived from its seed, so it is the same one);
+  - it adds the member again with that KeyPackage, which owes the new seat and pins its new Welcome;
+  - the survivors are owed both commits;
+  - the removal goes to the survivors only, so the member, which never took its seat, does not depart before the new seat arrives;
+  - at most once per member and room a day (`RESEAT_EVERY`), and only by an admin of the room;
+  - `GET .../treekem/catch-up` reports `seats`, `room_seats` and `reseats`.
+  - A Welcome cannot be minted at the current epoch without a commit: commits since the seat set path secrets on the member's leaf path that only a commit can hand on.
+- **`due_now` keeps the edge floor (review S-2).** A burst of 409 retries does not resend the seat each time. The next send is no sooner than 60 s after the last one.
 - **Blind schedule only when refused.** A seated member the obligations refused (past a cap, or a record that could not be written) keeps A12's direct sends at 6 to 60 s, with no republish. A refused survivor keeps the republishing schedule.
 
 ## Consequences
 
+- **The re-seat lands only on a current roster base.** The re-seat applies to the member only once its local roster reaches the re-seat's base. A member still at its pre-seat base cannot get there: its old seat is evicted from the log, or names a Welcome it cannot fetch. It lands once its roster base is refreshed, for example from a fresh card.
+  - The pin covers the common case: a member away for days, with the log still holding its seat.
+  - The re-seat makes the owner's side whole: survivors move on, and the new seat stays owed.
+- **The re-seat limiter is in memory.** A restart allows one more re-seat that day.
+
 - A sibling that sleeps for hours is seated when it returns. The worker sends its seat at the 15 min cap, and at once when its link comes back. No new invite is needed.
-- The Welcome a seat names is staged for 24 h (`PENDING_WELCOME_TTL`, kept across restarts). A member that comes back after that gets the seat event, but the Welcome fetch fails. It then needs a new seat, which a retried add cannot give while the stale seat stands. That case is not handled here.
 - The member counts toward the room's cap of 256 obligations and the daemon's 4096, as a survivor does.
 
 ## Tests
+
+Fix round 1 (`seat_obligation.rs`), each red with its fix reverted:
+- `a_member_back_after_25_hours_is_seated_from_the_kept_welcome`: the Welcome is backdated 25 h and the owner restarts in the middle (staging and obligations read back from disk). The pinned Welcome survives, an unpinned one as old does not, N is seated from it, and the pin goes once N's proof settles.
+- `a_seat_the_log_lost_is_re_seated_with_a_commit`: the seat is evicted from the log. The worker re-seats N (a removal and an add, epoch +2), N is owed the new seat with its Welcome pinned, and the survivors are owed both commits and follow them.
+- `re_seats_are_limited_to_one_a_day_and_a_retry_may_trigger_one`: a 409 retry re-seats a lost seat once. A second lost seat, from a retry or the worker, is refused as too soon.
+- `a_sibling_asleep_past_ten_minutes_is_seated_when_it_returns` now settles on N's own `prove_held` request (review S-3).
+
 
 `named_groups/tests/seat_obligation.rs`, on the survivor fixture plus a sibling daemon that knows the room but holds no tree. Its Welcome references resolve from the owner's staged Welcomes, in process (`welcome_source`, a test-only stand-in for the blob transport).
 

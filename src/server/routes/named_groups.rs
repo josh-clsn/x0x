@@ -40,6 +40,8 @@ pub(in crate::server) use rekey_obligations::{
     load_rekey_obligations, spawn_worker as spawn_rekey_obligation_worker, RekeyObligations,
 };
 mod seat_cert_fetch;
+mod seat_reseat;
+mod seat_welcome_pin;
 mod signed_catchup;
 mod signer_delivery;
 mod treekem_binding;
@@ -22805,9 +22807,11 @@ pub(in crate::server) async fn add_named_group_member(
 
 /// Survivor re-key A13: deliver `member`'s seat in `group_key` again, the
 /// latest `MemberAdded` or `JoinRequestApproved` naming it in the room's
-/// catch-up log, and make its seat obligation due now. Returns whether the
-/// log held a seat to send.
-async fn redeliver_seat(state: &Arc<AppState>, group_key: &str, member_hex: &str) -> bool {
+/// catch-up log, and make its seat obligation due now. When the seat is
+/// still owed but the log or the staging lost it, re-seat the member with a
+/// commit instead (`seat_reseat`). The caller holds the room's membership
+/// lock. Returns (redelivered, re-seated).
+async fn redeliver_seat(state: &Arc<AppState>, group_key: &str, member_hex: &str) -> (bool, bool) {
     let seat = {
         let aliases = {
             let groups = state.named_groups.read().await;
@@ -22841,12 +22845,24 @@ async fn redeliver_seat(state: &Arc<AppState>, group_key: &str, member_hex: &str
             .max_by_key(|event| commit_bearing_event_sort_key(event))
             .cloned()
     };
+    let deliverable = match &seat {
+        Some(seat) => seat_welcome_pin::seat_welcome_staged(state, seat).await,
+        None => false,
+    };
+    if !deliverable {
+        if rekey_obligations::owes_seat(state, group_key, member_hex).await {
+            let reseated = seat_reseat::reseat_locked(state, group_key, member_hex).await
+                == seat_reseat::Reseat::Done;
+            return (false, reseated);
+        }
+        return (false, false);
+    }
     let Some(seat) = seat else {
-        return false;
+        return (false, false);
     };
     spawn_named_group_event_delivery(state, member_hex, &seat);
     rekey_obligations::due_now(state, group_key, member_hex).await;
-    true
+    (true, false)
 }
 
 async fn add_treekem_named_group_member(
@@ -22905,13 +22921,18 @@ async fn add_treekem_named_group_member(
             // its seat obligation is due now. The answer is unchanged.
             let seated = info.has_active_member(&agent_hex);
             drop(groups);
-            let redelivered = seated && redeliver_seat(&state, &id, &agent_hex).await;
+            let (redelivered, reseated) = if seated {
+                redeliver_seat(&state, &id, &agent_hex).await
+            } else {
+                (false, false)
+            };
             return (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
                     "ok": false,
                     "error": "member already present",
                     "redelivered": redelivered,
+                    "reseated": reseated,
                 })),
             );
         }
@@ -23200,7 +23221,11 @@ async fn add_treekem_named_group_member(
             Some(&refused),
         );
     }
-    if !seated_refused.is_empty() {
+    if seated_refused.is_empty() {
+        // A13: the seat is owed; its Welcome stays staged until it is proven.
+        rekey_obligations::mark_seat(&state, &id, &agent_hex).await;
+        seat_welcome_pin::pin_seat(&state, &event).await;
+    } else {
         spawn_seated_member_resends(&state, &metadata_topic, &next, &event, &agent_hex);
     }
     spawn_named_group_event_delivery_to_active_members(&state, &next, &member_joined_recovery, &[]);
@@ -24631,6 +24656,20 @@ async fn remove_treekem_named_group_member(
     agent_id_hex: String,
     local_agent_hex: String,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    remove_treekem_named_group_member_with(state, id, agent_id_hex, local_agent_hex, true).await
+}
+
+/// [`remove_treekem_named_group_member`]. `notify_removed` false sends the
+/// removal to no one but the survivors: a re-seat (survivor re-key A13)
+/// removes a member that never took its seat, and must not make it depart
+/// before the new seat reaches it.
+async fn remove_treekem_named_group_member_with(
+    state: Arc<AppState>,
+    id: String,
+    agent_id_hex: String,
+    local_agent_hex: String,
+    notify_removed: bool,
+) -> (StatusCode, Json<serde_json::Value>) {
     use base64::Engine as _;
 
     let signing_kp = state.agent.identity().agent_keypair();
@@ -24832,7 +24871,11 @@ async fn remove_treekem_named_group_member(
     // Survivor re-key A10: each survivor is owed this re-key, on disk, before
     // the first publish. The removed member keeps the blind schedule below,
     // with any survivor the obligations refused.
-    let mut blind = vec![agent_id_hex.clone()];
+    let mut blind = if notify_removed {
+        vec![agent_id_hex.clone()]
+    } else {
+        Vec::new()
+    };
     blind.extend(
         rekey_obligations::owe_survivors(&state, &id, &next, &[agent_id_hex.as_str()], &[&event])
             .await,
@@ -24845,7 +24888,11 @@ async fn remove_treekem_named_group_member(
             &state,
             &next,
             &event,
-            std::slice::from_ref(&agent_id_hex),
+            if notify_removed {
+                std::slice::from_ref(&agent_id_hex)
+            } else {
+                &[]
+            },
         );
     }
     // #333 C/D: without this the removed peer keeps its roster and TreeKEM key
@@ -24855,7 +24902,11 @@ async fn remove_treekem_named_group_member(
         &metadata_topic,
         &next,
         &event,
-        std::slice::from_ref(&agent_id_hex),
+        if notify_removed {
+            std::slice::from_ref(&agent_id_hex)
+        } else {
+            &[]
+        },
         Some(&blind),
     );
     maybe_publish_group_card_after_state_change(&state, &id).await;
@@ -29959,7 +30010,11 @@ async fn approve_treekem_join_request(
             Some(&refused),
         );
     }
-    if !seated_refused.is_empty() {
+    if seated_refused.is_empty() {
+        // A13: the seat is owed; its Welcome stays staged until it is proven.
+        rekey_obligations::mark_seat(&state, &id, &requester_hex).await;
+        seat_welcome_pin::pin_seat(&state, &event).await;
+    } else {
         spawn_seated_member_resends(&state, &metadata_topic, &next, &event, &requester_hex);
     }
     cache_treekem_member_key_package(
@@ -37773,6 +37828,9 @@ struct JoinResultStagingSidecar {
     join_results: HashMap<String, PendingJoinResult>,
     #[serde(default)]
     welcomes: HashMap<String, PendingWelcome>,
+    /// Survivor re-key A13: the staged Welcomes an unproven seat pins.
+    #[serde(default)]
+    seat_pinned_welcomes: Vec<String>,
 }
 
 /// Wall-clock cadence for `MemberJoined` resends to the authority (#333),
@@ -37806,6 +37864,13 @@ pub(in crate::server) async fn save_join_result_staging(
             version: JOIN_RESULT_STAGING_SIDECAR_VERSION,
             join_results: results.clone(),
             welcomes: welcomes.clone(),
+            seat_pinned_welcomes: state
+                .seat_welcome_pins
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .cloned()
+                .collect(),
         };
         serde_json::to_string(&sidecar)
             .map_err(|e| std::io::Error::other(format!("serialize join-result staging: {e}")))
@@ -37882,7 +37947,18 @@ pub(in crate::server) async fn load_join_result_staging(state: &AppState) {
     join_results
         .retain(|_, p| staging_entry_fresh(p.created_at_ms, PENDING_JOIN_RESULT_TTL, now_ms));
     let mut welcomes = sidecar.welcomes;
-    welcomes.retain(|_, p| staging_entry_fresh(p.created_at_ms, PENDING_WELCOME_TTL, now_ms));
+    // Survivor re-key A13: a Welcome an unproven seat pins outlives the TTL.
+    let pins: HashSet<String> = sidecar.seat_pinned_welcomes.into_iter().collect();
+    welcomes.retain(|id, p| {
+        staging_entry_fresh(p.created_at_ms, PENDING_WELCOME_TTL, now_ms) || pins.contains(id)
+    });
+    *state
+        .seat_welcome_pins
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = pins
+        .into_iter()
+        .filter(|id| welcomes.contains_key(id))
+        .collect();
     cap_staging_oldest_first(&mut join_results, |p| p.created_at_ms);
     cap_staging_oldest_first(&mut welcomes, |p| p.created_at_ms);
     let (results_len, welcomes_len) = (join_results.len(), welcomes.len());
@@ -41581,7 +41657,8 @@ fn welcome_staged_now(
     state.pending_welcomes.try_read().is_ok_and(|welcomes| {
         welcomes.get(welcome_id).is_some_and(|pending| {
             pending.created_at == staged_at
-                && pending.created_at.elapsed() < PENDING_WELCOME_TTL
+                && (pending.created_at.elapsed() < PENDING_WELCOME_TTL
+                    || seat_welcome_pin::pinned(state, welcome_id))
                 && pending.joiner_agent == recipient_hex
         })
     })
@@ -41712,7 +41789,8 @@ fn welcome_frame_admission(
                     .get(&welcome_id)
                     .is_some_and(|pending| {
                         pending.created_at == staged_at
-                            && pending.created_at.elapsed() < PENDING_WELCOME_TTL
+                            && (pending.created_at.elapsed() < PENDING_WELCOME_TTL
+                                || seat_welcome_pin::pinned(&state, &welcome_id))
                             && pending.joiner_agent == recipient_hex
                     });
                 if !staged {
@@ -41851,7 +41929,8 @@ async fn welcome_frame_servable(
         .get(welcome_id)
         .is_some_and(|pending| {
             pending.created_at == staged_at
-                && pending.created_at.elapsed() < PENDING_WELCOME_TTL
+                && (pending.created_at.elapsed() < PENDING_WELCOME_TTL
+                    || seat_welcome_pin::pinned(state, welcome_id))
                 && pending.joiner_agent == recipient_hex
         });
     if staged {
@@ -43792,7 +43871,7 @@ async fn stage_treekem_welcome(
     let mut welcomes = state.pending_welcomes.write().await;
     let mut expired_ids = Vec::new();
     welcomes.retain(|id, pending| {
-        let live = staging_entry_fresh(pending.created_at_ms, PENDING_WELCOME_TTL, now_ms);
+        let live = seat_welcome_pin::welcome_live(state, id, pending.created_at_ms, now_ms);
         if !live {
             expired_ids.push(id.clone());
         }
@@ -44008,11 +44087,21 @@ async fn fetch_treekem_welcome_with_retries(
             .ok()
             .and_then(|source| source.clone());
         if let Some(source) = source {
+            // The source serves only a live Welcome, as its serve path does.
+            let now_ms = now_millis_u64();
             return source
                 .pending_welcomes
                 .read()
                 .await
                 .get(&welcome_ref.welcome_id)
+                .filter(|pending| {
+                    seat_welcome_pin::welcome_live(
+                        &source,
+                        &welcome_ref.welcome_id,
+                        pending.created_at_ms,
+                        now_ms,
+                    )
+                })
                 .map(|pending| pending.bytes.clone())
                 .ok_or_else(|| "welcome not staged at the source".to_string());
         }
@@ -44484,12 +44573,15 @@ async fn handle_welcome_fetch_request(
                     }
                 };
                 let payload = welcome_blob_payload(&msg)?;
-                let Some(deadline) = state
-                    .pending_welcomes
-                    .read()
-                    .await
-                    .get(welcome_id)
-                    .map(|pending| pending.created_at + PENDING_WELCOME_TTL)
+                let Some(deadline) =
+                    state
+                        .pending_welcomes
+                        .read()
+                        .await
+                        .get(welcome_id)
+                        .map(|pending| {
+                            seat_welcome_pin::deadline(&state, welcome_id, pending.created_at)
+                        })
                 else {
                     return Err("the staged Welcome was withdrawn".to_string());
                 };
@@ -44571,13 +44663,19 @@ async fn handle_welcome_fetch_request_via<S, F>(
         tracing::warn!(welcome_id, "Welcome fetch for unknown blob");
         return;
     };
-    if !staging_entry_fresh(pending.created_at_ms, PENDING_WELCOME_TTL, now_millis_u64()) {
+    if !seat_welcome_pin::welcome_live(state, &welcome_id, pending.created_at_ms, now_millis_u64())
+    {
         let mut welcomes = state.pending_welcomes.write().await;
         // A concurrent restage can replace this content id between the read
         // above and this write. Only tear down the stream for an entry that is
         // still expired while holding the same lock as staging.
         if welcomes.get(&welcome_id).is_some_and(|current| {
-            !staging_entry_fresh(current.created_at_ms, PENDING_WELCOME_TTL, now_millis_u64())
+            !seat_welcome_pin::welcome_live(
+                state,
+                &welcome_id,
+                current.created_at_ms,
+                now_millis_u64(),
+            )
         }) {
             welcomes.remove(&welcome_id);
             let mut streams = state.pending_welcome_streams.lock().await;
@@ -44619,7 +44717,7 @@ async fn handle_welcome_fetch_request_via<S, F>(
     // r5 (lifecycle note section 2.7 item 6): the stream never outlives the
     // staged Welcome's deadline; a timeout drops it (an unfinished stream
     // resets) and never purges.
-    let stream_deadline = pending.created_at + PENDING_WELCOME_TTL;
+    let stream_deadline = seat_welcome_pin::deadline(state, &welcome_id, pending.created_at);
     replace_welcome_stream(state, &welcome_id, async move {
         let _ = tokio::time::timeout_at(
             stream_deadline.into(),
@@ -46108,6 +46206,8 @@ pub(in crate::server) mod tests {
             treekem_gap_asks: std::sync::Mutex::default(),
             treekem_gap_catchups: std::sync::Mutex::default(),
             treekem_catchup_serve: CatchupServe::default(),
+            seat_welcome_pins: std::sync::Mutex::default(),
+            seat_reseats: std::sync::Mutex::default(),
             treekem_head_answers: std::sync::Mutex::default(),
             treekem_head_rounds: std::sync::Mutex::default(),
             treekem_head_counter: Mutex::new(treekem_head_counter),

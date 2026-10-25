@@ -1225,6 +1225,12 @@ pub(super) struct AppState {
     /// Survivor re-key A12: the catch-up listener's answer slots and each
     /// requester's waiting requests.
     pub(super) treekem_catchup_serve: crate::server::routes::named_groups::CatchupServe,
+    /// Survivor re-key A13: the staged Welcomes an unproven seat pins past
+    /// their TTL, by Welcome id. Written with the join-result staging file.
+    pub(super) seat_welcome_pins: StdMutex<std::collections::HashSet<String>>,
+    /// Survivor re-key A13: when each (room, member) was last re-seated with
+    /// a commit, wall-clock ms, for the one-a-day limit.
+    pub(super) seat_reseats: StdMutex<HashMap<(String, String), u64>>,
     /// Survivor re-key A6: per (room, requester), the latest challenge
     /// this daemon answered, its proof, and the answers in the current
     /// window.
@@ -1481,6 +1487,8 @@ pub(super) struct NamedGroupTestRecorders {
     /// semaphore each waits on (unsent) until it is closed.
     pub(super) answer_sends_started: std::sync::atomic::AtomicUsize,
     pub(super) answer_send_hold: StdMutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// Survivor re-key A13: re-seats refused as too soon.
+    pub(super) reseats_too_soon: std::sync::atomic::AtomicUsize,
     /// Survivor re-key A13: when set, a Welcome reference is resolved from
     /// this daemon's staged Welcomes, in place of the blob transport.
     pub(super) welcome_source: StdMutex<Option<Arc<crate::server::AppState>>>,
