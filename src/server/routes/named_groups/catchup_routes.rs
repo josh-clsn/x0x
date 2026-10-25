@@ -32,6 +32,7 @@
 
 use super::head_proof::{self, HeadProof, Refusal, SignedChallenge};
 use super::head_rounds::{self, NoRound, NotRecorded};
+use super::rekey_obligations;
 use super::{spawn_treekem_epoch_ahead_catchup, AppState, TreeKemCatchupRequest};
 use crate as x0x;
 use crate::server::group_access::{
@@ -774,6 +775,11 @@ pub(in crate::server) async fn treekem_head_proof_sign(
             "the challenge is for another room",
         )
         .respond();
+    }
+    // Survivor re-key A10: the requester signed its head, so it holds that
+    // epoch, and this daemon's obligation to it is settled as far.
+    if let Some(proof) = rekey_obligations::request_proof(&request, false) {
+        rekey_obligations::settle(&state, std::slice::from_ref(&id), &proof).await;
     }
     match head_proof::answer_challenge(&state, &challenge).await {
         Ok(proof) => (

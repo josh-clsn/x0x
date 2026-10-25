@@ -1450,6 +1450,9 @@ pub(super) struct NamedGroupTestRecorders {
     /// Survivor re-key A9: when set, the survivors the obligation worker
     /// counts as linked, in place of `is_agent_connected`.
     pub(super) rekey_obligation_connected: StdMutex<Option<std::collections::HashSet<String>>>,
+    /// Survivor re-key A10: every bounded resend schedule started, as
+    /// `(event kind, recipients)`.
+    pub(super) control_redelivery_recipients: StdMutex<Vec<(&'static str, Vec<String>)>>,
 }
 
 #[cfg(test)]

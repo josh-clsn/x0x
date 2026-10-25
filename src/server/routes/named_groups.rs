@@ -3820,13 +3820,47 @@ static GROUP_CONTROL_REDELIVERY_SCHEDULE_OVERRIDE: std::sync::LazyLock<Vec<Durat
 /// up front, so the task neither reads group state later — which for
 /// `GroupDeleted` is already gone — nor depends on the sender's own metadata
 /// listener, which `withdraw_group_state` stops before it publishes.
+///
+/// `recipients_override` (survivor re-key A10): the direct sends go to
+/// exactly these, not to `info`'s active members and `extra_recipients`. A
+/// re-key site passes the member it took out and the survivors its
+/// obligations refused; every other survivor is owed the re-key instead
+/// (`rekey_obligations`). The gossip republish runs either way.
 fn spawn_group_control_event_redelivery(
     state: &Arc<AppState>,
     metadata_topic: &str,
     info: &x0x::groups::GroupInfo,
     event: &NamedGroupMetadataEvent,
     extra_recipients: &[String],
+    recipients_override: Option<&[String]>,
 ) {
+    let recipients: Vec<String> = match recipients_override {
+        Some(recipients) => {
+            let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+            let mut chosen: Vec<String> = Vec::with_capacity(recipients.len());
+            for recipient in recipients {
+                if !recipient.eq_ignore_ascii_case(&local_agent_hex)
+                    && !chosen
+                        .iter()
+                        .any(|held| held.eq_ignore_ascii_case(recipient))
+                {
+                    chosen.push(recipient.clone());
+                }
+            }
+            chosen
+        }
+        None => named_group_event_recipients(state, info, extra_recipients)
+            .into_iter()
+            .collect(),
+    };
+    #[cfg(test)]
+    if let Ok(mut recorded) = state
+        .named_group_test_recorders
+        .control_redelivery_recipients
+        .lock()
+    {
+        recorded.push((named_group_metadata_event_kind(event), recipients.clone()));
+    }
     let schedule = GROUP_CONTROL_REDELIVERY_SCHEDULE_OVERRIDE.clone();
     // #531 I1: the early return below is silent, so "resends disabled" could
     // only be shown by an ABSENCE of trace. Make the control self-evidencing.
@@ -3840,9 +3874,6 @@ fn spawn_group_control_event_redelivery(
     if schedule.is_empty() {
         return;
     }
-    let recipients: Vec<String> = named_group_event_recipients(state, info, extra_recipients)
-        .into_iter()
-        .collect();
     // #531 I2: the trace below logs recipients.len() only; the banned target's
     // presence must be evidence, not inference from a count.
     tracing::debug!(
@@ -10921,6 +10952,15 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         );
         return;
     }
+    // Survivor re-key A10: a request only its requester can have sent (a
+    // verified transport, or its signature over its head) shows the epoch it
+    // holds, and that settles what this daemon owes it. A claimed sender
+    // shows nothing. The settle runs in its own task, off this listener.
+    if authorized {
+        if let Some(proof) = rekey_obligations::request_proof(&request, verified) {
+            rekey_obligations::spawn_settle(state, log_keys.clone(), proof);
+        }
+    }
     // Issue #205: member-keyed TreeKEM KeyPackage fetch. The requester is a
     // promoted admin missing a member's key package; serve this node's cached,
     // self-signed `MemberJoined` for the target (this node witnessed the join).
@@ -16127,6 +16167,21 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 )
                 .await;
 
+                // Survivor re-key A10: every other member is owed both commits
+                // before the first publish. The returning member keeps the
+                // blind schedule (and its Welcome), with any survivor the
+                // obligations refused.
+                let mut blind = vec![member_agent_id.clone()];
+                blind.extend(
+                    rekey_obligations::owe_survivors(
+                        state,
+                        &resolved_group_key,
+                        &next,
+                        &[member_agent_id.as_str()],
+                        &[&removed_event, &added_event],
+                    )
+                    .await,
+                );
                 publish_named_group_metadata_event(state, &metadata_topic, &removed_event).await;
                 remember_commit_bearing_event(state, &removed_event).await;
                 publish_named_group_metadata_event(state, &metadata_topic, &added_event).await;
@@ -16154,6 +16209,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     &next,
                     &removed_event,
                     std::slice::from_ref(&member_agent_id),
+                    Some(&blind),
                 );
                 spawn_group_control_event_redelivery(
                     state,
@@ -16161,6 +16217,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     &next,
                     &added_event,
                     std::slice::from_ref(&member_agent_id),
+                    Some(&blind),
                 );
                 if let Some((revision3, role, commit3)) = role_commit {
                     let role_event = NamedGroupMetadataEvent::MemberRoleUpdated {
@@ -16185,6 +16242,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         &next,
                         &role_event,
                         &[],
+                        None,
                     );
                 }
                 tracing::info!(
@@ -16760,6 +16818,21 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 seated_attempt_id.as_deref(),
             )
             .await;
+            // Survivor re-key A10: a TreeKEM add moves the epoch, so every
+            // member it did not seat is owed it before the first publish. Any
+            // the obligations refused get the blind schedule.
+            let refused = if treekem_epoch.is_some() {
+                rekey_obligations::owe_survivors(
+                    state,
+                    &resolved_group_key,
+                    &next,
+                    &[member_agent_id.as_str()],
+                    &[&event],
+                )
+                .await
+            } else {
+                Vec::new()
+            };
             publish_named_group_metadata_event(state, &metadata_topic, &event).await;
             remember_commit_bearing_event(state, &event).await;
             spawn_named_group_event_delivery_to_active_members(
@@ -16768,6 +16841,16 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &event,
                 std::slice::from_ref(&member_agent_id),
             );
+            if !refused.is_empty() {
+                spawn_group_control_event_redelivery(
+                    state,
+                    &metadata_topic,
+                    &next,
+                    &event,
+                    &[],
+                    Some(&refused),
+                );
+            }
             if let Some(recovery) = member_joined_recovery.as_deref() {
                 spawn_named_group_event_delivery_to_active_members(state, &next, recovery, &[]);
             }
@@ -22908,6 +22991,12 @@ async fn add_treekem_named_group_member(
         true,
     )
     .await;
+    // Survivor re-key A10: every member the add did not seat is owed it
+    // before the first publish; any the obligations refused get the blind
+    // schedule.
+    let refused =
+        rekey_obligations::owe_survivors(&state, &id, &next, &[agent_hex.as_str()], &[&event])
+            .await;
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     remember_commit_bearing_event(&state, &event).await;
     spawn_named_group_event_delivery_to_active_members(
@@ -22916,6 +23005,16 @@ async fn add_treekem_named_group_member(
         &event,
         std::slice::from_ref(&agent_hex),
     );
+    if !refused.is_empty() {
+        spawn_group_control_event_redelivery(
+            &state,
+            &metadata_topic,
+            &next,
+            &event,
+            &[],
+            Some(&refused),
+        );
+    }
     spawn_named_group_event_delivery_to_active_members(&state, &next, &member_joined_recovery, &[]);
     let recovery_deliveries = state
         .treekem_member_key_packages
@@ -23194,6 +23293,7 @@ pub(in crate::server) async fn remove_named_group_member(
         &delivery_roster,
         &event,
         std::slice::from_ref(&agent_id_hex),
+        None,
     ); // F1 §5a step 5: publish the buffered survivor envelopes only after the
        // removal is live and persisted. Each is broadcast on the metadata topic
        // plus direct + delayed delivery, mirroring publish_secure_share's shape.
@@ -24540,6 +24640,14 @@ async fn remove_treekem_named_group_member(
         secret_epoch: None,
         commit: Some(commit),
     };
+    // Survivor re-key A10: each survivor is owed this re-key, on disk, before
+    // the first publish. The removed member keeps the blind schedule below,
+    // with any survivor the obligations refused.
+    let mut blind = vec![agent_id_hex.clone()];
+    blind.extend(
+        rekey_obligations::owe_survivors(&state, &id, &next, &[agent_id_hex.as_str()], &[&event])
+            .await,
+    );
     if !drop_initial_volley(&event) {
         publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     }
@@ -24560,6 +24668,7 @@ async fn remove_treekem_named_group_member(
         &next,
         &event,
         std::slice::from_ref(&agent_id_hex),
+        Some(&blind),
     );
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
@@ -24791,6 +24900,17 @@ async fn reconcile_treekem_self_leave_rekeys(
             secret_epoch: None,
             commit: Some(commit),
         };
+        // Survivor re-key A10: each remaining member is owed this re-key
+        // before the first publish. Only those the obligations refused keep
+        // the blind schedule's direct sends.
+        let blind = rekey_obligations::owe_survivors(
+            state,
+            group_key,
+            &next,
+            &[departed_hex.as_str()],
+            &[&event],
+        )
+        .await;
         publish_named_group_metadata_event(state, &metadata_topic, &event).await;
         remember_commit_bearing_event(state, &event).await;
         // Deliberately not delivered to the departed member: they left
@@ -24800,7 +24920,14 @@ async fn reconcile_treekem_self_leave_rekeys(
         // the rekey as a revision gap and cannot decrypt at the new epoch —
         // its own commit message documents that failure mode — so it gets
         // the bounded redelivery schedule like every admin-side removal.
-        spawn_group_control_event_redelivery(state, &metadata_topic, &next, &event, &[]);
+        spawn_group_control_event_redelivery(
+            state,
+            &metadata_topic,
+            &next,
+            &event,
+            &[],
+            Some(&blind),
+        );
         maybe_publish_group_card_after_state_change(state, group_key).await;
 
         tracing::info!(
@@ -25438,6 +25565,17 @@ async fn owner_certified_seal_with_eviction(
                 (commit, event, metadata_topic, delivery_roster)
             };
             drop(guard);
+            // Survivor re-key A10: each member left seated is owed this
+            // re-key before the first publish; any the obligations refused
+            // get the blind schedule.
+            let refused = rekey_obligations::owe_survivors(
+                state,
+                id,
+                &delivery_roster,
+                &[evict_hex.as_str()],
+                &[&event],
+            )
+            .await;
             remember_commit_bearing_event(state, &event).await;
             if !drop_initial_volley(&event) {
                 publish_named_group_metadata_event(state, &metadata_topic, &event).await;
@@ -25446,6 +25584,16 @@ async fn owner_certified_seal_with_eviction(
                     &delivery_roster,
                     &event,
                     std::slice::from_ref(&evict_hex),
+                );
+            }
+            if !refused.is_empty() {
+                spawn_group_control_event_redelivery(
+                    state,
+                    &metadata_topic,
+                    &delivery_roster,
+                    &event,
+                    &[],
+                    Some(&refused),
                 );
             }
             evicted_total.push(evict_hex.clone());
@@ -25813,7 +25961,14 @@ async fn withdraw_named_group_terminal(
     // sole-member deletes AND for the shared POST /state/withdraw route.
     // (Round-1 item 8 was wrong; perf of the empty direct loop is a
     // follow-up, not a gate.)
-    spawn_group_control_event_redelivery(state, &metadata_topic, &delivery_roster, &event, &[]);
+    spawn_group_control_event_redelivery(
+        state,
+        &metadata_topic,
+        &delivery_roster,
+        &event,
+        &[],
+        None,
+    );
 
     Ok(commit)
 }
@@ -28093,6 +28248,7 @@ pub(in crate::server) async fn ban_group_member(
         &delivery_roster,
         &event,
         std::slice::from_ref(&agent_id_hex),
+        None,
     );
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
@@ -28293,6 +28449,14 @@ async fn ban_treekem_group_member(
         treekem_epoch: Some(treekem_epoch),
         commit: Some(commit),
     };
+    // Survivor re-key A10: as for a removal, each survivor is owed the ban's
+    // re-key before the first publish; the banned member keeps the blind
+    // schedule.
+    let mut blind = vec![agent_id_hex.clone()];
+    blind.extend(
+        rekey_obligations::owe_survivors(&state, &id, &next, &[agent_id_hex.as_str()], &[&event])
+            .await,
+    );
     if !drop_initial_volley(&event) {
         publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     }
@@ -28313,6 +28477,7 @@ async fn ban_treekem_group_member(
         &next,
         &event,
         std::slice::from_ref(&agent_id_hex),
+        Some(&blind),
     );
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
@@ -29580,6 +29745,11 @@ async fn approve_treekem_join_request(
             .and_then(|member| member.treekem_key_package_hash.clone()),
         commit: Some(commit),
     };
+    // Survivor re-key A10: as for any add, every member the approval did
+    // not seat is owed it before the first publish.
+    let refused =
+        rekey_obligations::owe_survivors(&state, &id, &next, &[requester_hex.as_str()], &[&event])
+            .await;
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     remember_commit_bearing_event(&state, &event).await;
     spawn_named_group_event_delivery_to_active_members(
@@ -29588,6 +29758,16 @@ async fn approve_treekem_join_request(
         &event,
         std::slice::from_ref(&requester_hex),
     );
+    if !refused.is_empty() {
+        spawn_group_control_event_redelivery(
+            &state,
+            &metadata_topic,
+            &next,
+            &event,
+            &[],
+            Some(&refused),
+        );
+    }
     cache_treekem_member_key_package(
         &state,
         join_result_key(&id, &requester_hex),
@@ -30606,9 +30786,13 @@ async fn treekem_group_decrypt_for_actor(
             }
         }
     };
+    // Survivor re-key A10: the survivors still owed here, with the
+    // KeyPackages their seats commit, to tell whether this message is one
+    // of theirs.
+    let owed = rekey_obligations::owed_packages(state, group_id_hex).await;
     let mut guard = group.lock().await;
-    let plaintext = match guard.decrypt_message(&ciphertext) {
-        Ok(p) => p,
+    let (plaintext, sender_leaf) = match guard.decrypt_message_with_sender(&ciphertext) {
+        Ok(opened) => opened,
         Err(e) => {
             // #1427: a ciphertext from a later epoch means a missed commit.
             if let Some(observed) = x0x::mls::TreeKemMlsGroup::ciphertext_epoch(&ciphertext)
@@ -30619,6 +30803,9 @@ async fn treekem_group_decrypt_for_actor(
             return bad_request(format!("treekem decrypt failed: {e}"));
         }
     };
+    // The leaf signed the message, and this tree opened it at its own
+    // epoch, so the survivor at that leaf holds this epoch.
+    let owed_sender = rekey_obligations::owed_sender(&guard, &owed, sender_leaf);
     // Persisting the receive replay window is best-effort. A failure here may
     // permit the same ciphertext to be accepted again after restart, but the
     // plaintext has already been validly recovered and retrying in-process would
@@ -30635,6 +30822,18 @@ async fn treekem_group_decrypt_for_actor(
     }
     let epoch = guard.epoch();
     drop(guard);
+    if let Some(recipient_hex) = owed_sender {
+        rekey_obligations::settle(
+            state,
+            &[group_id_hex.to_string()],
+            &rekey_obligations::Proof {
+                recipient_hex,
+                epoch,
+                revision: None,
+            },
+        )
+        .await;
+    }
     record_mls_history(
         state,
         stable_group_id.unwrap_or(group_id_hex),
@@ -44875,6 +45074,7 @@ pub(in crate::server) mod tests {
     mod pr291_restart_marker_matrix;
     mod r17_cert_hydrate;
     mod r19_cert_carry;
+    mod rekey_obligation_proofs;
     mod rekey_obligations;
     mod rekey_plane_gate;
     mod requester_offer;

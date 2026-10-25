@@ -24,6 +24,15 @@ pub(super) fn install_deliver(state: &AppState, deliver: TestDeliver) {
         .unwrap() = Some(deliver);
 }
 
+/// Stand in for which survivors are linked right now.
+pub(super) fn set_connected(state: &AppState, members: &[&str]) {
+    *state
+        .named_group_test_recorders
+        .rekey_obligation_connected
+        .lock()
+        .unwrap() = Some(members.iter().map(|member| member.to_string()).collect());
+}
+
 /// `state`'s obligation to `recipient` in `group_key`, if any.
 pub(super) async fn owed(
     state: &AppState,

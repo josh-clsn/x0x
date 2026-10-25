@@ -501,11 +501,28 @@ impl TreeKemMlsGroup {
     /// # Errors
     /// Returns [`MlsError::DecryptionError`] on malformed input or failure.
     pub fn decrypt_message(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>> {
+        self.decrypt_message_with_sender(ciphertext)
+            .map(|(plaintext, _)| plaintext)
+    }
+
+    /// [`Self::decrypt_message`], also naming the leaf that sent it.
+    ///
+    /// The leaf is authenticated: `saorsa-mls` checks the sender's
+    /// signature over the envelope (epoch, leaf, generation, ciphertext)
+    /// against that leaf's key package before it decrypts. Map the leaf to a
+    /// member with [`Self::leaf_for_key_package`] (survivor re-key A10: a
+    /// survivor's message at the new epoch proves it holds the epoch).
+    ///
+    /// # Errors
+    /// Returns [`MlsError::DecryptionError`] on malformed input or failure.
+    pub fn decrypt_message_with_sender(&mut self, ciphertext: &[u8]) -> Result<(Vec<u8>, u32)> {
         let ct: ApplicationCiphertext = decode(ciphertext, "ciphertext")
             .map_err(|e| MlsError::DecryptionError(e.to_string()))?;
-        self.inner
+        let plaintext = self
+            .inner
             .decrypt_message(&ct)
-            .map_err(|e| MlsError::DecryptionError(e.to_string()))
+            .map_err(|e| MlsError::DecryptionError(e.to_string()))?;
+        Ok((plaintext, ct.sender_leaf))
     }
 
     /// The epoch an encoded application ciphertext claims, or `None` when
@@ -714,6 +731,45 @@ mod tests {
         let ct2 = bob.encrypt_message(b"glad to be here").expect("encrypt");
         let pt2 = alice.decrypt_message(&ct2).expect("alice decrypt");
         assert_eq!(pt2, b"glad to be here");
+    }
+
+    #[test]
+    fn a_decrypt_names_the_leaf_that_sent_it() {
+        let (alice_id, bob_id, carol_id) = (agent(1), agent(2), agent(3));
+        let mut alice =
+            TreeKemMlsGroup::create(b"group-S".to_vec(), alice_id, &seed(1)).expect("alice");
+        let bob_prepared = TreeKemMlsGroup::prepare_member(bob_id, &seed(2)).expect("bob");
+        let bob_package = bob_prepared.key_package_bytes().to_vec();
+        let added = alice.add_member(bob_id, &bob_package).expect("add bob");
+        let mut bob =
+            TreeKemMlsGroup::join_from_welcome(bob_prepared, &added.welcome).expect("bob");
+        let carol_prepared = TreeKemMlsGroup::prepare_member(carol_id, &seed(3)).expect("carol");
+        let carol_package = carol_prepared.key_package_bytes().to_vec();
+        let added = alice
+            .add_member(carol_id, &carol_package)
+            .expect("add carol");
+        bob.process_commit(&added.commit).expect("bob follows");
+        let mut carol =
+            TreeKemMlsGroup::join_from_welcome(carol_prepared, &added.welcome).expect("carol");
+
+        let from_bob = bob.encrypt_message(b"from bob").expect("bob seals");
+        let (plaintext, leaf) = carol
+            .decrypt_message_with_sender(&from_bob)
+            .expect("carol opens");
+        assert_eq!(plaintext, b"from bob");
+        assert_eq!(Some(leaf), carol.leaf_for_key_package(&bob_package));
+        assert_ne!(Some(leaf), carol.leaf_for_key_package(&carol_package));
+
+        // Bob's envelope with Carol's leaf named in it does not open: the
+        // leaf is checked against the signature, not taken on trust.
+        let mut claimed: ApplicationCiphertext =
+            decode(&alice.encrypt_message(b"x").expect("seal"), "ciphertext").expect("decode");
+        let carol_leaf = alice
+            .leaf_for_key_package(&carol_package)
+            .expect("carol's leaf");
+        claimed.sender_leaf = carol_leaf;
+        let claimed = encode(&claimed, "ciphertext").expect("encode");
+        assert!(bob.decrypt_message_with_sender(&claimed).is_err());
     }
 
     #[test]

@@ -59,13 +59,46 @@ A survivor away for longer than a minute, or away while the remover restarted, w
 
 Lock order: `rekey_obligations`, then `named_groups`. Nothing takes `rekey_obligations` while it holds `named_groups` or `treekem_event_log`.
 
+### Where obligations are written (A10)
+
+Every TreeKEM re-key site of A1 calls `owe_survivors` after its commits are durable and before its first publish, so the obligation is on disk before the route (or the apply) returns. The survivors are the active members after the change, less this daemon and the member the change took out or seated.
+
+| Site | Owed | Not owed | Blind schedule's direct sends |
+|---|---|---|---|
+| Admin removal (`remove_treekem_named_group_member`) | the survivors | the removed member | the removed member, and any survivor refused |
+| Ban (`ban_treekem_group_member`) | the survivors | the banned member | the banned member, and any survivor refused |
+| Post-leave re-key (`reconcile_treekem_self_leave_rekeys`) | the remaining members | the leaver | any survivor refused (the gossip republish still runs) |
+| OwnerCertified eviction (`owner_certified_seal_with_eviction`) | the members left seated | the evicted member | any survivor refused (there was no blind schedule before) |
+| Returning-member re-key (the `MemberJoined` arm) | the other members, both commits (`owed` at the removal, `through` at the add) | the returning member, which gets its Welcome | the returning member, and any survivor refused |
+| Invite add (the `MemberJoined` arm, TreeKEM only), direct add, approval | every member the add did not seat | the member seated, which gets its Welcome | any survivor refused (there was no blind schedule before) |
+
+`spawn_group_control_event_redelivery` gains `recipients_override`. With it, the direct sends go to exactly those recipients; without it, as before. The gossip republish at each offset runs either way. The +0 and +8 s volley to every member is unchanged. The GSS-plane sites, `GroupDeleted` and the role restore after a returning-member re-key keep the old schedule (`None`).
+
+### What settles an obligation (A10)
+
+Only the survivor's own evidence, never a claimed sender:
+
+- **A catch-up or challenge request** (`handle_treekem_catchup_request`, after its membership gate, for an active requester) whose requester is proven: the transport verified the sender, and the sender is the requester; or the requester signed the request over its head (A5's page-request signature, which covers `from_revision`, `from_treekem_epoch` and the challenge). A member-keyed request's signature does not cover a head, so over an unverified transport it settles nothing. A challenge is a page request with `head_challenge`, so it takes the same path. The settle runs in its own task, so the serial catch-up listener never waits on the file write.
+- **A challenge through `POST /groups/:id/treekem/head-proof`** (the relay leg): the route already requires the requester's signature (`SignedChallenge::from_request`), so the same proof settles.
+- **A decrypt at or past the epoch** (`treekem_group_decrypt_for_actor`): `decrypt_message_with_sender` names the leaf that sent the message. `saorsa-mls` checks the sender's signature over the envelope against that leaf's key package before it decrypts, and the message decrypts only at this tree's own epoch. The leaf is matched against the KeyPackage each owed survivor's seat commits (the A2 rule, not `agent_to_leaf`, which holds only the members this daemon added). The KeyPackages are read before the tree lock and matched under it.
+- **The survivor leaving or being removed, or the room being withdrawn:** the worker's step drops any entry whose survivor is no longer an active member, and a withdrawal wipes the room.
+
+A proof at or past `through_epoch` removes the entry. A proof between `owed_epoch` and `through_epoch` moves `owed_epoch` (and, from a request, `owed_revision`) on, and leaves the rest owed. Anything below changes nothing. A replayed request was signed by the survivor at the head it names, so it cannot prove more than the survivor once held, and it cannot move a schedule.
+
 ## Consequences
 
 - A survivor away for any time, across the remover's restarts, gets the re-key when it is next linked, at most 15 minutes after it is reachable without a link edge.
 - The worker sends more than before only to survivors that have not proven their head, at most 4 sends at once.
 - The file holds at most 4096 short entries.
 - A refused survivor is no worse off than before this change.
+- **A removed or non-member peer cannot settle or put off another member's obligation.** It cannot produce the survivor's signature, a verified transport as the survivor, or a message signed by the survivor's leaf at the new epoch. Nothing a peer sends moves a send time, so it cannot put one off either.
+- **Known limits.**
+  - A survivor that missed a join request cannot apply the approval, from anyone (A3 review m-10, pre-existing). Its obligation stays `delivered_unproven`, sent every 15 min, until it catches up some other way.
+  - A store record's decrypt (`routes/stores.rs`) is not a proof here; only the secure decrypt route is.
+  - A survivor that never comes back, and never leaves the roster, is sent the re-key every 15 min for as long as it stays on the roster.
 
 ## Validation
 
-`named_groups/rekey_obligations.rs` (unit, a paused clock for the timings) and `named_groups/tests/rekey_obligations.rs` (the worker on a daemon's state, with a stand-in network): coalescing, restart, backoff, an acknowledgement without proof, the connect edge, at most four in flight and none twice, both caps, a refused or unwritten obligation, a missing payload said once, and a departure's wipe.
+A10: `named_groups/tests/rekey_obligation_proofs.rs` (the survivor fixture, through the real routes), `tests/issue1139_back_to_back_join.rs` (`eviction_and_rekey_removal_owe_survivors`) and `mls::treekem` (`a_decrypt_names_the_leaf_that_sent_it`): every site owes its survivors and not the member it took out or seated; the obligation is on disk when the route returns; a signed or verified request, a challenge over x0x or the route, and a decrypt each settle; a request below the epoch, a claimed sender, another member's signature, a removed member's transport and a member-keyed request's unsigned head settle nothing; leaving and withdrawal drop it; the removed member keeps the blind schedule and a refused survivor joins it; a survivor away past the old 60 s horizon gets the key from the obligation on its return; a survivor away while the remover restarted gets the key from another survivor, and its message settles the restarted remover's obligation.
+
+A9: `named_groups/rekey_obligations.rs` (unit, a paused clock for the timings) and `named_groups/tests/rekey_obligations.rs` (the worker on a daemon's state, with a stand-in network): coalescing, restart, backoff, an acknowledgement without proof, the connect edge, at most four in flight and none twice, both caps, a refused or unwritten obligation, a missing payload said once, and a departure's wipe.

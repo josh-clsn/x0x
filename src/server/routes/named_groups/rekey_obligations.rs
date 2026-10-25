@@ -20,7 +20,7 @@
 //!   once.
 //! - **Delivered is not held.** A send the survivor acknowledged becomes
 //!   [`ObligationState::DeliveredUnproven`] and is sent again at the cap.
-//! - **Settled only on proof** (`settle`): a catch-up or challenge
+//! - **Settled only on proof** ([`settle`]): a catch-up or challenge
 //!   request from the survivor itself at or past the epoch, a message from
 //!   it decrypted at or past the epoch, the survivor leaving the roster, or
 //!   the room being withdrawn or wiped. A claimed sender proves nothing.
@@ -35,9 +35,6 @@
 //! Lock order: `rekey_obligations`, then `named_groups`. Nothing takes
 //! `rekey_obligations` while it holds `named_groups` or `treekem_event_log`.
 
-// The re-key sites and the proofs that settle an obligation arrive with A10.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -46,10 +43,12 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::event_log_store::{commit_bearing_event_sort_key, run_blocking, write_durable};
+use super::event_log_store::{
+    commit_bearing_event_frontier, commit_bearing_event_sort_key, run_blocking, write_durable,
+};
 use super::{
-    has_withdrawn_group_record, named_group_event_delivery_result, now_millis_u64, AppState,
-    NamedGroupMetadataEvent,
+    committer_leaf, has_withdrawn_group_record, named_group_event_delivery_result, now_millis_u64,
+    signed_catchup, AppState, NamedGroupMetadataEvent, TreeKemCatchupRequest,
 };
 use crate as x0x;
 use crate::logging::LogHexId;
@@ -258,10 +257,12 @@ fn well_formed(owed: &RekeyObligation) -> bool {
 }
 
 impl RekeyObligations {
+    #[cfg(test)]
     pub(in crate::server) fn len(&self) -> usize {
         self.entries.len()
     }
 
+    #[cfg(test)]
     pub(in crate::server) fn get(
         &self,
         group_key: &str,
@@ -278,7 +279,17 @@ impl RekeyObligations {
             .count()
     }
 
+    /// The survivors this daemon owes in `group_key`.
+    pub(in crate::server) fn recipients_in(&self, group_key: &str) -> Vec<String> {
+        self.entries
+            .range((group_key.to_string(), String::new())..)
+            .take_while(|((key, _), _)| key == group_key)
+            .map(|((_, recipient), _)| recipient.clone())
+            .collect()
+    }
+
     /// How many payloads were missing from the log, each said once.
+    #[cfg(test)]
     pub(in crate::server) fn missing_reports(&self) -> u64 {
         self.missing_reports
     }
@@ -627,6 +638,25 @@ pub(in crate::server) async fn load_rekey_obligations(
     store
 }
 
+/// The members a re-key of `next` is owed to: its active members, less
+/// this daemon and `excluded` (the member removed, banned or added).
+pub(in crate::server) fn survivors(
+    state: &AppState,
+    next: &x0x::groups::GroupInfo,
+    excluded: &[&str],
+) -> Vec<String> {
+    let local = hex::encode(state.agent.agent_id().as_bytes());
+    next.active_members()
+        .map(|member| member.agent_id.to_ascii_lowercase())
+        .filter(|member| {
+            *member != local
+                && !excluded
+                    .iter()
+                    .any(|excluded| excluded.eq_ignore_ascii_case(member))
+        })
+        .collect()
+}
+
 /// Owe `survivors` the commits `first` through `last` in `group_key`, on
 /// disk before this returns. Returns the survivors to keep on the blind
 /// schedule: past a cap, all of them when the record cannot be written, and
@@ -676,6 +706,132 @@ pub(in crate::server) async fn owe(
         );
     }
     refused
+}
+
+/// [`owe`] for the commit-bearing `events` a re-key sealed, from the lowest
+/// to the highest TreeKEM epoch among them. An event that names no epoch
+/// owes nothing by itself; the worker still sends it when it falls in the
+/// owed revisions.
+pub(in crate::server) async fn owe_for(
+    state: &AppState,
+    group_key: &str,
+    survivors: &[String],
+    events: &[&NamedGroupMetadataEvent],
+) -> Vec<String> {
+    let rekeys: Vec<Rekey> = events
+        .iter()
+        .filter_map(|event| commit_bearing_event_frontier(event))
+        .filter(|frontier| frontier.epoch > 0)
+        .map(|frontier| Rekey {
+            epoch: frontier.epoch,
+            revision: frontier.revision,
+        })
+        .collect();
+    let first = rekeys
+        .iter()
+        .min_by_key(|rekey| (rekey.epoch, rekey.revision));
+    let last = rekeys
+        .iter()
+        .max_by_key(|rekey| (rekey.epoch, rekey.revision));
+    match (first, last) {
+        (Some(first), Some(last)) => owe(state, group_key, survivors, *first, *last).await,
+        _ => survivors.to_vec(),
+    }
+}
+
+/// [`owe_for`] to every survivor of `next` ([`survivors`]): what a re-key
+/// site calls once its commits are durable and before its first publish.
+/// Returns the survivors to keep on the blind schedule.
+pub(in crate::server) async fn owe_survivors(
+    state: &AppState,
+    group_key: &str,
+    next: &x0x::groups::GroupInfo,
+    excluded: &[&str],
+    events: &[&NamedGroupMetadataEvent],
+) -> Vec<String> {
+    let survivors = survivors(state, next, excluded);
+    owe_for(state, group_key, &survivors, events).await
+}
+
+/// Apply `proof` to the survivor's obligations under any of `aliases`.
+pub(in crate::server) async fn settle(state: &AppState, aliases: &[String], proof: &Proof) {
+    let mut store = state.rekey_obligations.lock().await;
+    if store.settle_entry(aliases, proof) {
+        tracing::debug!(
+            recipient = %LogHexId::agent(&proof.recipient_hex),
+            epoch = proof.epoch,
+            "re-key obligation: the survivor proved its head"
+        );
+        store.persist_or_warn("a settled obligation").await;
+    }
+}
+
+/// [`settle`] in its own task, for a listener that must not wait on it.
+pub(in crate::server) fn spawn_settle(state: &Arc<AppState>, aliases: Vec<String>, proof: Proof) {
+    let state = Arc::clone(state);
+    tokio::spawn(async move { settle(&state, &aliases, &proof).await });
+}
+
+/// The proof a catch-up or challenge request gives, when only its requester
+/// can have sent it: the transport verified the sender as the requester
+/// (`verified_requester`), or the requester signed it over its head (a
+/// page request, A5). Anything else is a claim and proves nothing.
+pub(super) fn request_proof(
+    request: &TreeKemCatchupRequest,
+    verified_requester: bool,
+) -> Option<Proof> {
+    (verified_requester || signed_catchup::page_request_signed(request)).then(|| Proof {
+        recipient_hex: request.requester_agent_id.to_ascii_lowercase(),
+        epoch: request.from_treekem_epoch,
+        revision: Some(request.from_revision),
+    })
+}
+
+/// The KeyPackage each survivor owed in `group_key` holds on the roster,
+/// for telling which of them sealed a message.
+pub(in crate::server) async fn owed_packages(
+    state: &AppState,
+    group_key: &str,
+) -> Vec<(String, Vec<u8>)> {
+    let recipients = state
+        .rekey_obligations
+        .lock()
+        .await
+        .recipients_in(group_key);
+    if recipients.is_empty() {
+        return Vec::new();
+    }
+    let Some(info) = state.named_groups.read().await.get(group_key).cloned() else {
+        return Vec::new();
+    };
+    let ids = [
+        group_key.to_string(),
+        info.stable_group_id().to_string(),
+        info.mls_group_id.clone(),
+    ];
+    let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let mut packages = Vec::with_capacity(recipients.len());
+    for recipient in recipients {
+        if let Ok(package) =
+            committer_leaf::member_committed_key_package(state, &ids, &info, &recipient).await
+        {
+            packages.push((recipient, package));
+        }
+    }
+    packages
+}
+
+/// Which owed survivor sits at `sender_leaf` in `group`, if any. Run under
+/// the tree's lock, on the tree that authenticated the message.
+pub(in crate::server) fn owed_sender(
+    group: &x0x::mls::TreeKemMlsGroup,
+    packages: &[(String, Vec<u8>)],
+    sender_leaf: u32,
+) -> Option<String> {
+    packages
+        .iter()
+        .find(|(_, package)| group.leaf_for_key_package(package) == Some(sender_leaf))
+        .map(|(recipient, _)| recipient.clone())
 }
 
 /// Forget every obligation in the room under `aliases`, in memory and on

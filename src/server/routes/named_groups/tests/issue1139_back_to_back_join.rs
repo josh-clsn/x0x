@@ -3696,6 +3696,108 @@ async fn ban_add_eviction_and_rekey_removal_seal_the_digest_binding() -> Result<
     Ok(())
 }
 
+/// Survivor re-key A10: the returning-member re-key and the OwnerCertified
+/// eviction owe the members they did not take out.
+#[tokio::test]
+async fn eviction_and_rekey_removal_owe_survivors() -> Result<()> {
+    use super::rekey_obligations::owed;
+    fn epoch(event: &NamedGroupMetadataEvent) -> u64 {
+        match event {
+            NamedGroupMetadataEvent::MemberRemoved { treekem_epoch, .. }
+            | NamedGroupMetadataEvent::MemberAdded { treekem_epoch, .. } => {
+                treekem_epoch.unwrap_or_default()
+            }
+            _ => 0,
+        }
+    }
+    fn revision(event: &NamedGroupMetadataEvent) -> u64 {
+        named_group_metadata_event_commit(event).map_or(0, |commit| commit.revision)
+    }
+
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let authority = &s._authority;
+    let j1_hex = hex::encode(s.j1.agent.agent_id().as_bytes());
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+
+    wa_clear_published(&s);
+    let r = wa_stuck_keyless(&s).await?;
+    anyhow::ensure!(r.treekem, "precondition: J2 re-keyed with keys: {r}");
+    let removal = wa_published_for(&s, &j2_hex, "removed").context("re-key removal")?;
+    let add = wa_published_for(&s, &j2_hex, "added").context("re-key add")?;
+    let owed_j1 = owed(authority, &s.group_key, &j1_hex)
+        .await
+        .context("J1 is owed the re-key")?;
+    assert_eq!(
+        (
+            owed_j1.owed_epoch,
+            owed_j1.owed_revision,
+            owed_j1.through_epoch,
+            owed_j1.through_revision
+        ),
+        (
+            epoch(&removal),
+            revision(&removal),
+            epoch(&add),
+            revision(&add)
+        ),
+        "from the removal through the add"
+    );
+    assert!(
+        owed(authority, &s.group_key, &j2_hex).await.is_none(),
+        "the returning member gets its Welcome instead"
+    );
+
+    // J1 revokes its own certificate; the owner's explicit seal evicts it.
+    wa_clear_published(&s);
+    let cert = authority
+        .named_groups
+        .read()
+        .await
+        .get(&s.group_key)
+        .and_then(|info| info.members_v2.get(&j1_hex).cloned())
+        .and_then(|member| member.certificate)
+        .context("J1's seat certificate")?;
+    let j1_kp = s.j1.agent.identity().agent_keypair();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let record = x0x::revocation::RevocationRecord::sign(
+        x0x::revocation::RevokedSubject::Agent(j1_kp.agent_id()),
+        j1_kp.public_key(),
+        j1_kp.secret_key(),
+        now,
+        Some("survivor re-key A10 eviction".to_string()),
+    )?;
+    authority
+        .agent
+        .revocation_set()
+        .write()
+        .await
+        .verify_and_insert(record, Some(&cert))?;
+    let sealed = seal_group_state(
+        State(Arc::clone(authority)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(s.group_key.clone()),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(sealed).await?;
+    assert_eq!(status, StatusCode::OK, "the seal evicts J1: {body}");
+    let eviction = wa_published_for(&s, &j1_hex, "removed").context("eviction")?;
+    let owed_j2 = owed(authority, &s.group_key, &j2_hex)
+        .await
+        .context("J2 is owed the eviction")?;
+    assert_eq!(owed_j2.through_epoch, epoch(&eviction));
+    super::super::rekey_obligations::step(authority).await;
+    assert!(
+        owed(authority, &s.group_key, &j1_hex).await.is_none(),
+        "the evicted member is owed nothing"
+    );
+    Ok(())
+}
+
 fn wa_swap_removal_bytes(event: &NamedGroupMetadataEvent) -> NamedGroupMetadataEvent {
     let mut swapped = event.clone();
     if let NamedGroupMetadataEvent::MemberRemoved {

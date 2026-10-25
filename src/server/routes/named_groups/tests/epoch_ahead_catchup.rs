@@ -18,6 +18,13 @@ pub(super) struct LeaveFixture {
     pub(super) leaver_group: x0x::mls::TreeKemMlsGroup,
 }
 
+impl LeaveFixture {
+    /// The admin's data directory, for a restart (survivor re-key A10).
+    pub(super) fn dir(&self) -> &std::path::Path {
+        self._dir.path()
+    }
+}
+
 pub(super) async fn two_member_treekem_group() -> Result<LeaveFixture> {
     let group_id = "cd".repeat(16);
     let (state, dir) = secure_endpoint_test_state().await?;
