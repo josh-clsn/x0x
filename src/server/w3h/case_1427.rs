@@ -25,9 +25,15 @@
 //!   first catch-up round reaches nobody. The single write gives one
 //!   observation, so that observation must move on to the signer. Since
 //!   survivor re-key A9/A10 the signer owes V the removal and sends it on
-//!   V's return. This arm pins that path: after the hold ends it waits,
-//!   before the write, for V to reach e+1 (nothing else can move it then),
-//!   and requires an obligation send to V.
+//!   V's return. This arm pins that path: after the hold ends, with every
+//!   gossip frame toward V dropped (the group store's anti-entropy would
+//!   otherwise start #1427's catch-up first), it waits before the write for
+//!   V to reach e+1. It requires an obligation send to V, and that every
+//!   page request V sent until it moved proved a re-key the signer sent it
+//!   directly (none a catch-up of V's own), with the signer serving no page
+//!   but its answers to those proofs: the first, already-held event of the
+//!   obligation's send makes V prove, and the signer's answer carries the
+//!   re-key.
 //! - rotation with the obligation lost: the rotation arm, with every
 //!   direct named-group event the signer sends V failing in the signer's
 //!   daemon (its initial sends and its obligation sends; the test drop list
@@ -174,6 +180,44 @@ impl InboundHold {
     }
 }
 
+/// Drops every pubsub frame toward `target` that is not a direct message
+/// carried over the gossip inbox, while held, and counts them. Direct
+/// messages (catch-up pages, obligation sends) still pass.
+struct GossipBlock {
+    held: Arc<AtomicBool>,
+    dropped: Arc<AtomicUsize>,
+}
+
+impl GossipBlock {
+    fn install(sim: &Sim, target: &str) -> Result<Self> {
+        let machine = sim.peer(target)?.0;
+        let held = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (rule_held, rule_dropped) = (Arc::clone(&held), Arc::clone(&dropped));
+        sim.fabric().add_rule(move |write| {
+            if rule_held.load(Ordering::SeqCst)
+                && write.lane.dst == machine
+                && write.lane.class == LaneClass::PubSub
+                && !contains(&write.bytes, DM_TOPIC_MARKER)
+            {
+                rule_dropped.fetch_add(1, Ordering::SeqCst);
+                Fault::Drop
+            } else {
+                Fault::Pass
+            }
+        });
+        Ok(Self { held, dropped })
+    }
+
+    fn set(&self, held: bool) {
+        self.held.store(held, Ordering::SeqCst);
+    }
+
+    fn dropped(&self) -> usize {
+        self.dropped.load(Ordering::SeqCst)
+    }
+}
+
 /// Drops metadata-topic frames toward `target` while held, and counts them.
 struct TopicBlock {
     held: Arc<AtomicBool>,
@@ -289,6 +333,52 @@ fn served_pages(sim: &Sim, label: &str) -> Result<usize> {
         .count())
 }
 
+/// The page requests `label` sent so far: (to, from revision, from epoch).
+fn page_requests_sent(sim: &Sim, label: &str) -> Result<Vec<(String, u64, u64)>> {
+    let state = sim.state(label)?;
+    let recorded = state
+        .named_group_test_recorders
+        .catchup_page_requests
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok(recorded
+        .iter()
+        .filter_map(|(to, bytes)| {
+            let request: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+            Some((
+                to.chars().take(8).collect(),
+                request["from_revision"].as_u64()?,
+                request["from_treekem_epoch"].as_u64()?,
+            ))
+        })
+        .collect())
+}
+
+/// The signed revisions of the events in each page with events `label`
+/// built, after the first `skip` such pages.
+fn served_page_revisions(sim: &Sim, label: &str, skip: usize) -> Result<Vec<Vec<u64>>> {
+    let state = sim.state(label)?;
+    let recorded = state
+        .named_group_test_recorders
+        .catchup_responses
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok(recorded
+        .iter()
+        .filter_map(|page| serde_json::from_slice::<serde_json::Value>(page).ok())
+        .filter_map(|page| {
+            let events = page["events"].as_array()?;
+            (!events.is_empty()).then(|| {
+                events
+                    .iter()
+                    .filter_map(|event| event["commit"]["revision"].as_u64())
+                    .collect()
+            })
+        })
+        .skip(skip)
+        .collect())
+}
+
 async fn open_everywhere(sim: &Sim, labels: &[&str], group: &str, store: &str) -> Result<()> {
     for label in labels {
         let mut opened = None;
@@ -389,6 +479,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         .await??;
     let metadata = TopicBlock::install(sim, "V", &topic)?;
     let hold = InboundHold::install(sim, "V")?;
+    let gossip = GossipBlock::install(sim, "V")?;
     let v_hex = sim.agent_hex("V")?;
     if arm == Arm::SignerWithObligationSendsLost {
         sim.state(signer)?
@@ -464,6 +555,12 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     let reopened = open_store(sim, "V", &group).await?;
     ensure!(reopened == store, "V reopened {reopened}, expected {store}");
     let held_frames = hold.dropped();
+    // The signer arm keeps every gossip frame (store anti-entropy included)
+    // from V until V moves, so no catch-up can start: only the signer's
+    // obligation, a direct message, can bring V to e+1.
+    if arm == Arm::SignerAfterThreeOfflineAdmins {
+        gossip.set(true);
+    }
     hold.set(false);
     ensure!(
         connected_to(sim, "V", signer).await,
@@ -499,12 +596,35 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     // request draws afterwards (survivor re-key fix round I-5) goes out only
     // once V holds e+1, so it is not evidence either way.
     let mut moved_before_write = None;
+    // The signer's served pages at the poll where V is first past e: equal
+    // to the count before, or V took a catch-up page of its own.
+    let mut served_at_move = None;
+    let mut pages_at_move: Option<Vec<Vec<u64>>> = None;
+    let mut v_requests_at_move = None;
+    let mut obligation_at_move = None;
+    let mut v_proofs_at_move = None;
     if arm == Arm::SignerAfterThreeOfflineAdmins {
         let moved = sim
             .until(
                 "V reaches e+1 through the obligation",
                 CATCHUP,
-                async |s: &Sim| epoch_now(s, "V", &group).await.is_ok_and(|v| v > e),
+                async |s: &Sim| {
+                    let past = epoch_now(s, "V", &group).await.is_ok_and(|v| v > e);
+                    if past {
+                        served_at_move = served_pages(s, signer).ok();
+                        pages_at_move = served_page_revisions(s, signer, served_before).ok();
+                        v_requests_at_move = page_requests_sent(s, "V").ok();
+                        v_proofs_at_move = s.state("V").ok().map(|v| {
+                            v.named_group_test_recorders
+                                .held_proofs_sent
+                                .load(Ordering::SeqCst)
+                        });
+                        obligation_at_move = obligation_sends(s, signer, &v_hex)
+                            .ok()
+                            .map(|n| n - obligation_before);
+                    }
+                    past
+                },
             )
             .await;
         if let Err(error) = &moved {
@@ -513,11 +633,23 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
             }
         }
         receipt.note(format!(
-            "before the write: V moved past e={e}: {} at {} us",
+            "before the write: V moved past e={e}: {} at {} us; pages served by {signer} \
+             then={served_at_move:?}, before={served_before}; their revisions \
+             {pages_at_move:?}; the removal's revision {}; V's page requests then \
+             {v_requests_at_move:?}, of them proofs of a held re-key {v_proofs_at_move:?}; \
+             obligation sends to V then {obligation_at_move:?}",
             moved.is_ok(),
-            at(sim)
+            at(sim),
+            removed["event"]["commit"]["revision"]
+                .as_u64()
+                .map_or_else(|| "unknown".to_string(), |revision| revision.to_string())
         ));
         moved_before_write = Some(moved.is_ok());
+        gossip.set(false);
+        receipt.note(format!(
+            "gossip frames toward V dropped while waiting={}",
+            gossip.dropped()
+        ));
     }
     // One later-epoch write, then silence: no further traffic restarts a
     // catch-up request.
@@ -634,7 +766,19 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     // Each rotation arm pins the path it exists to cover.
     let path_ok = match arm {
         Arm::Plain => true,
-        Arm::SignerAfterThreeOfflineAdmins => converged_via == "obligation",
+        // Only the obligation moved V: every page request V sent until it
+        // moved proved a re-key the signer sent it directly (fix round I-5),
+        // none was a catch-up of its own, and the signer served no page but
+        // its answers to those proofs.
+        Arm::SignerAfterThreeOfflineAdmins => {
+            let requests = v_requests_at_move.as_ref().map(Vec::len);
+            converged_via == "obligation"
+                && requests.is_some()
+                && requests == v_proofs_at_move
+                && served_at_move
+                    .zip(v_proofs_at_move)
+                    .is_some_and(|(served, proofs)| served <= served_before + proofs)
+        }
         Arm::SignerWithObligationSendsLost => served >= 1,
     };
     let passed = caught_up && data_ok && path_ok;
