@@ -838,27 +838,44 @@ fn schedules(
 }
 
 /// A direct add and an approved join request seat a member with no join
-/// result to poll: it gets the resend schedule's direct sends (6 to 60 s),
-/// not only +0 and +8 s, with no room-wide republish.
+/// result to poll. Survivor re-key A13: the seat obligation carries its
+/// seat, so it gets no blind schedule; past the obligations' cap it gets the
+/// schedule's direct sends (6 to 60 s), with no room-wide republish.
 #[tokio::test]
 async fn a_member_an_add_seats_keeps_the_resend_schedule() -> Result<()> {
     let cast = survivor_relay_fixture().await?;
     let owner = &cast.fixture.state;
     let (newcomer_id, _) = add(&cast, 0x52).await?;
     let recorders = &owner.named_group_test_recorders;
+    assert!(
+        super::rekey_obligations::owed(owner, &cast.fixture.group_id, &hex_of(&newcomer_id))
+            .await
+            .is_some(),
+        "the seat is owed"
+    );
+    assert!(schedules(&recorders.seated_member_resends).is_empty());
+    assert!(schedules(&recorders.control_redelivery_recipients).is_empty());
+    cast.shutdown().await;
+
+    // Past the cap, the seated member keeps the direct sends.
+    let cast = survivor_relay_fixture().await?;
+    let owner = &cast.fixture.state;
+    owner.rekey_obligations.lock().await.set_caps(0, 4096);
+    let (newcomer_id, _) = add(&cast, 0x58).await?;
+    let recorders = &owner.named_group_test_recorders;
     assert_eq!(
         schedules(&recorders.seated_member_resends),
         vec![("member_added", vec![hex_of(&newcomer_id)])]
     );
-    assert!(
-        schedules(&recorders.control_redelivery_recipients).is_empty(),
-        "no republishing schedule when no survivor was refused"
-    );
+    let republishing = schedules(&recorders.control_redelivery_recipients);
+    assert_eq!(republishing.len(), 1, "the refused survivors keep theirs");
+    assert!(!republishing[0].1.contains(&hex_of(&newcomer_id)));
     cast.shutdown().await;
 
     let fixture = two_member_treekem_group().await?;
     let state = &fixture.state;
     let group_id = &fixture.group_id;
+    state.rekey_obligations.lock().await.set_caps(0, 4096);
     let (requester_id, requester_package) = newcomer(0x53)?;
     let requester_hex = hex_of(&requester_id);
     let request_id = {
@@ -889,6 +906,5 @@ async fn a_member_an_add_seats_keeps_the_resend_schedule() -> Result<()> {
         schedules(&recorders.seated_member_resends),
         vec![("join_request_approved", vec![requester_hex])]
     );
-    assert!(schedules(&recorders.control_redelivery_recipients).is_empty());
     Ok(())
 }

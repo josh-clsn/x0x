@@ -22811,6 +22811,52 @@ pub(in crate::server) async fn add_named_group_member(
     )
 }
 
+/// Survivor re-key A13: deliver `member`'s seat in `group_key` again, the
+/// latest `MemberAdded` or `JoinRequestApproved` naming it in the room's
+/// catch-up log, and make its seat obligation due now. Returns whether the
+/// log held a seat to send.
+async fn redeliver_seat(state: &Arc<AppState>, group_key: &str, member_hex: &str) -> bool {
+    let seat = {
+        let aliases = {
+            let groups = state.named_groups.read().await;
+            groups.get(group_key).map_or_else(
+                || vec![group_key.to_string()],
+                |info| {
+                    let mut aliases = vec![group_key.to_string()];
+                    for alias in [info.stable_group_id(), info.mls_group_id.as_str()] {
+                        if !alias.is_empty() && !aliases.iter().any(|held| held == alias) {
+                            aliases.push(alias.to_string());
+                        }
+                    }
+                    aliases
+                },
+            )
+        };
+        let logs = state.treekem_event_log.read().await;
+        aliases
+            .iter()
+            .filter_map(|alias| logs.get(alias))
+            .flat_map(|logged| logged.iter())
+            .filter(|event| match event {
+                NamedGroupMetadataEvent::MemberAdded { agent_id, .. } => {
+                    agent_id.eq_ignore_ascii_case(member_hex)
+                }
+                NamedGroupMetadataEvent::JoinRequestApproved {
+                    requester_agent_id, ..
+                } => requester_agent_id.eq_ignore_ascii_case(member_hex),
+                _ => false,
+            })
+            .max_by_key(|event| commit_bearing_event_sort_key(event))
+            .cloned()
+    };
+    let Some(seat) = seat else {
+        return false;
+    };
+    spawn_named_group_event_delivery(state, member_hex, &seat);
+    rekey_obligations::due_now(state, group_key, member_hex).await;
+    true
+}
+
 async fn add_treekem_named_group_member(
     state: Arc<AppState>,
     id: String,
@@ -22862,9 +22908,19 @@ async fn add_treekem_named_group_member(
             return committer_leaf::sealer_package_uncommitted(&id, "add");
         }
         if info.has_member(&agent_hex) {
+            // Survivor re-key A13: a retried add of a member already seated
+            // asks for its seat again: the seat is delivered once more, and
+            // its seat obligation is due now. The answer is unchanged.
+            let seated = info.has_active_member(&agent_hex);
+            drop(groups);
+            let redelivered = seated && redeliver_seat(&state, &id, &agent_hex).await;
             return (
                 StatusCode::CONFLICT,
-                Json(serde_json::json!({ "ok": false, "error": "member already present" })),
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "member already present",
+                    "redelivered": redelivered,
+                })),
             );
         }
 
@@ -23126,14 +23182,15 @@ async fn add_treekem_named_group_member(
     )
     .await;
     remember_commit_bearing_event(&state, &event).await;
-    // Survivor re-key A10: every member the add did not seat is owed it
-    // before the first publish; any the obligations refused get the blind
-    // schedule. A12: the member it seats has no join result to poll, so it
-    // gets the schedule's direct sends too, past +8 s, with no republish
-    // (it is not subscribed yet).
-    let refused =
-        rekey_obligations::owe_survivors(&state, &id, &next, &[agent_hex.as_str()], &[&event])
-            .await;
+    // Survivor re-key A10: every other member is owed the add before the
+    // first publish. A13: so is the member it seats, which has no join result
+    // to poll: it is owed its seat until it proves it holds it. Any member
+    // the obligations refused gets the blind schedule (A12: the seated
+    // member its direct sends only, as it is not subscribed yet).
+    let refused = rekey_obligations::owe_survivors(&state, &id, &next, &[], &[&event]).await;
+    let (seated_refused, refused): (Vec<String>, Vec<String>) = refused
+        .into_iter()
+        .partition(|member| member.eq_ignore_ascii_case(&agent_hex));
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     spawn_named_group_event_delivery_to_active_members(
         &state,
@@ -23151,7 +23208,9 @@ async fn add_treekem_named_group_member(
             Some(&refused),
         );
     }
-    spawn_seated_member_resends(&state, &metadata_topic, &next, &event, &agent_hex);
+    if !seated_refused.is_empty() {
+        spawn_seated_member_resends(&state, &metadata_topic, &next, &event, &agent_hex);
+    }
     spawn_named_group_event_delivery_to_active_members(&state, &next, &member_joined_recovery, &[]);
     let recovery_deliveries = state
         .treekem_member_key_packages
@@ -29883,14 +29942,14 @@ async fn approve_treekem_join_request(
         commit: Some(commit),
     };
     remember_commit_bearing_event(&state, &event).await;
-    // Survivor re-key A10: as for any add, every member the approval did
-    // not seat is owed it before the first publish; any the obligations
-    // refused get the blind schedule. A12: the requester it seats has no
-    // join result to poll, so it gets the schedule's direct sends too, with
-    // no republish (it is not subscribed yet).
-    let refused =
-        rekey_obligations::owe_survivors(&state, &id, &next, &[requester_hex.as_str()], &[&event])
-            .await;
+    // Survivor re-key A10: as for any add, every other member is owed the
+    // approval before the first publish. A13: so is the requester it seats,
+    // which has no join result to poll. Any member the obligations refused
+    // gets the blind schedule (A12: the requester its direct sends only).
+    let refused = rekey_obligations::owe_survivors(&state, &id, &next, &[], &[&event]).await;
+    let (seated_refused, refused): (Vec<String>, Vec<String>) = refused
+        .into_iter()
+        .partition(|member| member.eq_ignore_ascii_case(&requester_hex));
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     spawn_named_group_event_delivery_to_active_members(
         &state,
@@ -29908,7 +29967,9 @@ async fn approve_treekem_join_request(
             Some(&refused),
         );
     }
-    spawn_seated_member_resends(&state, &metadata_topic, &next, &event, &requester_hex);
+    if !seated_refused.is_empty() {
+        spawn_seated_member_resends(&state, &metadata_topic, &next, &event, &requester_hex);
+    }
     cache_treekem_member_key_package(
         &state,
         join_result_key(&id, &requester_hex),
@@ -43944,6 +44005,26 @@ async fn fetch_treekem_welcome_with_retries(
     group_id: &str,
     welcome_ref: &WelcomeRef,
 ) -> std::result::Result<Vec<u8>, String> {
+    // Survivor re-key A13 tests: the Welcome blob transport between two
+    // in-process daemons, read from the source's staged Welcomes.
+    #[cfg(test)]
+    {
+        let source = state
+            .named_group_test_recorders
+            .welcome_source
+            .lock()
+            .ok()
+            .and_then(|source| source.clone());
+        if let Some(source) = source {
+            return source
+                .pending_welcomes
+                .read()
+                .await
+                .get(&welcome_ref.welcome_id)
+                .map(|pending| pending.bytes.clone())
+                .ok_or_else(|| "welcome not staged at the source".to_string());
+        }
+    }
     let send_state = Arc::clone(state);
     fetch_treekem_welcome_via(
         state,
@@ -45220,6 +45301,7 @@ pub(in crate::server) mod tests {
     mod rekey_obligations;
     mod rekey_plane_gate;
     mod requester_offer;
+    mod seat_obligation;
     mod sec377_dm_verified_gate;
     mod self_leave_rekey;
     mod signed_catchup;

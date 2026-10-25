@@ -1477,6 +1477,9 @@ pub(super) struct NamedGroupTestRecorders {
     pub(super) gap_asks: StdMutex<Vec<(String, u64)>>,
     /// Survivor re-key A12: follow-up page asks started.
     pub(super) follow_ups_started: std::sync::atomic::AtomicUsize,
+    /// Survivor re-key A13: when set, a Welcome reference is resolved from
+    /// this daemon's staged Welcomes, in place of the blob transport.
+    pub(super) welcome_source: StdMutex<Option<Arc<crate::server::AppState>>>,
     /// Survivor re-key A12 fix round 2 (N-3): unverified catch-up requests
     /// whose signature `dispatch` went on to check.
     pub(super) catchup_signature_checks: std::sync::atomic::AtomicUsize,

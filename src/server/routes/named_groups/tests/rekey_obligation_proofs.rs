@@ -490,9 +490,14 @@ async fn an_add_owes_the_members_it_did_not_add() -> Result<()> {
             "every member the add did not seat is owed it"
         );
     }
-    assert!(
-        owed(owner, group_id, &newcomer_hex).await.is_none(),
-        "the newcomer gets its Welcome instead"
+    // Survivor re-key A13: the newcomer has no join result to poll, so it
+    // is owed its seat too.
+    assert_eq!(
+        owed(owner, group_id, &newcomer_hex)
+            .await
+            .map(|owed| owed.through_epoch),
+        Some(epoch),
+        "the newcomer is owed its seat"
     );
     cast.shutdown().await;
     Ok(())
@@ -789,7 +794,13 @@ async fn invite_and_approval_adds_owe_the_members_already_seated() -> Result<()>
         Some(epoch),
         "the member already seated is owed the approval"
     );
-    assert!(owed(state, group_id, &requester_hex).await.is_none());
+    assert_eq!(
+        owed(state, group_id, &requester_hex)
+            .await
+            .map(|owed| owed.through_epoch),
+        Some(epoch),
+        "A13: the requester the approval seats is owed its seat"
+    );
     Ok(())
 }
 

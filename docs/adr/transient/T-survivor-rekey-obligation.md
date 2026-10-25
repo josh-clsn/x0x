@@ -73,7 +73,7 @@ Every TreeKEM re-key site of A1 appends its events to the event log, then calls 
 | OwnerCertified eviction (`owner_certified_seal_with_eviction`) | the members left seated | the evicted member | any survivor refused (there was no blind schedule before) |
 | Returning-member re-key (the `MemberJoined` arm) | the other members, both commits (`owed` at the removal, `through` at the add) | the returning member, which gets its Welcome | the returning member, and any survivor refused |
 | Invite add (the `MemberJoined` arm, TreeKEM only) | every member the add did not seat | the member seated, which gets its Welcome and can poll its join result | any survivor refused (there was no blind schedule before) |
-| Direct add (`add_treekem_named_group_member`), approval (`approve_treekem_join_request`) | every member the add did not seat | the member seated, which gets its Welcome | the member seated, which has no join result to poll (A12: direct sends only, no republish), and any survivor refused (with the republish) |
+| Direct add (`add_treekem_named_group_member`), approval (`approve_treekem_join_request`) | every member, the member seated included (A13: its seat, until it proves it; `T-seat-obligation.md`) | none | any member refused: the seated member gets direct sends only, no republish (A12); a survivor gets the republish too |
 
 `spawn_group_control_event_redelivery` gains `recipients_override`. With it, the direct sends go to exactly those recipients; without it, as before. The gossip republish at each offset runs either way. The +0 and +8 s volley to every member is unchanged. The GSS-plane sites, `GroupDeleted` and the role restore after a returning-member re-key keep the old schedule (`None`).
 

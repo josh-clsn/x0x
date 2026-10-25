@@ -990,6 +990,24 @@ pub(in crate::server) async fn owe_survivors(
     owe_for(state, group_key, &survivors, events).await
 }
 
+/// Survivor re-key A13: make `recipient_hex`'s obligation in `group_key`
+/// due at the next step, as a retried add asks. Returns whether one is owed.
+pub(in crate::server) async fn due_now(
+    state: &AppState,
+    group_key: &str,
+    recipient_hex: &str,
+) -> bool {
+    let mut store = state.rekey_obligations.lock().await;
+    let key = (group_key.to_string(), recipient_hex.to_ascii_lowercase());
+    match store.entries.get_mut(&key) {
+        Some(owed) => {
+            owed.next_attempt_at_ms = 0;
+            true
+        }
+        None => false,
+    }
+}
+
 /// Apply `proof` to the survivor's obligations under any of `aliases`.
 pub(in crate::server) async fn settle(state: &AppState, aliases: &[String], proof: &Proof) {
     let mut store = state.rekey_obligations.lock().await;

@@ -78,6 +78,12 @@ All notable changes to this project will be documented in this file.
   not name, and for a join-request lifecycle event.
 - **A TreeKEM seal route answers 409 `sealer_key_package_uncommitted`** when this
   daemon's own seat commits no KeyPackage hash (groups made before #220).
+- **A member seated by a direct add or an approved join request is owed its
+  seat until it proves it holds it.** The seat rides the re-key obligations
+  (durable, 6 s to 15 min backoff, sent at once on reconnect), so a sibling
+  device asleep through the first minute is seated when it returns. A retried
+  add answers 409 as before, with `"redelivered": true`, and sends the seat
+  again. See `docs/adr/transient/T-seat-obligation.md`.
 - **No catch-up ask blocks an apply or the catch-up listener.** An event ahead
   of the head is parked and the apply returns; each ask runs in its own task,
   once per peer and head. A truncated page's follow-up ask runs in its own task
