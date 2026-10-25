@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **A build says which commit it came from.** `build.rs` records
+  `X0X_BUILD_SHA` (the build environment's value, else `git rev-parse HEAD`
+  of the crate's own checkout, `-dirty` when a tracked file differs), exposed
+  as `x0x::BUILD_SHA`, `GET /health` `build_sha` (absent when none was
+  recorded) and a second line `build <sha>` from `x0xd --version
+  --build-sha`. `x0xd --version` alone still prints one line. Two builds of
+  one version, such as two fork tails, can now be told apart.
+
 - **A metered leaf consumes the DM-capability topics but no longer forwards
   them (`[gossip] caps_consume_only`).** A leaf still receives every
   `x0x/caps/*` advert, request and response, answers requests for itself and

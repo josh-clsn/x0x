@@ -81,6 +81,11 @@ async fn main() -> anyhow::Result<()> {
     // Handle --version and --help before anything else
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("x0xd {}", env!("CARGO_PKG_VERSION"));
+        // A second line only on request, so a reader of the one-line form is
+        // unchanged; an older x0xd ignores the flag and prints the first line.
+        if args.iter().any(|a| a == "--build-sha") {
+            println!("build {}", x0x::BUILD_SHA.unwrap_or("unknown"));
+        }
         return Ok(());
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -107,6 +112,7 @@ async fn main() -> anyhow::Result<()> {
         println!("    --skip-update-check   Disable self-update for this process");
         println!("    --doctor              Run diagnostics");
         println!("    --version, -V         Print version and exit");
+        println!("    --version --build-sha Also print the commit this build came from");
         println!("    --help, -h            Print this help and exit");
         return Ok(());
     }

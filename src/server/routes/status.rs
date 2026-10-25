@@ -73,6 +73,10 @@ pub(in crate::server) struct ApiResponse<T: Serialize> {
 pub(in crate::server) struct HealthData {
     status: String,
     version: String,
+    /// The commit this build came from (`x0x::BUILD_SHA`), absent when its
+    /// build recorded none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_sha: Option<String>,
     peers: usize,
     send_ready_peers: usize,
     uptime_secs: u64,
@@ -176,6 +180,7 @@ pub(in crate::server) async fn health(
         data: HealthData {
             status: status.to_string(),
             version: x0x::VERSION.to_string(),
+            build_sha: x0x::BUILD_SHA.map(str::to_owned),
             peers,
             send_ready_peers,
             uptime_secs,
@@ -325,7 +330,7 @@ pub(in crate::server) async fn get_constitution_json() -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_health, classify_runtime_status, HealthSnapshot};
+    use super::{classify_health, classify_runtime_status, HealthData, HealthSnapshot};
 
     /// The `health` handler's own source, for the structural guard below.
     /// Matches the `include_str!`-of-route-source convention in
@@ -385,6 +390,42 @@ mod tests {
         assert_eq!(snapshot.load(), (17, 3));
         snapshot.store(0, 0);
         assert_eq!(snapshot.load(), (0, 0), "a drop to zero must be visible");
+    }
+
+    /// A consumer pinned to one fork tail tells two builds of one version
+    /// apart by `build_sha`; a build that recorded none says nothing rather
+    /// than an empty string a consumer could mistake for a commit.
+    #[test]
+    fn health_reports_the_build_sha_only_when_recorded() {
+        let mut data = HealthData {
+            status: "healthy".to_owned(),
+            version: "0.0.0".to_owned(),
+            build_sha: None,
+            peers: 0,
+            send_ready_peers: 0,
+            uptime_secs: 0,
+            degraded_reason: None,
+            warnings: Vec::new(),
+        };
+        let without = serde_json::to_value(&data).unwrap();
+        assert!(without.get("build_sha").is_none(), "{without}");
+        data.build_sha = Some("ab".repeat(20));
+        let with = serde_json::to_value(&data).unwrap();
+        assert_eq!(with["build_sha"], "ab".repeat(20));
+    }
+
+    #[test]
+    fn a_build_from_a_checkout_records_its_commit() {
+        let checkout = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".git")
+            .exists();
+        let Some(sha) = crate::BUILD_SHA else {
+            assert!(!checkout, "built from a checkout but recorded no commit");
+            return;
+        };
+        let hex = sha.strip_suffix("-dirty").unwrap_or(sha);
+        assert_eq!(hex.len(), 40, "{sha}");
+        assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()), "{sha}");
     }
 
     /// WHY (issue #262): a wedged-transport daemon — up for hours, zero

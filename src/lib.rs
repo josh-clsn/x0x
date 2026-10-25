@@ -23278,6 +23278,12 @@ pub struct AdvisoryOwnership {
 /// The x0x protocol version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The commit this build came from, when its build recorded one
+/// (`build.rs`): 40 hex digits, with `-dirty` when a tracked file differed
+/// from that commit. Two builds of one [`VERSION`] can differ; this tells
+/// them apart.
+pub const BUILD_SHA: Option<&str> = option_env!("X0X_BUILD_SHA");
+
 /// The name. Three bytes. A palindrome. A philosophy.
 pub const NAME: &str = "x0x";
 

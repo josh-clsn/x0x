@@ -211,8 +211,12 @@ browser calls. Two further served paths sit outside the registry:
 
 ```bash
 curl http://127.0.0.1:12700/health
-# {"ok":true,"status":"healthy","version":"<x.y.z>","peers":4,"send_ready_peers":4,"uptime_secs":300}
+# {"ok":true,"status":"healthy","version":"<x.y.z>","build_sha":"<40 hex>","peers":4,"send_ready_peers":4,"uptime_secs":300}
 ```
+
+`build_sha` is the commit the daemon was built from (`-dirty` appended when a
+tracked file differed from it), and is absent when the build recorded none.
+`x0xd --version --build-sha` prints it on a second line, `build <sha>`.
 
 ### Example: status
 
