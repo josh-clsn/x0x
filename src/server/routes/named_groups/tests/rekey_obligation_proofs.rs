@@ -15,7 +15,9 @@ use super::epoch_ahead_catchup::{
     deliver_catchup, encrypt, live_epoch, live_treekem_group, published_removal_event,
     signed_self_leave, survivor_relay_fixture, wait_until, SurvivorRelay,
 };
-use super::rekey_obligations::{eventually, hex_of, install_deliver, owed, set_connected, skew};
+use super::rekey_obligations::{
+    eventually, hex_of, idle, install_deliver, owed, set_connected, settles_done, skew,
+};
 use super::signer_delivery::{ban_route, direct_add_route, newcomer, published};
 use super::*;
 use axum::http::Method;
@@ -142,7 +144,13 @@ async fn obligation_is_durable_before_the_route_returns() -> Result<()> {
     let (epoch, _) = rekey_of(&removal);
     // What a restart right after the route returned would load.
     let groups = owner.named_groups.read().await.clone();
-    let loaded = load_rekey_obligations(&owner.treekem_dir, &groups, &owner_hex(&cast)).await;
+    let loaded = load_rekey_obligations(
+        &owner.treekem_dir,
+        &groups,
+        &owner_hex(&cast),
+        &*owner.treekem_event_log.read().await,
+    )
+    .await;
     for survivor in [s1_hex(&cast), s2_hex(&cast)] {
         assert_eq!(
             loaded
@@ -323,7 +331,15 @@ async fn request_below_the_epoch_does_not_settle() -> Result<()> {
         "an unsigned challenge is refused"
     );
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(settles_done(owner).await, "every settle spawned has run");
+    assert!(
+        owner
+            .named_group_test_recorders
+            .settles_spawned
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= 2,
+        "S1's own requests did reach a settle"
+    );
     assert_eq!(
         owed(owner, group_id, &s1_hex(&cast)).await,
         Some(before),
@@ -582,7 +598,8 @@ async fn survivor_away_past_the_old_horizon_gets_the_key_from_the_obligation() -
         let counted = eventually(|| async {
             owed(owner, group_id, &s1)
                 .await
-                .is_some_and(|owed| owed.attempt_count == attempts && !owed.in_flight)
+                .is_some_and(|owed| owed.attempt_count == attempts)
+                && idle(owner, group_id, &s1).await
         })
         .await;
         assert!(counted, "attempt {attempts}");
@@ -597,7 +614,9 @@ async fn survivor_away_past_the_old_horizon_gets_the_key_from_the_obligation() -
         Some(ObligationState::Owed)
     );
 
-    // S1 comes back: linked again, it is sent the re-key at once.
+    // S1 comes back: linked again, it is sent the re-key at once, the edge
+    // floor after its last failed send having passed.
+    skew(owner, rekey_obligations::EDGE_FLOOR_MS).await;
     away.store(false, Ordering::SeqCst);
     set_connected(owner, &[&s1]);
     rekey_obligations::step(owner).await;
@@ -687,7 +706,13 @@ async fn survivor_away_with_the_remover_restarted_gets_the_key_from_another_surv
     );
     assert!(owed(&restarted, group_id, &s1_hex(&cast)).await.is_none());
     let groups = restarted.named_groups.read().await.clone();
-    let loaded = load_rekey_obligations(&restarted.treekem_dir, &groups, &owner_hex(&cast)).await;
+    let loaded = load_rekey_obligations(
+        &restarted.treekem_dir,
+        &groups,
+        &owner_hex(&cast),
+        &*restarted.treekem_event_log.read().await,
+    )
+    .await;
     assert!(
         loaded.get(group_id, &s1_hex(&cast)).is_none(),
         "settled on disk"
@@ -765,5 +790,84 @@ async fn invite_and_approval_adds_owe_the_members_already_seated() -> Result<()>
         "the member already seated is owed the approval"
     );
     assert!(owed(state, group_id, &requester_hex).await.is_none());
+    Ok(())
+}
+
+/// Fix round I-5: a survivor that applied the re-key and then says nothing
+/// still settles. The author's direct send makes it answer with one signed
+/// page request from its new head, and that request settles the obligation.
+#[tokio::test]
+async fn a_silent_survivor_settles_without_user_traffic() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let owner = &cast.fixture.state;
+    let group_id = &cast.fixture.group_id;
+    let owner_id = owner.agent.agent_id();
+    let owner_hex = owner_hex(&cast);
+    let s2 = s2_hex(&cast);
+    {
+        let (s2, s2_state) = (s2.clone(), Arc::clone(&cast.s2));
+        install_deliver(
+            owner,
+            Arc::new(move |recipient, event| {
+                let target = (recipient == s2).then(|| Arc::clone(&s2_state));
+                Box::pin(async move {
+                    let Some(target) = target else {
+                        return Err("unreachable".to_string());
+                    };
+                    // As the direct-message listener applies it.
+                    apply_direct_named_group_metadata_event(&target, event, owner_id, true).await;
+                    Ok(())
+                })
+            }),
+        );
+    }
+    let removal = remove(&cast, &r_hex(&cast)).await;
+    let (epoch, _) = rekey_of(&removal);
+    skew(owner, 6_000).await;
+    rekey_obligations::step(owner).await;
+
+    let asked = || -> Vec<TreeKemCatchupRequest> {
+        cast.s2
+            .named_group_test_recorders
+            .catchup_page_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(peer, _)| *peer == owner_hex)
+            .filter_map(|(_, bytes)| serde_json::from_slice(bytes).ok())
+            .collect()
+    };
+    assert!(
+        eventually(|| async { asked().len() == 1 }).await,
+        "S2 answers the owner once"
+    );
+    assert_eq!(live_epoch(&cast.s2, group_id).await, epoch);
+    let request = asked().pop().expect("S2's request");
+    assert!(request.signed_by.is_some(), "signed over its head");
+    // The owner takes it as off the wire, from a transport it cannot verify.
+    handle_treekem_catchup_request(owner, &cast.s2.agent.agent_id(), false, request).await;
+    assert!(
+        eventually(|| async { owed(owner, group_id, &s2).await.is_none() }).await,
+        "the quiet survivor's answer settles"
+    );
+    assert!(
+        owed(owner, group_id, &s1_hex(&cast)).await.is_some(),
+        "S1 got nothing and proved nothing"
+    );
+
+    // Once per room per gap, and only for the author over a verified transport.
+    let held = rekey_obligations::held_rekey(&cast.s2, &removal, &owner_id, true)
+        .expect("the author's re-key, verified");
+    assert!(
+        !rekey_obligations::prove_held(&cast.s2, held).await,
+        "not again within the gap"
+    );
+    assert!(rekey_obligations::held_rekey(&cast.s2, &removal, &owner_id, false).is_none());
+    assert!(
+        rekey_obligations::held_rekey(&cast.s2, &removal, &cast.s1.agent.agent_id(), true)
+            .is_none(),
+        "a copy from someone who did not sign it asks nothing"
+    );
+    cast.shutdown().await;
     Ok(())
 }

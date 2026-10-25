@@ -3654,7 +3654,17 @@ pub(in crate::server) fn named_group_event_delivery_result(
     let agent = Arc::clone(&state.agent);
     let control_blobs = state.control_blobs.clone();
     let group_id = named_group_metadata_event_group_id(event).to_string();
+    #[cfg(test)]
+    let dropped_for_test = state
+        .named_group_test_recorders
+        .direct_delivery_drop
+        .lock()
+        .is_ok_and(|dropped| dropped.contains(recipient_hex));
     Some(async move {
+        #[cfg(test)]
+        if dropped_for_test {
+            return Err("dropped for a test".to_string());
+        }
         if payload.len() > x0x::dm::MAX_PAYLOAD_BYTES {
             control_blob::send_reference(
                 &control_blobs,
@@ -12172,6 +12182,24 @@ fn metadata_event_bypasses_transport_verified(event: &NamedGroupMetadataEvent) -
             ..
         }
     )
+}
+
+/// The direct-message listener's apply (`server/mod.rs`): the ordinary
+/// apply, then, for a re-key its author sent here directly, one signed
+/// page request back to the author, which proves this daemon holds it and
+/// settles the author's obligation (survivor re-key fix round I-5).
+pub(in crate::server) async fn apply_direct_named_group_metadata_event(
+    state: &Arc<AppState>,
+    event: NamedGroupMetadataEvent,
+    sender: AgentId,
+    verified: bool,
+) -> ApplyMetadataResult {
+    let held = rekey_obligations::held_rekey(state, &event, &sender, verified);
+    let applied = apply_named_group_metadata_event(state, event, sender, verified, None).await;
+    if let Some(held) = held {
+        rekey_obligations::spawn_prove_held(state, held);
+    }
+    applied
 }
 
 pub(in crate::server) async fn apply_named_group_metadata_event(
@@ -30789,7 +30817,7 @@ async fn treekem_group_decrypt_for_actor(
     // Survivor re-key A10: the survivors still owed here, with the
     // KeyPackages their seats commit, to tell whether this message is one
     // of theirs.
-    let owed = rekey_obligations::owed_packages(state, group_id_hex).await;
+    let (owed_room, owed) = rekey_obligations::owed_packages(state, group_id_hex).await;
     let mut guard = group.lock().await;
     let (plaintext, sender_leaf) = match guard.decrypt_message_with_sender(&ciphertext) {
         Ok(opened) => opened,
@@ -30825,7 +30853,7 @@ async fn treekem_group_decrypt_for_actor(
     if let Some(recipient_hex) = owed_sender {
         rekey_obligations::settle(
             state,
-            &[group_id_hex.to_string()],
+            std::slice::from_ref(&owed_room),
             &rekey_obligations::Proof {
                 recipient_hex,
                 epoch,
@@ -45734,6 +45762,7 @@ pub(in crate::server) mod tests {
             &treekem_dir,
             &named_groups,
             &hex::encode(agent.agent_id().as_bytes()),
+            &treekem_event_log,
         )
         .await;
         // ADR-0041 Tier-1: mirror daemon startup — owned agents get the

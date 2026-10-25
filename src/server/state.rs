@@ -1449,7 +1449,15 @@ pub(super) struct NamedGroupTestRecorders {
         StdMutex<Option<crate::server::routes::named_groups::RekeyObligationTestDeliver>>,
     /// Survivor re-key A9: when set, the survivors the obligation worker
     /// counts as linked, in place of `is_agent_connected`.
-    pub(super) rekey_obligation_connected: StdMutex<Option<std::collections::HashSet<String>>>,
+    pub(super) rekey_obligation_connected:
+        StdMutex<Option<std::collections::HashMap<String, Option<String>>>>,
+    /// Survivor re-key fix round m-8: settles spawned and finished, so a
+    /// test waits for every settle before it asserts nothing settled.
+    pub(super) settles_spawned: std::sync::atomic::AtomicUsize,
+    pub(super) settles_finished: std::sync::atomic::AtomicUsize,
+    /// Survivor re-key fix round I-4: recipients `named_group_event_delivery_result`
+    /// fails for, as if the send were lost.
+    pub(super) direct_delivery_drop: StdMutex<std::collections::HashSet<String>>,
     /// Survivor re-key A10: every bounded resend schedule started, as
     /// `(event kind, recipients)`.
     pub(super) control_redelivery_recipients: StdMutex<Vec<(&'static str, Vec<String>)>>,

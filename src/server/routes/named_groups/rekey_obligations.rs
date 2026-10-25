@@ -24,6 +24,9 @@
 //!   request from the survivor itself at or past the epoch, a message from
 //!   it decrypted at or past the epoch, the survivor leaving the roster, or
 //!   the room being withdrawn or wiped. A claimed sender proves nothing.
+//! - **Proved by a quiet survivor too.** A survivor that gets a re-key
+//!   directly from its author answers with one signed page request from its
+//!   head ([`held_rekey`], [`prove_held`]), which settles.
 //! - **Refused.** Past a cap, or when the record cannot be written, [`owe`]
 //!   returns the survivor, and the caller keeps it on the blind schedule.
 //!   Nothing already owed is dropped to make room.
@@ -45,10 +48,12 @@ use serde::{Deserialize, Serialize};
 
 use super::event_log_store::{
     commit_bearing_event_frontier, commit_bearing_event_sort_key, run_blocking, write_durable,
+    EventLog,
 };
 use super::{
-    committer_leaf, has_withdrawn_group_record, named_group_event_delivery_result, now_millis_u64,
-    signed_catchup, AppState, NamedGroupMetadataEvent, TreeKemCatchupRequest,
+    committer_leaf, has_withdrawn_group_record, named_group_event_delivery_result,
+    named_group_metadata_event_commit, now_millis_u64, signed_catchup, AppState,
+    NamedGroupMetadataEvent, TreeKemCatchupRequest,
 };
 use crate as x0x;
 use crate::logging::LogHexId;
@@ -68,6 +73,9 @@ pub(in crate::server) const STEP_EVERY: Duration = Duration::from_secs(5);
 const FIRST_DELAYS_MS: [u64; 4] = [6_000, 15_000, 30_000, 60_000];
 /// The longest wait between two sends of one obligation.
 pub(in crate::server) const MAX_DELAY_MS: u64 = 15 * 60 * 1000;
+/// A connect edge sends again only this long after the last send to the
+/// same obligation, so a link that flaps does not resend on every step.
+pub(in crate::server) const EDGE_FLOOR_MS: u64 = 60_000;
 /// The most events one send carries.
 pub(in crate::server) const EVENTS_PER_ATTEMPT: usize = 16;
 /// How long one event's send may take.
@@ -108,12 +116,10 @@ pub(in crate::server) struct RekeyObligation {
     /// The revision of the latest re-key owed.
     pub(in crate::server) through_revision: u64,
     pub(in crate::server) state: ObligationState,
+    /// Kept on disk only as of the last state change (fix round m-2): a
+    /// restart may send at once.
     pub(in crate::server) next_attempt_at_ms: u64,
     pub(in crate::server) attempt_count: u32,
-    /// A send is running. Never written: nothing is in flight after a
-    /// restart.
-    #[serde(skip)]
-    pub(in crate::server) in_flight: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -135,6 +141,9 @@ pub(in crate::server) struct Proof {
 /// One send the worker started.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::server) struct Attempt {
+    /// Which send this is, so a send that ends after its obligation was
+    /// settled and owed again frees only its own slot.
+    id: u64,
     pub(in crate::server) group_key: String,
     pub(in crate::server) recipient_hex: String,
     pub(in crate::server) owed_revision: u64,
@@ -211,18 +220,32 @@ pub(in crate::server) fn retry_delay_ms(attempt_count: u32) -> u64 {
         .min(MAX_DELAY_MS)
 }
 
+/// Which survivors are linked now, each with its link id when A8's
+/// presence names one. A survivor missing from the map is not linked.
+pub(in crate::server) type Links = HashMap<String, Option<String>>;
+
+type Key = (String, String);
+
 /// The obligations, in memory and in their file.
 pub(in crate::server) struct RekeyObligations {
     /// By (room, survivor).
-    entries: BTreeMap<(String, String), RekeyObligation>,
+    entries: BTreeMap<Key, RekeyObligation>,
     /// `None` keeps them in memory only.
     path: Option<PathBuf>,
     pub(in crate::server) clock: ObligationClock,
     /// The survivors linked at the last step, for connect edges.
-    connected: HashSet<String>,
+    links: Links,
+    /// The sends running, by obligation, with each one's attempt id. A
+    /// settle or a wipe leaves its slot here until the send returns.
+    in_flight: HashMap<Key, u64>,
+    next_attempt_id: u64,
+    /// When each obligation's last send started.
+    last_sent: HashMap<Key, u64>,
     /// The (room, survivor, owed revision) a missing payload was said for.
     missing_said: HashSet<(String, String, u64)>,
     missing_reports: u64,
+    /// The name an unreadable file was set aside under at load.
+    set_aside: Option<String>,
     room_cap: usize,
     total_cap: usize,
 }
@@ -233,12 +256,26 @@ impl Default for RekeyObligations {
             entries: BTreeMap::new(),
             path: None,
             clock: ObligationClock::start(),
-            connected: HashSet::new(),
+            links: HashMap::new(),
+            in_flight: HashMap::new(),
+            next_attempt_id: 0,
+            last_sent: HashMap::new(),
             missing_said: HashSet::new(),
             missing_reports: 0,
+            set_aside: None,
             room_cap: ROOM_CAP,
             total_cap: TOTAL_CAP,
         }
+    }
+}
+
+/// Whether a survivor whose link was `before` at the last step and is
+/// `now` has just come back: it was not linked, or its link id changed (a
+/// drop and a reconnect between two steps).
+fn is_edge(before: Option<&Option<String>>, now: &Option<String>) -> bool {
+    match before {
+        None => true,
+        Some(before) => now.is_some() && before != now,
     }
 }
 
@@ -254,6 +291,7 @@ fn well_formed(owed: &RekeyObligation) -> bool {
         && !owed.group_key.is_empty()
         && owed.group_key.len() <= 256
         && owed.owed_epoch <= owed.through_epoch
+        && owed.owed_revision <= owed.through_revision
 }
 
 impl RekeyObligations {
@@ -286,6 +324,38 @@ impl RekeyObligations {
             .take_while(|((key, _), _)| key == group_key)
             .map(|((_, recipient), _)| recipient.clone())
             .collect()
+    }
+
+    /// Whether a send to this obligation is running.
+    #[cfg(test)]
+    pub(in crate::server) fn is_in_flight(&self, group_key: &str, recipient_hex: &str) -> bool {
+        self.in_flight
+            .contains_key(&(group_key.to_string(), recipient_hex.to_ascii_lowercase()))
+    }
+
+    /// How many sends are running.
+    #[cfg(test)]
+    pub(in crate::server) fn sends_running(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    /// What the catch-up status reports: what this daemon owes in all, and
+    /// in `group_key`, and how much of it was delivered but is unproven.
+    pub(in crate::server) fn status(&self, group_key: &str) -> serde_json::Value {
+        let unproven = |owed: &RekeyObligation| owed.state == ObligationState::DeliveredUnproven;
+        let room: Vec<&RekeyObligation> = self
+            .entries
+            .range((group_key.to_string(), String::new())..)
+            .take_while(|((key, _), _)| key == group_key)
+            .map(|(_, owed)| owed)
+            .collect();
+        serde_json::json!({
+            "owed": self.entries.len(),
+            "unproven": self.entries.values().filter(|owed| unproven(owed)).count(),
+            "room_owed": room.len(),
+            "room_unproven": room.iter().filter(|owed| unproven(owed)).count(),
+            "unreadable_file_set_aside": self.set_aside,
+        })
     }
 
     /// How many payloads were missing from the log, each said once.
@@ -363,7 +433,6 @@ impl RekeyObligations {
                     state: ObligationState::Owed,
                     next_attempt_at_ms: soon,
                     attempt_count: 0,
-                    in_flight: false,
                 },
             );
         }
@@ -389,8 +458,14 @@ impl RekeyObligations {
             } else if proof.epoch >= owed.owed_epoch {
                 owed.owed_epoch = proof.epoch.saturating_add(1);
                 if let Some(revision) = proof.revision {
-                    owed.owed_revision = owed.owed_revision.max(revision.saturating_add(1));
+                    owed.owed_revision = owed
+                        .owed_revision
+                        .max(revision.saturating_add(1).min(owed.through_revision));
                 }
+                let current = owed.owed_revision;
+                self.missing_said.retain(|(room, member, revision)| {
+                    room != alias || *member != recipient || *revision == current
+                });
                 changed = true;
             }
         }
@@ -404,6 +479,7 @@ impl RekeyObligations {
         let entries = &self.entries;
         self.missing_said
             .retain(|(room, member, _)| entries.contains_key(&(room.clone(), member.clone())));
+        self.last_sent.retain(|key, _| entries.contains_key(key));
         self.entries.len() != before
     }
 
@@ -413,59 +489,107 @@ impl RekeyObligations {
     }
 
     /// Start the sends that are due now, at most [`MAX_IN_FLIGHT`] in all,
-    /// none of them already running. A survivor in `connected_now` that was
-    /// not linked at the last step is due at once.
-    fn begin(&mut self, now_ms: u64, connected_now: &HashSet<String>) -> Vec<Attempt> {
-        let newly: HashSet<&String> = connected_now.difference(&self.connected).collect();
-        if !newly.is_empty() {
-            for owed in self.entries.values_mut() {
-                if newly.contains(&owed.recipient_hex) {
-                    owed.next_attempt_at_ms = owed.next_attempt_at_ms.min(now_ms);
+    /// none of them already running.
+    ///
+    /// A survivor that came back since the last step ([`is_edge`]) is due
+    /// at once, or, when its last send started less than [`EDGE_FLOOR_MS`]
+    /// ago, once that floor has passed, and an `Owed` one starts its backoff
+    /// again from the first wait. Due sends rank by: a connect edge this step, then a first
+    /// attempt, then `Owed` before `DeliveredUnproven`, then the due time.
+    /// So a backlog of unreachable survivors never holds back one that just
+    /// linked or a fresh re-key.
+    fn begin(&mut self, now_ms: u64, links_now: &Links) -> Vec<Attempt> {
+        let edges: HashSet<&String> = links_now
+            .iter()
+            .filter(|(member, now)| is_edge(self.links.get(*member), now))
+            .map(|(member, _)| member)
+            .collect();
+        let mut edged: HashSet<Key> = HashSet::new();
+        if !edges.is_empty() {
+            for (key, owed) in &mut self.entries {
+                if !edges.contains(&owed.recipient_hex) {
+                    continue;
+                }
+                // Within the floor, the edge is kept as a due time at its end.
+                let earliest = self.last_sent.get(key).map_or(now_ms, |sent| {
+                    sent.saturating_add(EDGE_FLOOR_MS).max(now_ms)
+                });
+                owed.next_attempt_at_ms = owed.next_attempt_at_ms.min(earliest);
+                // A linked survivor is not the unreachable one the backoff
+                // is for: a send that fails now retries on the first waits,
+                // not at the cap a long absence built up.
+                if owed.state == ObligationState::Owed {
+                    owed.attempt_count = 0;
+                }
+                if earliest == now_ms {
+                    edged.insert(key.clone());
                 }
             }
         }
-        self.connected.clone_from(connected_now);
-        let busy = self.entries.values().filter(|owed| owed.in_flight).count();
-        let free = MAX_IN_FLIGHT.saturating_sub(busy);
+        self.links.clone_from(links_now);
+        let free = MAX_IN_FLIGHT.saturating_sub(self.in_flight.len());
         if free == 0 {
             return Vec::new();
         }
-        let mut due: Vec<(u64, (String, String))> = self
+        let mut due: Vec<(bool, bool, bool, u64, &Key)> = self
             .entries
             .iter()
-            .filter(|(_, owed)| !owed.in_flight && owed.next_attempt_at_ms <= now_ms)
-            .map(|(key, owed)| (owed.next_attempt_at_ms, key.clone()))
+            .filter(|(key, owed)| {
+                !self.in_flight.contains_key(*key) && owed.next_attempt_at_ms <= now_ms
+            })
+            .map(|(key, owed)| {
+                (
+                    !edged.contains(key),
+                    owed.attempt_count != 0,
+                    owed.state != ObligationState::Owed,
+                    owed.next_attempt_at_ms,
+                    key,
+                )
+            })
             .collect();
         due.sort();
-        due.truncate(free);
-        let mut attempts = Vec::with_capacity(due.len());
-        for (_, key) in due {
-            if let Some(owed) = self.entries.get_mut(&key) {
-                owed.in_flight = true;
-                attempts.push(Attempt {
-                    group_key: owed.group_key.clone(),
-                    recipient_hex: owed.recipient_hex.clone(),
-                    owed_revision: owed.owed_revision,
-                    through_revision: owed.through_revision,
-                });
-            }
+        let chosen: Vec<Key> = due
+            .into_iter()
+            .take(free)
+            .map(|(_, _, _, _, key)| key.clone())
+            .collect();
+        let mut attempts = Vec::with_capacity(chosen.len());
+        for key in chosen {
+            let Some(owed) = self.entries.get(&key) else {
+                continue;
+            };
+            let id = self.next_attempt_id;
+            self.next_attempt_id = self.next_attempt_id.wrapping_add(1);
+            attempts.push(Attempt {
+                id,
+                group_key: owed.group_key.clone(),
+                recipient_hex: owed.recipient_hex.clone(),
+                owed_revision: owed.owed_revision,
+                through_revision: owed.through_revision,
+            });
+            self.in_flight.insert(key.clone(), id);
+            self.last_sent.insert(key, now_ms);
         }
         attempts
     }
 
-    /// Record how `attempt` ended. Returns whether the obligation is still
-    /// there.
+    /// Record how `attempt` ended, and free its slot. Returns whether the
+    /// obligation changed state (`Owed` to `DeliveredUnproven`), which is
+    /// what is written to disk; a new due time is kept in memory only.
     fn finish(&mut self, attempt: &Attempt, outcome: Outcome, now_ms: u64) -> bool {
         let key = (attempt.group_key.clone(), attempt.recipient_hex.clone());
+        if self.in_flight.get(&key) == Some(&attempt.id) {
+            self.in_flight.remove(&key);
+        }
         let Some(owed) = self.entries.get_mut(&key) else {
             return false;
         };
-        owed.in_flight = false;
         if owed.through_revision != attempt.through_revision {
-            return true;
+            return false;
         }
         owed.attempt_count = owed.attempt_count.saturating_add(1);
-        if outcome == Outcome::Delivered {
+        let delivered_now = outcome == Outcome::Delivered && owed.state == ObligationState::Owed;
+        if delivered_now {
             owed.state = ObligationState::DeliveredUnproven;
         }
         let wait = if owed.state == ObligationState::DeliveredUnproven {
@@ -474,7 +598,7 @@ impl RekeyObligations {
             retry_delay_ms(owed.attempt_count)
         };
         owed.next_attempt_at_ms = now_ms.saturating_add(wait);
-        true
+        delivered_now
     }
 
     /// Say once per owed revision that the log cannot serve `attempt`.
@@ -557,12 +681,20 @@ fn room_owes(
 }
 
 /// Load the obligations at startup, keeping those still live
-/// ([`obligation_is_live`]) and within the caps. A file that does not read
-/// back loads nothing and is replaced at the next write.
+/// ([`obligation_is_live`]) and within the caps.
+///
+/// A file that does not read back, or names another version, is never
+/// overwritten and never stops the daemon (fix round I-3): it is renamed
+/// aside to `rekey-obligations.json.unreadable-<ms>`, logged at error, and
+/// reported in the catch-up status. The daemon then owes more rather than
+/// less: in every live TreeKEM room it administers, every other active
+/// member is owed the room's current epoch ([`owe_every_member`]). A member
+/// already there settles on its next request, challenge or message.
 pub(in crate::server) async fn load_rekey_obligations(
     treekem_dir: &Path,
     groups: &HashMap<String, x0x::groups::GroupInfo>,
     local_agent_hex: &str,
+    event_log: &EventLog,
 ) -> RekeyObligations {
     let path = treekem_dir.join(OBLIGATIONS_FILE);
     let mut store = RekeyObligations {
@@ -576,32 +708,27 @@ pub(in crate::server) async fn load_rekey_obligations(
         Err(error) => Err(error),
     })
     .await;
-    let bytes = match bytes {
-        Ok(Some(bytes)) => bytes,
+    let sidecar = match bytes {
         Ok(None) => return store,
-        Err(error) => {
-            tracing::warn!(
-                path = %path.display(),
-                "re-key obligations: not loaded; survivors still owed get the key only by catch-up: {error}"
-            );
-            return store;
-        }
+        Ok(Some(bytes)) => match serde_json::from_slice::<Sidecar>(&bytes) {
+            Ok(sidecar) if sidecar.version == FILE_VERSION => Ok(sidecar),
+            Ok(sidecar) => Err(format!("unknown file version {}", sidecar.version)),
+            Err(error) => Err(format!("does not read back: {error}")),
+        },
+        Err(error) => Err(format!("cannot be read: {error}")),
     };
-    let sidecar = match serde_json::from_slice::<Sidecar>(&bytes) {
-        Ok(sidecar) if sidecar.version == FILE_VERSION => sidecar,
-        Ok(sidecar) => {
-            tracing::warn!(
-                path = %path.display(),
-                version = sidecar.version,
-                "re-key obligations: unknown file version; nothing loaded"
-            );
-            return store;
-        }
-        Err(error) => {
-            tracing::warn!(
-                path = %path.display(),
-                "re-key obligations: the file does not read back; nothing loaded, survivors still owed get the key only by catch-up: {error}"
-            );
+    let sidecar = match sidecar {
+        Ok(sidecar) => sidecar,
+        Err(why) => {
+            set_aside_and_owe_every_member(
+                &mut store,
+                &path,
+                &why,
+                groups,
+                local_agent_hex,
+                event_log,
+            )
+            .await;
             return store;
         }
     };
@@ -621,7 +748,6 @@ pub(in crate::server) async fn load_rekey_obligations(
             dropped = dropped.saturating_add(1);
             continue;
         }
-        owed.in_flight = false;
         owed.next_attempt_at_ms = owed
             .next_attempt_at_ms
             .min(now_ms.saturating_add(MAX_DELAY_MS));
@@ -636,6 +762,115 @@ pub(in crate::server) async fn load_rekey_obligations(
         store.persist_or_warn("the load's clean-up").await;
     }
     store
+}
+
+async fn set_aside_and_owe_every_member(
+    store: &mut RekeyObligations,
+    path: &Path,
+    why: &str,
+    groups: &HashMap<String, x0x::groups::GroupInfo>,
+    local_agent_hex: &str,
+    event_log: &EventLog,
+) {
+    let aside_name = format!("{OBLIGATIONS_FILE}.unreadable-{}", now_millis_u64());
+    let aside = path.with_file_name(&aside_name);
+    let (from, to) = (path.to_path_buf(), aside.clone());
+    match run_blocking(move || std::fs::rename(&from, &to)).await {
+        Ok(()) => {
+            tracing::error!(
+                path = %path.display(),
+                set_aside = %aside.display(),
+                "re-key obligations: the file {why}; it is kept under the name set aside, and every other active member of each room this daemon administers is owed its current epoch instead"
+            );
+            store.set_aside = Some(aside_name);
+        }
+        Err(error) => {
+            // Never write over what could not be set aside.
+            tracing::error!(
+                path = %path.display(),
+                "re-key obligations: the file {why}, and setting it aside failed ({error}); obligations are kept in memory only until the next start"
+            );
+            store.path = None;
+            store.set_aside = Some(format!("{OBLIGATIONS_FILE} (not set aside: {error})"));
+        }
+    }
+    let now_ms = store.clock.now_ms();
+    for (group_key, info) in groups {
+        let Some((survivors, rekey_from, rekey_to)) =
+            owe_every_member(group_key, info, local_agent_hex, event_log)
+        else {
+            continue;
+        };
+        let refused = store.owe_entries(group_key, &survivors, rekey_from, rekey_to, now_ms);
+        if !refused.is_empty() {
+            tracing::error!(
+                group_id = %LogHexId::group(group_key),
+                refused = refused.len(),
+                "re-key obligations: past the cap while owing every member; these get the key only by catch-up"
+            );
+        }
+    }
+    store
+        .persist_or_warn("the obligations owed in place of an unreadable file")
+        .await;
+}
+
+/// What a room is owed when this daemon's record of it is lost: in a live
+/// TreeKEM room this daemon administers, every other active member, from
+/// the earliest commit this daemon authored that the A4 log still holds
+/// (else the head) through the head and its current epoch.
+fn owe_every_member(
+    group_key: &str,
+    info: &x0x::groups::GroupInfo,
+    local_agent_hex: &str,
+    event_log: &EventLog,
+) -> Option<(Vec<String>, Rekey, Rekey)> {
+    let administers = info
+        .caller_role(local_agent_hex)
+        .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin));
+    if info.withdrawn
+        || info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem
+        || !info.has_active_member(local_agent_hex)
+        || info.is_banned(local_agent_hex)
+        || !administers
+    {
+        return None;
+    }
+    let survivors: Vec<String> = info
+        .active_members()
+        .map(|member| member.agent_id.to_ascii_lowercase())
+        .filter(|member| !member.eq_ignore_ascii_case(local_agent_hex))
+        .collect();
+    if survivors.is_empty() {
+        return None;
+    }
+    let head = info.state_revision;
+    let first_authored = [
+        group_key,
+        info.stable_group_id(),
+        info.mls_group_id.as_str(),
+    ]
+    .iter()
+    .filter_map(|alias| event_log.get(*alias))
+    .flat_map(|events| events.iter())
+    .filter_map(named_group_metadata_event_commit)
+    .filter(|commit| commit.committed_by.eq_ignore_ascii_case(local_agent_hex))
+    .map(|commit| commit.revision)
+    .min()
+    .unwrap_or(head)
+    .min(head);
+    let epoch = info.secret_epoch;
+    Some((
+        survivors,
+        Rekey {
+            epoch,
+            revision: first_authored,
+        },
+        Rekey {
+            epoch,
+            revision: head,
+        },
+    ))
 }
 
 /// The members a re-key of `next` is owed to: its active members, less
@@ -769,7 +1004,19 @@ pub(in crate::server) async fn settle(state: &AppState, aliases: &[String], proo
 /// [`settle`] in its own task, for a listener that must not wait on it.
 pub(in crate::server) fn spawn_settle(state: &Arc<AppState>, aliases: Vec<String>, proof: Proof) {
     let state = Arc::clone(state);
-    tokio::spawn(async move { settle(&state, &aliases, &proof).await });
+    #[cfg(test)]
+    state
+        .named_group_test_recorders
+        .settles_spawned
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    tokio::spawn(async move {
+        settle(&state, &aliases, &proof).await;
+        #[cfg(test)]
+        state
+            .named_group_test_recorders
+            .settles_finished
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
 }
 
 /// The proof a catch-up or challenge request gives, when only its requester
@@ -791,21 +1038,26 @@ pub(super) fn request_proof(
 /// for telling which of them sealed a message.
 pub(in crate::server) async fn owed_packages(
     state: &AppState,
-    group_key: &str,
-) -> Vec<(String, Vec<u8>)> {
+    group_id: &str,
+) -> (String, Vec<(String, Vec<u8>)>) {
+    // Any spelling of the room: obligations are kept by its roster key.
+    let Some((group_key, info)) = ({
+        let groups = state.named_groups.read().await;
+        crate::server::resolve_group_entry_locked(&groups, group_id)
+            .map(|(key, info)| (key.to_string(), info.clone()))
+    }) else {
+        return (group_id.to_string(), Vec::new());
+    };
     let recipients = state
         .rekey_obligations
         .lock()
         .await
-        .recipients_in(group_key);
+        .recipients_in(&group_key);
     if recipients.is_empty() {
-        return Vec::new();
+        return (group_key, Vec::new());
     }
-    let Some(info) = state.named_groups.read().await.get(group_key).cloned() else {
-        return Vec::new();
-    };
     let ids = [
-        group_key.to_string(),
+        group_key.clone(),
         info.stable_group_id().to_string(),
         info.mls_group_id.clone(),
     ];
@@ -818,7 +1070,7 @@ pub(in crate::server) async fn owed_packages(
             packages.push((recipient, package));
         }
     }
-    packages
+    (group_key, packages)
 }
 
 /// Which owed survivor sits at `sender_leaf` in `group`, if any. Run under
@@ -842,6 +1094,98 @@ pub(in crate::server) async fn wipe_rooms(state: &AppState, aliases: &[String]) 
     if store.wipe(aliases) {
         store.persist_or_warn("a wiped room").await;
     }
+}
+
+/// How often a survivor proves, per room, that it holds a re-key its
+/// author sent it directly: once per [`super::head_rounds::ROUND_MIN_GAP`].
+pub(in crate::server) const HELD_PROOF_GAP: Duration = super::head_rounds::ROUND_MIN_GAP;
+
+/// A re-key its author delivered to this daemon directly, to prove held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::server) struct HeldRekey {
+    group_id: String,
+    author: x0x::identity::AgentId,
+    epoch: u64,
+}
+
+/// The survivor side (fix round I-5). An author's obligation to this
+/// daemon ends only on proof, and a survivor that applied the re-key but is
+/// quiet would otherwise prove nothing. So when the author itself, over a
+/// verified transport, delivers a commit-bearing event that names a TreeKEM
+/// epoch, this daemon answers with one signed page request from its head.
+/// That is an existing message, so the wire does not change.
+pub(in crate::server) fn held_rekey(
+    state: &AppState,
+    event: &NamedGroupMetadataEvent,
+    sender: &x0x::identity::AgentId,
+    verified: bool,
+) -> Option<HeldRekey> {
+    let frontier = commit_bearing_event_frontier(event)?;
+    let commit = named_group_metadata_event_commit(event)?;
+    let sender_hex = hex::encode(sender.as_bytes());
+    (verified
+        && frontier.epoch > 0
+        && commit.committed_by.eq_ignore_ascii_case(&sender_hex)
+        && *sender != state.agent.agent_id())
+    .then(|| HeldRekey {
+        group_id: frontier.group_id.to_string(),
+        author: *sender,
+        epoch: frontier.epoch,
+    })
+}
+
+/// [`prove_held`] in its own task, so the listener that applied the event
+/// never waits on it.
+pub(in crate::server) fn spawn_prove_held(state: &Arc<AppState>, held: HeldRekey) {
+    let state = Arc::clone(state);
+    tokio::spawn(async move { prove_held(&state, held).await });
+}
+
+/// Send `held`'s author one signed page request from this daemon's head,
+/// when this daemon is an active member of the TreeKEM room, its live tree
+/// is at or past the event's epoch (applied now, or before), and no such
+/// request went for the room in the last [`HELD_PROOF_GAP`].
+pub(in crate::server) async fn prove_held(state: &Arc<AppState>, held: HeldRekey) -> bool {
+    let local = hex::encode(state.agent.agent_id().as_bytes());
+    let Some(group_key) = ({
+        let groups = state.named_groups.read().await;
+        crate::server::resolve_group_entry_locked(&groups, &held.group_id)
+            .filter(|(_, info)| {
+                !info.withdrawn
+                    && info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+                    && info.has_active_member(&local)
+            })
+            .map(|(key, _)| key.to_string())
+    }) else {
+        return false;
+    };
+    let Some(tree) = state.treekem_groups.read().await.get(&group_key).cloned() else {
+        return false;
+    };
+    if tree.lock().await.epoch() < held.epoch {
+        return false;
+    }
+    {
+        let throttle_key = format!("{group_key}:rekey-held");
+        let mut throttle = state.treekem_catchup_throttle.write().await;
+        if throttle
+            .get(&throttle_key)
+            .is_some_and(|last| last.elapsed() < HELD_PROOF_GAP)
+        {
+            return false;
+        }
+        super::stamp_catchup_throttle(&mut throttle, throttle_key, tokio::time::Instant::now());
+    }
+    let Some(request) = signed_catchup::page_request(state, &group_key, None).await else {
+        return false;
+    };
+    if let Err(error) = signed_catchup::send_page_request(state, &held.author, request).await {
+        tracing::debug!(
+            group_id = %LogHexId::group(&group_key),
+            "re-key obligation: proving a held re-key to its author failed: {error}"
+        );
+    }
+    true
 }
 
 /// The room's keys: its `named_groups` key and its other ids.
@@ -944,12 +1288,12 @@ async fn run_attempt(state: Arc<AppState>, attempt: Attempt) {
     }
     let now_ms = store.clock.now_ms();
     if store.finish(&attempt, outcome, now_ms) {
-        store.persist_or_warn("a send's outcome").await;
+        store.persist_or_warn("a delivered obligation").await;
     }
 }
 
 /// Which survivors are linked right now.
-async fn linked(state: &AppState, recipients: Vec<String>) -> HashSet<String> {
+async fn linked(state: &AppState, recipients: Vec<String>) -> Links {
     #[cfg(test)]
     {
         let stand_in = state
@@ -962,15 +1306,28 @@ async fn linked(state: &AppState, recipients: Vec<String>) -> HashSet<String> {
             return connected;
         }
     }
-    let mut linked = HashSet::new();
-    for recipient in recipients {
-        if let Ok(agent) = crate::server::parse_agent_id_hex(&recipient) {
-            if state.agent.is_agent_connected(&agent).await {
-                linked.insert(recipient);
-            }
+    let agents: Vec<(String, x0x::identity::AgentId)> = recipients
+        .into_iter()
+        .filter_map(|recipient| {
+            crate::server::parse_agent_id_hex(&recipient)
+                .ok()
+                .map(|agent| (recipient, agent))
+        })
+        .collect();
+    let ids: Vec<x0x::identity::AgentId> = agents.iter().map(|(_, agent)| *agent).collect();
+    let presence = state.agent.presence_links(&ids).await;
+    let mut links = Links::new();
+    for (recipient, agent) in agents {
+        let link_id = presence
+            .get(&agent)
+            .filter(|link| link.authenticated)
+            .and_then(|link| link.generation)
+            .map(|generation| generation.to_string());
+        if link_id.is_some() || state.agent.has_live_direct_connection(&agent).await {
+            links.insert(recipient, link_id);
         }
     }
-    linked
+    links
 }
 
 /// One worker step: drop what is no longer owed, then start the sends that
@@ -991,7 +1348,7 @@ pub(in crate::server) async fn begin_due(state: &AppState) -> Vec<Attempt> {
         let distinct: HashSet<&String> = store.entries.keys().map(|(_, member)| member).collect();
         distinct.into_iter().cloned().collect()
     };
-    let connected = linked(state, recipients).await;
+    let links = linked(state, recipients).await;
     let local = hex::encode(state.agent.agent_id().as_bytes());
     let mut store = state.rekey_obligations.lock().await;
     let dropped = {
@@ -999,7 +1356,7 @@ pub(in crate::server) async fn begin_due(state: &AppState) -> Vec<Attempt> {
         store.retain(|owed| obligation_is_live(&groups, owed, &local))
     };
     let now_ms = store.clock.now_ms();
-    let attempts = store.begin(now_ms, &connected);
+    let attempts = store.begin(now_ms, &links);
     if dropped {
         store
             .persist_or_warn("dropping obligations no longer owed")
@@ -1059,8 +1416,15 @@ mod tests {
             .collect()
     }
 
-    fn connected(members: &[&String]) -> HashSet<String> {
-        members.iter().map(|member| (*member).clone()).collect()
+    fn connected(members: &[&String]) -> Links {
+        members
+            .iter()
+            .map(|member| ((*member).clone(), None))
+            .collect()
+    }
+
+    fn none() -> Links {
+        Links::new()
     }
 
     #[test]
@@ -1158,7 +1522,7 @@ mod tests {
         );
         tokio::time::advance(Duration::from_secs(6)).await;
         let now = store.clock.now_ms();
-        let attempts = store.begin(now, &HashSet::new());
+        let attempts = store.begin(now, &none());
         assert!(store.finish(&attempts[0], Outcome::Delivered, now));
         assert_eq!(
             store.get(ROOM, &s1).unwrap().state,
@@ -1190,12 +1554,10 @@ mod tests {
             now,
         );
         tokio::time::advance(Duration::from_secs(5)).await;
-        assert!(store
-            .begin(store.clock.now_ms(), &HashSet::new())
-            .is_empty());
+        assert!(store.begin(store.clock.now_ms(), &none()).is_empty());
         tokio::time::advance(Duration::from_secs(1)).await;
         let now = store.clock.now_ms();
-        let attempts = store.begin(now, &HashSet::new());
+        let attempts = store.begin(now, &none());
         assert_eq!(recipients(&attempts), vec![s1.clone()]);
         assert!(store.finish(&attempts[0], Outcome::Delivered, now));
         let owed = store
@@ -1203,14 +1565,12 @@ mod tests {
             .expect("an acknowledgement is not proof");
         assert_eq!(owed.state, ObligationState::DeliveredUnproven);
         assert_eq!(owed.next_attempt_at_ms, now + MAX_DELAY_MS);
-        assert!(!owed.in_flight);
+        assert!(!store.is_in_flight(ROOM, &s1));
         tokio::time::advance(Duration::from_millis(MAX_DELAY_MS - 1_000)).await;
-        assert!(store
-            .begin(store.clock.now_ms(), &HashSet::new())
-            .is_empty());
+        assert!(store.begin(store.clock.now_ms(), &none()).is_empty());
         tokio::time::advance(Duration::from_secs(1)).await;
         assert_eq!(
-            recipients(&store.begin(store.clock.now_ms(), &HashSet::new())),
+            recipients(&store.begin(store.clock.now_ms(), &none())),
             vec![s1]
         );
     }
@@ -1228,14 +1588,15 @@ mod tests {
         );
         for (count, wait_ms) in [(1u32, 6_000u64), (2, 15_000), (3, 30_000), (4, 60_000)] {
             tokio::time::advance(Duration::from_millis(wait_ms - 1)).await;
-            assert!(store
-                .begin(store.clock.now_ms(), &HashSet::new())
-                .is_empty());
+            assert!(store.begin(store.clock.now_ms(), &none()).is_empty());
             tokio::time::advance(Duration::from_millis(1)).await;
             let now = store.clock.now_ms();
-            let attempts = store.begin(now, &HashSet::new());
+            let attempts = store.begin(now, &none());
             assert_eq!(attempts.len(), 1, "attempt {count}");
-            assert!(store.finish(&attempts[0], Outcome::Failed, now));
+            assert!(
+                !store.finish(&attempts[0], Outcome::Failed, now),
+                "a failed send changes no state, so nothing is written"
+            );
             let owed = store.get(ROOM, &s1).unwrap();
             assert_eq!(owed.attempt_count, count);
             assert_eq!(owed.state, ObligationState::Owed);
@@ -1258,19 +1619,29 @@ mod tests {
             rekey(5, 10),
             now,
         );
-        assert!(store.begin(now, &HashSet::new()).is_empty(), "not due yet");
+        assert!(store.begin(now, &none()).is_empty(), "not due yet");
         let attempts = store.begin(now, &connected(&[&s1]));
         assert_eq!(recipients(&attempts), vec![s1.clone()], "S1 just connected");
-        assert!(store.finish(&attempts[0], Outcome::Failed, now));
+        assert!(
+            !store.finish(&attempts[0], Outcome::Failed, now),
+            "a failed send changes no state, so nothing is written"
+        );
         assert!(
             store.begin(now, &connected(&[&s1])).is_empty(),
             "staying connected is no new edge"
         );
-        assert!(store.begin(now, &HashSet::new()).is_empty());
-        assert_eq!(
-            recipients(&store.begin(now, &connected(&[&s1]))),
-            vec![s1.clone()],
-            "a reconnect is an edge again"
+        // A reconnect within the floor waits for its end, and is not lost.
+        assert!(store.begin(now, &none()).is_empty());
+        assert!(
+            store.begin(now, &connected(&[&s1])).is_empty(),
+            "not again within the floor"
+        );
+        tokio::time::advance(Duration::from_millis(EDGE_FLOOR_MS)).await;
+        let now = store.clock.now_ms();
+        let started = recipients(&store.begin(now, &connected(&[&s1])));
+        assert!(
+            started.contains(&s1),
+            "the reconnect is sent once the floor has passed: {started:?}"
         );
 
         // An edge with no free slot is not lost: the obligation is due.
@@ -1278,7 +1649,7 @@ mod tests {
         let now = store.clock.now_ms();
         let many: Vec<String> = (1..=6).map(member).collect();
         store.owe_entries(ROOM, &many, rekey(5, 10), rekey(5, 10), now);
-        let all: HashSet<String> = many.iter().cloned().collect();
+        let all: Links = many.iter().map(|member| (member.clone(), None)).collect();
         let first = store.begin(now, &all);
         assert_eq!(first.len(), MAX_IN_FLIGHT);
         for attempt in &first {
@@ -1305,14 +1676,11 @@ mod tests {
         );
         tokio::time::advance(Duration::from_secs(6)).await;
         let now = store.clock.now_ms();
-        let first = store.begin(now, &HashSet::new());
+        let first = store.begin(now, &none());
         assert_eq!(first.len(), MAX_IN_FLIGHT);
-        assert!(
-            store.begin(now, &HashSet::new()).is_empty(),
-            "every slot is busy"
-        );
-        assert!(store.finish(&first[0], Outcome::Failed, now));
-        let next = store.begin(now, &HashSet::new());
+        assert!(store.begin(now, &none()).is_empty(), "every slot is busy");
+        store.finish(&first[0], Outcome::Failed, now);
+        let next = store.begin(now, &none());
         assert_eq!(next.len(), 1);
         let started: Vec<String> = recipients(&first)
             .into_iter()
@@ -1336,7 +1704,7 @@ mod tests {
         );
         tokio::time::advance(Duration::from_secs(6)).await;
         let now = store.clock.now_ms();
-        let attempts = store.begin(now, &HashSet::new());
+        let attempts = store.begin(now, &none());
         store.owe_entries(
             ROOM,
             std::slice::from_ref(&s1),
@@ -1344,7 +1712,7 @@ mod tests {
             rekey(6, 11),
             now,
         );
-        assert!(store.finish(&attempts[0], Outcome::Delivered, now));
+        assert!(!store.finish(&attempts[0], Outcome::Delivered, now));
         let owed = store.get(ROOM, &s1).unwrap();
         assert_eq!(
             owed.state,
@@ -1356,7 +1724,7 @@ mod tests {
             "a new re-key never pushes a send later"
         );
         assert_eq!(owed.attempt_count, 0);
-        assert!(!owed.in_flight);
+        assert!(!store.is_in_flight(ROOM, &s1));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1455,55 +1823,275 @@ mod tests {
 
         let mut groups = HashMap::new();
         groups.insert(ROOM.to_string(), live_room(&local, &[&s1, &s2]));
-        let loaded = load_rekey_obligations(dir.path(), &groups, &local).await;
+        let loaded =
+            load_rekey_obligations(dir.path(), &groups, &local, &EventLog::default()).await;
         assert_eq!(
             loaded.len(),
             2,
             "a departed survivor and a gone room are dropped"
         );
-        let mut expected = store.get(ROOM, &s1).unwrap().clone();
-        expected.in_flight = false;
+        let expected = store.get(ROOM, &s1).unwrap().clone();
         assert_eq!(loaded.get(ROOM, &s1), Some(&expected));
         let s2_loaded = loaded.get(ROOM, &s2).unwrap();
-        assert!(!s2_loaded.in_flight, "nothing is in flight after a restart");
+        assert!(
+            !loaded.is_in_flight(ROOM, &s2),
+            "nothing is in flight after a restart"
+        );
         assert_eq!(s2_loaded.through_epoch, 6);
 
         // The dropped ones are gone from disk too.
-        let again = load_rekey_obligations(dir.path(), &HashMap::new(), &local).await;
+        let again =
+            load_rekey_obligations(dir.path(), &HashMap::new(), &local, &EventLog::default()).await;
         assert_eq!(again.len(), 0);
         let text = std::fs::read_to_string(dir.path().join(OBLIGATIONS_FILE)).unwrap();
         assert!(!text.contains(&gone), "{text}");
     }
 
-    #[tokio::test]
-    async fn an_unreadable_file_loads_nothing_and_a_write_replaces_it() {
+    /// A TreeKEM room `local` owns at `epoch` and `revision`, with `members`.
+    fn treekem_room(
+        local: &str,
+        members: &[&String],
+        epoch: u64,
+        revision: u64,
+    ) -> x0x::groups::GroupInfo {
+        let mut info = live_room(local, members);
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        info.secret_epoch = epoch;
+        info.state_revision = revision;
+        info
+    }
+
+    /// The file `contents` is set aside under a new name, not overwritten,
+    /// and every other active member of the room is owed its current epoch.
+    async fn set_aside_and_owe(contents: &[u8]) {
         let dir = tempfile::tempdir().unwrap();
         let local = member(0xa);
-        let s1 = member(1);
-        std::fs::write(dir.path().join(OBLIGATIONS_FILE), b"{ not json").unwrap();
+        let (s1, s2) = (member(1), member(2));
+        std::fs::write(dir.path().join(OBLIGATIONS_FILE), contents).unwrap();
         let mut groups = HashMap::new();
-        groups.insert(ROOM.to_string(), live_room(&local, &[&s1]));
-        let mut loaded = load_rekey_obligations(dir.path(), &groups, &local).await;
-        assert_eq!(loaded.len(), 0);
-        let now = loaded.clock.now_ms();
-        loaded.owe_entries(
+        groups.insert(ROOM.to_string(), treekem_room(&local, &[&s1, &s2], 7, 9));
+        // A room this daemon does not administer is not owed.
+        let mut other = treekem_room(&member(0xb), &[&local, &s1], 3, 4);
+        other.set_member_role(&local, x0x::groups::GroupRole::Member);
+        groups.insert("room-b".to_string(), other);
+        let loaded =
+            load_rekey_obligations(dir.path(), &groups, &local, &EventLog::default()).await;
+        for survivor in [&s1, &s2] {
+            let owed = loaded.get(ROOM, survivor).expect("over-owed");
+            assert_eq!(
+                (
+                    owed.owed_epoch,
+                    owed.through_epoch,
+                    owed.owed_revision,
+                    owed.through_revision
+                ),
+                (7, 7, 9, 9)
+            );
+        }
+        assert!(loaded.get(ROOM, &local).is_none());
+        assert_eq!(loaded.room_count("room-b"), 0);
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let aside = names
+            .iter()
+            .find(|name| name.starts_with(&format!("{OBLIGATIONS_FILE}.unreadable-")))
+            .expect("the file is set aside");
+        assert_eq!(std::fs::read(dir.path().join(aside)).unwrap(), contents);
+        assert!(names.contains(&OBLIGATIONS_FILE.to_string()));
+        assert_eq!(names.len(), 2, "no temp file is left: {names:?}");
+        assert_eq!(
+            loaded.status(ROOM)["unreadable_file_set_aside"],
+            serde_json::json!(aside)
+        );
+        // What was owed instead is on disk, and loads back.
+        let reloaded =
+            load_rekey_obligations(dir.path(), &groups, &local, &EventLog::default()).await;
+        assert!(reloaded.get(ROOM, &s1).is_some());
+        assert!(reloaded.status(ROOM)["unreadable_file_set_aside"].is_null());
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_file_is_set_aside_and_every_member_is_owed() {
+        set_aside_and_owe(b"{ not json").await;
+    }
+
+    #[tokio::test]
+    async fn an_unknown_version_is_set_aside_and_every_member_is_owed() {
+        set_aside_and_owe(br#"{"version":2,"entries":[]}"#).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_changed_link_id_is_an_edge() {
+        let mut store = RekeyObligations::default();
+        let s1 = member(1);
+        let now = store.clock.now_ms();
+        store.owe_entries(
             ROOM,
             std::slice::from_ref(&s1),
             rekey(5, 10),
             rekey(5, 10),
             now,
         );
-        loaded.persist().await.unwrap();
-        let reloaded = load_rekey_obligations(dir.path(), &groups, &local).await;
-        assert!(reloaded.get(ROOM, &s1).is_some());
-        let names: Vec<String> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
+        let link = |id: &str| -> Links { [(s1.clone(), Some(id.to_string()))].into() };
+        let first = store.begin(now, &link("1"));
+        assert_eq!(recipients(&first), vec![s1.clone()]);
+        // Delivered, so it is not due again for 15 min by itself.
+        assert!(store.finish(&first[0], Outcome::Delivered, now));
+        tokio::time::advance(Duration::from_millis(EDGE_FLOOR_MS)).await;
+        let now = store.clock.now_ms();
+        assert!(store.begin(now, &link("1")).is_empty(), "the same link");
         assert_eq!(
-            names,
-            vec![OBLIGATIONS_FILE.to_string()],
-            "no temp file is left"
+            recipients(&store.begin(now, &link("2"))),
+            vec![s1.clone()],
+            "a drop and a reconnect between two steps"
+        );
+    }
+
+    /// A send at a connect edge that fails (the link is not yet carrying
+    /// messages) retries on the first waits, not at the cap a long absence
+    /// built up.
+    #[tokio::test(start_paused = true)]
+    async fn an_edge_restarts_the_backoff() {
+        let mut store = RekeyObligations::default();
+        let s1 = member(1);
+        let now = store.clock.now_ms();
+        store.owe_entries(
+            ROOM,
+            std::slice::from_ref(&s1),
+            rekey(5, 10),
+            rekey(5, 10),
+            now,
+        );
+        // Away for long enough that the backoff reached its cap.
+        for _ in 0..9 {
+            let wait = store.get(ROOM, &s1).unwrap().next_attempt_at_ms - store.clock.now_ms();
+            tokio::time::advance(Duration::from_millis(wait)).await;
+            let now = store.clock.now_ms();
+            let attempts = store.begin(now, &none());
+            store.finish(&attempts[0], Outcome::Failed, now);
+        }
+        let now = store.clock.now_ms();
+        assert_eq!(
+            store.get(ROOM, &s1).unwrap().next_attempt_at_ms,
+            now + MAX_DELAY_MS
+        );
+        tokio::time::advance(Duration::from_millis(EDGE_FLOOR_MS)).await;
+        let now = store.clock.now_ms();
+        let attempts = store.begin(now, &connected(&[&s1]));
+        assert_eq!(recipients(&attempts), vec![s1.clone()], "sent at the edge");
+        store.finish(&attempts[0], Outcome::Failed, now);
+        assert_eq!(
+            store.get(ROOM, &s1).unwrap().next_attempt_at_ms,
+            now + retry_delay_ms(1),
+            "the next try is the second wait, not the cap"
+        );
+    }
+
+    /// Fix round I-2: a backlog of unreachable survivors holding every slot
+    /// never holds back a fresh obligation or a survivor that just linked.
+    #[tokio::test(start_paused = true)]
+    async fn a_backlog_never_holds_back_a_fresh_obligation_or_an_edge() {
+        let mut store = RekeyObligations::default();
+        let backlog: Vec<String> = (100..224).map(member).collect();
+        store.owe_entries(
+            ROOM,
+            &backlog,
+            rekey(5, 10),
+            rekey(5, 10),
+            store.clock.now_ms(),
+        );
+        tokio::time::advance(Duration::from_secs(6)).await;
+        // Every backlog survivor fails once, and is due again.
+        let now = store.clock.now_ms();
+        loop {
+            let started = store.begin(now, &none());
+            if started.is_empty() {
+                break;
+            }
+            for attempt in &started {
+                store.finish(attempt, Outcome::Failed, now);
+            }
+        }
+        tokio::time::advance(Duration::from_secs(15)).await;
+        let now = store.clock.now_ms();
+        let holding = store.begin(now, &none());
+        assert_eq!(
+            holding.len(),
+            MAX_IN_FLIGHT,
+            "unreachable sends hold every slot"
+        );
+
+        let fresh = member(1);
+        store.owe_entries(
+            ROOM,
+            std::slice::from_ref(&fresh),
+            rekey(6, 11),
+            rekey(6, 11),
+            now,
+        );
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let now = store.clock.now_ms();
+        assert!(store.begin(now, &none()).is_empty(), "no slot is free");
+        store.finish(&holding[0], Outcome::Failed, now);
+        assert_eq!(
+            recipients(&store.begin(now, &none())),
+            vec![fresh.clone()],
+            "the first slot that frees goes to the fresh obligation, not the backlog"
+        );
+
+        // A backlog survivor that just linked comes next, before the rest.
+        let linked = backlog[100].clone();
+        tokio::time::advance(Duration::from_millis(EDGE_FLOOR_MS)).await;
+        let now = store.clock.now_ms();
+        store.finish(&holding[1], Outcome::Failed, now);
+        assert_eq!(
+            recipients(&store.begin(now, &connected(&[&linked]))),
+            vec![linked],
+            "a connect edge ranks first"
+        );
+    }
+
+    /// Fix round m-1: a send whose obligation is settled and owed again
+    /// keeps its slot until it returns, and no second send to the same
+    /// survivor starts meanwhile.
+    #[tokio::test(start_paused = true)]
+    async fn a_settle_during_a_send_keeps_its_slot_until_it_returns() {
+        let mut store = RekeyObligations::default();
+        let s1 = member(1);
+        store.owe_entries(
+            ROOM,
+            std::slice::from_ref(&s1),
+            rekey(5, 10),
+            rekey(5, 10),
+            store.clock.now_ms(),
+        );
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let now = store.clock.now_ms();
+        let first = store.begin(now, &none());
+        assert!(store.settle_entry(&rooms(&[ROOM]), &proof(&s1, 5, None)));
+        store.owe_entries(
+            ROOM,
+            std::slice::from_ref(&s1),
+            rekey(6, 11),
+            rekey(6, 11),
+            now,
+        );
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let now = store.clock.now_ms();
+        assert!(
+            store.begin(now, &none()).is_empty(),
+            "no second send while the first runs"
+        );
+        assert_eq!(store.sends_running(), 1);
+        assert!(store.wipe(&rooms(&[ROOM])));
+        assert_eq!(store.sends_running(), 1, "a wipe keeps the slot too");
+        assert!(!store.finish(&first[0], Outcome::Delivered, now));
+        assert_eq!(
+            store.sends_running(),
+            0,
+            "the slot frees when the send returns"
         );
     }
 

@@ -702,6 +702,9 @@ pub(in crate::server) async fn treekem_catch_up_state(
                 "suspended_since_last_get": presence.suspended_since_last_get,
                 "presence_mark": presence.presence_mark,
                 "round": round,
+                // Survivor re-key fix round I-5: what this daemon still owes
+                // survivors of its re-keys, so a soak can read what is left.
+                "rekey_obligations": state.rekey_obligations.lock().await.status(&id),
             })),
         )
             .into_response();
@@ -778,8 +781,9 @@ pub(in crate::server) async fn treekem_head_proof_sign(
     }
     // Survivor re-key A10: the requester signed its head, so it holds that
     // epoch, and this daemon's obligation to it is settled as far.
+    // It runs in its own task, so the relay leg's answer never waits on it.
     if let Some(proof) = rekey_obligations::request_proof(&request, false) {
-        rekey_obligations::settle(&state, std::slice::from_ref(&id), &proof).await;
+        rekey_obligations::spawn_settle(&state, vec![id.clone()], proof);
     }
     match head_proof::answer_challenge(&state, &challenge).await {
         Ok(proof) => (

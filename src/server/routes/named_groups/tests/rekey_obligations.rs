@@ -30,7 +30,32 @@ pub(super) fn set_connected(state: &AppState, members: &[&str]) {
         .named_group_test_recorders
         .rekey_obligation_connected
         .lock()
-        .unwrap() = Some(members.iter().map(|member| member.to_string()).collect());
+        .unwrap() = Some(
+        members
+            .iter()
+            .map(|member| (member.to_string(), None))
+            .collect(),
+    );
+}
+
+/// Whether no send to `recipient` in `group_key` is running.
+pub(super) async fn idle(state: &AppState, group_key: &str, recipient: &str) -> bool {
+    !state
+        .rekey_obligations
+        .lock()
+        .await
+        .is_in_flight(group_key, recipient)
+}
+
+/// Wait until every settle `state` spawned has run (fix round m-8).
+pub(super) async fn settles_done(state: &AppState) -> bool {
+    use std::sync::atomic::Ordering;
+    let recorders = &state.named_group_test_recorders;
+    eventually(|| async {
+        recorders.settles_finished.load(Ordering::SeqCst)
+            == recorders.settles_spawned.load(Ordering::SeqCst)
+    })
+    .await
 }
 
 /// `state`'s obligation to `recipient` in `group_key`, if any.
@@ -234,7 +259,8 @@ async fn at_most_four_attempts_run_at_once_and_none_twice() -> Result<()> {
                 .iter()
                 .filter(|member| {
                     store.get(&fixture.group_id, member).is_some_and(|owed| {
-                        owed.state == ObligationState::DeliveredUnproven && !owed.in_flight
+                        owed.state == ObligationState::DeliveredUnproven
+                            && !store.is_in_flight(&fixture.group_id, member)
                     })
                 })
                 .count()
@@ -289,7 +315,8 @@ async fn payload_missing_from_the_log_is_kept_and_said_once() -> Result<()> {
         let counted = eventually(|| async {
             owed(state, &fixture.group_id, &member)
                 .await
-                .is_some_and(|owed| owed.attempt_count == attempts && !owed.in_flight)
+                .is_some_and(|owed| owed.attempt_count == attempts)
+                && idle(state, &fixture.group_id, &member).await
         })
         .await;
         assert!(counted, "attempt {attempts} is counted");
