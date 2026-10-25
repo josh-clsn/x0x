@@ -614,6 +614,13 @@ impl AckPublisherHandle {
     }
 }
 
+/// Survivor re-key A14 tests: recipients whose v1 ACK gossip publish is
+/// dropped, as a non-forwarding leaf bystander drops it. The Direct hedge
+/// still runs.
+#[cfg(test)]
+pub(crate) static V1_GOSSIP_ACK_DROPPED_FROM: std::sync::Mutex<Vec<AgentId>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// Legacy shared DM transport topic. New sends use per-recipient inbox
 /// topics; this listener remains so rolling upgrades can still receive
 /// envelopes from older daemons.
@@ -752,6 +759,12 @@ impl DmInboxService {
         } else {
             Some(pubsub.subscribe(DM_BUS_TOPIC.to_string()).await)
         };
+        // Survivor re-key A14: a leaf's v1 ACK gets the same Direct hedge.
+        let v1_direct_hedge = if skip_legacy_bus {
+            direct_hedge.clone()
+        } else {
+            None
+        };
         let (ack_publisher, ack_worker) = spawn_durable_ack_publisher(
             Arc::clone(&pubsub),
             Arc::clone(&dm),
@@ -778,6 +791,7 @@ impl DmInboxService {
             authenticated_machine_bindings,
             history,
             ack_publisher,
+            v1_direct_hedge,
         };
 
         let mut handles = vec![spawn_subscription_loop(
@@ -1220,6 +1234,12 @@ pub(crate) struct InboxPipeline {
     history: Option<crate::history::HistoryHandle>,
     /// Bounded background publisher for durable (v2) ACK envelopes.
     ack_publisher: AckPublisherHandle,
+    /// Survivor re-key A14: on a node that skips the legacy DM bus (a leaf),
+    /// a v1 ACK has one gossip route, a single eager frame on the sender's
+    /// inbox topic that a non-forwarding leaf bystander refuses (#380 C0,
+    /// x0x#1455). The same live Direct hedge the durable path uses then
+    /// carries it too, in its own task. `None` keeps v1 exactly as it was.
+    v1_direct_hedge: Option<Arc<dyn DirectAckHedge>>,
 }
 
 impl InboxPipeline {
@@ -2614,9 +2634,27 @@ impl InboxPipeline {
                 encoded: Bytes::from(encoded),
             })
         } else {
-            // Preserve v1 exactly: target first, and only publish back on the
+            // Survivor re-key A14: on a leaf, the same ACK envelope also goes
+            // on live Direct, in its own task, so this loop never waits on it
+            // and a refused gossip frame no longer costs the sender its whole
+            // ACK budget. Direct send-ok is never a receipt: the sender's
+            // waiter completes only when the envelope itself arrives.
+            if let Some(hedge) = self.v1_direct_hedge.clone() {
+                let hedged = Bytes::from(encoded.clone());
+                tokio::spawn(async move {
+                    let _ = hedge.hedge(to, hedged).await;
+                });
+            }
+            // Preserve v1 otherwise: target first, and only publish back on the
             // compatibility bus when this payload itself arrived there. No
             // new deadline or background ownership changes legacy behavior.
+            #[cfg(test)]
+            if V1_GOSSIP_ACK_DROPPED_FROM
+                .lock()
+                .is_ok_and(|dropped| dropped.contains(&self.self_agent_id))
+            {
+                return Ok(());
+            }
             let topic = DmInboxService::inbox_topic_name(&to);
             let primary = self
                 .pubsub
@@ -2873,6 +2911,12 @@ mod tests {
                 .expect("insert machine revocation");
         }
 
+        // Survivor re-key A14: a leaf's v1 ACK gets the same Direct hedge.
+        let v1_direct_hedge = if skip_legacy_bus {
+            direct_hedge.clone()
+        } else {
+            None
+        };
         let (ack_publisher, ack_worker) = spawn_durable_ack_publisher(
             Arc::clone(&pubsub),
             Arc::clone(&dm),
@@ -2900,6 +2944,7 @@ mod tests {
             authenticated_machine_bindings,
             history: None,
             ack_publisher,
+            v1_direct_hedge,
         };
 
         InboxHarness {
@@ -3938,6 +3983,66 @@ mod tests {
                 .is_err(),
             "a v1 ACK with ack_legacy_bus=false must not reach the shared bus"
         );
+    }
+
+    /// Survivor re-key A14: on a leaf (legacy bus skipped), a v1 ACK also
+    /// goes to the live Direct hedge, in its own task: a hedge that never
+    /// returns does not hold the ACK publish. A node on the bus keeps v1 as
+    /// it was, with no hedge.
+    #[tokio::test]
+    async fn a_leafs_v1_ack_is_hedged_on_direct_without_waiting_for_it() {
+        struct StuckHedge {
+            tx: mpsc::UnboundedSender<(AgentId, Bytes)>,
+        }
+        #[async_trait]
+        impl DirectAckHedge for StuckHedge {
+            async fn hedge(&self, recipient: AgentId, encoded: Bytes) -> DirectAckHedgeOutcome {
+                let _ = self.tx.send((recipient, encoded));
+                std::future::pending::<()>().await;
+                DirectAckHedgeOutcome::Sent
+            }
+        }
+        for leaf in [true, false] {
+            let sender = test_keypair();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let hedge: Arc<dyn DirectAckHedge> = Arc::new(StuckHedge { tx });
+            let harness = make_inbox_harness_with_hedge_options(
+                &sender,
+                Some(MachineId([0xDA; 32])),
+                None,
+                Some(hedge),
+                leaf,
+            )
+            .await;
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                harness.pipeline.publish_ack_for_protocol(
+                    sender.agent_id(),
+                    [0x5A; 16],
+                    DmAckOutcome::Accepted,
+                    DM_PROTOCOL_V1,
+                    false,
+                ),
+            )
+            .await
+            .expect("the ACK publish never waits on the hedge")
+            .expect("v1 ACK publishes");
+            let hedged = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
+            if leaf {
+                let (recipient, encoded) = hedged
+                    .expect("a leaf hedges its v1 ACK")
+                    .expect("hedge channel open");
+                assert_eq!(recipient, sender.agent_id());
+                let envelope = DmEnvelope::from_wire_bytes(&encoded).expect("an ACK envelope");
+                assert_eq!(envelope.protocol_version, DM_PROTOCOL_V1);
+                match envelope.body {
+                    DmBody::Ack(ack) => assert_eq!(ack.acks_request_id, [0x5A; 16]),
+                    other => panic!("not an ACK: {other:?}"),
+                }
+            } else {
+                assert!(hedged.is_err(), "a node on the bus keeps v1 unhedged");
+            }
+        }
     }
 
     /// The other half of the hedge contract: a durable v2 ACK reaches the

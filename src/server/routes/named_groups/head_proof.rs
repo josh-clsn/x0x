@@ -28,9 +28,8 @@
 //!   delays the requester by at most one window.
 
 use super::{
-    build_catchup_signer, catchup_signer_matches, named_group_direct_delivery_config,
-    signed_catchup, spawn_treekem_epoch_ahead_catchup, AppState, CatchupSigner,
-    TreeKemCatchupResponse,
+    build_catchup_signer, catchup_signer_matches, signed_catchup,
+    spawn_treekem_epoch_ahead_catchup, AppState, CatchupSigner, TreeKemCatchupResponse,
 };
 use crate as x0x;
 use crate::identity::AgentId;
@@ -717,7 +716,7 @@ pub(in crate::server) fn is_proof_only(response: &TreeKemCatchupResponse) -> boo
 
 /// Send `proof` to `requester` on its own.
 pub(in crate::server) async fn send_proof_only(
-    state: &AppState,
+    state: &Arc<AppState>,
     requester: &AgentId,
     group_id: &str,
     proof: HeadProof,
@@ -733,13 +732,8 @@ pub(in crate::server) async fn send_proof_only(
     if let Ok(mut recorded) = state.named_group_test_recorders.catchup_responses.lock() {
         recorded.push(payload.clone());
     }
-    if let Err(e) = state
-        .agent
-        .send_direct_with_config(requester, payload, named_group_direct_delivery_config())
-        .await
-    {
-        tracing::warn!(group_id = %LogHexId::group(group_id), requester = %LogHexId::agent(&hex::encode(requester.as_bytes())), "failed to send a head proof: {e}");
-    }
+    // Survivor re-key A14: handed off, as a page is.
+    super::catchup_serve::send_answer(state, *requester, payload, group_id, "head proof").await;
 }
 
 #[cfg(test)]

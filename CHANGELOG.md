@@ -78,6 +78,13 @@ All notable changes to this project will be documented in this file.
   not name, and for a join-request lifecycle event.
 - **A TreeKEM seal route answers 409 `sealer_key_package_uncommitted`** when this
   daemon's own seat commits no KeyPackage hash (groups made before #220).
+- **A leaf's v1 DM acknowledgement also goes on live Direct.** A node that
+  skips the legacy DM bus hedges its v1 ACK on the same Direct path v2 ACKs
+  use, in its own task, so a sender whose gossip ACK frame was refused by a
+  non-forwarding leaf no longer waits 24 s for a DM that arrived. A catch-up
+  answer now frees its slot when it hands its send off (at most 32 sends
+  waiting, 8 per requester). See
+  `docs/adr/transient/T-v1-ack-direct-hedge.md`.
 - **A member seated by a direct add or an approved join request is owed its
   seat until it proves it holds it.** The seat rides the re-key obligations
   (durable, 6 s to 15 min backoff, sent at once on reconnect), so a sibling

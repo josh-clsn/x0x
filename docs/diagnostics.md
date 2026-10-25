@@ -132,9 +132,10 @@ at the top level so a Tester can capture both keys on every durable 200/504.
 gossip-inbox sends that waited for a v1 (non-durable) recipient ACK, and the
 milliseconds they took from the first publish to the outcome.
 `stats.v1_ack_wait_timeouts` and `stats.v1_ack_wait_timeout_ms` are the subset
-that ended without the ACK. A leaf recipient's v1 ACK has no Direct hedge, so
-a lost ACK counts here even when the message arrived (survivor re-key A12,
-`docs/adr/transient/T-catchup-off-the-apply-path.md`).
+that ended without the ACK. A lost ACK counts here even when the message
+arrived. Since survivor re-key A14 a leaf recipient also sends its v1 ACK on
+live Direct, so these should stay low when the sender is connected to it
+(`docs/adr/transient/T-v1-ack-direct-hedge.md`).
 
 `stats.ack_publish_route_failed` increments when the ACK never left this
 recipient: both first-success hedge routes failed, or the bounded publisher

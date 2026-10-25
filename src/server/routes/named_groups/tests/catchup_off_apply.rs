@@ -800,6 +800,49 @@ async fn a_requester_off_the_roster_gets_no_place() -> Result<()> {
     Ok(())
 }
 
+/// Survivor re-key A14: an answer hands its send off and frees its slot.
+/// While the first answer's send waits on its acknowledgement, the same
+/// requester's next request is answered, so one lost acknowledgement does
+/// not pace a requester at one page per send timeout.
+#[tokio::test]
+async fn an_answer_frees_its_slot_while_its_send_waits() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let hold = Arc::new(Semaphore::new(0));
+    *state
+        .named_group_test_recorders
+        .answer_send_hold
+        .lock()
+        .unwrap() = Some(Arc::clone(&hold));
+    let sends = || {
+        state
+            .named_group_test_recorders
+            .answer_sends_started
+            .load(Ordering::SeqCst)
+    };
+    let requester = x0x::identity::AgentId([12; 32]);
+    room_with(&state, &room(0x10), &[requester]).await;
+    room_with(&state, &room(0x11), &[requester]).await;
+    assert_eq!(
+        verified_dispatch(&state, requester, &room(0x10), 0),
+        Dispatched::Started
+    );
+    assert!(
+        eventually(|| async { sends() == 1 }).await,
+        "the first answer sends"
+    );
+    verified_dispatch(&state, requester, &room(0x11), 0);
+    assert!(
+        eventually(|| async { sends() == 2 }).await,
+        "the next answer runs while the first send waits"
+    );
+    assert!(
+        eventually(|| async { state.treekem_catchup_serve.free_slots() == 4 }).await,
+        "no slot is held by a waiting send"
+    );
+    hold.close();
+    Ok(())
+}
+
 /// The listener's answer is the answer a direct call gives.
 #[tokio::test]
 async fn a_dispatched_answer_is_the_direct_answer() -> Result<()> {

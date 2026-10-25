@@ -35409,6 +35409,8 @@ mod asymmetric_capability_convergence_tests;
 
 #[cfg(test)]
 mod caps_consume_only_tests;
+#[cfg(test)]
+mod v1_ack_hedge_tests;
 
 #[cfg(test)]
 mod legacy_bus_interop_tests;

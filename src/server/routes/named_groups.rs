@@ -11102,13 +11102,9 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
                 }
             }
         }
-        if let Err(e) = state
-            .agent
-            .send_direct_with_config(sender, payload, named_group_direct_delivery_config())
-            .await
-        {
-            tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %sender_hex, "failed to send member-keyed TreeKEM catch-up response: {e}");
-        }
+        // Survivor re-key A14: handed off, so this answer frees its slot.
+        catchup_serve::send_answer(state, *sender, payload, &request.group_id, "member-keyed")
+            .await;
         return;
     }
     // Issue #378: the regular event-log serve below is a peer-driven amplifier —
@@ -11249,13 +11245,9 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         serve_throttle_key,
         tokio::time::Instant::now(),
     );
-    if let Err(e) = state
-        .agent
-        .send_direct_with_config(sender, payload, named_group_direct_delivery_config())
-        .await
-    {
-        tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %sender_hex, "failed to send TreeKEM catch-up response: {e}");
-    }
+    // Survivor re-key A14: handed off, so this answer frees its slot while
+    // the send waits on its acknowledgement.
+    catchup_serve::send_answer(state, *sender, payload, &request.group_id, "page").await;
 }
 
 /// How long a `treekem_catchup_throttle` entry is kept. Every reader looks
@@ -60635,6 +60627,12 @@ pub(in crate::server) mod tests {
             head_challenge: None,
         };
         handle_treekem_catchup_request(state, sender, true, request).await;
+        // Survivor re-key A14: the answer hands its send off; count it once
+        // every handed-off send has returned.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !state.treekem_catchup_serve.sends_idle() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         outgoing().saturating_sub(before)
     }
 
@@ -60816,6 +60814,12 @@ pub(in crate::server) mod tests {
             head_challenge: None,
         };
         handle_treekem_catchup_request(state, sender, true, request).await;
+        // Survivor re-key A14: the answer hands its send off; count it once
+        // every handed-off send has returned.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !state.treekem_catchup_serve.sends_idle() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         outgoing().saturating_sub(before)
     }
 
