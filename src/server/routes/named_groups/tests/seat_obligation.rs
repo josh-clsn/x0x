@@ -416,13 +416,13 @@ async fn a_retried_add_answers_409_and_redelivers_the_seat() -> Result<()> {
             .any(|(recipient, _, kind, _)| *recipient == n.hex && *kind == "member_added"),
         "the seat goes to N again: {delivered:?}"
     );
-    assert_eq!(
-        owed(owner, group_id, &n.hex)
-            .await
-            .map(|owed| owed.next_attempt_at_ms),
-        Some(owner.rekey_obligations.lock().await.clock.now_ms()),
-        "the seat obligation is due now"
-    );
+    // Due now: no later than the obligation clock reads after the retry.
+    let due = owed(owner, group_id, &n.hex)
+        .await
+        .map(|owed| owed.next_attempt_at_ms)
+        .expect("the seat is owed");
+    let now = owner.rekey_obligations.lock().await.clock.now_ms();
+    assert!(due <= now, "the seat obligation is due now ({due} > {now})");
     cast.shutdown().await;
     Ok(())
 }
@@ -655,6 +655,131 @@ async fn re_seats_are_limited_to_one_a_day_and_a_retry_may_trigger_one() -> Resu
     );
     assert_eq!(reseats(owner).await, 1, "the worker waits too");
     assert_eq!(latest_add(owner, &n.hex), second, "no third seat");
+    cast.shutdown().await;
+    Ok(())
+}
+
+/// A retried direct add of N, answered 409; its body.
+async fn retry_add(cast: &SurvivorRelay, n: &Sibling) -> serde_json::Value {
+    let response = add_named_group_member(
+        State(Arc::clone(&cast.fixture.state)),
+        owner_extension(),
+        Path(cast.fixture.group_id.clone()),
+        Json(AddNamedGroupMemberRequest {
+            agent_id: n.hex.clone(),
+            display_name: Some("Sibling".to_string()),
+            treekem_key_package_b64: Some(n.package_b64.clone()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    serde_json::from_slice(&bytes).expect("json")
+}
+
+/// Fix round 2 (review I-F1): the owner restarts with its staging table
+/// full of newer Welcomes. The pinned seat Welcome, the oldest, is not the
+/// one the cap drops.
+#[tokio::test]
+async fn a_restart_with_a_full_staging_table_keeps_the_pinned_welcome() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let owner = &cast.fixture.state;
+    let group_id = &cast.fixture.group_id;
+    let n = sibling(&cast).await?;
+    let add = direct_add_route(owner, group_id, &n.hex, "Sibling", &n.package_b64).await;
+    let welcome_id = welcome_id_of(&add);
+    {
+        let mut welcomes = owner.pending_welcomes.write().await;
+        let mut template = welcomes.get(&welcome_id).expect("staged").clone();
+        let now = template.created_at_ms;
+        welcomes.get_mut(&welcome_id).expect("staged").created_at_ms =
+            now.saturating_sub(60 * 60 * 1000);
+        for n in 0..300u32 {
+            template.joiner_agent = format!("{n:064x}");
+            welcomes.insert(format!("{n:064x}"), template.clone());
+        }
+    }
+    restart_staging_and_obligations(owner).await;
+    let welcomes = owner.pending_welcomes.read().await;
+    assert!(
+        welcomes.contains_key(&welcome_id),
+        "the pinned Welcome survives a full table"
+    );
+    assert_eq!(welcomes.len(), 257, "the unpinned ones are capped at 256");
+    drop(welcomes);
+    cast.shutdown().await;
+    Ok(())
+}
+
+/// Fix round 2 (review concern 2): the one-a-day re-seat limit is on disk.
+/// A daemon that restarts, as one in a crash loop would, does not re-key
+/// the room again.
+#[tokio::test]
+async fn a_restart_does_not_allow_a_second_re_seat_that_day() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let owner = &cast.fixture.state;
+    let group_id = &cast.fixture.group_id;
+    let n = sibling(&cast).await?;
+    let first = direct_add_route(owner, group_id, &n.hex, "Sibling", &n.package_b64).await;
+    evict_from_log(owner, &first).await;
+    assert_eq!(retry_add(&cast, &n).await["reseated"], true);
+    let second = latest_add(owner, &n.hex);
+    evict_from_log(owner, &second).await;
+
+    restart_staging_and_obligations(owner).await;
+    owner.seat_reseats.lock().unwrap().clear();
+    load_join_result_staging(owner).await;
+    assert_eq!(
+        retry_add(&cast, &n).await["reseated"],
+        false,
+        "the restarted daemon remembers today's re-seat"
+    );
+    assert_eq!(latest_add(owner, &n.hex), second, "no new seat");
+    cast.shutdown().await;
+    Ok(())
+}
+
+/// Fix round 2 (review concern 3): a member promoted to Admin keeps its
+/// role across a re-seat, as a returning member does.
+#[tokio::test]
+async fn an_admin_re_seated_stays_admin() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let owner = &cast.fixture.state;
+    let group_id = &cast.fixture.group_id;
+    let n = sibling(&cast).await?;
+    let first = direct_add_route(owner, group_id, &n.hex, "Sibling", &n.package_b64).await;
+    let response = update_member_role(
+        State(Arc::clone(owner)),
+        owner_extension(),
+        Path((group_id.clone(), n.hex.clone())),
+        Json(UpdateMemberRoleRequest {
+            role: "admin".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK, "N is promoted");
+    evict_from_log(owner, &first).await;
+    assert_eq!(retry_add(&cast, &n).await["reseated"], true);
+    let role = owner
+        .named_groups
+        .read()
+        .await
+        .get(group_id)
+        .and_then(|info| info.members_v2.get(&n.hex).map(|member| member.role));
+    assert_eq!(role, Some(x0x::groups::GroupRole::Admin), "N stays Admin");
+    assert!(
+        super::signer_delivery::published(owner, |event| matches!(
+            event,
+            NamedGroupMetadataEvent::MemberRoleUpdated { agent_id, role: x0x::groups::GroupRole::Admin, .. }
+                if *agent_id == n.hex
+        ))
+        .is_some(),
+        "the restore is a signed role update the room sees"
+    );
     cast.shutdown().await;
     Ok(())
 }

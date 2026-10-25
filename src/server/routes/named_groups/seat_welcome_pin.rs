@@ -70,6 +70,19 @@ pub(super) fn welcome_ref_of(seat: &NamedGroupMetadataEvent) -> Option<&WelcomeR
     }
 }
 
+/// Whether `event` is `member_hex`'s own seat: an add or an approval naming it.
+pub(super) fn names_seat(event: &NamedGroupMetadataEvent, member_hex: &str) -> bool {
+    match event {
+        NamedGroupMetadataEvent::MemberAdded { agent_id, .. } => {
+            agent_id.eq_ignore_ascii_case(member_hex)
+        }
+        NamedGroupMetadataEvent::JoinRequestApproved {
+            requester_agent_id, ..
+        } => requester_agent_id.eq_ignore_ascii_case(member_hex),
+        _ => false,
+    }
+}
+
 /// Pin the Welcome `seat` names, on disk.
 pub(super) async fn pin_seat(state: &AppState, seat: &NamedGroupMetadataEvent) {
     let Some(welcome) = welcome_ref_of(seat) else {

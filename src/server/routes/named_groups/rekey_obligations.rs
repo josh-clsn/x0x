@@ -252,8 +252,10 @@ pub(in crate::server) struct RekeyObligations {
     /// The (room, survivor, owed revision) a missing payload was said for.
     missing_said: HashSet<(String, String, u64)>,
     missing_reports: u64,
-    /// Survivor re-key A13: seats re-sealed with a commit, for the status.
+    /// Survivor re-key A13: seats re-sealed with a commit, and re-seats
+    /// whose add failed after the removal, for the status.
     pub(in crate::server) reseats: u64,
+    pub(in crate::server) reseat_failures: u64,
     /// The name an unreadable file was set aside under at load.
     set_aside: Option<String>,
     room_cap: usize,
@@ -271,6 +273,7 @@ impl Default for RekeyObligations {
             next_attempt_id: 0,
             last_sent: HashMap::new(),
             reseats: 0,
+            reseat_failures: 0,
             missing_said: HashSet::new(),
             missing_reports: 0,
             set_aside: None,
@@ -370,6 +373,7 @@ impl RekeyObligations {
             "seats": self.entries.values().filter(|owed| owed.seat).count(),
             "room_seats": room.iter().filter(|owed| owed.seat).count(),
             "reseats": self.reseats,
+            "reseat_failures": self.reseat_failures,
         })
     }
 
@@ -1088,6 +1092,11 @@ pub(in crate::server) async fn forget(state: &AppState, group_key: &str, recipie
     }
 }
 
+/// Count a re-seat whose add failed after its removal (A13 fix round 2).
+pub(in crate::server) async fn count_reseat_failure(state: &AppState) {
+    state.rekey_obligations.lock().await.reseat_failures += 1;
+}
+
 /// Count a seat re-sealed with a commit (A13).
 pub(in crate::server) async fn count_reseat(state: &AppState) {
     state.rekey_obligations.lock().await.reseats += 1;
@@ -1419,10 +1428,14 @@ async fn run_attempt(state: Arc<AppState>, attempt: Attempt) {
     let events = payload(&state, &attempt).await;
     // Survivor re-key A13: a seat the log no longer reaches, or whose Welcome
     // is no longer staged, cannot be delivered as it was; re-seat it.
+    // Review F-1: the first event must be the recipient's own seat; any
+    // other means the log lost it.
     let seat_lost = attempt.seat
         && match events.first() {
-            None => true,
-            Some(seat) => !super::seat_welcome_pin::seat_welcome_staged(&state, seat).await,
+            Some(seat) if super::seat_welcome_pin::names_seat(seat, &attempt.recipient_hex) => {
+                !super::seat_welcome_pin::seat_welcome_staged(&state, seat).await
+            }
+            _ => true,
         };
     if seat_lost {
         super::seat_reseat::spawn(&state, &attempt.group_key, &attempt.recipient_hex);

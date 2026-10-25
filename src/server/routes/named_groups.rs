@@ -37831,6 +37831,10 @@ struct JoinResultStagingSidecar {
     /// Survivor re-key A13: the staged Welcomes an unproven seat pins.
     #[serde(default)]
     seat_pinned_welcomes: Vec<String>,
+    /// Survivor re-key A13 (fix round 2): when each (room, member) was last
+    /// re-seated, wall-clock ms, so the one-a-day limit survives a restart.
+    #[serde(default)]
+    seat_reseated_at_ms: Vec<(String, String, u64)>,
 }
 
 /// Wall-clock cadence for `MemberJoined` resends to the authority (#333),
@@ -37870,6 +37874,13 @@ pub(in crate::server) async fn save_join_result_staging(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .iter()
                 .cloned()
+                .collect(),
+            seat_reseated_at_ms: state
+                .seat_reseats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .map(|((room, member), at)| (room.clone(), member.clone(), *at))
                 .collect(),
         };
         serde_json::to_string(&sidecar)
@@ -37960,7 +37971,30 @@ pub(in crate::server) async fn load_join_result_staging(state: &AppState) {
         .filter(|id| welcomes.contains_key(id))
         .collect();
     cap_staging_oldest_first(&mut join_results, |p| p.created_at_ms);
+    // Review I-F1: a pinned Welcome is the oldest by definition, so it is
+    // left out of the cap (the seat obligations' caps bound the pins).
+    let pinned_now: HashSet<String> = state
+        .seat_welcome_pins
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let mut pinned_welcomes: HashMap<String, PendingWelcome> = welcomes
+        .iter()
+        .filter(|(id, _)| pinned_now.contains(*id))
+        .map(|(id, pending)| (id.clone(), pending.clone()))
+        .collect();
+    welcomes.retain(|id, _| !pinned_now.contains(id));
     cap_staging_oldest_first(&mut welcomes, |p| p.created_at_ms);
+    welcomes.extend(pinned_welcomes.drain());
+    // The re-seat limit survives the restart (fix round 2).
+    *state
+        .seat_reseats
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = sidecar
+        .seat_reseated_at_ms
+        .into_iter()
+        .map(|(room, member, at)| ((room, member), at))
+        .collect();
     let (results_len, welcomes_len) = (join_results.len(), welcomes.len());
     *state.pending_join_results.write().await = join_results;
     *state.pending_welcomes.write().await = welcomes;
