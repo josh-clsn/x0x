@@ -2414,15 +2414,12 @@ async fn d39_r2_preexisting_seated_invite_without_row_reports_active() -> Result
     Ok(())
 }
 
-/// ADR 0107 Validation, Shape B (separate limitation control, never combined
-/// with the carry test): a join that timed out with NO carry leaves no row —
-/// the finalizer removed the stub — so S8 (a) has nothing to re-arm. A fresh
-/// base-seated invite keeps the known #1150 limitation: the
-/// ordinary (non-re-armed) path reports the snapshot `active`, with no keys
-/// and no key recovery claimed. On the SAME device, without a restart, the
-/// operator exit — owner remove-member + re-invite — restores membership
-/// WITH keys (#1191). Cover a timeout that loses to the snapshot seat and
-/// a poll superseded by removal before its deadline.
+/// ADR 0107 Validation, Shape B (separate from the carry test): a join that
+/// timed out with NO carry leaves no row (the finalizer removed the stub), so
+/// S8 (a) has nothing to re-arm. Upstream keeps the #1150 limitation there;
+/// on this fork the ordinary new attempt's MemberJoined makes the authority
+/// re-key the seated device, so a fresh invite alone recovers keys. The
+/// operator exit (owner remove-member + re-invite) restores keys as well.
 #[tokio::test]
 async fn s8a_shape_b_no_carry_is_not_rearmed_and_remove_reinvite_restores_keys() -> Result<()> {
     for timeout_before_removal in [true, false] {
@@ -2440,13 +2437,12 @@ async fn shape_b_remove_reinvite_without_restart(timeout_before_removal: bool) -
         "the no-carry timeout removed the stub and row"
     );
     let r = wa_fresh_invite_round_trip(&s).await?;
+    // This fork: with no row there is nothing to re-arm, and the ordinary
+    // new attempt's MemberJoined makes the authority re-key the seated
+    // device (remove and re-add), so a fresh invite alone recovers keys.
     assert!(
-        r.new_attempt
-            && !r.authority_accepted
-            && !r.staged
-            && r.final_state == "active"
-            && !r.treekem,
-        "Shape B keeps the known limitation, with no re-arm and no key recovery: {r}"
+        r.new_attempt && r.authority_accepted && r.staged && r.final_state == "active" && r.treekem,
+        "Shape B is recovered by the returning-member re-key: {r}"
     );
 
     let member = hex::encode(s.j2.agent.agent_id().as_bytes());

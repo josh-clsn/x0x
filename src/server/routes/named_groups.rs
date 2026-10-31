@@ -22168,7 +22168,30 @@ pub(in crate::server) async fn join_group_via_invite(
                     #[cfg(test)]
                     let base_seats_device =
                         base_seats_device && !rearm_disabled_for_test(&group_id_hex);
-                    if base_seats_device {
+                    // This fork: a re-arm that already ended `timed_out`
+                    // because the authority's original artifacts were gone
+                    // would only time out again. The next fresh invite takes
+                    // the ordinary new-attempt path: its MemberJoined makes
+                    // the authority re-key the seated device.
+                    let rearm_already_failed = {
+                        let outcomes = state
+                            .last_join_outcomes
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        [
+                            group_id_hex.as_str(),
+                            info.stable_group_id(),
+                            info.mls_group_id.as_str(),
+                        ]
+                        .iter()
+                        .any(|key| {
+                            outcomes.get(*key).is_some_and(|outcome| {
+                                outcome.outcome == "timed_out"
+                                    && outcome.reason == Some(JOIN_REARM_TIMEOUT_REASON)
+                            })
+                        })
+                    };
+                    if base_seats_device && !rearm_already_failed {
                         rearm_remnant = Some(info);
                     } else {
                         stale_not_member_row = true;
@@ -28542,7 +28565,9 @@ pub(in crate::server) async fn leave_group(
             // disposition covers. Every other non-member leave stays refused.
             // The fence only answers the membership 403: an unknown group
             // (404) and a withdrawn tombstone (409) keep the core's reply.
-            let local_only_drop = groups.get(&id).is_some_and(|info| {
+            // ADR0066-LOOKUP-WAIVER: this is the leave route's own raw-id row,
+            // the one admit_self_leave just refused; no alias is consulted.
+            let fence_row = groups.get(&id).filter(|info| {
                 !info.withdrawn
                     && info.caller_role(&local_agent_hex).is_none()
                     && actor.is_durable_owner()
@@ -28550,16 +28575,15 @@ pub(in crate::server) async fn leave_group(
                     && treekem_leave_disposition(info, &local_agent_hex)
                         == TreeKemLeaveDisposition::LocalOnlyDrop
             });
-            if !local_only_drop {
+            let Some(fence_row) = fence_row else {
                 return resp;
-            }
+            };
             // D39 containment: a fork-quarantined row is cleared only through
             // POST /groups/:id/quarantine/clear (force + reason, audited); a
             // local drop would erase the marker and its evidence unrecorded.
-            if groups.get(&id).is_some_and(|info| {
-                classify_not_member_join_row(info, &local_agent_hex)
-                    == NotMemberJoinRow::Quarantined
-            }) {
+            if classify_not_member_join_row(fence_row, &local_agent_hex)
+                == NotMemberJoinRow::Quarantined
+            {
                 return api_error_with_reason(
                     StatusCode::CONFLICT,
                     "this group's local row is fork-quarantined; clear it with \
@@ -41563,9 +41587,9 @@ async fn stage_join_result(
     results.insert(
         key.clone(),
         PendingJoinResult {
+            created_at: std::time::Instant::now(),
             head_attestation: head_attestation.clone(),
             event,
-            created_at: Instant::now(),
             created_at_ms: now_ms,
             delivered_at_ms: None,
         },
@@ -45520,16 +45544,19 @@ async fn handle_join_result_message_bound(
                     retry_pending_owner_cert_joins(&retry_state, Some(&retry_group)).await;
                 })
                 .await;
-            // Signed fetches are replayable for the staging TTL, and the serve
-            // pays an ML-DSA sign plus a locked staging sweep per request. The
-            // per-(group, member) entry mirrors the mk-serve throttle; the
-            // joiner's poll backoff is coarser than the window, so a
-            // legitimate retry is never blocked.
+            // A signed fetch on an unverified transport (#377) is replayable
+            // by anyone holding its bytes for the staging TTL, and the serve
+            // pays an ML-DSA sign plus a locked staging sweep per request, so
+            // those are throttled per (group, member, attempt); the joiner's
+            // poll backoff is coarser than the window. A verified fetch comes
+            // from the bound member itself and is bounded by the ADR 0107
+            // fetch admission instead, so it is never throttled here: a
+            // re-fetch after a cancelled egress must be admitted.
             let throttle_key = format!(
                 "{group_id}:jr-serve:{sender_hex}:{}",
                 attempt_id.as_deref().unwrap_or("")
             );
-            {
+            if !verified {
                 let mut throttle = state.treekem_catchup_throttle.write().await;
                 if throttle
                     .get(&throttle_key)
@@ -46706,10 +46733,10 @@ async fn stage_treekem_welcome(
     let source = hex::encode(state.agent.agent_id().as_bytes());
     let now_ms = now_millis_u64();
     let pending = PendingWelcome {
+        created_at: std::time::Instant::now(),
         group_id: group_id.to_string(),
         joiner_agent: joiner_agent.to_string(),
         bytes,
-        created_at: Instant::now(),
         created_at_ms: now_ms,
     };
     let mut welcomes = state.pending_welcomes.write().await;
@@ -51093,6 +51120,7 @@ pub(in crate::server) mod tests {
             state.pending_join_results.write().await.insert(
                 "authority-key".to_string(),
                 PendingJoinResult {
+                    created_at: std::time::Instant::now(),
                     event: NamedGroupMetadataEvent::GroupDeleted {
                         group_id: event_group.clone(),
                         actor: member.clone(),
@@ -51100,7 +51128,6 @@ pub(in crate::server) mod tests {
                         commit: None,
                     },
                     head_attestation: None,
-                    created_at: Instant::now(),
                     created_at_ms: now_millis_u64(),
                     delivered_at_ms: None,
                 },
@@ -51110,10 +51137,10 @@ pub(in crate::server) mod tests {
             state.pending_welcomes.write().await.insert(
                 "welcome-sentinel".to_string(),
                 PendingWelcome {
+                    created_at: std::time::Instant::now(),
                     group_id: event_group.clone(),
                     joiner_agent: member.clone(),
                     bytes: vec![1, 2, 3],
-                    created_at: Instant::now(),
                     created_at_ms: now_millis_u64(),
                 },
             );
@@ -59494,6 +59521,7 @@ pub(in crate::server) mod tests {
     fn pending_welcome_flags_only_staged_fresh_undelivered_members() {
         fn staged(delivered: Option<u64>, created_at_ms: u64) -> PendingJoinResult {
             PendingJoinResult {
+                created_at: std::time::Instant::now(),
                 event: NamedGroupMetadataEvent::GroupDeleted {
                     group_id: "g".into(),
                     revision: 1,
@@ -59502,7 +59530,6 @@ pub(in crate::server) mod tests {
                 },
                 head_attestation: None,
                 created_at_ms,
-                created_at: Instant::now(),
                 delivered_at_ms: delivered,
             }
         }
@@ -59567,13 +59594,13 @@ pub(in crate::server) mod tests {
             // round-trip instead: serialize a current entry, strip the new
             // field, re-parse.
             let entry = PendingJoinResult {
+                created_at: std::time::Instant::now(),
                 event: NamedGroupMetadataEvent::GroupDeleted {
                     group_id: "g".into(),
                     revision: 1,
                     actor: "a".repeat(64),
                     commit: None,
                 },
-                created_at: Instant::now(),
                 created_at_ms: 7,
                 delivered_at_ms: Some(9),
                 head_attestation: None,
@@ -60678,10 +60705,10 @@ pub(in crate::server) mod tests {
         };
 
         let pending = PendingWelcome {
+            created_at: std::time::Instant::now(),
             group_id: group_id.clone(),
             joiner_agent: hex::encode(joiner_id.as_bytes()),
             bytes: bytes.clone(),
-            created_at: Instant::now(),
             created_at_ms: now_millis_u64(),
         };
         tokio::time::timeout(
@@ -60843,10 +60870,10 @@ pub(in crate::server) mod tests {
         owner.pending_welcomes.write().await.insert(
             welcome_id.clone(),
             PendingWelcome {
+                created_at: std::time::Instant::now(),
                 group_id: group_id.clone(),
                 joiner_agent: hex::encode(joiner_id.as_bytes()),
                 bytes,
-                created_at: Instant::now(),
                 created_at_ms: now_millis_u64(),
             },
         );
@@ -60954,10 +60981,10 @@ pub(in crate::server) mod tests {
         owner.pending_welcomes.write().await.insert(
             welcome_id.clone(),
             PendingWelcome {
+                created_at: std::time::Instant::now(),
                 group_id: group_id.clone(),
                 joiner_agent: hex::encode(joiner_id.as_bytes()),
                 bytes,
-                created_at: Instant::now(),
                 created_at_ms: now_millis_u64()
                     .saturating_sub(PENDING_WELCOME_TTL.as_millis() as u64 + 1_000),
             },
@@ -61193,10 +61220,10 @@ pub(in crate::server) mod tests {
         owner.pending_welcomes.write().await.insert(
             welcome_id.clone(),
             PendingWelcome {
+                created_at: std::time::Instant::now(),
                 group_id: group_id.clone(),
                 joiner_agent: joiner_id.clone(),
                 bytes: bytes.clone(),
-                created_at: Instant::now(),
                 created_at_ms: now_millis_u64()
                     .saturating_sub(PENDING_WELCOME_TTL.as_millis() as u64 + 1_000),
             },
@@ -63437,10 +63464,10 @@ pub(in crate::server) mod tests {
         f.state.pending_welcomes.write().await.insert(
             "welcome-376".to_string(),
             PendingWelcome {
+                created_at: std::time::Instant::now(),
                 group_id: f.stable_group_id.clone(),
                 joiner_agent: f.peer_hex.clone(),
                 bytes: vec![1, 2, 3],
-                created_at: Instant::now(),
                 created_at_ms: now_millis_u64(),
             },
         );

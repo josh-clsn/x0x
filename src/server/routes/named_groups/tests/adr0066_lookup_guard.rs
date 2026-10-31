@@ -326,13 +326,15 @@ fn adr0066_every_quarantine_lookup_resolves_both_spellings_or_waives() {
 /// Anti-vacuity: a scanner that silently stopped finding anything would pass
 /// the test above forever. The waived population is the #732 census, so it is
 /// pinned — adding or removing a waiver is a deliberate edit here too.
+// This fork adds one waived site: the #376 local-only-drop fence in the
+// leave route reads the raw-id row admit_self_leave just refused (9 -> 10).
 #[test]
 fn adr0066_lookup_guard_still_sees_the_waived_census() {
     let sites = all_sites();
     assert_eq!(
         sites.len(),
-        9,
-        "#732 census: 9 single-spelling roster lookups remain on quarantine \
+        10,
+        "#732 census: 10 single-spelling roster lookups remain on quarantine \
          paths, each waived at the site (8 at the original 15-line window, 4 \
          more once review of #750 widened it to 25; N19-B routes the manual \
          clear's closure through resolve_group_entry_mut_locked, so that \
