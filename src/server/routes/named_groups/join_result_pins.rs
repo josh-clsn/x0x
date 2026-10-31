@@ -17,6 +17,9 @@
 //! parsed (truncated by a crash before this writer existed, or edited by
 //! hand) loads as NO pins, with a warning: the device then treats its
 //! re-key removal as an ordinary departure, which is the safe direction.
+//!
+//! A pin armed by an ADR 0107 re-arm loads as timed out: the re-arm's
+//! attempt and poll do not survive the process.
 
 use super::{
     now_millis_u64, write_named_groups_json_atomic, AppState, ExpectedJoinResultInviter,
@@ -108,11 +111,16 @@ pub(super) async fn load(state: &AppState) {
         if age >= EXPECTED_JOIN_RESULT_INVITER_TTL {
             continue;
         }
+        // A re-arm lives only in this process (its attempt and its 120 s
+        // poll are in memory), so a re-arm pin read at boot is a re-arm
+        // that ended: it loads timed out, which reads `not_member` and makes
+        // the next invite re-key.
+        let timed_out = pin.timed_out || pin.rearm;
         pins.entry(key).or_insert(ExpectedJoinResultInviter {
             inviter_agent_id: pin.inviter_agent_id,
             created_at: Instant::now().checked_sub(age).unwrap_or_else(Instant::now),
             recorded_at_ms: pin.recorded_at_ms,
-            timed_out: pin.timed_out,
+            timed_out,
             rearm: pin.rearm,
         });
     }
