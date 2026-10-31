@@ -38757,14 +38757,31 @@ const EXPECTED_JOIN_RESULT_INVITER_TTL: Duration = NON_TREEKEM_JOIN_RESULT_POLL_
 
 const JOIN_RESULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Ceiling for the non-TreeKEM poll's exponential backoff. That poll runs for
+/// the full staging horizon, so a fixed 2 s interval would cost ~43 200 fetches
+/// (and a `MemberJoined` resend every third) per stuck join; at the cap it
+/// costs ~300 while a mesh recovery still converges within minutes.
+const JOIN_RESULT_POLL_BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
+
+/// Delay before poll attempt `attempt` (0-based) of the long non-TreeKEM
+/// poll: 2 s, 4 s, 8 s, ... capped at [`JOIN_RESULT_POLL_BACKOFF_CAP`].
+fn join_result_poll_delay(attempt: u32) -> Duration {
+    JOIN_RESULT_POLL_INTERVAL
+        .saturating_mul(1u32 << attempt.min(16))
+        .min(JOIN_RESULT_POLL_BACKOFF_CAP)
+}
+
 /// How many unconfirmed join-result polls pass between `MemberJoined` resends
-/// to the authority (#333). At `JOIN_RESULT_POLL_INTERVAL` that is roughly one
-/// resend every 6s — slow enough that a merely slow authority is not spammed,
+/// to the authority (#333). At the TreeKEM cadence (`JOIN_RESULT_POLL_INTERVAL`) that
+/// is roughly one resend every 6s — slow enough that a merely slow authority is not spammed,
 /// fast enough that a lost join volley is repaired well inside the 30s the
 /// propagation tests allow.
 const MEMBER_JOINED_RESEND_POLL_INTERVALS: u32 = 3;
 
-const PENDING_WELCOME_TTL: Duration = Duration::from_secs(10 * 60);
+/// Matches `PENDING_JOIN_RESULT_TTL`: with a shorter Welcome TTL the owner
+/// would serve a staged `MemberAdded` whose `welcome_ref` resolves to nothing
+/// (`welcome_not_staged`), an orphaned join no poll can repair.
+const PENDING_WELCOME_TTL: Duration = PENDING_JOIN_RESULT_TTL;
 
 // The TreeKEM join-result poll closes at 120s. All fetch retries and the
 // final receive wait must finish inside that window.
@@ -38908,9 +38925,13 @@ pub(in crate::server) struct ApplyMetadataEventRequest {
 /// routing key only; the authoritative group is resolved from the event itself.
 pub(in crate::server) async fn apply_group_metadata_event(
     State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
     Path(id): Path<String>,
     Json(req): Json<ApplyMetadataEventRequest>,
 ) -> impl IntoResponse {
+    if let Err(refused) = durable_owner_or_forbid(&actor, "the relay-bridge apply door") {
+        return refused;
+    }
     let event_bytes = match BASE64.decode(&req.event_b64) {
         Ok(b) => b,
         Err(e) => {
@@ -38950,11 +38971,9 @@ pub(in crate::server) async fn apply_group_metadata_event(
         sender = %req.sender_agent_id,
         "non-gossip local-apply endpoint invoked"
     );
-    let Some(applied) = apply_door_event_shielded(&state, event, sender).await else {
-        return api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "the daemon is shutting down",
-        );
+    let applied = match apply_door_event(&state, event, sender).await {
+        Ok(applied) => applied,
+        Err(refused) => return refused,
     };
     if applied {
         (StatusCode::OK, Json(serde_json::json!({ "applied": true })))
@@ -38966,23 +38985,27 @@ pub(in crate::server) async fn apply_group_metadata_event(
     }
 }
 
-/// Apply a door-delivered event as a shielded apply. A caller that
-/// disconnects, or a shutdown that begins mid-apply, cannot cut the apply
-/// off between its durable writes. `None` when shutdown refused it before
-/// it started.
-async fn apply_door_event_shielded(
+/// Apply a door-delivered event through upstream's shielded listener apply.
+/// A caller that disconnects, or a shutdown that begins mid-apply, cannot cut
+/// the apply off between its durable writes. A refused admission answers 503
+/// only when shutdown has started; any other failure to complete (a panicked
+/// apply) answers 500.
+async fn apply_door_event(
     state: &Arc<AppState>,
     event: NamedGroupMetadataEvent,
     sender: AgentId,
-) -> Option<bool> {
-    let apply_state = Arc::clone(state);
-    state
-        .run_shielded(async move {
-            apply_named_group_metadata_event(&apply_state, event, sender, true, None)
-                .await
-                .accepted
-        })
-        .await
+) -> std::result::Result<bool, (StatusCode, Json<serde_json::Value>)> {
+    match apply_listener_metadata_event(state, event, sender, true, None).await {
+        Some(result) => Ok(result.accepted),
+        None if state.shutdown_started.is_cancelled() => Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the daemon is shutting down",
+        )),
+        None => Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the apply did not complete",
+        )),
+    }
 }
 
 /// Set `treekem_welcome_b64` on a `MemberAdded` event (no-op for every
@@ -39015,8 +39038,12 @@ fn set_inline_welcome(event: &mut NamedGroupMetadataEvent, welcome_b64: String) 
 /// polls with backoff rather than relaying a welcome-less event.
 pub(in crate::server) async fn get_join_result_inline(
     State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
     Path((id, member)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    if let Err(refused) = durable_owner_or_forbid(&actor, "the relay-bridge join-result read") {
+        return refused;
+    }
     let key = join_result_key(&id, &member);
     // This door hands out the same recovery bytes as the fetch path, so it
     // runs the same serving guard under the group's membership lock. A
@@ -39119,9 +39146,13 @@ pub(in crate::server) struct ApplyJoinResultRequest {
 /// (127.0.0.1 + API token).
 pub(in crate::server) async fn apply_join_result_endpoint(
     State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
     Path((id, member)): Path<(String, String)>,
     Json(req): Json<ApplyJoinResultRequest>,
 ) -> impl IntoResponse {
+    if let Err(refused) = durable_owner_or_forbid(&actor, "the relay-bridge join-result apply") {
+        return refused;
+    }
     let event_bytes = match BASE64.decode(&req.event_b64) {
         Ok(b) => b,
         Err(e) => {
@@ -39204,11 +39235,9 @@ pub(in crate::server) async fn apply_join_result_endpoint(
             format!("join-result sender rejected: {reason}"),
         );
     }
-    let Some(applied) = apply_door_event_shielded(&state, event, sender).await else {
-        return api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "the daemon is shutting down",
-        );
+    let applied = match apply_door_event(&state, event, sender).await {
+        Ok(applied) => applied,
+        Err(refused) => return refused,
     };
     if applied {
         clear_expected_join_result_inviter(state.as_ref(), &expected_key);
@@ -43668,7 +43697,12 @@ async fn poll_join_result_until_membership_confirmed(
                 payload_hash = %payload_hash,
             );
         }
-        tokio::time::sleep(JOIN_RESULT_POLL_INTERVAL).await;
+        let delay = if await_treekem {
+            JOIN_RESULT_POLL_INTERVAL
+        } else {
+            join_result_poll_delay(unconfirmed_polls.saturating_sub(1))
+        };
+        tokio::time::sleep(delay).await;
     }
     // #477 (r5 item 2): finalize takes the membership guard from its
     // caller — the poll acquires the (lookup-gated) lock here so the

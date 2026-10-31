@@ -397,7 +397,8 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
 
 /// This fork's engine-A relay-bridge doors, durable token only:
 /// `POST /groups/<id>/apply-metadata-event` and
-/// `GET|POST /groups/<id>/join-result/<member>`.
+/// `GET|HEAD|POST /groups/<id>/join-result/<member>`. axum answers a HEAD from
+/// the GET handler, so HEAD is gated with it.
 fn is_engine_a_bridge_path(method: &Method, path: &str) -> bool {
     let Some(rest) = path.strip_prefix("/groups/") else {
         return false;
@@ -408,7 +409,7 @@ fn is_engine_a_bridge_path(method: &Method, path: &str) -> bool {
         [id, "join-result", member] => {
             !id.is_empty()
                 && !member.is_empty()
-                && (*method == Method::GET || *method == Method::POST)
+                && matches!(*method, Method::GET | Method::HEAD | Method::POST)
         }
         _ => false,
     }

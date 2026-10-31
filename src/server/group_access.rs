@@ -501,10 +501,11 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
     // This fork's engine-A relay-bridge doors are OwnerDurable like
     // quarantine/clear (#1228): the auth layer refuses a session token at
     // the route (`requires_durable_owner`), before any body is parsed. What
-    // they admit past that is decided by the event itself: the apply doors
-    // take only commit-signed events or the self-signed original
-    // MemberJoined and verify them as any delivery would, and the GET runs
-    // the ADR 0107 serving guard for the named member.
+    // they admit past that is decided by the event itself: the apply door
+    // takes only events whose actor signed their commit (or the joiner's
+    // self-signed original MemberJoined), applies them with the caller's
+    // `sender_agent_id` claim, and verifies the commit as any delivery
+    // would. The GET runs the ADR 0107 serving guard for the named member.
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/apply-metadata-event",
