@@ -1598,8 +1598,9 @@ mod join_hook_tests {
             .expect("agent")
     }
 
-    /// A quiesce that lands after the dial and before the hooks leaves the
-    /// hooks unrun, and one that lands mid-dial does the same.
+    /// A quiesce that lands after the dial returned and before the hooks
+    /// leaves the hooks unrun (the join_mesh_with re-read); a quiesce inside
+    /// the dial is covered by `quiesce_during_the_dial_reports_no_join`.
     #[tokio::test]
     async fn quiesce_between_dial_and_hooks_skips_the_hooks() {
         let dir = tempfile::tempdir().unwrap();

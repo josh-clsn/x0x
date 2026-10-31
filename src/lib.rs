@@ -28590,6 +28590,43 @@ mod tests {
         assert!(agent.mesh_off());
     }
 
+    /// A quiesce that lands while the dial is still running ends the join:
+    /// the dial reports `false`, so no caller runs post-join work.
+    #[tokio::test(start_paused = true)]
+    async fn quiesce_during_the_dial_reports_no_join() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = std::sync::Arc::new(
+            Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .with_network_config(network::NetworkConfig {
+                    bind_addr: Some("127.0.0.1:0".parse().expect("addr")),
+                    bootstrap_nodes: vec!["127.0.0.1:40909".parse().expect("addr")],
+                    mdns_enabled: false,
+                    port_mapping_enabled: false,
+                    ..network::NetworkConfig::default()
+                })
+                .build()
+                .await
+                .expect("agent"),
+        );
+        agent.start_network_infra().await.expect("infra");
+        let epoch = agent.mesh_transition_epoch();
+        let dialling = {
+            let agent = std::sync::Arc::clone(&agent);
+            tokio::spawn(async move { agent.dial_bootstrap_superseding(epoch).await })
+        };
+        // The spawned dial has run to its first await: it has unlatched and
+        // started its dial phases.
+        tokio::task::yield_now().await;
+        agent.quiesce_mesh().await.expect("quiesce");
+        let dialled = dialling.await.expect("join task").expect("dial");
+        assert!(!dialled, "a dial overtaken by a quiesce is not a join");
+        assert!(agent.mesh_quiesced());
+    }
+
     /// A running reconnect ladder and the announcement auto-connect both
     /// stop once the mesh is quiesced, with no tombstone involved.
     #[tokio::test]

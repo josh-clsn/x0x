@@ -428,7 +428,6 @@ pub async fn serve(config: DaemonConfig) -> anyhow::Result<ServerHandle> {
     let options = ServeOptions {
         skip_update_check: true,
         self_update_enabled: false,
-        embedded: true,
         ..ServeOptions::default()
     };
     serve_with_options(config, options).await
@@ -494,6 +493,21 @@ async fn install_revocation_snapshot_authority(state: &Arc<AppState>) {
         .set_snapshot_authority(authority);
 }
 
+/// The zero-peer watchdog ends in `process::exit`, so it is armed only for
+/// the standalone daemon process, and never for a daemon whose mesh dial is
+/// deferred. Returns the configured window when armed.
+const fn zero_peer_watchdog_window(
+    standalone_process: bool,
+    defer_mesh_join: bool,
+    zero_peer_restart_secs: Option<u64>,
+) -> Option<u64> {
+    if standalone_process && !defer_mesh_join {
+        zero_peer_restart_secs
+    } else {
+        None
+    }
+}
+
 /// The relay opt-in decision for a daemon start, as a pure function of the
 /// three sources plus the metered switch.
 ///
@@ -504,13 +518,6 @@ async fn install_revocation_snapshot_authority(state: &Arc<AppState>) {
 /// the #398 capability advertisement reads argv and the env var itself, so
 /// closing only one of them leaves a metered phone advertising relay and
 /// coordinator capability it refuses to honour.
-/// The zero-peer watchdog ends in `process::exit`, so it runs only for a
-/// standalone daemon: never inside a host application, and never for a
-/// daemon whose mesh dial is deferred.
-const fn zero_peer_watchdog_may_exit(embedded: bool, defer_mesh_join: bool) -> bool {
-    !embedded && !defer_mesh_join
-}
-
 fn metered_relay_decision(
     cli_relay: bool,
     toml_relay: bool,
@@ -554,7 +561,7 @@ pub async fn serve_with_options(
         exec_policy,
         connect_policy,
         self_update_enabled,
-        embedded,
+        standalone_process,
     } = options;
     // `--skip-update-check` is process-scoped updater suppression. Compute one
     // effective capability before any updater path is considered, then use it
@@ -1009,10 +1016,11 @@ pub async fn serve_with_options(
     // graceful shutdown and hard-exits 30s later so the known shutdown hang
     // cannot defeat the restart. Only meaningful under a supervisor
     // (systemd Restart=always) — off by default.
-    if let Some(window) = config
-        .zero_peer_restart_secs
-        .filter(|_| zero_peer_watchdog_may_exit(embedded, config.defer_mesh_join))
-    {
+    if let Some(window) = zero_peer_watchdog_window(
+        standalone_process,
+        config.defer_mesh_join,
+        config.zero_peer_restart_secs,
+    ) {
         let watchdog_agent = Arc::clone(&agent);
         let watchdog_shutdown = shutdown_tx.clone();
         startup_tasks.push(tokio::spawn(async move {
@@ -5260,22 +5268,24 @@ mod owner_singleton_tests {
     }
 }
 
-/// Invite-auth #468/#469 (design v6 E2d / v7 F1): the member-certificate
-/// hydration bridge — pre-populated cache ⇒ reconcile hydrates with no
-/// event; ring overflow (`Lagged`) ⇒ the full reconcile recovers; a second
-/// reconcile run hydrates nothing.
 #[cfg(test)]
 mod zero_peer_watchdog_tests {
-    use super::zero_peer_watchdog_may_exit;
+    use super::zero_peer_watchdog_window;
+    use crate::server::ServeOptions;
 
-    /// The watchdog hard-exits the process, so it never runs inside a host
-    /// application or for a daemon whose mesh dial is deferred.
+    /// The watchdog hard-exits the process, so default options never arm
+    /// it, even with a window configured; only the standalone daemon does,
+    /// and not when its mesh dial is deferred.
     #[test]
-    fn watchdog_never_exits_an_embedding_or_deferred_process() {
-        assert!(zero_peer_watchdog_may_exit(false, false));
-        assert!(!zero_peer_watchdog_may_exit(true, false));
-        assert!(!zero_peer_watchdog_may_exit(false, true));
-        assert!(!zero_peer_watchdog_may_exit(true, true));
+    fn default_serve_options_never_arm_the_watchdog() {
+        let options = ServeOptions::default();
+        assert_eq!(
+            zero_peer_watchdog_window(options.standalone_process, false, Some(300)),
+            None
+        );
+        assert_eq!(zero_peer_watchdog_window(true, false, Some(300)), Some(300));
+        assert_eq!(zero_peer_watchdog_window(true, false, None), None);
+        assert_eq!(zero_peer_watchdog_window(true, true, Some(300)), None);
     }
 }
 
@@ -5327,6 +5337,10 @@ mod metered_relay_decision_tests {
     }
 }
 
+/// Invite-auth #468/#469 (design v6 E2d / v7 F1): the member-certificate
+/// hydration bridge — pre-populated cache ⇒ reconcile hydrates with no
+/// event; ring overflow (`Lagged`) ⇒ the full reconcile recovers; a second
+/// reconcile run hydrates nothing.
 #[cfg(test)]
 mod member_certificate_bridge_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

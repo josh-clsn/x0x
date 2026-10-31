@@ -129,10 +129,12 @@ pub struct ServeOptions {
     /// never replace or restart the host application. Updater-owned manifest
     /// broadcast/listener side effects are gated with the install paths.
     pub self_update_enabled: bool,
-    /// The server runs inside a host application. The zero-peer watchdog
-    /// (issue #262) hard-exits the process, so it never runs for an embedder.
-    /// [`crate::server::serve`] sets this.
-    pub embedded: bool,
+    /// This process is the standalone `x0xd` daemon. Only the daemon binary
+    /// sets it. The zero-peer watchdog (issue #262) ends in `process::exit`,
+    /// so it is armed only when this is `true`: [`crate::server::serve`] and
+    /// every embedder that builds `ServeOptions` from `Default` get no
+    /// watchdog.
+    pub standalone_process: bool,
 }
 
 pub(super) const fn effective_self_update_enabled(
