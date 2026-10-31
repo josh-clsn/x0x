@@ -8959,6 +8959,71 @@ mod tests {
         assert!(node.close().await.is_ok());
     }
 
+    /// A quiesced Full node holding a direct link to a peer sends no gossip
+    /// frame to it on either gossip path: the ordinary path drops, the
+    /// guarded path refuses. Unlatching restores delivery.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn quiesce_full_node_gossip_frames_to_a_connected_peer_are_not_sent() {
+        use saorsa_gossip_transport::{GossipStreamType, GossipTransport};
+
+        let plane = "quiesce-full-gossip";
+        let fabric = sim::SimFabric::new(1426);
+        sim::register(plane, &fabric);
+        let config = |host: u8| NetworkConfig {
+            bind_addr: Some(SocketAddr::from(([198, 18, 3, host], 5483))),
+            network_id: Some(plane.to_string()),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..NetworkConfig::default()
+        };
+        let a = NetworkNode::new(config(1), None, None).await.unwrap();
+        let b = NetworkNode::new(config(2), None, None).await.unwrap();
+        let peer_b = a
+            .connect_addr(SocketAddr::from(([198, 18, 3, 2], 5483)))
+            .await
+            .unwrap();
+        let gossip_b = ant_to_gossip_peer_id(&peer_b);
+        assert!(a.latch_mesh_quiesced().is_some());
+        let admit: saorsa_gossip_transport::SessionAdmission =
+            Arc::new(|_| Ok(bytes::Bytes::from_static(b"v3")));
+        assert!(a
+            .send_to_peer(
+                gossip_b,
+                GossipStreamType::PubSub,
+                bytes::Bytes::from_static(b"p")
+            )
+            .await
+            .is_ok());
+        let refused = a
+            .send_to_peer_guarded(gossip_b, GossipStreamType::PubSub, admit)
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("mesh quiesced"), "{refused}");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), b.receive_message())
+                .await
+                .is_err(),
+            "nothing reaches the peer while quiesced"
+        );
+
+        let epoch = a.mesh_transition_epoch();
+        assert!(a.unlatch_mesh_if_current(epoch));
+        a.send_to_peer(
+            gossip_b,
+            GossipStreamType::PubSub,
+            bytes::Bytes::from_static(b"p"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), b.receive_message())
+                .await
+                .is_ok(),
+            "delivery resumes after the latch lifts"
+        );
+    }
+
     /// The guarded gossip egress (key-cache V3, controls) refuses while the
     /// mesh is quiesced and never calls the admission closure.
     #[tokio::test]

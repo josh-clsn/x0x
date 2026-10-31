@@ -773,6 +773,9 @@ pub struct Agent {
     dm_inflight_acks: std::sync::Arc<dm::InFlightAcks>,
     /// Receiver-side dedupe cache.
     recent_delivery_cache: std::sync::Arc<dm::RecentDeliveryCache>,
+    /// True from a deferred start until the first mesh join dials: the mesh
+    /// is off on purpose, as under a quiesce.
+    mesh_join_pending: std::sync::atomic::AtomicBool,
     /// Set once the presence broadcast-peer refresh task is running, so
     /// repeated `dial_bootstrap` calls (mesh join/quiesce flips) share one.
     presence_refresh_started: std::sync::atomic::AtomicBool,
@@ -14715,9 +14718,10 @@ impl Agent {
     /// # Errors
     ///
     /// Propagates [`dial_bootstrap`](Agent::dial_bootstrap)'s errors. Returns
-    /// `Ok(true)` when the dial ran and `Ok(false)` when it was superseded
-    /// by a newer quiesce or there is no network, so callers run their
-    /// post-join work only after a real join.
+    /// `Ok(true)` when the dial ran and no quiesce landed during it, and
+    /// `Ok(false)` when it was superseded or quiesced meanwhile, or there is
+    /// no network, so callers run their post-join work only after a real
+    /// join.
     pub async fn dial_bootstrap_superseding(&self, requested_at_epoch: u64) -> error::Result<bool> {
         let Some(network) = self.network.as_ref() else {
             tracing::debug!("dial_bootstrap called but no network configured");
@@ -14735,6 +14739,8 @@ impl Agent {
             );
             return Ok(false);
         }
+        self.mesh_join_pending
+            .store(false, std::sync::atomic::Ordering::Release);
 
         let bootstrap_nodes = network.config().bootstrap_nodes.clone();
 
@@ -15106,7 +15112,26 @@ impl Agent {
             tracing::warn!("failed to start capability advert service: {e}");
         }
 
-        Ok(true)
+        // A quiesce that landed during the dial owns the state: not a join.
+        Ok(!network.mesh_quiesced())
+    }
+
+    /// Record that the mesh dial is deferred (`defer_mesh_join`): until the
+    /// first [`dial_bootstrap`](Agent::dial_bootstrap), [`Agent::mesh_off`]
+    /// holds.
+    pub fn mark_mesh_join_deferred(&self) {
+        self.mesh_join_pending
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether the mesh is off on purpose: quiesced, or deferred and not yet
+    /// joined. Zero peers is expected in this state, not a wedged transport.
+    #[must_use]
+    pub fn mesh_off(&self) -> bool {
+        self.mesh_quiesced()
+            || self
+                .mesh_join_pending
+                .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Claim the single presence-refresh task slot; `true` only for the
@@ -22480,6 +22505,7 @@ impl AgentBuilder {
             )),
             dm_inflight_acks: std::sync::Arc::new(dm::InFlightAcks::new()),
             recent_delivery_cache: std::sync::Arc::new(dm::RecentDeliveryCache::with_defaults()),
+            mesh_join_pending: std::sync::atomic::AtomicBool::new(false),
             presence_refresh_started: std::sync::atomic::AtomicBool::new(false),
             capability_advert_service: tokio::sync::Mutex::new(None),
             selection_skew: std::sync::Arc::new(SelectionSkew::default()),
@@ -26585,6 +26611,7 @@ mod tests {
                 coordinator_service_enabled: true,
                 ..ant_quic::NodeStatus::default()
             };
+            crate::METERED_LEAF_RELAY_SUPPRESSED.store(false, std::sync::atomic::Ordering::Relaxed);
             RELAY_OPT_IN_TEST_SOURCES.with(|cell| cell.set(Some((true, true))));
             let advertised = AnnouncementAssistSnapshot::from_node_status(&status);
             assert_eq!(
@@ -26605,6 +26632,7 @@ mod tests {
             assert_eq!(snapshot.relay_capable, Some(false));
             assert_eq!(snapshot.coordinator_capable, Some(false));
             RELAY_OPT_IN_TEST_SOURCES.with(|cell| cell.set(None));
+            crate::METERED_LEAF_RELAY_SUPPRESSED.store(false, std::sync::atomic::Ordering::Relaxed);
         }
 
         /// #398: capability still requires the service — reachability
@@ -28525,6 +28553,41 @@ mod tests {
         for _ in 0..3 {
             assert!(!agent.claim_presence_refresh(), "later joins reuse it");
         }
+    }
+
+    /// A deferred daemon that has not joined is off on purpose; the first
+    /// dial ends that, and a quiesce brings it back.
+    #[tokio::test]
+    async fn mesh_off_covers_deferred_start_and_quiesce() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("addr")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..network::NetworkConfig::default()
+            })
+            .build()
+            .await
+            .expect("agent");
+        assert!(!agent.mesh_off());
+        agent.mark_mesh_join_deferred();
+        assert!(agent.mesh_off(), "deferred and not yet joined");
+        agent.start_network_infra().await.expect("infra");
+        agent.dial_bootstrap().await.expect("join");
+        assert!(!agent.mesh_off(), "the first dial ends the deferral");
+        assert!(
+            !agent.claim_presence_refresh(),
+            "dial_bootstrap took the presence-refresh slot"
+        );
+        agent.dial_bootstrap().await.expect("second join");
+        agent.quiesce_mesh().await.expect("quiesce");
+        assert!(agent.mesh_off());
     }
 
     /// A running reconnect ladder and the announcement auto-connect both

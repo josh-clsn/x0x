@@ -422,6 +422,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         exec_policy,
         connect_policy,
         self_update_enabled,
+        embedded: false,
     };
     let handle = x0x::server::serve_with_options(config, options).await?;
 

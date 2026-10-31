@@ -261,12 +261,12 @@ pub(in crate::server) async fn health(
 ) -> Json<ApiResponse<HealthData>> {
     let (peers, send_ready_peers, one_sided_peers) = state.health_snapshot.load();
     let uptime_secs = state.start_time.elapsed().as_secs();
-    let (status, degraded_reason) =
-        if quiesced_idle(state.agent.mesh_quiesced(), peers, one_sided_peers) {
-            ("healthy", None)
-        } else {
-            classify_health(peers, send_ready_peers, uptime_secs, one_sided_peers)
-        };
+    let (status, degraded_reason) = if quiesced_idle(state.agent.mesh_off(), peers, one_sided_peers)
+    {
+        ("healthy", None)
+    } else {
+        classify_health(peers, send_ready_peers, uptime_secs, one_sided_peers)
+    };
 
     Json(ApiResponse {
         ok: true,
@@ -371,7 +371,7 @@ pub(in crate::server) async fn status(
 
     let one_sided_peers = state.health_snapshot.load().2;
     let (connectivity, degraded_reason) =
-        if quiesced_idle(state.agent.mesh_quiesced(), peers, one_sided_peers) {
+        if quiesced_idle(state.agent.mesh_off(), peers, one_sided_peers) {
             (
                 if warnings.is_empty() {
                     "isolated"

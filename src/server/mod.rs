@@ -427,6 +427,7 @@ pub async fn serve(config: DaemonConfig) -> anyhow::Result<ServerHandle> {
     let options = ServeOptions {
         skip_update_check: true,
         self_update_enabled: false,
+        embedded: true,
         ..ServeOptions::default()
     };
     serve_with_options(config, options).await
@@ -502,6 +503,13 @@ async fn install_revocation_snapshot_authority(state: &Arc<AppState>) {
 /// the #398 capability advertisement reads argv and the env var itself, so
 /// closing only one of them leaves a metered phone advertising relay and
 /// coordinator capability it refuses to honour.
+/// The zero-peer watchdog ends in `process::exit`, so it runs only for a
+/// standalone daemon: never inside a host application, and never for a
+/// daemon whose mesh dial is deferred.
+const fn zero_peer_watchdog_may_exit(embedded: bool, defer_mesh_join: bool) -> bool {
+    !embedded && !defer_mesh_join
+}
+
 fn metered_relay_decision(
     cli_relay: bool,
     toml_relay: bool,
@@ -545,6 +553,7 @@ pub async fn serve_with_options(
         exec_policy,
         connect_policy,
         self_update_enabled,
+        embedded,
     } = options;
     // `--skip-update-check` is process-scoped updater suppression. Compute one
     // effective capability before any updater path is considered, then use it
@@ -998,7 +1007,10 @@ pub async fn serve_with_options(
     // graceful shutdown and hard-exits 30s later so the known shutdown hang
     // cannot defeat the restart. Only meaningful under a supervisor
     // (systemd Restart=always) — off by default.
-    if let Some(window) = config.zero_peer_restart_secs {
+    if let Some(window) = config
+        .zero_peer_restart_secs
+        .filter(|_| zero_peer_watchdog_may_exit(embedded, config.defer_mesh_join))
+    {
         let watchdog_agent = Arc::clone(&agent);
         let watchdog_shutdown = shutdown_tx.clone();
         startup_tasks.push(tokio::spawn(async move {
@@ -1013,8 +1025,9 @@ pub async fn serve_with_options(
                     .await
                     .map(|p| p.len())
                     .unwrap_or(usize::MAX);
-                // A mesh quiesced on purpose has zero peers by design.
-                if peers == 0 && !watchdog_agent.mesh_quiesced() {
+                // A mesh that is off on purpose (quiesced, or deferred and
+                // not yet joined) has zero peers by design.
+                if peers == 0 && !watchdog_agent.mesh_off() {
                     let since = *zero_since.get_or_insert_with(std::time::Instant::now);
                     if since.elapsed() >= window {
                         tracing::error!(
@@ -1786,6 +1799,9 @@ pub async fn serve_with_options(
     // Join network in background — API is available immediately
     let join_agent = Arc::clone(&agent);
     let defer_mesh_join = config.defer_mesh_join;
+    if defer_mesh_join {
+        agent.mark_mesh_join_deferred();
+    }
 
     // Start the DM inbox as soon as join_network has created the gossip
     // runtime. join_network may keep working through slow bootstrap/cache
@@ -5187,6 +5203,21 @@ mod owner_singleton_tests {
 /// hydration bridge — pre-populated cache ⇒ reconcile hydrates with no
 /// event; ring overflow (`Lagged`) ⇒ the full reconcile recovers; a second
 /// reconcile run hydrates nothing.
+#[cfg(test)]
+mod zero_peer_watchdog_tests {
+    use super::zero_peer_watchdog_may_exit;
+
+    /// The watchdog hard-exits the process, so it never runs inside a host
+    /// application or for a daemon whose mesh dial is deferred.
+    #[test]
+    fn watchdog_never_exits_an_embedding_or_deferred_process() {
+        assert!(zero_peer_watchdog_may_exit(false, false));
+        assert!(!zero_peer_watchdog_may_exit(true, false));
+        assert!(!zero_peer_watchdog_may_exit(false, true));
+        assert!(!zero_peer_watchdog_may_exit(true, true));
+    }
+}
+
 #[cfg(test)]
 mod metered_relay_decision_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

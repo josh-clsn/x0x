@@ -540,3 +540,67 @@ fn test_direct_messaging_decode_too_short() {
 // - recv_direct_annotated() returns all messages with trust annotations
 // - Network layer drops oversized direct messages (>16MB + 32 bytes)
 // - Sender AgentId is self-asserted (security documentation)
+
+/// Raw-QUIC DMs keep working in both directions with a quiesced node: the
+/// latch silences the gossip plane, not the DM lane.
+async fn quiesced_node_exchanges_raw_dms(leaf: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = TempDir::new().unwrap();
+    let Some(alice) = create_loopback_test_agent(&temp_dir, "alice").await? else {
+        return Ok(());
+    };
+    let Some(bob) = create_loopback_test_agent(&temp_dir, "bob").await? else {
+        return Ok(());
+    };
+    alice.set_leaf_mode(leaf);
+    alice.join_network().await?;
+    bob.join_network().await?;
+
+    let alice_network = alice.network().expect("alice network").clone();
+    let bob_network = bob.network().expect("bob network").clone();
+    let alice_addr = normalize_loopback(alice_network.bound_addr().await.expect("alice bound"));
+    let bob_addr = normalize_loopback(bob_network.bound_addr().await.expect("bob bound"));
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_secs();
+    alice
+        .insert_discovered_agent_for_testing(discovered_agent(&bob, bob_addr, now_secs))
+        .await;
+    bob.insert_discovered_agent_for_testing(discovered_agent(&alice, alice_addr, now_secs))
+        .await;
+
+    alice.quiesce_mesh().await?;
+    assert!(alice.mesh_quiesced());
+
+    let mut bob_rx = bob.subscribe_direct();
+    let to_bob = b"quiesced-to-bob".to_vec();
+    let receipt = alice.send_direct(&bob.agent_id(), to_bob.clone()).await?;
+    assert_eq!(receipt.path, x0x::dm::DmPath::RawQuic);
+    let received = tokio::time::timeout(Duration::from_secs(5), bob_rx.recv())
+        .await
+        .expect("bob receives the DM from a quiesced node")
+        .expect("bob direct subscription remains open");
+    assert_eq!(received.payload, to_bob);
+    assert!(alice.mesh_quiesced(), "a DM does not lift the latch");
+
+    let mut alice_rx = alice.subscribe_direct();
+    let to_alice = b"to-quiesced-alice".to_vec();
+    let receipt = bob.send_direct(&alice.agent_id(), to_alice.clone()).await?;
+    assert_eq!(receipt.path, x0x::dm::DmPath::RawQuic);
+    let received = tokio::time::timeout(Duration::from_secs(5), alice_rx.recv())
+        .await
+        .expect("a quiesced node receives a DM")
+        .expect("alice direct subscription remains open");
+    assert_eq!(received.payload, to_alice);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quiesced_leaf_node_exchanges_raw_dms() -> Result<(), Box<dyn std::error::Error>> {
+    quiesced_node_exchanges_raw_dms(true).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quiesced_full_node_exchanges_raw_dms() -> Result<(), Box<dyn std::error::Error>> {
+    quiesced_node_exchanges_raw_dms(false).await
+}

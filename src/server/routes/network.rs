@@ -179,20 +179,42 @@ pub(in crate::server) async fn mesh_join(State(state): State<Arc<AppState>>) -> 
 /// it, so the initial rendezvous advert and the #1406 self-leave catch-up
 /// retry cannot be missed on either path.
 pub(in crate::server) async fn join_mesh(state: &Arc<AppState>, requested_at_epoch: u64) {
-    let dialled = state
-        .agent
-        .dial_bootstrap_superseding(requested_at_epoch)
-        .await;
-    run_after_dial(dialled, || post_join_hooks(state)).await;
+    join_mesh_with(
+        &state.agent,
+        state.agent.dial_bootstrap_superseding(requested_at_epoch),
+        || post_join_hooks(state),
+    )
+    .await;
 }
 
-/// Run `hooks` only when the dial ran (not superseded, not absent).
-async fn run_after_dial<H, F>(dialled: crate::error::Result<bool>, hooks: H) -> bool
+/// [`join_mesh`] with the dial and the hooks supplied, so a test can land a
+/// quiesce between them.
+async fn join_mesh_with<D, H, F>(agent: &x0x::Agent, dial: D, hooks: H) -> bool
+where
+    D: std::future::Future<Output = crate::error::Result<bool>>,
+    H: FnOnce() -> F,
+    F: std::future::Future<Output = ()>,
+{
+    let dialled = dial.await;
+    // Read after the dial returned and immediately before the hooks: a
+    // quiesce latches under the transition lock before it sweeps, so any
+    // quiesce that has begun is seen here.
+    let quiesced = agent.mesh_quiesced();
+    run_after_dial(dialled, quiesced, hooks).await
+}
+
+/// Run `hooks` only when the dial ran (not superseded, not absent) and the
+/// mesh is not quiesced now.
+async fn run_after_dial<H, F>(dialled: crate::error::Result<bool>, quiesced: bool, hooks: H) -> bool
 where
     H: FnOnce() -> F,
     F: std::future::Future<Output = ()>,
 {
     match dialled {
+        Ok(true) if quiesced => {
+            tracing::info!("mesh quiesced after the dial: skipping the post-join hooks");
+            false
+        }
         Ok(true) => {
             tracing::info!("Network joined");
             hooks().await;
@@ -208,6 +230,9 @@ where
 
 async fn post_join_hooks(state: &Arc<AppState>) {
     super::named_groups::retry_startup_self_leave_catchup(state).await;
+    if state.agent.mesh_quiesced() {
+        return;
+    }
     if let Some(validity_ms) = state.rendezvous_advert_validity_ms {
         if let Err(e) = state.agent.advertise_identity(validity_ms).await {
             tracing::warn!("Initial rendezvous advertisement failed: {e}");
@@ -1528,13 +1553,14 @@ pub(in crate::server) async fn peer_health_handler(
 mod join_hook_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::run_after_dial;
-
+    use super::{join_mesh_with, run_after_dial};
+    use crate::network::NetworkConfig;
+    use crate::Agent;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    async fn run(dialled: crate::error::Result<bool>) -> (bool, usize) {
+    async fn run(dialled: crate::error::Result<bool>, quiesced: bool) -> (bool, usize) {
         let runs = AtomicUsize::new(0);
-        let ran = run_after_dial(dialled, || async {
+        let ran = run_after_dial(dialled, quiesced, || async {
             runs.fetch_add(1, Ordering::Relaxed);
         })
         .await;
@@ -1542,14 +1568,71 @@ mod join_hook_tests {
     }
 
     /// Startup and `/mesh/join` share this path: the hooks run after a real
-    /// join and never after a superseded, absent or failed dial.
+    /// join and never after a superseded, absent, failed or quiesced dial.
     #[tokio::test]
     async fn post_join_hooks_run_only_after_a_real_join() {
-        assert_eq!(run(Ok(true)).await, (true, 1));
-        assert_eq!(run(Ok(false)).await, (false, 0));
+        assert_eq!(run(Ok(true), false).await, (true, 1));
+        assert_eq!(run(Ok(true), true).await, (false, 0));
+        assert_eq!(run(Ok(false), false).await, (false, 0));
         let failed = Err(crate::error::IdentityError::Storage(std::io::Error::other(
             "dial failed",
         )));
-        assert_eq!(run(failed).await, (false, 0));
+        assert_eq!(run(failed, false).await, (false, 0));
+    }
+
+    async fn loopback_agent(dir: &tempfile::TempDir) -> Agent {
+        Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..NetworkConfig::default()
+            })
+            .build()
+            .await
+            .expect("agent")
+    }
+
+    /// A quiesce that lands after the dial and before the hooks leaves the
+    /// hooks unrun, and one that lands mid-dial does the same.
+    #[tokio::test]
+    async fn quiesce_between_dial_and_hooks_skips_the_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = loopback_agent(&dir).await;
+        agent.start_network_infra().await.unwrap();
+        let runs = AtomicUsize::new(0);
+        let hooks = || async {
+            runs.fetch_add(1, Ordering::Relaxed);
+        };
+
+        let epoch = agent.mesh_transition_epoch();
+        let ran = join_mesh_with(&agent, agent.dial_bootstrap_superseding(epoch), hooks).await;
+        assert!(ran, "an undisturbed join runs the hooks");
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+
+        let epoch = agent.mesh_transition_epoch();
+        let ran = join_mesh_with(
+            &agent,
+            async {
+                let dialled = agent.dial_bootstrap_superseding(epoch).await;
+                agent.quiesce_mesh().await.unwrap();
+                dialled
+            },
+            hooks,
+        )
+        .await;
+        assert!(!ran);
+        assert_eq!(runs.load(Ordering::Relaxed), 1, "hooks must not run");
+        assert!(agent.mesh_quiesced());
+
+        let stale = agent.mesh_transition_epoch().wrapping_sub(1);
+        let ran = join_mesh_with(&agent, agent.dial_bootstrap_superseding(stale), hooks).await;
+        assert!(!ran, "a superseded join runs no hooks");
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
     }
 }
