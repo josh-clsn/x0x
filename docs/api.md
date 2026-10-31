@@ -169,7 +169,7 @@ Disabled unless an exec ACL is loaded with `[exec].enabled = true`. See
 | DELETE | `/groups/:id` | `x0x group leave` | Leave group; sole-member leave deletes the group (otherwise last admin is blocked) |
 | GET | `/groups/:id/members` | `x0x group members` | List members |
 | POST | `/groups/:id/members` | `x0x group add-member` | Add member (admin-authored) |
-| DELETE | `/groups/:id/members/:agent_id` | `x0x group remove-member` | Remove member (admin-authored) |
+| DELETE | `/groups/:id/members/:agent_id` | `x0x group remove-member` | Remove member (admin-authored); the response carries the signed `MemberRemoved` as `event` |
 | POST | `/groups/:id/invite` | `x0x group invite` | Generate invite link |
 | POST | `/groups/join` | `x0x group join` | Join from invite |
 | PUT | `/groups/:id/display-name` | `x0x group set-name` | Set display name |
@@ -192,7 +192,7 @@ still emits withdrawn cards so stale public listings are superseded.
 |---|---|---|---|
 | PATCH | `/groups/:id/policy` | `x0x group policy` | Update group policy (admin+) |
 | PATCH | `/groups/:id/members/:agent_id/role` | `x0x group set-role` | Change a member's role (admin+) |
-| POST | `/groups/:id/ban/:agent_id` | `x0x group ban` | Ban a member (admin+) |
+| POST | `/groups/:id/ban/:agent_id` | `x0x group ban` | Ban a member (admin+); the response carries the signed `MemberBanned` as `event` |
 | DELETE | `/groups/:id/ban/:agent_id` | `x0x group unban` | Unban a member (admin+) |
 | GET | `/groups/:id/requests` | `x0x group requests` | List join requests (admin+) |
 | POST | `/groups/:id/requests` | `x0x group request-access` | Submit a join request |
