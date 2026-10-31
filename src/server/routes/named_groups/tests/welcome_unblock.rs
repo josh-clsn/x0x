@@ -36,7 +36,10 @@ fn staged_welcome(
 ) -> (Vec<u8>, WelcomeRef, Vec<WelcomeBlobMessage>) {
     let chunk_size = x0x::files::DEFAULT_CHUNK_SIZE;
     let len = chunk_size * (chunks - 1) + 4096;
-    let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    let mut bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    // A nonce per Welcome: ids key the process-global ack gates, so tests
+    // running in one process never share one.
+    bytes[..16].copy_from_slice(&rand::random::<[u8; 16]>());
     let welcome_id = welcome_id_for_bytes(&bytes);
     let welcome_ref = WelcomeRef {
         welcome_id: welcome_id.clone(),
@@ -104,6 +107,8 @@ async fn welcome_completes_while_chunk_ack_receipts_never_arrive() -> anyhow::Re
                 tokio::spawn(async move {
                     for frame in frames {
                         dispatch_welcome_blob_message(&state, &owner_id, frame).await;
+                        // Let the ack task spawned for a chunk start.
+                        tokio::task::yield_now().await;
                     }
                     done.store(true, Ordering::SeqCst);
                 });
@@ -121,10 +126,7 @@ async fn welcome_completes_while_chunk_ack_receipts_never_arrive() -> anyhow::Re
     );
     tokio::task::yield_now().await;
     assert!(listener_done.load(Ordering::SeqCst));
-    assert!(
-        gate.started.load(Ordering::SeqCst) <= 2,
-        "one ack per chunk"
-    );
+    assert_eq!(gate.started.load(Ordering::SeqCst), 2, "one ack per chunk");
     // The assembled Welcome released its acks still waiting on receipts.
     assert_eq!(joiner.welcome_ack_tasks.in_flight(), 0);
     assert_eq!(joiner.welcome_chunk_ack_admission.in_flight(), 0);
@@ -658,6 +660,165 @@ async fn shutdown_drains_the_welcome_acks() -> anyhow::Result<()> {
         "no ack starts once shutdown has closed admission"
     );
     assert_eq!(joiner.welcome_ack_tasks.in_flight(), 0);
+    unpark_chunk_acks(&welcome_ref.welcome_id);
+    Ok(())
+}
+
+fn receive_for(
+    group_id: &str,
+    welcome_ref: &WelcomeRef,
+    total_chunks: u64,
+) -> PendingWelcomeReceive {
+    PendingWelcomeReceive {
+        group_id: group_id.to_string(),
+        source: welcome_ref.source.clone(),
+        byte_len: welcome_ref.byte_len,
+        total_chunks,
+        chunks: BTreeMap::new(),
+        received_bytes: 0,
+        ended_early: None,
+    }
+}
+
+/// A mismatched Offer ends the receive, and its acks with it.
+#[tokio::test]
+async fn an_offer_mismatch_releases_the_welcome_acks() -> anyhow::Result<()> {
+    let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+    let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+    let owner_id = owner.agent.agent_id();
+    let group_id = "ed".repeat(32);
+    let (_bytes, welcome_ref, frames) = staged_welcome(&owner, &group_id, 3);
+    let gate = park_chunk_acks(&welcome_ref.welcome_id);
+    joiner.pending_welcome_receives.write().await.insert(
+        welcome_ref.welcome_id.clone(),
+        receive_for(&group_id, &welcome_ref, 3),
+    );
+    for frame in frames[1..3].iter().cloned() {
+        dispatch_welcome_blob_message(&joiner, &owner_id, frame).await;
+    }
+    tokio::task::yield_now().await;
+    assert_eq!(gate.started.load(Ordering::SeqCst), 2);
+    assert_eq!(joiner.welcome_ack_tasks.in_flight(), 2);
+
+    let WelcomeBlobMessage::Offer {
+        group_id: offer_group,
+        welcome_id,
+        byte_len,
+        chunk_size,
+        total_chunks,
+        blake3_hex,
+    } = frames[0].clone()
+    else {
+        anyhow::bail!("the first frame is the Offer");
+    };
+    let wrong = WelcomeBlobMessage::Offer {
+        group_id: offer_group,
+        welcome_id,
+        byte_len: byte_len + 1,
+        chunk_size,
+        total_chunks,
+        blake3_hex,
+    };
+    dispatch_welcome_blob_message(&joiner, &owner_id, wrong).await;
+    assert!(joiner.pending_welcome_receives.read().await.is_empty());
+    assert_eq!(joiner.welcome_ack_tasks.in_flight(), 0);
+    assert_eq!(joiner.welcome_chunk_ack_admission.in_flight(), 0);
+    unpark_chunk_acks(&welcome_ref.welcome_id);
+    Ok(())
+}
+
+/// The last chunk's ack, spawned beside its own assemble, does not outlive
+/// it or hold a group slot.
+#[tokio::test]
+async fn the_last_chunks_ack_does_not_outlive_its_assemble() -> anyhow::Result<()> {
+    let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+    let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+    let owner_id = owner.agent.agent_id();
+    let group_id = "ee".repeat(32);
+    let (_bytes, welcome_ref, frames) = staged_welcome(&owner, &group_id, 2);
+    let gate = park_chunk_acks(&welcome_ref.welcome_id);
+    joiner.pending_welcome_receives.write().await.insert(
+        welcome_ref.welcome_id.clone(),
+        receive_for(&group_id, &welcome_ref, 2),
+    );
+    // Chunk 0, the Complete ahead of chunk 1, then chunk 1.
+    for frame in [frames[1].clone(), frames[3].clone(), frames[2].clone()] {
+        dispatch_welcome_blob_message(&joiner, &owner_id, frame).await;
+    }
+    tokio::task::yield_now().await;
+    assert!(joiner.pending_welcome_receives.read().await.is_empty());
+    assert_eq!(joiner.welcome_ack_tasks.in_flight(), 0);
+    assert_eq!(joiner.welcome_chunk_ack_admission.in_flight(), 0);
+    unpark_chunk_acks(&welcome_ref.welcome_id);
+    let _ = gate;
+    Ok(())
+}
+
+/// A chunk that fails to decode ends the fetch with its receive and acks
+/// cleaned up, and the next fetch sends its first request at once.
+#[tokio::test]
+async fn a_chunk_that_fails_to_decode_cleans_up_its_receive_and_acks() -> anyhow::Result<()> {
+    let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+    let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+    let owner_id = owner.agent.agent_id();
+    let group_id = "ef".repeat(32);
+    let (_bytes, welcome_ref, frames) = staged_welcome(&owner, &group_id, 2);
+    let gate = park_chunk_acks(&welcome_ref.welcome_id);
+    tokio::time::pause();
+    let schedule = [Duration::ZERO, Duration::from_millis(10)];
+    let listener_state = Arc::clone(&joiner);
+    let bad = WelcomeBlobMessage::Chunk {
+        welcome_id: welcome_ref.welcome_id.clone(),
+        sequence: 1,
+        data: "not base64!".to_string(),
+    };
+    let failed = fetch_treekem_welcome_via_schedule(
+        &joiner,
+        &group_id,
+        &welcome_ref,
+        move |_, _| {
+            let state = Arc::clone(&listener_state);
+            let (offer, chunk0, bad) = (frames[0].clone(), frames[1].clone(), bad.clone());
+            async move {
+                tokio::spawn(async move {
+                    for frame in [offer, chunk0, bad] {
+                        dispatch_welcome_blob_message(&state, &owner_id, frame).await;
+                    }
+                });
+                Ok(())
+            }
+        },
+        &schedule,
+        Duration::from_millis(50),
+    )
+    .await;
+    let error = failed.expect_err("the bad chunk ends the fetch");
+    assert!(error.contains("decode failed"), "{error}");
+    assert_eq!(gate.started.load(Ordering::SeqCst), 1, "chunk 0 was acked");
+    assert!(joiner.pending_welcome_receives.read().await.is_empty());
+    assert_eq!(joiner.welcome_ack_tasks.in_flight(), 0);
+    assert_eq!(joiner.welcome_chunk_ack_admission.in_flight(), 0);
+
+    let sends = Arc::new(AtomicUsize::new(0));
+    let sent = Arc::clone(&sends);
+    let again = fetch_treekem_welcome_via_schedule(
+        &joiner,
+        &group_id,
+        &welcome_ref,
+        move |_, _| {
+            sent.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(()))
+        },
+        &schedule,
+        Duration::from_millis(50),
+    )
+    .await;
+    assert!(again.is_err(), "nothing streams in this test");
+    assert_eq!(
+        sends.load(Ordering::SeqCst),
+        2,
+        "the first request goes out (attempt 0), then the retry"
+    );
     unpark_chunk_acks(&welcome_ref.welcome_id);
     Ok(())
 }

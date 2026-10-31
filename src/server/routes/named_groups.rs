@@ -46989,13 +46989,7 @@ async fn poll_join_result_until_deadline(
                 .groups_diagnostics
                 .record_join_attempt_timed_out(&group_id);
         } else if attempt_id.is_empty() {
-            // A poll respawned at boot owns no attempt and, with stubs not
-            // persisted, usually finds no pending stub, so the finalizer
-            // returns before it marks the pin. End the pin here as a live
-            // timeout does: it keeps authorizing a late result but no
-            // longer reads as a pending join or a re-key in flight.
-            mark_expected_join_result_inviter_timed_out(state.as_ref(), &expected_key);
-            persist_join_result_pins(state.as_ref()).await;
+            end_legacy_poll_pin(state.as_ref(), &expected_key).await;
         }
     } else {
         // #477 C5: a confirmed seat finalizes the attempt bookkeeping
@@ -47018,6 +47012,20 @@ async fn poll_join_result_until_deadline(
         )
         .await;
     }
+}
+
+/// A poll respawned at boot owns no attempt and, with stubs not persisted,
+/// usually finds no pending stub, so the finalizer returns before it marks
+/// the pin. End the pin here as a live timeout does: it keeps authorizing a
+/// late result but no longer reads as a pending join or a re-key in flight.
+/// Only while no attempt is registered for `expected_key`: a fresh invite
+/// that registered one owns the pin now.
+async fn end_legacy_poll_pin(state: &AppState, expected_key: &str) {
+    if !join_attempt_is_current_locked(state, expected_key, "") {
+        return;
+    }
+    mark_expected_join_result_inviter_timed_out(state, expected_key);
+    persist_join_result_pins(state).await;
 }
 
 async fn stage_treekem_welcome(
@@ -47330,9 +47338,9 @@ where
         if attempt > 0 {
             let (progress_bytes, ended_early) = state
                 .pending_welcome_receives
-                .write()
+                .read()
                 .await
-                .get_mut(&welcome_ref.welcome_id)
+                .get(&welcome_ref.welcome_id)
                 .map_or((0, None), |receive| {
                     (receive.received_bytes, receive.ended_early)
                 });
@@ -47391,7 +47399,11 @@ where
     }
     drop(requests);
     let received = match received {
-        Some(Ok(result)) => result?,
+        Some(Ok(Ok(bytes))) => bytes,
+        Some(Ok(Err(error))) => {
+            cleanup_welcome_fetch_state(state, &welcome_ref.welcome_id).await;
+            return Err(error);
+        }
         Some(Err(_)) => return Err("TreeKEM Welcome waiter dropped".to_string()),
         None => {
             cleanup_welcome_fetch_state(state, &welcome_ref.welcome_id).await;
@@ -48102,10 +48114,12 @@ async fn handle_welcome_blob_chunk(
     let group_id = receive.group_id.clone();
     drop(receives);
     tracing::debug!(target: "welcome.trace", stage = "chunk_recv", welcome_id = %LogHexId::new("welcome", &welcome_id), seq = sequence);
+    // The ack goes first: the assemble releases the Welcome's acks, this
+    // last one included, so none outlives the receive.
+    spawn_welcome_chunk_ack(state, sender, &group_id, welcome_id.clone(), sequence);
     if assemble {
         handle_welcome_blob_complete(state, sender, &welcome_id).await;
     }
-    spawn_welcome_chunk_ack(state, sender, &group_id, welcome_id, sequence);
 }
 
 /// Acknowledge a received Welcome chunk without holding the Welcome
@@ -48152,6 +48166,7 @@ fn spawn_welcome_chunk_ack(
             welcome_id: welcome_id.clone(),
             sequence,
         };
+        let started = tokio::time::Instant::now();
         match tokio::time::timeout(
             WELCOME_CHUNK_ACK_BUDGET,
             send_welcome_chunk_ack(&task_state, &owner, &ack),
@@ -48162,10 +48177,10 @@ fn spawn_welcome_chunk_ack(
                 tracing::debug!(target: "welcome.trace", stage = "chunk_ack_sent", welcome_id = %LogHexId::new("welcome", &welcome_id), seq = sequence);
             }
             Ok(Err(e)) => {
-                tracing::warn!(target: "welcome.trace", stage = "chunk_ack_failed", welcome_id = %LogHexId::new("welcome", &welcome_id), seq = sequence, "failed to ack Welcome blob chunk: {e}");
+                tracing::warn!(target: "welcome.trace", stage = "chunk_ack_failed", welcome_id = %LogHexId::new("welcome", &welcome_id), seq = sequence, age_ms = started.elapsed().as_millis() as u64, "failed to ack Welcome blob chunk: {e}");
             }
             Err(_) => {
-                tracing::warn!(target: "welcome.trace", stage = "chunk_ack_budget_spent", welcome_id = %LogHexId::new("welcome", &welcome_id), seq = sequence, "Welcome blob chunk ack ran out of its budget");
+                tracing::info!(target: "welcome.trace", stage = "chunk_ack_budget_spent", welcome_id = %LogHexId::new("welcome", &welcome_id), seq = sequence, "Welcome blob chunk ack ran out of its budget");
             }
         }
     };

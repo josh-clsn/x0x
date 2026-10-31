@@ -579,3 +579,49 @@ fn parse_member(hex_id: &str) -> Result<AgentId> {
         .map_err(|_| anyhow::anyhow!("agent id is 32 bytes"))?;
     Ok(AgentId(bytes))
 }
+
+/// R-1: a legacy (respawned) poll that times out ends the pin only while no
+/// attempt is registered for its key. A fresh invite's attempt owns the pin.
+#[tokio::test]
+async fn a_legacy_poll_timeout_leaves_a_newer_attempts_pin_alone() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let event_group = hex::encode(rand::random::<[u8; 16]>());
+    let member = hex::encode(rand::random::<[u8; 32]>());
+    let inviter = hex::encode(rand::random::<[u8; 32]>());
+    let key = join_result_key(&event_group, &member);
+
+    record_expected_join_result_inviter(&state, key.clone(), inviter.clone());
+    end_legacy_poll_pin(&state, &key).await;
+    assert_eq!(
+        join_result_pin_view(&state, &key).map(|(_, timed_out, _)| timed_out),
+        Some(true),
+        "with no attempt registered, the legacy timeout ends the pin"
+    );
+
+    record_expected_join_result_inviter(&state, key.clone(), inviter.clone());
+    state
+        .pending_join_attempts
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(
+            key.clone(),
+            PendingJoinAttempt {
+                attempt_id: "fresh-attempt".to_string(),
+                local_group_key: event_group.clone(),
+                invite_fingerprint: "fp".to_string(),
+                invite_group_id: event_group.clone(),
+                inviter_public_key_b64: String::new(),
+                stored_resend: None,
+                polls: Vec::new(),
+                tasks: Vec::new(),
+                listener_token: None,
+            },
+        );
+    end_legacy_poll_pin(&state, &key).await;
+    assert_eq!(
+        join_result_pin_view(&state, &key).map(|(_, timed_out, _)| timed_out),
+        Some(false),
+        "a newer attempt's pin stays armed"
+    );
+    Ok(())
+}
