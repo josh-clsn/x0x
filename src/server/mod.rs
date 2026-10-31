@@ -3349,8 +3349,9 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
     }
     // #1274: the ADR 0107 join-artifact egress tasks (join-result and
     // control-blob sends, secure shares) hold this AppState up to their
-    // artifact deadline: a secure share to an unavailable member retries for
-    // up to `PENDING_JOIN_RESULT_TTL` (24 h). They only send, and a removal
+    // artifact deadline: a join-artifact copy to an unavailable member for
+    // up to `PENDING_JOIN_RESULT_TTL` (24 h), a secure share for up to
+    // `SECURE_SHARE_DELIVERY_HORIZON` (10 min). They only send, and a removal
     // or ban already aborts them at any await point, so they are abortable
     // by design. They stay in their registry, which that quiesce uses, so
     // they are not taken here: they share the grace window above, and any

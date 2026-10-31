@@ -2329,8 +2329,11 @@ async fn publish_secure_share(
 }
 
 /// ADR 0107 / D60 (r5, G11): how long a class-K share delivery may stay
-/// pending (withheld) before it is dropped.
-const SECURE_SHARE_DELIVERY_HORIZON: Duration = PENDING_JOIN_RESULT_TTL;
+/// pending (withheld) before it is dropped. Upstream's 10 minutes: the
+/// fork's 24 h staging is for a join's own artifacts (result, Welcome,
+/// control blobs), which its join poll fetches for that long; no fork path
+/// waits on a share past this horizon.
+const SECURE_SHARE_DELIVERY_HORIZON: Duration = Duration::from_secs(10 * 60);
 
 /// ADR 0107 / D60 (r5, G11): admitted sends per share (the first and the
 /// [`GROUP_BACKGROUND_PUBLISH_DELAY`] resend), each admitted afresh.
@@ -40608,9 +40611,10 @@ struct JoinResultStagingSidecar {
 /// propagation tests were calibrated against.
 const MEMBER_JOINED_RESEND_INTERVAL: Duration = Duration::from_secs(6);
 
-/// Stop resending after this many attempts (~2 min at the cadence above);
-/// the poll itself keeps running to `JOIN_RESULT_POLL_HORIZON`.
-const MEMBER_JOINED_RESEND_MAX_ATTEMPTS: u32 = 20;
+/// Stop resending after this many attempts: 6 s for 10 minutes, as stock
+/// 0.48.1 resent on its fixed 2 s poll. The poll itself keeps running to
+/// `JOIN_RESULT_POLL_HORIZON` on its backoff.
+const MEMBER_JOINED_RESEND_MAX_ATTEMPTS: u32 = 100;
 
 const JOIN_RESULT_STAGING_SIDECAR_VERSION: u32 = 1;
 
@@ -46540,6 +46544,7 @@ async fn poll_join_result_until_deadline(
 ) {
     let expected_key = join_result_key(&event_group_id, &member_agent_id);
     let mut attempt: u32 = 0;
+    let mut next_fetch_at = tokio::time::Instant::now();
     let mut timed_out = true;
     let mut already_finalized = false;
     let mut superseded = false;
@@ -46695,79 +46700,91 @@ async fn poll_join_result_until_deadline(
         // Currency verified under the lock: release it BEFORE the network
         // send (the fetch can block for the full ack timeout).
         drop(membership_guard);
-        let request = JoinResultMessage::FetchRequest {
-            group_id: event_group_id.clone(),
-            member_agent_id: member_agent_id.clone(),
-            from_revision,
-            base_state_hash,
-            // #477: this joiner understands Refused receipts; bind the
-            // fetch to this attempt so a stale staged refusal is not
-            // served.
-            accepts_refusal: true,
-            accepts_control_blob_ref: true,
-            attempt_id: Some(attempt_id.clone()),
-            signed_by: build_catchup_signer(
-                &state,
-                &join_result_fetch_sign_input(&event_group_id, &member_agent_id),
-            ),
-        };
-        let payload = match serde_json::to_vec(&request) {
-            Ok(payload) => payload,
-            Err(e) => {
-                tracing::warn!(group_id = %LogHexId::group(&group_id), "failed to serialize join-result fetch request: {e}");
-                return;
+        if tokio::time::Instant::now() >= next_fetch_at {
+            let request = JoinResultMessage::FetchRequest {
+                group_id: event_group_id.clone(),
+                member_agent_id: member_agent_id.clone(),
+                from_revision,
+                base_state_hash,
+                // #477: this joiner understands Refused receipts; bind the
+                // fetch to this attempt so a stale staged refusal is not
+                // served.
+                accepts_refusal: true,
+                accepts_control_blob_ref: true,
+                attempt_id: Some(attempt_id.clone()),
+                signed_by: build_catchup_signer(
+                    &state,
+                    &join_result_fetch_sign_input(&event_group_id, &member_agent_id),
+                ),
+            };
+            let payload = match serde_json::to_vec(&request) {
+                Ok(payload) => payload,
+                Err(e) => {
+                    tracing::warn!(group_id = %LogHexId::group(&group_id), "failed to serialize join-result fetch request: {e}");
+                    return;
+                }
+            };
+            let payload_len = payload.len();
+            let payload_hash = hex::encode(blake3::hash(&payload).as_bytes());
+            tracing::debug!(
+                target: "treekem.trace",
+                stage = "fetch_request_send_start",
+                group_id = %group_id,
+                event_group_id = %event_group_id,
+                member = %member_agent_id,
+                targets = targets.len(),
+                payload_len,
+                payload_hash = %payload_hash,
+            );
+            #[cfg(test)]
+            if let Ok(mut sent) = JOIN_FETCHES_SENT_FOR_TEST.lock() {
+                match sent.iter_mut().find(|(g, _)| g == &group_id) {
+                    Some((_, n)) => *n += 1,
+                    None => sent.push((group_id.clone(), 1)),
+                }
             }
-        };
-        let payload_len = payload.len();
-        let payload_hash = hex::encode(blake3::hash(&payload).as_bytes());
-        tracing::debug!(
-            target: "treekem.trace",
-            stage = "fetch_request_send_start",
-            group_id = %group_id,
-            event_group_id = %event_group_id,
-            member = %member_agent_id,
-            targets = targets.len(),
-            payload_len,
-            payload_hash = %payload_hash,
-        );
-        #[cfg(test)]
-        if let Ok(mut sent) = JOIN_FETCHES_SENT_FOR_TEST.lock() {
-            match sent.iter_mut().find(|(g, _)| g == &group_id) {
-                Some((_, n)) => *n += 1,
-                None => sent.push((group_id.clone(), 1)),
+            for target in &targets {
+                if let Err(e) = state
+                    .agent
+                    .send_direct_with_config(target, payload.clone(), direct_message_send_config())
+                    .await
+                {
+                    tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch attempt failed: {e}");
+                    tracing::debug!(
+                        target: "treekem.trace",
+                        stage = "fetch_request_send_err",
+                        group_id = %group_id,
+                        event_group_id = %event_group_id,
+                        member = %member_agent_id,
+                        payload_len,
+                        payload_hash = %payload_hash,
+                        error = %e,
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "treekem.trace",
+                        stage = "fetch_request_send_ok",
+                        group_id = %group_id,
+                        event_group_id = %event_group_id,
+                        member = %member_agent_id,
+                        payload_len,
+                        payload_hash = %payload_hash,
+                    );
+                }
             }
+            next_fetch_at = tokio::time::Instant::now() + join_result_poll_delay(attempt);
+            attempt = attempt.saturating_add(1);
         }
-        for target in &targets {
-            if let Err(e) = state
-                .agent
-                .send_direct_with_config(target, payload.clone(), direct_message_send_config())
-                .await
-            {
-                tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch attempt failed: {e}");
-                tracing::debug!(
-                    target: "treekem.trace",
-                    stage = "fetch_request_send_err",
-                    group_id = %group_id,
-                    event_group_id = %event_group_id,
-                    member = %member_agent_id,
-                    payload_len,
-                    payload_hash = %payload_hash,
-                    error = %e,
-                );
-            } else {
-                tracing::debug!(
-                    target: "treekem.trace",
-                    stage = "fetch_request_send_ok",
-                    group_id = %group_id,
-                    event_group_id = %event_group_id,
-                    member = %member_agent_id,
-                    payload_len,
-                    payload_hash = %payload_hash,
-                );
-            }
-        }
-        tokio::time::sleep(join_result_poll_delay(attempt)).await;
-        attempt = attempt.saturating_add(1);
+        // The fetch backs off; the #333 resend keeps its own wall-clock
+        // cadence, so the loop wakes for whichever is due first.
+        let resend_due =
+            member_joined.is_some() && resend_attempts < MEMBER_JOINED_RESEND_MAX_ATTEMPTS;
+        let wake = if resend_due {
+            next_fetch_at.min(next_resend_at)
+        } else {
+            next_fetch_at
+        };
+        tokio::time::sleep_until(wake.min(deadline)).await;
     }
     // #477 (r5 item 2): finalize takes the membership guard from its
     // caller — the poll acquires the (lookup-gated) lock here so the
@@ -48110,6 +48127,7 @@ pub(in crate::server) mod tests {
     mod adr0068_quarantine_pin;
     mod adr0068_task_buffer;
     mod adr0107_stuck_join_rearm;
+    mod batch3_carries;
     mod cache_hardening_followup;
     mod engine_a_apply_gate;
     mod engine_a_doors;

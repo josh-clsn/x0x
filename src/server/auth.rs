@@ -1273,6 +1273,16 @@ mod tests {
             &Method::POST,
             &format!("/groups/{g}/join-result/{m}")
         ));
+        // axum answers HEAD with the GET handler, so the route layer pins
+        // HEAD on its own.
+        assert!(requires_durable_owner(
+            &Method::HEAD,
+            &format!("/groups/{g}/join-result/{m}")
+        ));
+        assert!(!requires_durable_owner(
+            &Method::HEAD,
+            &format!("/groups/{g}/apply-metadata-event")
+        ));
         assert!(!requires_durable_owner(
             &Method::GET,
             &format!("/groups/{g}/apply-metadata-event")
