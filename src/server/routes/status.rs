@@ -172,6 +172,12 @@ fn one_sided_reason(count: usize) -> String {
     )
 }
 
+/// A mesh that is off on purpose (`POST /mesh/quiesce`) has zero peers by
+/// design; that is not a wedged transport.
+fn quiesced_idle(quiesced: bool, peers: usize, one_sided_peers: usize) -> bool {
+    quiesced && peers == 0 && one_sided_peers == 0
+}
+
 fn classify_health(
     peers: usize,
     send_ready_peers: usize,
@@ -256,7 +262,11 @@ pub(in crate::server) async fn health(
     let (peers, send_ready_peers, one_sided_peers) = state.health_snapshot.load();
     let uptime_secs = state.start_time.elapsed().as_secs();
     let (status, degraded_reason) =
-        classify_health(peers, send_ready_peers, uptime_secs, one_sided_peers);
+        if quiesced_idle(state.agent.mesh_quiesced(), peers, one_sided_peers) {
+            ("healthy", None)
+        } else {
+            classify_health(peers, send_ready_peers, uptime_secs, one_sided_peers)
+        };
 
     Json(ApiResponse {
         ok: true,
@@ -360,13 +370,25 @@ pub(in crate::server) async fn status(
     }
 
     let one_sided_peers = state.health_snapshot.load().2;
-    let (connectivity, degraded_reason) = classify_runtime_status(
-        peers,
-        send_ready_peers,
-        uptime_secs,
-        !warnings.is_empty(),
-        one_sided_peers,
-    );
+    let (connectivity, degraded_reason) =
+        if quiesced_idle(state.agent.mesh_quiesced(), peers, one_sided_peers) {
+            (
+                if warnings.is_empty() {
+                    "isolated"
+                } else {
+                    "degraded"
+                },
+                None,
+            )
+        } else {
+            classify_runtime_status(
+                peers,
+                send_ready_peers,
+                uptime_secs,
+                !warnings.is_empty(),
+                one_sided_peers,
+            )
+        };
     if let Some(reason) = degraded_reason {
         warnings.push(reason);
     }
@@ -440,7 +462,7 @@ pub(in crate::server) async fn get_constitution_json() -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_health, classify_runtime_status, HealthSnapshot};
+    use super::{classify_health, classify_runtime_status, quiesced_idle, HealthSnapshot};
     use crate as x0x;
 
     /// The `health` handler's own source, for the structural guard below.
@@ -510,6 +532,14 @@ mod tests {
     /// WHY (issue #262): a wedged-transport daemon — up for hours, zero
     /// peers, silent socket — must not read `healthy` to fleet monitoring.
     /// That exact state hid the NYC prod bootstrap outage for 6+ hours.
+    #[test]
+    fn quiesced_mesh_with_zero_peers_is_not_a_wedged_transport() {
+        assert!(quiesced_idle(true, 0, 0));
+        assert!(!quiesced_idle(false, 0, 0));
+        assert!(!quiesced_idle(true, 1, 0));
+        assert!(!quiesced_idle(true, 0, 1));
+    }
+
     #[test]
     fn zero_peers_past_grace_is_degraded() {
         let (status, reason) = classify_health(0, 0, 121, 0);

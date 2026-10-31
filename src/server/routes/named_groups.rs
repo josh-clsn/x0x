@@ -45851,6 +45851,7 @@ pub(in crate::server) mod tests {
             shutdown_tx,
             shutdown_notify,
             update_config: DaemonUpdateConfig::default(),
+            rendezvous_advert_validity_ms: None,
             self_update_enabled: false,
             upgrade_check_cache: Mutex::new(None),
             upgrade_apply_lock: Arc::new(Mutex::new(())),

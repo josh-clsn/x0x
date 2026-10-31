@@ -1317,6 +1317,9 @@ pub(super) struct AppState {
     pub(super) shutdown_notify: watch::Sender<bool>,
     /// Update configuration honored by manual API-triggered update checks.
     pub(super) update_config: DaemonUpdateConfig,
+    /// Validity of the initial rendezvous advert published after a mesh
+    /// join; `None` when rendezvous adverts are disabled.
+    pub(super) rendezvous_advert_validity_ms: Option<u64>,
     /// Whether install/restart-capable self-update is allowed. `false` on the
     /// embed path so `/upgrade/apply` cannot replace/restart the host process.
     pub(super) self_update_enabled: bool,

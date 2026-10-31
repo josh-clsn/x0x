@@ -77,13 +77,13 @@ use routes::{
     handle_treekem_catchup_response, health, history_diagnostics, history_list, history_message,
     history_policy, history_purge, history_retain, history_scopes, history_search, history_stats,
     identity_revocations, identity_revoke, import_agent_card, import_group_card,
-    ingest_public_message, introduction, join_group_via_invite, join_kv_store, leave_group,
-    list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys, list_kv_stores,
-    list_machines, list_mls_groups, list_named_groups, list_revocations, list_task_lists,
-    list_tasks, listener_restart_context, load_causal_approval_queue, load_named_groups_merged,
-    load_predecessor_relay_outbox, load_requester_offer_outbox, load_treekem_member_key_packages,
-    machine_for_agent_handler, machines_by_user_handler, mesh_join, mesh_quiesce,
-    migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
+    ingest_public_message, introduction, join_group_via_invite, join_kv_store, join_mesh,
+    leave_group, list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys,
+    list_kv_stores, list_machines, list_mls_groups, list_named_groups, list_revocations,
+    list_task_lists, list_tasks, listener_restart_context, load_causal_approval_queue,
+    load_named_groups_merged, load_predecessor_relay_outbox, load_requester_offer_outbox,
+    load_treekem_member_key_packages, machine_for_agent_handler, machines_by_user_handler,
+    mesh_join, mesh_quiesce, migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
     named_group_metadata_event_group_id, network_status, now_millis_u64, owner_agents,
     owner_agents_issue, owner_agents_revoke, owner_riders_issue, owner_riders_list,
     owner_riders_revoke, peer_health_handler, peers, pin_machine, presence, presence_find,
@@ -1013,7 +1013,8 @@ pub async fn serve_with_options(
                     .await
                     .map(|p| p.len())
                     .unwrap_or(usize::MAX);
-                if peers == 0 {
+                // A mesh quiesced on purpose has zero peers by design.
+                if peers == 0 && !watchdog_agent.mesh_quiesced() {
                     let since = *zero_since.get_or_insert_with(std::time::Instant::now);
                     if since.elapsed() >= window {
                         tracing::error!(
@@ -1319,6 +1320,9 @@ pub async fn serve_with_options(
         shutdown_tx,
         shutdown_notify,
         update_config: config.update.clone(),
+        rendezvous_advert_validity_ms: config
+            .rendezvous_enabled
+            .then_some(config.rendezvous_validity_ms),
         self_update_enabled,
         upgrade_check_cache: Mutex::new(None),
         upgrade_apply_lock: Arc::new(Mutex::new(())),
@@ -1781,8 +1785,6 @@ pub async fn serve_with_options(
 
     // Join network in background — API is available immediately
     let join_agent = Arc::clone(&agent);
-    let rendezvous_enabled = config.rendezvous_enabled;
-    let rendezvous_validity_ms = config.rendezvous_validity_ms;
     let defer_mesh_join = config.defer_mesh_join;
 
     // Start the DM inbox as soon as join_network has created the gossip
@@ -1838,22 +1840,8 @@ pub async fn serve_with_options(
             tracing::info!("mesh join deferred (defer_mesh_join): POST /mesh/join to dial");
             return;
         }
-        match join_agent.dial_bootstrap().await {
-            Ok(()) => {
-                tracing::info!("Network joined");
-                routes::named_groups::retry_startup_self_leave_catchup(&join_rekey_state).await;
-                if rendezvous_enabled {
-                    if let Err(e) = join_agent.advertise_identity(rendezvous_validity_ms).await {
-                        tracing::warn!("Initial rendezvous advertisement failed: {e}");
-                    } else {
-                        tracing::info!("Rendezvous advertisement published");
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::error!("Failed to join network: {e}");
-            }
-        }
+        let epoch = join_agent.mesh_transition_epoch();
+        join_mesh(&join_rekey_state, epoch).await;
     }));
 
     let self_published_release_manifests =

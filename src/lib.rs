@@ -773,6 +773,9 @@ pub struct Agent {
     dm_inflight_acks: std::sync::Arc<dm::InFlightAcks>,
     /// Receiver-side dedupe cache.
     recent_delivery_cache: std::sync::Arc<dm::RecentDeliveryCache>,
+    /// Set once the presence broadcast-peer refresh task is running, so
+    /// repeated `dial_bootstrap` calls (mesh join/quiesce flips) share one.
+    presence_refresh_started: std::sync::atomic::AtomicBool,
     /// Handle for the running capability advert service.
     capability_advert_service:
         tokio::sync::Mutex<Option<dm_capability_service::CapabilityAdvertService>>,
@@ -4734,6 +4737,14 @@ const fn relay_opt_in_declared(argv_opt_in: bool, env_opt_in: bool, metered_leaf
     !metered_leaf && (argv_opt_in || env_opt_in)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam: the (argv, env) opt-in sources for this thread, standing in
+    /// for what the process observed.
+    static RELAY_OPT_IN_TEST_SOURCES: std::cell::Cell<Option<(bool, bool)>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// #398: explicit operator opt-in for announcing relay/coordinator
 /// capability without verified public reachability (manually
 /// port-forwarded hosts, hosts behind an operator-trusted edge). The
@@ -4745,7 +4756,7 @@ const fn relay_opt_in_declared(argv_opt_in: bool, env_opt_in: bool, metered_leaf
 /// for the life of the process.
 fn relay_opt_in_explicit() -> bool {
     static OPT_IN: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
-    let (argv_opt_in, env_opt_in) = *OPT_IN.get_or_init(|| {
+    let observed = *OPT_IN.get_or_init(|| {
         (
             // Command line: --relay / --relay-opt-in flag present.
             std::env::args().any(|arg| arg == "--relay" || arg == "--relay-opt-in"),
@@ -4753,6 +4764,11 @@ fn relay_opt_in_explicit() -> bool {
             std::env::var_os("X0X_RELAY_OPT_IN").is_some_and(|v| v == "1"),
         )
     });
+    #[cfg(test)]
+    let observed = RELAY_OPT_IN_TEST_SOURCES
+        .with(std::cell::Cell::get)
+        .unwrap_or(observed);
+    let (argv_opt_in, env_opt_in) = observed;
     relay_opt_in_declared(
         argv_opt_in,
         env_opt_in,
@@ -14416,7 +14432,7 @@ impl Agent {
                         let suppressed = net.is_reconnect_suppressed(announcement.machine_id.0);
                         let connected = net.is_connected(&ant_peer).await;
                         let leaf = listener_leaf_mode.load(std::sync::atomic::Ordering::Relaxed);
-                        if announcement_should_auto_connect(leaf, suppressed, connected) {
+                        if announcement_should_auto_connect(leaf, net.mesh_quiesced(), suppressed, connected) {
                             auto_connect_attempts
                                 .insert(announcement.agent_id, tokio::time::Instant::now());
                             let net = std::sync::Arc::clone(net);
@@ -14685,7 +14701,7 @@ impl Agent {
     pub async fn dial_bootstrap(&self) -> error::Result<()> {
         // For a direct caller, "request time" is entry time.
         let epoch = self.mesh_transition_epoch();
-        self.dial_bootstrap_superseding(epoch).await
+        self.dial_bootstrap_superseding(epoch).await.map(|_| ())
     }
 
     /// [`dial_bootstrap`](Agent::dial_bootstrap) with an explicit request
@@ -14698,12 +14714,14 @@ impl Agent {
     ///
     /// # Errors
     ///
-    /// Propagates [`dial_bootstrap`](Agent::dial_bootstrap)'s errors; a
-    /// superseded dial is `Ok(())`.
-    pub async fn dial_bootstrap_superseding(&self, requested_at_epoch: u64) -> error::Result<()> {
+    /// Propagates [`dial_bootstrap`](Agent::dial_bootstrap)'s errors. Returns
+    /// `Ok(true)` when the dial ran and `Ok(false)` when it was superseded
+    /// by a newer quiesce or there is no network, so callers run their
+    /// post-join work only after a real join.
+    pub async fn dial_bootstrap_superseding(&self, requested_at_epoch: u64) -> error::Result<bool> {
         let Some(network) = self.network.as_ref() else {
             tracing::debug!("dial_bootstrap called but no network configured");
-            return Ok(());
+            return Ok(false);
         };
 
         // Mesh-on: lift the quiesce latch first so the accept loop and the
@@ -14715,7 +14733,7 @@ impl Agent {
                 requested_at_epoch,
                 "dial_bootstrap superseded by a newer mesh quiesce; staying latched"
             );
-            return Ok(());
+            return Ok(false);
         }
 
         let bootstrap_nodes = network.config().bootstrap_nodes.clone();
@@ -14937,48 +14955,53 @@ impl Agent {
                 let runtime_clone = runtime.clone();
                 let network_clone = self.network.as_ref().map(std::sync::Arc::clone);
                 let token = self.shutdown_token.clone();
-                self.spawn_tracked(async move {
-                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-                    interval.tick().await; // first tick fires immediately; startup already seeded
-                    loop {
-                        tokio::select! {
-                            _ = interval.tick() => {}
-                            // Inert until shutdown; then the 30s timer loop exits
-                            // instead of being merely aborted.
-                            _ = token.cancelled() => break,
+                if self.claim_presence_refresh() {
+                    self.spawn_tracked(async move {
+                        let mut interval =
+                            tokio::time::interval(std::time::Duration::from_secs(30));
+                        interval.tick().await; // first tick fires immediately; startup already seeded
+                        loop {
+                            tokio::select! {
+                                _ = interval.tick() => {}
+                                // Inert until shutdown; then the 30s timer loop exits
+                                // instead of being merely aborted.
+                                _ = token.cancelled() => break,
+                            }
+
+                            let active = runtime_clone.membership().active_view();
+                            let active_view_count = active.len();
+
+                            let mut connected = Vec::new();
+                            if let Some(ref net) = network_clone {
+                                connected = net
+                                    .connected_peers()
+                                    .await
+                                    .into_iter()
+                                    .map(|peer| saorsa_gossip_types::PeerId::new(peer.0))
+                                    .collect();
+                            }
+                            let connected_peer_count = connected.len();
+                            // x0x#1036: active-view peers without a connection
+                            // are not beacon targets (see presence_broadcast_targets).
+                            let broadcast_peers = gossip::stale_targets::presence_broadcast_targets(
+                                active, &connected,
+                            );
+
+                            pw_clone
+                                .manager()
+                                .replace_broadcast_peers(broadcast_peers)
+                                .await;
+                            let broadcast_peer_count =
+                                pw_clone.manager().broadcast_peer_count().await;
+                            tracing::info!(
+                                active_view_count,
+                                connected_peer_count,
+                                broadcast_peer_count,
+                                "Presence broadcast peer refresh"
+                            );
                         }
-
-                        let active = runtime_clone.membership().active_view();
-                        let active_view_count = active.len();
-
-                        let mut connected = Vec::new();
-                        if let Some(ref net) = network_clone {
-                            connected = net
-                                .connected_peers()
-                                .await
-                                .into_iter()
-                                .map(|peer| saorsa_gossip_types::PeerId::new(peer.0))
-                                .collect();
-                        }
-                        let connected_peer_count = connected.len();
-                        // x0x#1036: active-view peers without a connection
-                        // are not beacon targets (see presence_broadcast_targets).
-                        let broadcast_peers =
-                            gossip::stale_targets::presence_broadcast_targets(active, &connected);
-
-                        pw_clone
-                            .manager()
-                            .replace_broadcast_peers(broadcast_peers)
-                            .await;
-                        let broadcast_peer_count = pw_clone.manager().broadcast_peer_count().await;
-                        tracing::info!(
-                            active_view_count,
-                            connected_peer_count,
-                            broadcast_peer_count,
-                            "Presence broadcast peer refresh"
-                        );
-                    }
-                });
+                    });
+                }
             }
 
             // Populate address hints from network status for beacon metadata.
@@ -15083,7 +15106,16 @@ impl Agent {
             tracing::warn!("failed to start capability advert service: {e}");
         }
 
-        Ok(())
+        Ok(true)
+    }
+
+    /// Claim the single presence-refresh task slot; `true` only for the
+    /// first caller. The task reads live state each tick, so one task serves
+    /// every later join.
+    fn claim_presence_refresh(&self) -> bool {
+        !self
+            .presence_refresh_started
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
     }
 
     /// Mesh-off for embedders: latch the network quiesced, disconnect every
@@ -20846,10 +20878,11 @@ const RECONNECT_FAILURE_COOLDOWN: std::time::Duration = std::time::Duration::fro
 /// the security invariant is unit-testable independently of the gossip stack.
 fn announcement_should_auto_connect(
     leaf_mode: bool,
+    mesh_quiesced: bool,
     reconnect_suppressed: bool,
     already_connected: bool,
 ) -> bool {
-    !leaf_mode && !reconnect_suppressed && !already_connected
+    !leaf_mode && !mesh_quiesced && !reconnect_suppressed && !already_connected
 }
 
 /// Cadence of the quiesce re-sweep task ([`Agent::quiesce_mesh`]): while the
@@ -20991,6 +21024,13 @@ static RECONNECT_CACHE_WAITS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<[u8; 32], u32>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// A proactive redial stops when the peer is suppressed or the mesh is
+/// quiesced; the latch holds without writing a tombstone, so a ladder that is
+/// already running must read it on every attempt.
+fn reconnect_blocked(network: &network::NetworkNode, peer_id_bytes: [u8; 32]) -> bool {
+    network.is_reconnect_suppressed(peer_id_bytes) || network.mesh_quiesced()
+}
+
 /// Schedule a bounded, backoff reconnect for a peer that just disconnected.
 ///
 /// This closes the gap identified in the post-restart transport failure: when a
@@ -21032,7 +21072,7 @@ fn schedule_reconnect(
     // eviction). The call sites already gate on this, but re-checking here
     // keeps the scheduler authoritative if a future call site forgets — a
     // suppressed peer must never be proactively redialed.
-    if network.is_reconnect_suppressed(peer_id_bytes) {
+    if reconnect_blocked(&network, peer_id_bytes) {
         return;
     }
 
@@ -21092,7 +21132,7 @@ fn schedule_reconnect(
             // again immediately before each dial below, since the intervening
             // `is_connected`/cache-read awaits give a concurrent
             // `disconnect_with_reason` a window to set the tombstone.
-            if network.is_reconnect_suppressed(peer_id_bytes) {
+            if reconnect_blocked(&network, peer_id_bytes) {
                 tracing::debug!(
                     target: "x0x::connect",
                     peer_id_prefix = %prefix,
@@ -21225,7 +21265,7 @@ fn schedule_reconnect(
                 // TOCTOU window left open by the awaits above (and by prior dials
                 // in this same loop), so a peer revoked/evicted mid-backoff is
                 // never actually redialed.
-                if network.is_reconnect_suppressed(peer_id_bytes) {
+                if reconnect_blocked(&network, peer_id_bytes) {
                     tracing::debug!(
                         target: "x0x::connect",
                         peer_id_prefix = %prefix,
@@ -21312,7 +21352,7 @@ fn schedule_reconnect(
             }
             if !connected {
                 // Final suppression gate before the fallback dial (see Phase 1).
-                if network.is_reconnect_suppressed(peer_id_bytes) {
+                if reconnect_blocked(&network, peer_id_bytes) {
                     tracing::debug!(
                         target: "x0x::connect",
                         peer_id_prefix = %prefix,
@@ -22440,6 +22480,7 @@ impl AgentBuilder {
             )),
             dm_inflight_acks: std::sync::Arc::new(dm::InFlightAcks::new()),
             recent_delivery_cache: std::sync::Arc::new(dm::RecentDeliveryCache::with_defaults()),
+            presence_refresh_started: std::sync::atomic::AtomicBool::new(false),
             capability_advert_service: tokio::sync::Mutex::new(None),
             selection_skew: std::sync::Arc::new(SelectionSkew::default()),
             kv_snapshot_leases: std::sync::Mutex::new(KvSnapshotRegistry::default()),
@@ -26544,6 +26585,15 @@ mod tests {
                 coordinator_service_enabled: true,
                 ..ant_quic::NodeStatus::default()
             };
+            RELAY_OPT_IN_TEST_SOURCES.with(|cell| cell.set(Some((true, true))));
+            let advertised = AnnouncementAssistSnapshot::from_node_status(&status);
+            assert_eq!(
+                advertised.relay_capable,
+                Some(true),
+                "without the suppression the explicit opt-in advertises relay"
+            );
+            assert_eq!(advertised.coordinator_capable, Some(true));
+
             suppress_relay_opt_in_for_metered_leaf();
             assert!(relay_opt_in_suppressed_for_metered_leaf());
             assert!(
@@ -26554,6 +26604,7 @@ mod tests {
             let snapshot = AnnouncementAssistSnapshot::from_node_status(&status);
             assert_eq!(snapshot.relay_capable, Some(false));
             assert_eq!(snapshot.coordinator_capable, Some(false));
+            RELAY_OPT_IN_TEST_SOURCES.with(|cell| cell.set(None));
         }
 
         /// #398: capability still requires the service — reachability
@@ -28459,6 +28510,44 @@ mod tests {
     /// Mesh-off must be a safe no-op on an agent that never had a network:
     /// the fetch>it shell calls `quiesce_mesh` unconditionally when the user
     /// flips mesh mode, including before any network was configured.
+    /// Repeated join/quiesce flips share one presence-refresh task.
+    #[tokio::test]
+    async fn mesh_flips_claim_one_presence_refresh_task() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await
+            .expect("agent");
+        assert!(agent.claim_presence_refresh(), "the first join spawns it");
+        for _ in 0..3 {
+            assert!(!agent.claim_presence_refresh(), "later joins reuse it");
+        }
+    }
+
+    /// A running reconnect ladder and the announcement auto-connect both
+    /// stop once the mesh is quiesced, with no tombstone involved.
+    #[tokio::test]
+    async fn quiesce_stops_reconnect_ladder_and_announcement_auto_connect() {
+        let node = network::NetworkNode::new(network::NetworkConfig::default(), None, None)
+            .await
+            .expect("node");
+        let peer = [7u8; 32];
+        assert!(!reconnect_blocked(&node, peer));
+        assert!(announcement_should_auto_connect(false, false, false, false));
+        assert!(node.latch_mesh_quiesced().is_some());
+        assert!(!node.is_reconnect_suppressed(peer));
+        assert!(reconnect_blocked(&node, peer));
+        assert!(!announcement_should_auto_connect(
+            false,
+            node.mesh_quiesced(),
+            false,
+            false
+        ));
+    }
+
     #[tokio::test]
     async fn quiesce_mesh_without_network_is_zero() {
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -32039,7 +32128,7 @@ mod tests {
         let suppressed = alice_network.is_reconnect_suppressed(bob_id);
         let connected = alice_network.is_connected(&bob_peer).await;
         assert!(
-            !announcement_should_auto_connect(false, suppressed, connected),
+            !announcement_should_auto_connect(false, false, suppressed, connected),
             "a suppressed peer's announcement must not trigger auto-connect"
         );
     }
@@ -32053,15 +32142,15 @@ mod tests {
     #[test]
     fn announcement_auto_connect_predicate_truth_table() {
         // (leaf, suppressed, connected) -> should_dial
-        assert!(announcement_should_auto_connect(false, false, false));
-        assert!(!announcement_should_auto_connect(false, false, true));
-        assert!(!announcement_should_auto_connect(false, true, false));
-        assert!(!announcement_should_auto_connect(false, true, true));
+        assert!(announcement_should_auto_connect(false, false, false, false));
+        assert!(!announcement_should_auto_connect(false, false, false, true));
+        assert!(!announcement_should_auto_connect(false, false, true, false));
+        assert!(!announcement_should_auto_connect(false, false, true, true));
         // A leaf never auto-connects, regardless of the other inputs.
-        assert!(!announcement_should_auto_connect(true, false, false));
-        assert!(!announcement_should_auto_connect(true, false, true));
-        assert!(!announcement_should_auto_connect(true, true, false));
-        assert!(!announcement_should_auto_connect(true, true, true));
+        assert!(!announcement_should_auto_connect(true, false, false, false));
+        assert!(!announcement_should_auto_connect(true, false, false, true));
+        assert!(!announcement_should_auto_connect(true, false, true, false));
+        assert!(!announcement_should_auto_connect(true, false, true, true));
     }
 
     /// A leaf must not run proactive post-disconnect reconnects; a non-leaf

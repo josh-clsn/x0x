@@ -157,21 +157,64 @@ pub(in crate::server) async fn peers(State(state): State<Arc<AppState>>) -> impl
 /// a control-plane request open. `/network/status` shows the resulting peer
 /// count.
 pub(in crate::server) async fn mesh_join(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let agent = Arc::clone(&state.agent);
     // Capture the request time HERE, not inside the spawned task: a
     // /mesh/quiesce that lands between this handler returning and the
     // task's first poll must win, or a stale join would silently undo a
     // fresh mesh-off on a metered link.
-    let requested_at_epoch = agent.mesh_transition_epoch();
+    let requested_at_epoch = state.agent.mesh_transition_epoch();
+    let hook_state = Arc::clone(&state);
     tokio::spawn(async move {
-        if let Err(e) = agent.dial_bootstrap_superseding(requested_at_epoch).await {
-            tracing::error!("mesh join failed: {e}");
-        }
+        join_mesh(&hook_state, requested_at_epoch).await;
     });
     (
         StatusCode::OK,
         Json(serde_json::json!({ "ok": true, "status": "dialing" })),
     )
+}
+
+/// Dial the mesh and, once a join really happened, run the post-join hooks.
+///
+/// The one entry point for every mesh-on: the startup join and
+/// `POST /mesh/join` (the only join a deferred embedder ever gets) both call
+/// it, so the initial rendezvous advert and the #1406 self-leave catch-up
+/// retry cannot be missed on either path.
+pub(in crate::server) async fn join_mesh(state: &Arc<AppState>, requested_at_epoch: u64) {
+    let dialled = state
+        .agent
+        .dial_bootstrap_superseding(requested_at_epoch)
+        .await;
+    run_after_dial(dialled, || post_join_hooks(state)).await;
+}
+
+/// Run `hooks` only when the dial ran (not superseded, not absent).
+async fn run_after_dial<H, F>(dialled: crate::error::Result<bool>, hooks: H) -> bool
+where
+    H: FnOnce() -> F,
+    F: std::future::Future<Output = ()>,
+{
+    match dialled {
+        Ok(true) => {
+            tracing::info!("Network joined");
+            hooks().await;
+            true
+        }
+        Ok(false) => false,
+        Err(e) => {
+            tracing::error!("mesh join failed: {e}");
+            false
+        }
+    }
+}
+
+async fn post_join_hooks(state: &Arc<AppState>) {
+    super::named_groups::retry_startup_self_leave_catchup(state).await;
+    if let Some(validity_ms) = state.rendezvous_advert_validity_ms {
+        if let Err(e) = state.agent.advertise_identity(validity_ms).await {
+            tracing::warn!("Initial rendezvous advertisement failed: {e}");
+        } else {
+            tracing::info!("Rendezvous advertisement published");
+        }
+    }
 }
 
 /// POST /mesh/quiesce — disconnect every mesh peer; the daemon stays up.
@@ -1480,3 +1523,33 @@ pub(in crate::server) async fn peer_health_handler(
 // ---------------------------------------------------------------------------
 // Shared helpers for new endpoints
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod join_hook_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::run_after_dial;
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn run(dialled: crate::error::Result<bool>) -> (bool, usize) {
+        let runs = AtomicUsize::new(0);
+        let ran = run_after_dial(dialled, || async {
+            runs.fetch_add(1, Ordering::Relaxed);
+        })
+        .await;
+        (ran, runs.load(Ordering::Relaxed))
+    }
+
+    /// Startup and `/mesh/join` share this path: the hooks run after a real
+    /// join and never after a superseded, absent or failed dial.
+    #[tokio::test]
+    async fn post_join_hooks_run_only_after_a_real_join() {
+        assert_eq!(run(Ok(true)).await, (true, 1));
+        assert_eq!(run(Ok(false)).await, (false, 0));
+        let failed = Err(crate::error::IdentityError::Storage(std::io::Error::other(
+            "dial failed",
+        )));
+        assert_eq!(run(failed).await, (false, 0));
+    }
+}
