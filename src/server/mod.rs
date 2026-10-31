@@ -1286,6 +1286,7 @@ pub async fn serve_with_options(
             crate::server::routes::named_groups::WELCOME_CHUNK_ACK_PER_GROUP_CAP,
             crate::server::routes::named_groups::WELCOME_CHUNK_ACK_CAP,
         ),
+        welcome_ack_tasks: crate::server::routes::named_groups::WelcomeAckTasks::new(),
         join_result_fetch_admission: crate::server::routes::named_groups::FairAdmission::new(
             crate::server::routes::named_groups::JOIN_RESULT_FETCH_PER_GROUP_CAP,
             crate::server::routes::named_groups::JOIN_RESULT_FETCH_HANDLER_CAP,
@@ -3271,6 +3272,10 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
         .take()
         .unwrap_or_default();
     bg_tasks.extend(welcome_streams.into_values());
+    // Closing the joiner's ChunkAck registry under its own lock: an ack the
+    // listener hands over after this spawns nothing. The ack tasks themselves
+    // are in `detached_tasks`, drained below.
+    state.welcome_ack_tasks.close();
     bg_tasks.extend(std::mem::take(&mut *state.directory_tasks.write().await).into_values());
     // #1269: detached best-effort tasks (delayed direct deliveries, the
     // redelivery schedules, control-blob fetches, the owner-side join-result
