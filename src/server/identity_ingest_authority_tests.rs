@@ -1611,6 +1611,7 @@ async fn adr0115_card_lead_and_loopback_dial_never_follow_a_class_c_forgery() {
     // attacker's machine and loopback address.
     let cold = Subject::new();
     let later = now + ATTACKER_LEAD_SECS;
+    let before_class_c = unauthenticated_announces();
     victim
         .announce(&attacker_key, v2_wire(&forged_with_address(&x, later)))
         .await;
@@ -1618,6 +1619,10 @@ async fn adr0115_card_lead_and_loopback_dial_never_follow_a_class_c_forgery() {
         .announce(&attacker_key, v2_wire(&forged_with_address(&cold, later)))
         .await;
     victim.identity_barrier().await;
+    assert!(
+        unauthenticated_announces() >= before_class_c + 2,
+        "CONTROL FAILED (not the vector): both forgeries must reach the class C gate"
+    );
 
     let mut open = Vec::new();
     let entry = victim.agent.cached_agent(&x.id()).await.expect("X cached");
@@ -1643,11 +1648,26 @@ async fn adr0115_card_lead_and_loopback_dial_never_follow_a_class_c_forgery() {
     if victim.agent.direct_messaging.get_machine_id(&x.id()).await == Some(attacker_machine) {
         open.push("the DM registry maps X to the attacker's machine".to_string());
     }
+    // Keep the attacker connected and let the DM registry name it, so only
+    // authority stands between it and X.
+    let reached = victim_network
+        .connect_addr(attacker_addr)
+        .await
+        .expect("HARNESS: the victim dials the attacker's node");
+    assert_eq!(reached, ant_quic::PeerId(attacker_machine.0), "HARNESS");
+    victim
+        .agent
+        .direct_messaging
+        .mark_connected(x.id(), attacker_machine)
+        .await;
     if victim.agent.has_live_direct_connection(&x.id()).await {
         open.push("a live connection to the attacker reads as a link to X".to_string());
     }
     if victim.raw_frame_verified(x.id(), attacker_machine).await {
         open.push("raw frames from the attacker's machine verify as X".to_string());
+    }
+    if victim.raw_frame_verified(cold.id(), attacker_machine).await {
+        open.push("raw frames from the attacker's machine verify as cold Y".to_string());
     }
     let transport = crate::RawQuicTransport::Scripted(Arc::new(
         crate::PinnedTransportScript::connected_only(&[x.machine_id(), attacker_machine], false),

@@ -8329,14 +8329,22 @@ impl Agent {
         //    LAN/private agents may have no publicly-routable addresses in
         //    their announcement but are still reachable via the existing
         //    gossip QUIC connection.
+        //    ADR 0115 §2: only a machine an authority store confirms counts,
+        //    so an unconfirmed one never reports success or skips the dials.
         let connected_machine_id = if agent.machine_id.0 != [0u8; 32]
             && network
                 .is_connected(&ant_quic::PeerId(agent.machine_id.0))
                 .await
+            && self
+                .authority_confirms_with(agent_id, &agent.machine_id, nonblocking_evidence)
+                .await
         {
             Some(agent.machine_id)
         } else {
-            match self.direct_messaging.get_machine_id(agent_id).await {
+            match self
+                .authorized_registry_machine(agent_id, nonblocking_evidence)
+                .await
+            {
                 Some(machine_id) if network.is_connected(&ant_quic::PeerId(machine_id.0)).await => {
                     Some(machine_id)
                 }
@@ -29445,6 +29453,54 @@ mod tests {
         );
         drop(permit);
         assert!(tokio::time::timeout(quiet, bob_rx.recv()).await.is_err());
+    }
+
+    /// ADR 0115 §2 (batch 5 review O1): a rejected pin's machine is
+    /// connected and the DM registry names it, but no authority store does.
+    /// `/agents/connect` never reports that connection as the contact's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn connect_never_reports_an_unconfirmed_registry_machine() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (alice, bob, _bob_addr) = leaf_and_peer(dir.path()).await;
+        let alice_network = alice.network().expect("alice network");
+        let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+        alice
+            .connect_to_agent(&bob.agent_id())
+            .await
+            .expect("the connect runs");
+        assert!(alice_network.is_connected(&bob_peer).await);
+
+        let claimant = identity::AgentKeypair::generate()
+            .expect("claimant key")
+            .agent_id();
+        let now = Agent::unix_timestamp_secs();
+        dm_inbox::record_authenticated_machine_binding(
+            &alice.authenticated_machine_bindings,
+            claimant,
+            identity::MachineId([0x5c; 32]),
+            now + 20,
+        )
+        .await;
+        alice
+            .pin_card_binding(card_pin(claimant, bob.machine_id(), Vec::new(), now))
+            .await;
+        assert_eq!(
+            alice.direct_messaging.get_machine_id(&claimant).await,
+            Some(bob.machine_id()),
+            "the rejected pin still wrote the registry"
+        );
+        alice.identity_discovery_cache.write().await.insert(
+            claimant,
+            card_pin(claimant, identity::MachineId([0u8; 32]), Vec::new(), now),
+        );
+        let outcome = alice
+            .connect_to_agent(&claimant)
+            .await
+            .expect("the connect runs");
+        assert!(
+            !outcome.is_live_path(),
+            "an unconfirmed registry machine is no success: {outcome:?}"
+        );
     }
 
     /// Mesh-off must be a safe no-op on an agent that never had a network:
