@@ -603,7 +603,53 @@ async fn named_group_join_returns_inline_member_joined() {
     use base64::Engine as _;
 
     let d = daemon().await;
-    let (group_id, _) = create_group(&d, "MemberJoined Group", "", Some("Alice")).await;
+    // public_open so a roster backup admin can be added by agent_id; a sole
+    // member's DELETE is now a group DELETION with a withdrawn tombstone
+    // (#369/#370), which the rejoin below would be refused against.
+    let create_r: Value = authed_client(&d)
+        .post(d.url("/groups"))
+        .json(&serde_json::json!({
+            "name": "MemberJoined Group",
+            "description": "",
+            "display_name": "Alice",
+            "preset": "public_open"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let group_id = create_r["group"]["id"].as_str().unwrap_or("").to_string();
+    assert!(!group_id.is_empty(), "create group: {create_r:?}");
+
+    let backup_admin = fake_agent_id(0x45);
+    let add_admin_r: Value = authed_client(&d)
+        .post(d.url(&format!("/groups/{group_id}/members")))
+        .json(&serde_json::json!({
+            "agent_id": backup_admin,
+            "display_name": "Backup Admin"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(add_admin_r["ok"], true, "add admin: {add_admin_r:?}");
+    let promote_admin: Value = authed_client(&d)
+        .patch(d.url(&format!("/groups/{group_id}/members/{backup_admin}/role")))
+        .json(&serde_json::json!({ "role": "admin" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        promote_admin["ok"], true,
+        "promote admin: {promote_admin:?}"
+    );
 
     // Mint an invite, then leave so the rejoin exercises the full
     // invite/join codepath on this single-daemon suite.

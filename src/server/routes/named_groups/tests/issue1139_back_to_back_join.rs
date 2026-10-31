@@ -335,6 +335,7 @@ async fn build_back_to_back(dir: &std::path::Path) -> Result<BackToBack> {
                 head_attestation,
                 roster_certificates_b64,
                 intervening_events,
+                ..
             } => (
                 event,
                 chain,
@@ -356,6 +357,7 @@ async fn build_back_to_back(dir: &std::path::Path) -> Result<BackToBack> {
     );
     // A pre-#1139 (legacy) authority serves the same result with no carry.
     let j2_legacy_result = JoinResultMessage::Result {
+        signed_by: None,
         event: served_event,
         chain: served_chain,
         head_attestation: served_head,
@@ -424,6 +426,9 @@ fn catchup_page(s: &BackToBack) -> TreeKemCatchupResponse {
         events: vec![s.add_j1.event.clone(), s.add_j2.event.clone()],
         truncated: false,
         responder_state_hash: None,
+        signed_by: None,
+        target_member_id: None,
+        target_member_key_package_b64: None,
     }
 }
 
@@ -545,6 +550,7 @@ async fn issue1139_legacy_join_result_alone_leaves_second_joiner_pending() -> Re
             head_attestation: None,
             roster_certificates_b64: Vec::new(),
             intervening_events: Vec::new(),
+            signed_by: None,
         },
         Some(s.j1_attempt.as_str()),
     )
@@ -642,6 +648,9 @@ async fn issue1139_catchup_page_converges_second_joiner() -> Result<()> {
         events: vec![logged],
         truncated: false,
         responder_state_hash: None,
+        signed_by: None,
+        target_member_id: None,
+        target_member_key_package_b64: None,
     })?
     .len();
     assert!(
@@ -1278,6 +1287,7 @@ async fn issue1139_joiner_ignores_stale_foreign_or_oversized_carries() -> Result
             head_attestation,
             roster_certificates_b64,
             intervening_events: events,
+            signed_by: None,
         },
         other => other,
     };
@@ -1353,6 +1363,7 @@ fn result_with_events(s: &BackToBack, events: Vec<NamedGroupMetadataEvent>) -> J
             head_attestation,
             roster_certificates_b64,
             intervening_events: events,
+            signed_by: None,
         },
         other => other,
     }
@@ -1784,6 +1795,7 @@ async fn wa_fresh_invite_round_trip_on(s: &BackToBack, joiner: &Arc<AppState>) -
                     head_attestation: head_attestation.map(Box::new),
                     roster_certificates_b64: Vec::new(),
                     intervening_events,
+                    signed_by: None,
                 },
                 Some(attempt_id.as_str()),
             )
@@ -2401,7 +2413,7 @@ async fn shape_b_remove_reinvite_without_restart(timeout_before_removal: bool) -
         Arc::clone(&s.j2),
         s.group_key.clone(),
         s.stable_group_id.clone(),
-        s.authority_id,
+        vec![s.authority_id],
         member,
         true,
         None,
@@ -2488,7 +2500,7 @@ async fn issue1191_stale_finalizer_and_poll_preserve_new_attempt() -> Result<()>
         Arc::clone(&s.j2),
         s.group_key.clone(),
         s.stable_group_id.clone(),
-        s.authority_id,
+        vec![s.authority_id],
         member,
         true,
         None,
@@ -2555,7 +2567,7 @@ async fn issue1191_existing_outcome_retires_matching_attempt() -> Result<()> {
                 Arc::clone(&s.j2),
                 s.group_key.clone(),
                 s.stable_group_id.clone(),
-                s.authority_id,
+                vec![s.authority_id],
                 member,
                 true,
                 None,

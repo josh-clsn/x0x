@@ -763,7 +763,7 @@ async fn engine_a_join_result_get_runs_the_serving_guard() -> Result<()> {
 #[test]
 fn engine_a_staging_horizon_holds_the_welcome_and_the_long_poll_backs_off() {
     assert!(PENDING_WELCOME_TTL >= PENDING_JOIN_RESULT_TTL);
-    assert!(EXPECTED_JOIN_RESULT_INVITER_TTL >= NON_TREEKEM_JOIN_RESULT_POLL_TIMEOUT);
+    assert!(EXPECTED_JOIN_RESULT_INVITER_TTL >= JOIN_RESULT_POLL_HORIZON);
     assert_eq!(join_result_poll_delay(0), Duration::from_secs(2));
     assert_eq!(join_result_poll_delay(1), Duration::from_secs(4));
     assert_eq!(join_result_poll_delay(2), Duration::from_secs(8));

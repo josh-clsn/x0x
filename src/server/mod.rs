@@ -81,23 +81,24 @@ use routes::{
     leave_group, list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys,
     list_kv_stores, list_machines, list_mls_groups, list_named_groups, list_revocations,
     list_task_lists, list_tasks, listener_restart_context, load_causal_approval_queue,
-    load_named_groups_merged, load_predecessor_relay_outbox, load_requester_offer_outbox,
-    load_treekem_member_key_packages, machine_for_agent_handler, machines_by_user_handler,
-    mesh_join, mesh_quiesce, migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
-    named_group_metadata_event_group_id, network_status, now_millis_u64, owner_agents,
-    owner_agents_issue, owner_agents_revoke, owner_riders_issue, owner_riders_list,
+    load_join_result_staging, load_named_groups_merged, load_predecessor_relay_outbox,
+    load_requester_offer_outbox, load_treekem_member_key_packages, machine_for_agent_handler,
+    machines_by_user_handler, mesh_join, mesh_quiesce, migrate_unsplit_home_suite_store_if_needed,
+    mls_decrypt, mls_encrypt, named_group_metadata_event_group_id, network_status, now_millis_u64,
+    owner_agents, owner_agents_issue, owner_agents_revoke, owner_riders_issue, owner_riders_list,
     owner_riders_revoke, peer_health_handler, peers, pin_machine, presence, presence_find,
     presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
     publish_group_card_to_discovery, put_kv_value, quick_trust,
     recover_home_suite_sidecar_journals, recover_treekem_named_journals, reject_join_request,
     reject_unverified_direct_public_message, relay_diagnostics, remove_mls_member,
     remove_named_group_member, replay_pending_causal_approvals, requester_offer_step,
-    restore_treekem_groups, revoke_contact, run_direct_metadata_listener, run_fallback_github_poll,
-    run_gossip_update_listener, run_startup_update_check, save_named_groups_checked,
-    save_named_groups_checked_unlocked, save_predecessor_relay_outbox_unlocked, seal_group_state,
-    secure_group_decrypt, secure_group_encrypt, secure_group_reseal,
-    secure_open_envelope_adversarial, send_group_public_message, set_group_display_name,
-    shutdown_handler, spawn_directory_resubscribe, spawn_global_discovery_listener,
+    respawn_unconverged_join_polls, restore_treekem_groups, revoke_contact,
+    run_direct_metadata_listener, run_fallback_github_poll, run_gossip_update_listener,
+    run_startup_update_check, save_named_groups_checked, save_named_groups_checked_unlocked,
+    save_predecessor_relay_outbox_unlocked, seal_group_state, secure_group_decrypt,
+    secure_group_encrypt, secure_group_reseal, secure_open_envelope_adversarial,
+    send_group_public_message, set_group_display_name, shutdown_handler,
+    spawn_directory_resubscribe, spawn_global_discovery_listener,
     spawn_global_public_message_listener, spawn_listed_to_contacts_listener,
     state_sync_diagnostics, status, store_named_group_info, streams_diagnostics, subscribe,
     transport_diagnostics, unban_group_member, unenroll_device, unpin_machine, unsubscribe,
@@ -866,6 +867,7 @@ pub async fn serve_with_options(
     let requester_offer_outbox_path = config.data_dir.join("requester_offer_outbox.json");
     let public_group_bootstrap_outbox_path =
         config.data_dir.join("public_group_bootstrap_outbox.json");
+    let join_result_staging_path = config.data_dir.join("pending_join_results.json");
     let treekem_dir = config.data_dir.join("treekem");
     if let Err(e) = tokio::fs::create_dir_all(&treekem_dir).await {
         tracing::warn!(
@@ -1308,6 +1310,8 @@ pub async fn serve_with_options(
         predecessor_relay_outbox_path,
         requester_offer_outbox_path,
         public_group_bootstrap_outbox_path,
+        join_result_staging_path,
+        join_result_staging_persistence_lock: Mutex::new(()),
         treekem_event_log: RwLock::new(HashMap::new()),
         treekem_member_key_packages,
         treekem_catchup_throttle: RwLock::new(HashMap::new()),
@@ -1604,6 +1608,12 @@ pub async fn serve_with_options(
         )
         .await);
     }
+    // #390: restore staged join-results + Welcome blobs so an authority
+    // restart no longer strands joiners waiting on a Welcome that nothing
+    // will ever re-stage. Lenient by design — this is best-effort delivery
+    // state, not causal-integrity state, so a bad sidecar is set aside and
+    // the daemon starts with empty staging rather than refusing to boot.
+    load_join_result_staging(&state).await;
 
     // Publish the API port only after every fallible causal-state loader has
     // completed. A rejected sidecar therefore leaves no listener task and no
@@ -1667,6 +1677,18 @@ pub async fn serve_with_options(
     // the emptiness proof is not held across the withdrawal in any case.
     // Duplicates are reported read-only by `GET /home` until a proven
     // retirement fence exists. See docs/design/449-p4-retirement-fence.md.
+
+    // #390: re-arm the join-result poll for every group whose join never
+    // converged before the previous shutdown. The poll task does not survive
+    // a restart, and nothing else on the joiner re-requests the Welcome — an
+    // app relaunch mid-join (routine on Android) orphaned the join for good.
+    let respawned = respawn_unconverged_join_polls(Arc::clone(&state)).await;
+    if !respawned.is_empty() {
+        tracing::info!(
+            groups = ?respawned,
+            "re-armed join-result polls for unconverged joins"
+        );
+    }
 
     // ADR 0028: post-restore queue drain — any queued approvals whose
     // predecessors arrived during downtime can now be drained (Kimi blocker 9).

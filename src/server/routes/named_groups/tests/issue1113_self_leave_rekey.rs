@@ -694,6 +694,9 @@ fn add_active_peer(info: &mut x0x::groups::GroupInfo, peer: x0x::identity::Agent
 
 fn empty_catchup(group_id: &str, truncated: bool) -> TreeKemCatchupResponse {
     TreeKemCatchupResponse {
+        signed_by: None,
+        target_member_id: None,
+        target_member_key_package_b64: None,
         message_type: "treekem_catchup_response".to_string(),
         group_id: group_id.to_string(),
         events: Vec::new(),
@@ -716,6 +719,9 @@ async fn truncated_catchup_page_does_not_seal() -> Result<()> {
     let leave = signed_self_leave(&fixture).await?;
     let member_hex = hex::encode(fixture.member_id.as_bytes());
     let truncated = TreeKemCatchupResponse {
+        signed_by: None,
+        target_member_id: None,
+        target_member_key_package_b64: None,
         message_type: "treekem_catchup_response".to_string(),
         group_id: fixture.group_id.clone(),
         events: vec![leave],
@@ -1813,6 +1819,9 @@ async fn deliver_catchup(
         sender,
         true,
         TreeKemCatchupResponse {
+            signed_by: None,
+            target_member_id: None,
+            target_member_key_package_b64: None,
             message_type: "treekem_catchup_response".to_string(),
             group_id: group_id.to_string(),
             events: vec![event],
@@ -2024,6 +2033,9 @@ fn catchup_page(
     responder_state_hash: Option<String>,
 ) -> TreeKemCatchupResponse {
     TreeKemCatchupResponse {
+        signed_by: None,
+        target_member_id: None,
+        target_member_key_package_b64: None,
         message_type: "treekem_catchup_response".to_string(),
         group_id: group_id.to_string(),
         events: Vec::new(),
@@ -2049,6 +2061,9 @@ fn key_package_reply(
     responder_state_hash: Option<String>,
 ) -> TreeKemCatchupResponse {
     TreeKemCatchupResponse {
+        signed_by: None,
+        target_member_id: None,
+        target_member_key_package_b64: None,
         message_type: "treekem_catchup_response".to_string(),
         group_id: group_id.to_string(),
         events: vec![NamedGroupMetadataEvent::MemberJoined {
@@ -2169,6 +2184,7 @@ async fn cold_responder_newer_head_does_not_clear_the_startup_gate() -> Result<(
         &requester,
         true,
         TreeKemCatchupRequest {
+            signed_by: None,
             message_type: "treekem_catchup_request".to_string(),
             group_id: responder.group_id.clone(),
             requester_agent_id: hex::encode(requester.as_bytes()),
@@ -3736,6 +3752,7 @@ async fn epoch_ahead_ciphertext_requests_catchup_and_converges() -> Result<()> {
         let groups = victim.named_groups.read().await;
         let info = groups.get(group_id).expect("group on the victim");
         TreeKemCatchupRequest {
+            signed_by: None,
             message_type: "treekem_catchup_request".to_string(),
             group_id: group_id.clone(),
             requester_agent_id: hex::encode(victim_id.as_bytes()),
@@ -4012,6 +4029,7 @@ async fn newer_epoch_observation_survives_a_late_older_epoch_page() -> Result<()
         let groups = victim.named_groups.read().await;
         let info = groups.get(group_id).expect("group on the victim");
         TreeKemCatchupRequest {
+            signed_by: None,
             message_type: "treekem_catchup_request".to_string(),
             group_id: group_id.clone(),
             requester_agent_id: hex::encode(victim_id.as_bytes()),

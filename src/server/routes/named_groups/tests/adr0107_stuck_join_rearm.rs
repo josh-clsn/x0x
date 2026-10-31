@@ -204,6 +204,7 @@ pub(super) async fn serve_result(
         &joiner.agent.agent_id(),
         true,
         JoinResultMessage::FetchRequest {
+            signed_by: None,
             group_id: stable.to_string(),
             member_agent_id: member.clone(),
             from_revision,
@@ -363,6 +364,7 @@ async fn with_pulled_welcome(
             head_attestation,
             roster_certificates_b64,
             intervening_events,
+            signed_by,
         } => {
             if let NamedGroupMetadataEvent::MemberAdded {
                 treekem_welcome_b64,
@@ -384,6 +386,7 @@ async fn with_pulled_welcome(
                 }
             }
             JoinResultMessage::Result {
+                signed_by,
                 event,
                 chain,
                 head_attestation,
@@ -2913,6 +2916,7 @@ async fn s8a_r4_welcome_fetch_admission_is_fair_across_groups() -> anyhow::Resul
             group_id: other_group.clone(),
             joiner_agent: hex_of(&s.j1),
             bytes: other_bytes,
+            created_at_ms: super::super::now_millis_u64(),
             created_at: Instant::now(),
         },
     );
@@ -3643,6 +3647,7 @@ async fn s8a_r5_g7_join_result_listener_never_waits_on_a_group_lock() -> anyhow:
     let s = build(dir.path()).await?;
     let j2_hex = hex_of(&s.j2);
     let fetch = || JoinResultMessage::FetchRequest {
+        signed_by: None,
         group_id: s.stable.clone(),
         member_agent_id: j2_hex.clone(),
         from_revision: Some(s.base),
@@ -3743,7 +3748,9 @@ async fn s8a_r5_g8_chunk_fetch_admission_is_validated_and_fair() -> anyhow::Resu
         super::super::PendingJoinResult {
             event: s.j1_add.clone(),
             head_attestation: None,
+            created_at_ms: super::super::now_millis_u64(),
             created_at: staged_at,
+            delivered_at_ms: None,
         },
     );
     let reference_b = super::super::control_blob::stage_reference(
@@ -4499,6 +4506,7 @@ async fn s8a_r6_duplicate_fetches_never_overlap_inline_egress() -> anyhow::Resul
             &g.joiner.agent.agent_id(),
             true,
             JoinResultMessage::FetchRequest {
+                signed_by: None,
                 group_id: g.stable.clone(),
                 member_agent_id: g_hex.clone(),
                 from_revision: from,
@@ -4654,6 +4662,7 @@ async fn s8a_r6_a_fetch_after_a_cancelled_egress_is_admitted() -> anyhow::Result
     let g_hex = hex_of(&g.joiner);
     let from = remnant_revision(&g.joiner, &g.group_key).await;
     let fetch = || JoinResultMessage::FetchRequest {
+        signed_by: None,
         group_id: g.stable.clone(),
         member_agent_id: g_hex.clone(),
         from_revision: from,

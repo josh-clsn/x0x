@@ -107,6 +107,7 @@ async fn deliver_result(
         &authority.agent.agent_id(),
         true,
         JoinResultMessage::Result {
+            signed_by: None,
             event: Box::new(event),
             chain: Vec::new(),
             head_attestation: None,
