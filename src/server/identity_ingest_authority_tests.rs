@@ -1643,6 +1643,9 @@ async fn adr0115_card_lead_and_loopback_dial_never_follow_a_class_c_forgery() {
     if victim.agent.direct_messaging.get_machine_id(&x.id()).await == Some(attacker_machine) {
         open.push("the DM registry maps X to the attacker's machine".to_string());
     }
+    if victim.agent.has_live_direct_connection(&x.id()).await {
+        open.push("a live connection to the attacker reads as a link to X".to_string());
+    }
     if victim.raw_frame_verified(x.id(), attacker_machine).await {
         open.push("raw frames from the attacker's machine verify as X".to_string());
     }

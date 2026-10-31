@@ -282,8 +282,11 @@ async fn pull_welcome_through_guarded_stream(
     let receiver = Arc::clone(joiner);
     let owner_id = authority.agent.agent_id();
     let joiner_id = joiner.agent.agent_id();
-    let pull =
-        super::super::fetch_treekem_welcome_via(joiner, stable, welcome_ref, move |_, request| {
+    let pull = super::super::fetch_treekem_welcome_via(
+        joiner,
+        stable,
+        welcome_ref,
+        move |_, request, _| {
             let owner = Arc::clone(&owner);
             let receiver = Arc::clone(&receiver);
             async move {
@@ -341,7 +344,8 @@ async fn pull_welcome_through_guarded_stream(
                 .await;
                 Ok(())
             }
-        });
+        },
+    );
     tokio::time::timeout(Duration::from_secs(30), pull)
         .await
         .map_err(|_| anyhow::anyhow!("the guarded Welcome transfer never completed"))?

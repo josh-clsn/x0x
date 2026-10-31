@@ -12647,6 +12647,40 @@ impl Agent {
         }
     }
 
+    /// Whether a direct QUIC connection to `agent_id`'s machine is live right
+    /// now, for a machine an authority store confirms (ADR 0115 §2): the
+    /// routing entry's machine through `authorized_routing_machine_with`,
+    /// and the DM registry's (which the connect paths, card imports and the
+    /// peer's own verified raw frames write) through
+    /// `authorized_registry_machine`. Never dials and never blocks on the
+    /// evidence store.
+    pub(crate) async fn has_live_direct_connection(&self, agent_id: &identity::AgentId) -> bool {
+        let transport = match self.network.as_ref() {
+            Some(network) => RawQuicTransport::Network(network),
+            #[cfg(test)]
+            None if pinned_standin_is_strict(&self.identity.agent_id()) => {
+                RawQuicTransport::Scripted(pinned_standin_transport(&self.identity.agent_id()))
+            }
+            None => return false,
+        };
+        let routing = self
+            .identity_discovery_cache
+            .read()
+            .await
+            .get(agent_id)
+            .map(|entry| entry.machine_id);
+        let routed = self
+            .authorized_routing_machine_with(agent_id, routing, true)
+            .await;
+        let registry = self.authorized_registry_machine(agent_id, true).await;
+        for machine in [routed, registry].into_iter().flatten() {
+            if transport.is_connected(&ant_quic::PeerId(machine.0)).await {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Get list of currently connected agents.
     ///
     /// Returns agents that have been discovered and are currently connected

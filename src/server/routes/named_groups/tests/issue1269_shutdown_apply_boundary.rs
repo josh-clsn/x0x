@@ -168,7 +168,7 @@ async fn issue1269_welcome_fetch_ends_when_shutdown_starts() -> Result<()> {
             &fetch_state,
             &"ef".repeat(32),
             &welcome_ref,
-            |_, _| async { Ok(()) },
+            |_, _, _| async { Ok(()) },
             &[Duration::ZERO, Duration::from_secs(30)],
             WELCOME_FETCH_TIMEOUT,
         )
@@ -204,7 +204,7 @@ async fn issue1269_welcome_fetch_ends_when_shutdown_starts() -> Result<()> {
         &joiner,
         &"ef".repeat(32),
         &late_ref,
-        |_, _| async { Ok(()) },
+        |_, _, _| async { Ok(()) },
         &[Duration::ZERO],
         WELCOME_FETCH_TIMEOUT,
     )
@@ -235,7 +235,7 @@ async fn issue1269_welcome_fetch_send_ends_when_shutdown_starts() -> Result<()> 
             &fetch_state,
             &"ef".repeat(32),
             &welcome_ref,
-            move |_, _| {
+            move |_, _, _| {
                 // The injected sender signals that it is sending, then
                 // blocks like a send whose receipt never arrives.
                 if let Some(tx) = started_tx

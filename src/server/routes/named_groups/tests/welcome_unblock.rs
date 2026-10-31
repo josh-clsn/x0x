@@ -93,8 +93,11 @@ async fn welcome_completes_while_chunk_ack_receipts_never_arrive() -> anyhow::Re
     let listener_state = Arc::clone(&joiner);
     let listener_done = Arc::new(AtomicBool::new(false));
     let done = Arc::clone(&listener_done);
-    let fetched =
-        fetch_treekem_welcome_via(&joiner, &group_id, &welcome_ref, move |source, request| {
+    let fetched = fetch_treekem_welcome_via(
+        &joiner,
+        &group_id,
+        &welcome_ref,
+        move |source, request, _| {
             let state = Arc::clone(&listener_state);
             let frames = frames.clone();
             let done = Arc::clone(&done);
@@ -114,9 +117,10 @@ async fn welcome_completes_while_chunk_ack_receipts_never_arrive() -> anyhow::Re
                 });
                 Ok(())
             }
-        })
-        .await
-        .map_err(anyhow::Error::msg)?;
+        },
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
 
     assert_eq!(fetched, bytes, "the joiner assembles the exact Welcome");
     // The paused clock moves only in millisecond ticks between polls.
@@ -250,7 +254,7 @@ async fn an_early_complete_never_fails_the_fetch() -> anyhow::Result<()> {
 
     let fetched = tokio::time::timeout(
         Duration::from_secs(60),
-        fetch_treekem_welcome_via(&joiner, &group_id, &welcome_ref, move |_, _| {
+        fetch_treekem_welcome_via(&joiner, &group_id, &welcome_ref, move |_, _, _| {
             let state = Arc::clone(&listener_state);
             let attempt = sent.fetch_add(1, Ordering::SeqCst);
             // The first stream loses its last chunk; the restream is whole.
@@ -303,7 +307,7 @@ async fn late_fetch_request_receipt_keeps_the_pending_receive() -> anyhow::Resul
     let welcome_id = welcome_ref.welcome_id.clone();
     let fetched = tokio::time::timeout(
         Duration::from_secs(300),
-        fetch_treekem_welcome_via(&joiner, &group_id, &welcome_ref, move |_, _| {
+        fetch_treekem_welcome_via(&joiner, &group_id, &welcome_ref, move |_, _, _| {
             let state = Arc::clone(&listener_state);
             let frames = frames.clone();
             let welcome_id = welcome_id.clone();
@@ -362,7 +366,7 @@ async fn fetch_ends_at_its_deadline_while_a_request_is_outstanding() -> anyhow::
 
     let result = tokio::time::timeout(
         Duration::from_secs(300),
-        fetch_treekem_welcome_via(&joiner, &group_id, &welcome_ref, move |_, _| {
+        fetch_treekem_welcome_via(&joiner, &group_id, &welcome_ref, move |_, _, _| {
             sent.fetch_add(1, Ordering::SeqCst);
             std::future::pending::<std::result::Result<(), WelcomeFetchSendError>>()
         }),
@@ -407,7 +411,7 @@ async fn a_late_chunk_after_an_early_complete_is_assembled() -> anyhow::Result<(
 
     let fetched = tokio::time::timeout(
         Duration::from_secs(60),
-        fetch_treekem_welcome_via(&joiner, &group_id, &welcome_ref, move |_, _| {
+        fetch_treekem_welcome_via(&joiner, &group_id, &welcome_ref, move |_, _, _| {
             sent.fetch_add(1, Ordering::SeqCst);
             let state = Arc::clone(&listener_state);
             // Offer, chunk 0 and the Complete; chunk 1 is a second late.
@@ -462,7 +466,7 @@ async fn a_stale_complete_never_aborts_a_healthy_restream() -> anyhow::Result<()
 
     let fetched = tokio::time::timeout(
         Duration::from_secs(60),
-        fetch_treekem_welcome_via(&joiner, &group_id, &welcome_ref, move |_, _| {
+        fetch_treekem_welcome_via(&joiner, &group_id, &welcome_ref, move |_, _, _| {
             sent.fetch_add(1, Ordering::SeqCst);
             let state = Arc::clone(&listener_state);
             let frames = frames.clone();
@@ -560,7 +564,7 @@ async fn a_last_chunk_after_the_check_still_assembles() -> anyhow::Result<()> {
 
     let fetched = tokio::time::timeout(
         Duration::from_secs(60),
-        fetch_treekem_welcome_via(&joiner, &group_id, &welcome_ref, move |_, _| {
+        fetch_treekem_welcome_via(&joiner, &group_id, &welcome_ref, move |_, _, _| {
             sent.fetch_add(1, Ordering::SeqCst);
             let state = Arc::clone(&listener_state);
             let frames = frames.clone();
@@ -776,7 +780,7 @@ async fn a_chunk_that_fails_to_decode_cleans_up_its_receive_and_acks() -> anyhow
         &joiner,
         &group_id,
         &welcome_ref,
-        move |_, _| {
+        move |_, _, _| {
             let state = Arc::clone(&listener_state);
             let (offer, chunk0, bad) = (frames[0].clone(), frames[1].clone(), bad.clone());
             async move {
@@ -805,7 +809,7 @@ async fn a_chunk_that_fails_to_decode_cleans_up_its_receive_and_acks() -> anyhow
         &joiner,
         &group_id,
         &welcome_ref,
-        move |_, _| {
+        move |_, _, _| {
             sent.fetch_add(1, Ordering::SeqCst);
             std::future::ready(Ok(()))
         },
@@ -820,5 +824,238 @@ async fn a_chunk_that_fails_to_decode_cleans_up_its_receive_and_acks() -> anyhow
         "the first request goes out (attempt 0), then the retry"
     );
     unpark_chunk_acks(&welcome_ref.welcome_id);
+    Ok(())
+}
+
+/// A fetch that joins one already in flight sends its first FetchRequest
+/// as the retry it is (`first` is false), so it takes the gossip inbox; a
+/// fetch of its own sends its first one as first.
+#[tokio::test]
+async fn joining_a_fetch_in_flight_sends_its_first_request_as_a_retry() -> anyhow::Result<()> {
+    let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+    let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+    let group_id = "e7".repeat(32);
+    let (_bytes, welcome_ref, _frames) = staged_welcome(&owner, &group_id, 1);
+    tokio::time::pause();
+    let schedule = [Duration::ZERO, Duration::from_millis(10)];
+    let firsts = Arc::new(StdMutex::new(Vec::new()));
+    let fetch = |state: Arc<AppState>| {
+        let firsts = Arc::clone(&firsts);
+        let welcome_ref = welcome_ref.clone();
+        let group_id = group_id.clone();
+        async move {
+            fetch_treekem_welcome_via_schedule(
+                &state,
+                &group_id,
+                &welcome_ref,
+                move |_, _, first| {
+                    firsts.lock().expect("firsts").push(first);
+                    std::future::ready(Ok(()))
+                },
+                &schedule,
+                Duration::from_millis(50),
+            )
+            .await
+        }
+    };
+
+    let own = fetch(Arc::clone(&joiner)).await;
+    assert!(own.is_err(), "nothing streams in this test");
+    assert_eq!(*firsts.lock().expect("firsts"), vec![true, false]);
+
+    firsts.lock().expect("firsts").clear();
+    let in_flight = fetch(Arc::clone(&joiner));
+    let joined = fetch(Arc::clone(&joiner));
+    let (_, _) = tokio::join!(in_flight, joined);
+    let recorded = firsts.lock().expect("firsts").clone();
+    assert_eq!(
+        recorded.iter().filter(|first| **first).count(),
+        1,
+        "only the fetch that registered the receive sends a first request: {recorded:?}"
+    );
+    Ok(())
+}
+
+/// The raw deliveries `from`'s strict stand-in made to `machine`.
+fn raw_frames_to(
+    from: &AppState,
+    to: &AppState,
+    machine: x0x::identity::MachineId,
+) -> Vec<Vec<u8>> {
+    from.agent
+        .general_raw_standin_deliveries_for_testing()
+        .into_iter()
+        .filter(|(agent, to_machine, _)| *agent == to.agent.agent_id() && *to_machine == machine)
+        .map(|(_, _, payload)| payload)
+        .collect()
+}
+
+/// A gossip-capable owner, known to the joiner by a class A record (the
+/// test seed) and a capability advert.
+async fn gossip_capable_owner(
+    joiner: &AppState,
+    owner: &AppState,
+    announced: bool,
+) -> anyhow::Result<()> {
+    let kem = x0x::groups::kem_envelope::AgentKemKeypair::generate()?;
+    assert!(joiner.agent.capability_store().insert(
+        owner.agent.agent_id(),
+        owner.agent.machine_id(),
+        x0x::dm::DmCapabilities::v1_gossip_ready(kem.public_bytes.clone()),
+        x0x::dm::now_unix_ms(),
+    ));
+    if announced {
+        let now = now_millis_u64() / 1000;
+        joiner
+            .agent
+            .insert_discovered_agent_for_testing(x0x::DiscoveredAgent {
+                self_name: None,
+                agent_id: owner.agent.agent_id(),
+                machine_id: owner.agent.machine_id(),
+                user_id: None,
+                addresses: Vec::new(),
+                announced_at: now,
+                last_seen: now,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                cert_not_after: None,
+                agent_certificate: None,
+                agent_public_key: Vec::new(),
+                cert_digest: None,
+            })
+            .await;
+    }
+    Ok(())
+}
+
+/// Over a live direct connection to the owner's confirmed machine, the
+/// joiner's FetchRequest and ChunkAck take raw QUIC although the owner's
+/// gossip-inbox advert is known. Without one they keep the gossip inbox,
+/// and so does a stalled retry.
+#[tokio::test]
+async fn welcome_control_frames_take_raw_quic_over_a_live_connection() -> anyhow::Result<()> {
+    let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+    let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+    let owner_id = owner.agent.agent_id();
+    let owner_machine = owner.agent.machine_id();
+    gossip_capable_owner(&joiner, &owner, true).await?;
+    joiner
+        .agent
+        .set_pinned_standin_strict_resolution_for_testing(true);
+    let live_machines = [owner_machine];
+    let connected = |live: bool| {
+        joiner.agent.script_pinned_standin_transport_for_testing(
+            x0x::PinnedTransportScript::connected_only(
+                if live { &live_machines[..] } else { &[] },
+                false,
+            ),
+        );
+    };
+
+    let request = WelcomeBlobMessage::FetchRequest {
+        group_id: "e5".repeat(32),
+        welcome_id: "f5".repeat(32),
+    };
+    let ack = WelcomeBlobMessage::ChunkAck {
+        welcome_id: "f5".repeat(32),
+        sequence: 0,
+    };
+    connected(true);
+    let fetched = send_welcome_fetch_request(&joiner, &owner_id, &request, true).await;
+    assert!(fetched.is_ok(), "{fetched:?}");
+    let path = std::sync::OnceLock::new();
+    let acked = send_welcome_blob_message(&joiner, &owner_id, &ack, Some(&path))
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert!(matches!(acked.path, x0x::dm::DmPath::RawQuic));
+    assert_eq!(path.get().copied(), Some("raw_quic"));
+    assert_eq!(
+        raw_frames_to(&joiner, &owner, owner_machine),
+        vec![
+            welcome_blob_payload(&request).map_err(anyhow::Error::msg)?,
+            welcome_blob_payload(&ack).map_err(anyhow::Error::msg)?,
+        ],
+        "both frames went over the live connection"
+    );
+
+    assert!(
+        send_welcome_fetch_request(&joiner, &owner_id, &request, false)
+            .await
+            .is_err()
+    );
+    connected(false);
+    assert!(
+        send_welcome_fetch_request(&joiner, &owner_id, &request, true)
+            .await
+            .is_err()
+    );
+    let path = std::sync::OnceLock::new();
+    assert!(
+        send_welcome_blob_message(&joiner, &owner_id, &ack, Some(&path))
+            .await
+            .is_err()
+    );
+    assert_eq!(path.get().copied(), Some("gossip_inbox"));
+    assert_eq!(
+        raw_frames_to(&joiner, &owner, owner_machine).len(),
+        2,
+        "no raw send since"
+    );
+
+    joiner
+        .agent
+        .set_pinned_standin_strict_resolution_for_testing(false);
+    Ok(())
+}
+
+/// ADR 0115: a live connection counts only to a machine an authority store
+/// confirms. A DM-registry entry for a machine no authority names (live in
+/// the transport) never makes a control frame prefer raw QUIC, and nothing
+/// is sent to that machine.
+#[tokio::test]
+async fn welcome_control_frames_ride_only_the_confirmed_machine() -> anyhow::Result<()> {
+    let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+    let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+    let owner_id = owner.agent.agent_id();
+    let rogue = x0x::identity::MachineId([0x6b; 32]);
+    gossip_capable_owner(&joiner, &owner, false).await?;
+    joiner
+        .agent
+        .direct_messaging()
+        .mark_connected(owner_id, rogue)
+        .await;
+    joiner
+        .agent
+        .set_pinned_standin_strict_resolution_for_testing(true);
+    joiner.agent.script_pinned_standin_transport_for_testing(
+        x0x::PinnedTransportScript::connected_only(&[rogue], false),
+    );
+
+    assert!(!joiner.agent.has_live_direct_connection(&owner_id).await);
+    let request = WelcomeBlobMessage::FetchRequest {
+        group_id: "e6".repeat(32),
+        welcome_id: "f6".repeat(32),
+    };
+    let ack = WelcomeBlobMessage::ChunkAck {
+        welcome_id: "f6".repeat(32),
+        sequence: 0,
+    };
+    let _ = send_welcome_fetch_request(&joiner, &owner_id, &request, true).await;
+    let path = std::sync::OnceLock::new();
+    let _ = send_welcome_blob_message(&joiner, &owner_id, &ack, Some(&path)).await;
+    assert_eq!(path.get().copied(), Some("gossip_inbox"));
+    assert!(
+        raw_frames_to(&joiner, &owner, rogue).is_empty(),
+        "nothing rode the unconfirmed machine"
+    );
+
+    joiner
+        .agent
+        .set_pinned_standin_strict_resolution_for_testing(false);
     Ok(())
 }

@@ -9,7 +9,9 @@
 //! - a Welcome whose receive ends (assembled, failed or expired) aborts its
 //!   acks and releases their tickets;
 //! - shutdown closes registration; the tasks themselves run in the daemon's
-//!   detached-task registry, which drains them (#1269).
+//!   detached-task registry, which drains them (#1269);
+//! - an ack aborted while still in flight logs one line with its chunk,
+//!   its path and its age.
 //!
 //! The ticket lives in the registry entry, not in the task, so releasing an
 //! entry frees its admission slot at once; aborting the task only takes
@@ -18,9 +20,13 @@
 use super::fair_admission::AdmissionTicket;
 use crate::logging::LogHexId;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
+
+/// The path an ack's send took (`raw_quic` or `gossip_inbox`), set once the
+/// send has chosen it.
+pub(in crate::server) type AckPath = Arc<OnceLock<&'static str>>;
 
 /// The ack task, boxed for the caller's task registry.
 pub(in crate::server) type AckFuture =
@@ -31,11 +37,13 @@ struct Entry {
     task: AbortHandle,
     _ticket: AdmissionTicket,
     started: Instant,
+    path: AckPath,
 }
 
 impl Entry {
     /// Abort the send; a send still running leaves one line saying which
-    /// chunk it was for and for how long, so a stuck ack is visible.
+    /// chunk it was for, where it was going and for how long, so a stuck ack
+    /// is visible.
     fn abort(self, welcome_id: &str, sequence: u64, reason: &'static str) {
         if !self.task.is_finished() {
             tracing::info!(
@@ -43,6 +51,7 @@ impl Entry {
                 stage = "chunk_ack_aborted",
                 welcome_id = %LogHexId::new("welcome", welcome_id),
                 seq = sequence,
+                path = self.path.get().copied().unwrap_or("undecided"),
                 age_ms = self.started.elapsed().as_millis() as u64,
                 reason,
                 "Welcome ChunkAck still in flight was aborted"
@@ -107,7 +116,8 @@ impl WelcomeAckTasks {
     }
 
     /// Run `send` as the ack task for `(welcome_id, sequence)` under
-    /// `ticket`, replacing any earlier one. `spawn_task` starts the task in
+    /// `ticket`, replacing any earlier one. `path` is the send's path cell.
+    /// `spawn_task` starts the task in
     /// the detached-task registry and returns its abort handle, or `None`
     /// once shutdown has closed that registry. The entry removes itself when
     /// the send ends, by task id, so it never removes a replacement's.
@@ -119,6 +129,7 @@ impl WelcomeAckTasks {
         welcome_id: &str,
         sequence: u64,
         ticket: AdmissionTicket,
+        path: AckPath,
         send: F,
     ) -> bool
     where
@@ -169,6 +180,7 @@ impl WelcomeAckTasks {
                 task,
                 _ticket: ticket,
                 started: Instant::now(),
+                path,
             },
         );
         drop(guard);
@@ -202,6 +214,10 @@ mod tests {
     use super::WelcomeAckTasks;
     use std::time::Duration;
 
+    fn path() -> super::AckPath {
+        std::sync::Arc::new(std::sync::OnceLock::new())
+    }
+
     fn spawn_task(task: super::AckFuture) -> Option<tokio::task::AbortHandle> {
         Some(tokio::spawn(task).abort_handle())
     }
@@ -215,14 +231,14 @@ mod tests {
         let admission = FairAdmission::new(1, 4);
         let tasks = WelcomeAckTasks::new();
         let first = admission.try_admit("w:0", "g").expect("first ack");
-        assert!(tasks.spawn(spawn_task, "w", 0, first, pending()));
+        assert!(tasks.spawn(spawn_task, "w", 0, first, path(), pending()));
         assert!(admission.try_admit("w:0", "g").is_err(), "slot held");
         // The chunk arrives again: its earlier ack gives way at once.
         tasks.release("w", 0);
         let again = admission
             .try_admit("w:0", "g")
             .expect("the released slot is free immediately");
-        assert!(tasks.spawn(spawn_task, "w", 0, again, pending()));
+        assert!(tasks.spawn(spawn_task, "w", 0, again, path(), pending()));
         assert_eq!(tasks.in_flight(), 1);
         tasks.release_welcome("w");
         assert_eq!(tasks.in_flight(), 0);
@@ -234,7 +250,7 @@ mod tests {
         let admission = FairAdmission::new(4, 4);
         let tasks = WelcomeAckTasks::new();
         let ticket = admission.try_admit("w:1", "g").expect("ack");
-        assert!(tasks.spawn(spawn_task, "w", 1, ticket, async {}));
+        assert!(tasks.spawn(spawn_task, "w", 1, ticket, path(), async {}));
         tokio::time::timeout(Duration::from_secs(1), async {
             while tasks.in_flight() > 0 {
                 tokio::task::yield_now().await;
@@ -245,16 +261,19 @@ mod tests {
         assert_eq!(admission.in_flight(), 0);
 
         let ticket = admission.try_admit("w:2", "g").expect("ack");
-        assert!(tasks.spawn(spawn_task, "w", 2, ticket, pending()));
+        assert!(tasks.spawn(spawn_task, "w", 2, ticket, path(), pending()));
         tasks.close();
         assert_eq!(tasks.in_flight(), 0);
         assert_eq!(admission.in_flight(), 0, "closing frees the slots");
         let ticket = admission.try_admit("w:3", "g").expect("ack");
-        assert!(!tasks.spawn(spawn_task, "w", 3, ticket, async {}), "closed");
+        assert!(
+            !tasks.spawn(spawn_task, "w", 3, ticket, path(), async {}),
+            "closed"
+        );
         let ticket = admission.try_admit("w:4", "g").expect("ack");
         let tasks = WelcomeAckTasks::new();
         assert!(
-            !tasks.spawn(|_| None, "w", 4, ticket, async {}),
+            !tasks.spawn(|_| None, "w", 4, ticket, path(), async {}),
             "a closed detached registry refuses the ack"
         );
     }
