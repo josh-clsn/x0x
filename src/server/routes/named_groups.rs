@@ -1105,6 +1105,11 @@ impl HeadAttestation {
 pub(in crate::server) struct ExpectedJoinResultInviter {
     inviter_agent_id: String,
     created_at: Instant,
+    /// Set when the attempt that armed the pin was finalized `TimedOut`. The
+    /// pin still authorizes a late result from this inviter (#390), but the
+    /// join no longer counts as pending: the typed membership state reports
+    /// `not_member` exactly as upstream's D39 recovery expects.
+    timed_out: bool,
 }
 
 /// Wall-clock for the same sidecar-restart reason as [`PendingJoinResult`].
@@ -18217,7 +18222,9 @@ pub(in crate::server) async fn local_join_membership_state(
         return "active";
     }
     let stable = info.stable_group_id().to_string();
-    if expected_join_result_inviter(state, &join_result_key(&stable, local_agent_hex)).is_some() {
+    if live_expected_join_result_inviter(state, &join_result_key(&stable, local_agent_hex))
+        .is_some()
+    {
         return "pending_authority_commit";
     }
     match info.members_v2.get(local_agent_hex) {
@@ -40503,11 +40510,16 @@ const PENDING_WELCOME_TTL: Duration = PENDING_JOIN_RESULT_TTL;
 /// evicting queued DMs and outliving the poll window. Retry cadence belongs
 /// to `poll_join_result_until_membership_confirmed`, which re-delivers the
 /// event and re-enters this fetch on its own backoff.
-const WELCOME_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+const WELCOME_FETCH_UNDER_GUARD_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Upstream's in-window re-send schedule for the Welcome pull. Under the
-/// bound above only the first two sends fit; the outer join-result poll owns
-/// every later retry.
+// The TreeKEM join-result poll closes at 120s. All fetch retries and the
+// final receive wait must finish inside that window. Upstream's bound, still
+// used by the control-blob pull, which holds no membership guard.
+const WELCOME_FETCH_TIMEOUT: Duration = Duration::from_secs(115);
+
+/// Upstream's in-window re-send schedule for the Welcome pull. Under
+/// `WELCOME_FETCH_UNDER_GUARD_TIMEOUT` only the first two sends fit; the outer
+/// join-result poll owns every later retry.
 const WELCOME_FETCH_RETRY_DELAYS: [Duration; 4] = [
     Duration::ZERO,
     Duration::from_secs(5),
@@ -40671,6 +40683,7 @@ fn record_expected_join_result_inviter(state: &AppState, key: String, inviter_ag
         ExpectedJoinResultInviter {
             inviter_agent_id,
             created_at: Instant::now(),
+            timed_out: false,
         },
     );
 }
@@ -40686,6 +40699,25 @@ fn expected_join_result_inviter(state: &AppState, key: &str) -> Option<String> {
     expected
         .get(key)
         .map(|pending| pending.inviter_agent_id.clone())
+}
+
+/// The pin only while its attempt is still live: a `TimedOut` pin keeps
+/// authorizing a late result but no longer makes the join read as pending.
+fn live_expected_join_result_inviter(state: &AppState, key: &str) -> Option<String> {
+    expected_join_result_inviter(state, key)?;
+    let expected = state.expected_join_result_inviters.lock().ok()?;
+    expected
+        .get(key)
+        .filter(|pending| !pending.timed_out)
+        .map(|pending| pending.inviter_agent_id.clone())
+}
+
+fn mark_expected_join_result_inviter_timed_out(state: &AppState, key: &str) {
+    if let Ok(mut expected) = state.expected_join_result_inviters.lock() {
+        if let Some(pending) = expected.get_mut(key) {
+            pending.timed_out = true;
+        }
+    }
 }
 
 fn clear_expected_join_result_inviter(state: &AppState, key: &str) {
@@ -42128,8 +42160,11 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
             // join can record the same key in any gap after this remove.
             // #390: a `TimedOut` exit keeps the pin armed, so a result that
             // lands after the horizon and matches it still applies (the
-            // pin's own TTL bounds it). A later attempt overwrites it.
-            if outcome != JoinAttemptOutcome::TimedOut {
+            // pin's own TTL bounds it); it is marked timed out so the join
+            // reads `not_member` (D39). A later attempt overwrites it.
+            if outcome == JoinAttemptOutcome::TimedOut {
+                mark_expected_join_result_inviter_timed_out(state, &expected_key);
+            } else {
                 clear_expected_join_result_inviter(state, &expected_key);
             }
             fetch_only = entry.stored_resend.is_none();
@@ -42167,6 +42202,7 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
                         if !stub_pending {
                             return JoinFinalizeDisposition::NotApplicable;
                         }
+                        mark_expected_join_result_inviter_timed_out(state, &expected_key);
                         (Vec::new(), Vec::new(), None)
                     }
                 },
@@ -45885,7 +45921,7 @@ where
         welcome_ref,
         send,
         &WELCOME_FETCH_RETRY_DELAYS,
-        WELCOME_FETCH_TIMEOUT,
+        WELCOME_FETCH_UNDER_GUARD_TIMEOUT,
     )
     .await
 }
