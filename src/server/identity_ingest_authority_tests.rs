@@ -1666,3 +1666,94 @@ async fn adr0115_card_lead_and_loopback_dial_never_follow_a_class_c_forgery() {
     assert_vector_closed("card lead", &open);
     attacker_node.shutdown().await;
 }
+
+/// Batch 5 (I1): after the local user's card moves X to M1, routing follows
+/// ADR 0115's authority order. A class A beat for X's old machine M2 signed
+/// before the import leaves routing on M1; one signed after it moves
+/// routing back. A beat from the card's own machine replaces a card entry
+/// whatever its clock says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adr0115_card_pin_holds_routing_against_an_older_beat() {
+    let victim = Victim::start("cardpin").await;
+    let now = now_secs();
+    let x = Subject::new();
+    let m1 = MachineKeypair::generate().expect("X's new machine");
+    victim.announce_genuine(&x, now - 30).await;
+    victim.identity_barrier().await;
+    victim.expect_genuine_entry(&x, "card pin").await;
+    let card = |agent: AgentId, machine: MachineId| crate::DiscoveredAgent {
+        self_name: None,
+        agent_id: agent,
+        machine_id: machine,
+        user_id: None,
+        addresses: Vec::new(),
+        announced_at: now,
+        last_seen: now,
+        machine_public_key: Vec::new(),
+        nat_type: None,
+        can_receive_direct: None,
+        is_relay: None,
+        is_coordinator: None,
+        reachable_via: Vec::new(),
+        relay_candidates: Vec::new(),
+        cert_not_after: None,
+        agent_certificate: None,
+        agent_public_key: Vec::new(),
+        cert_digest: None,
+    };
+    let beat = |subject: &Subject, machine: &MachineKeypair, at: u64| {
+        v2_wire(&signed_announcement(
+            subject.id(),
+            subject.public_key(),
+            machine,
+            at,
+            None,
+        ))
+    };
+
+    victim
+        .agent
+        .pin_card_binding(card(x.id(), m1.machine_id()))
+        .await;
+    assert_eq!(
+        victim.cached_machine(&x.id()).await,
+        Some(m1.machine_id()),
+        "CONTROL FAILED (not the vector): the card moves X to M1"
+    );
+    victim
+        .announce(&x.agent, beat(&x, &x.machine, now - 5))
+        .await;
+    victim.identity_barrier().await;
+    assert_eq!(
+        victim.cached_machine(&x.id()).await,
+        Some(m1.machine_id()),
+        "a class A beat for M2 signed before the import never moves routing off the pin"
+    );
+    victim
+        .announce(&x.agent, beat(&x, &x.machine, now + 5))
+        .await;
+    victim.identity_barrier().await;
+    assert_eq!(
+        victim.cached_machine(&x.id()).await,
+        Some(x.machine_id()),
+        "a beat signed after the import moves routing"
+    );
+
+    // The card's own machine: an older beat still replaces the card entry.
+    let y = Subject::new();
+    victim
+        .agent
+        .pin_card_binding(card(y.id(), y.machine_id()))
+        .await;
+    victim
+        .announce(&y.agent, beat(&y, &y.machine, now - 20))
+        .await;
+    victim.identity_barrier().await;
+    let entry = victim.agent.cached_agent(&y.id()).await.expect("Y cached");
+    assert_eq!(entry.machine_id, y.machine_id());
+    assert_eq!(
+        entry.announced_at,
+        now - 20,
+        "the own-machine beat replaced the card entry"
+    );
+}

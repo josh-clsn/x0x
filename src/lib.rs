@@ -5399,6 +5399,35 @@ pub(crate) mod announced_record_barrier {
     }
 }
 
+/// Whether the local user's card pin keeps `incoming` out of the routing
+/// entry. An entry a card made or moved carries `announced_at` 0, so a beat
+/// from the card's own machine replaces it whatever its clock says. A beat
+/// (or a rendezvous hint) for any other machine moves it only when it is
+/// newer than the pin that still names the routed machine: ADR 0115's
+/// `authority_machine` order.
+async fn card_pin_holds_routing(
+    cache: &std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+    >,
+    attested: &dm_inbox::AuthenticatedMachineBindings,
+    incoming: &DiscoveredAgent,
+) -> bool {
+    let routed = match cache.read().await.get(&incoming.agent_id) {
+        Some(entry) if entry.announced_at == 0 && entry.machine_id.0 != [0u8; 32] => {
+            entry.machine_id
+        }
+        _ => return false,
+    };
+    if incoming.machine_id == routed {
+        return false;
+    }
+    attested
+        .read()
+        .await
+        .peek(&incoming.agent_id)
+        .is_some_and(|pin| pin.machine_id == routed && incoming.announced_at <= pin.announced_at)
+}
+
 /// The identity listener's cache step for one announcement that passed its
 /// signature, timestamp, trust, revocation, pairing and freshness gates:
 /// the machine cache, the announced-binding store (x0x #1150 r7c) and the
@@ -5413,6 +5442,7 @@ async fn cache_verified_announcement(
         tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
     >,
     cert_events: &tokio::sync::broadcast::Sender<VerifiedCertificate>,
+    attested: Option<&dm_inbox::AuthenticatedMachineBindings>,
     discovered_agent: DiscoveredAgent,
 ) {
     upsert_discovered_machine_from_agent(machine_cache, &discovered_agent).await;
@@ -5440,6 +5470,11 @@ async fn cache_verified_announcement(
     #[cfg(test)]
     announced_record_barrier::park(&agent_id, announced_record_barrier::INGEST_BETWEEN_WRITES)
         .await;
+    if let Some(attested) = attested {
+        if card_pin_holds_routing(cache, attested, &discovered_agent).await {
+            return;
+        }
+    }
     upsert_discovered_agent(cache, cert_events, discovered_agent).await;
 }
 
@@ -14654,6 +14689,7 @@ impl Agent {
                         Some(&announce_blob_cache),
                         &cache,
                         &cert_events,
+                        Some(&authenticated_machine_bindings),
                         discovered_agent,
                     )
                     .await;
@@ -18260,7 +18296,16 @@ impl Agent {
                                 )
                                 .await;
                             }
-                            upsert_discovered_agent(&cache, &self.verified_cert_tx, discovered_agent).await;
+                            if !card_pin_holds_routing(
+                                &cache,
+                                &self.authenticated_machine_bindings,
+                                &discovered_agent,
+                            )
+                            .await
+                            {
+                                upsert_discovered_agent(&cache, &self.verified_cert_tx, discovered_agent)
+                                    .await;
+                            }
                             return Ok(Some(addrs));
                         }
                     }
@@ -18275,33 +18320,31 @@ impl Agent {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
-            upsert_discovered_agent(
-                &cache,
-                &self.verified_cert_tx,
-                DiscoveredAgent {
-                    self_name: None,
-                    agent_id,
-                    machine_id: identity::MachineId([0u8; 32]),
-                    user_id: None,
-                    addresses: addrs.clone(),
-                    // ADR 0115 §1: an unsigned rendezvous hint never
-                    // out-ranks a signed beat. Liveness reads `last_seen`.
-                    announced_at: 0,
-                    last_seen: now,
-                    machine_public_key: Vec::new(),
-                    nat_type: None,
-                    can_receive_direct: None,
-                    is_relay: None,
-                    is_coordinator: None,
-                    reachable_via: Vec::new(),
-                    relay_candidates: Vec::new(),
-                    cert_not_after: None,
-                    agent_certificate: None,
-                    agent_public_key: Vec::new(),
-                    cert_digest: None,
-                },
-            )
-            .await;
+            let hint = DiscoveredAgent {
+                self_name: None,
+                agent_id,
+                machine_id: identity::MachineId([0u8; 32]),
+                user_id: None,
+                addresses: addrs.clone(),
+                // ADR 0115 §1: an unsigned rendezvous hint never
+                // out-ranks a signed beat. Liveness reads `last_seen`.
+                announced_at: 0,
+                last_seen: now,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                cert_not_after: None,
+                agent_certificate: None,
+                agent_public_key: Vec::new(),
+                cert_digest: None,
+            };
+            if !card_pin_holds_routing(&cache, &self.authenticated_machine_bindings, &hint).await {
+                upsert_discovered_agent(&cache, &self.verified_cert_tx, hint).await;
+            }
             return Ok(Some(addrs));
         }
 
@@ -20715,11 +20758,8 @@ impl Agent {
         self.record_card_routing_hint(agent).await;
     }
 
-    /// The routing half of [`Self::pin_card_binding`]. Stamped with the
-    /// importer's clock, a card used to replace the announced address set
-    /// (a pair code carries none) and the relay hints until the contact's
-    /// next heartbeat. A card keeps at most its first `CARD_DIAL_HINTS_MAX`
-    /// distinct addresses. So:
+    /// The routing half of [`Self::pin_card_binding`]. A card keeps at most
+    /// its first `CARD_DIAL_HINTS_MAX` distinct addresses. So:
     /// - **An announced entry for the card's machine** keeps its
     ///   `announced_at`, relay hints and certificate fields. When an
     ///   authority store confirms that machine (the pin itself, unless a
@@ -20736,9 +20776,12 @@ impl Agent {
     ///   `announced_at` 0. The machine it left no longer lists the agent,
     ///   and the DM registry forgets that binding. Unconfirmed, the card
     ///   leaves the entry as it is.
-    /// - **No announced entry** (none, or one only a card made): the card is
-    ///   recorded with `announced_at` 0, so the next class A or B
-    ///   announcement replaces it whatever the two clocks say.
+    /// - **No announced entry** (none, or one only a card made): a confirmed
+    ///   card (or, with no entry, one naming no machine) is recorded with
+    ///   `announced_at` 0, so the next class A or B announcement from the
+    ///   card's machine replaces it whatever the two clocks say. One from
+    ///   another machine moves it only when it is newer than the pin
+    ///   ([`card_pin_holds_routing`]).
     ///
     /// The machine cache merges the card's addresses into the card's own
     /// machine's record as observed ones (the #308 rule), never clearing an
@@ -20824,7 +20867,10 @@ impl Agent {
                     existing.is_coordinator = None;
                     true
                 }
-                _ => false,
+                // A card-only entry yields only to a confirmed card; with no
+                // entry, a card naming no machine is recorded too.
+                Some(_) => !confirmed,
+                None => !(confirmed || card_names_no_machine),
             }
         };
         if let Some(left) = left_machine {
@@ -40028,6 +40074,7 @@ async fn r7d_announced_binding_learns_expiry_when_the_certificate_blob_lands() {
         None,
         &cache,
         &cert_events,
+        None,
         entry,
     )
     .await;
@@ -40098,13 +40145,23 @@ async fn r7d_announced_binding_keeps_known_expiry_across_a_same_digest_blob_miss
         None,
         &cache,
         &cert_events,
+        None,
         first,
     )
     .await;
     let mut miss = discovered_agent_fixture(0x5e, 200, &[], None);
     miss.agent_id = joiner.agent_id();
     miss.cert_digest = Some(digest);
-    cache_verified_announcement(&machine_cache, &announced, None, &cache, &cert_events, miss).await;
+    cache_verified_announcement(
+        &machine_cache,
+        &announced,
+        None,
+        &cache,
+        &cert_events,
+        None,
+        miss,
+    )
+    .await;
     assert_eq!(
         announced
             .read()
@@ -40160,6 +40217,7 @@ async fn r7e_a_certificate_landing_mid_ingest_keeps_its_expiry() {
                 Some(&blob_cache),
                 &cache,
                 &cert_events,
+                None,
                 entry,
             )
             .await;
@@ -40264,6 +40322,7 @@ async fn r7g_a_landed_certificate_is_never_published_before_its_expiry() {
         None,
         &cache,
         &cert_events,
+        None,
         entry,
     )
     .await;
@@ -40378,6 +40437,7 @@ async fn r7e_discovery_eviction_never_erases_a_retained_expiry() {
         None,
         &cache,
         &cert_events,
+        None,
         ingest(100, digest, Some(cert)),
     )
     .await;
@@ -40389,6 +40449,7 @@ async fn r7e_discovery_eviction_never_erases_a_retained_expiry() {
         None,
         &cache,
         &cert_events,
+        None,
         ingest(200, digest, None),
     )
     .await;
@@ -40403,6 +40464,7 @@ async fn r7e_discovery_eviction_never_erases_a_retained_expiry() {
         None,
         &cache,
         &cert_events,
+        None,
         ingest(300, [0x77; 32], None),
     )
     .await;

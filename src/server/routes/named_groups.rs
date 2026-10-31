@@ -54739,6 +54739,55 @@ pub(in crate::server) mod tests {
                 .map(|bound| bound.machine_id),
             Some(announced_machine)
         );
+
+        // No entry and an outranked pin: nothing is recorded.
+        let unrouted = crate::identity::AgentKeypair::generate()?.agent_id();
+        x0x::dm_inbox::record_authenticated_machine_binding(
+            &state.agent.authenticated_machine_bindings,
+            unrouted,
+            crate::identity::MachineId([0x57; 32]),
+            now + 20,
+        )
+        .await;
+        let mut card = x0x::groups::card::AgentCard::new(
+            "Dave".to_string(),
+            &unrouted,
+            &hex::encode([0x58u8; 32]),
+        );
+        card.addresses = vec![card_addr.to_string()];
+        import_card(&state, &card).await?;
+        assert!(
+            state
+                .agent
+                .discovered_agent_for_testing(&unrouted)
+                .await
+                .is_none(),
+            "an unconfirmed card makes no routing entry"
+        );
+
+        // A card naming no machine never replaces a card-only entry.
+        let card_only = crate::identity::AgentKeypair::generate()?.agent_id();
+        let mut card = x0x::groups::card::AgentCard::new(
+            "Erin".to_string(),
+            &card_only,
+            &hex::encode([0x59u8; 32]),
+        );
+        card.addresses = vec![announced_addr.to_string()];
+        import_card(&state, &card).await?;
+        let mut anonymous = x0x::groups::card::AgentCard::new(
+            "Erin".to_string(),
+            &card_only,
+            &hex::encode([0u8; 32]),
+        );
+        anonymous.addresses = vec![card_addr.to_string()];
+        import_card(&state, &anonymous).await?;
+        let entry = state
+            .agent
+            .discovered_agent_for_testing(&card_only)
+            .await
+            .context("the card is recorded")?;
+        assert_eq!(entry.machine_id, crate::identity::MachineId([0x59; 32]));
+        assert_eq!(entry.addresses, vec![announced_addr], "no machine, no lead");
         Ok(())
     }
 
