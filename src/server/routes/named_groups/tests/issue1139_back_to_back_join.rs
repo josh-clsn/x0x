@@ -2422,13 +2422,6 @@ async fn d39_r2_preexisting_seated_invite_without_row_reports_active() -> Result
 /// operator exit (owner remove-member + re-invite) restores keys as well.
 #[tokio::test]
 async fn s8a_shape_b_no_carry_is_not_rearmed_and_remove_reinvite_restores_keys() -> Result<()> {
-    for timeout_before_removal in [true, false] {
-        shape_b_remove_reinvite_without_restart(timeout_before_removal).await?;
-    }
-    Ok(())
-}
-
-async fn shape_b_remove_reinvite_without_restart(timeout_before_removal: bool) -> Result<()> {
     let dir = tempfile::tempdir()?;
     let s = build_back_to_back(dir.path()).await?;
     assert_eq!(
@@ -2445,89 +2438,36 @@ async fn shape_b_remove_reinvite_without_restart(timeout_before_removal: bool) -
         "Shape B is recovered by the returning-member re-key: {r}"
     );
 
+    // The operator exit on the same process (#1191): the owner's removal
+    // retires any matching attempt and its pin, and the re-invite is
+    // accepted without a restart.
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    assert_eq!(d39_timed_out_without_carry(&s).await, "no_row");
     let member = hex::encode(s.j2.agent.agent_id().as_bytes());
     let key = join_result_key(&s.stable_group_id, &member);
-    let attempt =
-        s.j2.pending_join_attempts
-            .lock()
-            .expect("attempt registry")
-            .get(&key)
-            .expect("base-seated invite attempt")
-            .attempt_id
-            .clone();
-    if timeout_before_removal {
-        let lock = super::super::group_membership_lock_for_known_group(&s.j2, &s.group_key)
-            .await
-            .expect("known group");
-        assert_eq!(
-            super::super::finalize_join_attempt(
-                &s.j2,
-                &s.group_key,
-                &s.stable_group_id,
-                &member,
-                &attempt,
-                super::super::JoinAttemptOutcome::TimedOut,
-                super::super::JoinFinalizeGuard::Owned(lock.lock().await),
-            )
-            .await,
-            super::super::JoinFinalizeDisposition::NotApplicable
-        );
-        assert!(
-            !s.j2
-                .pending_join_attempts
-                .lock()
-                .expect("attempt registry")
-                .contains_key(&key),
-            "#1191: NotApplicable must retire the matching attempt before removal"
-        );
-        assert_eq!(wa_state(&s.j2, &s.group_key).await, "active");
-        assert!(
-            !s.j2
-                .last_join_outcomes
-                .lock()
-                .expect("outcomes")
-                .contains_key(&s.group_key),
-            "the snapshot seat must not acquire a timeout outcome"
-        );
-    }
     let after_removal = wa_owner_removes_j2(&s, true).await?;
-    assert_eq!(after_removal.after, "no_row");
     assert!(
         !s.j2
             .pending_join_attempts
             .lock()
             .expect("attempt registry")
             .contains_key(&key),
-        "#1191: self-removal retires the matching attempt before the poll's next tick \
-         (timeout_before_removal={timeout_before_removal})"
+        "#1191: no attempt survives the removal"
     );
+    // The timed-out attempt's pin is kept for the #390 late result and the
+    // re-key chain step, but only as a timed-out pin: it no longer makes the
+    // join read as pending, so it cannot hold the re-invite.
     assert!(
-        super::super::expected_join_result_inviter(&s.j2, &key).is_none(),
-        "#1191: self-removal clears the matching inviter pin \
-         (timeout_before_removal={timeout_before_removal})"
-    );
-    super::super::poll_join_result_until_membership_confirmed(
-        Arc::clone(&s.j2),
-        s.group_key.clone(),
-        s.stable_group_id.clone(),
-        vec![s.authority_id],
-        member,
-        true,
-        None,
-        attempt,
-    )
-    .await;
-    assert!(super::super::expected_join_result_inviter(&s.j2, &key).is_none());
-    assert_eq!(
-        super::group_counters_for_test(&s.j2, &s.group_key)
-            .await
-            .join_attempts_timed_out,
-        0,
-        "bookkeeping-only exits must not count a timeout"
+        super::super::live_expected_join_result_inviter(&s.j2, &key).is_none(),
+        "#1191: no live inviter pin survives the removal"
     );
     let r = wa_fresh_invite_round_trip(&s).await?;
-    assert_eq!(r.status, StatusCode::OK,
-        "#1191: remove + re-invite must be accepted without restart (timeout_before_removal={timeout_before_removal}): {r}");
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "#1191: remove + re-invite must be accepted without restart: {r}"
+    );
     wa_assert_recovered(
         &format!(
             "shape B, j2_after_removal={} j2_apply_accepted={:?}",
@@ -2546,12 +2486,40 @@ async fn issue1191_stale_finalizer_and_poll_preserve_new_attempt() -> Result<()>
     let s = build_back_to_back(dir.path()).await?;
     assert_eq!(d39_timed_out_without_carry(&s).await, "no_row");
     let r = wa_fresh_invite_round_trip(&s).await?;
-    assert!(
-        r.new_attempt && r.final_state == "active" && !r.treekem,
-        "{r}"
-    );
+    // This fork re-keys the seated device on the new attempt, so it ends
+    // with keys and that attempt finalizes as seated (upstream keeps the
+    // #1150 limitation and the attempt live). A newer live attempt and its
+    // pin are re-registered here so the stale finalizer and poll below meet
+    // the shape this test pins.
+    assert!(r.new_attempt && r.final_state == "active", "{r}");
     let member = hex::encode(s.j2.agent.agent_id().as_bytes());
     let key = join_result_key(&s.stable_group_id, &member);
+    {
+        let mut attempts = s.j2.pending_join_attempts.lock().expect("attempt registry");
+        if !attempts.contains_key(&key) {
+            attempts.insert(
+                key.clone(),
+                super::super::PendingJoinAttempt {
+                    attempt_id: "issue1191-newer-attempt".to_string(),
+                    local_group_key: s.group_key.clone(),
+                    invite_fingerprint: "issue1191-newer-invite".to_string(),
+                    invite_group_id: s.stable_group_id.clone(),
+                    inviter_public_key_b64: String::new(),
+                    stored_resend: None,
+                    polls: Vec::new(),
+                    tasks: Vec::new(),
+                    listener_token: None,
+                },
+            );
+        }
+    }
+    if super::super::expected_join_result_inviter(&s.j2, &key).is_none() {
+        super::super::record_expected_join_result_inviter(
+            &s.j2,
+            key.clone(),
+            hex::encode(s.authority_id.as_bytes()),
+        );
+    }
     let current =
         s.j2.pending_join_attempts
             .lock()

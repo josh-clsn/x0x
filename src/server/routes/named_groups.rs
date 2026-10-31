@@ -42680,11 +42680,13 @@ async fn finalize_join_attempt_with_reason_inner(
             // #1191: clear this attempt's pin before the registry mutex
             // drops. The superseded exit holds no membership lock, so a new
             // join can record the same key in any gap after this remove.
-            // #390: a `TimedOut` exit keeps the pin armed, so a result that
-            // lands after the horizon and matches it still applies (the
-            // pin's own TTL bounds it); it is marked timed out so the join
-            // reads `not_member` (D39). A later attempt overwrites it.
-            if outcome == JoinAttemptOutcome::TimedOut {
+            // #390: a `TimedOut` exit that applies keeps the pin armed, so a
+            // result that lands after the horizon and matches it still
+            // applies (the pin's own TTL bounds it); it is marked timed out
+            // so the join reads `not_member` (D39). A later attempt
+            // overwrites it. A timeout that lost to a seat or to an existing
+            // outcome retires like any other exit (#1191).
+            if outcome == JoinAttemptOutcome::TimedOut && outcome_applies {
                 mark_expected_join_result_inviter_timed_out(state, &expected_key);
             } else {
                 clear_expected_join_result_inviter(state, &expected_key);
