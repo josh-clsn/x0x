@@ -21858,8 +21858,15 @@ pub(in crate::server) async fn join_group_via_invite(
     // FAST PATH ONLY; the authoritative recheck runs under the membership
     // lock just before the stub install (closing the install race where a
     // concurrent join passed this check and waited on the lock).
-    if let Some(resp) = join_pending_invite_check(state.as_ref(), &invite, &req.invite).await {
-        return resp;
+    // A pending attempt held only by this device's own applied removal
+    // (below) does not answer 409; the locked pass retires it.
+    if attempt_held_by_own_removal(state.as_ref(), &invite, &req.invite)
+        .await
+        .is_none()
+    {
+        if let Some(resp) = join_pending_invite_check(state.as_ref(), &invite, &req.invite).await {
+            return resp;
+        }
     }
 
     // ── #469 A2: v4 authentication. EVERY check below runs BEFORE any
@@ -22113,6 +22120,18 @@ pub(in crate::server) async fn join_group_via_invite(
     let invite_stable_group_id = invite.stable_group_id.as_deref().unwrap_or(&group_id_hex);
     let membership_lock = group_membership_lock(&state, &group_id_hex).await;
     let membership_guard = membership_lock.lock().await;
+    // #1191 x the re-key chain step: a removal by the pinned inviter during
+    // a live attempt is applied as a state link and keeps the attempt, in
+    // case the re-add follows. A different invite proves no re-add is
+    // coming for that attempt, so it is retired here, as upstream retires an
+    // attempt on self-removal, and the re-invite is not 409.
+    if let Some((key, stable, mls)) =
+        attempt_held_by_own_removal(state.as_ref(), &invite, &req.invite).await
+    {
+        let joiner_hex = hex::encode(state.agent.agent_id().as_bytes());
+        retire_join_attempts_after_self_removal(state.as_ref(), &key, &stable, &mls, &joiner_hex)
+            .await;
+    }
     // #477: the AUTHORITATIVE 409 recheck — serialized against the stub
     // install, so a concurrent different-invite join cannot slip through
     // the pre-lock fast path.
@@ -42885,7 +42904,7 @@ static JOIN_POLL_WINDOW_OVERRIDES: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 #[cfg(test)]
-struct JoinPollWindowGuard(JoinPollWindowKey);
+pub(in crate::server) struct JoinPollWindowGuard(JoinPollWindowKey);
 
 #[cfg(test)]
 impl Drop for JoinPollWindowGuard {
@@ -42905,6 +42924,24 @@ fn set_join_poll_window_override(group_id: &str, attempt_id: &str, ms: u64) -> J
     JoinPollWindowGuard(key)
 }
 
+/// Test-only: every join poll for `group_id`, whatever its attempt, ends
+/// after `window`. A W3-H case written for upstream's 120 s TreeKEM join
+/// window uses it to put that window back over the fork's 24 h horizon.
+#[cfg(test)]
+pub(in crate::server) fn set_group_join_poll_window_for_test(
+    group_id: &str,
+    window: Duration,
+) -> JoinPollWindowGuard {
+    set_join_poll_window_override(
+        group_id,
+        JOIN_POLL_WINDOW_ANY_ATTEMPT,
+        u64::try_from(window.as_millis()).unwrap_or(u64::MAX),
+    )
+}
+
+#[cfg(test)]
+const JOIN_POLL_WINDOW_ANY_ATTEMPT: &str = "*";
+
 #[cfg(test)]
 fn join_poll_window_override(group_id: &str, attempt_id: &str) -> Option<u64> {
     JOIN_POLL_WINDOW_OVERRIDES
@@ -42913,6 +42950,12 @@ fn join_poll_window_override(group_id: &str, attempt_id: &str) -> Option<u64> {
         .and_then(|overrides| {
             overrides
                 .get(&(group_id.to_string(), attempt_id.to_string()))
+                .or_else(|| {
+                    overrides.get(&(
+                        group_id.to_string(),
+                        JOIN_POLL_WINDOW_ANY_ATTEMPT.to_string(),
+                    ))
+                })
                 .copied()
         })
 }
@@ -43202,6 +43245,50 @@ async fn join_pending_invite_check(
         }
     }
     None
+}
+
+/// The attempt that would answer `invite` with 409 `join_already_pending`
+/// is held only by this device's own applied removal: every alias row is a
+/// TreeKEM row listing this device as Removed (not banned, not withdrawn)
+/// and no tree is held. Returns the row's (key, stable id, MLS id).
+async fn attempt_held_by_own_removal(
+    state: &AppState,
+    invite: &x0x::groups::invite::SignedInvite,
+    invite_link: &str,
+) -> Option<(String, String, String)> {
+    let invite_group = invite
+        .stable_group_id
+        .clone()
+        .unwrap_or_else(|| invite.group_id.clone());
+    let incoming_fp = join_invite_fingerprint(invite_link);
+    let blocking = state
+        .pending_join_attempts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .values()
+        .any(|attempt| {
+            attempt.invite_group_id.eq_ignore_ascii_case(&invite_group)
+                && attempt.invite_fingerprint != incoming_fp
+        });
+    if !blocking {
+        return None;
+    }
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let (stable, aliases) = depart_alias_set(state, &invite_group).await?;
+    let row = {
+        let groups = state.named_groups.read().await;
+        if !depart_rows_qualify(&groups, &aliases, &local_hex) {
+            return None;
+        }
+        groups
+            .iter()
+            .find(|(key, _)| aliases.contains(key.as_str()))
+            .map(|(key, info)| (key.clone(), info.mls_group_id.clone()))?
+    };
+    if !depart_tree_absent(&*state.treekem_groups.read().await, &aliases) {
+        return None;
+    }
+    Some((row.0, stable, row.1))
 }
 
 /// #477 C7 — lookup-gated membership lock: resolves the group first (the

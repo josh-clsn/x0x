@@ -35,8 +35,10 @@ use serde_json::json;
 const SEED: u64 = 0x1191_0001;
 const CASE: &str = "w3h_1191_attempt_exit";
 const FINAL: &str = "reinvite_starts_a_new_attempt";
-/// `JOIN_RESULT_POLL_TIMEOUT` plus margin for the poll that started inside
-/// the redeem barrier.
+/// Upstream's TreeKEM join-poll window, which this case is written for.
+const POLL_WINDOW: Duration = Duration::from_secs(120);
+/// `POLL_WINDOW` plus margin for the poll that started inside the redeem
+/// barrier.
 const POLL_DEADLINE: Duration = Duration::from_secs(130);
 /// Long enough for the poll to be running, and short of its deadline.
 const SUPERSEDED_WAIT: Duration = Duration::from_secs(30);
@@ -177,6 +179,12 @@ async fn listed(sim: &Sim, label: &str, group: &str, agent: &str) -> Result<bool
 async fn scenario(sim: &Sim, receipt: &mut Receipt, leg: ExitLeg) -> Result<LegOutcome> {
     mesh(sim, &["A", "J"]).await?;
     let group = create_group(sim, "A").await?;
+    // This case is written for upstream's 120 s TreeKEM join window; the
+    // fork polls for 24 h (#390). Put upstream's window back for this group.
+    let _window = crate::server::routes::named_groups::set_group_join_poll_window_for_test(
+        &group,
+        POLL_WINDOW,
+    );
     let block = AwayFromJ::install(sim)?;
     receipt.setup_done(at(sim));
 
