@@ -371,6 +371,10 @@ decision**. Two rules protect prior intent:
    trust is `max(existing, requested)`, so a re-import (which defaults to
    `"known"`) cannot downgrade a manually-trusted peer.
 
+An import is also a local-user pin (ADR 0115) of the card's machine, and it
+records the card's addresses as a dial hint; see
+[What `/agents/connect` dials](#what-agentsconnect-dials).
+
 For a new contact the requested `trust_level` (default `"known"`) is applied
 as-is. The response includes `trust_change_ignored: true` when the requested
 level conflicted with an existing trust decision and was therefore ignored.
@@ -1067,6 +1071,26 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 | GET | `/direct/connections` | `x0x direct connections` | List active direct connections |
 | GET | `/history/message/:msg_id` | `x0x history message` | Point lookup of one durable history row by exposed `msg_id` (64 hex; canonical group ids need `?scope=`); 404 when absent, 400 on malformed id. Same record shape as `/history` (issue #319) |
 | GET | `/direct/events` | `x0x direct events` | SSE stream of direct messages; `?backfill=N` requests up to N stored `dm:` rows as `history_direct_message` events before a `live` marker and live frames (ADR-0023 §7). The attempt is best-effort; reconcile through [`/history`](#durable-history-adr-0023) |
+
+### What `/agents/connect` dials
+
+Signed announcements set the contact's discovery entry.
+`POST /agent/card/import` adds to it without outranking an announcement:
+
+- **The card names the announced machine** (or no machine): the entry keeps
+  its addresses, `announced_at`, relay hints and certificate fields.
+- **The card names another machine:** the entry becomes the card's, with its
+  machine id and addresses, no relay hints and `announced_at` 0. The daemon
+  also forgets the contact's live binding to the machine it left. The next
+  agent-authenticated announcement replaces the entry.
+- **No announcement yet:** the card's machine id and addresses are recorded
+  with `announced_at` 0, so the first agent-authenticated announcement
+  replaces them, whatever the two clocks say.
+
+The import still pins the card's machine as an authority source at the
+import time (ADR 0115), so the routing entry and the authority stores are
+separate: a dial binds the machine it reaches only when an authority store
+confirms it.
 
 ### Direct send request body
 

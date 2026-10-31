@@ -20396,18 +20396,106 @@ impl Agent {
     /// Besides class A announcements and ADR 0021 origin attestations, this
     /// is the only writer of the authenticated-binding store. No network
     /// input reaches it; only the local user's card import calls it.
+    ///
+    /// `agent.announced_at` is the pin time. The routing entry follows
+    /// [`Self::record_card_routing_hint`]: a card is no announcement and
+    /// never outranks one there.
     pub(crate) async fn pin_card_binding(&self, agent: DiscoveredAgent) {
         let (agent_id, machine_id, pinned_at) =
             (agent.agent_id, agent.machine_id, agent.announced_at);
-        upsert_discovered_machine_from_agent(&self.machine_discovery_cache, &agent).await;
-        upsert_discovered_agent(
-            &self.identity_discovery_cache,
-            &self.verified_cert_tx,
-            agent,
-        )
-        .await;
+        self.record_card_routing_hint(agent).await;
         self.record_pinned_pairing(agent_id, machine_id, pinned_at)
             .await;
+    }
+
+    /// The routing half of [`Self::pin_card_binding`]. Stamped with the
+    /// importer's clock, a card used to replace the announced address set
+    /// (a pair code carries none) and the relay hints until the contact's
+    /// next heartbeat. So:
+    /// - **An announced entry for the card's machine**, or a card naming no
+    ///   machine, keeps its addresses, `announced_at`, relay hints and
+    ///   certificate fields.
+    /// - **An announced entry for another machine** becomes the card's
+    ///   whole: its machine id and addresses, no relay hints or machine
+    ///   attributes, `announced_at` 0. The machine it left no longer lists
+    ///   the agent, and the DM registry forgets that binding.
+    /// - **No announced entry** (none, or one only a card made): the card is
+    ///   recorded with `announced_at` 0, so the next class A or B
+    ///   announcement replaces it whatever the two clocks say.
+    ///
+    /// The machine cache merges the card's addresses into the card's own
+    /// machine's record as observed ones (the #308 rule), never clearing an
+    /// announced set. A card naming no machine adds to no machine's record.
+    async fn record_card_routing_hint(&self, card: DiscoveredAgent) {
+        let now = Self::unix_timestamp_secs();
+        let agent_id = card.agent_id;
+        let machine_id = card.machine_id;
+        let mut card_addresses: Vec<std::net::SocketAddr> = Vec::new();
+        for addr in card.addresses {
+            push_unique(&mut card_addresses, addr);
+        }
+        let hint = DiscoveredAgent {
+            addresses: card_addresses.clone(),
+            announced_at: 0,
+            last_seen: now,
+            ..card
+        };
+        let card_names_no_machine = machine_id.0 == [0u8; 32];
+        let mut left_machine = None;
+        let recorded = {
+            let mut cache = self.identity_discovery_cache.write().await;
+            match cache.get_mut(&agent_id) {
+                Some(existing)
+                    if existing.announced_at > 0
+                        && (card_names_no_machine || existing.machine_id == machine_id) =>
+                {
+                    existing.last_seen = existing.last_seen.max(now);
+                    true
+                }
+                Some(existing) if existing.announced_at > 0 => {
+                    left_machine = Some(existing.machine_id);
+                    existing.machine_id = machine_id;
+                    existing.addresses = card_addresses;
+                    existing.announced_at = 0;
+                    existing.last_seen = existing.last_seen.max(now);
+                    existing.reachable_via.clear();
+                    existing.relay_candidates.clear();
+                    existing.machine_public_key.clear();
+                    existing.nat_type = None;
+                    existing.can_receive_direct = None;
+                    existing.is_relay = None;
+                    existing.is_coordinator = None;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if let Some(left) = left_machine {
+            if let Some(machine) = self.machine_discovery_cache.write().await.get_mut(&left) {
+                machine.agent_ids.retain(|id| *id != agent_id);
+            }
+            // A reconnect or a raw-send reconcile would otherwise move the
+            // entry back to that machine while it keeps the card's addresses.
+            self.direct_messaging.forget_binding(&agent_id, &left).await;
+        }
+        upsert_discovered_machine_from_agent(&self.machine_discovery_cache, &hint).await;
+        if !recorded {
+            upsert_discovered_agent(&self.identity_discovery_cache, &self.verified_cert_tx, hint)
+                .await;
+        }
+    }
+
+    /// Test seam: read one machine-cache entry.
+    #[cfg(test)]
+    pub(crate) async fn discovered_machine_for_testing(
+        &self,
+        machine: &identity::MachineId,
+    ) -> Option<DiscoveredMachine> {
+        self.machine_discovery_cache
+            .read()
+            .await
+            .get(machine)
+            .cloned()
     }
 
     /// The authenticated binding and DM-registry writes of
