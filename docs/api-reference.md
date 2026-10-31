@@ -1091,6 +1091,26 @@ card keeps at most its first 4 distinct addresses, whichever case applies:
   with `announced_at` 0, so the first agent-authenticated announcement
   replaces them, whatever the two clocks say.
 
+`POST /agents/connect` first reuses a live connection to the contact's
+machine. Otherwise it dials from the contact's discovery entry, step by step,
+until one step connects:
+
+1. **Loopback addresses**, address-only, at most 2 s each, keeping a
+   connection only if the far end is the entry's machine (a stray the dial
+   opened is closed). This step runs only for an entry that names a machine
+   an authority store confirms. In production only an imported card puts
+   loopback here (for example fetch>it's same-computer link).
+2. **Private IPv4 addresses**, peer-verified.
+3. **One dial by machine id** with the whole list as hints. ant-quic ranks
+   the hints itself and drops loopback and LAN addresses when any global
+   address is present.
+4. **Each address in list order**, unless the contact's latest announcement
+   says it cannot receive direct connections (`can_receive_direct: false`).
+5. Coordinated hole punching, then a relay.
+
+A later card for the same machine replaces the earlier card's lead, so card
+addresses never total more than 4 ahead of the announced ones.
+
 The import still pins the card's machine as an authority source at the
 import time (ADR 0115). A card leads or moves an announced entry only when an
 authority store then confirms its machine; a fresher binding for another

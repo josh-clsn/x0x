@@ -54661,6 +54661,72 @@ pub(in crate::server) mod tests {
         Ok(())
     }
 
+    /// Repeated same-machine card imports never stack: a later card
+    /// replaces the earlier card's lead, so card addresses total at most 4
+    /// ahead of the announced ones. After a new announcement replaced the
+    /// list, nothing announced is stripped.
+    #[tokio::test]
+    async fn later_card_replaces_the_earlier_cards_lead() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let target_id = crate::identity::AgentKeypair::generate()?.agent_id();
+        let machine = crate::identity::MachineId([0x22; 32]);
+        let announced_addr: std::net::SocketAddr = "203.0.113.8:5483".parse()?;
+        let announced_at = now_millis_u64() / 1000 - 30;
+        let announced = announced_contact(target_id, machine, vec![announced_addr], announced_at);
+        state
+            .agent
+            .insert_discovered_agent_for_testing(announced.clone())
+            .await;
+        let card = |addrs: &[&str]| {
+            let mut card = x0x::groups::card::AgentCard::new(
+                "Alice".to_string(),
+                &target_id,
+                &hex::encode(machine.0),
+            );
+            card.addresses = addrs.iter().map(ToString::to_string).collect();
+            card
+        };
+        let addresses = || async {
+            state
+                .agent
+                .discovered_agent_for_testing(&target_id)
+                .await
+                .map(|entry| entry.addresses)
+                .unwrap_or_default()
+        };
+        let parse = |a: &str| -> std::net::SocketAddr { a.parse().expect("addr") };
+
+        import_card(&state, &card(&["127.0.0.1:41001", "127.0.0.1:41002"])).await?;
+        import_card(&state, &card(&["127.0.0.1:42001"])).await?;
+        assert_eq!(
+            addresses().await,
+            vec![parse("127.0.0.1:42001"), announced_addr],
+            "the later card replaced the earlier lead"
+        );
+        let many: Vec<String> = (0..6).map(|i| format!("127.0.0.1:{}", 43000 + i)).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        import_card(&state, &card(&many)).await?;
+        let list = addresses().await;
+        assert_eq!(list.len(), 5, "at most 4 card addresses lead: {list:?}");
+        assert_eq!(list[4], announced_addr);
+
+        let fresh = parse("127.0.0.1:43000");
+        state
+            .agent
+            .insert_discovered_agent_for_testing(x0x::DiscoveredAgent {
+                addresses: vec![fresh, announced_addr],
+                announced_at: announced_at + 1,
+                ..announced
+            })
+            .await;
+        import_card(&state, &card(&["127.0.0.1:44001"])).await?;
+        assert_eq!(
+            addresses().await,
+            vec![parse("127.0.0.1:44001"), fresh, announced_addr]
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn explicit_patch_downgrade_still_works() -> Result<()> {
         let (state, _dir) = secure_endpoint_test_state().await?;

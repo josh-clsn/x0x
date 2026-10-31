@@ -1516,3 +1516,150 @@ async fn adr0115_mixed_version_v0464_publisher_and_legacy_republisher() {
     victim.identity_barrier().await;
     victim.expect_genuine_entry(&cold, "mixed-version").await;
 }
+
+/// Batch 5 (welcome-unblock, restated inside ADR 0115): a class C
+/// forgery that names X with the attacker's own loopback address, beside
+/// the local user's card for X whose loopback lead is the attacker's
+/// listener (a stale or hostile card address), never steers a dial to the
+/// attacker's machine, never binds it and never verifies its raw frames.
+/// For a cold Y the forgery creates nothing to dial.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adr0115_card_lead_and_loopback_dial_never_follow_a_class_c_forgery() {
+    let victim = Victim::start("cardlead").await;
+    let victim_network = victim.agent.network().expect("victim network");
+    let attacker_dir = tempfile::tempdir().expect("attacker dir");
+    let attacker_node = Agent::builder()
+        .with_machine_key(attacker_dir.path().join("machine.key"))
+        .with_agent_key_path(attacker_dir.path().join("agent.key"))
+        .with_contact_store_path(attacker_dir.path().join("contacts.json"))
+        .with_peer_cache_disabled()
+        .with_network_config(crate::network::NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("loopback bind address")),
+            ..victim_network.config().clone()
+        })
+        .build()
+        .await
+        .expect("the attacker's loopback node");
+    let attacker_network = attacker_node.network().expect("attacker network");
+    let bound = attacker_network.bound_addr().await.expect("attacker bound");
+    let attacker_addr = std::net::SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        bound.port(),
+    );
+    let attacker_machine = attacker_node.machine_id();
+    let attacker_key = AgentKeypair::generate().expect("attacker publisher key");
+    let forged_with_address = |target: &Subject, announced_at: u64| {
+        let mut forged = crate::signed_identity_announcement_fixture(
+            target.id(),
+            attacker_node.identity.machine_keypair(),
+            announced_at,
+        );
+        forged.agent_public_key = target.public_key().to_vec();
+        forged.addresses = vec![attacker_addr];
+        forged.machine_signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            attacker_node.identity.machine_keypair().secret_key(),
+            &bincode::serialize(&forged.to_unsigned()).expect("unsigned announcement bytes"),
+        )
+        .expect("machine signature")
+        .as_bytes()
+        .to_vec();
+        forged
+            .verify()
+            .expect("the forgery is a valid announcement");
+        forged
+    };
+
+    let now = now_secs();
+    let x = Subject::new();
+    victim.announce_genuine(&x, now).await;
+    victim.identity_barrier().await;
+    victim.expect_genuine_entry(&x, "card lead").await;
+
+    // The local user's card for X: X's own machine, a loopback lead that
+    // the attacker's node answers.
+    victim
+        .agent
+        .pin_card_binding(crate::DiscoveredAgent {
+            self_name: None,
+            agent_id: x.id(),
+            machine_id: x.machine_id(),
+            user_id: None,
+            addresses: vec![attacker_addr],
+            announced_at: now,
+            last_seen: now,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: None,
+            agent_certificate: None,
+            agent_public_key: Vec::new(),
+            cert_digest: None,
+        })
+        .await;
+    let before = victim.agent.cached_agent(&x.id()).await.expect("X cached");
+    assert_eq!(
+        before.addresses,
+        vec![attacker_addr],
+        "CONTROL FAILED (not the vector): the card for X's confirmed machine leads"
+    );
+
+    // VECTOR: class C forgeries for warm X and cold Y, each naming the
+    // attacker's machine and loopback address.
+    let cold = Subject::new();
+    let later = now + ATTACKER_LEAD_SECS;
+    victim
+        .announce(&attacker_key, v2_wire(&forged_with_address(&x, later)))
+        .await;
+    victim
+        .announce(&attacker_key, v2_wire(&forged_with_address(&cold, later)))
+        .await;
+    victim.identity_barrier().await;
+
+    let mut open = Vec::new();
+    let entry = victim.agent.cached_agent(&x.id()).await.expect("X cached");
+    if entry.machine_id != x.machine_id() || entry.announced_at != before.announced_at {
+        open.push("the forgery changed X's routing entry".to_string());
+    }
+    if victim.agent.cached_agent(&cold.id()).await.is_some() {
+        open.push("the forgery created an entry for cold Y".to_string());
+    }
+    let outcome = tokio::time::timeout(DEADLINE, victim.agent.connect_to_agent(&x.id()))
+        .await
+        .expect("the connect to X ends")
+        .expect("the connect to X runs");
+    if outcome.is_live_path() {
+        open.push(format!(
+            "a dial to X over the attacker's address counted as X: {outcome:?}"
+        ));
+    }
+    let entry = victim.agent.cached_agent(&x.id()).await.expect("X cached");
+    if entry.machine_id == attacker_machine {
+        open.push("a dial bound X's routing entry to the attacker's machine".to_string());
+    }
+    if victim.agent.direct_messaging.get_machine_id(&x.id()).await == Some(attacker_machine) {
+        open.push("the DM registry maps X to the attacker's machine".to_string());
+    }
+    if victim.raw_frame_verified(x.id(), attacker_machine).await {
+        open.push("raw frames from the attacker's machine verify as X".to_string());
+    }
+    let transport = crate::RawQuicTransport::Scripted(Arc::new(
+        crate::PinnedTransportScript::connected_only(&[x.machine_id(), attacker_machine], false),
+    ));
+    if victim.raw_target(x.id(), &transport).await == Some(attacker_machine) {
+        open.push("a raw-first send to X resolves the attacker's machine".to_string());
+    }
+    let cold_outcome = victim
+        .agent
+        .connect_to_agent(&cold.id())
+        .await
+        .expect("the connect to Y runs");
+    if !matches!(cold_outcome, crate::connectivity::ConnectOutcome::NotFound) {
+        open.push(format!("cold Y was dialed: {cold_outcome:?}"));
+    }
+    assert_vector_closed("card lead", &open);
+    attacker_node.shutdown().await;
+}

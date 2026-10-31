@@ -707,6 +707,12 @@ pub struct Agent {
     /// auto-connect). Shared so the long-lived listener tasks observe
     /// flips made after they spawn.
     leaf_mode: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Per contact, the addresses the latest card put at the head of an
+    /// announced entry's dial list, with that entry's `announced_at` then
+    /// (`Agent::record_card_routing_hint`).
+    card_dial_leads: std::sync::Mutex<
+        std::collections::HashMap<identity::AgentId, (Vec<std::net::SocketAddr>, u64)>,
+    >,
     /// How often to re-announce identity (seconds).
     heartbeat_interval_secs: u64,
     /// Whether to keep publishing the legacy V2 announce set (V2 identity +
@@ -8081,6 +8087,55 @@ impl Agent {
             .await;
     }
 
+    /// Dial each loopback address in `addresses`, address-only, and keep
+    /// the connection only if the far end is `peer_id` (the peer check of
+    /// the LAN probes' raw fallback), each within 2 s. A connection that
+    /// reaches another peer is closed, unless that peer was already
+    /// connected just before this dial. Returns the address that reached
+    /// `peer_id`.
+    async fn dial_loopback_first(
+        &self,
+        network: &std::sync::Arc<network::NetworkNode>,
+        addresses: &[std::net::SocketAddr],
+        peer_id: ant_quic::PeerId,
+    ) -> Option<std::net::SocketAddr> {
+        const LOOPBACK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+        for addr in addresses.iter().copied().filter(|a| a.ip().is_loopback()) {
+            // Taken right before each dial: a peer some other path connected
+            // meanwhile is never closed here.
+            let before = network.connected_peers().await;
+            match tokio::time::timeout(LOOPBACK_PROBE_TIMEOUT, network.connect_addr(addr)).await {
+                Ok(Ok(connected)) if connected == peer_id => return Some(addr),
+                Ok(Ok(other)) => {
+                    if !before.contains(&other) {
+                        let _ = network.disconnect(&other).await;
+                    }
+                    tracing::debug!(
+                        target: "x0x::connect",
+                        strategy = "loopback_first",
+                        addr = %crate::logging::LogHexId::addr(&addr.to_string()),
+                        reached = %crate::logging::LogHexId::new("machine", &network::hex_prefix(&other.0, 4)),
+                        "loopback dial reached another peer; ignored"
+                    );
+                }
+                Ok(Err(e)) => tracing::debug!(
+                    target: "x0x::connect",
+                    strategy = "loopback_first",
+                    addr = %crate::logging::LogHexId::addr(&addr.to_string()),
+                    error = %e,
+                    "loopback dial failed"
+                ),
+                Err(_) => tracing::debug!(
+                    target: "x0x::connect",
+                    strategy = "loopback_first",
+                    addr = %crate::logging::LogHexId::addr(&addr.to_string()),
+                    "loopback dial timed out"
+                ),
+            }
+        }
+        None
+    }
+
     async fn connect_to_agent_inner(
         &self,
         agent_id: &identity::AgentId,
@@ -8271,14 +8326,58 @@ impl Agent {
         let dial_timeout = std::time::Duration::from_secs(8);
         let local_probe_timeout = std::time::Duration::from_secs(3);
         let direct_probe_addrs = local_direct_probe_addrs(&info.addresses);
+        let peer_id_hint =
+            (agent.machine_id.0 != [0u8; 32]).then_some(ant_quic::PeerId(agent.machine_id.0));
+
+        // In production a loopback address reaches an entry only through a
+        // card the local user imported (fetch>it's same-computer link):
+        // announcements leave loopback out unless the node runs local-scope
+        // discovery. Dial it first. No later step would: the LAN probes skip
+        // loopback, ant-quic's hinted dial drops loopback whenever the list
+        // holds a global address, and the in-order loop is skipped when the
+        // contact's latest announcement says it cannot receive direct
+        // connections (a daemon just after it restarts). Only an entry whose
+        // machine an authority store confirms takes this step, and the dial
+        // stays peer-verified.
+        if let Some(peer_id_hint) = peer_id_hint {
+            if info.addresses.iter().any(|addr| addr.ip().is_loopback())
+                && self
+                    .authority_confirms_with(agent_id, &agent.machine_id, nonblocking_evidence)
+                    .await
+            {
+                if let Some(addr) = self
+                    .dial_loopback_first(network, &info.addresses, peer_id_hint)
+                    .await
+                {
+                    if let Some(ref bc) = self.bootstrap_cache {
+                        bc.add_from_connection(peer_id_hint, vec![addr], None).await;
+                    }
+                    self.record_dialed_machine(
+                        agent_id,
+                        identity::MachineId(peer_id_hint.0),
+                        nonblocking_evidence,
+                    )
+                    .await;
+                    tracing::info!(
+                        target: "x0x::connect",
+                        stage = "connect_to_agent",
+                        agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                        strategy = "loopback_first",
+                        outcome = "direct",
+                        selected_addr = %crate::logging::LogHexId::addr(&addr.to_string()),
+                        dur_ms = call_start.elapsed().as_millis() as u64,
+                        "peer-verified loopback dial succeeded"
+                    );
+                    return Ok(connectivity::ConnectOutcome::Direct(addr));
+                }
+            }
+        }
 
         // Agent cards minted for a local dogfood run often contain both
         // reachable LAN IPv4 hints and globally-scoped IPv6/Tailscale hints
         // that may be stale or firewalled. Probe local IPv4 first so a bad
         // multi-address peer dial cannot consume the full API timeout before
         // the reachable LAN path is attempted.
-        let peer_id_hint =
-            (agent.machine_id.0 != [0u8; 32]).then_some(ant_quic::PeerId(agent.machine_id.0));
         for addr in &direct_probe_addrs {
             if let Some(peer_id_hint) = peer_id_hint {
                 match tokio::time::timeout(
@@ -20421,10 +20520,10 @@ impl Agent {
     ///   `announced_at`, relay hints and certificate fields. When an
     ///   authority store confirms that machine (the pin itself, unless a
     ///   fresher binding names another), the card's addresses lead its dial
-    ///   list, ahead of the announced ones, until the next announcement
-    ///   replaces the list: the local user just named them (fetch>it's
-    ///   same-computer link imports a card whose only address is loopback,
-    ///   then connects).
+    ///   list, ahead of the announced ones, replacing an earlier card's
+    ///   lead, until the next announcement replaces the list: the local user
+    ///   just named them (fetch>it's same-computer link imports a card whose
+    ///   only address is loopback, then connects).
     /// - **A card naming no machine** leaves an announced entry as it is:
     ///   its addresses belong to no confirmed machine.
     /// - **An announced entry for another machine** becomes the card's
@@ -20467,14 +20566,33 @@ impl Agent {
                         && (card_names_no_machine || existing.machine_id == machine_id) =>
                 {
                     if confirmed {
+                        // A later card replaces the earlier card's lead, so
+                        // card addresses never total more than the cap. The
+                        // earlier lead is stripped only while no
+                        // announcement has replaced the list since.
+                        let mut leads = self
+                            .card_dial_leads
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let rest = match leads.remove(&agent_id) {
+                            Some((lead, at))
+                                if at == existing.announced_at
+                                    && existing.addresses.starts_with(&lead) =>
+                            {
+                                &existing.addresses[lead.len()..]
+                            }
+                            _ => &existing.addresses[..],
+                        };
                         let mut merged = card_addresses.clone();
                         merged.extend(
-                            existing
-                                .addresses
-                                .iter()
+                            rest.iter()
                                 .copied()
                                 .filter(|addr| !card_addresses.contains(addr)),
                         );
+                        if !card_addresses.is_empty() {
+                            leads.insert(agent_id, (card_addresses.clone(), existing.announced_at));
+                        }
+                        drop(leads);
                         existing.addresses = merged;
                     }
                     existing.last_seen = existing.last_seen.max(now);
@@ -20485,6 +20603,10 @@ impl Agent {
                 Some(existing) if existing.announced_at > 0 && !confirmed => true,
                 Some(existing) if existing.announced_at > 0 => {
                     left_machine = Some(existing.machine_id);
+                    self.card_dial_leads
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&agent_id);
                     existing.machine_id = machine_id;
                     existing.addresses = card_addresses;
                     existing.announced_at = 0;
@@ -22598,6 +22720,7 @@ impl AgentBuilder {
             )),
             identity_listener_started: std::sync::atomic::AtomicBool::new(false),
             leaf_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            card_dial_leads: std::sync::Mutex::new(std::collections::HashMap::new()),
             heartbeat_interval_secs: self
                 .heartbeat_interval_secs
                 .unwrap_or(IDENTITY_HEARTBEAT_INTERVAL_SECS),
@@ -28782,6 +28905,162 @@ mod tests {
                 .is_connected(&ant_quic::PeerId(bob.machine_id().0))
                 .await
         );
+    }
+
+    /// fetch>it's same-computer link after an app restart: the contact's
+    /// latest announcement names only a global (TEST-NET) address and says
+    /// it cannot receive direct connections. A same-machine card's loopback
+    /// address is still dialed first, at once, and never handed to
+    /// ant-quic's hinted dial (which would drop it beside a global address).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn loopback_card_is_dialed_first_over_a_global_announcement() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (alice, bob, bob_addr) = leaf_and_peer(dir.path()).await;
+        let global: std::net::SocketAddr = "192.0.2.10:5483".parse().expect("addr");
+        let mut record = alice
+            .discovered_agent_for_testing(&bob.agent_id())
+            .await
+            .expect("bob is known");
+        record.addresses = vec![global];
+        record.can_receive_direct = Some(false);
+        record.announced_at = Agent::unix_timestamp_secs() + 1;
+        alice.insert_discovered_agent_for_testing(record).await;
+        alice
+            .pin_card_binding(card_pin(
+                bob.agent_id(),
+                bob.machine_id(),
+                vec![bob_addr],
+                Agent::unix_timestamp_secs(),
+            ))
+            .await;
+
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10) * test_time_multiplier(),
+            alice.connect_to_agent(&bob.agent_id()),
+        )
+        .await
+        .expect("the connect ends")
+        .expect("the connect runs");
+        assert!(
+            matches!(outcome, connectivity::ConnectOutcome::Direct(addr) if addr == bob_addr),
+            "loopback first: {outcome:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2) * test_time_multiplier(),
+            "at once: {:?}",
+            started.elapsed()
+        );
+        let network = alice.network().expect("alice network");
+        assert!(
+            network
+                .is_connected(&ant_quic::PeerId(bob.machine_id().0))
+                .await
+        );
+        assert_eq!(
+            alice.direct_messaging.get_machine_id(&bob.agent_id()).await,
+            Some(bob.machine_id()),
+            "the confirmed machine becomes routing state"
+        );
+    }
+
+    /// The loopback-first dial closes a wrong peer only when that peer was
+    /// not connected just before the dial: a peer another path connected
+    /// while an earlier loopback dial was running stays connected, and a
+    /// stray connection the dial itself opened is closed. Neither stray is
+    /// bound to the contact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn loopback_dial_closes_only_a_stray_it_opened() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (alice, bob, bob_addr) = leaf_and_peer(dir.path()).await;
+        let carol = Agent::builder()
+            .with_machine_key(dir.path().join("carol-machine.key"))
+            .with_agent_key_path(dir.path().join("carol-agent.key"))
+            .with_contact_store_path(dir.path().join("carol-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("carol-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("carol");
+        let carol_network = carol.network().expect("carol network");
+        let carol_addr = normalize_loopback_addr(carol_network.bound_addr().await.expect("bound"));
+        let carol_peer = ant_quic::PeerId(carol.machine_id().0);
+        // A socket that never answers: a dial to it spends the probe's 2 s.
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("silent socket");
+        let silent_addr = silent.local_addr().expect("silent addr");
+        let alice_network = std::sync::Arc::clone(alice.network().expect("alice network"));
+        let set_entry = |addresses: Vec<std::net::SocketAddr>| {
+            let alice = &alice;
+            let bob = &bob;
+            async move {
+                let mut record = alice
+                    .discovered_agent_for_testing(&bob.agent_id())
+                    .await
+                    .expect("bob is known");
+                record.addresses = addresses;
+                record.announced_at += 1;
+                alice.insert_discovered_agent_for_testing(record).await;
+            }
+        };
+
+        // 1. Carol connects by another path while the silent address's dial
+        //    runs; the dial that then reaches carol leaves her connected.
+        set_entry(vec![silent_addr, carol_addr, bob_addr]).await;
+        let other_path = std::sync::Arc::clone(&alice_network);
+        let meanwhile = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            other_path.connect_addr(carol_addr).await
+        });
+        let outcome = alice
+            .connect_to_agent(&bob.agent_id())
+            .await
+            .expect("the connect runs");
+        assert!(
+            matches!(outcome, connectivity::ConnectOutcome::Direct(addr) if addr == bob_addr),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            meanwhile.await.expect("joined").expect("carol connects"),
+            carol_peer
+        );
+        assert!(
+            alice_network.is_connected(&carol_peer).await,
+            "a connection another path opened is never closed"
+        );
+
+        // 2. A stray connection the dial itself opened is closed.
+        alice_network
+            .disconnect(&carol_peer)
+            .await
+            .expect("disconnect");
+        alice_network
+            .disconnect(&ant_quic::PeerId(bob.machine_id().0))
+            .await
+            .expect("disconnect");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while alice_network.is_connected(&carol_peer).await && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        set_entry(vec![carol_addr, bob_addr]).await;
+        let outcome = alice
+            .connect_to_agent(&bob.agent_id())
+            .await
+            .expect("the connect runs");
+        assert!(
+            matches!(outcome, connectivity::ConnectOutcome::Direct(addr) if addr == bob_addr),
+            "{outcome:?}"
+        );
+        assert!(
+            !alice_network.is_connected(&carol_peer).await,
+            "the stray the dial opened was closed"
+        );
+        let entry = alice
+            .discovered_agent_for_testing(&bob.agent_id())
+            .await
+            .expect("bob is known");
+        assert_eq!(entry.machine_id, bob.machine_id(), "no stray is bound");
+        drop(silent);
     }
 
     /// Mesh-off must be a safe no-op on an agent that never had a network:
