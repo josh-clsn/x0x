@@ -231,3 +231,53 @@ async fn engine_a_join_result_get_runs_the_serving_guard_before_it_serves() -> R
     );
     Ok(())
 }
+
+/// A session bearer is refused 403 at the route layer, ahead of any body
+/// parse; the durable token passes the gate and meets the handler's own
+/// validation (a malformed body answers 400, never 403).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engine_a_doors_refuse_a_session_bearer_before_the_body_is_parsed() -> Result<()> {
+    use axum::http::Request;
+    use axum::routing::{get, post};
+    use tower::ServiceExt;
+
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let app = axum::Router::new()
+        .route(
+            "/groups/:id/apply-metadata-event",
+            post(apply_group_metadata_event),
+        )
+        .route(
+            "/groups/:id/join-result/:member",
+            get(get_join_result_inline).post(apply_join_result_endpoint),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            crate::server::auth::auth_middleware,
+        ))
+        .with_state(Arc::clone(&state));
+    let session = state.sessions.issue(std::time::Instant::now());
+    let member = "cc".repeat(32);
+    let doors = [
+        ("POST", format!("/groups/{STABLE}/apply-metadata-event")),
+        ("POST", format!("/groups/{STABLE}/join-result/{member}")),
+        ("GET", format!("/groups/{STABLE}/join-result/{member}")),
+    ];
+    for (method, path) in doors {
+        for (bearer, refused) in [(session.as_str(), true), ("test-token", false)] {
+            let request = Request::builder()
+                .method(method)
+                .uri(&path)
+                .header("authorization", format!("Bearer {bearer}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from("{not json"))?;
+            let response = app.clone().oneshot(request).await?;
+            if refused {
+                assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
+            } else {
+                assert_ne!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
+            }
+        }
+    }
+    Ok(())
+}
