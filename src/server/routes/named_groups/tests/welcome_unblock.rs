@@ -1059,3 +1059,53 @@ async fn welcome_control_frames_ride_only_the_confirmed_machine() -> anyhow::Res
         .set_pinned_standin_strict_resolution_for_testing(false);
     Ok(())
 }
+
+/// The ChunkAck budget bounds a real send: on a paused clock, a ChunkAck
+/// over a live connection whose raw leg is a zombie that spends its window
+/// and then a resend that spends the second, followed by the publish-only
+/// gossip leg (never acked by design), ends before
+/// `WELCOME_CHUNK_ACK_BUDGET`.
+#[tokio::test]
+async fn a_zombie_chunk_ack_ends_inside_its_budget() -> anyhow::Result<()> {
+    let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+    let (owner, _owner_dir) = secure_endpoint_test_state().await?;
+    let owner_id = owner.agent.agent_id();
+    gossip_capable_owner(&joiner, &owner, true).await?;
+    joiner
+        .agent
+        .set_pinned_standin_strict_resolution_for_testing(true);
+    joiner.agent.script_pinned_standin_transport_for_testing(
+        x0x::PinnedTransportScript::connected_only(&[owner.agent.machine_id()], false),
+    );
+    let ack = WelcomeBlobMessage::ChunkAck {
+        welcome_id: hex::encode(rand::random::<[u8; 32]>()),
+        sequence: 0,
+    };
+    let config = welcome_blob_send_config(&ack, true);
+    assert!(!config.require_gossip_ack, "the gossip leg is never acked");
+    let window = config
+        .raw_quic_receive_ack_timeout
+        .expect("an ACKed raw leg");
+    joiner
+        .agent
+        .inject_zombie_ack_failures_for_testing(&[window, window]);
+
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let path = std::sync::OnceLock::new();
+    let sent = send_welcome_chunk_ack(&joiner, &owner_id, &ack, &path).await;
+    let took = started.elapsed();
+    assert_eq!(path.get().copied(), Some("raw_quic"));
+    assert!(sent.is_err(), "no leg delivered: {sent:?}");
+    assert_eq!(joiner.agent.zombie_resends_started_for_testing(), 1);
+    assert!(took >= 2 * window, "both raw windows ran: {took:?}");
+    assert!(
+        took < WELCOME_CHUNK_ACK_BUDGET,
+        "the send ended inside its budget: {took:?}"
+    );
+
+    joiner
+        .agent
+        .set_pinned_standin_strict_resolution_for_testing(false);
+    Ok(())
+}

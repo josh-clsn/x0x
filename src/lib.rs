@@ -12097,11 +12097,9 @@ impl Agent {
                 &mut zombie,
             )
             .await;
-        let (Some((window_end, peer)), Some(window), Some(network)) = (
-            zombie.filter(|_| result.is_err()),
-            receive_ack_timeout,
-            self.network.as_ref(),
-        ) else {
+        let (Some((window_end, peer)), Some(window)) =
+            (zombie.filter(|_| result.is_err()), receive_ack_timeout)
+        else {
             return result;
         };
         // The send that tore a zombie down redials and resends once, inside
@@ -12137,10 +12135,14 @@ impl Agent {
             )
             .await
         };
-        match network
-            .with_one_sided_dial_permit_until(peer, resend_deadline, resend)
-            .await
-        {
+        let resent = match self.network.as_ref() {
+            Some(node) => {
+                node.with_one_sided_dial_permit_until(peer, resend_deadline, resend)
+                    .await
+            }
+            None => tokio::time::timeout_at(resend_deadline, resend).await.ok(),
+        };
+        match resent {
             Some(Ok(path)) => {
                 tracing::info!(
                     target: "x0x::direct",
@@ -12199,6 +12201,25 @@ impl Agent {
 
         #[cfg(test)]
         if self.network.is_none() && pinned_standin_is_strict(&self.identity.agent_id()) {
+            // An injected ACK failure stands in for a zombie connection the
+            // scripted transport still reads as connected.
+            if let Some(timeout) = receive_ack_timeout {
+                if let Some((delay, backpressured)) =
+                    take_injected_zombie_ack_failure(&self.identity.agent_id())
+                {
+                    let window_end = tokio::time::Instant::now() + timeout;
+                    tokio::time::sleep(delay).await;
+                    if backpressured {
+                        return Err(error::NetworkError::RemoteReceiveBackpressured(
+                            "Backpressured (test)".to_string(),
+                        ));
+                    }
+                    *zombie = Some((window_end, ant_quic::PeerId([0u8; 32])));
+                    return Err(error::NetworkError::ConnectionFailed(
+                        "send_with_receive_ack failed: injected zombie (test)".to_string(),
+                    ));
+                }
+            }
             return self
                 .general_raw_standin(agent_id, payload, &agent_prefix, send_start, cold)
                 .await;

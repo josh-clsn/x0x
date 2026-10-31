@@ -44178,14 +44178,16 @@ pub(in crate::server) const WELCOME_CHUNK_ACK_CAP: usize = 32;
 /// (`FILE_CHUNK_WINDOW`), so a stream never outruns its acks' slots.
 pub(in crate::server) const WELCOME_CHUNK_ACK_PER_GROUP_CAP: usize = 8;
 
-/// Bound on one `ChunkAck` send: the DM layer's own legs for the frame's
-/// config, rounded up to whole seconds. A peer-evidence capability first
-/// dials (3 s); the raw leg (preferred over a live connection, or the
-/// fallback without a gossip advert, never both) waits one 8 s receive-ACK
-/// window, then a supersede reissue after the 250 ms grace with its own
-/// 8 s, and a zombie resend ends inside the second window (16.25 s); the
-/// gossip leg publishes twice, each bounded at 8 s, 250 ms apart (16.25 s).
-/// 3 + 16.25 + 16.25 = 35.5 s. An ack also ends with its Welcome's receive.
+/// Bound on one `ChunkAck` send. It covers the legs the frame takes over a
+/// live connection, or with no gossip advert: a peer-evidence capability's
+/// dial (3 s); the raw leg's 8 s receive-ACK window, a supersede reissue
+/// after the 250 ms grace with its own 8 s, and the zombie resend that ends
+/// inside the second window (16.25 s); the publish-only gossip leg, two
+/// publishes bounded at 8 s each, 250 ms apart (16.25 s). 35.5 s, rounded
+/// up. It deliberately cuts the legs it does not count (a timed-out
+/// publish's backoff, the raw leg's own evidence dial, a send-readiness
+/// repair and redial for a target that is not live): acks are cumulative,
+/// and an ack also ends with its Welcome's receive.
 const WELCOME_CHUNK_ACK_BUDGET: Duration = Duration::from_secs(36);
 
 /// ADR 0107 (review r2): spawn a join-artifact egress task registered under
@@ -62353,7 +62355,6 @@ pub(in crate::server) mod tests {
             .expect("an ACKed raw leg");
         let grace = Duration::from_millis(config.prefer_newest_grace_ms);
         let raw = ack_window + grace + ack_window;
-        assert!(raw >= 2 * ack_window, "the zombie resend ends inside it");
         let attempts = u32::from(config.max_retries) + 1;
         let gossip = config.timeout_per_attempt * attempts
             + crate::dm_send::PUBLISH_ONLY_REDUNDANT_REPUBLISH_DELAY * (attempts - 1);
