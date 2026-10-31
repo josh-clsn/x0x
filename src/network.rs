@@ -7197,11 +7197,11 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         let ant_peer = gossip_to_ant_peer_id(&peer);
 
         // Mesh-off latch: drop every gossip-plane frame while quiesced.
-        // This is the single choke point for all saorsa-gossip emitters —
-        // SWIM probes, HyParView shuffles, presence beacons, identity
-        // announces, anti-entropy digests, and eager-push all funnel
-        // through here, so one gate silences them without touching the
-        // DM plane (`send_with_receive_ack` / `probe_peer`). Reported as
+        // Together with `send_to_peer_guarded` (key-cache V3 and control
+        // frames) this covers every saorsa-gossip emitter — SWIM probes,
+        // HyParView shuffles, presence beacons, identity announces,
+        // anti-entropy digests, and eager-push — so the two gates silence
+        // them without touching the DM plane (`send_with_receive_ack` / `probe_peer`). Reported as
         // success: gossip is loss-tolerant, and erroring would put every
         // overlay crate into its failure/retry paths. Skipping the
         // pool-activity note below is deliberate — gossip chatter must
@@ -7307,6 +7307,19 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         admit: saorsa_gossip_transport::SessionAdmission,
     ) -> anyhow::Result<()> {
         let ant_peer = gossip_to_ant_peer_id(&peer);
+
+        // Mesh-off latch: the guarded path carries the same gossip-plane
+        // frames as `send_to_peer` (key-cache V3 pubsub data, legacy-grant
+        // migration sends, key-cache controls), so it is gated the same way.
+        // Guarded egress errors rather than holding: nothing is admitted.
+        // DMs ride the raw-QUIC lane (`send_with_receive_ack`), which never
+        // reaches this method.
+        if self.mesh_quiesced.load(Ordering::Relaxed) {
+            return Err(anyhow::anyhow!(
+                "guarded send to peer {:?} refused: mesh quiesced",
+                peer
+            ));
+        }
 
         // Capture the exact (ant generation, SG token) before any queue
         // wait: the node read lock below can park behind shutdown's write
@@ -8916,6 +8929,63 @@ mod tests {
             "an Admin-swept peer must stay dial-gated"
         );
 
+        assert!(node.close().await.is_ok());
+    }
+
+    /// A Quiesce sweep must not replace a live Revocation or Admin tombstone
+    /// with its never-live entry.
+    #[tokio::test]
+    async fn quiesce_sweep_keeps_live_revocation_and_admin_tombstones() {
+        let node = NetworkNode::new(NetworkConfig::default(), None, None)
+            .await
+            .unwrap();
+        for (seed, reason) in [
+            (31, DisconnectReason::Revocation),
+            (32, DisconnectReason::Admin),
+        ] {
+            let peer = test_ant_peer(seed);
+            node.suppress_reconnect(peer.0, reason);
+            assert!(node.is_reconnect_suppressed(peer.0));
+            node.suppress_reconnect(peer.0, DisconnectReason::Quiesce);
+            assert!(
+                node.is_reconnect_suppressed(peer.0),
+                "{reason:?} tombstone must survive a quiesce sweep"
+            );
+            assert!(
+                node.dial_gated(&peer, "peer").await.is_err(),
+                "{reason:?} stay-down must still gate demand dials"
+            );
+        }
+        assert!(node.close().await.is_ok());
+    }
+
+    /// The guarded gossip egress (key-cache V3, controls) refuses while the
+    /// mesh is quiesced and never calls the admission closure.
+    #[tokio::test]
+    async fn quiesce_guarded_send_is_refused() {
+        use saorsa_gossip_transport::GossipTransport;
+
+        let node = NetworkNode::new(NetworkConfig::default(), None, None)
+            .await
+            .unwrap();
+        let peer = ant_to_gossip_peer_id(&test_ant_peer(41));
+        let admitted = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&admitted);
+        let admit: saorsa_gossip_transport::SessionAdmission = Arc::new(move |_| {
+            flag.store(true, Ordering::Relaxed);
+            Ok(bytes::Bytes::from_static(b"x"))
+        });
+        assert!(node.latch_mesh_quiesced().is_some());
+        let err = node
+            .send_to_peer_guarded(
+                peer,
+                saorsa_gossip_transport::GossipStreamType::PubSub,
+                admit,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("mesh quiesced"), "{err}");
+        assert!(!admitted.load(Ordering::Relaxed));
         assert!(node.close().await.is_ok());
     }
 
