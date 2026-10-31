@@ -322,3 +322,63 @@ async fn get_join_result_inline_runs_the_serving_guard() -> Result<()> {
     );
     Ok(())
 }
+
+/// The relay-bridge doors change durable state, so a 10-minute session
+/// bearer is refused with 403 on all three; the durable API token passes
+/// the gate (and then gets the door's ordinary answer).
+#[tokio::test]
+async fn engine_a_doors_require_the_durable_token() -> Result<()> {
+    use crate::server::rider_auth::ActorContext;
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let group_id = "7c".repeat(32);
+    let member = "bb".repeat(32);
+    for durable in [false, true] {
+        let actor = || axum::extract::Extension(ActorContext::Owner { durable });
+        let apply = apply_group_metadata_event(
+            State(Arc::clone(&state)),
+            actor(),
+            Path(group_id.clone()),
+            Json(ApplyMetadataEventRequest {
+                event_b64: BASE64.encode(b"not json"),
+                sender_agent_id: member.clone(),
+            }),
+        )
+        .await
+        .into_response()
+        .status();
+        let get = get_join_result_inline(
+            State(Arc::clone(&state)),
+            actor(),
+            Path((group_id.clone(), member.clone())),
+        )
+        .await
+        .into_response()
+        .status();
+        let post = apply_join_result_endpoint(
+            State(Arc::clone(&state)),
+            actor(),
+            Path((group_id.clone(), member.clone())),
+            Json(ApplyJoinResultRequest {
+                event_b64: BASE64.encode(b"not json"),
+                sender_agent_id: member.clone(),
+            }),
+        )
+        .await
+        .into_response()
+        .status();
+        if durable {
+            assert_eq!(
+                apply,
+                StatusCode::BAD_REQUEST,
+                "durable: the body is judged"
+            );
+            assert_eq!(get, StatusCode::NOT_FOUND, "durable: an unknown group");
+            assert_eq!(post, StatusCode::BAD_REQUEST, "durable: the body is judged");
+        } else {
+            for status in [apply, get, post] {
+                assert_eq!(status, StatusCode::FORBIDDEN, "a session bearer is refused");
+            }
+        }
+    }
+    Ok(())
+}

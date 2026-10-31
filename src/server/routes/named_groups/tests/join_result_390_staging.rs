@@ -336,3 +336,33 @@ async fn respawn_poll_targets_include_every_active_admin() -> Result<()> {
     assert_eq!(targets.len(), 2, "no duplicate or extraneous targets");
     Ok(())
 }
+
+/// ADR 0107's purge drops an ineligible member's staged artifacts; the
+/// #390 sidecar must record that, or a restart inside the 24 h staging TTL
+/// reloads a removed member's result and Welcome.
+#[tokio::test]
+async fn a_purged_member_is_not_resurrected_by_a_restart() -> Result<()> {
+    let (state, dir) = secure_endpoint_test_state().await?;
+    let group_id = "purge-390-group";
+    let member_hex = "bb".repeat(32);
+    let inviter_hex = "aa".repeat(32);
+    let welcome_ref =
+        stage_treekem_welcome(&state, group_id, &member_hex, b"welcome".to_vec()).await;
+    let event =
+        member_added_with_welcome_ref(group_id, &member_hex, &inviter_hex, Some(welcome_ref));
+    stage_join_result(&state, group_id, &member_hex, event, None).await;
+    purge_member_join_artifacts(&state, group_id, &member_hex).await;
+    drop(state);
+
+    let restarted = restarted_state(dir.path()).await?;
+    load_join_result_staging(&restarted).await;
+    assert!(
+        restarted.pending_join_results.read().await.is_empty(),
+        "the purged result stays purged across a restart"
+    );
+    assert!(
+        restarted.pending_welcomes.read().await.is_empty(),
+        "the purged Welcome stays purged across a restart"
+    );
+    Ok(())
+}
