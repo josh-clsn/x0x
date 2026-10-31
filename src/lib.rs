@@ -571,6 +571,31 @@ static PINNED_STANDIN_TRANSPORT: std::sync::LazyLock<
 
 /// x0x #1207 (test builds): every general raw-QUIC delivery a strict
 /// in-process stand-in made, as `(sender, recipient, machine, payload)`.
+/// Test builds: the next ACKed raw sends of these agents fail as a zombie
+/// connection's do (the receive ACK never comes while the connection still
+/// reads as connected), one per queued delay, each after its delay. A
+/// `true` flag makes the failure the remote's backpressure refusal instead.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+static INJECTED_ZOMBIE_ACK_FAILURES: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<
+            identity::AgentId,
+            std::collections::VecDeque<(std::time::Duration, bool)>,
+        >,
+    >,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+fn take_injected_zombie_ack_failure(
+    agent: &identity::AgentId,
+) -> Option<(std::time::Duration, bool)> {
+    INJECTED_ZOMBIE_ACK_FAILURES
+        .lock()
+        .ok()
+        .and_then(|mut failures| failures.get_mut(agent)?.pop_front())
+}
+
 #[cfg(test)]
 #[allow(clippy::type_complexity)]
 static GENERAL_RAW_STANDIN_DELIVERIES: std::sync::LazyLock<
@@ -5066,6 +5091,11 @@ const MAX_DISCOVERED_MACHINE_ADDRESSES: usize = 8;
 /// (`Agent::record_card_routing_hint`); each may cost a bounded dial.
 const CARD_DIAL_HINTS_MAX: usize = 4;
 
+/// Bound on the dial from a peer-evidence view
+/// (`Agent::connect_from_evidence_with`).
+pub(crate) const EVIDENCE_CONNECT_DIAL_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(3);
+
 /// Per-candidate timeout for the proactive-reconnect sequential dial loop.
 const RECONNECT_CANDIDATE_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -8031,7 +8061,7 @@ impl Agent {
             allow_local_discovery_addresses(network.config()),
         );
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
+            EVIDENCE_CONNECT_DIAL_TIMEOUT,
             network.connect_peer_with_addrs(peer, addrs),
         )
         .await;
@@ -11997,12 +12027,100 @@ impl Agent {
         prefer_newest_grace: std::time::Duration,
         cold_wait: Option<ColdWait>,
     ) -> error::NetworkResult<dm::DmPath> {
-        let send_start = std::time::Instant::now();
         // x0x #1207 (P2): ONE absolute deadline, from the start of this raw
-        // attempt, for every resolution read of an opted-in send. The
-        // existing warm-recipient transport and ACK budgets are unchanged;
-        // a newly learned cold binding's repair also ends at this deadline.
+        // send, for every resolution read of an opted-in send, shared by a
+        // resend after a zombie teardown.
         let cold = ColdResolution::starting_now(cold_wait);
+        let mut zombie = None;
+        let result = self
+            .send_direct_raw_quic_once(
+                agent_id,
+                payload,
+                receive_ack_timeout,
+                prefer_newest_grace,
+                cold,
+                &mut zombie,
+            )
+            .await;
+        let (Some((window_end, peer)), Some(window), Some(network)) = (
+            zombie.filter(|_| result.is_err()),
+            receive_ack_timeout,
+            self.network.as_ref(),
+        ) else {
+            return result;
+        };
+        // The send that tore a zombie down redials and resends once, inside
+        // ONE more receive-ACK window counted from the end of its first,
+        // rather than leaving the redial to its caller's next retry (a
+        // gossip fallback whose receipt a metered leaf may not see for
+        // minutes, or a whole retry cycle). So a raw send's worst case
+        // before that fallback is two windows, and only after a zombie was
+        // torn down. The redial is the per-send demand dial a leaf keeps:
+        // resolution's send-readiness repair, then `connect_to_agent`, both
+        // through the ADR 0115 authority readers. It holds the peer's shared
+        // dial permit (#1419), so it never races a one-sided repair's dial.
+        let to = crate::logging::LogHexId::agent(&network::hex_prefix(&agent_id.0, 4)).to_string();
+        let resend_deadline = window_end + window;
+        let resend = async {
+            let _permit = network.one_sided_dial_gate(peer).lock_owned().await;
+            let mut again = None;
+            self.send_direct_raw_quic_once(
+                agent_id,
+                payload,
+                receive_ack_timeout,
+                prefer_newest_grace,
+                cold,
+                &mut again,
+            )
+            .await
+        };
+        match tokio::time::timeout_at(resend_deadline, resend).await {
+            Ok(Ok(path)) => {
+                tracing::info!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    %to,
+                    "resent over a redialed connection after a zombie teardown"
+                );
+                Ok(path)
+            }
+            Ok(Err(resend_error)) => {
+                tracing::debug!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    %to,
+                    error = %resend_error,
+                    "resend after a zombie teardown failed"
+                );
+                result
+            }
+            Err(_) => {
+                tracing::debug!(
+                    target: "x0x::direct",
+                    stage = "send",
+                    %to,
+                    "resend after a zombie teardown ran out of its receive-ACK window"
+                );
+                result
+            }
+        }
+    }
+
+    /// One raw-QUIC send: resolution, any repair or redial, and the
+    /// transmission. `cold` carries the send's one resolution deadline
+    /// (x0x #1207). When an ACKed send failed on a connection that still
+    /// read as connected and that zombie was torn down, `zombie` is set to
+    /// the end of the failed send's receive-ACK window and the peer.
+    async fn send_direct_raw_quic_once(
+        &self,
+        agent_id: &identity::AgentId,
+        payload: &[u8],
+        receive_ack_timeout: Option<std::time::Duration>,
+        prefer_newest_grace: std::time::Duration,
+        cold: ColdResolution,
+        zombie: &mut Option<(tokio::time::Instant, ant_quic::PeerId)>,
+    ) -> error::NetworkResult<dm::DmPath> {
+        let send_start = std::time::Instant::now();
         let agent_prefix = network::hex_prefix(&agent_id.0, 4);
         let self_prefix = network::hex_prefix(&self.identity.agent_id().0, 4);
         let bytes = payload.len();
@@ -12060,7 +12178,9 @@ impl Agent {
         // Send via network layer. Prefer receive-pipeline ACK when configured:
         // success then means the remote ant-quic reader drained the direct
         // message bytes, not merely that the local socket accepted them.
+        let mut ack_window_end = None;
         let send_result = if let Some(timeout) = receive_ack_timeout {
+            ack_window_end = Some(tokio::time::Instant::now() + timeout);
             let wire = direct::DirectMessaging::encode_message(&self.identity.agent_id(), payload)?;
             tracing::debug!(
                 target: "dm.trace",
@@ -12078,16 +12198,34 @@ impl Agent {
             // ant-quic's send_with_receive_ack contract) and reissue once
             // against the new generation. The reissue does not race again;
             // a healthy peer should converge in a single supersede cycle.
-            self.send_ack_racing_replaced(
-                network.as_ref(),
-                ant_peer_id,
-                machine_id,
-                &wire,
-                timeout,
-                prefer_newest_grace,
-                agent_id,
-            )
-            .await
+            #[cfg(test)]
+            let injected = take_injected_zombie_ack_failure(&self.identity.agent_id());
+            #[cfg(not(test))]
+            let injected: Option<(std::time::Duration, bool)> = None;
+            if let Some((delay, backpressured)) = injected {
+                tokio::time::sleep(delay).await;
+                Err(if backpressured {
+                    error::NetworkError::RemoteReceiveBackpressured(
+                        "Remote receive pipeline rejected payload: Backpressured (test)"
+                            .to_string(),
+                    )
+                } else {
+                    error::NetworkError::ConnectionFailed(
+                        "send_with_receive_ack failed: injected zombie (test)".to_string(),
+                    )
+                })
+            } else {
+                self.send_ack_racing_replaced(
+                    network.as_ref(),
+                    ant_peer_id,
+                    machine_id,
+                    &wire,
+                    timeout,
+                    prefer_newest_grace,
+                    agent_id,
+                )
+                .await
+            }
         } else {
             tracing::debug!(
                 target: "dm.trace",
@@ -12157,19 +12295,30 @@ impl Agent {
                 // as connected means the connection is a zombie: the remote
                 // endpoint is gone (supersede/NAT loss without a lifecycle
                 // event) yet `is_connected` keeps steering every retry back
-                // onto it via `cached_connected`. Tear it down so the next
-                // attempt fails the fast path and takes the X0X-0031/0033
-                // send-readiness repair (fresh dial) instead of re-sending
-                // into the same dead connection until the caller's deadline.
-                if receive_ack_timeout.is_some() && network.is_connected(&ant_peer_id).await {
+                // onto it via `cached_connected`. Tear it down so the resend
+                // (in one more window) or the caller's next retry fails the
+                // fast path and takes the X0X-0031/0033 send-readiness repair
+                // (fresh dial) instead of re-sending into the same dead
+                // connection until the caller's deadline. A backpressure
+                // refusal is an answer from a live receiver, not a zombie:
+                // never tear its connection down or resend into it.
+                let refused_by_live_peer =
+                    matches!(e, error::NetworkError::RemoteReceiveBackpressured(_));
+                if receive_ack_timeout.is_some()
+                    && !refused_by_live_peer
+                    && network.is_connected(&ant_peer_id).await
+                {
                     match network.disconnect(&ant_peer_id).await {
-                        Ok(()) => tracing::info!(
-                            target: "x0x::direct",
-                            stage = "send",
-                            to = %agent_prefix,
-                            %machine_prefix,
-                            "tore down zombie connection after acked send failure; retry will redial"
-                        ),
+                        Ok(()) => {
+                            *zombie = ack_window_end.map(|end| (end, ant_peer_id));
+                            tracing::info!(
+                                target: "x0x::direct",
+                                stage = "send",
+                                to = %crate::logging::LogHexId::agent(&agent_prefix),
+                                machine_prefix = %crate::logging::LogHexId::new("machine", &machine_prefix),
+                                "tore down zombie connection after acked send failure; the resend or the next retry redials"
+                            );
+                        }
                         Err(de) => tracing::debug!(
                             target: "x0x::direct",
                             stage = "send",
@@ -12679,6 +12828,27 @@ impl Agent {
             }
         }
         false
+    }
+
+    /// Test seam: this agent's next ACKed raw sends fail as a zombie
+    /// connection's do, one per entry of `delays`, each after its delay.
+    #[cfg(test)]
+    pub(crate) fn inject_zombie_ack_failures_for_testing(&self, delays: &[std::time::Duration]) {
+        if let Ok(mut failures) = INJECTED_ZOMBIE_ACK_FAILURES.lock() {
+            failures.insert(
+                self.identity.agent_id(),
+                delays.iter().map(|delay| (*delay, false)).collect(),
+            );
+        }
+    }
+
+    /// Test seam: this agent's next ACKed raw send is refused by the
+    /// remote's receive pipeline (backpressure) after `delay`.
+    #[cfg(test)]
+    pub(crate) fn inject_backpressure_ack_failure_for_testing(&self, delay: std::time::Duration) {
+        if let Ok(mut failures) = INJECTED_ZOMBIE_ACK_FAILURES.lock() {
+            failures.insert(self.identity.agent_id(), [(delay, true)].into());
+        }
     }
 
     /// Get list of currently connected agents.
@@ -29095,6 +29265,140 @@ mod tests {
             .expect("bob is known");
         assert_eq!(entry.machine_id, bob.machine_id(), "no stray is bound");
         drop(silent);
+    }
+
+    /// An ACKed raw send that tears a zombie connection down redials and
+    /// resends inside the same send, on a metered leaf too, within ONE more
+    /// receive-ACK window counted from the end of its first: the payload
+    /// arrives once and the send succeeds instead of failing over to its
+    /// caller's next retry. A send without a zombie keeps its one window, a
+    /// backpressure refusal is never taken for one, and the resend waits on
+    /// the peer's shared dial permit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn zombie_teardown_redials_and_resends_within_the_send() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (alice, bob, bob_addr) = leaf_and_peer(dir.path()).await;
+        let mut bob_rx = bob.subscribe_direct();
+        let alice_network = alice.network().expect("alice network");
+        let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+        let settle = std::time::Duration::from_millis(500) * test_time_multiplier();
+        let connect = || async {
+            if !alice_network.is_connected(&bob_peer).await {
+                alice_network
+                    .connect_addr(bob_addr)
+                    .await
+                    .expect("alice connects to bob");
+            }
+            await_quiesced_connection(alice_network, &bob_peer, settle).await;
+        };
+        let send = |payload: &'static [u8], window: std::time::Duration| {
+            let alice = &alice;
+            let to = bob.agent_id();
+            async move {
+                let started = std::time::Instant::now();
+                let result = alice
+                    .send_direct_raw_quic(
+                        &to,
+                        payload,
+                        Some(window),
+                        std::time::Duration::from_millis(250),
+                        None,
+                    )
+                    .await;
+                (result, started.elapsed())
+            }
+        };
+        let quiet = std::time::Duration::from_millis(500);
+
+        // 1. A zombie torn down mid-window: the resend lands at once.
+        connect().await;
+        let window = std::time::Duration::from_secs(5) * test_time_multiplier();
+        alice.inject_zombie_ack_failures_for_testing(&[std::time::Duration::ZERO]);
+        let (result, took) = send(b"mid-window zombie", window).await;
+        assert_eq!(result.expect("resent"), dm::DmPath::RawQuicAcked);
+        assert!(took < window, "{took:?}");
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), bob_rx.recv())
+            .await
+            .expect("bob receives the resend")
+            .expect("bob's direct subscription is open");
+        assert_eq!(received.sender, alice.agent_id());
+        assert_eq!(received.payload, b"mid-window zombie");
+        assert!(
+            tokio::time::timeout(quiet, bob_rx.recv()).await.is_err(),
+            "one copy"
+        );
+
+        // 2. A zombie that spends its whole window: the resend gets one more.
+        connect().await;
+        let window = std::time::Duration::from_secs(1);
+        alice.inject_zombie_ack_failures_for_testing(&[window]);
+        let (result, took) = send(b"whole-window zombie", window).await;
+        assert_eq!(result.expect("resent"), dm::DmPath::RawQuicAcked);
+        assert!(took >= window && took < 2 * window, "{took:?}");
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), bob_rx.recv())
+            .await
+            .expect("bob receives the resend")
+            .expect("bob's direct subscription is open");
+        assert_eq!(received.payload, b"whole-window zombie");
+        assert!(
+            tokio::time::timeout(quiet, bob_rx.recv()).await.is_err(),
+            "one copy"
+        );
+
+        // 3. The resend hangs too: the send ends at two windows.
+        connect().await;
+        alice.inject_zombie_ack_failures_for_testing(&[window, 3 * window]);
+        let (result, took) = send(b"two zombies", window).await;
+        assert!(result.is_err());
+        let slack = std::time::Duration::from_millis(400);
+        assert!(
+            took >= 2 * window - slack && took < 2 * window + slack,
+            "{took:?}"
+        );
+        assert!(tokio::time::timeout(quiet, bob_rx.recv()).await.is_err());
+
+        // 4. No zombie: the connection is gone when the ACK wait fails, so
+        //    nothing is torn down and the send keeps its single window.
+        connect().await;
+        let delay = std::time::Duration::from_millis(500);
+        alice.inject_zombie_ack_failures_for_testing(&[delay]);
+        let drop_network = std::sync::Arc::clone(alice_network);
+        let dropper = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = drop_network.disconnect(&bob_peer).await;
+        });
+        let (result, took) = send(b"no zombie", window).await;
+        dropper.await.expect("dropper");
+        assert!(result.is_err());
+        assert!(took >= delay && took < delay + slack, "{took:?}");
+        assert!(tokio::time::timeout(quiet, bob_rx.recv()).await.is_err());
+
+        // 5. A backpressure refusal is a live peer's answer: the connection
+        //    stays up and nothing is resent into it.
+        connect().await;
+        alice.inject_backpressure_ack_failure_for_testing(delay);
+        let (result, took) = send(b"backpressured", window).await;
+        assert!(result.is_err());
+        assert!(took >= delay && took < delay + slack, "{took:?}");
+        assert!(alice_network.is_connected(&bob_peer).await, "not torn down");
+        assert!(tokio::time::timeout(quiet, bob_rx.recv()).await.is_err());
+
+        // 6. While a one-sided repair holds the peer's dial permit, the
+        //    resend waits on it and ends with its own window.
+        connect().await;
+        let permit = alice_network
+            .one_sided_dial_gate(bob_peer)
+            .lock_owned()
+            .await;
+        alice.inject_zombie_ack_failures_for_testing(&[std::time::Duration::ZERO]);
+        let (result, took) = send(b"permit held", window).await;
+        assert!(result.is_err(), "no resend while the permit is held");
+        assert!(
+            took >= 2 * window - slack && took < 2 * window + slack,
+            "{took:?}"
+        );
+        drop(permit);
+        assert!(tokio::time::timeout(quiet, bob_rx.recv()).await.is_err());
     }
 
     /// Mesh-off must be a safe no-op on an agent that never had a network:

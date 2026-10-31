@@ -44178,11 +44178,15 @@ pub(in crate::server) const WELCOME_CHUNK_ACK_CAP: usize = 32;
 /// (`FILE_CHUNK_WINDOW`), so a stream never outruns its acks' slots.
 pub(in crate::server) const WELCOME_CHUNK_ACK_PER_GROUP_CAP: usize = 8;
 
-/// Bound on one `ChunkAck` send. It exceeds the DM layer's own bound for
-/// the frame's config (two gossip-inbox publishes, 8 s windows each), so it
-/// only ends a send that would not end. An ack also ends with its Welcome's
-/// receive.
-const WELCOME_CHUNK_ACK_BUDGET: Duration = Duration::from_secs(45);
+/// Bound on one `ChunkAck` send: the DM layer's own legs for the frame's
+/// config, rounded up to whole seconds. A peer-evidence capability first
+/// dials (3 s); the raw leg (preferred over a live connection, or the
+/// fallback without a gossip advert, never both) waits one 8 s receive-ACK
+/// window, then a supersede reissue after the 250 ms grace with its own
+/// 8 s, and a zombie resend ends inside the second window (16.25 s); the
+/// gossip leg publishes twice, each bounded at 8 s, 250 ms apart (16.25 s).
+/// 3 + 16.25 + 16.25 = 35.5 s. An ack also ends with its Welcome's receive.
+const WELCOME_CHUNK_ACK_BUDGET: Duration = Duration::from_secs(36);
 
 /// ADR 0107 (review r2): spawn a join-artifact egress task registered under
 /// `(group_id, recipient)`. Its body runs only AFTER registration, so a
@@ -62281,6 +62285,35 @@ pub(in crate::server) mod tests {
             .as_ref()
             .is_some_and(|streams| streams.contains_key(&welcome_id)));
         Ok(())
+    }
+
+    /// The ChunkAck budget is the sum of the DM layer's legs for the frame's
+    /// raw-preferring config, rounded up: the peer-evidence dial, the raw
+    /// receive-ACK window with its supersede reissue (which also covers the
+    /// zombie resend's second window), and the publish-only gossip attempts.
+    #[test]
+    fn welcome_chunk_ack_budget_is_the_dm_layers_bound() {
+        let ack = WelcomeBlobMessage::ChunkAck {
+            welcome_id: "bb".repeat(32),
+            sequence: 0,
+        };
+        let config = welcome_blob_send_config(&ack, true);
+        assert!(!config.require_gossip_ack, "publish-only gossip leg");
+        let ack_window = config
+            .raw_quic_receive_ack_timeout
+            .expect("an ACKed raw leg");
+        let grace = Duration::from_millis(config.prefer_newest_grace_ms);
+        let raw = ack_window + grace + ack_window;
+        assert!(raw >= 2 * ack_window, "the zombie resend ends inside it");
+        let attempts = u32::from(config.max_retries) + 1;
+        let gossip = config.timeout_per_attempt * attempts
+            + crate::dm_send::PUBLISH_ONLY_REDUNDANT_REPUBLISH_DELAY * (attempts - 1);
+        let legs = crate::EVIDENCE_CONNECT_DIAL_TIMEOUT + raw + gossip;
+        assert_eq!(legs, Duration::from_millis(35_500));
+        assert_eq!(
+            WELCOME_CHUNK_ACK_BUDGET,
+            Duration::from_secs(legs.as_millis().div_ceil(1000) as u64)
+        );
     }
 
     #[test]
