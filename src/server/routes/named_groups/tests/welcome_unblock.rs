@@ -135,8 +135,8 @@ async fn welcome_completes_while_chunk_ack_receipts_never_arrive() -> anyhow::Re
     Ok(())
 }
 
-/// The ack sends the listener spawns are bounded: a re-sent chunk whose ack
-/// is in flight does not add one, and a group gets at most its share.
+/// The ack sends the listener spawns are bounded: a group gets at most its
+/// share, a re-sent chunk included (it is acked again, not coalesced).
 #[tokio::test]
 async fn chunk_ack_sends_are_bounded_and_end_within_their_budget() -> anyhow::Result<()> {
     let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
@@ -177,7 +177,7 @@ async fn chunk_ack_sends_are_bounded_and_end_within_their_budget() -> anyhow::Re
     assert_eq!(
         gate.started.load(Ordering::SeqCst),
         WELCOME_CHUNK_ACK_PER_GROUP_CAP,
-        "a duplicate coalesces and the group's share caps the rest"
+        "the group's share caps the acks, the re-sent chunk's included"
     );
     assert_eq!(
         joiner.welcome_chunk_ack_admission.in_flight(),

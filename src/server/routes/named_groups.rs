@@ -44164,9 +44164,9 @@ pub(in crate::server) const WELCOME_CHUNK_ACK_CAP: usize = 32;
 /// (`FILE_CHUNK_WINDOW`), so a stream never outruns its acks' slots.
 pub(in crate::server) const WELCOME_CHUNK_ACK_PER_GROUP_CAP: usize = 8;
 
-/// Bound on one `ChunkAck` send. It covers the DM layer's own worst case
-/// (an 8 s raw receive-ACK, then a gossip-inbox attempt, its backoff and
-/// one retry of 8 s each), so it only ends a send that would not end.
+/// Bound on one `ChunkAck` send. It exceeds the DM layer's own bound for
+/// the frame's config (two gossip-inbox publishes, 8 s windows each), so it
+/// only ends a send that would not end.
 const WELCOME_CHUNK_ACK_BUDGET: Duration = Duration::from_secs(45);
 
 /// ADR 0107 (review r2): spawn a join-artifact egress task registered under
@@ -47063,6 +47063,12 @@ fn welcome_blob_send_config(msg: &WelcomeBlobMessage) -> x0x::dm::DmSendConfig {
             // apply here, because a welcome fetch races the very connection
             // establishment that raw delivery depends on.
             prefer_raw_quic_if_connected: false,
+            // A ChunkAck on the gossip inbox is published, not awaited. Its
+            // receipt-driven resend fires after the joiner's bounded fetch
+            // has ended, so it cannot help that fetch, and the wait only
+            // holds the ack's admission slot. Acks are cumulative, and the
+            // publish-only path publishes twice.
+            require_gossip_ack: !matches!(msg, WelcomeBlobMessage::ChunkAck { .. }),
             ..direct_message_send_config()
         },
     }
@@ -48069,11 +48075,13 @@ async fn handle_welcome_blob_chunk(
 /// inline, it held every later Chunk and the Complete behind it until the
 /// joiner's bounded fetch expired and discarded the receive.
 ///
-/// Sends are admitted per `(welcome, chunk)` under a per-group share and a
-/// global cap, and each ends within [`WELCOME_CHUNK_ACK_BUDGET`]. A refused
-/// ack is dropped: acks are cumulative (`FileChunkAckSlot::record_ack` keeps
-/// the highest), so a later one covers it, and a stream whose final ack is
-/// lost ends without its Complete; the joiner's next fetch restreams it
+/// Sends are admitted under a per-group share and a global cap, and each
+/// ends within [`WELCOME_CHUNK_ACK_BUDGET`]. A chunk received again (the
+/// owner restreams) is acked again, not coalesced with an earlier ack that
+/// may have landed on the replaced stream's slot. A refused ack is dropped:
+/// acks are cumulative (`FileChunkAckSlot::record_ack` keeps the highest),
+/// so a later one covers it, and a stream whose final ack is lost ends
+/// without its Complete; the joiner's next FetchRequest restreams it
 /// (`replace_welcome_stream`).
 fn spawn_welcome_chunk_ack(
     state: &Arc<AppState>,
@@ -48082,10 +48090,12 @@ fn spawn_welcome_chunk_ack(
     welcome_id: String,
     sequence: u64,
 ) {
-    let ticket = match state
-        .welcome_chunk_ack_admission
-        .try_admit(&format!("{welcome_id}:{sequence}"), group_id)
-    {
+    static ACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let key = format!(
+        "{welcome_id}:{sequence}:{}",
+        ACKS.fetch_add(1, Ordering::Relaxed)
+    );
+    let ticket = match state.welcome_chunk_ack_admission.try_admit(&key, group_id) {
         Ok(ticket) => ticket,
         Err(refusal) => {
             tracing::debug!(target: "welcome.trace", stage = "chunk_ack_not_admitted", welcome_id = %welcome_id, seq = sequence, ?refusal);
@@ -61662,6 +61672,13 @@ pub(in crate::server) mod tests {
         let fetch_config = welcome_blob_send_config(&fetch);
         assert!(!fetch_config.prefer_raw_quic_if_connected);
         assert!(!fetch_config.stop_fallback_on_raw_error);
+        // Only the FetchRequest awaits its gossip-inbox receipt.
+        let ack = WelcomeBlobMessage::ChunkAck {
+            welcome_id: "bb".repeat(32),
+            sequence: 0,
+        };
+        assert!(fetch_config.require_gossip_ack);
+        assert!(!welcome_blob_send_config(&ack).require_gossip_ack);
 
         let chunk = WelcomeBlobMessage::Chunk {
             welcome_id: "bb".repeat(32),
