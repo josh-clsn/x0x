@@ -54503,6 +54503,164 @@ pub(in crate::server) mod tests {
         Ok(())
     }
 
+    /// A card keeps at most its first 4 distinct addresses on every branch:
+    /// leading an announced entry, a contact known only by card, and a card
+    /// naming another machine.
+    #[tokio::test]
+    async fn every_card_keeps_at_most_four_addresses() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let addrs: Vec<String> = (0..6).map(|i| format!("127.0.0.1:{}", 45000 + i)).collect();
+        let first_four: Vec<std::net::SocketAddr> = addrs[..4]
+            .iter()
+            .map(|a| a.parse().expect("addr"))
+            .collect();
+        let announced_at = now_millis_u64() / 1000 - 30;
+        let card = |agent: &crate::identity::AgentId, machine: [u8; 32]| {
+            let mut card =
+                x0x::groups::card::AgentCard::new("Bob".to_string(), agent, &hex::encode(machine));
+            card.addresses = addrs.clone();
+            card
+        };
+
+        let led = crate::identity::AgentKeypair::generate()?.agent_id();
+        let led_addr: std::net::SocketAddr = "203.0.113.8:5483".parse()?;
+        state
+            .agent
+            .insert_discovered_agent_for_testing(announced_contact(
+                led,
+                crate::identity::MachineId([0x50; 32]),
+                vec![led_addr],
+                announced_at,
+            ))
+            .await;
+        import_card(&state, &card(&led, [0x50; 32])).await?;
+        let entry = state
+            .agent
+            .discovered_agent_for_testing(&led)
+            .await
+            .context("the contact stays discovered")?;
+        let mut expected = first_four.clone();
+        expected.push(led_addr);
+        assert_eq!(entry.addresses, expected, "four card addresses lead");
+
+        let card_only = crate::identity::AgentKeypair::generate()?.agent_id();
+        import_card(&state, &card(&card_only, [0x51; 32])).await?;
+        let entry = state
+            .agent
+            .discovered_agent_for_testing(&card_only)
+            .await
+            .context("the card is recorded")?;
+        assert_eq!(entry.addresses, first_four);
+
+        let moved = crate::identity::AgentKeypair::generate()?.agent_id();
+        state
+            .agent
+            .insert_discovered_agent_for_testing(announced_contact(
+                moved,
+                crate::identity::MachineId([0x52; 32]),
+                vec!["203.0.113.9:5483".parse()?],
+                announced_at,
+            ))
+            .await;
+        import_card(&state, &card(&moved, [0x53; 32])).await?;
+        let entry = state
+            .agent
+            .discovered_agent_for_testing(&moved)
+            .await
+            .context("the contact stays discovered")?;
+        assert_eq!(entry.addresses, first_four);
+        Ok(())
+    }
+
+    /// Card addresses lead only for a machine an authority store confirms.
+    /// A card naming no machine leaves an announced entry as it is, and so
+    /// does a card whose pin a fresher binding outranks, which also never
+    /// moves the entry or the machine cache to its machine.
+    #[tokio::test]
+    async fn card_addresses_lead_only_for_the_confirmed_machine() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let card_addr: std::net::SocketAddr = "198.51.100.6:5483".parse()?;
+        let announced_addr: std::net::SocketAddr = "203.0.113.10:5483".parse()?;
+        let now = now_millis_u64() / 1000;
+
+        let anonymous_card = crate::identity::AgentKeypair::generate()?.agent_id();
+        let machine = crate::identity::MachineId([0x54; 32]);
+        state
+            .agent
+            .insert_discovered_agent_for_testing(announced_contact(
+                anonymous_card,
+                machine,
+                vec![announced_addr],
+                now - 30,
+            ))
+            .await;
+        let mut card = x0x::groups::card::AgentCard::new(
+            "Bob".to_string(),
+            &anonymous_card,
+            &hex::encode([0u8; 32]),
+        );
+        card.addresses = vec![card_addr.to_string()];
+        import_card(&state, &card).await?;
+        let entry = state
+            .agent
+            .discovered_agent_for_testing(&anonymous_card)
+            .await
+            .context("the contact stays discovered")?;
+        assert_eq!(entry.addresses, vec![announced_addr], "no machine, no lead");
+
+        // A class A beat signed inside the future-skew bound outranks the
+        // pin made now, so the card's machine stays unconfirmed.
+        let outranked = crate::identity::AgentKeypair::generate()?.agent_id();
+        let announced_machine = crate::identity::MachineId([0x55; 32]);
+        let card_machine = crate::identity::MachineId([0x56; 32]);
+        state
+            .agent
+            .insert_discovered_agent_for_testing(announced_contact(
+                outranked,
+                announced_machine,
+                vec![announced_addr],
+                now + 20,
+            ))
+            .await;
+        for machine in [announced_machine, card_machine] {
+            let mut card = x0x::groups::card::AgentCard::new(
+                "Carol".to_string(),
+                &outranked,
+                &hex::encode(machine.0),
+            );
+            card.addresses = vec![card_addr.to_string()];
+            import_card(&state, &card).await?;
+        }
+        let entry = state
+            .agent
+            .discovered_agent_for_testing(&outranked)
+            .await
+            .context("the contact stays discovered")?;
+        assert_eq!(entry.machine_id, announced_machine);
+        assert_eq!(
+            entry.addresses,
+            vec![card_addr, announced_addr],
+            "the confirmed machine's card leads"
+        );
+        assert!(
+            state
+                .agent
+                .discovered_machine_for_testing(&card_machine)
+                .await
+                .is_none(),
+            "an unconfirmed machine gets no addresses"
+        );
+        assert_eq!(
+            state
+                .agent
+                .authenticated_bound_machine(&outranked)
+                .await
+                .map(|bound| bound.machine_id),
+            Some(announced_machine)
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn explicit_patch_downgrade_still_works() -> Result<()> {
         let (state, _dir) = secure_endpoint_test_state().await?;

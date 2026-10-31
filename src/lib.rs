@@ -5056,6 +5056,10 @@ fn sort_discovered_machine(machine: &mut DiscoveredMachine) {
 /// (issue #308).
 const MAX_DISCOVERED_MACHINE_ADDRESSES: usize = 8;
 
+/// The most distinct addresses one imported card contributes to a dial list
+/// (`Agent::record_card_routing_hint`); each may cost a bounded dial.
+const CARD_DIAL_HINTS_MAX: usize = 4;
+
 /// Per-candidate timeout for the proactive-reconnect sequential dial loop.
 const RECONNECT_CANDIDATE_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -20398,34 +20402,44 @@ impl Agent {
     /// input reaches it; only the local user's card import calls it.
     ///
     /// `agent.announced_at` is the pin time. The routing entry follows
-    /// [`Self::record_card_routing_hint`]: a card is no announcement and
-    /// never outranks one there.
+    /// [`Self::record_card_routing_hint`], after the pin: a card is no
+    /// announcement and never outranks one there.
     pub(crate) async fn pin_card_binding(&self, agent: DiscoveredAgent) {
         let (agent_id, machine_id, pinned_at) =
             (agent.agent_id, agent.machine_id, agent.announced_at);
-        self.record_card_routing_hint(agent).await;
         self.record_pinned_pairing(agent_id, machine_id, pinned_at)
             .await;
+        self.record_card_routing_hint(agent).await;
     }
 
     /// The routing half of [`Self::pin_card_binding`]. Stamped with the
     /// importer's clock, a card used to replace the announced address set
     /// (a pair code carries none) and the relay hints until the contact's
-    /// next heartbeat. So:
-    /// - **An announced entry for the card's machine**, or a card naming no
-    ///   machine, keeps its addresses, `announced_at`, relay hints and
-    ///   certificate fields.
+    /// next heartbeat. A card keeps at most its first `CARD_DIAL_HINTS_MAX`
+    /// distinct addresses. So:
+    /// - **An announced entry for the card's machine** keeps its
+    ///   `announced_at`, relay hints and certificate fields. When an
+    ///   authority store confirms that machine (the pin itself, unless a
+    ///   fresher binding names another), the card's addresses lead its dial
+    ///   list, ahead of the announced ones, until the next announcement
+    ///   replaces the list: the local user just named them (fetch>it's
+    ///   same-computer link imports a card whose only address is loopback,
+    ///   then connects).
+    /// - **A card naming no machine** leaves an announced entry as it is:
+    ///   its addresses belong to no confirmed machine.
     /// - **An announced entry for another machine** becomes the card's
-    ///   whole: its machine id and addresses, no relay hints or machine
-    ///   attributes, `announced_at` 0. The machine it left no longer lists
-    ///   the agent, and the DM registry forgets that binding.
+    ///   whole when an authority store confirms the card's machine: its
+    ///   machine id and addresses, no relay hints or machine attributes,
+    ///   `announced_at` 0. The machine it left no longer lists the agent,
+    ///   and the DM registry forgets that binding. Unconfirmed, the card
+    ///   leaves the entry as it is.
     /// - **No announced entry** (none, or one only a card made): the card is
     ///   recorded with `announced_at` 0, so the next class A or B
     ///   announcement replaces it whatever the two clocks say.
     ///
     /// The machine cache merges the card's addresses into the card's own
     /// machine's record as observed ones (the #308 rule), never clearing an
-    /// announced set. A card naming no machine adds to no machine's record.
+    /// announced set, and only for a confirmed machine.
     async fn record_card_routing_hint(&self, card: DiscoveredAgent) {
         let now = Self::unix_timestamp_secs();
         let agent_id = card.agent_id;
@@ -20434,6 +20448,7 @@ impl Agent {
         for addr in card.addresses {
             push_unique(&mut card_addresses, addr);
         }
+        card_addresses.truncate(CARD_DIAL_HINTS_MAX);
         let hint = DiscoveredAgent {
             addresses: card_addresses.clone(),
             announced_at: 0,
@@ -20441,6 +20456,8 @@ impl Agent {
             ..card
         };
         let card_names_no_machine = machine_id.0 == [0u8; 32];
+        let confirmed =
+            !card_names_no_machine && self.authority_confirms(&agent_id, &machine_id).await;
         let mut left_machine = None;
         let recorded = {
             let mut cache = self.identity_discovery_cache.write().await;
@@ -20449,9 +20466,23 @@ impl Agent {
                     if existing.announced_at > 0
                         && (card_names_no_machine || existing.machine_id == machine_id) =>
                 {
+                    if confirmed {
+                        let mut merged = card_addresses.clone();
+                        merged.extend(
+                            existing
+                                .addresses
+                                .iter()
+                                .copied()
+                                .filter(|addr| !card_addresses.contains(addr)),
+                        );
+                        existing.addresses = merged;
+                    }
                     existing.last_seen = existing.last_seen.max(now);
                     true
                 }
+                // An unconfirmed card (a fresher binding names another
+                // machine) never moves an announced entry.
+                Some(existing) if existing.announced_at > 0 && !confirmed => true,
                 Some(existing) if existing.announced_at > 0 => {
                     left_machine = Some(existing.machine_id);
                     existing.machine_id = machine_id;
@@ -20478,7 +20509,9 @@ impl Agent {
             // entry back to that machine while it keeps the card's addresses.
             self.direct_messaging.forget_binding(&agent_id, &left).await;
         }
-        upsert_discovered_machine_from_agent(&self.machine_discovery_cache, &hint).await;
+        if confirmed {
+            upsert_discovered_machine_from_agent(&self.machine_discovery_cache, &hint).await;
+        }
         if !recorded {
             upsert_discovered_agent(&self.identity_discovery_cache, &self.verified_cert_tx, hint)
                 .await;
@@ -28621,6 +28654,134 @@ mod tests {
         } else {
             addr
         }
+    }
+
+    /// Two loopback agents for the dial tests: `alice` is a metered leaf
+    /// (no proactive redial), `bob` runs its direct listener, and each holds
+    /// the other's class A record (the test seed).
+    async fn leaf_and_peer(dir: &std::path::Path) -> (Agent, Agent, std::net::SocketAddr) {
+        let build = |name: &str| {
+            Agent::builder()
+                .with_machine_key(dir.join(format!("{name}-machine.key")))
+                .with_agent_key_path(dir.join(format!("{name}-agent.key")))
+                .with_contact_store_path(dir.join(format!("{name}-contacts.json")))
+                .with_peer_cache_dir(dir.join(format!("{name}-peers")))
+                .with_network_config(loopback_network_config())
+                .build()
+        };
+        let alice = build("alice").await.expect("alice");
+        alice.set_leaf_mode(true);
+        let bob = build("bob").await.expect("bob");
+        bob.start_direct_listener();
+        let address = |agent: &Agent| {
+            let network = std::sync::Arc::clone(agent.network().expect("network"));
+            async move { normalize_loopback_addr(network.bound_addr().await.expect("bound")) }
+        };
+        let (alice_addr, bob_addr) = (address(&alice).await, address(&bob).await);
+        let now = Agent::unix_timestamp_secs();
+        let record = |agent: &Agent, addr| DiscoveredAgent {
+            can_receive_direct: Some(true),
+            ..card_pin(agent.agent_id(), agent.machine_id(), vec![addr], now)
+        };
+        alice
+            .insert_discovered_agent_for_testing(record(&bob, bob_addr))
+            .await;
+        bob.insert_discovered_agent_for_testing(record(&alice, alice_addr))
+            .await;
+        (alice, bob, bob_addr)
+    }
+
+    /// The entry `POST /agent/card/import` hands to `Agent::pin_card_binding`.
+    fn card_pin(
+        agent_id: identity::AgentId,
+        machine_id: identity::MachineId,
+        addresses: Vec<std::net::SocketAddr>,
+        at: u64,
+    ) -> DiscoveredAgent {
+        DiscoveredAgent {
+            self_name: None,
+            agent_id,
+            machine_id,
+            user_id: None,
+            addresses,
+            announced_at: at,
+            last_seen: at,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: None,
+            agent_certificate: None,
+            agent_public_key: Vec::new(),
+            cert_digest: None,
+        }
+    }
+
+    /// fetch>it's same-computer link: after the contact's signed
+    /// announcement, a re-imported card naming the same machine and a
+    /// loopback address puts that address first in the list the connect
+    /// path dials, and the connect reaches it. (The announced address is a
+    /// closed loopback port, so the test stays on this host.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_machine_card_after_an_announcement_is_dialed_first() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (alice, bob, bob_addr) = leaf_and_peer(dir.path()).await;
+        let announced: std::net::SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        let coordinator = identity::MachineId([0x41; 32]);
+        let now = Agent::unix_timestamp_secs();
+        let mut record = alice
+            .discovered_agent_for_testing(&bob.agent_id())
+            .await
+            .expect("bob is known");
+        record.addresses = vec![announced];
+        record.announced_at = now + 1;
+        record.reachable_via = vec![coordinator];
+        alice.insert_discovered_agent_for_testing(record).await;
+
+        alice
+            .pin_card_binding(card_pin(
+                bob.agent_id(),
+                bob.machine_id(),
+                vec![bob_addr, bob_addr],
+                now,
+            ))
+            .await;
+        let entry = alice
+            .discovered_agent_for_testing(&bob.agent_id())
+            .await
+            .expect("bob is known");
+        let dialed = connectivity::ReachabilityInfo::from_discovered(&entry).addresses;
+        assert_eq!(
+            dialed,
+            vec![bob_addr, announced],
+            "the card's address first, once"
+        );
+        assert_eq!(entry.announced_at, now + 1, "the announcement still stands");
+        assert_eq!(entry.reachable_via, vec![coordinator]);
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(20) * test_time_multiplier(),
+            alice.connect_to_agent(&bob.agent_id()),
+        )
+        .await
+        .expect("the connect ends")
+        .expect("the connect runs");
+        match outcome {
+            connectivity::ConnectOutcome::Direct(addr)
+            | connectivity::ConnectOutcome::Coordinated(addr) => {
+                assert_eq!(addr, bob_addr, "the card's loopback address was dialed");
+            }
+            other => panic!("bob was not reached over the card's address: {other:?}"),
+        }
+        let network = alice.network().expect("alice network");
+        assert!(
+            network
+                .is_connected(&ant_quic::PeerId(bob.machine_id().0))
+                .await
+        );
     }
 
     /// Mesh-off must be a safe no-op on an agent that never had a network:

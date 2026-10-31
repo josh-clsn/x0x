@@ -1075,10 +1075,14 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 ### What `/agents/connect` dials
 
 Signed announcements set the contact's discovery entry.
-`POST /agent/card/import` adds to it without outranking an announcement:
+`POST /agent/card/import` adds to it without outranking an announcement. A
+card keeps at most its first 4 distinct addresses, whichever case applies:
 
-- **The card names the announced machine** (or no machine): the entry keeps
-  its addresses, `announced_at`, relay hints and certificate fields.
+- **The card names the announced machine:** the card's addresses lead the
+  list, ahead of the announced ones, because the local user just named them.
+  The entry keeps its `announced_at`, relay hints and certificate fields, and
+  the next signed announcement replaces the list.
+- **The card names no machine:** an announced entry is left as it is.
 - **The card names another machine:** the entry becomes the card's, with its
   machine id and addresses, no relay hints and `announced_at` 0. The daemon
   also forgets the contact's live binding to the machine it left. The next
@@ -1088,9 +1092,12 @@ Signed announcements set the contact's discovery entry.
   replaces them, whatever the two clocks say.
 
 The import still pins the card's machine as an authority source at the
-import time (ADR 0115), so the routing entry and the authority stores are
-separate: a dial binds the machine it reaches only when an authority store
-confirms it.
+import time (ADR 0115). A card leads or moves an announced entry only when an
+authority store then confirms its machine; a fresher binding for another
+machine (an agent-authenticated beat signed inside the clock-skew bound)
+leaves the entry as it is. A dial binds the machine it reaches only when an
+authority store confirms it, so a card's address can cost dial time but can
+neither impersonate the contact nor rebind it.
 
 ### Direct send request body
 
