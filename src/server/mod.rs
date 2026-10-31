@@ -1312,6 +1312,7 @@ pub async fn serve_with_options(
         public_group_bootstrap_outbox_path,
         join_result_staging_path,
         join_result_staging_persistence_lock: Mutex::new(()),
+        join_result_pins_persistence_lock: Mutex::new(()),
         treekem_event_log: RwLock::new(HashMap::new()),
         treekem_member_key_packages,
         treekem_catchup_throttle: RwLock::new(HashMap::new()),
@@ -1683,6 +1684,43 @@ pub async fn serve_with_options(
     // a restart, and nothing else on the joiner re-requests the Welcome — an
     // app relaunch mid-join (routine on Android) orphaned the join for good.
     let respawned = respawn_unconverged_join_polls(Arc::clone(&state)).await;
+    // A re-key chain-step row whose pin passes its TTL while the daemon keeps
+    // running departs on this tick (the startup pass inside the respawn
+    // covers the restart case). #1269: the loop is a detached task the drain
+    // joins; each sweep persists the roster, so it runs shielded (#1275).
+    {
+        let sweep_state = Arc::clone(&state);
+        let mut shutdown_rx = state.shutdown_notify.subscribe();
+        state.spawn_detached(async move {
+            let mut tick =
+                tokio::time::interval(routes::named_groups::ABANDONED_REKEY_SWEEP_INTERVAL);
+            tick.tick().await;
+            loop {
+                if *shutdown_rx.borrow_and_update() || sweep_state.shutdown_started.is_cancelled() {
+                    break;
+                }
+                tokio::select! {
+                    _ = shutdown_rx.changed() => break,
+                    () = sweep_state.shutdown_started.cancelled() => break,
+                    _ = tick.tick() => {
+                        let run_state = Arc::clone(&sweep_state);
+                        let ran = sweep_state
+                            .run_shielded(async move {
+                                routes::named_groups::sweep_abandoned_rekey_rows(
+                                    &run_state,
+                                    "rekey_abandoned_periodic",
+                                )
+                                .await;
+                            })
+                            .await;
+                        if ran.is_none() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
     if !respawned.is_empty() {
         tracing::info!(
             groups = ?respawned,
