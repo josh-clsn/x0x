@@ -2916,6 +2916,27 @@ impl NetworkNode {
             .clone()
     }
 
+    /// Run `work` holding `peer`'s dial permit (#1419), both bounded by
+    /// `deadline`; `None` when the deadline passed first. The permit's idle
+    /// map entry is dropped afterwards, as the one-sided repair does.
+    pub(crate) async fn with_one_sided_dial_permit_until<F: std::future::Future>(
+        &self,
+        peer: AntPeerId,
+        deadline: tokio::time::Instant,
+        work: F,
+    ) -> Option<F::Output> {
+        let gate = self.one_sided_dial_gate(peer);
+        let permit_gate = Arc::clone(&gate);
+        let out = tokio::time::timeout_at(deadline, async move {
+            let _permit = permit_gate.lock_owned().await;
+            work.await
+        })
+        .await
+        .ok();
+        self.drop_idle_one_sided_dial_gate(&peer, &gate);
+        out
+    }
+
     /// Drop `peer`'s dial permit when this caller is the last holder besides
     /// the map. A scheduler that still holds the same permit keeps the entry,
     /// so two permits are not created for one peer.

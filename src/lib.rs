@@ -569,8 +569,6 @@ static PINNED_STANDIN_TRANSPORT: std::sync::LazyLock<
     >,
 > = std::sync::LazyLock::new(Default::default);
 
-/// x0x #1207 (test builds): every general raw-QUIC delivery a strict
-/// in-process stand-in made, as `(sender, recipient, machine, payload)`.
 /// Test builds: the next ACKed raw sends of these agents fail as a zombie
 /// connection's do (the receive ACK never comes while the connection still
 /// reads as connected), one per queued delay, each after its delay. A
@@ -586,6 +584,12 @@ static INJECTED_ZOMBIE_ACK_FAILURES: std::sync::LazyLock<
     >,
 > = std::sync::LazyLock::new(Default::default);
 
+/// Test builds: zombie resends each agent has started.
+#[cfg(test)]
+static ZOMBIE_RESENDS_STARTED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<identity::AgentId, usize>>,
+> = std::sync::LazyLock::new(Default::default);
+
 #[cfg(test)]
 fn take_injected_zombie_ack_failure(
     agent: &identity::AgentId,
@@ -596,6 +600,8 @@ fn take_injected_zombie_ack_failure(
         .and_then(|mut failures| failures.get_mut(agent)?.pop_front())
 }
 
+/// x0x #1207 (test builds): every general raw-QUIC delivery a strict
+/// in-process stand-in made, as `(sender, recipient, machine, payload)`.
 #[cfg(test)]
 #[allow(clippy::type_complexity)]
 static GENERAL_RAW_STANDIN_DELIVERIES: std::sync::LazyLock<
@@ -8155,9 +8161,10 @@ impl Agent {
     /// Dial each loopback address in `addresses`, address-only, and keep
     /// the connection only if the far end is `peer_id` (the peer check of
     /// the LAN probes' raw fallback), each within 2 s. A connection that
-    /// reaches another peer is closed, unless that peer was already
-    /// connected just before this dial. Returns the address that reached
-    /// `peer_id`.
+    /// reaches another peer is closed only when that peer was absent both
+    /// before the dial (not connected) and after it (no path has bound it to
+    /// an agent in the DM registry meanwhile). Returns the address that
+    /// reached `peer_id`.
     async fn dial_loopback_first(
         &self,
         network: &std::sync::Arc<network::NetworkNode>,
@@ -8172,7 +8179,12 @@ impl Agent {
             match tokio::time::timeout(LOOPBACK_PROBE_TIMEOUT, network.connect_addr(addr)).await {
                 Ok(Ok(connected)) if connected == peer_id => return Some(addr),
                 Ok(Ok(other)) => {
-                    if !before.contains(&other) {
+                    let claimed_after = self
+                        .direct_messaging
+                        .lookup_agent(&identity::MachineId(other.0))
+                        .await
+                        .is_some();
+                    if !before.contains(&other) && !claimed_after {
                         let _ = network.disconnect(&other).await;
                     }
                     tracing::debug!(
@@ -12104,8 +12116,16 @@ impl Agent {
         // dial permit (#1419), so it never races a one-sided repair's dial.
         let to = crate::logging::LogHexId::agent(&network::hex_prefix(&agent_id.0, 4)).to_string();
         let resend_deadline = window_end + window;
+        // A first attempt that spent both windows (a supersede reissue)
+        // leaves nothing to resend in.
+        if tokio::time::Instant::now() >= resend_deadline {
+            return result;
+        }
         let resend = async {
-            let _permit = network.one_sided_dial_gate(peer).lock_owned().await;
+            #[cfg(test)]
+            if let Ok(mut started) = ZOMBIE_RESENDS_STARTED.lock() {
+                *started.entry(self.identity.agent_id()).or_default() += 1;
+            }
             let mut again = None;
             self.send_direct_raw_quic_once(
                 agent_id,
@@ -12117,8 +12137,11 @@ impl Agent {
             )
             .await
         };
-        match tokio::time::timeout_at(resend_deadline, resend).await {
-            Ok(Ok(path)) => {
+        match network
+            .with_one_sided_dial_permit_until(peer, resend_deadline, resend)
+            .await
+        {
+            Some(Ok(path)) => {
                 tracing::info!(
                     target: "x0x::direct",
                     stage = "send",
@@ -12127,7 +12150,7 @@ impl Agent {
                 );
                 Ok(path)
             }
-            Ok(Err(resend_error)) => {
+            Some(Err(resend_error)) => {
                 tracing::debug!(
                     target: "x0x::direct",
                     stage = "send",
@@ -12137,7 +12160,7 @@ impl Agent {
                 );
                 result
             }
-            Err(_) => {
+            None => {
                 tracing::debug!(
                     target: "x0x::direct",
                     stage = "send",
@@ -12365,8 +12388,8 @@ impl Agent {
                         Err(de) => tracing::debug!(
                             target: "x0x::direct",
                             stage = "send",
-                            to = %agent_prefix,
-                            %machine_prefix,
+                            to = %crate::logging::LogHexId::agent(&agent_prefix),
+                            machine_prefix = %crate::logging::LogHexId::new("machine", &machine_prefix),
                             error = %de,
                             "failed to tear down zombie connection after acked send failure"
                         ),
@@ -12883,6 +12906,26 @@ impl Agent {
                 delays.iter().map(|delay| (*delay, false)).collect(),
             );
         }
+    }
+
+    /// Test seam: how many zombie resends this agent has started.
+    #[cfg(test)]
+    pub(crate) fn zombie_resends_started_for_testing(&self) -> usize {
+        ZOMBIE_RESENDS_STARTED
+            .lock()
+            .ok()
+            .and_then(|started| started.get(&self.identity.agent_id()).copied())
+            .unwrap_or(0)
+    }
+
+    /// Test seam: how many injected ACK failures this agent has left.
+    #[cfg(test)]
+    pub(crate) fn injected_ack_failures_left_for_testing(&self) -> usize {
+        INJECTED_ZOMBIE_ACK_FAILURES
+            .lock()
+            .ok()
+            .and_then(|failures| failures.get(&self.identity.agent_id()).map(|q| q.len()))
+            .unwrap_or(0)
     }
 
     /// Test seam: this agent's next ACKed raw send is refused by the
@@ -29313,6 +29356,29 @@ mod tests {
             !alice_network.is_connected(&carol_peer).await,
             "the stray the dial opened was closed"
         );
+
+        // 3. A peer some path bound to an agent during the dial is kept.
+        alice_network
+            .disconnect(&ant_quic::PeerId(bob.machine_id().0))
+            .await
+            .expect("disconnect");
+        alice
+            .direct_messaging
+            .register_agent(carol.agent_id(), carol.machine_id())
+            .await;
+        set_entry(vec![carol_addr, bob_addr]).await;
+        let outcome = alice
+            .connect_to_agent(&bob.agent_id())
+            .await
+            .expect("the connect runs");
+        assert!(
+            matches!(outcome, connectivity::ConnectOutcome::Direct(addr) if addr == bob_addr),
+            "{outcome:?}"
+        );
+        assert!(
+            alice_network.is_connected(&carol_peer).await,
+            "a peer bound to an agent after the dial is kept"
+        );
         let entry = alice
             .discovered_agent_for_testing(&bob.agent_id())
             .await
@@ -29380,6 +29446,11 @@ mod tests {
         assert!(
             tokio::time::timeout(quiet, bob_rx.recv()).await.is_err(),
             "one copy"
+        );
+        assert_eq!(
+            alice_network.one_sided_dial_gate_count(),
+            0,
+            "the resend's idle permit entry is dropped"
         );
 
         // 2. A zombie that spends its whole window: the resend gets one more.
@@ -29452,6 +29523,25 @@ mod tests {
             "{took:?}"
         );
         drop(permit);
+        assert!(tokio::time::timeout(quiet, bob_rx.recv()).await.is_err());
+
+        // 7. A first attempt that spent both windows leaves no resend: the
+        //    second injected failure is never reached.
+        connect().await;
+        alice.inject_zombie_ack_failures_for_testing(&[
+            2 * window + std::time::Duration::from_millis(200),
+            std::time::Duration::ZERO,
+        ]);
+        let resends = alice.zombie_resends_started_for_testing();
+        let (result, _took) = send(b"no time left", window).await;
+        assert!(result.is_err());
+        assert_eq!(
+            alice.zombie_resends_started_for_testing(),
+            resends,
+            "no resend starts after its deadline"
+        );
+        assert_eq!(alice.injected_ack_failures_left_for_testing(), 1);
+        alice.inject_zombie_ack_failures_for_testing(&[]);
         assert!(tokio::time::timeout(quiet, bob_rx.recv()).await.is_err());
     }
 
