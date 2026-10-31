@@ -1621,6 +1621,8 @@ async fn wa_state(joiner: &Arc<AppState>, group_key: &str) -> &'static str {
 }
 
 struct WaJoin {
+    /// The invite link the round trip redeemed.
+    link: String,
     status: StatusCode,
     body: String,
     new_attempt: bool,
@@ -1692,6 +1694,7 @@ async fn wa_fresh_invite_round_trip_with(
             .user_id()
             .as_bytes(),
     );
+    let redeemed = link.clone();
     let response = join_group_via_invite(
         State(Arc::clone(joiner)),
         Json(JoinGroupRequest {
@@ -1721,6 +1724,7 @@ async fn wa_fresh_invite_round_trip_with(
             )
         });
     let mut out = WaJoin {
+        link: redeemed,
         status,
         body,
         new_attempt: attempt.is_some(),
@@ -2437,43 +2441,154 @@ async fn s8a_shape_b_no_carry_is_not_rearmed_and_remove_reinvite_restores_keys()
         r.new_attempt && r.authority_accepted && r.staged && r.final_state == "active" && r.treekem,
         "Shape B is recovered by the returning-member re-key: {r}"
     );
+    for timeout_before_removal in [true, false] {
+        shape_b_remove_reinvite_without_restart(timeout_before_removal).await?;
+    }
+    Ok(())
+}
 
-    // The operator exit on the same process (#1191): the owner's removal
-    // retires any matching attempt and its pin, and the re-invite is
-    // accepted without a restart.
+/// Upstream's #1191 operator exit on the fork's terms. The re-key's result
+/// is held back, so the new attempt stays live and the device keyless, the
+/// state upstream's #1150 limitation leaves it in.
+async fn shape_b_remove_reinvite_without_restart(timeout_before_removal: bool) -> Result<()> {
     let dir = tempfile::tempdir()?;
     let s = build_back_to_back(dir.path()).await?;
     assert_eq!(d39_timed_out_without_carry(&s).await, "no_row");
+    let r = wa_fresh_invite_round_trip_with(&s, &s.j2, false).await?;
+    assert!(
+        r.new_attempt && r.final_state == "active" && !r.treekem,
+        "the held re-key leaves a live attempt on a keyless device: {r}"
+    );
     let member = hex::encode(s.j2.agent.agent_id().as_bytes());
     let key = join_result_key(&s.stable_group_id, &member);
+    let attempt =
+        s.j2.pending_join_attempts
+            .lock()
+            .expect("attempt registry")
+            .get(&key)
+            .expect("base-seated invite attempt")
+            .attempt_id
+            .clone();
+    if timeout_before_removal {
+        let lock = super::super::group_membership_lock_for_known_group(&s.j2, &s.group_key)
+            .await
+            .expect("known group");
+        assert_eq!(
+            super::super::finalize_join_attempt(
+                &s.j2,
+                &s.group_key,
+                &s.stable_group_id,
+                &member,
+                &attempt,
+                super::super::JoinAttemptOutcome::TimedOut,
+                super::super::JoinFinalizeGuard::Owned(lock.lock().await),
+            )
+            .await,
+            super::super::JoinFinalizeDisposition::NotApplicable
+        );
+        assert!(
+            !s.j2
+                .pending_join_attempts
+                .lock()
+                .expect("attempt registry")
+                .contains_key(&key),
+            "#1191: NotApplicable must retire the matching attempt before removal"
+        );
+        assert_eq!(wa_state(&s.j2, &s.group_key).await, "active");
+        assert!(
+            !s.j2
+                .last_join_outcomes
+                .lock()
+                .expect("outcomes")
+                .contains_key(&s.group_key),
+            "the snapshot seat must not acquire a timeout outcome"
+        );
+        assert!(
+            super::super::expected_join_result_inviter(&s.j2, &key).is_none(),
+            "a timeout that lost to the seat clears its pin"
+        );
+    }
+    // The re-key's own removal (r+1) reaches the device first, as gossip;
+    // the operator's removal follows at the authority.
+    let (_, _, carried) = r.held.clone().context("held result")?;
+    let rekey_removal = carried.first().cloned().context("re-key removal")?;
+    let applied =
+        apply_named_group_metadata_event(&s.j2, rekey_removal, s.authority_id, false, None).await;
+    assert!(applied.accepted, "the device applies the re-key removal");
     let after_removal = wa_owner_removes_j2(&s, true).await?;
-    assert!(
-        !s.j2
+    if timeout_before_removal {
+        // No pin is left, so the removal is an ordinary departure.
+        assert_eq!(after_removal.after, "no_row");
+        assert!(
+            !s.j2
+                .pending_join_attempts
+                .lock()
+                .expect("attempt registry")
+                .contains_key(&key),
+            "#1191: self-removal retires the matching attempt before the poll's next tick"
+        );
+        assert!(
+            super::super::expected_join_result_inviter(&s.j2, &key).is_none(),
+            "#1191: self-removal clears the matching inviter pin"
+        );
+        // The stale poll for the retired attempt revives nothing.
+        super::super::poll_join_result_until_membership_confirmed(
+            Arc::clone(&s.j2),
+            s.group_key.clone(),
+            s.stable_group_id.clone(),
+            vec![s.authority_id],
+            member.clone(),
+            true,
+            None,
+            attempt.clone(),
+        )
+        .await;
+        assert!(super::super::expected_join_result_inviter(&s.j2, &key).is_none());
+    } else {
+        // This fork: the removal comes from the device's pinned inviter while
+        // its attempt is live and it holds no tree, so it applies as the
+        // re-key chain step (the re-add may follow) and keeps the attempt.
+        assert_eq!(after_removal.after, "pending_authority_commit");
+        assert!(s
+            .j2
             .pending_join_attempts
             .lock()
             .expect("attempt registry")
-            .contains_key(&key),
-        "#1191: no attempt survives the removal"
-    );
-    // The timed-out attempt's pin is kept for the #390 late result and the
-    // re-key chain step, but only as a timed-out pin: it no longer makes the
-    // join read as pending, so it cannot hold the re-invite.
-    assert!(
-        super::super::live_expected_join_result_inviter(&s.j2, &key).is_none(),
-        "#1191: no live inviter pin survives the removal"
-    );
+            .contains_key(&key));
+    }
     let r = wa_fresh_invite_round_trip(&s).await?;
-    assert_eq!(
-        r.status,
-        StatusCode::OK,
-        "#1191: remove + re-invite must be accepted without restart: {r}"
-    );
+    assert_eq!(r.status, StatusCode::OK,
+        "#1191: remove + re-invite must be accepted without restart (timeout_before_removal={timeout_before_removal}): {r}");
     wa_assert_recovered(
         &format!(
             "shape B, j2_after_removal={} j2_apply_accepted={:?}",
             after_removal.after, after_removal.applied
         ),
         &r,
+    );
+    if !timeout_before_removal {
+        // The re-invite retired the old attempt; its stale poll exits and
+        // touches nothing.
+        super::super::poll_join_result_until_membership_confirmed(
+            Arc::clone(&s.j2),
+            s.group_key.clone(),
+            s.stable_group_id.clone(),
+            vec![s.authority_id],
+            member,
+            true,
+            None,
+            attempt,
+        )
+        .await;
+        assert_eq!(wa_state(&s.j2, &s.group_key).await, "active");
+    }
+    assert_eq!(
+        super::group_counters_for_test(&s.j2, &s.group_key)
+            .await
+            .join_attempts_timed_out,
+        0,
+        "bookkeeping-only exits must not count a timeout \
+         (timeout_before_removal={timeout_before_removal})"
     );
     Ok(())
 }
@@ -2485,41 +2600,16 @@ async fn issue1191_stale_finalizer_and_poll_preserve_new_attempt() -> Result<()>
     let dir = tempfile::tempdir()?;
     let s = build_back_to_back(dir.path()).await?;
     assert_eq!(d39_timed_out_without_carry(&s).await, "no_row");
-    let r = wa_fresh_invite_round_trip(&s).await?;
-    // This fork re-keys the seated device on the new attempt, so it ends
-    // with keys and that attempt finalizes as seated (upstream keeps the
-    // #1150 limitation and the attempt live). A newer live attempt and its
-    // pin are re-registered here so the stale finalizer and poll below meet
-    // the shape this test pins.
-    assert!(r.new_attempt && r.final_state == "active", "{r}");
+    // This fork re-keys the seated device on the new attempt, so the result
+    // is held back to keep that real attempt live and the device keyless,
+    // the shape upstream's #1150 limitation leaves it in.
+    let r = wa_fresh_invite_round_trip_with(&s, &s.j2, false).await?;
+    assert!(
+        r.new_attempt && r.final_state == "active" && !r.treekem,
+        "{r}"
+    );
     let member = hex::encode(s.j2.agent.agent_id().as_bytes());
     let key = join_result_key(&s.stable_group_id, &member);
-    {
-        let mut attempts = s.j2.pending_join_attempts.lock().expect("attempt registry");
-        if !attempts.contains_key(&key) {
-            attempts.insert(
-                key.clone(),
-                super::super::PendingJoinAttempt {
-                    attempt_id: "issue1191-newer-attempt".to_string(),
-                    local_group_key: s.group_key.clone(),
-                    invite_fingerprint: "issue1191-newer-invite".to_string(),
-                    invite_group_id: s.stable_group_id.clone(),
-                    inviter_public_key_b64: String::new(),
-                    stored_resend: None,
-                    polls: Vec::new(),
-                    tasks: Vec::new(),
-                    listener_token: None,
-                },
-            );
-        }
-    }
-    if super::super::expected_join_result_inviter(&s.j2, &key).is_none() {
-        super::super::record_expected_join_result_inviter(
-            &s.j2,
-            key.clone(),
-            hex::encode(s.authority_id.as_bytes()),
-        );
-    }
     let current =
         s.j2.pending_join_attempts
             .lock()
@@ -4595,5 +4685,137 @@ async fn batch6_the_removal_and_ban_events_pass_the_engine_a_door() -> Result<()
         StatusCode::OK,
         "the removed device applies its own signed removal through the door"
     );
+    Ok(())
+}
+
+/// Redeem `link` again on J2 through the real route.
+async fn wa_redeem(s: &BackToBack, link: &str) -> Result<(StatusCode, serde_json::Value)> {
+    let owner_pin = hex::encode(
+        s._authority
+            .agent
+            .identity()
+            .user_keypair()
+            .expect("owned")
+            .user_id()
+            .as_bytes(),
+    );
+    wa_json(
+        join_group_via_invite(
+            State(Arc::clone(&s.j2)),
+            Json(JoinGroupRequest {
+                invite: link.to_string(),
+                display_name: None,
+                mode: Some("home".to_string()),
+                expected_owner_user_id: Some(owner_pin),
+            }),
+        )
+        .await
+        .into_response(),
+    )
+    .await
+}
+
+/// I-3 (a): mid returning-member re-key (the r+1 removal applied as the
+/// chain step, the r+2 re-add not yet in), the device redeems the SAME
+/// invite again. That is the idempotent resend: the attempt and its live
+/// pin stay, and the r+2 add still seats the device with keys.
+#[tokio::test]
+async fn the_same_invite_resent_mid_rekey_keeps_the_attempt_and_the_rekey_seats() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    let key = join_result_key(&s.stable_group_id, &j2_hex);
+    super::super::finalize_join_attempt(
+        &s.j2,
+        &s.group_key,
+        &s.stable_group_id,
+        &j2_hex,
+        &s.j2_attempt,
+        super::super::JoinAttemptOutcome::TimedOut,
+        super::super::JoinFinalizeGuard::Unlocked,
+    )
+    .await;
+    let r = wa_fresh_invite_round_trip_with(&s, &s.j2, false).await?;
+    let (attempt, terminal, carried) = r.held.clone().context("held result")?;
+    wa_chain_step(&s, carried.first().context("removal")?).await?;
+
+    let (status, body) = wa_redeem(&s, &r.link).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["join_state"], "pending_authority_commit", "{body}");
+    assert_eq!(
+        s.j2.pending_join_attempts
+            .lock()
+            .expect("attempt registry")
+            .get(&key)
+            .map(|a| a.attempt_id.clone()),
+        Some(attempt.clone()),
+        "the in-flight attempt is kept"
+    );
+    assert!(
+        super::super::live_expected_join_result_inviter(&s.j2, &key).is_some(),
+        "the live pin is kept"
+    );
+
+    wa_deliver_held(&s, Some(&attempt), terminal, carried).await?;
+    assert_eq!(wa_state(&s.j2, &s.group_key).await, "active");
+    assert!(s.j2.treekem_groups.read().await.contains_key(&s.group_key));
+    assert!(wa_decrypts_post_rekey(&s, &s.j2).await?);
+    Ok(())
+}
+
+/// I-3 (b): the same mid-re-key state, but a DIFFERENT invite arrives. It
+/// proves no re-add is coming for the old attempt: the old attempt is
+/// retired and its pin cleared, the chain-step row departs, the new attempt
+/// seats the device with keys, and the old attempt's late r+2 changes
+/// nothing.
+#[tokio::test]
+async fn a_different_invite_mid_rekey_retires_the_attempt_held_by_our_removal() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+    let key = join_result_key(&s.stable_group_id, &j2_hex);
+    super::super::finalize_join_attempt(
+        &s.j2,
+        &s.group_key,
+        &s.stable_group_id,
+        &j2_hex,
+        &s.j2_attempt,
+        super::super::JoinAttemptOutcome::TimedOut,
+        super::super::JoinFinalizeGuard::Unlocked,
+    )
+    .await;
+    let r = wa_fresh_invite_round_trip_with(&s, &s.j2, false).await?;
+    let (old_attempt, old_terminal, old_carried) = r.held.clone().context("held result")?;
+    wa_chain_step(&s, old_carried.first().context("removal")?).await?;
+
+    // The rule's own decision, under the lock the route takes.
+    let fresh = wa_fresh_invite_round_trip_with(&s, &s.j2, false).await?;
+    assert_eq!(fresh.status, StatusCode::OK, "no 409: {fresh}");
+    assert!(fresh.new_attempt, "a new attempt is registered: {fresh}");
+    let current =
+        s.j2.pending_join_attempts
+            .lock()
+            .expect("attempt registry")
+            .get(&key)
+            .map(|a| a.attempt_id.clone())
+            .context("new attempt")?;
+    assert_ne!(current, old_attempt, "the old attempt is retired");
+    let (new_attempt, new_terminal, new_carried) = fresh.held.clone().context("held")?;
+    assert_eq!(new_attempt, current);
+
+    wa_deliver_held(&s, Some(&new_attempt), new_terminal, new_carried).await?;
+    assert_eq!(wa_state(&s.j2, &s.group_key).await, "active");
+    assert!(s.j2.treekem_groups.read().await.contains_key(&s.group_key));
+    let head = wa_head(&s.j2, &s).await;
+    let epoch = wa_tree_epoch(&s.j2, &s).await;
+
+    wa_deliver_held(&s, Some(&old_attempt), old_terminal, old_carried).await?;
+    assert_eq!(
+        wa_head(&s.j2, &s).await,
+        head,
+        "the late r+2 changes nothing"
+    );
+    assert_eq!(wa_tree_epoch(&s.j2, &s).await, epoch);
+    assert_eq!(wa_state(&s.j2, &s.group_key).await, "active");
     Ok(())
 }

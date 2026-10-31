@@ -22311,6 +22311,18 @@ pub(in crate::server) async fn join_group_via_invite(
                         stale_not_member_row = true;
                     }
                 } else if not_member_row.is_none()
+                    // A registered attempt already owns this join, and a
+                    // resend of its invite is #477's idempotent resend (the
+                    // stored volley keeps flowing). Re-running the join
+                    // would replace that attempt, which is mid-way through
+                    // a returning-member re-key when the device's own
+                    // removal has applied as the chain step. Only a stub no
+                    // attempt owns (a restart) re-runs.
+                    && !state
+                        .pending_join_attempts
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .contains_key(&join_result_key(info.stable_group_id(), &joiner_hex))
                     && !join_stub_is_converged(
                         state.as_ref(),
                         &info,
@@ -40943,6 +40955,11 @@ const WELCOME_FETCH_SHUTDOWN: &str = "TreeKEM Welcome fetch ended: the daemon is
 /// horizon costs ~300 sends instead of 43 200.
 const JOIN_RESULT_POLL_BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
 
+/// How long a join poll fetches on the fixed `JOIN_RESULT_POLL_INTERVAL`
+/// before it backs off: upstream's TreeKEM join window, so an ADR 0107
+/// re-arm (bounded by the same 120 s) fetches every 2 s for its whole life.
+const JOIN_RESULT_POLL_STEADY_WINDOW: Duration = Duration::from_secs(120);
+
 /// Delay before poll attempt `attempt` (0-based): 2s, 4s, 8s, … capped at
 /// [`JOIN_RESULT_POLL_BACKOFF_CAP`]. Pure, so the schedule is unit-testable.
 fn join_result_poll_delay(attempt: u32) -> Duration {
@@ -46630,8 +46647,9 @@ async fn poll_join_result_until_deadline(
     deadline: tokio::time::Instant,
 ) {
     let expected_key = join_result_key(&event_group_id, &member_agent_id);
-    let mut attempt: u32 = 0;
     let mut next_fetch_at = tokio::time::Instant::now();
+    let poll_started = next_fetch_at;
+    let mut backoff_step: u32 = 0;
     let mut timed_out = true;
     let mut already_finalized = false;
     let mut superseded = false;
@@ -46859,8 +46877,17 @@ async fn poll_join_result_until_deadline(
                     );
                 }
             }
-            next_fetch_at = tokio::time::Instant::now() + join_result_poll_delay(attempt);
-            attempt = attempt.saturating_add(1);
+            // Stock's 2 s for the first window (a re-arm's whole life, and
+            // a fresh join's push-miss fallback), the backoff after it.
+            let now = tokio::time::Instant::now();
+            let delay = if now.duration_since(poll_started) < JOIN_RESULT_POLL_STEADY_WINDOW {
+                JOIN_RESULT_POLL_INTERVAL
+            } else {
+                let delay = join_result_poll_delay(backoff_step);
+                backoff_step = backoff_step.saturating_add(1);
+                delay
+            };
+            next_fetch_at = now + delay;
         }
         // The fetch backs off; the #333 resend keeps its own wall-clock
         // cadence, so the loop wakes for whichever is due first.
@@ -46933,6 +46960,14 @@ async fn poll_join_result_until_deadline(
             state
                 .groups_diagnostics
                 .record_join_attempt_timed_out(&group_id);
+        } else if attempt_id.is_empty() {
+            // A poll respawned at boot owns no attempt and, with stubs not
+            // persisted, usually finds no pending stub, so the finalizer
+            // returns before it marks the pin. End the pin here as a live
+            // timeout does: it keeps authorizing a late result but no
+            // longer reads as a pending join or a re-key in flight.
+            mark_expected_join_result_inviter_timed_out(state.as_ref(), &expected_key);
+            persist_join_result_pins(state.as_ref()).await;
         }
     } else {
         // #477 C5: a confirmed seat finalizes the attempt bookkeeping
