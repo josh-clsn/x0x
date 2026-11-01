@@ -12,7 +12,7 @@
 //! - `POST /groups/:id/treekem/head-proof` signs this daemon's head proof
 //!   for a requester's own signed challenge, as received over another path
 //!   (the relay). It takes only the requester's signed page request, so
-//!   nobody else can move the requester's floor (A6 re-review N-2).
+//!   nobody else can move the requester's floor.
 //! - `POST /groups/:id/treekem/head-proof/accept` records a proof that
 //!   reached the engine over another path, under the same rules as one
 //!   that arrives over x0x.
@@ -297,8 +297,8 @@ impl AdminsSince {
 /// signed roster root; and the last one is the live roster. When the
 /// engine gives the anchor's `since_state_hash`, the anchor must also be
 /// that state: the retained base's hash, or the first state's
-/// `prev_state_hash`, or the live hash when nothing was applied since (A7
-/// review m-3). Otherwise the engine must hold.
+/// `prev_state_hash`, or the live hash when nothing was applied since.
+/// Otherwise the engine must hold.
 pub(in crate::server) fn admins_since(
     info: &x0x::groups::GroupInfo,
     since_revision: u64,
@@ -432,10 +432,9 @@ pub(in crate::server) struct TreeKemCatchUpTriggerRequest {
 /// catch-up. When no round opens, a refusal with `"round": null` and
 /// `"hold": true`: the room holds, and no smaller round is ever opened.
 /// Such a refusal also closes the room's previous round, so the GET never
-/// reports a round asked of fewer agents than the engine named (A7 review
-/// m-6), except `round_too_soon`, which leaves the round opened moments
+/// reports a round asked of fewer agents than the engine named, except `round_too_soon`, which leaves the round opened moments
 /// ago in place. A room opens at most one round per
-/// [`head_rounds::ROUND_MIN_GAP`] (A7 review m-5).
+/// [`head_rounds::ROUND_MIN_GAP`].
 pub(in crate::server) async fn treekem_catch_up_trigger(
     State(state): State<Arc<AppState>>,
     Extension(actor): Extension<ActorContext>,
@@ -836,7 +835,7 @@ mod tests {
             ),
             (StatusCode::FORBIDDEN, "requester_not_active")
         );
-        // The hint says what can succeed next (A7 review m-2): the same
+        // The hint says what can succeed next: the same
         // request, only a new round, or nothing until the room changes.
         for later in [Refusal::RepeatTooSoon, Refusal::NoRoom] {
             assert_eq!(pick(later).retry, Retry::Later, "{later:?}");
@@ -939,7 +938,7 @@ mod tests {
             "an anchor ahead of this roster is not something it can vouch for"
         );
 
-        // The anchor's identity (A7 review m-3).
+        // The anchor's identity.
         let base_hash = info.commit_log[0].commit.state_hash.clone();
         assert!(complete(&info, Some(&base_hash)));
         assert!(
@@ -985,7 +984,7 @@ mod tests {
         assert!(!complete(&moved, None));
     }
 
-    /// A7 review m-4: states naming more admins than a round holds are not
+    /// states naming more admins than a round holds are not
     /// listed; the answer says so, and the engine holds.
     #[test]
     fn admins_since_too_large_to_challenge_is_a_hold() {

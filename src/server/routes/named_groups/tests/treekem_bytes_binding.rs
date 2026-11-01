@@ -23,7 +23,7 @@ fn empty_extras() -> String {
 }
 
 /// An add's extras. An add that carries an owner mandate also names the
-/// mandate's digest (A3 review I-1).
+/// mandate's digest.
 fn add_extras(
     kind: u8,
     display_name: Option<&str>,

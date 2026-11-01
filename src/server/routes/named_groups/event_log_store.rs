@@ -196,6 +196,7 @@ impl std::ops::Deref for EventLog {
     }
 }
 
+#[cfg(test)]
 impl std::ops::DerefMut for EventLog {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.rooms

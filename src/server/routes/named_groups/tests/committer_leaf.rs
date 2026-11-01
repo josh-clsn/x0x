@@ -244,7 +244,7 @@ async fn the_door_ties_each_commit_to_its_named_actor() -> Result<()> {
     Ok(())
 }
 
-/// I-1's shape: the admin's genuine legacy-bound removal of R, delivered
+/// the admin's genuine legacy-bound removal of R, delivered
 /// under the admin's name (as the engine-A doors do) with R's own commit in
 /// place of the admin's. The legacy binding names no bytes, so only the
 /// committer leaf stops it.
@@ -535,7 +535,7 @@ async fn admin_page_for_victim(cast: &CatchupRelay) -> Result<TreeKemCatchupResp
     Ok(serde_json::from_slice(&served)?)
 }
 
-/// Fix round 1 (I-1): a member holding the admin's package by hash alone
+/// A member holding the admin's package by hash alone
 /// refuses the admin's removal, and the refusal itself starts what heals
 /// it. The epoch-ahead catch-up starts, the admin's package arrives through
 /// the real catch-up response handler, and the next page of missed commits
@@ -609,7 +609,7 @@ async fn a_refused_removal_heals_by_catch_up_without_a_resend() -> Result<()> {
     Ok(())
 }
 
-/// Fix round 1 (I-1): once the mesh is up, a member asks for every package
+/// Once the mesh is up, a member asks for every package
 /// it holds by hash alone, and only those.
 #[tokio::test]
 async fn the_mesh_sweep_asks_for_each_package_held_by_hash_alone() -> Result<()> {
@@ -637,7 +637,7 @@ async fn the_mesh_sweep_asks_for_each_package_held_by_hash_alone() -> Result<()>
     Ok(())
 }
 
-/// Fix round 1 (I-2): a member whose own seat commits no package (a group
+/// A member whose own seat commits no package (a group
 /// made before 2026-07-11) refuses to seal. Receivers would refuse its
 /// commit and the group would split while the admin saw success. The route
 /// says why, and nothing changes.

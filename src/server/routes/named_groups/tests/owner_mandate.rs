@@ -2239,7 +2239,7 @@ async fn treekem_direct_add_mints_epoch_bound_mandate_peer_applies() -> Result<(
     // Negative arm: an honestly owner-signed mandate whose declared epoch
     // disagrees with the event's treekem_epoch must refuse on a fresh peer
     // (state byte-identical). Swapped in after the seal, it is not the
-    // mandate the add's binding names (survivor re-key A3 review I-1), so
+    // mandate the add's binding names, so
     // the binding refuses it before the mandate check reads it.
     let peer2_dir = tempfile::tempdir()?;
     let peer2_agent = Arc::new(
@@ -2329,7 +2329,7 @@ async fn treekem_direct_add_mints_epoch_bound_mandate_peer_applies() -> Result<(
     Ok(())
 }
 
-/// Survivor re-key A3 review I-1: an owner-certified add's binding names
+/// an owner-certified add's binding names
 /// its owner mandate. A deliverer that strips the mandate no longer gets a
 /// receiver to warn-accept the add as one with no mandate, and the full
 /// copy from the author still applies and records the capability.

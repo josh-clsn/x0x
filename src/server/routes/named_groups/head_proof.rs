@@ -37,7 +37,9 @@ use crate::identity::AgentId;
 use crate::logging::LogHexId;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, LazyLock, PoisonError};
+#[cfg(any(test, feature = "test-rig"))]
+use std::sync::LazyLock;
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -66,23 +68,34 @@ pub(in crate::server) const HEAD_PROOF_MAX_ADMINS: usize = 512;
 /// How many hex digits open a challenge with its counter.
 const CHALLENGE_COUNTER_HEX: usize = 16;
 
-/// Test-only: when set to exactly `1`, this daemon signs its head proofs
-/// with the live epoch plus one and a random authenticator. The rig plays a
-/// removed admin running a modified app with it (design F-1). Never set in
-/// production; read once per process.
+/// Test rig only (`cfg(test)` or the `test-rig` feature): when set to
+/// exactly `1`, this daemon signs its head proofs with the live epoch plus
+/// one and a random authenticator, playing a removed admin running a
+/// modified app. Absent from production builds; read once per process.
+#[cfg(any(test, feature = "test-rig"))]
 pub(in crate::server) const INFLATE_KNOB: &str = "X0X_TEST_HEAD_PROOF_INFLATE";
 
+#[cfg(any(test, feature = "test-rig"))]
 static INFLATE: LazyLock<bool> =
     LazyLock::new(|| inflate_requested(std::env::var(INFLATE_KNOB).ok().as_deref()));
 
 /// Whether the value of [`INFLATE_KNOB`] turns the knob on: only `1` does.
+#[cfg(any(test, feature = "test-rig"))]
 fn inflate_requested(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
-/// Whether [`INFLATE_KNOB`] is on in this process.
+/// Whether the test-rig inflate knob is on in this process. Always `false`
+/// in a production build.
 pub(in crate::server) fn inflate_knob() -> bool {
-    *INFLATE
+    #[cfg(any(test, feature = "test-rig"))]
+    {
+        *INFLATE
+    }
+    #[cfg(not(any(test, feature = "test-rig")))]
+    {
+        false
+    }
 }
 
 /// What a head proof states. Every field is signed.
@@ -288,8 +301,7 @@ pub(in crate::server) enum Refusal {
 /// A head challenge its requester signed: built only from a page request
 /// whose signature verifies for its claimed requester over the group, the
 /// requester, the head and the challenge (A5's page-request signature). So
-/// only the requester itself can move its floor at an admin (A6 re-review
-/// N-2), whatever the transport or the route.
+/// only the requester itself can move its floor at an admin, whatever the transport or the route.
 #[derive(Debug, Clone)]
 pub(in crate::server) struct SignedChallenge {
     group_id: String,
@@ -301,8 +313,16 @@ pub(in crate::server) struct SignedChallenge {
 impl SignedChallenge {
     /// The challenge `request` carries, when its requester signed it.
     pub(in crate::server) fn from_request(request: &super::TreeKemCatchupRequest) -> Option<Self> {
+        Self::from_checked_request(request, signed_catchup::page_request_signed(request))
+    }
+
+    /// [`Self::from_request`], with the page signature already checked.
+    pub(in crate::server) fn from_checked_request(
+        request: &super::TreeKemCatchupRequest,
+        signed: bool,
+    ) -> Option<Self> {
         let nonce = request.head_challenge.clone()?;
-        signed_catchup::page_request_signed(request).then(|| Self {
+        signed.then(|| Self {
             group_id: request.group_id.clone(),
             requester: request.requester_agent_id.to_ascii_lowercase(),
             nonce,
@@ -351,9 +371,9 @@ impl HeadAnswers {
     /// Decide on `requester`'s challenge `nonce`, whose counter is
     /// `counter`, in `key`. A newer challenge always becomes the latest,
     /// so every older one is refused from then on, but it is charged only
-    /// within the limit (A6 re-review I-1b). The latest one again is
-    /// re-sent its proof at most once per [`HEAD_PROOF_REPEAT_WINDOW`]
-    /// (N-1), uncharged.
+    /// within the limit. The latest one again is
+    /// re-sent its proof at most once per [`HEAD_PROOF_REPEAT_WINDOW`],
+    /// uncharged.
     fn admit(
         &mut self,
         key: &str,
@@ -535,7 +555,7 @@ pub(in crate::server) async fn answer_challenge_with(
     }
     let answered = answer_fresh(state, &key, requester, nonce, *requester_epoch, inflate).await;
     if let Err(refusal) = answered {
-        // A6 re-review m-r3: this challenge was charged and is now the
+        // this challenge was charged and is now the
         // latest, so a repeat of it is refused as stale.
         tracing::debug!(
             group_id = %LogHexId::group(&key),
@@ -647,7 +667,7 @@ fn sign_head(
     let (epoch, authenticator) = if inflate {
         tracing::warn!(
             group_id = %LogHexId::group(&roster.key),
-            "{INFLATE_KNOB}=1: signing a head proof with the next epoch and a random authenticator (test-only)"
+            "X0X_TEST_HEAD_PROOF_INFLATE=1: signing a head proof with the next epoch and a random authenticator (test-only)"
         );
         (epoch.saturating_add(1), rand::random::<[u8; 32]>())
     } else {
@@ -864,7 +884,7 @@ mod tests {
         assert!(!verify(&sign_claim_with(&admin, long)));
         let empty = claim(&agent_hex(&admin), &requester, "");
         assert!(!verify(&sign_claim_with(&admin, empty)));
-        // Review m-2: a signer that does not name itself an admin.
+        // a signer that does not name itself an admin.
         let mut not_listed = claim(&agent_hex(&admin), &requester, "n");
         not_listed.admins = vec!["0".repeat(64)];
         assert!(!verify(&sign_claim_with(&admin, not_listed)));
@@ -987,7 +1007,7 @@ mod tests {
         ));
     }
 
-    /// A6 re-review I-1b: an admin that forgot S (a restart, or it was
+    /// an admin that forgot S (a restart, or it was
     /// offline while S ran rounds) faces a replayer holding 30 of S's
     /// challenges above its floor. S's newest arrives after the twelfth:
     /// it is limited, but it fences off the rest, and S's next challenge

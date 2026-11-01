@@ -10,7 +10,7 @@
 //! - the event's `actor` must be the commit's verified signer;
 //! - TreeKEM bytes in a copy the author did not deliver must be named by the
 //!   signed binding (survivor re-key A1);
-//! - a field no signature covers is dropped from such a copy (F-2).
+//! - a field no signature covers is dropped from such a copy.
 //!
 //! The join-request lifecycle events stay with their author.
 

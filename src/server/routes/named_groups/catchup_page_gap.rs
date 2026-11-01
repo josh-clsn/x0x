@@ -152,7 +152,7 @@ struct RoomAsks {
 }
 
 /// Which members a requester asked about a hole after its head, and when it
-/// may ask each again (A5 review I-2). One entry per room and member: a new
+/// may ask each again. One entry per room and member: a new
 /// head starts the room afresh, and a wipe drops it.
 #[derive(Debug, Default)]
 pub(in crate::server) struct GapAsks {

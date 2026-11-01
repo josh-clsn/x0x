@@ -251,7 +251,7 @@ async fn event_log_holds_every_commit_bearing_kind() -> Result<()> {
     // The join-request lifecycle carries a commit too. An admin's
     // rejection is logged. A request and its cancellation come from a
     // requester who never serves catch-up, and apply only from it, so no
-    // member logs them (A4 review I-2).
+    // member logs them.
     let requester = hex_id(&newcomer(0x72)?.0);
     let signed = named_group_metadata_event_commit(&events[0]).cloned();
     let created = NamedGroupMetadataEvent::JoinRequestCreated {

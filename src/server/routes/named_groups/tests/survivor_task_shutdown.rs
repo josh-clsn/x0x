@@ -57,7 +57,12 @@ async fn shutdown_and_wait_releases_state_held_by_survivor_rekey_tasks() -> Resu
     let pause = super::super::detached_send_test_seam::arm(
         &super::super::detached_send_test_seam::key_package_catchup_key(&group_id, &peer_hex),
     );
-    super::super::committer_leaf::request_key_packages(&state, &group_id, vec![peer_hex], 4);
+    super::super::committer_leaf::request_key_packages(
+        &state,
+        &group_id,
+        vec![peer_hex.clone()],
+        4,
+    );
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while !pause.reached() && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -66,10 +71,23 @@ async fn shutdown_and_wait_releases_state_held_by_survivor_rekey_tasks() -> Resu
         pause.reached(),
         "setup: the KeyPackage request is in flight"
     );
+    // The hole ask and the head-round send park at their page request.
+    let seam = super::super::detached_send_test_seam::page_request_key;
+    let gap_pause = super::super::detached_send_test_seam::arm(&seam(&group_id, &peer_hex, false));
+    let round_pause = super::super::detached_send_test_seam::arm(&seam(&group_id, &peer_hex, true));
     super::super::committer_leaf::spawn_hash_only_key_package_sweep(&state);
     super::super::catchup_page_gap::spawn_ask_another_member(&state, &group_id);
     let _ =
         super::super::head_rounds::challenge_admins(&state, &group_id, &[], Duration::ZERO).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !(gap_pause.reached() && round_pause.reached()) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(gap_pause.reached(), "setup: the hole ask is in flight");
+    assert!(
+        round_pause.reached(),
+        "setup: the head-round send is in flight"
+    );
     drop(state);
 
     tokio::time::timeout(LIFECYCLE, handle.shutdown_and_wait())
@@ -82,5 +100,7 @@ async fn shutdown_and_wait_releases_state_held_by_survivor_rekey_tasks() -> Resu
         "the AppState and Agent are released when shutdown_and_wait returns"
     );
     drop(pause);
+    drop(gap_pause);
+    drop(round_pause);
     Ok(())
 }

@@ -42,7 +42,7 @@ pub(super) fn push_field(out: &mut Vec<u8>, bytes: &[u8]) {
 /// The bytes a page request's signature covers. Every field after the
 /// domain is length-prefixed, so no two requests share an encoding.
 /// `limit` is covered too: a replay cannot turn a request into one for an
-/// empty page (A5 review I-1).
+/// empty page.
 pub(super) fn page_request_sign_input(
     group_id: &str,
     requester: &str,
@@ -183,6 +183,13 @@ pub(super) async fn send_page_request(
         sign_page_request(state, &mut request);
     }
     let payload = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
+    #[cfg(test)]
+    super::detached_send_test_seam::park(&super::detached_send_test_seam::page_request_key(
+        &request.group_id,
+        &hex::encode(peer.as_bytes()),
+        request.head_challenge.is_some(),
+    ))
+    .await;
     #[cfg(test)]
     if let Ok(mut recorded) = state
         .named_group_test_recorders

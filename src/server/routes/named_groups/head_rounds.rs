@@ -5,10 +5,10 @@
 //!   admin set) and every active admin on this member's roster, never this
 //!   member. A named agent is never left out: when the whole set would be
 //!   larger than [`HEAD_PROOF_MAX_ADMINS`], no round opens at all, so the
-//!   room holds (A6 review C-1).
+//!   room holds.
 //! - **The challenge.** A counter that only grows, then 32 random bytes,
-//!   so an admin can refuse a replayed older challenge without charging it
-//!   (A6 review I-1). The counter is at least the wall clock in
+//!   so an admin can refuse a replayed older challenge without charging it.
+//!   The counter is at least the wall clock in
 //!   milliseconds, and it is kept on disk ([`HeadCounter`]), so it never
 //!   goes back, whatever the clock does across a restart.
 //! - **What is recorded.** A proof that verifies, for this member, in this
@@ -16,8 +16,7 @@
 //!   within [`HEAD_ROUND_DEADLINE`] of the round opening. Every distinct
 //!   head a signer signs in a round is kept (at most
 //!   [`HEADS_PER_SIGNER`]), and a signer with more than one is marked
-//!   conflicted, so a conflict wins whatever order the proofs arrive in
-//!   (A6 review I-2).
+//!   conflicted, so a conflict wins whatever order the proofs arrive in.
 //!
 //! [`HEAD_ROUND_DEADLINE`] runs on the process monotonic clock, which stops
 //! while a device sleeps. It is not a freshness age: the engine measures
@@ -42,7 +41,7 @@ pub(in crate::server) const HEAD_ROUND_DEADLINE: Duration = Duration::from_secs(
 /// proof can make the engine name up to 511 agents (its anchored closure
 /// grows from proofs' admin lists), and each round sends every one of them
 /// a signed request naming this member and the room, so the trigger must
-/// not let that repeat faster than this (A7 review m-5).
+/// not let that repeat faster than this.
 pub(in crate::server) const ROUND_MIN_GAP: Duration = Duration::from_secs(5);
 
 /// The most distinct heads kept per signer in one round.
@@ -70,7 +69,7 @@ pub(in crate::server) enum NotRecorded {
 const HEAD_COUNTER_FILE: &str = "head-challenge-counter";
 
 /// This daemon's challenge counter: the last one used, kept on disk so it
-/// never goes back (A6 re-review m-r1).
+/// never goes back.
 #[derive(Debug)]
 pub(in crate::server) struct HeadCounter {
     last: u64,
@@ -111,7 +110,7 @@ impl HeadCounter {
 
 /// An open round: one nonce, the agents it challenged, and the distinct
 /// heads each signer returned. A head is kept as its claim once its proof
-/// verified (A6 re-review m-r2).
+/// verified.
 #[derive(Debug, Clone)]
 struct HeadRound {
     nonce: String,
@@ -623,8 +622,7 @@ pub(in crate::server) async fn record_proof(
 
 /// Close the open round in `group_id` (a room key), if any, with its
 /// proofs. A trigger that opens no round closes the last one, so nothing
-/// reports a round asked of a smaller set than the engine named (A7 review
-/// m-6).
+/// reports a round asked of a smaller set than the engine named.
 pub(in crate::server) fn close_round(state: &AppState, group_id: &str) {
     state
         .treekem_head_rounds
@@ -910,7 +908,7 @@ mod tests {
             Some(BTreeSet::new())
         );
 
-        // A6 review C-1: a roster padded with admins does not crowd out the
+        // a roster padded with admins does not crowd out the
         // named one; the set is refused whole instead.
         let anchored = "d".repeat(64);
         let padded: Vec<String> = (0..HEAD_PROOF_MAX_ADMINS)

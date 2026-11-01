@@ -295,14 +295,14 @@ async fn trigger_challenges_the_named_admins_and_roster_admins_only() -> Result<
     assert_eq!(body["hold"], true);
     assert!(
         round_view(s1, group_id).is_none(),
-        "a refused trigger closes the last round (review m-6)"
+        "a refused trigger closes the last round"
     );
     let _ = round;
     cast.shutdown().await;
     Ok(())
 }
 
-/// A6 review C-1 carried: when the named agents and the roster admins are
+/// when the named agents and the roster admins are
 /// more than a round holds, the trigger says so and the room holds. It
 /// never opens a round with fewer agents.
 #[tokio::test]
@@ -334,7 +334,7 @@ async fn trigger_that_would_ask_too_many_opens_no_round_and_says_hold() -> Resul
     assert_eq!(body["asked"], serde_json::json!([]));
     assert!(
         round_view(s1, group_id).is_none(),
-        "no new round, no smaller one, and the earlier round is closed (review m-6)"
+        "no new round, no smaller one, and the earlier round is closed"
     );
     let _ = earlier;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -805,7 +805,7 @@ async fn accept_route_records_only_a_proof_for_the_open_round() -> Result<()> {
     assert_eq!(body["recorded"], false);
     assert_eq!(body["reason"], "no_round", "S2 opened no round");
 
-    // Over HTTP, each reason a proof is refused for (review m-8).
+    // Over HTTP, each reason a proof is refused for.
     let round = first["round"].as_str().expect("a round").to_string();
     let stranger = crate::identity::AgentKeypair::generate()?;
     let stranger_hex = hex_id(&stranger.agent_id());
@@ -847,7 +847,7 @@ async fn accept_route_records_only_a_proof_for_the_open_round() -> Result<()> {
     Ok(())
 }
 
-/// A7 review m-5: a room opens at most one round per gap through the
+/// a room opens at most one round per gap through the
 /// trigger. The round opened moments ago stays open, and the answer is a
 /// hold that may succeed later.
 #[tokio::test]
@@ -892,7 +892,7 @@ async fn trigger_opens_at_most_one_round_per_gap() -> Result<()> {
     Ok(())
 }
 
-/// A7 review m-1 and m-2: a trigger in a room with no tree here is a hold
+/// a trigger in a room with no tree here is a hold
 /// with the hold body; it may change later only on the TreeKEM plane.
 #[tokio::test]
 async fn trigger_without_a_tree_holds_and_says_whether_it_may_come() -> Result<()> {
@@ -930,7 +930,7 @@ async fn trigger_without_a_tree_holds_and_says_whether_it_may_come() -> Result<(
     Ok(())
 }
 
-/// A7 review I-1: the routes run in a fork-quarantined room (ADR-0066
+/// the routes run in a fork-quarantined room (ADR-0066
 /// control plane), so the GET says the room is quarantined, with the
 /// marker's wire fields only.
 #[tokio::test]

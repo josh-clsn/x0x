@@ -132,8 +132,8 @@ pub(super) enum AddKind {
     JoinRequestApproved = 2,
 }
 
-/// An add's extras (F-2): the display name, the KeyPackage hash, the
-/// Welcome, and the owner mandate when the add carries one (A3 review I-1).
+/// An add's extras: the display name, the KeyPackage hash, the
+/// Welcome, and the owner mandate when the add carries one.
 /// So a deliverer cannot strip the mandate from an owner-certified add, and
 /// the receiver never warn-accepts it as absent. An add with no mandate
 /// keeps A1's digest. `JoinRequestApproved` carries no display name and no

@@ -7943,7 +7943,7 @@ async fn process_treekem_commit_after_crypto_recheck(
 ) -> anyhow::Result<()> {
     // Survivor re-key A2: the commit must come from the actor's own leaf.
     let group_ids = [group_id, info.stable_group_id(), info.mls_group_id.as_str()];
-    // Survivor re-key A3 (A2 review m-1): a removal's commit must take its
+    // Survivor re-key A3: a removal's commit must take its
     // target out. A legacy binding names no bytes, so without this the
     // actor's other commit at the same epoch would pass every other check.
     // A target whose package this member does not hold is not checked.
@@ -8964,7 +8964,7 @@ fn treekem_add_security_binding(
 /// Whether a TreeKEM add may apply under its signed binding. A binding that
 /// names bytes must name exactly the commit and extras this copy carries,
 /// so whoever hands the add on cannot rename the member or swap its
-/// KeyPackage hash or Welcome (F-2). An add sealed before survivor re-key A1
+/// KeyPackage hash or Welcome. An add sealed before survivor re-key A1
 /// names none and still applies from its author (A3: from no one else). A
 /// TreeKEM binding that is none of the written forms is refused.
 #[allow(clippy::too_many_arguments)]
@@ -11626,10 +11626,11 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
             ),
             _ => false,
         };
-    // Survivor re-key A5: a page request proves its origin the same way,
-    // over its own domain and frontier. Checked before the #378 throttle,
-    // so a forged request cannot use up a member's window.
-    let page_signed_ok = !verified && signed_catchup::page_request_signed(&request);
+    // A page request proves its origin over its own domain and frontier,
+    // before the #378 throttle. Verified once; a head challenge reuses it.
+    let page_signed = (!verified || request.head_challenge.is_some())
+        && signed_catchup::page_request_signed(&request);
+    let page_signed_ok = !verified && page_signed;
     if !verified && !member_keyed_signed_ok && !page_signed_ok {
         return;
     }
@@ -11800,12 +11801,10 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     // re-requests of an already-served page inside the window are dropped. The
     // member-keyed serve (#205) returns above this point, so multi-member key-
     // package recovery — many distinct targets at one frontier — is unaffected.
-    // Survivor re-key A6: a head challenge is answered here, before the
-    // #378 throttle, under its own limit per (group, requester). Only a
-    // challenge the requester signed counts, whatever the transport; only
-    // an active requester is answered, and only an active admin signs; the
-    // requester's epoch, when ahead, starts this daemon's own catch-up.
-    let head_proof = match head_proof::SignedChallenge::from_request(&request) {
+    // A signed head challenge is answered before the #378 throttle, under
+    // its own limit (survivor re-key A6).
+    let head_proof = match head_proof::SignedChallenge::from_checked_request(&request, page_signed)
+    {
         Some(challenge) if authorized && !sender_departed => {
             match head_proof::answer_challenge(state, &challenge).await {
                 Ok(proof) => Some(proof),
@@ -11826,7 +11825,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         "serve:{}:{}:{}:{}",
         request.group_id, sender_hex, request.from_revision, request.from_treekem_epoch
     );
-    // Survivor re-key A5 (review I-1): the window starts only when a page
+    // Survivor re-key A5: the window starts only when a page
     // is handed to the transport, below. A request is signed over every
     // field that shapes the page, and `limit` is clamped to at least one, so
     // a replayed request can only send the requester its own real page.
@@ -11848,7 +11847,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         return;
     }
     // Survivor re-key A4: every commit-bearing event this member applied,
-    // after a restart too, ordered by signed revision. A5 (A4 review n-1):
+    // after a restart too, ordered by signed revision. A5:
     // a page starts right after the requester's head and stops at a hole.
     // A requester this log cannot serve from its head gets no events and is
     // told why, so it asks another member.
@@ -11948,8 +11947,7 @@ const TREEKEM_CATCHUP_THROTTLE_RETENTION: Duration = Duration::from_secs(60 * 60
 const TREEKEM_CATCHUP_THROTTLE_PRUNE_AT: usize = 1024;
 
 /// Stamp `key` in the catch-up throttle at `now`, dropping entries older
-/// than [`TREEKEM_CATCHUP_THROTTLE_RETENTION`] once the map is large
-/// (survivor re-key A5 review I-2, m-2).
+/// than [`TREEKEM_CATCHUP_THROTTLE_RETENTION`] once the map is large.
 fn stamp_catchup_throttle(
     throttle: &mut HashMap<String, tokio::time::Instant>,
     key: String,
@@ -12219,12 +12217,9 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
             }
             _ => false,
         };
-    // Survivor re-key A5: a page the transport could not verify is read
-    // too, and its claimed sender counts for nothing: no revocation or
-    // roster check, and nothing applies as it. Each event applies as its
-    // verified commit signer under the non-author rules
-    // (`signer_delivery::admit(.., false)`), or is dropped. A signed
-    // targeted reply (#398) proves its sender, which must be a member.
+    // An unverified page is read too (survivor re-key A5); its claimed
+    // sender counts for nothing, and each event applies as its verified
+    // signer or is dropped. A signed targeted reply proves its sender.
     let sender_authenticated = verified || targeted_signed_ok;
     let sender_hex = hex::encode(sender.as_bytes());
     if sender_authenticated {
@@ -12285,7 +12280,7 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         });
     let was_truncated = response.truncated;
     let gap_through = response.log_evicted_through;
-    // A5 review I-2: over a transport that did not verify the sender, a
+    // over a transport that did not verify the sender, a
     // hole report counts only when the responder signed it.
     let gap_report_signed = !verified
         && signed_catchup::gap_report_signed(
@@ -12365,18 +12360,13 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                     .filter(|ev| {
                         verify_authority_attested_member_joined_recovery(&response_info, ev)
                     });
-                // Survivor re-key A3: any member may hand on a signed commit.
-                // It applies as its verified signer (upstream's
-                // T-self-leave-catchup-author rule, for every commit-bearing
-                // kind), and a copy its author did not deliver must name its
-                // TreeKEM bytes (T-self-leave-relay-commit-binding) and keeps
-                // only bound fields.
+                // Any member may hand on a signed commit; it applies as its
+                // verified signer (survivor re-key A3).
                 let kind = named_group_metadata_event_kind(&event);
                 let Some((apply_sender, event)) = signer_delivery::admit(event, sender, verified)
                 else {
-                    // A5 review m-3: a stranger can send these at will, so an
-                    // unverified refusal is a debug line, and the sender is a
-                    // claim.
+                    // A stranger can send these at will: unverified refusals
+                    // log at debug.
                     if verified {
                         tracing::warn!(
                             group_id = %LogHexId::group(&response.group_id),
@@ -12449,10 +12439,10 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
             );
         }
     }
-    // A5 (A4 review n-1): still behind a hole after this page? Ask other
+    // A5: still behind a hole after this page? Ask other
     // members, but only on a report from an active member here whose report
-    // is authenticated: a verified transport, or a signed hole report
-    // (review I-2). An older responder's gapped page counts only over a
+    // is authenticated: a verified transport, or a signed hole report.
+    // An older responder's gapped page counts only over a
     // verified transport. On a page the transport could not verify, ask
     // its claimed sender for the next page only when the page moved this
     // member's head, and only when that sender is an active member here:
@@ -17001,7 +16991,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 // PRE-MUTATION point — `next` already holds the re-admitted
                 // seat, `expected2` is the TreeKEM epoch the terminal
                 // `MemberAdded` carries, and nothing is sealed or persisted
-                // yet; the add's binding names it (A3 review I-1). An owner-axis group whose re-key event carries no
+                // yet; the add's binding names it. An owner-axis group whose re-key event carries no
                 // mandate is refused by every enforcing member, and the
                 // refusal is silent to the returning member: it never gets
                 // its seat back.
@@ -17581,7 +17571,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 // pre-mutation point — `next` holds the seat-write and
                 // the epoch is the TreeKEM epoch the terminal will
                 // carry; still nothing is sealed, mutated or persisted.
-                // The add's binding names it (A3 review I-1).
+                // The add's binding names it.
                 owner_mandate = mint_owner_mandate_for_seat(
                     state,
                     &next,
@@ -20802,6 +20792,16 @@ pub(in crate::server) mod detached_send_test_seam {
     /// `group_id`.
     pub(in crate::server) fn key_package_catchup_key(group_id: &str, member_hex: &str) -> String {
         format!("kp-catchup:{group_id}:{member_hex}")
+    }
+
+    /// A signed page request to `peer`; `challenged` when it carries a head
+    /// challenge.
+    pub(in crate::server) fn page_request_key(
+        group_id: &str,
+        peer_hex: &str,
+        challenged: bool,
+    ) -> String {
+        format!("page-request:{group_id}:{peer_hex}:{challenged}")
     }
 
     /// #1288: the signed-public bootstrap delivery to `recipient_hex` for
@@ -24189,7 +24189,7 @@ async fn add_treekem_named_group_member(
         .and_then(|member| member.treekem_key_package_hash.clone());
     // ADR-0064 slice 3 (round-2 advisory A1): the TreeKEM sibling of the
     // GSS direct-add mint — declared epoch is the epoch this add's TreeKEM
-    // commit will carry. The add's binding names it (A3 review I-1).
+    // commit will carry. The add's binding names it.
     let owner_mandate = mint_owner_mandate_for_seat(
         state.as_ref(),
         &next,
@@ -25179,7 +25179,7 @@ async fn wipe_local_group_crypto_material(
         }
     }
     {
-        // Survivor re-key A5 (review m-2): every key names its room first
+        // Survivor re-key A5: every key names its room first
         // (or after `serve:`), so the room's keys go by prefix.
         let mut catchup = state.treekem_catchup_throttle.write().await;
         catchup.retain(|key, _| {
@@ -28449,8 +28449,7 @@ async fn remove_treekem_named_group_member(
 
 /// Survivor re-key A2: once the mesh is up, ask for every KeyPackage this
 /// member holds by hash alone, so an earlier member's first commit is not
-/// refused for want of it. It runs in its own task (A3, from A2 re-review
-/// r-6), so the caller never waits on the roster.
+/// refused for want of it. It runs in its own task, so the caller never waits on the roster.
 pub(in crate::server) fn spawn_hash_only_treekem_key_package_sweep(state: &Arc<AppState>) {
     committer_leaf::spawn_hash_only_key_package_sweep(state);
 }
@@ -42183,7 +42182,7 @@ pub(in crate::server) async fn apply_group_metadata_event(
             );
         }
     };
-    // Survivor re-key A3 (A1 review I-1): `sender` is the caller's claim.
+    // Survivor re-key A3: `sender` is the caller's claim.
     // The original MemberJoined is checked against it by the joiner's own
     // signature. Every other event applies as its verified signer, as a copy
     // its author did not deliver: its TreeKEM bytes must be named by its
@@ -42437,7 +42436,7 @@ pub(in crate::server) async fn apply_join_result_endpoint(
             );
         }
     };
-    // Survivor re-key A3 (A1 review I-1): `sender` is the caller's claim, so
+    // Survivor re-key A3: `sender` is the caller's claim, so
     // the result applies as its verified signer, as a copy its author did not
     // deliver: its binding must name its TreeKEM bytes and Welcome.
     let (sender, event) = match signer_delivery::door_admit(event, &sender) {

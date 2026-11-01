@@ -206,7 +206,7 @@ pub(super) fn spawn_hash_only_key_package_sweep(state: &Arc<AppState>) {
 }
 
 /// Per group key, the TreeKEM epoch that a refusal for a missing KeyPackage
-/// last pulled the group's commits again for (A2 re-review r-1). Without it
+/// last pulled the group's commits again for. Without it
 /// a page refused after the pull's rounds ended would start another, and a
 /// member that can serve the event but not the package would keep a group
 /// polling. An entry lives until the group's next package lands.

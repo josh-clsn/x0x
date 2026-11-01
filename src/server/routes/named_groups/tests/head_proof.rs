@@ -673,7 +673,7 @@ async fn an_inflating_admin_signs_the_next_epoch_and_a_random_authenticator() ->
     Ok(())
 }
 
-/// A5 review r-2: every writer of the catch-up throttle drops expired keys
+/// every writer of the catch-up throttle drops expired keys
 /// once the map is large, here the member-keyed serve.
 #[tokio::test]
 async fn the_member_keyed_serve_prunes_the_catchup_throttle() -> Result<()> {
@@ -723,7 +723,7 @@ async fn proof_for(
         .and_then(|response| response.head_proof)
 }
 
-/// A6 review C-1. R, removed by the owner on the real chain, sends S1
+/// R, removed by the owner on the real chain, sends S1
 /// commits from S1's stale head that seat 600 admins of its own and
 /// remove the owner. The engine still names the owner (its anchor), and the
 /// owner is never dropped to make room: no round opens, and the room holds.
@@ -793,7 +793,7 @@ async fn a_roster_full_of_admins_does_not_crowd_out_a_named_admin() -> Result<()
     Ok(())
 }
 
-/// A6 review I-1: anyone holding one of S1's old signed challenges replays
+/// anyone holding one of S1's old signed challenges replays
 /// it, claiming to be S1 over an unverified transport. That spends none of
 /// S1's answers, and S1's latest challenge is answered from cache.
 #[tokio::test]
@@ -842,7 +842,7 @@ async fn a_replayed_old_challenge_does_not_spend_the_requesters_answers() -> Res
     Ok(())
 }
 
-/// A6 review I-1, across a re-invite: S1 is removed and invited back, and
+/// Across a re-invite: S1 is removed and invited back, and
 /// its challenges from before still count for nothing. Even after the
 /// owner forgets every challenge (a restart, or the room wiped), replaying
 /// them costs S1 at most one answer per old challenge, once.
@@ -933,7 +933,7 @@ async fn the_same_challenge_twice_is_answered_once() -> Result<()> {
     Ok(())
 }
 
-/// A6 review I-2: the owner answers S1's round at epoch E, moves on, and
+/// the owner answers S1's round at epoch E, moves on, and
 /// signs E+1 for the same challenge. The E+1 proof arrives first. S1 keeps
 /// both, and marks the owner conflicted.
 #[tokio::test]
@@ -973,7 +973,7 @@ async fn two_heads_from_one_signer_in_a_round_are_both_kept() -> Result<()> {
     Ok(())
 }
 
-/// A6 review m-1: the owner removes S2 after the requester gate and before
+/// the owner removes S2 after the requester gate and before
 /// the tree is read. S2 gets no proof of the new head.
 #[tokio::test]
 async fn a_requester_removed_while_the_head_is_read_gets_no_proof() -> Result<()> {
@@ -1014,7 +1014,7 @@ async fn a_requester_removed_while_the_head_is_read_gets_no_proof() -> Result<()
     Ok(())
 }
 
-/// A6 review m-8: a page and a proof that do not fit one direct message
+/// a page and a proof that do not fit one direct message
 /// go apart, the proof first.
 #[tokio::test]
 async fn a_page_and_a_proof_too_large_for_one_message_go_apart() -> Result<()> {
@@ -1058,7 +1058,7 @@ async fn a_page_and_a_proof_too_large_for_one_message_go_apart() -> Result<()> {
     Ok(())
 }
 
-/// A6 re-review N-1: replaying S1's current challenge makes the owner
+/// replaying S1's current challenge makes the owner
 /// re-send its proof at most once a window, so the owner is no reflector.
 #[tokio::test]
 async fn a_replayed_current_challenge_is_re_sent_at_most_once_a_window() -> Result<()> {
@@ -1093,7 +1093,7 @@ async fn a_replayed_current_challenge_is_re_sent_at_most_once_a_window() -> Resu
     Ok(())
 }
 
-/// A6 re-review I-1b: the owner forgot S1 (a restart, or it was away while
+/// the owner forgot S1 (a restart, or it was away while
 /// S1 ran rounds). A replayer holding 20 of S1's challenges above the
 /// owner's floor spends the window, but S1's newest, limited, fences off
 /// the rest of the stock: a delay of one window, not stock / 12.
@@ -1131,7 +1131,7 @@ async fn a_replayed_stock_of_old_challenges_is_fenced_off_by_the_requesters_newe
     Ok(())
 }
 
-/// A6 re-review N-2: only a challenge S1 signed can move S1's floor at the
+/// only a challenge S1 signed can move S1's floor at the
 /// owner. An unsigned all-`f` counter, one signed by another key, and one
 /// swapped into S1's signed request all leave it where it was.
 #[tokio::test]
@@ -1576,5 +1576,59 @@ async fn a_cached_or_pre_apply_head_proof_does_not_end_the_startup_wait() -> Res
     );
     cast.state.shutdown_notify.send_replace(true);
     cast.state.agent.shutdown().await;
+    Ok(())
+}
+
+/// An admin that never answers (a stock 0.48.1 daemon, or one offline)
+/// ends the startup wait only when its send budget is spent, each ask
+/// carries its own fresh challenge, and no retry sends past the bound.
+#[tokio::test]
+async fn a_silent_admin_ends_the_startup_wait_at_the_send_budget() -> Result<()> {
+    let group_id = "d9".repeat(16);
+    let (state, _dir, witness, epoch_before) = startup_with_admin_witness(&group_id).await?;
+    let witness_hex = hex_id(&witness.agent_id());
+    let challenges = |state: &AppState| -> Vec<String> {
+        state
+            .named_group_test_recorders
+            .catchup_page_requests
+            .lock()
+            .expect("page request recorder")
+            .iter()
+            .filter(|(peer, _)| *peer == witness_hex)
+            .filter_map(|(_, bytes)| {
+                serde_json::from_slice::<TreeKemCatchupRequest>(bytes)
+                    .ok()
+                    .and_then(|request| request.head_challenge)
+            })
+            .collect()
+    };
+    startup_self_leave_rekey(&state).await;
+    assert_eq!(self_leave_startup_send_count(&state, &group_id), 1);
+    retry_startup_self_leave_catchup(&state).await;
+    assert_eq!(self_leave_startup_send_count(&state, &group_id), 2);
+    assert_eq!(
+        live_epoch(&state, &group_id).await,
+        epoch_before,
+        "a silent admin holds the wait while its budget lasts"
+    );
+    retry_startup_self_leave_catchup(&state).await;
+    assert_eq!(self_leave_startup_send_count(&state, &group_id), 3);
+    wait_until(|| false).await;
+    assert!(
+        live_epoch(&state, &group_id).await > epoch_before,
+        "spending the admin's send budget ends the wait and seals"
+    );
+    retry_startup_self_leave_catchup(&state).await;
+    assert_eq!(
+        self_leave_startup_send_count(&state, &group_id),
+        3,
+        "no retry sends past the bound"
+    );
+    let asked = challenges(&state);
+    assert_eq!(asked.len(), 3, "each ask carried a challenge: {asked:?}");
+    let distinct: std::collections::BTreeSet<_> = asked.iter().collect();
+    assert_eq!(distinct.len(), 3, "every ask's challenge is fresh");
+    state.shutdown_notify.send_replace(true);
+    state.agent.shutdown().await;
     Ok(())
 }

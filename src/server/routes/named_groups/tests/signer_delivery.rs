@@ -734,7 +734,7 @@ async fn a_non_author_copy_applies_no_unbound_field() -> Result<()> {
     Ok(())
 }
 
-/// A1 review I-1: the engine-A door's sender is a claim. A legacy-bound
+/// the engine-A door's sender is a claim. A legacy-bound
 /// removal through it is refused even when it claims the author.
 #[tokio::test]
 async fn the_engine_a_metadata_door_refuses_unnamed_bytes_whatever_it_claims() -> Result<()> {
@@ -753,7 +753,7 @@ async fn the_engine_a_metadata_door_refuses_unnamed_bytes_whatever_it_claims() -
     Ok(())
 }
 
-/// A1 review I-1: a removal that names its bytes applies through the door
+/// a removal that names its bytes applies through the door
 /// as its signer, whatever sender the caller claims.
 #[tokio::test]
 async fn the_engine_a_metadata_door_applies_named_bytes_as_their_signer() -> Result<()> {
@@ -889,7 +889,7 @@ async fn post_join_result_door(
     response_json(response).await
 }
 
-/// A1 review I-1, the other door: a relayed join result whose binding
+/// The other door: a relayed join result whose binding
 /// names no bytes is refused, though it claims the expected inviter.
 #[tokio::test]
 async fn the_engine_a_join_result_door_refuses_unnamed_bytes_whatever_it_claims() -> Result<()> {
@@ -911,7 +911,7 @@ async fn the_engine_a_join_result_door_refuses_unnamed_bytes_whatever_it_claims(
     Ok(())
 }
 
-/// A1 review I-1, the other door: the expected inviter's join result that
+/// The other door: the expected inviter's join result that
 /// names its bytes applies as its signer, whatever sender the caller claims.
 #[tokio::test]
 async fn the_engine_a_join_result_door_applies_as_the_signer() -> Result<()> {
@@ -938,7 +938,7 @@ async fn the_engine_a_join_result_door_applies_as_the_signer() -> Result<()> {
     Ok(())
 }
 
-/// A2 review m-1: a legacy binding names no bytes, so the owner's own
+/// a legacy binding names no bytes, so the owner's own
 /// commit at the same epoch that removes someone else (S2) would pass
 /// every other check as its removal of R. The removal must leave R with no
 /// leaf: refused, and rolled back.
@@ -984,7 +984,7 @@ async fn a_removal_whose_commit_keeps_the_target_is_refused() -> Result<()> {
     Ok(())
 }
 
-/// A2 review m-4 (1), by the real routes: a requester approved by the
+/// By the real routes: a requester approved by the
 /// owner seats the roster packages its Welcome holds, so it applies the
 /// owner's next removal with no package request.
 #[tokio::test]
@@ -1074,7 +1074,7 @@ async fn an_approved_requester_seats_its_welcome_packages_and_follows_the_owner(
     Ok(())
 }
 
-/// A2 review m-4 (2), by the real routes: A joins after S1, by the owner's
+/// By the real routes: A joins after S1, by the owner's
 /// direct add, and is promoted. S1 holds A's package only through the
 /// recovery record A's add carried. A's own removal of R applies at S1.
 #[tokio::test]
@@ -1180,7 +1180,7 @@ async fn a_later_admins_commit_applies_at_an_earlier_member_from_its_recovery_re
     Ok(())
 }
 
-/// A2 re-review r-3: the sweep asks only active members, never a removed
+/// the sweep asks only active members, never a removed
 /// adder, and asks a bounded number of them for each package.
 #[tokio::test]
 async fn the_sweep_asks_only_active_members_and_a_bounded_number() -> Result<()> {
@@ -1230,7 +1230,7 @@ async fn the_sweep_asks_only_active_members_and_a_bounded_number() -> Result<()>
     Ok(())
 }
 
-/// A2 re-review r-1: a refusal for a missing package pulls the group's
+/// a refusal for a missing package pulls the group's
 /// commits again once per refused epoch, not on every later refusal, and
 /// once more when the package lands.
 #[tokio::test]
@@ -1282,7 +1282,7 @@ async fn a_pending_package_pulls_again_once_per_epoch_and_once_when_it_lands() -
     Ok(())
 }
 
-/// A2 re-review r-6: the sweep is spawned, so the caller (the startup join
+/// the sweep is spawned, so the caller (the startup join
 /// task, before its rendezvous advertisement) never waits on the roster.
 #[tokio::test]
 async fn the_key_package_sweep_never_holds_up_its_caller() -> Result<()> {
@@ -1306,7 +1306,7 @@ async fn the_key_package_sweep_never_holds_up_its_caller() -> Result<()> {
     Ok(())
 }
 
-/// A1 review m-4: a `treekem:` binding that is none of the written forms is
+/// a `treekem:` binding that is none of the written forms is
 /// refused, rather than admitted as one that names no bytes. Another
 /// plane's binding names no TreeKEM bytes, so only its author delivers it.
 #[test]

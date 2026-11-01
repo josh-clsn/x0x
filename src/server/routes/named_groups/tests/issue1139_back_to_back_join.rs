@@ -5142,7 +5142,7 @@ async fn a4_j2_serves_its_rekey_link_and_add(s: &BackToBack) -> Result<()> {
     Ok(())
 }
 
-/// Survivor re-key A4 review I-1: the link that removes this device just
+/// the link that removes this device just
 /// before its add re-seats it (the join-result path) is logged, though the
 /// device is not an active member at that moment.
 #[tokio::test]
