@@ -49,7 +49,7 @@ A Noetic leaf agent's drill showed group messages stalling behind membership app
   - With four slots, four requesters that went away time out together, and a fifth waits at most one send timeout. Before, it waited behind every request queued ahead of it.
   - Four keeps a phone's catch-up work to a few pages in memory and a few signatures at a time.
   - It matches the re-key obligation worker's sends in flight (`rekey_obligations::MAX_IN_FLIGHT`).
-- **A seated member the obligations refused gets the resend schedule.** A direct add or an approval owes the member it seats its seat (`T-seat-obligation`), and sends nothing blind. Only when the obligations refuse the seat (past their caps, or the file cannot be written) is the member put on the schedule's direct sends at 6, 15, 30 and 60 s (`spawn_seated_member_resends`), with no room-wide republish: that member is not subscribed to the room's metadata topic yet. A survivor the obligations refused keeps the full schedule with the republish.
+- **A seated member the obligations refused gets the resend schedule.** A direct add or an approval owes the member it seats its seat (`T-seat-obligation`). It still sends the +0 and +8 s volley to every active member, the seated one included, but withholds the 6 to 60 s resend schedule while the seat is owed. Only when the obligations refuse the seat (past their caps, or the file cannot be written) is the member put on the schedule's direct sends at 6, 15, 30 and 60 s (`spawn_seated_member_resends`), with no room-wide republish: that member is not subscribed to the room's metadata topic yet. A survivor the obligations refused keeps the full schedule with the republish.
 - **A counter for v1 acknowledgement waits.** `GET /diagnostics/dm` `stats` reports:
   - `v1_ack_waits` and `v1_ack_wait_ms`: gossip-inbox sends that waited for a v1 recipient acknowledgement, and the time they took;
   - `v1_ack_wait_timeouts` and `v1_ack_wait_timeout_ms`: those that ended without one.
@@ -89,7 +89,7 @@ A Noetic leaf agent's drill showed group messages stalling behind membership app
 - `a_machine_flooding_unverified_requests_is_checked_a_burst_at_most`: 100 unverified requests from one machine get about 16 signature checks; another machine's still gets one.
 - `a_requester_off_the_roster_gets_no_place`: a self-signed or transport-verified requester the roster does not hold, and a room this daemon does not hold, get no place.
 - `a_dispatched_answer_is_the_direct_answer`: the page the listener path sends is byte for byte the page a direct call sends.
-- `a_member_an_add_seats_keeps_the_resend_schedule`: while the seat is owed, a direct add and an approval give the seated member no blind schedule; past the obligations' cap they give it the direct-send schedule, with no republishing schedule.
+- `a_member_an_add_seats_keeps_the_resend_schedule`: while the seat is owed, a direct add and an approval give the seated member no resend schedule beyond the +0 and +8 s volley; past the obligations' cap they give it the direct-send schedule, with no republishing schedule.
 
 Unit tests:
 

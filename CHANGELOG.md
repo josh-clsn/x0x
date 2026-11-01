@@ -179,8 +179,8 @@ engine-A routes, and the four TreeKEM catch-up routes).
   re-seat or an add obligation does not help a stock member. Removals in
   upstream's `:commit=` form apply.
 - The catch-up request gains `signed_by` and `head_challenge`, and the catch-up
-  response gains `log_evicted_through`, `target_member_id`, `signed_by` and
-  `head_proof`. A stock peer ignores all of them. Without the signed hole
+  response gains `log_evicted_through`, `target_member_id`,
+  `target_member_key_package_b64`, `signed_by` and `head_proof`. A stock peer ignores all of them. Without the signed hole
   report a stock requester never moves on to another member.
 - `POST /groups/:id/members` answers 409 for a member already present as
   before, now with `"redelivered": true`, and sends the seat again. A stock
