@@ -138,6 +138,11 @@ pub(crate) fn authority_machine(
 /// authenticated binding, or a usable ADR 0089 evidence record for exactly
 /// (agent, `machine`). `evidence` runs only when neither record names the
 /// machine. A zero machine is never confirmed.
+///
+/// Once the local user's card pin names a newer machine than the announced
+/// record, the announced record no longer confirms (the newest-wins order
+/// of [`authority_machine`]); a later announcement that replaces the pin
+/// confirms again. Without a pin this is upstream's rule.
 pub(crate) fn confirms(
     machine: MachineId,
     announced: Option<AuthenticatedMachineBinding>,
@@ -147,6 +152,13 @@ pub(crate) fn confirms(
     if machine.0 == [0u8; 32] {
         return false;
     }
+    let announced = announced.filter(|record| {
+        !attested.is_some_and(|pin| {
+            pin.local_pin
+                && pin.machine_id != record.machine_id
+                && pin.announced_at > record.announced_at
+        })
+    });
     let names = |binding: Option<AuthenticatedMachineBinding>| {
         binding.is_some_and(|binding| binding.machine_id == machine)
     };
@@ -244,6 +256,40 @@ mod tests {
         let mut store = AuthenticatedMachineBindingCache::default();
         store.record_announcement(agent, machine, announced_at, digest, not_after);
         store.peek(&agent).expect("recorded binding")
+    }
+
+    fn pin(machine: MachineId, at: u64) -> AuthenticatedMachineBinding {
+        let agent = AgentId([7; 32]);
+        let mut store = AuthenticatedMachineBindingCache::default();
+        store.record_local_pin(agent, machine, at);
+        store.peek(&agent).expect("recorded pin")
+    }
+
+    #[test]
+    fn a_newer_local_pin_supersedes_the_announced_machine() {
+        let (old, new) = (MachineId([1; 32]), MachineId([2; 32]));
+        let announced = Some(binding(old, 100, None, None));
+        let newer_pin = Some(pin(new, 200));
+        assert!(newer_pin.is_some_and(|p| p.local_pin));
+        assert!(!confirms(old, announced, newer_pin, || false));
+        assert!(confirms(new, announced, newer_pin, || false));
+        assert!(
+            confirms(old, announced, newer_pin, || true),
+            "evidence stands"
+        );
+        // An older pin, or a newer non-pin binding, changes nothing.
+        assert!(confirms(old, announced, Some(pin(new, 50)), || false));
+        assert!(confirms(
+            old,
+            announced,
+            Some(binding(new, 200, None, None)),
+            || false
+        ));
+        // A later announcement for the pinned agent confirms its machine.
+        let reinstalled = Some(binding(MachineId([3; 32]), 300, None, None));
+        assert!(confirms(MachineId([3; 32]), reinstalled, newer_pin, || {
+            false
+        }));
     }
 
     #[test]

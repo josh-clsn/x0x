@@ -20825,7 +20825,7 @@ impl Agent {
     pub(crate) async fn pin_card_binding(&self, agent: DiscoveredAgent) {
         let (agent_id, machine_id, pinned_at) =
             (agent.agent_id, agent.machine_id, agent.announced_at);
-        self.record_pinned_pairing(agent_id, machine_id, pinned_at)
+        self.record_pinned_pairing(agent_id, machine_id, pinned_at, true)
             .await;
         self.record_card_routing_hint(agent).await;
     }
@@ -20997,17 +20997,28 @@ impl Agent {
         agent_id: identity::AgentId,
         machine_id: identity::MachineId,
         pinned_at: u64,
+        local_pin: bool,
     ) {
         if machine_id.0 == [0u8; 32] {
             return;
         }
-        dm_inbox::record_authenticated_machine_binding(
-            &self.authenticated_machine_bindings,
-            agent_id,
-            machine_id,
-            pinned_at,
-        )
-        .await;
+        if local_pin {
+            dm_inbox::record_local_pin_binding(
+                &self.authenticated_machine_bindings,
+                agent_id,
+                machine_id,
+                pinned_at,
+            )
+            .await;
+        } else {
+            dm_inbox::record_authenticated_machine_binding(
+                &self.authenticated_machine_bindings,
+                agent_id,
+                machine_id,
+                pinned_at,
+            )
+            .await;
+        }
         self.direct_messaging
             .register_agent(agent_id, machine_id)
             .await;
@@ -21071,7 +21082,7 @@ impl Agent {
         )
         .await;
 
-        self.record_pinned_pairing(agent_id, machine_id, seeded_at)
+        self.record_pinned_pairing(agent_id, machine_id, seeded_at, false)
             .await;
     }
 

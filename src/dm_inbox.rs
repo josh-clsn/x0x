@@ -137,6 +137,10 @@ pub(crate) struct AuthenticatedMachineBinding {
     /// committed to, in the announced-binding store; `cert_not_after` is that
     /// certificate's expiry. Always `None` in the authenticated-binding store.
     pub(crate) cert_digest: Option<[u8; 32]>,
+    /// ADR 0115: the record is the local user's card pin
+    /// (`Agent::pin_card_binding`), not a network-authenticated binding. Any
+    /// later write that replaces it clears the mark.
+    pub(crate) local_pin: bool,
     last_used: (std::time::Instant, u64),
 }
 
@@ -198,6 +202,17 @@ impl AuthenticatedMachineBindingCache {
         // certificate expiry: a new machine attestation cannot renew a cert.
         let cert_not_after = self.entries.get(&agent_id).and_then(|b| b.cert_not_after);
         self.record_with_expiry(agent_id, machine_id, announced_at, cert_not_after);
+    }
+
+    /// The local user's card pin: [`Self::record`], marked `local_pin`
+    /// when it took effect (newest-wins).
+    pub(crate) fn record_local_pin(&mut self, agent_id: AgentId, machine_id: MachineId, at: u64) {
+        self.record(agent_id, machine_id, at);
+        if let Some(entry) = self.entries.get_mut(&agent_id) {
+            if entry.machine_id == machine_id && entry.announced_at == at {
+                entry.local_pin = true;
+            }
+        }
     }
 
     fn record_with_expiry(
@@ -290,6 +305,7 @@ impl AuthenticatedMachineBindingCache {
                 existing.announced_at = announced_at;
                 existing.cert_not_after = cert_not_after;
                 existing.cert_digest = cert_digest;
+                existing.local_pin = false;
             }
             self.entries.insert(agent_id, existing);
             self.recency.insert((tick.0, tick.1, agent_id.0));
@@ -322,6 +338,7 @@ impl AuthenticatedMachineBindingCache {
                 announced_at,
                 cert_not_after,
                 cert_digest,
+                local_pin: false,
                 last_used: tick,
             },
         );
@@ -378,6 +395,19 @@ pub(crate) async fn record_authenticated_machine_binding(
         .write()
         .await
         .record(agent_id, machine_id, announced_at);
+}
+
+/// Record the local user's card pin (ADR 0115 local-user pin).
+pub(crate) async fn record_local_pin_binding(
+    bindings: &AuthenticatedMachineBindings,
+    agent_id: AgentId,
+    machine_id: MachineId,
+    pinned_at: u64,
+) {
+    bindings
+        .write()
+        .await
+        .record_local_pin(agent_id, machine_id, pinned_at);
 }
 
 /// Record the certificate lifetime from a verified identity announcement.

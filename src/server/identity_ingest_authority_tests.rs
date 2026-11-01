@@ -1851,3 +1851,102 @@ async fn adr0115_card_move_from_a_card_only_entry_forgets_the_old_machine() {
     }
     assert_vector_closed("card move", &open);
 }
+
+/// Batch 5 (O2, fork strictening): once the local user's card pins X to M1,
+/// newer than X's announced binding to M2, M2 no longer confirms, even with
+/// M1 offline and M2 connected: M2's raw frames do not verify as X and M2
+/// is never the raw or pinned target. An agent with no pin is unchanged,
+/// and a later announcement from X's next machine still wins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adr0115_a_newer_local_pin_supersedes_the_announced_machine() {
+    let victim = Victim::start("pinorder").await;
+    let now = now_secs();
+    let x = Subject::new();
+    let y = Subject::new();
+    let m2 = x.machine_id();
+    let m1 = MachineKeypair::generate()
+        .expect("X's pinned machine")
+        .machine_id();
+    victim.announce_genuine(&x, now - 30).await;
+    victim.announce_genuine(&y, now - 30).await;
+    victim.identity_barrier().await;
+    victim.expect_genuine_entry(&x, "pin order").await;
+    victim.expect_genuine_entry(&y, "pin order").await;
+
+    victim
+        .agent
+        .pin_card_binding(crate::DiscoveredAgent {
+            self_name: None,
+            agent_id: x.id(),
+            machine_id: m1,
+            user_id: None,
+            addresses: Vec::new(),
+            announced_at: now,
+            last_seen: now,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: None,
+            agent_certificate: None,
+            agent_public_key: Vec::new(),
+            cert_digest: None,
+        })
+        .await;
+    // M2 is live and the DM registry still names it; M1 is offline.
+    victim
+        .agent
+        .direct_messaging
+        .mark_connected(x.id(), m2)
+        .await;
+    let only_m2 = crate::RawQuicTransport::Scripted(Arc::new(
+        crate::PinnedTransportScript::connected_only(&[m2, y.machine_id()], false),
+    ));
+
+    // CONTROL: the agent with no pin is unchanged.
+    assert!(
+        victim.raw_frame_verified(y.id(), y.machine_id()).await,
+        "CONTROL FAILED (not the vector): an unpinned agent's own frames verify"
+    );
+    assert_eq!(
+        victim.raw_target(y.id(), &only_m2).await,
+        Some(y.machine_id()),
+        "CONTROL FAILED (not the vector): an unpinned agent resolves its machine"
+    );
+
+    let mut open = Vec::new();
+    if victim.raw_frame_verified(x.id(), m2).await {
+        open.push("frames from the superseded machine verify as X".to_string());
+    }
+    if victim.raw_target(x.id(), &only_m2).await == Some(m2) {
+        open.push("a raw send to X resolves the superseded machine".to_string());
+    }
+    if victim.pinned_machine(x.id()).await == Some(m2) {
+        open.push("the pinned selector picks the superseded machine".to_string());
+    }
+    if victim.cached_machine(&x.id()).await == Some(m2) {
+        open.push("routing names the superseded machine".to_string());
+    }
+    assert_vector_closed("pin order", &open);
+
+    // X reinstalls on M3 and announces it: the new announcement wins.
+    let m3 = MachineKeypair::generate().expect("X's next machine");
+    let beat = signed_announcement(x.id(), x.public_key(), &m3, now + 5, Some(&x.cert));
+    victim.announce(&x.agent, v2_wire(&beat)).await;
+    victim.identity_barrier().await;
+    assert_eq!(victim.cached_machine(&x.id()).await, Some(m3.machine_id()));
+    assert!(
+        victim.raw_frame_verified(x.id(), m3.machine_id()).await,
+        "the reinstalled machine's frames verify"
+    );
+    let with_m3 = crate::RawQuicTransport::Scripted(Arc::new(
+        crate::PinnedTransportScript::connected_only(&[m2, m3.machine_id()], false),
+    ));
+    assert_eq!(
+        victim.raw_target(x.id(), &with_m3).await,
+        Some(m3.machine_id())
+    );
+}
