@@ -2751,9 +2751,8 @@ impl InboxPipeline {
         } else {
             // Survivor re-key A14: on a leaf, the same ACK envelope also goes
             // on live Direct, through the bounded hedge publisher, so this loop
-            // never waits on it
-            // and a refused gossip frame no longer costs the sender its whole
-            // ACK budget. Direct send-ok is never a receipt: the sender's
+            // never waits on it and a refused gossip frame no longer costs the
+            // sender its whole ACK budget. Direct send-ok is never a receipt: the sender's
             // waiter completes only when the envelope itself arrives.
             if let Some(hedge) = self.v1_direct_hedge.as_ref() {
                 // A full queue drops the hedge; the gossip ACK still goes.
