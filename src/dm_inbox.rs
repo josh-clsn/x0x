@@ -138,8 +138,9 @@ pub(crate) struct AuthenticatedMachineBinding {
     /// certificate's expiry. Always `None` in the authenticated-binding store.
     pub(crate) cert_digest: Option<[u8; 32]>,
     /// ADR 0115: the record is the local user's card pin
-    /// (`Agent::pin_card_binding`), not a network-authenticated binding. Any
-    /// later write that replaces it clears the mark.
+    /// (`Agent::pin_card_binding`), not a network-authenticated binding. A
+    /// later write that replaces it with another machine clears the mark; a
+    /// refresh naming the same machine keeps it.
     pub(crate) local_pin: bool,
     last_used: (std::time::Instant, u64),
 }
@@ -301,11 +302,13 @@ impl AuthenticatedMachineBindingCache {
             if announced_at >= existing.announced_at {
                 self.by_machine.remove(&(existing.machine_id.0, agent_id.0));
                 self.by_machine.insert((machine_id.0, agent_id.0));
+                // A refresh naming the pinned machine keeps the pin mark;
+                // only a binding that moves the agent elsewhere clears it.
+                existing.local_pin &= existing.machine_id == machine_id;
                 existing.machine_id = machine_id;
                 existing.announced_at = announced_at;
                 existing.cert_not_after = cert_not_after;
                 existing.cert_digest = cert_digest;
-                existing.local_pin = false;
             }
             self.entries.insert(agent_id, existing);
             self.recency.insert((tick.0, tick.1, agent_id.0));

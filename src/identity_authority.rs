@@ -285,6 +285,17 @@ mod tests {
             Some(binding(new, 200, None, None)),
             || false
         ));
+        // A newer same-machine refresh (an attested DM from the pinned
+        // machine) keeps the mark; a newer binding elsewhere clears it.
+        let agent = AgentId([7; 32]);
+        let mut store = AuthenticatedMachineBindingCache::default();
+        store.record_local_pin(agent, new, 200);
+        store.record_announcement(agent, new, 210, None, None);
+        let refreshed = store.peek(&agent);
+        assert!(refreshed.is_some_and(|b| b.local_pin));
+        assert!(!confirms(old, announced, refreshed, || false));
+        store.record_announcement(agent, MachineId([3; 32]), 220, None, None);
+        assert!(store.peek(&agent).is_some_and(|b| !b.local_pin));
         // A later announcement for the pinned agent confirms its machine.
         let reinstalled = Some(binding(MachineId([3; 32]), 300, None, None));
         assert!(confirms(MachineId([3; 32]), reinstalled, newer_pin, || {

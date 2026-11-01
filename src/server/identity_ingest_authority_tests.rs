@@ -1849,6 +1849,23 @@ async fn adr0115_card_move_from_a_card_only_entry_forgets_the_old_machine() {
     if victim.cached_machine(&x.id()).await == Some(m2) {
         open.push("routing was reconciled back to the machine it left".to_string());
     }
+    if victim
+        .agent
+        .discovered_machine_for_testing(&m2)
+        .await
+        .is_some_and(|record| record.agent_ids.contains(&x.id()))
+    {
+        open.push("the machine cache still lists X on the machine it left".to_string());
+    }
+    if victim
+        .agent
+        .card_dial_leads
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains_key(&x.id())
+    {
+        open.push("a card lead outlived the move".to_string());
+    }
     assert_vector_closed("card move", &open);
 }
 
@@ -1931,6 +1948,30 @@ async fn adr0115_a_newer_local_pin_supersedes_the_announced_machine() {
         open.push("routing names the superseded machine".to_string());
     }
     assert_vector_closed("pin order", &open);
+
+    // I3: X, now on M1, sends an attested DM, which refreshes the binding
+    // for M1. The pin still supersedes M2.
+    crate::dm_inbox::record_authenticated_machine_binding(
+        &victim.agent.authenticated_machine_bindings,
+        x.id(),
+        m1,
+        now + 1,
+    )
+    .await;
+    let mut open = Vec::new();
+    if victim.raw_frame_verified(x.id(), m2).await {
+        open.push("after a same-machine refresh, M2's frames verify as X".to_string());
+    }
+    if victim.raw_target(x.id(), &only_m2).await == Some(m2) {
+        open.push("after a same-machine refresh, a raw send resolves M2".to_string());
+    }
+    if victim.pinned_machine(x.id()).await == Some(m2) {
+        open.push("after a same-machine refresh, the pinned selector picks M2".to_string());
+    }
+    if victim.cached_machine(&x.id()).await == Some(m2) {
+        open.push("after a same-machine refresh, routing names M2".to_string());
+    }
+    assert_vector_closed("pin refresh", &open);
 
     // X reinstalls on M3 and announces it: the new announcement wins.
     let m3 = MachineKeypair::generate().expect("X's next machine");
