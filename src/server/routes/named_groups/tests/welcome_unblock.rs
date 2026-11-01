@@ -1109,3 +1109,118 @@ async fn a_zombie_chunk_ack_ends_inside_its_budget() -> anyhow::Result<()> {
         .set_pinned_standin_strict_resolution_for_testing(false);
     Ok(())
 }
+
+/// Two loopback daemons for a real ChunkAck send: the joiner's state runs a
+/// network and gossip runtime, the owner a direct listener. The joiner
+/// holds the owner's class A record (the test seed) and a gossip-inbox
+/// capability advert, and is connected to it.
+async fn networked_joiner_and_owner(
+    dir: &std::path::Path,
+) -> anyhow::Result<(Arc<AppState>, Arc<Agent>)> {
+    let loopback = || x0x::network::NetworkConfig {
+        bind_addr: Some("127.0.0.1:0".parse().expect("loopback bind address")),
+        bootstrap_nodes: Vec::new(),
+        port_mapping_enabled: false,
+        mdns_enabled: false,
+        ..x0x::network::NetworkConfig::default()
+    };
+    let build = |name: &str| {
+        Agent::builder()
+            .with_machine_key(dir.join(format!("{name}-machine.key")))
+            .with_agent_key_path(dir.join(format!("{name}-agent.key")))
+            .with_contact_store_path(dir.join(format!("{name}-contacts.json")))
+            .with_peer_cache_disabled()
+            .with_network_config(loopback())
+            .build()
+    };
+    let joiner_dir = dir.join("joiner");
+    tokio::fs::create_dir_all(&joiner_dir).await?;
+    let joiner_agent = Arc::new(build("joiner").await?);
+    let owner = Arc::new(build("owner").await?);
+    owner.start_direct_listener();
+    let bound = owner
+        .network()
+        .context("owner network")?
+        .bound_addr()
+        .await
+        .context("owner bound")?;
+    let owner_addr = std::net::SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        bound.port(),
+    );
+    let now = now_millis_u64() / 1000;
+    joiner_agent
+        .insert_discovered_agent_for_testing(x0x::DiscoveredAgent {
+            self_name: None,
+            agent_id: owner.agent_id(),
+            machine_id: owner.machine_id(),
+            user_id: None,
+            addresses: vec![owner_addr],
+            announced_at: now,
+            last_seen: now,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: Some(true),
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: None,
+            agent_certificate: None,
+            agent_public_key: Vec::new(),
+            cert_digest: None,
+        })
+        .await;
+    let kem = x0x::groups::kem_envelope::AgentKemKeypair::generate()?;
+    assert!(joiner_agent.capability_store().insert(
+        owner.agent_id(),
+        owner.machine_id(),
+        x0x::dm::DmCapabilities::v1_gossip_ready(kem.public_bytes.clone()),
+        x0x::dm::now_unix_ms(),
+    ));
+    joiner_agent
+        .network()
+        .context("joiner network")?
+        .connect_addr(owner_addr)
+        .await?;
+    let joiner = secure_endpoint_test_state_at(&joiner_dir, joiner_agent).await?;
+    Ok((joiner, owner))
+}
+
+/// The ChunkAck budget bounds a real send over both legs: over a live
+/// connection, a raw zombie spends its window and the resend the second,
+/// then the publish-only gossip leg publishes (it succeeds and is never
+/// acked) and the send ends, before `WELCOME_CHUNK_ACK_BUDGET`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_zombie_chunk_ack_then_a_never_acked_publish_ends_inside_its_budget() -> anyhow::Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let (joiner, owner) = networked_joiner_and_owner(dir.path()).await?;
+    let owner_id = owner.agent_id();
+    assert!(joiner.agent.has_live_direct_connection(&owner_id).await);
+    let ack = WelcomeBlobMessage::ChunkAck {
+        welcome_id: hex::encode(rand::random::<[u8; 32]>()),
+        sequence: 0,
+    };
+    let window = welcome_blob_send_config(&ack, true)
+        .raw_quic_receive_ack_timeout
+        .expect("an ACKed raw leg");
+    joiner
+        .agent
+        .inject_zombie_ack_failures_for_testing(&[window, window]);
+
+    let started = tokio::time::Instant::now();
+    let path = std::sync::OnceLock::new();
+    let sent = send_welcome_chunk_ack(&joiner, &owner_id, &ack, &path).await;
+    let took = started.elapsed();
+    assert!(
+        took < WELCOME_CHUNK_ACK_BUDGET,
+        "the send ended inside its budget: {took:?} ({sent:?})"
+    );
+    assert_eq!(path.get().copied(), Some("raw_quic"));
+    assert!(sent.is_ok(), "the gossip leg published: {sent:?}");
+    assert_eq!(joiner.agent.zombie_resends_started_for_testing(), 1);
+    assert!(took >= window, "the raw leg ran first: {took:?}");
+    joiner.agent.inject_zombie_ack_failures_for_testing(&[]);
+    Ok(())
+}
