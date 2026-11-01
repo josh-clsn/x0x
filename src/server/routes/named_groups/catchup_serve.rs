@@ -17,8 +17,8 @@
 //!   proves. A request that proves no one is dropped here; the answer would
 //!   refuse it anyway. So a peer that claims another member's id cannot
 //!   touch that member's queue.
-//! - **Unverified requests are rate-limited per machine before the check**
-//!  : each QUIC-authenticated machine may have
+//! - **Unverified requests are rate-limited per machine before the check**:
+//!   each QUIC-authenticated machine may have
 //!   [`UNVERIFIED_BURST`] signatures checked at once, refilling at
 //!   [`UNVERIFIED_PER_SEC`] a second, so a flood cannot spend this daemon's
 //!   CPU on signature checks.

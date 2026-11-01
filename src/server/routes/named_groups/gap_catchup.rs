@@ -271,7 +271,10 @@ pub(super) fn spawn_follow_up(
                 Ok(true) => return,
                 Ok(false) => {}
                 Err(_) => {
-                    tracing::debug!(group_id = %LogHexId::group(&room), "paged TreeKEM catch-up request timed out");
+                    tracing::debug!(
+                        group_id = %LogHexId::group(&room),
+                        "paged TreeKEM catch-up request timed out"
+                    );
                     return;
                 }
             }
