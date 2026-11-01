@@ -11,12 +11,15 @@
 //! event's `actor` must be the verified signer of its commit: a member cannot
 //! carry another member's self-leave, or sign in another's name.
 //!
-//! A removal or ban that carries TreeKEM bytes is admitted only when its
-//! signed binding names those bytes. Upstream's self-leave seal does
-//! (`treekem:epoch=<n>:commit=<d>`); the admin removal (`treekem:epoch=<n>`)
-//! does not, so a deliverer could swap its bytes.
+//! An event that carries TreeKEM bytes is admitted only when its signed
+//! binding names those bytes (survivor re-key A1): a removal or ban its
+//! commit, an add or approval its commit and its extras. The legacy
+//! `treekem:epoch=<n>` names nothing, so a deliverer could swap its bytes.
 
-use super::{named_group_metadata_event_commit, treekem_commit_binding, NamedGroupMetadataEvent};
+use super::{
+    named_group_metadata_event_commit, parse_treekem_binding, removal_binding_names_bytes,
+    treekem_add_binding_admits, NamedGroupMetadataEvent,
+};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
 pub(super) const UNNAMED_BYTES_REASON: &str = "needs_verified_signer_and_named_tree_bytes";
@@ -73,7 +76,46 @@ fn removal_names_its_bytes(
             };
             named_group_metadata_event_commit(event)
                 .and_then(|commit| commit.security_binding.as_deref())
-                .is_some_and(|binding| binding == treekem_commit_binding(epoch, &bytes))
+                .and_then(parse_treekem_binding)
+                .is_some_and(|binding| removal_binding_names_bytes(&binding, epoch, &bytes))
+        }
+        _ => false,
+    }
+}
+
+/// Whether an add's or approval's signed binding names the TreeKEM commit
+/// and the extras it carries. An add with no TreeKEM bytes has none to swap.
+#[allow(clippy::too_many_arguments)]
+fn add_names_its_bytes(
+    event: &NamedGroupMetadataEvent,
+    commit_b64: Option<&String>,
+    epoch: Option<u64>,
+    display_name: Option<&str>,
+    key_package_hash: Option<&str>,
+    welcome_b64: Option<&str>,
+    welcome_ref: Option<&super::WelcomeRef>,
+) -> bool {
+    match (commit_b64, epoch) {
+        (None, None) => welcome_b64.is_none() && welcome_ref.is_none(),
+        (Some(commit_b64), Some(epoch)) => {
+            let Some(commit) = named_group_metadata_event_commit(event) else {
+                return false;
+            };
+            let names_bytes = commit
+                .security_binding
+                .as_deref()
+                .and_then(parse_treekem_binding)
+                .is_some_and(|binding| binding.commit.is_some());
+            names_bytes
+                && treekem_add_binding_admits(
+                    commit,
+                    epoch,
+                    commit_b64,
+                    display_name,
+                    key_package_hash,
+                    welcome_b64,
+                    welcome_ref,
+                )
         }
         _ => false,
     }
@@ -115,6 +157,45 @@ pub(super) fn apply_refusal(event: &NamedGroupMetadataEvent) -> Option<&'static 
         } if !removal_names_its_bytes(event, treekem_commit_b64.as_ref(), *treekem_epoch) => {
             Some(UNNAMED_BYTES_REASON)
         }
+        NamedGroupMetadataEvent::MemberAdded {
+            treekem_commit_b64,
+            treekem_epoch,
+            display_name,
+            treekem_key_package_hash,
+            treekem_welcome_b64,
+            welcome_ref,
+            ..
+        } if !add_names_its_bytes(
+            event,
+            treekem_commit_b64.as_ref(),
+            *treekem_epoch,
+            display_name.as_deref(),
+            treekem_key_package_hash.as_deref(),
+            treekem_welcome_b64.as_deref(),
+            welcome_ref.as_ref(),
+        ) =>
+        {
+            Some(UNNAMED_BYTES_REASON)
+        }
+        NamedGroupMetadataEvent::JoinRequestApproved {
+            treekem_commit_b64,
+            treekem_epoch,
+            treekem_key_package_hash,
+            treekem_welcome_b64,
+            welcome_ref,
+            ..
+        } if !add_names_its_bytes(
+            event,
+            treekem_commit_b64.as_ref(),
+            *treekem_epoch,
+            None,
+            treekem_key_package_hash.as_deref(),
+            treekem_welcome_b64.as_deref(),
+            welcome_ref.as_ref(),
+        ) =>
+        {
+            Some(UNNAMED_BYTES_REASON)
+        }
         _ => None,
     }
 }
@@ -123,6 +204,9 @@ pub(super) fn apply_refusal(event: &NamedGroupMetadataEvent) -> Option<&'static 
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+    use super::super::{
+        add_extras_digest, treekem_bytes_binding, treekem_commit_binding, WelcomeContent,
+    };
     use super::*;
 
     fn signer() -> crate::identity::AgentKeypair {
@@ -388,22 +472,15 @@ mod tests {
         );
     }
 
-    /// Batch 6 (A1/A3): an add's TreeKEM bytes are named by the signed add
-    /// binding, which upstream's binding does not do. Until that lands the
-    /// door admits an add on its commit alone, so a deliverer could swap the
-    /// Welcome. This must pass when the add binding does.
-    #[test]
-    #[ignore = "batch 6: the add binding that names Welcome bytes arrives with A1/A3"]
-    fn batch6_an_add_whose_binding_does_not_name_its_welcome_is_refused() {
-        let kp = signer();
-        let event = NamedGroupMetadataEvent::MemberAdded {
+    fn add(kp: &crate::identity::AgentKeypair, binding: String) -> NamedGroupMetadataEvent {
+        NamedGroupMetadataEvent::MemberAdded {
             group_id: "g".into(),
             revision: 2,
-            actor: hex_id(&kp),
+            actor: hex_id(kp),
             agent_id: "bb".into(),
             display_name: None,
             treekem_commit_b64: Some(BASE64.encode(b"commit")),
-            treekem_welcome_b64: Some(BASE64.encode(b"swapped welcome")),
+            treekem_welcome_b64: Some(BASE64.encode(b"welcome")),
             welcome_ref: None,
             treekem_epoch: Some(2),
             treekem_key_package_hash: None,
@@ -412,8 +489,54 @@ mod tests {
             certificate_b64: None,
             owner_mandate: None,
             roster_certificates_b64: Vec::new(),
-            commit: Some(commit(&kp, Some("treekem:epoch=2".into()))),
-        };
+            commit: Some(commit(kp, Some(binding))),
+        }
+    }
+
+    fn named_add_binding(welcome: &[u8]) -> String {
+        let extras = add_extras_digest(None, None, Some(&WelcomeContent::of_bytes(welcome)))
+            .expect("extras");
+        treekem_bytes_binding(2, b"commit", &extras)
+    }
+
+    #[test]
+    fn an_add_whose_binding_names_nothing_is_refused() {
+        let kp = signer();
+        let event = add(&kp, "treekem:epoch=2".into());
         assert_eq!(apply_refusal(&event), Some(UNNAMED_BYTES_REASON));
+    }
+
+    #[test]
+    fn an_add_whose_binding_names_another_welcome_is_refused() {
+        let kp = signer();
+        let event = add(&kp, named_add_binding(b"another welcome"));
+        assert_eq!(apply_refusal(&event), Some(UNNAMED_BYTES_REASON));
+    }
+
+    #[test]
+    fn an_add_whose_binding_names_its_bytes_is_admitted() {
+        let kp = signer();
+        let event = add(&kp, named_add_binding(b"welcome"));
+        assert_eq!(apply_refusal(&event), None);
+    }
+
+    #[test]
+    fn a_ban_whose_binding_names_its_bytes_is_admitted() {
+        let kp = signer();
+        let bytes = b"bytes";
+        let event = NamedGroupMetadataEvent::MemberBanned {
+            group_id: "g".into(),
+            revision: 2,
+            actor: hex_id(&kp),
+            agent_id: "bb".into(),
+            secret_epoch: None,
+            treekem_commit_b64: Some(BASE64.encode(bytes)),
+            treekem_epoch: Some(3),
+            commit: Some(commit(
+                &kp,
+                super::super::treekem_ban_bytes_binding(3, bytes),
+            )),
+        };
+        assert_eq!(apply_refusal(&event), None);
     }
 }

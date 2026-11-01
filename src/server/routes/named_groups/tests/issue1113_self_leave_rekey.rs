@@ -1837,30 +1837,51 @@ async fn group_is_quarantined(state: &AppState, group_id: &str) -> bool {
     groups.get(group_id).expect("group").is_fork_quarantined()
 }
 
-/// The admin remove route still seals `treekem:epoch=N`. A third party
+/// The admin's removal of the leaver as a daemon that seals the legacy
+/// `treekem:epoch=<n>` binding makes it (stock 0.48.1's admin removal). The
+/// fork's admin route names the TreeKEM bytes (survivor re-key A1).
+async fn legacy_bound_removal(fixture: &LeaveFixture) -> Result<NamedGroupMetadataEvent> {
+    let state = &fixture.state;
+    let admin_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let member_hex = hex::encode(fixture.member_id.as_bytes());
+    let mut next = {
+        let groups = state.named_groups.read().await;
+        groups.get(&fixture.group_id).cloned().expect("group")
+    };
+    let group = live_treekem_group(state, &fixture.group_id).await;
+    let mut guard = group.lock().await;
+    let treekem_commit = guard.remove_member(fixture.member_id)?;
+    let treekem_epoch = guard.epoch();
+    drop(guard);
+    next.roster_revision = next.roster_revision.saturating_add(1);
+    let revision = next.roster_revision;
+    next.remove_member(&member_hex, Some(admin_hex.clone()));
+    next.secret_epoch = treekem_epoch;
+    next.security_binding = Some(format!("treekem:epoch={treekem_epoch}"));
+    let commit = next.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(fixture.group_id.clone(), next);
+    Ok(NamedGroupMetadataEvent::MemberRemoved {
+        group_id: fixture.group_id.clone(),
+        revision,
+        actor: admin_hex,
+        agent_id: member_hex,
+        treekem_commit_b64: Some(base64::engine::general_purpose::STANDARD.encode(treekem_commit)),
+        treekem_epoch: Some(treekem_epoch),
+        secret_epoch: None,
+        commit: Some(commit),
+    })
+}
+
+/// A removal sealed under `treekem:epoch=N`. A third party
 /// cannot relay those bytes, substituted or genuine. The author can.
 #[tokio::test]
 async fn catchup_legacy_binding_stays_with_the_author() -> Result<()> {
     let mut cast = catchup_relay_fixture().await?;
-    let member_hex = hex::encode(cast.fixture.member_id.as_bytes());
-    cast.fixture
-        .state
-        .named_group_test_recorders
-        .metadata_publish_force_ok
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    let response = remove_named_group_member(
-        State(Arc::clone(&cast.fixture.state)),
-        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
-        Path((cast.fixture.group_id.clone(), member_hex)),
-    )
-    .await
-    .into_response();
-    assert_eq!(
-        response.status(),
-        StatusCode::OK,
-        "the admin remove route must seal"
-    );
-    let genuine = published_removal_event(&cast.fixture.state).expect("legacy removal");
+    let genuine = legacy_bound_removal(&cast.fixture).await?;
     let binding = named_group_metadata_event_commit(&genuine)
         .expect("signed commit")
         .security_binding
@@ -1868,7 +1889,7 @@ async fn catchup_legacy_binding_stays_with_the_author() -> Result<()> {
         .expect("legacy binding");
     assert!(
         binding.starts_with("treekem:epoch=") && !binding.contains(":commit="),
-        "the admin remove route must keep the legacy binding, got {binding}"
+        "setup: the fixture seals the legacy binding, got {binding}"
     );
     let substituted = swap_treekem_commit(&genuine, &cast.attacker_commit);
     deliver_catchup(

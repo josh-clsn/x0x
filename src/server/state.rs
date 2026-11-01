@@ -1579,6 +1579,9 @@ pub(super) struct NamedGroupTestRecorders {
     pub(super) catchup_page_force_ok: std::sync::atomic::AtomicBool,
     /// Pages `handle_treekem_catchup_request` built, including a cold log.
     pub(super) catchup_responses: StdMutex<Vec<Vec<u8>>>,
+    /// Survivor re-key A1: the next `seal_commit_owner_certified` fails, so
+    /// a test can check the tree is rolled back after a mutate-then-seal.
+    pub(super) seal_force_err: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
