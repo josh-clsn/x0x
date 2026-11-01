@@ -38,6 +38,13 @@ use tokio::time::Instant;
 /// How long after a round opens its proofs are recorded.
 pub(in crate::server) const HEAD_ROUND_DEADLINE: Duration = Duration::from_secs(60);
 
+/// The least time between two rounds a room's trigger route opens. One
+/// proof can make the engine name up to 511 agents (its anchored closure
+/// grows from proofs' admin lists), and each round sends every one of them
+/// a signed request naming this member and the room, so the trigger must
+/// not let that repeat faster than this (A7 review m-5).
+pub(in crate::server) const ROUND_MIN_GAP: Duration = Duration::from_secs(5);
+
 /// The most distinct heads kept per signer in one round.
 pub(in crate::server) const HEADS_PER_SIGNER: usize = 4;
 
@@ -116,10 +123,11 @@ struct HeadRound {
 
 /// What [`round_view`] reports about a room's open round.
 #[derive(Debug, Clone)]
-#[cfg_attr(not(test), allow(dead_code))] // A7's GET reports it.
 pub(in crate::server) struct RoundView {
     pub(in crate::server) nonce: String,
-    /// On the process monotonic clock: not a freshness age.
+    /// On the process monotonic clock: not a freshness age, and never
+    /// reported (A7's GET leaves it out).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::server) opened_at: Instant,
     pub(in crate::server) asked: BTreeSet<String>,
     /// Every distinct head recorded, by signer, each from a proof that
@@ -136,6 +144,30 @@ pub(in crate::server) struct HeadRounds {
 }
 
 impl HeadRounds {
+    /// Whether a round opened in `key` less than `min_gap` before `now`.
+    fn opened_within(&self, key: &str, now: Instant, min_gap: Duration) -> bool {
+        self.rounds
+            .get(key)
+            .is_some_and(|round| now.saturating_duration_since(round.opened_at) < min_gap)
+    }
+
+    /// Open a round in `key`, replacing any open one and its proofs, unless
+    /// one opened less than `min_gap` ago. Returns whether it opened.
+    fn try_open_round(
+        &mut self,
+        key: &str,
+        nonce: String,
+        asked: BTreeSet<String>,
+        now: Instant,
+        min_gap: Duration,
+    ) -> bool {
+        if self.opened_within(key, now, min_gap) {
+            return false;
+        }
+        self.open_round(key, nonce, asked, now);
+        true
+    }
+
     /// Open a round in `key`, replacing any open one and its proofs.
     fn open_round(&mut self, key: &str, nonce: String, asked: BTreeSet<String>, now: Instant) {
         self.rounds.insert(
@@ -229,31 +261,65 @@ pub(in crate::server) fn challenge_set(
 
 /// The round [`challenge_admins`] opened.
 #[derive(Debug, Clone)]
-#[cfg_attr(not(test), allow(dead_code))] // A7's trigger reports it.
 pub(in crate::server) struct OpenedRound {
     pub(in crate::server) nonce: String,
     pub(in crate::server) asked: BTreeSet<String>,
+    /// This member's signed page request carrying the round's challenge,
+    /// as every asked agent was sent it. The engine can carry it to an
+    /// admin over another path (the relay), whose daemon answers it
+    /// through A7's sign route.
+    pub(in crate::server) request: super::TreeKemCatchupRequest,
+}
+
+/// Why [`challenge_admins`] opened no round. Every one holds the room: no
+/// caller may fall back to a smaller set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::server) enum NoRound {
+    /// No such room here, or it is withdrawn.
+    NoRoom,
+    /// This member is not active in the room.
+    NotActive,
+    /// The named agents and the roster admins together are more than
+    /// [`HEAD_PROOF_MAX_ADMINS`].
+    SetTooLarge,
+    /// The challenge counter could not be kept, or is used up.
+    NoCounter,
+    /// This member's page request could not be signed: every admin would
+    /// refuse it.
+    NoSignature,
+    /// A round opened in this room less than the caller's minimum gap ago.
+    /// That round stays open.
+    TooSoon,
 }
 
 /// Open a round in `group_id` for the [`challenge_set`], and build this
-/// member's signed page request carrying its new challenge. `None`, and no
-/// round, when this member is not active in the room or the set is too
-/// large.
+/// member's signed page request carrying its new challenge. No round, and
+/// a reason, when this member is not active in the room, the set is too
+/// large, no counter can be kept, the request cannot be signed, or a round
+/// opened less than `min_gap` ago (the trigger route passes
+/// [`ROUND_MIN_GAP`]).
 async fn open_challenge_round(
     state: &Arc<AppState>,
     group_id: &str,
     named: &[String],
-) -> Option<(OpenedRound, super::TreeKemCatchupRequest)> {
+    min_gap: Duration,
+) -> Result<OpenedRound, NoRound> {
     let me = hex::encode(state.agent.agent_id().as_bytes());
     let (key, roster_admins) = {
         let groups = state.named_groups.read().await;
-        let (key, info) = groups.get_key_value(group_id).or_else(|| {
-            groups
-                .iter()
-                .find(|(_, info)| info.stable_group_id() == group_id)
-        })?;
-        if info.withdrawn || !info.has_active_member(&me) {
-            return None;
+        let (key, info) = groups
+            .get_key_value(group_id)
+            .or_else(|| {
+                groups
+                    .iter()
+                    .find(|(_, info)| info.stable_group_id() == group_id)
+            })
+            .ok_or(NoRound::NoRoom)?;
+        if info.withdrawn {
+            return Err(NoRound::NoRoom);
+        }
+        if !info.has_active_member(&me) {
+            return Err(NoRound::NotActive);
         }
         let admins: Vec<String> = info
             .active_members()
@@ -269,8 +335,17 @@ async fn open_challenge_round(
             roster_admins = roster_admins.len(),
             "TreeKEM head: more agents to challenge than a round holds; no round opened, the room holds"
         );
-        return None;
+        return Err(NoRound::SetTooLarge);
     };
+    // Checked before a counter is spent, and again when the round opens.
+    let too_soon = state
+        .treekem_head_rounds
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .opened_within(&key, Instant::now(), min_gap);
+    if too_soon {
+        return Err(NoRound::TooSoon);
+    }
     let counter = state
         .treekem_head_counter
         .lock()
@@ -282,45 +357,62 @@ async fn open_challenge_round(
             group_id = %LogHexId::group(&key),
             "TreeKEM head: no challenge counter; no round opened, the room holds"
         );
-        return None;
+        return Err(NoRound::NoCounter);
     };
     let nonce = challenge_nonce(counter);
-    let mut request = signed_catchup::page_request(state, &key, None).await?;
+    let mut request = signed_catchup::page_request(state, &key, None)
+        .await
+        .ok_or(NoRound::NoRoom)?;
     request.head_challenge = Some(nonce.clone());
     signed_catchup::sign_page_request(state, &mut request);
-    state
+    if request.signed_by.is_none() {
+        tracing::warn!(
+            group_id = %LogHexId::group(&key),
+            "TreeKEM head: the challenge could not be signed; no round opened, the room holds"
+        );
+        return Err(NoRound::NoSignature);
+    }
+    let opened = state
         .treekem_head_rounds
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .open_round(&key, nonce.clone(), asked.clone(), Instant::now());
+        .try_open_round(&key, nonce.clone(), asked.clone(), Instant::now(), min_gap);
+    if !opened {
+        return Err(NoRound::TooSoon);
+    }
     tracing::info!(
         group_id = %LogHexId::group(&key),
         asked = asked.len(),
         "TreeKEM head: challenging the room's admins"
     );
-    Some((OpenedRound { nonce, asked }, request))
+    Ok(OpenedRound {
+        nonce,
+        asked,
+        request,
+    })
 }
 
 /// Open a round in `group_id` and send each agent of the
 /// [`challenge_set`] this member's signed page request carrying the round's
 /// new challenge. The sends run in the detached-task registry.
-#[cfg_attr(not(test), allow(dead_code))] // A7's trigger route calls it.
 pub(in crate::server) async fn challenge_admins(
     state: &Arc<AppState>,
     group_id: &str,
     named: &[String],
-) -> Option<OpenedRound> {
-    let (opened, request) = open_challenge_round(state, group_id, named).await?;
+    min_gap: Duration,
+) -> Result<OpenedRound, NoRound> {
+    let opened = open_challenge_round(state, group_id, named, min_gap).await?;
     let task_state = Arc::clone(state);
     let peers: Vec<_> = opened
         .asked
         .iter()
         .filter_map(|agent| parse_agent_id_hex(agent).ok())
         .collect();
+    let sent = opened.request.clone();
     let _ = state.spawn_detached(async move {
         let state = &task_state;
         let _sent = futures::future::join_all(peers.into_iter().map(|peer| {
-            let request = request.clone();
+            let request = sent.clone();
             async move {
                 if let Err(e) = signed_catchup::send_page_request(state, &peer, request).await {
                     tracing::debug!(peer = %LogHexId::agent(&hex::encode(peer.as_bytes())), "head challenge failed: {e}");
@@ -329,7 +421,7 @@ pub(in crate::server) async fn challenge_admins(
         }))
         .await;
     });
-    Some(opened)
+    Ok(opened)
 }
 
 /// The signed page request a #1406 startup ask sends an admin: it carries
@@ -347,7 +439,12 @@ pub(in crate::server) async fn startup_admin_request(
         .map(|round| round.nonce);
     let nonce = match open {
         Some(nonce) => nonce,
-        None => open_challenge_round(state, group_key, &[]).await?.0.nonce,
+        None => {
+            open_challenge_round(state, group_key, &[], Duration::ZERO)
+                .await
+                .ok()?
+                .nonce
+        }
     };
     let mut request = signed_catchup::page_request(state, group_key, None).await?;
     request.head_challenge = Some(nonce);
@@ -409,6 +506,18 @@ pub(in crate::server) async fn record_proof(
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .record(&key, &stable_group_id, &me, proof, Instant::now())
+}
+
+/// Close the open round in `group_id` (a room key), if any, with its
+/// proofs. A trigger that opens no round closes the last one, so nothing
+/// reports a round asked of a smaller set than the engine named (A7 review
+/// m-6).
+pub(in crate::server) fn close_round(state: &AppState, group_id: &str) {
+    state
+        .treekem_head_rounds
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .wipe(group_id);
 }
 
 /// The open round in `group_id` (a room key), with its recorded proofs.
@@ -570,6 +679,28 @@ mod tests {
         );
         book.wipe("k");
         assert!(book.rounds.is_empty());
+    }
+
+    #[test]
+    fn a_room_opens_at_most_one_round_per_gap() {
+        let now = Instant::now();
+        let mut book = HeadRounds::default();
+        let asked = BTreeSet::from(["a".repeat(64)]);
+        assert!(book.try_open_round("k", "n1".into(), asked.clone(), now, ROUND_MIN_GAP));
+        assert!(!book.try_open_round(
+            "k",
+            "n2".into(),
+            asked.clone(),
+            now + ROUND_MIN_GAP / 2,
+            ROUND_MIN_GAP
+        ));
+        assert_eq!(book.rounds["k"].nonce, "n1", "the open round stays");
+        assert!(
+            book.try_open_round("j", "m1".into(), asked.clone(), now, ROUND_MIN_GAP),
+            "per room"
+        );
+        assert!(book.try_open_round("k", "n3".into(), asked, now + ROUND_MIN_GAP, ROUND_MIN_GAP));
+        assert_eq!(book.rounds["k"].nonce, "n3");
     }
 
     #[test]

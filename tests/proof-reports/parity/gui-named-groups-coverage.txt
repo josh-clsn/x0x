@@ -1,4 +1,4 @@
-# GUI named-groups parity report — 44 endpoints total
+# GUI named-groups parity report — 48 endpoints total
   WIRED     POST /groups
   WIRED     GET /groups
   WIRED     GET /groups/:id
@@ -27,6 +27,10 @@
   DEFERRED  POST /groups/:id/apply-metadata-event  // engine-A control plane; client apps bridge events, not a browser action
   DEFERRED  GET /groups/:id/join-result/:member  // engine-A control plane; client apps poll staged join-results, not a browser action
   DEFERRED  POST /groups/:id/join-result/:member  // engine-A control plane; client apps push bridged join-results, not a browser action
+  DEFERRED  POST /groups/:id/treekem/catch-up  // survivor re-key control plane; the engine opens head rounds, not a browser action
+  DEFERRED  GET /groups/:id/treekem/catch-up  // survivor re-key control plane; the engine reads the head and round, not a browser action
+  DEFERRED  POST /groups/:id/treekem/head-proof  // survivor re-key control plane; an admin's engine signs relayed challenges, not a browser action
+  DEFERRED  POST /groups/:id/treekem/head-proof/accept  // survivor re-key control plane; the engine records relayed proofs, not a browser action
   WIRED     GET /groups/:id/requests
   WIRED     POST /groups/:id/requests
   WIRED     POST /groups/:id/requests/:request_id/approve
@@ -44,4 +48,4 @@
   DEFERRED  POST /groups/:id/secure/reseal  // secure-plane primitive; server-side rekey on approve/ban
   DEFERRED  POST /groups/secure/open-envelope  // adversarial test endpoint, not a user-facing action
 
-Coverage: 25/44 wired; 19 deferred; 0 missing
+Coverage: 25/48 wired; 23 deferred; 0 missing

@@ -101,18 +101,19 @@ use routes::{
     spawn_directory_resubscribe, spawn_global_discovery_listener,
     spawn_global_public_message_listener, spawn_listed_to_contacts_listener,
     state_sync_diagnostics, status, store_named_group_info, streams_diagnostics, subscribe,
-    transport_diagnostics, unban_group_member, unenroll_device, unpin_machine, unsubscribe,
-    update_contact, update_group_policy, update_member_role, update_named_group, update_profile,
-    update_task, withdraw_group_state, AtomicWriteOutcome, ControlBlobMessage, ControlBlobState,
-    JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent, PendingListenerAdmission,
-    PredecessorRelayObligation, PublicGroupBootstrap, SelfPublishedReleaseManifests,
-    StartupUpdateCheckRuntime, TreeKemCatchupRequest, TreeKemCatchupResponse,
-    CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
-    DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
-    GROUP_PREDECESSOR_RELAY_DM_PREFIX, GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE,
-    KV_STORE_DELTA_DM_PREFIX,
+    transport_diagnostics, treekem_catch_up_state, treekem_catch_up_trigger,
+    treekem_head_proof_accept, treekem_head_proof_sign, unban_group_member, unenroll_device,
+    unpin_machine, unsubscribe, update_contact, update_group_policy, update_member_role,
+    update_named_group, update_profile, update_task, withdraw_group_state, AtomicWriteOutcome,
+    ControlBlobMessage, ControlBlobState, JoinResultMessage, KvStoreDirectDelta,
+    NamedGroupMetadataEvent, PendingListenerAdmission, PredecessorRelayObligation,
+    PublicGroupBootstrap, SelfPublishedReleaseManifests, StartupUpdateCheckRuntime,
+    TreeKemCatchupRequest, TreeKemCatchupResponse, CAUSAL_ENVELOPE_MAX_BYTES,
+    CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
+    CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
+    DIRECTORY_RESUBSCRIBE_JITTER_MS, GROUP_PREDECESSOR_RELAY_DM_PREFIX,
+    GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE, KV_STORE_DELTA_DM_PREFIX,
 };
 use sse::{direct_events_sse, events_sse, peer_events_handler, presence_events, SseEvent};
 pub use state::{
@@ -1356,6 +1357,7 @@ pub async fn serve_with_options(
         api_address: actual_api_addr,
         data_dir: config.data_dir.clone(),
         start_time: Instant::now(),
+        started_at_ms: now_millis_u64(),
         health_snapshot: Arc::new(routes::status::HealthSnapshot::default()),
         broadcast_tx,
         calls: routes::calls::new_registry(),
@@ -2818,6 +2820,19 @@ pub async fn serve_with_options(
         .route(
             "/groups/:id/join-result/:member",
             get(get_join_result_inline).post(apply_join_result_endpoint),
+        )
+        // Survivor re-key A7: ask a room's admins where its key stands.
+        .route(
+            "/groups/:id/treekem/catch-up",
+            get(treekem_catch_up_state).post(treekem_catch_up_trigger),
+        )
+        .route(
+            "/groups/:id/treekem/head-proof",
+            post(treekem_head_proof_sign),
+        )
+        .route(
+            "/groups/:id/treekem/head-proof/accept",
+            post(treekem_head_proof_accept),
         )
         .route(
             "/groups/:id/members/:agent_id",

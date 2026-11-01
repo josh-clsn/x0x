@@ -7,11 +7,16 @@
 //! server decomposition. The router registrations stay in the parent module.
 
 mod catchup_page_gap;
+mod catchup_routes;
 mod committer_leaf;
 mod control_blob;
 mod direct_metadata_lanes;
 mod event_log_store;
 pub(in crate::server) use catchup_page_gap::GapAsks;
+pub(in crate::server) use catchup_routes::{
+    treekem_catch_up_state, treekem_catch_up_trigger, treekem_head_proof_accept,
+    treekem_head_proof_sign,
+};
 pub(in crate::server) use committer_leaf::PackageRepulls;
 use event_log_store::{
     commit_bearing_event_frontier, commit_bearing_event_sort_key, remember_commit_bearing_event,
@@ -49405,6 +49410,7 @@ pub(in crate::server) mod tests {
     mod adr0107_stuck_join_rearm;
     mod batch3_carries;
     mod cache_hardening_followup;
+    mod catchup_routes;
     mod committer_leaf;
     mod engine_a_apply_gate;
     mod engine_a_doors;
@@ -49447,6 +49453,7 @@ pub(in crate::server) mod tests {
     mod sec377_dm_verified_gate;
     mod signed_catchup;
     mod signer_delivery;
+    mod survivor_task_shutdown;
     mod treekem_bytes_binding;
     #[path = "issue1224_unsigned_group_card.rs"]
     mod unsigned_group_card_1224;
@@ -50272,6 +50279,7 @@ pub(in crate::server) mod tests {
             api_address: "127.0.0.1:0".parse().expect("valid test API address"),
             data_dir: data_dir.to_path_buf(),
             start_time: Instant::now(),
+            started_at_ms: now_millis_u64(),
             health_snapshot: Arc::new(crate::server::routes::status::HealthSnapshot::default()),
             broadcast_tx,
             calls: crate::server::routes::calls::new_registry(),

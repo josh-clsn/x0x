@@ -61,7 +61,7 @@ A challenge (`head_proof::challenge_nonce`) is the requester's counter as 16 low
 
 ### Who signs, what, and when
 
-`head_proof::answer_challenge(state, challenge)`. The page serve calls it, and A7's sign route will too. **`challenge` is a `SignedChallenge`, which can only be built from a page request whose signature verifies for its requester** (`SignedChallenge::from_request`, A5's signature over the group, the requester, the head and the challenge), whatever the transport. So only the requester itself can move its floor at an admin: neither a relay nor anyone who reaches a route can push an all-`f` counter in its name (A6 re-review N-2).
+`head_proof::answer_challenge(state, challenge)`. The page serve calls it, and so does A7's sign route. **`challenge` is a `SignedChallenge`, which can only be built from a page request whose signature verifies for its requester** (`SignedChallenge::from_request`, A5's signature over the group, the requester, the head and the challenge), whatever the transport. So only the requester itself can move its floor at an admin: neither a relay nor anyone who reaches a route can push an all-`f` counter in its name (A6 re-review N-2).
 
 1. The challenge must carry a counter (`BadChallenge`).
 2. The requester must be active on this daemon's roster. A removed or banned member, or one this daemon never knew, gets nothing (`RequesterNotActive`; A7 maps it to 403).
@@ -90,7 +90,38 @@ A challenge (`head_proof::challenge_nonce`) is the requester's counter as 16 low
 
 The claimed sender of the response plays no part. **Every distinct head (epoch, authenticator) a signer signs in a round is kept**, a duplicate once, at most four (a later epoch replaces the lowest when full), and a signer with more than one is reported as `conflicted` (A6 review I-2). A signer can show two heads in one round only by signing again after it forgot the challenge, or by equivocating, and the arrival order is not ordered: keeping every head lets C3 apply "a conflict always wins" whatever the order. **For C3: a conflicted signer counts as Behind and never as a match** (rule 1 applies to every kept head, and a conflicted signer never satisfies rule 3, even when its heads share the highest epoch). C3 must not reduce `RoundView::heads` to one head per signer. A head is kept as its claim once its proof verified, not the 7 KB signature (m-r2): the worst case is 512 signers × 4 heads × a claim naming at most 512 admins. A response that carried only a proof stops there. A room wipe drops the room's round and its answer records.
 
-**The round deadline is not a freshness age** (m-4). It runs on `tokio::time::Instant` (the process monotonic clock), which stops while a device sleeps, so a proof queued during a long sleep can still be recorded after resume. The proof is still fresh relative to the challenge. A7's GET must not report `opened_at` as an age, and C3 measures the 60 s round deadline and the time to live from the round's opening on the sleep-inclusive clock (C2).
+**The round deadline is not a freshness age** (m-4). It runs on `tokio::time::Instant` (the process monotonic clock), which stops while a device sleeps, so a proof queued during a long sleep can still be recorded after resume. The proof is still fresh relative to the challenge. A7's GET does not report `opened_at` at all, and C3 measures the 60 s round deadline and the time to live from the round's opening on the sleep-inclusive clock (C2).
+
+### The routes (A7)
+
+`named_groups/catchup_routes.rs`. Each route has a `GROUP_PLANE_ROUTES` row and takes the #1166 `GroupAccess` extractor: unknown group 404, then the route's core, then a withdrawn room 409. The handler re-runs the core on its own read.
+
+**ADR-0066: all four are `ControlPlane`.** They open a catch-up round, read the head, sign a proof or record one. None seals content or changes the roster, and sealing stays gated on the send path (rows 1, 2, 4 and 6). Refusing them in a quarantined room would stop the catch-up and the evidence that resolve the fork. So they run there, and the GET says the room is quarantined (`fork_quarantined`).
+
+**Every non-2xx answer is a hold.** A refusal the handlers produce carries `reason` and `retry`. The admission refusals (404, 403, 409 withdrawn) and axum's extractor rejections (400/422, plain text) carry neither, and are holds too. The `retry` hint says what can succeed next:
+- `later`: the **same request** may succeed if sent again later;
+- `new_round`: this request is spent and never succeeds, but a **new round** (the requester's next trigger, a fresh challenge) may;
+- `never`: nothing helps until something about the room changes (a member, a role, the plane), or the request is malformed.
+
+`not_a_treekem_room` carries the same hint on every route: `later` on the TreeKEM plane (a tree not installed yet: a Welcome pending, a re-join in flight), `never` on another plane.
+
+| Route | Access | Answer |
+|---|---|---|
+| `POST /groups/:id/treekem/catch-up` `{"observed_epoch"?, "challenge"?: [hex…]}` | `OwnerDurable` (auth middleware and core) | `202 {"round", "asked", "request", "catching_up"}`. `request` is this member's signed page request carrying the challenge, for the engine to carry to an admin over the relay. No round: `{"round": null, "asked": [], "hold": true}` with one of: `400 bad_challenge_agent` (never), `409 not_a_treekem_room`, `409 challenge_set_too_large` (never), `409 not_an_active_member` (never), `404 group_not_found` (never), `503 no_challenge_counter` (later), `503 challenge_not_signed` (later), `429 round_too_soon` (later). It never opens a smaller round. Every refusal except `round_too_soon` also closes the room's previous round, so the GET never reports a round asked of fewer agents than the engine named. A room opens at most one round per `ROUND_MIN_GAP` (5 s): one proof can make the engine name up to 511 agents, and each round sends each of them a signed request naming the member and the room. |
+| `GET /groups/:id/treekem/catch-up?since_revision=<r>[&since_state_hash=<h>]` | `Member(Active)`: this daemon's own active seat, whoever the bearer; riders 403 | `200 {"group_id", "epoch", "epoch_authenticator", "security_binding", "revision", "state_hash", "admins", "admins_since", "admins_since_complete", "admins_since_too_large", "fork_quarantined", "fork_quarantine", "started_at_ms", "connected_admins", "suspended_since_last_get", "round"}`. Refusals: `409 not_a_treekem_room`; `503 unavailable` (later) when the roster keeps moving across three reads. |
+| `POST /groups/:id/treekem/head-proof` `{"request": <signed page request>}` | `OwnerDurable` | `200 {"proof"}`. Refusals: `400` `no_challenge`, `challenge_not_signed`, `bad_challenge`, `group_mismatch` (never); `403 requester_not_active` (never); `409` `not_an_admin`, `stale_challenge` (never); `409 not_a_treekem_room`; `429 rate_limited` (new_round), `429 repeat_too_soon` (later); `503 unavailable` (new_round). |
+| `POST /groups/:id/treekem/head-proof/accept` `{"proof"}` | `OwnerDurable` | `200 {"recorded": true}`, or `{"recorded": false, "reason"}`: `no_round`, `other_nonce`, `late`, `not_for_this_round`, `not_asked`, `bad_signature` |
+
+- **The sign route takes only the requester's signed page request,** exactly as received, and builds the challenge through `SignedChallenge::from_request`. A bare `{requester, nonce, requester_epoch}` cannot reach `answer_challenge` (N-2). The route is the relay leg: over x0x the daemon answers a challenge itself, but a challenge the relay carries reaches the admin's engine, which hands it to its daemon here (Task C4).
+- **Why `rate_limited` and `unavailable` are `new_round`.** A limited challenge still becomes the latest, so a resend of it is refused as stale. Every `unavailable` comes after the challenge was charged: the roster kept moving, signing failed, or the room went away mid-answer. `answer_fresh` now reports a room that vanished after the charge as `Unavailable`, so `NoRoom` always means "before the charge", and `later`.
+- **`admins_since`** lists the admins of every state applied after the anchor, oldest first, from the room's retained commits (`GroupInfo::commit_log`, #111). Every commit this daemon seals or applies is retained there with its roster, at one chokepoint, and kept on disk with the roster. A4's catch-up log holds events whose signed commits carry only a roster root, so it cannot name a state's admins.
+  - `admins_since_complete` is false unless nothing after the anchor can be missing: the first retained state after it links by signed `prev_state_hash` to the retained state at or before it (or, with none retained, is the anchor's revision plus one, since revisions only grow); each later state links to the one before; every signed roster root re-derives; and the last state is the live roster.
+  - **With `since_state_hash`, the anchor must also be that very state:** the retained base's hash, or the first state's `prev_state_hash`, or the live hash when nothing was applied since. So an anchor from another chain at the same revision is a hold. The GET reports `state_hash` for the engine to keep.
+  - When the states name more than 512 distinct admins, `admins_since` is `[]`, complete is false and `admins_since_too_large` is true. The trigger could not open a round for them anyway. It is computed once per read attempt; the second roster read compares only the revision and hash.
+  - Any of these is a hold.
+- **`fork_quarantined`** is read under the same roster read as the revision. When it is true, `fork_quarantine` is `{"revision", "no_anchor"}`: the marker's wire fields only, as the WS annotation copies them. Every seal is refused while it holds, so the engine holds, with the "needs a new invite" wording.
+- **`started_at_ms`** is an opaque marker of the daemon run; it changes on a restart. The round reports no opening time: the round deadline runs on a clock that stops in a sleep (m-4), so the engine times a round on its own sleep-inclusive clock (C2) from when it triggered it.
+- **`connected_admins` and `suspended_since_last_get`** are Task A8's. Until A8 lands they fail closed: `[]` and `true`.
 
 ### Test knob
 
@@ -106,7 +137,7 @@ The claimed sender of the response plays no part. **Every distinct head (epoch, 
 - A requester can make an admin sign at most 12 proofs a minute per room, and only with challenges of its own that rise, and re-send a cached proof at most once per 5 s. Each answer costs a roster read, a tree lock and one signature; a challenge from ahead also costs at most one catch-up task per room (#1427's bound). `HeadAnswers` keeps one record per (room, active requester) that ever challenged, dropped with the room.
 - Each challenge is a page request (about 7 KB, A5), and each proof adds about 7 KB of base64 key and signature to a response.
 - Older daemons ignore `head_challenge` and `head_proof`, so a room is confirmed only through admins at A6 or later. That fits the B1 flag day.
-- `challenge_admins` and `round_view` have no production caller until A7's routes.
+- `challenge_admins` and `round_view` are reached through A7's routes.
 
 ## Validation
 
@@ -135,7 +166,22 @@ The claimed sender of the response plays no part. **Every distinct head (epoch, 
 - `a_replayed_stock_of_old_challenges_is_fenced_off_by_the_requesters_newest` (I-1b: 12 of a 20-challenge stock charged, S1's newest limited, the other 8 stale)
 - `an_unsigned_or_forged_challenge_cannot_move_the_floor` (N-2: unsigned all-`f`, another key, a challenge swapped into S1's signed request; S1's next challenge still answered)
 
+`named_groups/tests/catchup_routes.rs` (A7, through the auth middleware and the chokepoint):
+- `trigger_challenges_the_named_admins_and_roster_admins_only`
+- `trigger_that_would_ask_too_many_opens_no_round_and_says_hold`
+- `trigger_with_an_observed_epoch_starts_the_epoch_ahead_task`
+- `get_reports_head_presence_and_round` (the relay leg end to end: the trigger's request, the owner's sign route, S1's accept route)
+- `get_reports_the_admins_of_every_state_applied_in_one_burst`
+- `head_proof_route_refuses_a_session_bearer_and_a_rider`
+- `head_proof_route_refuses_a_departed_requester`
+- `head_proof_route_maps_every_refusal_to_its_reason`
+- `accept_route_records_only_a_proof_for_the_open_round` (every refusal reason over HTTP)
+- `trigger_opens_at_most_one_round_per_gap`
+- `trigger_without_a_tree_holds_and_says_whether_it_may_come`
+- `get_reports_a_fork_quarantined_room`
+
 Unit tests:
+- `catchup_routes::tests::every_refusal_has_its_own_reason_and_a_retry_class`, `admins_since_lists_every_retained_state_and_says_when_one_may_be_missing`, `admins_since_too_large_to_challenge_is_a_hold`, `a_hold_says_no_round_and_hold`; `head_rounds::tests::a_room_opens_at_most_one_round_per_gap`; `group_access::tests::treekem_catch_up_admission_needs_the_daemons_seat_or_the_durable_token`; `auth::tests::treekem_head_routes_require_the_durable_token`; `api::tests::endpoints_registry_lists_the_four_routes`;
 - `mls::treekem::tests::every_member_at_an_epoch_derives_the_same_authenticator` (three members, and equality with the exporter call itself), `the_authenticator_follows_the_live_epoch_and_the_group`;
 - `head_proof::tests::the_inflate_knob_is_off_unless_set`, `the_sign_input_names_its_domain_and_every_field`, `a_proof_verifies_only_in_canonical_form_and_for_its_signer_key`, `a_challenge_opens_with_its_counter`, `only_a_newer_challenge_is_charged_and_the_latest_is_answered_from_cache`, `the_latest_proof_is_re_sent_at_most_once_a_window`, `a_replayed_stock_of_old_challenges_delays_the_requester_at_most_one_window`;
 - `head_rounds::tests::a_round_records_only_its_own_nonce_requester_group_and_asked_signers_in_time`, `every_distinct_head_of_a_signer_is_kept_whatever_the_order`, `the_challenge_counter_only_grows_across_a_restart`, `the_challenge_set_never_drops_a_named_agent`.

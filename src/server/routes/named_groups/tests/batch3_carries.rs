@@ -339,7 +339,9 @@ async fn the_get_door_serves_a_welcome_staged_more_than_ten_minutes_ago() -> Res
     Ok(())
 }
 
-fn loopback_daemon_config(root: &std::path::Path) -> Result<crate::server::DaemonConfig> {
+pub(super) fn loopback_daemon_config(
+    root: &std::path::Path,
+) -> Result<crate::server::DaemonConfig> {
     Ok(serde_json::from_value(serde_json::json!({
         "bind_address": "127.0.0.1:0",
         "api_address": "127.0.0.1:0",
@@ -356,7 +358,7 @@ fn loopback_daemon_config(root: &std::path::Path) -> Result<crate::server::Daemo
     }))?)
 }
 
-fn loopback_daemon_options() -> crate::server::ServeOptions {
+pub(super) fn loopback_daemon_options() -> crate::server::ServeOptions {
     crate::server::ServeOptions {
         skip_update_check: true,
         cli_no_port_mapping: true,
