@@ -1131,6 +1131,14 @@ pub async fn serve_with_options(
     // Survivor re-key A6: the head challenge counter never goes back.
     let treekem_head_counter =
         crate::server::routes::named_groups::load_head_counter(&treekem_dir).await;
+    // Survivor re-key A9: what this daemon still owes each survivor of a
+    // re-key it sealed, keeping only rooms and survivors still live.
+    let rekey_obligations = crate::server::routes::named_groups::load_rekey_obligations(
+        &treekem_dir,
+        &named_groups,
+        &hex::encode(agent.agent_id().as_bytes()),
+    )
+    .await;
 
     // ADR-0036: load the daemon self-profile (names) and enforce the owner
     // singleton — an install whose recorded owner differs from the user key
@@ -1348,6 +1356,7 @@ pub async fn serve_with_options(
         treekem_head_answers: std::sync::Mutex::default(),
         treekem_head_rounds: std::sync::Mutex::default(),
         treekem_head_counter: Mutex::new(treekem_head_counter),
+        rekey_obligations: Mutex::new(rekey_obligations),
         group_membership_locks: RwLock::new(HashMap::new()),
         treekem_groups: RwLock::new(treekem_groups),
         treekem_dir,
@@ -2723,6 +2732,11 @@ pub async fn serve_with_options(
             }
         }));
     }
+
+    // Survivor re-key A9: the re-key obligation worker. It runs in its own
+    // task, with at most four bounded sends in flight, so it never waits on
+    // the catch-up or metadata listeners and they never wait on it.
+    let _ = crate::server::routes::named_groups::spawn_rekey_obligation_worker(&state);
 
     // Build router
     let app = Router::new()
