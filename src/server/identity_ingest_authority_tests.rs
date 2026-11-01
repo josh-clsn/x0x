@@ -1777,3 +1777,77 @@ async fn adr0115_card_pin_holds_routing_against_an_older_beat() {
         "the own-machine beat replaced the card entry"
     );
 }
+
+/// Batch 5 (N3): a card that moves a card-only entry to its own machine
+/// cleans up the machine it left. X's old class A beat named M2 (its
+/// routing entry since reaped), a card for M2 made a card-only entry, and a
+/// card for M1 moved it. With M2 still connected, a raw send goes to M1 or
+/// waits; it never goes to M2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adr0115_card_move_from_a_card_only_entry_forgets_the_old_machine() {
+    let victim = Victim::start("cardmove").await;
+    let now = now_secs();
+    let x = Subject::new();
+    let m2 = x.machine_id();
+    let m1 = MachineKeypair::generate()
+        .expect("X's new machine")
+        .machine_id();
+    victim.announce_genuine(&x, now - 60).await;
+    victim.identity_barrier().await;
+    victim.expect_genuine_entry(&x, "card move").await;
+    victim
+        .agent
+        .identity_discovery_cache
+        .write()
+        .await
+        .remove(&x.id());
+    let card = |machine: MachineId| crate::DiscoveredAgent {
+        self_name: None,
+        agent_id: x.id(),
+        machine_id: machine,
+        user_id: None,
+        addresses: Vec::new(),
+        announced_at: now,
+        last_seen: now,
+        machine_public_key: Vec::new(),
+        nat_type: None,
+        can_receive_direct: None,
+        is_relay: None,
+        is_coordinator: None,
+        reachable_via: Vec::new(),
+        relay_candidates: Vec::new(),
+        cert_not_after: None,
+        agent_certificate: None,
+        agent_public_key: Vec::new(),
+        cert_digest: None,
+    };
+    victim.agent.pin_card_binding(card(m2)).await;
+    // M2 is live when the card for M2 lands.
+    victim
+        .agent
+        .direct_messaging
+        .mark_connected(x.id(), m2)
+        .await;
+    victim.agent.pin_card_binding(card(m1)).await;
+    assert_eq!(
+        victim.cached_machine(&x.id()).await,
+        Some(m1),
+        "CONTROL FAILED (not the vector): the card moves X to M1"
+    );
+
+    let transport = crate::RawQuicTransport::Scripted(Arc::new(
+        crate::PinnedTransportScript::connected_only(&[m2], false),
+    ));
+    let mut open = Vec::new();
+    let target = victim.raw_target(x.id(), &transport).await;
+    if target == Some(m2) {
+        open.push("a raw send to X resolves the machine the card moved it off".to_string());
+    }
+    if victim.agent.direct_messaging.get_machine_id(&x.id()).await == Some(m2) {
+        open.push("the DM registry still maps X to the machine it left".to_string());
+    }
+    if victim.cached_machine(&x.id()).await == Some(m2) {
+        open.push("routing was reconciled back to the machine it left".to_string());
+    }
+    assert_vector_closed("card move", &open);
+}

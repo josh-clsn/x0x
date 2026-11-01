@@ -20940,8 +20940,22 @@ impl Agent {
                     true
                 }
                 // A card-only entry yields only to a confirmed card; with no
-                // entry, a card naming no machine is recorded too.
-                Some(_) => !confirmed,
+                // entry, a card naming no machine is recorded too. A card
+                // that moves the entry to its machine cleans up the machine
+                // it left, as for an announced entry.
+                Some(existing) => {
+                    if confirmed
+                        && existing.machine_id.0 != [0u8; 32]
+                        && existing.machine_id != machine_id
+                    {
+                        left_machine = Some(existing.machine_id);
+                        self.card_dial_leads
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(&agent_id);
+                    }
+                    !confirmed
+                }
                 None => !(confirmed || card_names_no_machine),
             }
         };
