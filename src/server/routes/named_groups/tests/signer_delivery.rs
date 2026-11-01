@@ -15,16 +15,17 @@ use super::epoch_ahead_catchup::{
 };
 use super::*;
 
-fn owner_extension() -> axum::extract::Extension<crate::server::rider_auth::ActorContext> {
+pub(super) fn owner_extension() -> axum::extract::Extension<crate::server::rider_auth::ActorContext>
+{
     axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true })
 }
 
-fn hex_id(id: &x0x::identity::AgentId) -> String {
+pub(super) fn hex_id(id: &x0x::identity::AgentId) -> String {
     hex::encode(id.as_bytes())
 }
 
 /// The last event `state` published that `pick` accepts.
-fn published(
+pub(super) fn published(
     state: &AppState,
     pick: impl Fn(&NamedGroupMetadataEvent) -> bool,
 ) -> Option<NamedGroupMetadataEvent> {
@@ -40,7 +41,7 @@ fn published(
         .find(|event| pick(event))
 }
 
-async fn roster(state: &AppState, group_id: &str) -> x0x::groups::GroupInfo {
+pub(super) async fn roster(state: &AppState, group_id: &str) -> x0x::groups::GroupInfo {
     state
         .named_groups
         .read()
@@ -50,12 +51,12 @@ async fn roster(state: &AppState, group_id: &str) -> x0x::groups::GroupInfo {
         .expect("group")
 }
 
-async fn assert_ok(response: axum::response::Response, what: &str) {
+pub(super) async fn assert_ok(response: axum::response::Response, what: &str) {
     let (status, body) = response_json(response).await.expect("route response");
     assert_eq!(status, StatusCode::OK, "{what}: {body}");
 }
 
-async fn ban_route(state: &Arc<AppState>, group_id: &str, member_hex: &str) {
+pub(super) async fn ban_route(state: &Arc<AppState>, group_id: &str, member_hex: &str) {
     let response = ban_group_member(
         State(Arc::clone(state)),
         owner_extension(),
@@ -66,7 +67,7 @@ async fn ban_route(state: &Arc<AppState>, group_id: &str, member_hex: &str) {
     assert_ok(response, "the owner bans").await;
 }
 
-async fn unban_route(state: &Arc<AppState>, group_id: &str, member_hex: &str) {
+pub(super) async fn unban_route(state: &Arc<AppState>, group_id: &str, member_hex: &str) {
     let response = unban_group_member(
         State(Arc::clone(state)),
         owner_extension(),
@@ -77,7 +78,7 @@ async fn unban_route(state: &Arc<AppState>, group_id: &str, member_hex: &str) {
     assert_ok(response, "the owner unbans").await;
 }
 
-async fn rename_route(state: &Arc<AppState>, group_id: &str, name: &str) {
+pub(super) async fn rename_route(state: &Arc<AppState>, group_id: &str, name: &str) {
     let response = update_named_group(
         State(Arc::clone(state)),
         owner_extension(),
@@ -92,7 +93,7 @@ async fn rename_route(state: &Arc<AppState>, group_id: &str, name: &str) {
     assert_ok(response, "the owner renames").await;
 }
 
-async fn admission_route(state: &Arc<AppState>, group_id: &str) {
+pub(super) async fn admission_route(state: &Arc<AppState>, group_id: &str) {
     let response = update_group_policy(
         State(Arc::clone(state)),
         owner_extension(),
@@ -111,7 +112,12 @@ async fn admission_route(state: &Arc<AppState>, group_id: &str) {
     assert_ok(response, "the owner changes the policy").await;
 }
 
-async fn role_route(state: &Arc<AppState>, group_id: &str, member_hex: &str, role: &str) {
+pub(super) async fn role_route(
+    state: &Arc<AppState>,
+    group_id: &str,
+    member_hex: &str,
+    role: &str,
+) {
     let response = update_member_role(
         State(Arc::clone(state)),
         owner_extension(),
@@ -126,13 +132,13 @@ async fn role_route(state: &Arc<AppState>, group_id: &str, member_hex: &str, rol
 }
 
 /// A newcomer's id and its TreeKEM KeyPackage, prepared from `seed`.
-fn newcomer(seed: u8) -> Result<(x0x::identity::AgentId, String)> {
+pub(super) fn newcomer(seed: u8) -> Result<(x0x::identity::AgentId, String)> {
     let id = x0x::identity::AgentKeypair::generate()?.agent_id();
     let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(id, &[seed; 32])?;
     Ok((id, BASE64.encode(prepared.key_package_bytes())))
 }
 
-async fn direct_add_route(
+pub(super) async fn direct_add_route(
     state: &Arc<AppState>,
     group_id: &str,
     member_hex: &str,
@@ -166,7 +172,7 @@ async fn direct_add_route(
 }
 
 /// S2 applies `event` from its author, the owner.
-async fn s2_applies(cast: &SurvivorRelay, event: &NamedGroupMetadataEvent) {
+pub(super) async fn s2_applies(cast: &SurvivorRelay, event: &NamedGroupMetadataEvent) {
     let owner_id = cast.fixture.state.agent.agent_id();
     let applied =
         apply_named_group_metadata_event(&cast.s2, event.clone(), owner_id, true, None).await;
@@ -177,14 +183,14 @@ async fn s2_applies(cast: &SurvivorRelay, event: &NamedGroupMetadataEvent) {
 }
 
 /// S1 gets `event` by catch-up from S2 alone.
-async fn s2_serves_s1(cast: &SurvivorRelay, event: NamedGroupMetadataEvent) {
+pub(super) async fn s2_serves_s1(cast: &SurvivorRelay, event: NamedGroupMetadataEvent) {
     let s2_id = cast.s2.agent.agent_id();
     deliver_catchup(&cast.s1, &s2_id, &cast.fixture.group_id, event).await;
 }
 
 /// S1 holds the owner's head and epoch, reads the owner's next message, and
 /// the removed member R does not.
-async fn s1_follows_the_owner(cast: &mut SurvivorRelay, text: &[u8]) -> Result<()> {
+pub(super) async fn s1_follows_the_owner(cast: &mut SurvivorRelay, text: &[u8]) -> Result<()> {
     let owner = &cast.fixture.state;
     let group_id = &cast.fixture.group_id;
     assert_eq!(

@@ -710,6 +710,7 @@ fn empty_catchup(group_id: &str, truncated: bool) -> TreeKemCatchupResponse {
         group_id: group_id.to_string(),
         events: Vec::new(),
         truncated,
+        log_evicted_through: None,
         responder_state_hash: None,
     }
 }
@@ -735,6 +736,7 @@ async fn truncated_catchup_page_does_not_seal() -> Result<()> {
         group_id: fixture.group_id.clone(),
         events: vec![leave],
         truncated: true,
+        log_evicted_through: None,
         responder_state_hash: None,
     };
     // The transport sender is an active peer, not the leaver. The commit
@@ -1835,6 +1837,7 @@ async fn deliver_catchup(
             group_id: group_id.to_string(),
             events: vec![event],
             truncated: false,
+            log_evicted_through: None,
             responder_state_hash: None,
         },
     )
@@ -2070,6 +2073,7 @@ fn catchup_page(
         group_id: group_id.to_string(),
         events: Vec::new(),
         truncated,
+        log_evicted_through: None,
         responder_state_hash,
     }
 }
@@ -2092,6 +2096,7 @@ fn key_package_reply(
 ) -> TreeKemCatchupResponse {
     TreeKemCatchupResponse {
         signed_by: None,
+        log_evicted_through: None,
         target_member_id: None,
         target_member_key_package_b64: None,
         message_type: "treekem_catchup_response".to_string(),
