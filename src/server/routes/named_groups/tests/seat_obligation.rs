@@ -959,3 +959,31 @@ async fn a_member_removed_and_re_added_within_one_step_is_not_re_seated() -> Res
     cast.shutdown().await;
     Ok(())
 }
+
+/// A crash between the seat's write and its Welcome pin leaves the seat
+/// owed and its staged Welcome unpinned. The worker's next step pins it
+/// again.
+#[tokio::test]
+async fn a_worker_step_re_pins_an_owed_seats_unpinned_welcome() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let owner = &cast.fixture.state;
+    let group_id = &cast.fixture.group_id;
+    let n = sibling(&cast).await?;
+    let add = direct_add_route(owner, group_id, &n.hex, "Sibling", &n.package_b64).await;
+    let welcome = welcome_id_of(&add);
+    assert!(rekey_obligations::owes_seat(owner, group_id, &n.hex).await);
+    assert!(
+        owner.pending_welcomes.read().await.contains_key(&welcome),
+        "setup: the Welcome is staged"
+    );
+    // The crash: the pin never reached the staging file.
+    owner.seat_welcome_pins.lock().unwrap().remove(&welcome);
+
+    rekey_obligations::step(owner).await;
+    assert!(
+        owner.seat_welcome_pins.lock().unwrap().contains(&welcome),
+        "the step pins the owed seat's Welcome again"
+    );
+    cast.shutdown().await;
+    Ok(())
+}
