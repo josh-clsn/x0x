@@ -1,4 +1,4 @@
-//! Survivor re-key A8 (review I-2): whether this Linux or Android system
+//! Survivor re-key A8: whether this Linux or Android system
 //! runs under a hypervisor. A guest whose VM is paused, or whose host
 //! sleeps (WSL2 under a sleeping Windows included), never suspends itself:
 //! `CLOCK_BOOTTIME` and `CLOCK_MONOTONIC` stop together, so the suspend pair

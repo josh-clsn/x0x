@@ -46,7 +46,7 @@ fn app(state: &Arc<AppState>) -> axum::Router {
         .with_state(Arc::clone(state))
 }
 
-async fn call(
+pub(super) async fn call(
     state: &Arc<AppState>,
     method: Method,
     path: &str,
@@ -87,7 +87,7 @@ fn state_path(group_id: &str, since: u64) -> String {
     format!("/groups/{group_id}/treekem/catch-up?since_revision={since}")
 }
 
-fn sign_path(group_id: &str) -> String {
+pub(super) fn sign_path(group_id: &str) -> String {
     format!("/groups/{group_id}/treekem/head-proof")
 }
 
