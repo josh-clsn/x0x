@@ -222,6 +222,19 @@ async fn shutdown_and_wait_releases_state_held_by_survivor_rekey_tasks() -> Resu
         .lock()
         .unwrap() = Some(Arc::clone(&send_hold));
     super::super::catchup_serve::send_answer(&state, peer_id, vec![0], &room, "test").await;
+    // F-1: a `POST /mesh/join` dial and its hooks.
+    held.push((
+        "the mesh join",
+        seam(&crate::server::routes::network::mesh_join_seam_key(&state)),
+    ));
+    let joined = crate::server::routes::network::mesh_join(State(Arc::clone(&state)))
+        .await
+        .into_response();
+    assert_eq!(
+        joined.status(),
+        StatusCode::OK,
+        "setup: the mesh join is admitted"
+    );
     // A13: a re-seat, waiting for the room's membership lock this test holds.
     let reseat_room = seat_room(&state, "bc", &peer_hex).await;
     let room_lock = group_membership_lock(&state, &reseat_room)

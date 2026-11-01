@@ -24680,10 +24680,18 @@ async fn add_treekem_named_group_member(
     // to poll: it is owed its seat until it proves it holds it. Any member
     // the obligations refused gets the blind schedule (A12: the seated
     // member its direct sends only, as it is not subscribed yet).
-    let refused = rekey_obligations::owe_survivors(&state, &id, &next, &[], &[&event]).await;
+    // A13: the seat is owed and marked in the obligations' one write, and
+    // its Welcome is pinned right after, with no await between them, so a
+    // dropped request leaves no seat or a pinned one. The worker's reconcile
+    // pins an owed seat's Welcome a crash left unpinned.
+    let refused =
+        rekey_obligations::owe_survivors_seating(&state, &id, &next, &[&event], &agent_hex).await;
+    seat_welcome_pin::pin_seat(&state, &event).await;
     let (seated_refused, refused): (Vec<String>, Vec<String>) = refused
         .into_iter()
         .partition(|member| member.eq_ignore_ascii_case(&agent_hex));
+    #[cfg(test)]
+    detached_send_test_seam::park(&format!("seat-owed:{id}:{agent_hex}")).await;
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     spawn_named_group_event_delivery_to_active_members(
         &state,
@@ -24701,11 +24709,7 @@ async fn add_treekem_named_group_member(
             Some(&refused),
         );
     }
-    if seated_refused.is_empty() {
-        // A13: the seat is owed; its Welcome stays staged until it is proven.
-        rekey_obligations::mark_seat(&state, &id, &agent_hex).await;
-        seat_welcome_pin::pin_seat(&state, &event).await;
-    } else {
+    if !seated_refused.is_empty() {
         spawn_seated_member_resends(&state, &metadata_topic, &next, &event, &agent_hex);
     }
     spawn_named_group_event_delivery_to_active_members(&state, &next, &member_joined_recovery, &[]);
@@ -28850,6 +28854,9 @@ async fn remove_treekem_named_group_member_with(
         rekey_obligations::owe_survivors(&state, &id, &next, &[agent_id_hex.as_str()], &[&event])
             .await,
     );
+    // A13: the removal is durable, so what was owed to the member goes now;
+    // a re-add starts a fresh seat instead of merging into it.
+    rekey_obligations::forget(&state, &id, &agent_id_hex).await;
     if !drop_initial_volley(&event) {
         publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     }
@@ -29515,6 +29522,8 @@ async fn owner_certified_seal_with_eviction(
                 &[&event],
             )
             .await;
+            // A13: as for a removal, a re-add starts a fresh seat.
+            rekey_obligations::forget(state, id, &evict_hex).await;
             if !drop_initial_volley(&event) {
                 publish_named_group_metadata_event(state, &metadata_topic, &event).await;
                 spawn_named_group_event_delivery_to_active_members(
@@ -32423,6 +32432,9 @@ async fn ban_treekem_group_member(
         rekey_obligations::owe_survivors(&state, &id, &next, &[agent_id_hex.as_str()], &[&event])
             .await,
     );
+    // A13: the removal is durable, so what was owed to the member goes now;
+    // a re-add starts a fresh seat instead of merging into it.
+    rekey_obligations::forget(&state, &id, &agent_id_hex).await;
     if !drop_initial_volley(&event) {
         publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     }
@@ -33797,10 +33809,19 @@ async fn approve_treekem_join_request(
     // approval before the first publish. A13: so is the requester it seats,
     // which has no join result to poll. Any member the obligations refused
     // gets the blind schedule (A12: the requester its direct sends only).
-    let refused = rekey_obligations::owe_survivors(&state, &id, &next, &[], &[&event]).await;
+    // A13: the seat is owed and marked in the obligations' one write, and
+    // its Welcome is pinned right after, with no await between them, so a
+    // dropped request leaves no seat or a pinned one. The worker's reconcile
+    // pins an owed seat's Welcome a crash left unpinned.
+    let refused =
+        rekey_obligations::owe_survivors_seating(&state, &id, &next, &[&event], &requester_hex)
+            .await;
+    seat_welcome_pin::pin_seat(&state, &event).await;
     let (seated_refused, refused): (Vec<String>, Vec<String>) = refused
         .into_iter()
         .partition(|member| member.eq_ignore_ascii_case(&requester_hex));
+    #[cfg(test)]
+    detached_send_test_seam::park(&format!("seat-owed:{id}:{requester_hex}")).await;
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     spawn_named_group_event_delivery_to_active_members(
         &state,
@@ -33818,11 +33839,7 @@ async fn approve_treekem_join_request(
             Some(&refused),
         );
     }
-    if seated_refused.is_empty() {
-        // A13: the seat is owed; its Welcome stays staged until it is proven.
-        rekey_obligations::mark_seat(&state, &id, &requester_hex).await;
-        seat_welcome_pin::pin_seat(&state, &event).await;
-    } else {
+    if !seated_refused.is_empty() {
         spawn_seated_member_resends(&state, &metadata_topic, &next, &event, &requester_hex);
     }
     cache_treekem_member_key_package(

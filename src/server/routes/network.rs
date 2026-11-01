@@ -163,12 +163,31 @@ pub(in crate::server) async fn mesh_join(State(state): State<Arc<AppState>>) -> 
     // fresh mesh-off on a metered link.
     let requested_at_epoch = state.agent.mesh_transition_epoch();
     let hook_state = Arc::clone(&state);
-    tokio::spawn(async move {
+    // In the detached-task registry, so shutdown drains the dial and its
+    // hooks and releases this state.
+    let admitted = state.spawn_detached(async move {
+        #[cfg(test)]
+        super::named_groups::detached_send_test_seam::park(&mesh_join_seam_key(&hook_state)).await;
         join_mesh(&hook_state, requested_at_epoch).await;
     });
+    if !admitted {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "status": "shutting_down" })),
+        );
+    }
     (
         StatusCode::OK,
         Json(serde_json::json!({ "ok": true, "status": "dialing" })),
+    )
+}
+
+/// The test seam key at the start of a `POST /mesh/join` task.
+#[cfg(test)]
+pub(in crate::server) fn mesh_join_seam_key(state: &AppState) -> String {
+    format!(
+        "mesh-join:{}",
+        hex::encode(state.agent.agent_id().as_bytes())
     )
 }
 

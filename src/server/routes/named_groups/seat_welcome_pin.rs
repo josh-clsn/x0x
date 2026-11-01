@@ -133,12 +133,12 @@ pub(super) async fn reconcile(state: &AppState) {
             .seat_welcome_pins
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if pins.is_empty() {
-            return;
-        }
         pins.iter().cloned().collect()
     };
     let seats = rekey_obligations::seats(state).await;
+    if pins.is_empty() && seats.is_empty() {
+        return;
+    }
     let owed: HashSet<(String, String)> = {
         let groups = state.named_groups.read().await;
         seats
@@ -155,20 +155,28 @@ pub(super) async fn reconcile(state: &AppState) {
             })
             .collect()
     };
-    let stale: Vec<String> = {
+    let (stale, missing): (Vec<String>, Vec<String>) = {
         let welcomes = state.pending_welcomes.read().await;
-        pins.into_iter()
-            .filter(|id| {
-                !welcomes.get(id).is_some_and(|pending| {
-                    owed.contains(&(
-                        pending.group_id.clone(),
-                        pending.joiner_agent.to_ascii_lowercase(),
-                    ))
-                })
-            })
-            .collect()
+        let seats_welcome = |pending: &super::PendingWelcome| {
+            owed.contains(&(
+                pending.group_id.clone(),
+                pending.joiner_agent.to_ascii_lowercase(),
+            ))
+        };
+        let stale = pins
+            .iter()
+            .filter(|id| !welcomes.get(*id).is_some_and(&seats_welcome))
+            .cloned()
+            .collect();
+        // An owed seat whose Welcome a crash left unpinned is pinned again.
+        let missing = welcomes
+            .iter()
+            .filter(|(id, pending)| !pins.contains(id) && seats_welcome(pending))
+            .map(|(id, _)| id.clone())
+            .collect();
+        (stale, missing)
     };
-    if stale.is_empty() {
+    if stale.is_empty() && missing.is_empty() {
         return;
     }
     {
@@ -179,6 +187,7 @@ pub(super) async fn reconcile(state: &AppState) {
         for id in &stale {
             pins.remove(id);
         }
+        pins.extend(missing);
     }
     persist_join_result_staging(state).await;
 }

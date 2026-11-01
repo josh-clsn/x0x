@@ -862,3 +862,100 @@ async fn a_dropped_retried_add_never_leaves_the_member_removed() -> Result<()> {
     cast.shutdown().await;
     Ok(())
 }
+
+/// A direct add whose request goes away right after the seat is owed, and
+/// before the publish, leaves the seat owed and its Welcome pinned, in
+/// memory and after a restart.
+#[tokio::test]
+async fn a_dropped_add_after_its_seat_is_owed_leaves_the_seat_pinned() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let owner = Arc::clone(&cast.fixture.state);
+    let group_id = cast.fixture.group_id.clone();
+    let n = sibling(&cast).await?;
+    let pause =
+        super::super::detached_send_test_seam::arm(&format!("seat-owed:{group_id}:{}", n.hex));
+    let request = {
+        let (owner, group_id, hex, package) = (
+            Arc::clone(&owner),
+            group_id.clone(),
+            n.hex.clone(),
+            n.package_b64.clone(),
+        );
+        tokio::spawn(async move {
+            add_named_group_member(
+                State(owner),
+                owner_extension(),
+                Path(group_id),
+                Json(AddNamedGroupMemberRequest {
+                    agent_id: hex,
+                    display_name: Some("Sibling".to_string()),
+                    treekem_key_package_b64: Some(package),
+                }),
+            )
+            .await
+            .into_response()
+        })
+    };
+    assert!(
+        eventually(|| async { pause.reached() }).await,
+        "setup: the seat is owed and the publish has not run"
+    );
+    request.abort();
+    let _ = request.await;
+    drop(pause);
+    let seat_held = || async {
+        rekey_obligations::owes_seat(&owner, &group_id, &n.hex).await
+            && !owner.seat_welcome_pins.lock().unwrap().is_empty()
+    };
+    assert!(
+        seat_held().await,
+        "the seat is owed with its Welcome pinned"
+    );
+    restart_staging_and_obligations(&owner).await;
+    assert!(seat_held().await, "and so after a restart");
+    cast.shutdown().await;
+    Ok(())
+}
+
+/// A member removed and added back directly within one worker step starts
+/// a fresh seat: the step does not take it as lost and re-seat it.
+#[tokio::test]
+async fn a_member_removed_and_re_added_within_one_step_is_not_re_seated() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let owner = &cast.fixture.state;
+    let group_id = &cast.fixture.group_id;
+    let n = sibling(&cast).await?;
+    direct_add_route(owner, group_id, &n.hex, "Sibling", &n.package_b64).await;
+    let response = remove_named_group_member(
+        State(Arc::clone(owner)),
+        owner_extension(),
+        Path((group_id.clone(), n.hex.clone())),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK, "the owner removes N");
+    let again = direct_add_route(owner, group_id, &n.hex, "Sibling", &n.package_b64).await;
+    let awake = Arc::new(AtomicBool::new(false));
+    route_sends(&cast, &n, &awake);
+    skew(owner, 6_000).await;
+    rekey_obligations::step(owner).await;
+    assert!(eventually(|| async { idle(owner, group_id, &n.hex).await }).await);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !super::super::seat_reseat::FINISHED_FOR_TEST
+            .lock()
+            .unwrap()
+            .contains(group_id),
+        "no re-seat ran"
+    );
+    assert_eq!(reseats(owner).await, 0);
+    assert_eq!(
+        owed(owner, group_id, &n.hex)
+            .await
+            .map(|owed| (owed.seat, owed.owed_epoch)),
+        Some((true, epoch_of(&again))),
+        "the fresh seat is owed from the re-add"
+    );
+    cast.shutdown().await;
+    Ok(())
+}

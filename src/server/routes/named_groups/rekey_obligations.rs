@@ -964,6 +964,20 @@ pub(in crate::server) async fn owe(
     first: Rekey,
     last: Rekey,
 ) -> Vec<String> {
+    owe_seating(state, group_key, survivors, first, last, None).await
+}
+
+/// [`owe`], and when `seated` is owed, its entry is its seat (A13) in the
+/// same write: it starts at the seat (`first`) and is marked a seat, so no
+/// crash or dropped request can leave it owed without its seat flag.
+async fn owe_seating(
+    state: &AppState,
+    group_key: &str,
+    survivors: &[String],
+    first: Rekey,
+    last: Rekey,
+    seated: Option<&str>,
+) -> Vec<String> {
     if survivors.is_empty() {
         return Vec::new();
     }
@@ -981,6 +995,14 @@ pub(in crate::server) async fn owe(
     let before = store.entries.clone();
     let now_ms = store.clock.now_ms();
     let refused = store.owe_entries(group_key, survivors, first, last, now_ms);
+    if let Some(seated) = seated {
+        let key = (group_key.to_string(), seated.to_ascii_lowercase());
+        if let Some(owed) = store.entries.get_mut(&key) {
+            owed.seat = true;
+            owed.owed_epoch = first.epoch;
+            owed.owed_revision = first.revision;
+        }
+    }
     if store.entries != before {
         if let Err(error) = store.persist().await {
             store.entries = before;
@@ -1014,6 +1036,16 @@ pub(in crate::server) async fn owe_for(
     survivors: &[String],
     events: &[&NamedGroupMetadataEvent],
 ) -> Vec<String> {
+    owe_for_seating(state, group_key, survivors, events, None).await
+}
+
+async fn owe_for_seating(
+    state: &AppState,
+    group_key: &str,
+    survivors: &[String],
+    events: &[&NamedGroupMetadataEvent],
+    seated: Option<&str>,
+) -> Vec<String> {
     let rekeys: Vec<Rekey> = events
         .iter()
         .filter_map(|event| commit_bearing_event_frontier(event))
@@ -1030,7 +1062,9 @@ pub(in crate::server) async fn owe_for(
         .iter()
         .max_by_key(|rekey| (rekey.epoch, rekey.revision));
     match (first, last) {
-        (Some(first), Some(last)) => owe(state, group_key, survivors, *first, *last).await,
+        (Some(first), Some(last)) => {
+            owe_seating(state, group_key, survivors, *first, *last, seated).await
+        }
         _ => survivors.to_vec(),
     }
 }
@@ -1047,6 +1081,19 @@ pub(in crate::server) async fn owe_survivors(
 ) -> Vec<String> {
     let survivors = survivors(state, next, excluded);
     owe_for(state, group_key, &survivors, events).await
+}
+
+/// [`owe_survivors`] for an add or approval that seats `seated`: its seat
+/// is owed and marked in the same write (A13).
+pub(in crate::server) async fn owe_survivors_seating(
+    state: &AppState,
+    group_key: &str,
+    next: &x0x::groups::GroupInfo,
+    events: &[&NamedGroupMetadataEvent],
+    seated: &str,
+) -> Vec<String> {
+    let survivors = survivors(state, next, &[]);
+    owe_for_seating(state, group_key, &survivors, events, Some(seated)).await
 }
 
 /// Survivor re-key A13: make `recipient_hex`'s obligation in `group_key`
@@ -1071,23 +1118,6 @@ pub(in crate::server) async fn due_now(
         }
         None => false,
     }
-}
-
-/// Survivor re-key A13: mark `recipient_hex`'s obligation in `group_key` as
-/// starting at its own seat, on disk. A no-op when it is not owed.
-pub(in crate::server) async fn mark_seat(
-    state: &AppState,
-    group_key: &str,
-    recipient_hex: &str,
-) -> bool {
-    let mut store = state.rekey_obligations.lock().await;
-    let key = (group_key.to_string(), recipient_hex.to_ascii_lowercase());
-    let Some(owed) = store.entries.get_mut(&key) else {
-        return false;
-    };
-    owed.seat = true;
-    store.persist_or_warn("a seat obligation").await;
-    true
 }
 
 /// Whether `recipient_hex` is owed its unproven seat in `group_key`.
