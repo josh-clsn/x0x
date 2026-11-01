@@ -260,6 +260,16 @@ pub(in crate::server) struct RekeyObligations {
     set_aside: Option<String>,
     room_cap: usize,
     total_cap: usize,
+    /// Orders the file writes. A write whose task was aborted at its await
+    /// still runs on the blocking pool; one that is older than a write
+    /// already on disk is skipped, so the file never goes back.
+    write_order: Arc<WriteOrder>,
+}
+
+#[derive(Default)]
+struct WriteOrder {
+    next: std::sync::atomic::AtomicU64,
+    written: std::sync::Mutex<u64>,
 }
 
 impl Default for RekeyObligations {
@@ -279,6 +289,7 @@ impl Default for RekeyObligations {
             set_aside: None,
             room_cap: ROOM_CAP,
             total_cap: TOTAL_CAP,
+            write_order: Arc::default(),
         }
     }
 }
@@ -639,7 +650,8 @@ impl RekeyObligations {
                 group_id = %LogHexId::group(&attempt.group_key),
                 recipient = %LogHexId::agent(&attempt.recipient_hex),
                 owed_revision = attempt.owed_revision,
-                "re-key obligation: the catch-up log holds nothing from the owed revision; it stays owed until the survivor proves its head"
+                "re-key obligation: the catch-up log holds nothing from the owed revision; it \
+                stays owed until the survivor proves its head"
             );
         }
     }
@@ -667,13 +679,33 @@ impl RekeyObligations {
         ) else {
             return Err(io::Error::other("the obligations path has no file name"));
         };
-        run_blocking(move || write_durable(&dir, &name, &bytes)).await
+        // Numbered under the caller's lock, so the numbers follow the
+        // changes; written in that order under the order's own lock.
+        let order = Arc::clone(&self.write_order);
+        let number = order
+            .next
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .saturating_add(1);
+        run_blocking(move || {
+            let mut written = order
+                .written
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if number <= *written {
+                return Ok(());
+            }
+            write_durable(&dir, &name, &bytes)?;
+            *written = number;
+            Ok(())
+        })
+        .await
     }
 
     async fn persist_or_warn(&self, what: &str) {
         if let Err(error) = self.persist().await {
             tracing::warn!(
-                "re-key obligations: {what} is held in memory but not on disk; a restart may send what is no longer owed: {error}"
+                "re-key obligations: {what} is held in memory but not on disk; a restart may \
+                send what is no longer owed: {error}"
             );
         }
     }
@@ -805,7 +837,9 @@ async fn set_aside_and_owe_every_member(
             tracing::error!(
                 path = %path.display(),
                 set_aside = %aside.display(),
-                "re-key obligations: the file {why}; it is kept under the name set aside, and every other active member of each room this daemon administers is owed its current epoch instead"
+                "re-key obligations: the file {why}; it is kept under the name set aside, and \
+                every other active member of each room this daemon administers is owed its \
+                current epoch instead"
             );
             store.set_aside = Some(aside_name);
         }
@@ -813,7 +847,8 @@ async fn set_aside_and_owe_every_member(
             // Never write over what could not be set aside.
             tracing::error!(
                 path = %path.display(),
-                "re-key obligations: the file {why}, and setting it aside failed ({error}); obligations are kept in memory only until the next start"
+                "re-key obligations: the file {why}, and setting it aside failed ({error}); \
+                obligations are kept in memory only until the next start"
             );
             store.path = None;
             store.set_aside = Some(format!("{OBLIGATIONS_FILE} (not set aside: {error})"));
@@ -831,7 +866,8 @@ async fn set_aside_and_owe_every_member(
             tracing::error!(
                 group_id = %LogHexId::group(group_key),
                 refused = refused.len(),
-                "re-key obligations: past the cap while owing every member; these get the key only by catch-up"
+                "re-key obligations: past the cap while owing every member; these get the key \
+                only by catch-up"
             );
         }
     }
@@ -1023,7 +1059,7 @@ pub(in crate::server) async fn due_now(
     let mut store = state.rekey_obligations.lock().await;
     let key = (group_key.to_string(), recipient_hex.to_ascii_lowercase());
     let now_ms = store.clock.now_ms();
-    // Review S-2: no sooner than an edge may send (`EDGE_FLOOR_MS` after the
+    // No sooner than an edge may send (`EDGE_FLOOR_MS` after the
     // last send), so a burst of retries does not resend the payload each time.
     let earliest = store.last_sent.get(&key).map_or(now_ms, |sent| {
         sent.saturating_add(EDGE_FLOOR_MS).max(now_ms)
@@ -1134,19 +1170,76 @@ pub(in crate::server) fn spawn_settle(state: &Arc<AppState>, aliases: Vec<String
     });
 }
 
-/// The proof a catch-up or challenge request gives, when only its requester
-/// can have sent it: the transport verified the sender as the requester
-/// (`verified_requester`), or the requester signed it over its head (a
-/// page request, A5). Anything else is a claim and proves nothing.
-pub(super) fn request_proof(
+/// The head a catch-up or challenge request names for its requester, when
+/// only its requester can have sent it: the transport verified the sender
+/// as the requester (`verified_requester`), or the requester signed it
+/// over its head, state hash included (a page request, A5). Anything else
+/// is a claim and names nothing.
+pub(super) struct RequestHead {
+    recipient_hex: String,
+    epoch: u64,
+    revision: u64,
+    state_hash: String,
+}
+
+pub(super) fn request_head(
     request: &TreeKemCatchupRequest,
     verified_requester: bool,
-) -> Option<Proof> {
-    (verified_requester || signed_catchup::page_request_signed(request)).then(|| Proof {
+) -> Option<RequestHead> {
+    (verified_requester || signed_catchup::page_request_signed(request)).then(|| RequestHead {
         recipient_hex: request.requester_agent_id.to_ascii_lowercase(),
         epoch: request.from_treekem_epoch,
-        revision: Some(request.from_revision),
+        revision: request.from_revision,
+        state_hash: request.current_state_hash.clone(),
     })
+}
+
+/// Settle on a request's head in its own shielded task. A request settles
+/// only when the head it names is this daemon's live head: the same
+/// revision, state hash and epoch, read together. An older head (a replay),
+/// another head at the same epoch (a divergence) and a claim past the live
+/// epoch settle nothing; the epoch number alone is never proof.
+pub(in crate::server) fn spawn_settle_request(
+    state: &Arc<AppState>,
+    aliases: Vec<String>,
+    head: RequestHead,
+) {
+    let settler = Arc::clone(state);
+    #[cfg(test)]
+    state
+        .named_group_test_recorders
+        .settles_spawned
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let _ = state.spawn_shielded(async move {
+        if let Some(proof) = request_settles(&settler, &aliases, &head).await {
+            settle(&settler, &aliases, &proof).await;
+        }
+        #[cfg(test)]
+        settler
+            .named_group_test_recorders
+            .settles_finished
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+}
+
+async fn request_settles(
+    state: &AppState,
+    aliases: &[String],
+    head: &RequestHead,
+) -> Option<Proof> {
+    let groups = state.named_groups.read().await;
+    let info = aliases
+        .iter()
+        .find_map(|alias| crate::server::resolve_group_entry_locked(&groups, alias))
+        .map(|(_, info)| info)?;
+    (info.state_revision == head.revision
+        && info.secret_epoch == head.epoch
+        && info.state_hash == head.state_hash)
+        .then(|| Proof {
+            recipient_hex: head.recipient_hex.clone(),
+            epoch: head.epoch,
+            revision: Some(head.revision),
+        })
 }
 
 /// The head a catch-up answer gave for its responder, weighed only after
@@ -1169,43 +1262,53 @@ pub(in crate::server) async fn note_answer_head(
     responder: &str,
     head: AnswerHead<'_>,
 ) {
-    let Some((group_key, info)) = ({
+    // One view: the epoch settled is the one the matched head was read
+    // with, so a re-key sealed after the read can never be settled by it.
+    let Some((group_key, settled_at)) = answer_head_settles_at(state, group_id, head).await else {
+        return;
+    };
+    #[cfg(test)]
+    super::detached_send_test_seam::park(&answer_head_seam_key(&group_key)).await;
+    let proof = Proof {
+        recipient_hex: responder.to_ascii_lowercase(),
+        epoch: settled_at.0,
+        revision: Some(settled_at.1),
+    };
+    settle(state, &[group_key], &proof).await;
+}
+
+/// The test seam key between an answer head's read and its settle.
+#[cfg(test)]
+pub(in crate::server) fn answer_head_seam_key(group_key: &str) -> String {
+    format!("answer-head:{group_key}")
+}
+
+/// The room key and the (epoch, revision) `head` names, when it is this
+/// daemon's head. A signed head is checked against one read of the live
+/// tree; a reported state hash against one roster read, settling at that
+/// read's epoch and revision.
+async fn answer_head_settles_at(
+    state: &AppState,
+    group_id: &str,
+    head: AnswerHead<'_>,
+) -> Option<(String, (u64, u64))> {
+    let (group_key, info) = {
         let groups = state.named_groups.read().await;
         crate::server::resolve_group_entry_locked(&groups, group_id)
             .map(|(key, info)| (key.to_string(), info.clone()))
-    }) else {
-        return;
-    };
-    if !state
-        .rekey_obligations
-        .lock()
-        .await
-        .recipients_in(&group_key)
-        .iter()
-        .any(|owed| owed.eq_ignore_ascii_case(responder))
-    {
-        return;
-    }
-    let Some(group) = state.treekem_groups.read().await.get(&group_key).cloned() else {
-        return;
-    };
-    let Ok((live_epoch, live_authenticator)) = group.lock().await.head() else {
-        return;
-    };
-    let holds_live = match head {
+    }?;
+    match head {
         AnswerHead::Signed {
             epoch,
             authenticator,
-        } => epoch == live_epoch && authenticator == hex::encode(live_authenticator),
-        AnswerHead::Reported(reported) => reported == info.state_hash,
-    };
-    if holds_live {
-        let proof = Proof {
-            recipient_hex: responder.to_ascii_lowercase(),
-            epoch: live_epoch,
-            revision: Some(info.state_revision),
-        };
-        settle(state, &[group_key], &proof).await;
+        } => {
+            let group = state.treekem_groups.read().await.get(&group_key).cloned()?;
+            let (live_epoch, live_authenticator) = group.lock().await.head().ok()?;
+            (epoch == live_epoch && authenticator == hex::encode(live_authenticator))
+                .then_some((group_key, (live_epoch, info.state_revision)))
+        }
+        AnswerHead::Reported(reported) => (reported == info.state_hash)
+            .then_some((group_key, (info.secret_epoch, info.state_revision))),
     }
 }
 
@@ -1285,6 +1388,22 @@ pub(in crate::server) struct HeldRekey {
     state_hash: String,
 }
 
+#[cfg(test)]
+impl HeldRekey {
+    pub(in crate::server) fn for_test(
+        group_id: &str,
+        author: x0x::identity::AgentId,
+        epoch: u64,
+    ) -> Self {
+        Self {
+            group_id: group_id.to_string(),
+            author,
+            epoch,
+            state_hash: String::new(),
+        }
+    }
+}
+
 /// The survivor side. An author's obligation to this
 /// daemon ends only on proof, and a survivor that applied the re-key but is
 /// quiet would otherwise prove nothing. So when the author itself, over a
@@ -1329,7 +1448,7 @@ pub(in crate::server) fn spawn_prove_held(state: &Arc<AppState>, held: HeldRekey
 ///   this copy is a duplicate);
 /// - after the apply, the author is an active member, not banned, with at
 ///   least the Admin role here, so a stranger, a removed member or a
-///   demoted admin learns nothing (N-1);
+///   demoted admin learns nothing;
 /// - this daemon's live tree is at or past the event's epoch;
 /// - no such request went for the room in the last [`HELD_PROOF_GAP`].
 pub(in crate::server) async fn prove_held(
@@ -1337,6 +1456,8 @@ pub(in crate::server) async fn prove_held(
     held: HeldRekey,
     applied: bool,
 ) -> bool {
+    #[cfg(test)]
+    super::detached_send_test_seam::park(&format!("prove-held:{}", held.group_id)).await;
     let local = hex::encode(state.agent.agent_id().as_bytes());
     let author_hex = hex::encode(held.author.as_bytes());
     let Some(group_key) = ({
@@ -1371,8 +1492,13 @@ pub(in crate::server) async fn prove_held(
     if tree.lock().await.epoch() < held.epoch {
         return false;
     }
-    {
-        let throttle_key = format!("{group_key}:rekey-held");
+    // The room's slot is taken only once a request is built, and given back
+    // when the send fails, so a failed try never mutes the next proof.
+    let Some(request) = signed_catchup::page_request(state, &group_key, None).await else {
+        return false;
+    };
+    let throttle_key = format!("{group_key}:rekey-held");
+    let stamped = {
         let mut throttle = state.treekem_catchup_throttle.write().await;
         if throttle
             .get(&throttle_key)
@@ -1380,10 +1506,9 @@ pub(in crate::server) async fn prove_held(
         {
             return false;
         }
-        super::stamp_catchup_throttle(&mut throttle, throttle_key, tokio::time::Instant::now());
-    }
-    let Some(request) = signed_catchup::page_request(state, &group_key, None).await else {
-        return false;
+        let now = tokio::time::Instant::now();
+        super::stamp_catchup_throttle(&mut throttle, throttle_key.clone(), now);
+        now
     };
     #[cfg(test)]
     state
@@ -1395,6 +1520,10 @@ pub(in crate::server) async fn prove_held(
             group_id = %LogHexId::group(&group_key),
             "re-key obligation: proving a held re-key to its author failed: {error}"
         );
+        let mut throttle = state.treekem_catchup_throttle.write().await;
+        if throttle.get(&throttle_key) == Some(&stamped) {
+            throttle.remove(&throttle_key);
+        }
     }
     true
 }
@@ -1427,7 +1556,7 @@ async fn payload(state: &AppState, attempt: &Attempt) -> Vec<NamedGroupMetadataE
             .collect()
     };
     events.sort_by_key(commit_bearing_event_sort_key);
-    // Review S-1: an unproven seat goes alone. A member that holds it asks
+    // An unproven seat goes alone. A member that holds it asks
     // for the rest itself, and one that never comes back costs one event.
     let limit = if attempt.seat { 1 } else { EVENTS_PER_ATTEMPT };
     let mut unique: Vec<NamedGroupMetadataEvent> = Vec::with_capacity(events.len());
@@ -1491,7 +1620,7 @@ async fn run_attempt(state: Arc<AppState>, attempt: Attempt) {
     let events = payload(&state, &attempt).await;
     // Survivor re-key A13: a seat the log no longer reaches, or whose Welcome
     // is no longer staged, cannot be delivered as it was; re-seat it.
-    // Review F-1: the first event must be the recipient's own seat; any
+    // The first event must be the recipient's own seat; any
     // other means the log lost it.
     let seat_lost = attempt.seat
         && match events.first() {
@@ -1512,14 +1641,21 @@ async fn run_attempt(state: Arc<AppState>, attempt: Attempt) {
             .await
             .unwrap_or(Outcome::Failed)
     };
-    let mut store = state.rekey_obligations.lock().await;
-    if outcome == Outcome::PayloadMissing {
-        store.say_payload_missing(&attempt);
-    }
-    let now_ms = store.clock.now_ms();
-    if store.finish(&attempt, outcome, now_ms) {
-        store.persist_or_warn("a delivered obligation").await;
-    }
+    // The send may be aborted at shutdown; the write it leads to runs
+    // shielded.
+    let book = Arc::clone(&state);
+    let _ = state
+        .run_shielded(async move {
+            let mut store = book.rekey_obligations.lock().await;
+            if outcome == Outcome::PayloadMissing {
+                store.say_payload_missing(&attempt);
+            }
+            let now_ms = store.clock.now_ms();
+            if store.finish(&attempt, outcome, now_ms) {
+                store.persist_or_warn("a delivered obligation").await;
+            }
+        })
+        .await;
 }
 
 /// Which survivors are linked right now.
@@ -1563,11 +1699,24 @@ async fn linked(state: &AppState, recipients: Vec<String>) -> Links {
 /// One worker step: drop what is no longer owed, then start the sends that
 /// are due. It never waits on a send.
 pub(in crate::server) async fn step(state: &Arc<AppState>) {
-    for attempt in begin_due(state).await {
+    // Selection and reconcile write the obligations and the seat pins, so
+    // they run shielded; the sends are detached.
+    let selecting = Arc::clone(state);
+    let Some(attempts) = state
+        .run_shielded(async move {
+            let attempts = begin_due(&selecting).await;
+            // A13: a seat that settled, or whose member left, unpins its
+            // Welcome.
+            super::seat_welcome_pin::reconcile(&selecting).await;
+            attempts
+        })
+        .await
+    else {
+        return;
+    };
+    for attempt in attempts {
         let _ = state.spawn_detached(run_attempt(Arc::clone(state), attempt));
     }
-    // A13: a seat that settled, or whose member left, unpins its Welcome.
-    super::seat_welcome_pin::reconcile(state).await;
 }
 
 /// The reconcile and selection half of [`step`].

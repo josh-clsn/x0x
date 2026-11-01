@@ -261,7 +261,7 @@ async fn decrypt_from_the_survivor_at_the_new_epoch_settles() -> Result<()> {
     let message = encrypt(&cast.s2, group_id, b"at the new epoch").await?;
     assert_eq!(owner_reads(owner, group_id, &message).await, StatusCode::OK);
     assert!(
-        owed(owner, group_id, &s2_hex(&cast)).await.is_none(),
+        eventually(|| async { owed(owner, group_id, &s2_hex(&cast)).await.is_none() }).await,
         "S2's message at the new epoch settles"
     );
     assert!(
@@ -645,7 +645,7 @@ async fn survivor_away_past_the_old_horizon_gets_the_key_from_the_obligation() -
     let message = encrypt(&cast.s1, group_id, b"back").await?;
     assert_eq!(owner_reads(owner, group_id, &message).await, StatusCode::OK);
     assert!(
-        owed(owner, group_id, &s1).await.is_none(),
+        eventually(|| async { owed(owner, group_id, &s1).await.is_none() }).await,
         "S1's message proves it"
     );
     cast.shutdown().await;
@@ -710,7 +710,9 @@ async fn survivor_away_with_the_remover_restarted_gets_the_key_from_another_surv
         owner_reads(&restarted, group_id, &message).await,
         StatusCode::OK
     );
-    assert!(owed(&restarted, group_id, &s1_hex(&cast)).await.is_none());
+    assert!(
+        eventually(|| async { owed(&restarted, group_id, &s1_hex(&cast)).await.is_none() }).await
+    );
     let groups = restarted.named_groups.read().await.clone();
     let loaded = load_rekey_obligations(
         &restarted.treekem_dir,
@@ -927,11 +929,25 @@ async fn a_silent_survivor_settles_without_user_traffic() -> Result<()> {
         "S1 got nothing and proved nothing"
     );
 
-    // Once per room per gap, and only for the author over a verified transport.
-    let held = rekey_obligations::held_rekey(&cast.s2, &removal, &owner_id, true)
-        .expect("the author's re-key, verified");
+    // The test transport failed that send, so the room's slot was given
+    // back. Once a send goes out, the next proof waits out the gap.
+    let sent = Arc::new(tokio::sync::Semaphore::new(16));
+    *cast
+        .s2
+        .named_group_test_recorders
+        .catchup_page_send_hold
+        .lock()
+        .unwrap() = Some(sent);
+    let held = || {
+        rekey_obligations::held_rekey(&cast.s2, &removal, &owner_id, true)
+            .expect("the author's re-key, verified")
+    };
     assert!(
-        !rekey_obligations::prove_held(&cast.s2, held, true).await,
+        rekey_obligations::prove_held(&cast.s2, held(), true).await,
+        "a failed send does not take the room's slot"
+    );
+    assert!(
+        !rekey_obligations::prove_held(&cast.s2, held(), true).await,
         "not again within the gap"
     );
     assert!(rekey_obligations::held_rekey(&cast.s2, &removal, &owner_id, false).is_none());
@@ -1081,6 +1097,111 @@ async fn a_held_rekey_is_proved_only_to_an_active_admin_after_an_apply_that_took
     let before = asked(&owner_id);
     assert!(rekey_obligations::prove_held(s2, held(&removal, &owner_id), false).await);
     assert_eq!(asked(&owner_id), before + 1, "the owner is answered");
+    cast.shutdown().await;
+    Ok(())
+}
+
+/// A member's reported head settles only at the epoch it was read with. A
+/// removal sealed between that read and the settle widens what is owed,
+/// and the survivor, which never saw it, stays owed.
+#[tokio::test]
+async fn a_reported_head_never_settles_a_rekey_sealed_after_its_read() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let owner = &cast.fixture.state;
+    let group_id = cast.fixture.group_id.clone();
+    let s1_id = cast.s1.agent.agent_id();
+    remove(&cast, &r_hex(&cast)).await;
+    let held = owner_state_hash(owner, &group_id).await;
+
+    let pause = super::super::detached_send_test_seam::arm(
+        &rekey_obligations::answer_head_seam_key(&group_id),
+    );
+    let answering = {
+        let (owner, group_id) = (Arc::clone(owner), group_id.clone());
+        tokio::spawn(async move {
+            handle_treekem_catchup_response(&owner, &s1_id, true, answer(&group_id, Some(held)))
+                .await;
+        })
+    };
+    assert!(
+        eventually(|| async { pause.reached() }).await,
+        "setup: the answer's head was read"
+    );
+    let second = remove(&cast, &s2_hex(&cast)).await;
+    let (epoch, _) = rekey_of(&second);
+    drop(pause);
+    answering.await?;
+    assert_eq!(
+        owed(owner, &group_id, &s1_hex(&cast))
+            .await
+            .map(|owed| owed.through_epoch),
+        Some(epoch),
+        "the survivor stays owed the removal sealed after its head was read"
+    );
+    cast.shutdown().await;
+    Ok(())
+}
+
+/// A request settles only when it names this daemon's live head. A replay
+/// of an earlier signed request, a signed request on another head at the
+/// same epoch, and a signed claim past the live epoch settle nothing; the
+/// survivor's own request from the live head does.
+#[tokio::test]
+async fn a_request_settles_only_on_the_live_head_it_names() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let owner = &cast.fixture.state;
+    let group_id = &cast.fixture.group_id;
+    let owner_id = owner.agent.agent_id();
+    let s2_id = cast.s2.agent.agent_id();
+    let first = remove(&cast, &r_hex(&cast)).await;
+    applies(&cast.s2, owner_id, &first).await;
+    let earlier = page_request(&cast.s2, group_id, None)
+        .await
+        .expect("S2 asks from the first re-key");
+    handle_treekem_catchup_request(owner, &s2_id, false, earlier.clone()).await;
+    assert!(
+        eventually(|| async { owed(owner, group_id, &s2_hex(&cast)).await.is_none() }).await,
+        "control: the request from the live head settles"
+    );
+
+    // The owner removes S1: S2 is owed again.
+    let second = remove(&cast, &s1_hex(&cast)).await;
+    let before = owed(owner, group_id, &s2_hex(&cast))
+        .await
+        .expect("owed the second re-key");
+    let (epoch, revision) = rekey_of(&second);
+
+    // A replay of S2's earlier signed request.
+    handle_treekem_catchup_request(owner, &s2_id, false, earlier.clone()).await;
+    // A signed request at the live epoch and revision on another head.
+    let mut diverged = earlier.clone();
+    diverged.from_treekem_epoch = epoch;
+    diverged.from_revision = revision;
+    diverged.current_state_hash = "ab".repeat(32);
+    sign_page_request(&cast.s2, &mut diverged);
+    handle_treekem_catchup_request(owner, &s2_id, false, diverged).await;
+    // A signed claim past the live epoch.
+    let mut ahead = earlier;
+    ahead.from_treekem_epoch = epoch + 1;
+    ahead.from_revision = revision + 1;
+    sign_page_request(&cast.s2, &mut ahead);
+    handle_treekem_catchup_request(owner, &s2_id, false, ahead).await;
+    assert!(super::rekey_obligations::settles_done(owner).await);
+    assert_eq!(
+        owed(owner, group_id, &s2_hex(&cast)).await,
+        Some(before),
+        "a replay, a diverged head and a claim past the live epoch settle nothing"
+    );
+
+    applies(&cast.s2, owner_id, &second).await;
+    let live = page_request(&cast.s2, group_id, None)
+        .await
+        .expect("S2 asks from the live head");
+    handle_treekem_catchup_request(owner, &s2_id, false, live).await;
+    assert!(
+        eventually(|| async { owed(owner, group_id, &s2_hex(&cast)).await.is_none() }).await,
+        "the request from the live head settles"
+    );
     cast.shutdown().await;
     Ok(())
 }

@@ -50,6 +50,7 @@ pub(super) fn page_request_sign_input(
     from_epoch: u64,
     limit: usize,
     head_challenge: Option<&str>,
+    current_state_hash: &str,
 ) -> Vec<u8> {
     let mut input = Vec::with_capacity(PAGE_REQUEST_DOMAIN.len() + 256);
     push_field(&mut input, PAGE_REQUEST_DOMAIN.as_bytes());
@@ -65,6 +66,9 @@ pub(super) fn page_request_sign_input(
             push_field(&mut input, challenge.as_bytes());
         }
     }
+    // The requester's head, so a request that settles a re-key obligation
+    // names the head it holds, not an epoch number alone.
+    push_field(&mut input, current_state_hash.as_bytes());
     input
 }
 
@@ -76,6 +80,7 @@ fn request_sign_input(request: &TreeKemCatchupRequest) -> Vec<u8> {
         request.from_treekem_epoch,
         request.limit,
         request.head_challenge.as_deref(),
+        &request.current_state_hash,
     )
 }
 
@@ -294,25 +299,26 @@ mod tests {
 
     #[test]
     fn the_sign_input_names_its_domain_and_every_field() {
-        let base = page_request_sign_input("g", "r", 1, 2, 1, None);
+        let base = page_request_sign_input("g", "r", 1, 2, 1, None, "s");
         assert!(base
             .windows(PAGE_REQUEST_DOMAIN.len())
             .any(|window| window == PAGE_REQUEST_DOMAIN.as_bytes()));
         for other in [
-            page_request_sign_input("h", "r", 1, 2, 1, None),
-            page_request_sign_input("g", "s", 1, 2, 1, None),
-            page_request_sign_input("g", "r", 9, 2, 1, None),
-            page_request_sign_input("g", "r", 1, 9, 1, None),
-            page_request_sign_input("g", "r", 1, 2, 0, None),
-            page_request_sign_input("g", "r", 1, 2, 1, Some("")),
-            page_request_sign_input("g", "r", 1, 2, 1, Some("n")),
+            page_request_sign_input("h", "r", 1, 2, 1, None, "s"),
+            page_request_sign_input("g", "s", 1, 2, 1, None, "s"),
+            page_request_sign_input("g", "r", 9, 2, 1, None, "s"),
+            page_request_sign_input("g", "r", 1, 9, 1, None, "s"),
+            page_request_sign_input("g", "r", 1, 2, 0, None, "s"),
+            page_request_sign_input("g", "r", 1, 2, 1, Some(""), "s"),
+            page_request_sign_input("g", "r", 1, 2, 1, Some("n"), "s"),
+            page_request_sign_input("g", "r", 1, 2, 1, None, "t"),
         ] {
             assert_ne!(base, other);
         }
         // Moving bytes between fields changes the encoding.
         assert_ne!(
-            page_request_sign_input("ab", "c", 1, 2, 1, None),
-            page_request_sign_input("a", "bc", 1, 2, 1, None)
+            page_request_sign_input("ab", "c", 1, 2, 1, None, "s"),
+            page_request_sign_input("a", "bc", 1, 2, 1, None, "s")
         );
     }
 

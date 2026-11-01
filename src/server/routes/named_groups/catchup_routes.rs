@@ -778,11 +778,11 @@ pub(in crate::server) async fn treekem_head_proof_sign(
         )
         .respond();
     }
-    // Survivor re-key A10: the requester signed its head, so it holds that
-    // epoch, and this daemon's obligation to it is settled as far.
-    // It runs in its own task, so the relay leg's answer never waits on it.
-    if let Some(proof) = rekey_obligations::request_proof(&request, false) {
-        rekey_obligations::spawn_settle(&state, vec![id.clone()], proof);
+    // Survivor re-key A10: the requester signed its head; when that is this
+    // daemon's live head, what is owed to it is settled. It runs in its own
+    // task, so the relay leg's answer never waits on it.
+    if let Some(head) = rekey_obligations::request_head(&request, false) {
+        rekey_obligations::spawn_settle_request(&state, vec![id.clone()], head);
     }
     match head_proof::answer_challenge(&state, &challenge).await {
         Ok(proof) => (
