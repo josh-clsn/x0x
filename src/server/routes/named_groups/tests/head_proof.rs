@@ -1534,6 +1534,10 @@ async fn a_cached_or_pre_apply_head_proof_does_not_end_the_startup_wait() -> Res
         leaver_leaf_live(&cast).await,
         "a cached proof for an earlier ask does not end the wait"
     );
+    assert!(
+        !head_rounds::startup_admin_head_matches(&cast.state, &group_id, &a_hex).await,
+        "the cached proof does not count for the latest ask"
+    );
 
     // A moved on: its fresh proof names the head before its removal of R2,
     // and the page carries that removal.
@@ -1630,5 +1634,58 @@ async fn a_silent_admin_ends_the_startup_wait_at_the_send_budget() -> Result<()>
     assert_eq!(distinct.len(), 3, "every ask's challenge is fresh");
     state.shutdown_notify.send_replace(true);
     state.agent.shutdown().await;
+    Ok(())
+}
+
+/// A later page from an admin that carries no proof never counts a proof
+/// recorded from an earlier response: the head this member reached since
+/// may no longer be the admin's.
+#[tokio::test]
+async fn a_proofless_admin_page_does_not_count_an_earlier_proof() -> Result<()> {
+    let mut cast = startup_with_live_admin(&"da".repeat(16)).await?;
+    let group_id = cast.group_id.clone();
+    let a_id = cast.a.agent_id();
+    startup_self_leave_rekey(&cast.state).await;
+
+    // A's proof for the latest ask names H1, the head after its removal of
+    // R2. This member is still before it, so the proof does not match.
+    let removal = admin_removes_r2(&mut cast).await?;
+    let h1 = cast.a_tree.head()?;
+    let proof = witness_proof(&cast.state, &group_id, &cast.a, h1).await;
+    handle_treekem_catchup_response(
+        &cast.state,
+        &a_id,
+        true,
+        super::super::head_proof::proof_only_response(&group_id, proof),
+    )
+    .await;
+    assert!(
+        leaver_leaf_live(&cast).await,
+        "setup: the proof does not match yet"
+    );
+
+    // This member reaches H1 by gossip, then gets an empty page from A.
+    let applied = apply_named_group_metadata_event(&cast.state, removal, a_id, true, None).await;
+    assert!(applied.accepted, "setup: the removal applies: {applied:?}");
+    assert_eq!(local_head(&cast.state, &group_id).await, h1);
+    let empty = TreeKemCatchupResponse {
+        message_type: "treekem_catchup_response".to_string(),
+        group_id: group_id.clone(),
+        events: Vec::new(),
+        truncated: false,
+        responder_state_hash: None,
+        log_evicted_through: None,
+        target_member_id: None,
+        target_member_key_package_b64: None,
+        signed_by: None,
+        head_proof: None,
+    };
+    handle_treekem_catchup_response(&cast.state, &a_id, true, empty).await;
+    assert!(
+        leaver_leaf_live(&cast).await,
+        "an admin's proofless page does not count the earlier proof"
+    );
+    cast.state.shutdown_notify.send_replace(true);
+    cast.state.agent.shutdown().await;
     Ok(())
 }

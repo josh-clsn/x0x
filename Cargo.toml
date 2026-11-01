@@ -111,7 +111,7 @@ optional = true
 
 [features]
 # Test-rig seams for multi-daemon drills (the head-proof inflate knob).
-# Never enabled in a release build.
+# Debug builds only: a non-debug build with it fails to compile.
 test-rig = []
 # Private debug fixtures only; never permitted in a non-debug build.
 upgrade-test-signing = ["dep:fips204"]

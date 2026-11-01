@@ -72,6 +72,9 @@ const CHALLENGE_COUNTER_HEX: usize = 16;
 /// exactly `1`, this daemon signs its head proofs with the live epoch plus
 /// one and a random authenticator, playing a removed admin running a
 /// modified app. Absent from production builds; read once per process.
+#[cfg(all(feature = "test-rig", not(debug_assertions)))]
+compile_error!("test-rig requires debug_assertions");
+
 #[cfg(any(test, feature = "test-rig"))]
 pub(in crate::server) const INFLATE_KNOB: &str = "X0X_TEST_HEAD_PROOF_INFLATE";
 
@@ -301,7 +304,8 @@ pub(in crate::server) enum Refusal {
 /// A head challenge its requester signed: built only from a page request
 /// whose signature verifies for its claimed requester over the group, the
 /// requester, the head and the challenge (A5's page-request signature). So
-/// only the requester itself can move its floor at an admin, whatever the transport or the route.
+/// only the requester itself can move its floor at an admin, whatever the
+/// transport or the route.
 #[derive(Debug, Clone)]
 pub(in crate::server) struct SignedChallenge {
     group_id: String,

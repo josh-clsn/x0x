@@ -12499,11 +12499,9 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     } else {
         // Record this peer even when another peer's page stream is open.
         // The aggregate fence still decides whether this pass may seal. An
-        // admin's unsigned head is no evidence (A6): it counts only through
-        // its signed head proof.
-        if sender_is_admin {
-            let _ = self_leave_startup_note_admin_head(state, &fence_ids, &sender_hex).await;
-        } else {
+        // admin counts only through a proof this response carried, already
+        // weighed by `note_startup_proof`; its unsigned head is no evidence.
+        if !sender_is_admin {
             self_leave_startup_note_verified_head(
                 state,
                 &fence_ids,
@@ -16991,8 +16989,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 // PRE-MUTATION point — `next` already holds the re-admitted
                 // seat, `expected2` is the TreeKEM epoch the terminal
                 // `MemberAdded` carries, and nothing is sealed or persisted
-                // yet; the add's binding names it. An owner-axis group whose re-key event carries no
-                // mandate is refused by every enforcing member, and the
+                // yet; the add's binding names it. An owner-axis group whose
+                // re-key event carries no mandate is refused by every enforcing member, and the
                 // refusal is silent to the returning member: it never gets
                 // its seat back.
                 let rekey_owner_mandate = mint_owner_mandate_for_seat(
@@ -27160,11 +27158,9 @@ async fn startup_peer_admins(state: &AppState, group_key: &str) -> HashSet<Strin
         .unwrap_or_default()
 }
 
-/// Survivor re-key A6 (#1406 ruling): an admin ends this member's startup
-/// wait only through a head proof it signed for this member's challenge,
-/// naming the head this member's tree holds now.
-/// Weigh a recorded startup proof against the head this member holds now,
-/// and seal when it ends the wait.
+/// Weigh a startup proof this response carried against the head this
+/// member holds now, after the response applied, and seal when it ends the
+/// wait.
 pub(in crate::server) async fn note_startup_proof(
     state: &Arc<AppState>,
     group_id: &str,
@@ -27180,6 +27176,9 @@ pub(in crate::server) async fn note_startup_proof(
     }
 }
 
+/// An admin ends this member's startup wait only through a head proof it
+/// signed for this member's latest challenge, naming the head this
+/// member's tree holds now (survivor re-key A6, the #1406 ruling).
 async fn self_leave_startup_note_admin_head(
     state: &AppState,
     group_ids: &[String],
