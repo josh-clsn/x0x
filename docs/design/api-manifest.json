@@ -1706,6 +1706,12 @@
             "required": false
           },
           {
+            "cli": "default",
+            "in": "body",
+            "name": "single_publish",
+            "required": false
+          },
+          {
             "cli": "ignored",
             "in": "body",
             "name": "require_gossip_ack",

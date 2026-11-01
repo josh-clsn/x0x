@@ -1355,6 +1355,9 @@ enum DirectSub {
         /// (diagnostic toggle for the transport-selection matrix).
         #[arg(long)]
         require_gossip: bool,
+        /// Make at most one gossip publish on the inbox topic for this send.
+        #[arg(long)]
+        single_publish: bool,
         /// Opt out of ADR 0030 durable delivery: succeed as soon as the
         /// recipient accepts the envelope, instead of requiring proof it was
         /// durably committed. Use to reach a peer that has not upgraded —
@@ -2821,6 +2824,7 @@ async fn run(
                 raw_quic_receive_ack_ms,
                 stop_fallback_on_raw_error,
                 require_gossip,
+                single_publish,
                 no_durable_ack,
                 logical_id,
             } => {
@@ -2833,6 +2837,7 @@ async fn run(
                     raw_quic_receive_ack_ms,
                     stop_fallback_on_raw_error,
                     require_gossip,
+                    single_publish,
                     !no_durable_ack,
                     logical_id.as_deref(),
                 )

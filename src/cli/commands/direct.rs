@@ -36,6 +36,7 @@ pub async fn send(
     raw_quic_receive_ack_ms: Option<u64>,
     stop_fallback_on_raw_error: bool,
     require_gossip: bool,
+    single_publish: bool,
     require_durable_app_ack: bool,
     logical_id: Option<&str>,
 ) -> Result<()> {
@@ -62,6 +63,9 @@ pub async fn send(
     }
     if require_gossip {
         body["require_gossip"] = serde_json::json!(true);
+    }
+    if single_publish {
+        body["single_publish"] = serde_json::json!(true);
     }
     if let Some(logical_id) = logical_id {
         body["logical_id"] = serde_json::json!(logical_id);
@@ -151,6 +155,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             true,
             None,
         )
@@ -170,6 +175,7 @@ mod tests {
             Some(500),
             None,
             None,
+            false,
             false,
             false,
             true,
@@ -203,6 +209,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             None,
         )
         .await
@@ -217,6 +224,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             None,
         )
         .await
@@ -228,6 +236,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             false,
             false,
             false,
@@ -286,6 +295,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             true,
             Some("order-7"),
         )
@@ -298,6 +308,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             false,
             false,
             false,
