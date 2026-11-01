@@ -6940,6 +6940,31 @@ fn direct_ack_sender_key(
     })
 }
 
+/// ADR 0115 §2: the two authority records for one sender, as the direct
+/// listener reads them for each frame: its announced-binding record and its
+/// authenticated binding (the pin input to `confirms`). The listener's own
+/// delivery check and the Direct ACK check both take them from here.
+#[derive(Clone, Copy)]
+struct DirectAuthorityRecords {
+    announced: Option<dm_inbox::AuthenticatedMachineBinding>,
+    attested: Option<dm_inbox::AuthenticatedMachineBinding>,
+}
+
+async fn direct_authority_records(
+    announced_store: &dm_inbox::AuthenticatedMachineBindings,
+    attested_store: &dm_inbox::AuthenticatedMachineBindings,
+    sender: &identity::AgentId,
+) -> DirectAuthorityRecords {
+    // Select one authoritative binding and its expiry for both delivery
+    // verification and the runtime expiry gate (#1098).
+    let attested = dm_inbox::authenticated_machine_binding_evidence(attested_store, sender).await;
+    let announced = announced_store.read().await.peek(sender);
+    DirectAuthorityRecords {
+        announced,
+        attested,
+    }
+}
+
 /// Survivor re-key A14: the key a Direct ACK envelope from `sender`, over a
 /// connection from `machine`, is checked against. ADR 0115 authority must
 /// confirm `sender` on `machine` first (`identity_authority::confirms`,
@@ -6950,19 +6975,21 @@ fn direct_ack_sender_key(
 /// discovery entry's `agent_public_key` (a class A/B field), the evidence
 /// key and the key that verified the sender's live capability advert that
 /// derives to `sender`.
-#[allow(clippy::too_many_arguments)]
 async fn direct_ack_verifying_key(
     discovery_cache: &tokio::sync::RwLock<
         std::collections::HashMap<identity::AgentId, DiscoveredAgent>,
     >,
     evidence: Option<&peer_evidence::EvidenceRuntime>,
     adverts: &dm_capability::CapabilityStore,
-    announced: Option<dm_inbox::AuthenticatedMachineBinding>,
-    attested: Option<dm_inbox::AuthenticatedMachineBinding>,
+    records: DirectAuthorityRecords,
     sender: identity::AgentId,
     machine: identity::MachineId,
 ) -> Option<Vec<u8>> {
     let now_ms = dm_capability::now_unix_ms();
+    let DirectAuthorityRecords {
+        announced,
+        attested,
+    } = records;
     let confirmed = identity_authority::confirms(machine, announced, attested, || {
         evidence.is_some_and(|evidence| evidence.confirms_pairing(sender, machine, now_ms))
     });
@@ -10441,7 +10468,7 @@ impl Agent {
                         lifecycle_hint,
                     )
                     .await;
-                    // Survivor re-key A12: how long v1 ACK waits cost, and how
+                    // Survivor re-key A14: how long v1 ACK waits cost, and how
                     // many end without the ACK (`/diagnostics/dm`).
                     if config.require_gossip_ack && !config.require_durable_app_ack {
                         self.direct_messaging.record_v1_ack_wait(
@@ -19180,13 +19207,6 @@ impl Agent {
         &self.capability_store.evidence
     }
 
-    /// Start the direct message listener background task.
-    ///
-    /// This task reads raw direct messages from the network layer and
-    /// dispatches them to `DirectMessaging::handle_incoming()`, which
-    /// fans out to all `subscribe_direct()` receiver queues.
-    ///
-    /// Called automatically by [`Agent::join_network`].
     /// Survivor re-key A14 tests: the key a Direct ACK from `sender` over
     /// `machine` would be checked against, from this agent's live stores.
     #[cfg(test)]
@@ -19195,8 +19215,8 @@ impl Agent {
         sender: identity::AgentId,
         machine: identity::MachineId,
     ) -> Option<Vec<u8>> {
-        let announced = self.announced_machine_bindings.read().await.peek(&sender);
-        let attested = dm_inbox::authenticated_machine_binding_evidence(
+        let records = direct_authority_records(
+            &self.announced_machine_bindings,
             &self.authenticated_machine_bindings,
             &sender,
         )
@@ -19205,14 +19225,20 @@ impl Agent {
             &self.identity_discovery_cache,
             Some(&self.capability_store.evidence),
             &self.capability_store,
-            announced,
-            attested,
+            records,
             sender,
             machine,
         )
         .await
     }
 
+    /// Start the direct message listener background task.
+    ///
+    /// This task reads raw direct messages from the network layer and
+    /// dispatches them to `DirectMessaging::handle_incoming()`, which
+    /// fans out to all `subscribe_direct()` receiver queues.
+    ///
+    /// Called automatically by [`Agent::join_network`].
     fn start_direct_listener(&self) {
         if self
             .direct_listener_started
@@ -19304,16 +19330,15 @@ impl Agent {
                     digest = %digest,
                 );
 
-                // Select one authoritative binding and its expiry for both
-                // delivery verification and the runtime expiry gate (#1098).
-                let registry = crate::dm_inbox::authenticated_machine_binding_evidence(
+                // ADR 0115 §2: the routing entry stands for the
+                // sender only when an authority store confirms its machine.
+                let records = direct_authority_records(
+                    &announced_for_direct,
                     &authenticated_machine_bindings,
                     &sender,
                 )
                 .await;
-                // ADR 0115 §2: the routing entry stands for the
-                // sender only when an authority store confirms its machine.
-                let announced = announced_for_direct.read().await.peek(&sender);
+                let (announced, registry) = (records.announced, records.attested);
                 let (verified, live_verified, cert_not_after) = {
                     let cache = discovery_cache.read().await;
                     let entry = cache.get(&sender).filter(|entry| {
@@ -19458,8 +19483,7 @@ impl Agent {
                             &discovery_cache,
                             evidence_ready.then_some(&*evidence),
                             &advert_keys,
-                            announced,
-                            registry,
+                            records,
                             sender,
                             machine_id,
                         )

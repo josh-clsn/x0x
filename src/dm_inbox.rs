@@ -801,12 +801,10 @@ impl DmInboxService {
         } else {
             Some(pubsub.subscribe(DM_BUS_TOPIC.to_string()).await)
         };
-        // Survivor re-key A14: a leaf's v1 ACK gets the same Direct hedge.
-        let v1_direct_hedge = if skip_legacy_bus {
-            direct_hedge.clone()
-        } else {
-            None
-        };
+        // Survivor re-key A14: a leaf's v1 ACK gets the same Direct hedge,
+        // through its own bounded publisher that the inbox's abort stops.
+        let (v1_direct_hedge, v1_hedge_worker) =
+            spawn_v1_ack_hedge_publisher(skip_legacy_bus.then(|| direct_hedge.clone()).flatten());
         let (ack_publisher, ack_worker) = spawn_durable_ack_publisher(
             Arc::clone(&pubsub),
             Arc::clone(&dm),
@@ -856,6 +854,7 @@ impl DmInboxService {
             // route publications. A graceful channel close drains them.
             handles: {
                 handles.push(ack_worker);
+                handles.extend(v1_hedge_worker);
                 handles
             },
             topic,
@@ -950,6 +949,32 @@ fn spawn_durable_ack_publisher(
         }
     });
     (AckPublisherHandle { sender }, worker)
+}
+
+/// How long one v1 ACK Direct hedge may wait on its send.
+const V1_ACK_HEDGE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Survivor re-key A14: the leaf's v1 ACK Direct hedge, bounded as the
+/// durable publisher is (its queue, its concurrency cap, the inbox's abort)
+/// and each send under [`V1_ACK_HEDGE_TIMEOUT`]. `None` without a hedge.
+fn spawn_v1_ack_hedge_publisher(
+    hedge: Option<Arc<dyn DirectAckHedge>>,
+) -> (Option<AckPublisherHandle>, Option<JoinHandle<()>>) {
+    let Some(hedge) = hedge else {
+        return (None, None);
+    };
+    let (sender, receiver) = mpsc::channel(DURABLE_ACK_QUEUE_CAPACITY);
+    let worker = spawn_ack_publish_worker(receiver, move |job| {
+        let hedge = Arc::clone(&hedge);
+        async move {
+            let _ = tokio::time::timeout(
+                V1_ACK_HEDGE_TIMEOUT,
+                hedge.hedge(job.recipient, job.encoded),
+            )
+            .await;
+        }
+    });
+    (Some(AckPublisherHandle { sender }), Some(worker))
 }
 
 /// Generic over the publish closure so the worker's queue and concurrency
@@ -1281,7 +1306,7 @@ pub(crate) struct InboxPipeline {
     /// inbox topic that a non-forwarding leaf bystander refuses (#380 C0,
     /// x0x#1455). The same live Direct hedge the durable path uses then
     /// carries it too, in its own task. `None` keeps v1 exactly as it was.
-    v1_direct_hedge: Option<Arc<dyn DirectAckHedge>>,
+    v1_direct_hedge: Option<AckPublisherHandle>,
 }
 
 impl InboxPipeline {
@@ -2727,10 +2752,13 @@ impl InboxPipeline {
             // and a refused gossip frame no longer costs the sender its whole
             // ACK budget. Direct send-ok is never a receipt: the sender's
             // waiter completes only when the envelope itself arrives.
-            if let Some(hedge) = self.v1_direct_hedge.clone() {
-                let hedged = Bytes::from(encoded.clone());
-                tokio::spawn(async move {
-                    let _ = hedge.hedge(to, hedged).await;
+            if let Some(hedge) = self.v1_direct_hedge.as_ref() {
+                // A full queue drops the hedge; the gossip ACK still goes.
+                let _ = hedge.try_publish(AckPublishJob {
+                    recipient: to,
+                    acked_request_id: acks_request_id,
+                    protocol_version,
+                    encoded: Bytes::from(encoded.clone()),
                 });
             }
             // Preserve v1 otherwise: target first, and only publish back on the
@@ -2998,12 +3026,8 @@ mod tests {
                 .expect("insert machine revocation");
         }
 
-        // Survivor re-key A14: a leaf's v1 ACK gets the same Direct hedge.
-        let v1_direct_hedge = if skip_legacy_bus {
-            direct_hedge.clone()
-        } else {
-            None
-        };
+        let (v1_direct_hedge, _v1_hedge_worker) =
+            spawn_v1_ack_hedge_publisher(skip_legacy_bus.then(|| direct_hedge.clone()).flatten());
         let (ack_publisher, ack_worker) = spawn_durable_ack_publisher(
             Arc::clone(&pubsub),
             Arc::clone(&dm),

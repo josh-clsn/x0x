@@ -190,6 +190,149 @@ async fn a_leaf_v1_ack_reaches_the_sender_over_direct_when_its_gossip_frame_is_l
     }
 }
 
+/// WHY (A14, ADR 0115): the listener's own Direct ACK path drops an ACK
+/// from a pair no authority store confirms, and counts it.
+#[tokio::test]
+async fn a_direct_ack_from_an_unconfirmed_pair_is_dropped_and_counted() {
+    let dir = tempfile::tempdir().expect("fixture directory");
+    let sender = leaf(dir.path(), "sender").await;
+    let recipient = leaf(dir.path(), "recipient").await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        for agent in [&sender, &recipient] {
+            let kem = std::sync::Arc::new(
+                groups::kem_envelope::AgentKemKeypair::generate().expect("real KEM"),
+            );
+            agent
+                .start_dm_inbox(kem, dm_inbox::DmInboxConfig::default())
+                .await
+                .expect("real inbox");
+            agent.join_network().await.expect("join actual runtime");
+        }
+        let addr = recipient
+            .network()
+            .expect("network")
+            .bound_addr()
+            .await
+            .expect("bound address");
+        tokio::time::timeout(PHASE, sender.network().expect("network").connect_addr(addr))
+            .await
+            .expect("connect deadline")
+            .expect("real connect");
+        for agent in [&sender, &recipient] {
+            agent
+                .gossip_runtime
+                .as_ref()
+                .expect("runtime")
+                .pubsub()
+                .refresh_topic_peers()
+                .await;
+        }
+
+        // The sender learns the recipient's gossip-inbox capability.
+        let ready = recipient.current_dm_capabilities();
+        assert!(ready.gossip_inbox);
+        let signing = gossip::SigningContext::from_keypair(recipient.identity.agent_keypair());
+        let advert = dm_capability_service::build_signed_advert(
+            &signing,
+            recipient.agent_id(),
+            recipient.machine_id(),
+            ready,
+        )
+        .expect("signed advert");
+        let learned = || {
+            sender
+                .capability_store
+                .lookup_binding(&recipient.agent_id())
+                .is_some_and(|binding| binding.capabilities.gossip_inbox)
+        };
+        tokio::time::timeout(PHASE, async {
+            while !learned() {
+                recipient
+                    .publish(dm_capability::DM_CAPABILITY_TOPIC, advert.clone())
+                    .await
+                    .expect("own advert publish");
+                tokio::time::sleep(Duration::from_millis(400)).await;
+            }
+        })
+        .await
+        .expect("sender learns the recipient's capability");
+
+        dm_inbox::V1_GOSSIP_ACK_DROPPED_FROM
+            .lock()
+            .expect("drop list")
+            .push(recipient.agent_id());
+        // The leaf never announces: no authority store confirms it on its
+        // machine.
+        assert!(
+            !sender
+                .identity_discovery_cache
+                .read()
+                .await
+                .contains_key(&recipient.agent_id()),
+            "the sender never heard the leaf announce"
+        );
+
+        let before = sender.direct_messaging().diagnostics_snapshot().stats;
+        let mut inbox = recipient.subscribe_direct();
+        let payload = b"v1 dm to a leaf whose gossip ack is lost".to_vec();
+        let sent = tokio::time::timeout(
+            PHASE,
+            sender.send_direct_with_config(
+                &recipient.agent_id(),
+                payload.clone(),
+                dm::DmSendConfig {
+                    timeout_per_attempt: Duration::from_secs(2),
+                    max_retries: 0,
+                    require_gossip: true,
+                    require_gossip_ack: true,
+                    require_durable_app_ack: false,
+                    ..dm::DmSendConfig::default()
+                },
+            ),
+        )
+        .await
+        .expect("the send ends within its own budget");
+        assert!(sent.is_err(), "no ACK verifies: {sent:?}");
+
+        let delivered = tokio::time::timeout(PHASE, async {
+            loop {
+                let message = inbox.recv().await.expect("delivery channel open");
+                if message.payload == payload {
+                    return message;
+                }
+            }
+        })
+        .await
+        .expect("the recipient receives the DM");
+        assert_eq!(delivered.sender, sender.agent_id());
+
+        let dropped = tokio::time::timeout(PHASE, async {
+            loop {
+                let after = sender.direct_messaging().diagnostics_snapshot().stats;
+                if after.direct_ack_dropped_no_key > before.direct_ack_dropped_no_key {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(
+            dropped.is_ok(),
+            "the leaf's Direct ACK, from a pair no authority confirms, is dropped and counted"
+        );
+    })
+    .catch_unwind()
+    .await;
+    if let Ok(mut dropped) = dm_inbox::V1_GOSSIP_ACK_DROPPED_FROM.lock() {
+        dropped.retain(|agent| *agent != recipient.agent_id());
+    }
+    sender.shutdown().await;
+    recipient.shutdown().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 fn keypair_key(keypair: &identity::AgentKeypair) -> Vec<u8> {
     keypair.public_key().as_bytes().to_vec()
 }
