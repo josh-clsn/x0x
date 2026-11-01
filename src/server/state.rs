@@ -1281,6 +1281,9 @@ pub(super) struct AppState {
     /// arrival pulls once more.
     pub(super) treekem_package_repulls:
         StdMutex<crate::server::routes::named_groups::PackageRepulls>,
+    /// Survivor re-key A5: which members this daemon asked about a hole
+    /// after its head, per room, and when it may ask each again.
+    pub(super) treekem_gap_asks: StdMutex<crate::server::routes::named_groups::GapAsks>,
     /// Per-group serialization for authoritative membership mutations. The
     /// owner-side `MemberJoined`→`MemberAdded` add (and every other membership
     /// apply) is a read-modify-write that loads `info`, mutates a clone, mutates
@@ -1585,6 +1588,9 @@ pub(super) struct NamedGroupTestRecorders {
     pub(super) catchup_page_force_ok: std::sync::atomic::AtomicBool,
     /// Pages `handle_treekem_catchup_request` built, including a cold log.
     pub(super) catchup_responses: StdMutex<Vec<Vec<u8>>>,
+    /// Survivor re-key A5: every page request this daemon sent, as
+    /// `(peer hex, exact payload)`, recorded before the send.
+    pub(super) catchup_page_requests: StdMutex<Vec<(String, Vec<u8>)>>,
     /// Survivor re-key A1: the next `seal_commit_owner_certified` fails, so
     /// a test can check the tree is rolled back after a mutate-then-seal.
     pub(super) seal_force_err: std::sync::atomic::AtomicBool,

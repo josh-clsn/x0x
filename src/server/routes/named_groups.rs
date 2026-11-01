@@ -6,10 +6,12 @@
 //! Extracted verbatim from `src/server/mod.rs` as part of the #125 / WS1.4
 //! server decomposition. The router registrations stay in the parent module.
 
+mod catchup_page_gap;
 mod committer_leaf;
 mod control_blob;
 mod direct_metadata_lanes;
 mod event_log_store;
+pub(in crate::server) use catchup_page_gap::GapAsks;
 pub(in crate::server) use committer_leaf::PackageRepulls;
 use event_log_store::{
     commit_bearing_event_frontier, commit_bearing_event_sort_key, remember_commit_bearing_event,
@@ -18,6 +20,7 @@ pub(in crate::server) use event_log_store::{load_event_log, EventLog};
 mod fair_admission;
 mod join_result_pins;
 mod seat_cert_fetch;
+mod signed_catchup;
 mod signer_delivery;
 mod treekem_binding;
 mod welcome_acks;
@@ -1362,6 +1365,11 @@ pub(in crate::server) struct TreeKemCatchupRequest {
     /// any discovery state. `#[serde(default)]` keeps old peers parseable.
     #[serde(default)]
     signed_by: Option<CatchupSigner>,
+    /// Survivor re-key A5: a fresh challenge for the responder's head
+    /// proof (A6 gives it its meaning). A page request's signature covers
+    /// it (`signed_catchup::page_request_sign_input`). Old peers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    head_challenge: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1377,8 +1385,11 @@ pub(in crate::server) struct TreeKemCatchupResponse {
     responder_state_hash: Option<String>,
     /// Survivor re-key A4: the responder's log no longer holds the events
     /// at or below this revision, which it dropped to stay within a cap.
-    /// Set, with no events, when the requester is behind it: a page from
-    /// this responder would have a hole. Old peers ignore it.
+    /// A5: or never held them, because the first event it holds past the
+    /// requester's revision is later than the next one. Set, with no
+    /// events, when the requester is behind it: a page from this responder
+    /// would have a hole, so the requester asks another member. Old peers
+    /// ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     log_evicted_through: Option<u64>,
     /// #398: which member `target_member_key_package_b64` belongs to — an
@@ -10404,9 +10415,9 @@ async fn request_treekem_catchup_for_gap(
             {
                 continue;
             }
-            throttle.insert(throttle_key, tokio::time::Instant::now());
+            stamp_catchup_throttle(&mut throttle, throttle_key, tokio::time::Instant::now());
         }
-        let request = TreeKemCatchupRequest {
+        let mut request = TreeKemCatchupRequest {
             message_type: "treekem_catchup_request".to_string(),
             group_id: group_id.to_string(),
             requester_agent_id: local_agent_hex.clone(),
@@ -10417,19 +10428,12 @@ async fn request_treekem_catchup_for_gap(
             target_member_id: None,
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
             signed_by: None,
+            head_challenge: None,
         };
-        let payload = match serde_json::to_vec(&request) {
-            Ok(payload) => payload,
-            Err(e) => {
-                tracing::warn!(group_id = %LogHexId::group(&group_id), "failed to serialize TreeKEM catch-up request: {e}");
-                continue;
-            }
-        };
-        if let Err(e) = state
-            .agent
-            .send_direct_with_config(&peer, payload, named_group_direct_delivery_config())
-            .await
-        {
+        // Survivor re-key A5: signed, for a responder that cannot verify
+        // this member's transport.
+        signed_catchup::sign_page_request(state, &mut request);
+        if let Err(e) = signed_catchup::send_page_request(state, &peer, request).await {
             tracing::debug!(group_id = %group_id, peer = %peer_hex, "TreeKEM catch-up request failed: {e}");
         }
     }
@@ -11599,7 +11603,11 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
             ),
             _ => false,
         };
-    if !verified && !member_keyed_signed_ok {
+    // Survivor re-key A5: a page request proves its origin the same way,
+    // over its own domain and frontier. Checked before the #378 throttle,
+    // so a forged request cannot use up a member's window.
+    let page_signed_ok = !verified && signed_catchup::page_request_signed(&request);
+    if !verified && !member_keyed_signed_ok && !page_signed_ok {
         return;
     }
     let sender_hex = hex::encode(sender.as_bytes());
@@ -11773,62 +11781,62 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         "serve:{}:{}:{}:{}",
         request.group_id, sender_hex, request.from_revision, request.from_treekem_epoch
     );
+    // Survivor re-key A5 (review I-1): the window starts only when a page
+    // is handed to the transport, below. A request is signed over every
+    // field that shapes the page, and `limit` is clamped to at least one, so
+    // a replayed request can only send the requester its own real page.
+    if state
+        .treekem_catchup_throttle
+        .read()
+        .await
+        .get(&serve_throttle_key)
+        .is_some_and(|last| last.elapsed() < TREEKEM_CATCHUP_THROTTLE)
     {
-        let mut throttle = state.treekem_catchup_throttle.write().await;
-        if throttle
-            .get(&serve_throttle_key)
-            .is_some_and(|last| last.elapsed() < TREEKEM_CATCHUP_THROTTLE)
-        {
-            tracing::debug!(
-                group_id = %LogHexId::group(&request.group_id),
-                requester = %sender_hex,
-                "throttling duplicate TreeKEM catch-up page request"
-            );
-            return;
-        }
-        throttle.insert(serve_throttle_key, tokio::time::Instant::now());
+        tracing::debug!(
+            group_id = %LogHexId::group(&request.group_id),
+            requester = %sender_hex,
+            "throttling duplicate TreeKEM catch-up page request"
+        );
+        return;
     }
     // Survivor re-key A4: every commit-bearing event this member applied,
-    // after a restart too, ordered by signed revision. A requester behind
-    // the revision this log dropped to stay within a cap would get a page
-    // with a hole in it, so it gets none, and is told why.
-    let (mut events, log_evicted_through) = {
+    // after a restart too, ordered by signed revision. A5 (A4 review n-1):
+    // a page starts right after the requester's head and stops at a hole.
+    // A requester this log cannot serve from its head gets no events and is
+    // told why, so it asks another member.
+    let page = {
         let logs = state.treekem_event_log.read().await;
-        let evicted_through = logs
-            .evicted_through(&log_keys)
-            .filter(|through| request.from_revision < *through);
-        let mut events = Vec::new();
-        if evicted_through.is_none() {
-            for key in &log_keys {
-                if let Some(logged) = logs.get(key) {
-                    events.extend(
-                        logged
-                            .iter()
-                            .filter(|event| {
-                                commit_bearing_event_frontier(event).is_some_and(|frontier| {
-                                    frontier.revision > request.from_revision
-                                        || frontier.epoch > request.from_treekem_epoch
-                                })
-                            })
-                            .cloned(),
-                    );
-                }
-            }
-        }
-        (events, evicted_through)
+        let held: Vec<NamedGroupMetadataEvent> = log_keys
+            .iter()
+            .filter_map(|key| logs.get(key))
+            .flat_map(|logged| logged.iter().cloned())
+            .collect();
+        catchup_page_gap::serve_page(
+            held,
+            request.from_revision,
+            logs.evicted_through(&log_keys),
+            signed_catchup::page_limit(request.limit),
+        )
     };
-    if let Some(through) = log_evicted_through {
+    if let Some(through) = page.gap_through {
         tracing::warn!(
             group_id = %LogHexId::group(&request.group_id),
             requester = %sender_hex,
             from_revision = request.from_revision,
             evicted_through = through,
-            "TreeKEM catch-up: this member's log no longer reaches back to the requester's revision; no page served"
+            "TreeKEM catch-up: this member's log does not reach back to the requester's revision; no page served"
         );
     }
-    events.sort_by_key(commit_bearing_event_sort_key);
-    let truncated = events.len() > request.limit.min(TREEKEM_CATCHUP_RESPONSE_EVENT_CAP);
-    events.truncate(request.limit.min(TREEKEM_CATCHUP_RESPONSE_EVENT_CAP));
+    let catchup_page_gap::ServedPage {
+        events,
+        truncated,
+        gap_through: log_evicted_through,
+    } = page;
+    // A hole report is signed, so a requester that cannot verify this
+    // transport can tell it came from a member before it acts on it.
+    let signed_by = log_evicted_through.and_then(|through| {
+        signed_catchup::sign_gap_report(state, &request.group_id, &sender_hex, through)
+    });
     let response = TreeKemCatchupResponse {
         message_type: "treekem_catchup_response".to_string(),
         group_id: request.group_id.clone(),
@@ -11838,7 +11846,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         log_evicted_through,
         target_member_id: None,
         target_member_key_package_b64: None,
-        signed_by: None,
+        signed_by,
     };
     let payload = match serde_json::to_vec(&response) {
         Ok(payload) => payload,
@@ -11851,6 +11859,11 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     if let Ok(mut recorded) = state.named_group_test_recorders.catchup_responses.lock() {
         recorded.push(payload.clone());
     }
+    stamp_catchup_throttle(
+        &mut *state.treekem_catchup_throttle.write().await,
+        serve_throttle_key,
+        tokio::time::Instant::now(),
+    );
     if let Err(e) = state
         .agent
         .send_direct_with_config(sender, payload, named_group_direct_delivery_config())
@@ -11858,6 +11871,46 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     {
         tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %sender_hex, "failed to send TreeKEM catch-up response: {e}");
     }
+}
+
+/// How long a `treekem_catchup_throttle` entry is kept. Every reader looks
+/// back at most one throttle window, except the #1427 rotation, which looks
+/// back to the start of its current pass; a pass over even a few hundred
+/// members ends well inside this.
+const TREEKEM_CATCHUP_THROTTLE_RETENTION: Duration = Duration::from_secs(60 * 60);
+
+/// Above this many entries, a stamp first drops the expired ones.
+const TREEKEM_CATCHUP_THROTTLE_PRUNE_AT: usize = 1024;
+
+/// Stamp `key` in the catch-up throttle at `now`, dropping entries older
+/// than [`TREEKEM_CATCHUP_THROTTLE_RETENTION`] once the map is large
+/// (survivor re-key A5 review I-2, m-2).
+fn stamp_catchup_throttle(
+    throttle: &mut HashMap<String, tokio::time::Instant>,
+    key: String,
+    now: tokio::time::Instant,
+) {
+    if throttle.len() >= TREEKEM_CATCHUP_THROTTLE_PRUNE_AT {
+        prune_catchup_throttle(throttle, now);
+    }
+    throttle.insert(key, now);
+}
+
+fn prune_catchup_throttle(
+    throttle: &mut HashMap<String, tokio::time::Instant>,
+    now: tokio::time::Instant,
+) {
+    throttle.retain(|_, stamped| {
+        now.saturating_duration_since(*stamped) < TREEKEM_CATCHUP_THROTTLE_RETENTION
+    });
+}
+
+/// Whether a `treekem_catchup_throttle` key belongs to the room `alias`:
+/// every writer puts the room key first, or after `serve:`.
+fn catchup_throttle_key_is_room(key: &str, alias: &str) -> bool {
+    let room = key.strip_prefix("serve:").unwrap_or(key);
+    room.strip_prefix(alias)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
 }
 
 /// Test-only observability for the #846 catch-up gate: set when the gate
@@ -12076,12 +12129,15 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
             }
             _ => false,
         };
-    if !verified && !targeted_signed_ok {
-        return;
-    }
-    let targeted_only = !verified;
+    // Survivor re-key A5: a page the transport could not verify is read
+    // too, and its claimed sender counts for nothing: no revocation or
+    // roster check, and nothing applies as it. Each event applies as its
+    // verified commit signer under the non-author rules
+    // (`signer_delivery::admit(.., false)`), or is dropped. A signed
+    // targeted reply (#398) proves its sender, which must be a member.
+    let sender_authenticated = verified || targeted_signed_ok;
     let sender_hex = hex::encode(sender.as_bytes());
-    {
+    if sender_authenticated {
         let revocation_set = state.agent.revocation_set();
         let revoked = revocation_set.read().await;
         if revoked.is_agent_revoked(sender) || revoked.revocation_resync_required() {
@@ -12097,13 +12153,16 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                     .values()
                     .find(|info| info.stable_group_id() == response.group_id)
             })
-            .filter(|info| !info.withdrawn && info.has_active_member(&sender_hex))
+            .filter(|info| {
+                !info.withdrawn && (!sender_authenticated || info.has_active_member(&sender_hex))
+            })
             .cloned()
     };
     let Some(response_info) = response_info else {
         tracing::warn!(
             group_id = %LogHexId::group(&response.group_id),
-            sender = %LogHexId::agent(&sender_hex),
+            claimed_sender = %LogHexId::agent(&sender_hex),
+            verified,
             "rejecting TreeKEM catch-up response from a non-member or withdrawn group"
         );
         return;
@@ -12114,7 +12173,8 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     // MemberJoined). Verified against the locally-held authority-anchored
     // hash before it is trusted, so the sender gate above plus the hash
     // anchor bound what a peer can inject.
-    if let (Some(target), Some(kp_b64)) = (
+    if let (true, Some(target), Some(kp_b64)) = (
+        sender_authenticated,
         response.target_member_id.as_deref(),
         response.target_member_key_package_b64.as_deref(),
     ) {
@@ -12127,24 +12187,34 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
             "#398: targeted KeyPackage apply attempted"
         );
     }
-    if targeted_only {
-        // #377: membership events from an unverified transport are never
-        // applied — the signed lane above covers only the hash-anchored
-        // KeyPackage heal.
-        return;
-    }
     let was_truncated = response.truncated;
-    if let Some(through) = response.log_evicted_through {
+    let gap_through = response.log_evicted_through;
+    // A5 review I-2: over a transport that did not verify the sender, a
+    // hole report counts only when the responder signed it.
+    let gap_report_signed = !verified
+        && signed_catchup::gap_report_signed(
+            &response,
+            &sender_hex,
+            &hex::encode(state.agent.agent_id().as_bytes()),
+        );
+    if let Some(through) = gap_through {
         tracing::info!(
             group_id = %LogHexId::group(&response.group_id),
-            sender = %LogHexId::agent(&sender_hex),
+            claimed_sender = %LogHexId::agent(&sender_hex),
+            verified,
+            signed = gap_report_signed,
             evicted_through = through,
-            "TreeKEM catch-up: the responder's log no longer reaches back to this member's revision"
+            "TreeKEM catch-up: the responder's log does not reach back to this member's revision"
         );
     }
     let reported_head = response.responder_state_hash.clone();
     let mut events = response.events;
     events.sort_by_key(commit_bearing_event_sort_key);
+    if !verified {
+        events = signed_catchup::unverified_page_events(events);
+    }
+    let served = catchup_page_gap::served_revisions(&events);
+    let head_before = response_info.state_revision;
     let key_package_shaped = !events.is_empty()
         && events
             .iter()
@@ -12168,7 +12238,8 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         ) {
             tracing::warn!(
                 group_id = %LogHexId::group(&response.group_id),
-                sender = %LogHexId::agent(&sender_hex),
+                claimed_sender = %LogHexId::agent(&sender_hex),
+                verified,
                 "[1/6 groups] #846: TreeKEM catch-up page leaves the owner-attested \
                  chain sequence; adopting nothing (fork or stale responder)"
             );
@@ -12185,7 +12256,9 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         response_info.mls_group_id.clone(),
         response_info.stable_group_id().to_string(),
     ];
-    if was_truncated {
+    // An unverified page (survivor re-key A5) names its sender only by
+    // claim, so it opens and closes no peer's fence and proves no head.
+    if was_truncated && verified {
         self_leave_rekey_fence_catchup_peer(&fence_ids, &sender_hex, true);
     }
     SELF_LEAVE_REKEY_BATCH
@@ -12205,12 +12278,24 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                 let kind = named_group_metadata_event_kind(&event);
                 let Some((apply_sender, event)) = signer_delivery::admit(event, sender, verified)
                 else {
-                    tracing::warn!(
-                        group_id = %LogHexId::group(&response.group_id),
-                        sender = %LogHexId::agent(&sender_hex),
-                        event = kind,
-                        "refusing a served event: no verified signer, a forged actor, or TreeKEM bytes its binding does not name"
-                    );
+                    // A5 review m-3: a stranger can send these at will, so an
+                    // unverified refusal is a debug line, and the sender is a
+                    // claim.
+                    if verified {
+                        tracing::warn!(
+                            group_id = %LogHexId::group(&response.group_id),
+                            sender = %LogHexId::agent(&sender_hex),
+                            event = kind,
+                            "refusing a served event: no verified signer, a forged actor, or TreeKEM bytes its binding does not name"
+                        );
+                    } else {
+                        tracing::debug!(
+                            group_id = %LogHexId::group(&response.group_id),
+                            claimed_sender = %LogHexId::agent(&sender_hex),
+                            event = kind,
+                            "refusing an event from an unverified page: no verified signer, a forged actor, or TreeKEM bytes its binding does not name"
+                        );
+                    }
                     continue;
                 };
                 apply_named_group_metadata_event(state, event, apply_sender, true, None).await;
@@ -12267,11 +12352,39 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
             );
         }
     }
-    if was_truncated {
+    // A5 (A4 review n-1): still behind a hole after this page? Ask other
+    // members, but only on a report from an active member here whose report
+    // is authenticated: a verified transport, or a signed hole report
+    // (review I-2). An older responder's gapped page counts only over a
+    // verified transport. On a page the transport could not verify, ask
+    // its claimed sender for the next page only when the page moved this
+    // member's head, and only when that sender is an active member here:
+    // the request carries this member's head, which goes to members only.
+    let (head_after, sender_is_member) = {
+        let groups = state.named_groups.read().await;
+        groups
+            .get(&response.group_id)
+            .or_else(|| {
+                groups
+                    .values()
+                    .find(|info| info.stable_group_id() == response.group_id)
+            })
+            .map_or((head_before, false), |info| {
+                (info.state_revision, info.has_active_member(&sender_hex))
+            })
+    };
+    let reporter_counts = sender_is_member && (verified || gap_report_signed);
+    let gapped_page: &[u64] = if verified { &served } else { &[] };
+    if reporter_counts && catchup_page_gap::page_leaves_gap(head_after, gapped_page, gap_through) {
+        catchup_page_gap::spawn_ask_another_member(state, &response.group_id);
+    }
+    let follow_up = verified || (head_after > head_before && sender_is_member);
+    if was_truncated && follow_up {
         tracing::debug!(
             target: "treekem.trace",
             group_id = %response.group_id,
-            sender = %hex::encode(sender.as_bytes()),
+            claimed_sender = %hex::encode(sender.as_bytes()),
+            verified,
             "TreeKEM catch-up response was truncated; requesting next page"
         );
         let mut sent = false;
@@ -12289,6 +12402,9 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                 "TreeKEM catch-up next page was not sent; this peer's page fence stays open"
             );
         }
+    } else if !verified {
+        // The self-leave fences and the startup head (#1337, #1406) read
+        // verified pages only.
     } else if self_leave_key_package_reply(&fence_ids, &sender_hex, key_package_shaped) {
         // A KeyPackage reply carries no proof that a membership page stream
         // reached its head. Leave every open page stream fenced. It also
@@ -12361,46 +12477,12 @@ async fn request_treekem_catchup_page(
             return true;
         }
     }
-    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
-    let (from_revision, from_epoch, current_state_hash) = {
-        let groups = state.named_groups.read().await;
-        let Some(info) = groups.get(group_id).or_else(|| {
-            groups
-                .values()
-                .find(|info| info.stable_group_id() == group_id)
-        }) else {
-            return false;
-        };
-        (
-            info.state_revision,
-            info.secret_epoch,
-            info.state_hash.clone(),
-        )
+    // Survivor re-key A5: signed, so a responder that cannot verify this
+    // member's transport still serves it.
+    let Some(request) = signed_catchup::page_request(state, group_id, None).await else {
+        return false;
     };
-    let request = TreeKemCatchupRequest {
-        message_type: "treekem_catchup_request".to_string(),
-        group_id: group_id.to_string(),
-        requester_agent_id: local_agent_hex,
-        from_revision,
-        from_treekem_epoch: from_epoch,
-        current_state_hash,
-        missing_prev_state_hash: None,
-        target_member_id: None,
-        limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
-        signed_by: None,
-    };
-    let payload = match serde_json::to_vec(&request) {
-        Ok(payload) => payload,
-        Err(e) => {
-            tracing::warn!(group_id = %LogHexId::group(&group_id), "failed to serialize paged TreeKEM catch-up request: {e}");
-            return false;
-        }
-    };
-    if let Err(e) = state
-        .agent
-        .send_direct_with_config(peer, payload, named_group_direct_delivery_config())
-        .await
-    {
+    if let Err(e) = signed_catchup::send_page_request(state, peer, request).await {
         tracing::debug!(group_id = %group_id, peer = %hex::encode(peer.as_bytes()), "paged TreeKEM catch-up request failed: {e}");
         return false;
     }
@@ -12769,6 +12851,7 @@ async fn request_member_key_package_catchup(
                 state,
                 &member_keyed_request_sign_input(group_id, &local_agent_hex, member_agent_id),
             ),
+            head_challenge: None,
         };
         let payload = match serde_json::to_vec(&request) {
             Ok(payload) => payload,
@@ -24972,9 +25055,22 @@ async fn wipe_local_group_crypto_material(
         }
     }
     {
+        // Survivor re-key A5 (review m-2): every key names its room first
+        // (or after `serve:`), so the room's keys go by prefix.
         let mut catchup = state.treekem_catchup_throttle.write().await;
+        catchup.retain(|key, _| {
+            !aliases
+                .iter()
+                .any(|alias| catchup_throttle_key_is_room(key, alias))
+        });
+    }
+    {
+        let mut gap_asks = state
+            .treekem_gap_asks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for alias in &aliases {
-            catchup.remove(alias);
+            gap_asks.wipe(alias);
         }
     }
     {
@@ -49178,6 +49274,7 @@ pub(in crate::server) mod tests {
     mod rekey_plane_gate;
     mod requester_offer;
     mod sec377_dm_verified_gate;
+    mod signed_catchup;
     mod signer_delivery;
     mod treekem_bytes_binding;
     #[path = "issue1224_unsigned_group_card.rs"]
@@ -49989,6 +50086,7 @@ pub(in crate::server) mod tests {
             treekem_catchup_throttle: RwLock::new(HashMap::new()),
             treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
             treekem_package_repulls: std::sync::Mutex::default(),
+            treekem_gap_asks: std::sync::Mutex::default(),
             group_membership_locks: RwLock::new(HashMap::new()),
             treekem_groups: RwLock::new(HashMap::new()),
             treekem_dir,
@@ -63567,6 +63665,7 @@ pub(in crate::server) mod tests {
             target_member_id: None,
             limit: 8,
             signed_by: None,
+            head_challenge: None,
         };
         let encoded = serde_json::to_value(&request).expect("catch-up request serializes");
         assert_eq!(encoded["message_type"], "treekem_catchup_request");
@@ -64611,6 +64710,7 @@ pub(in crate::server) mod tests {
             target_member_id: Some(fixture.member_hex.clone()),
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
             signed_by: None,
+            head_challenge: None,
         };
         let log_keys = vec![fixture.group_id.clone(), fixture.stable_group_id.clone()];
         let response = member_keyed_treekem_catchup_response(&restarted, &log_keys, &request)
@@ -64699,6 +64799,7 @@ pub(in crate::server) mod tests {
             target_member_id,
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
             signed_by: None,
+            head_challenge: None,
         };
         handle_treekem_catchup_request(state, sender, true, request).await;
         outgoing().saturating_sub(before)
@@ -64879,6 +64980,7 @@ pub(in crate::server) mod tests {
             target_member_id: None,
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
             signed_by: None,
+            head_challenge: None,
         };
         handle_treekem_catchup_request(state, sender, true, request).await;
         outgoing().saturating_sub(before)
@@ -66503,6 +66605,7 @@ pub(in crate::server) mod tests {
             target_member_id: Some(member_hex.clone()),
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
             signed_by: None,
+            head_challenge: None,
         };
         let log_keys = vec![group_id.clone(), stable_group_id.clone()];
         let response = member_keyed_treekem_catchup_response(&restarted, &log_keys, &request)
@@ -66728,6 +66831,7 @@ pub(in crate::server) mod tests {
             target_member_id: Some(member_hex.clone()),
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
             signed_by: None,
+            head_challenge: None,
         };
         let log_keys = vec![group_id.clone(), stable_group_id];
         let response = member_keyed_treekem_catchup_response(&w_state, &log_keys, &request)

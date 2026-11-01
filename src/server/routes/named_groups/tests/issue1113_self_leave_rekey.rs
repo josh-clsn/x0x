@@ -2220,6 +2220,7 @@ async fn cold_responder_newer_head_does_not_clear_the_startup_gate() -> Result<(
         true,
         TreeKemCatchupRequest {
             signed_by: None,
+            head_challenge: None,
             message_type: "treekem_catchup_request".to_string(),
             group_id: responder.group_id.clone(),
             requester_agent_id: hex::encode(requester.as_bytes()),
@@ -3797,6 +3798,7 @@ async fn epoch_ahead_ciphertext_requests_catchup_and_converges() -> Result<()> {
         let info = groups.get(group_id).expect("group on the victim");
         TreeKemCatchupRequest {
             signed_by: None,
+            head_challenge: None,
             message_type: "treekem_catchup_request".to_string(),
             group_id: group_id.clone(),
             requester_agent_id: hex::encode(victim_id.as_bytes()),
@@ -4074,6 +4076,7 @@ async fn newer_epoch_observation_survives_a_late_older_epoch_page() -> Result<()
         let info = groups.get(group_id).expect("group on the victim");
         TreeKemCatchupRequest {
             signed_by: None,
+            head_challenge: None,
             message_type: "treekem_catchup_request".to_string(),
             group_id: group_id.clone(),
             requester_agent_id: hex::encode(victim_id.as_bytes()),
