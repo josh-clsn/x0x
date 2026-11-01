@@ -26,7 +26,7 @@ impl LeaveFixture {
 }
 
 pub(super) async fn two_member_treekem_group() -> Result<LeaveFixture> {
-    two_member_treekem_group_with_id("cd".repeat(16)).await
+    two_member_treekem_group_with_id(super::fixture_room_id()).await
 }
 
 /// [`two_member_treekem_group`] under its own room id, for a test that
@@ -656,7 +656,7 @@ impl SurvivorRelay {
 }
 
 pub(super) async fn survivor_relay_fixture() -> Result<SurvivorRelay> {
-    survivor_relay_fixture_with_id("cd".repeat(16)).await
+    survivor_relay_fixture_with_id(super::fixture_room_id()).await
 }
 
 /// [`survivor_relay_fixture`] under its own room id.

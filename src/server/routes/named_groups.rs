@@ -50056,6 +50056,16 @@ pub(in crate::server) mod tests {
     mod engine_a_apply_gate;
     mod engine_a_doors;
     mod epoch_ahead_catchup;
+
+    /// A room id of its own for each two-member TreeKEM fixture. Upstream's
+    /// self-leave fences are process-wide and keyed by room id, so fixtures
+    /// sharing one id let one test's open fence hold another's seal.
+    pub(super) fn fixture_room_id() -> String {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("cd{n:030x}")
+    }
+
     mod event_log_store;
     mod fork_quarantine;
     mod genesis_kp_catchup_398;

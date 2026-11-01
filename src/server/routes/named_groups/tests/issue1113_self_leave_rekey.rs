@@ -15,7 +15,7 @@ struct LeaveFixture {
 }
 
 async fn two_member_treekem_group() -> Result<LeaveFixture> {
-    two_member_treekem_group_with_id("cd".repeat(16)).await
+    two_member_treekem_group_with_id(super::fixture_room_id()).await
 }
 
 async fn two_member_treekem_group_with_id(group_id: String) -> Result<LeaveFixture> {
