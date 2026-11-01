@@ -120,6 +120,12 @@ pub(in crate::server) struct RekeyObligation {
     /// restart may send at once.
     pub(in crate::server) next_attempt_at_ms: u64,
     pub(in crate::server) attempt_count: u32,
+    /// Survivor re-key A13: this obligation starts at the recipient's own
+    /// seat (a direct add or an approval), which it has not proven. While
+    /// set, a send carries the seat alone, the seat's Welcome stays staged,
+    /// and a seat the log or the staging lost is re-seated with a commit.
+    #[serde(default)]
+    pub(in crate::server) seat: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -150,6 +156,8 @@ pub(in crate::server) struct Attempt {
     /// The obligation's latest re-key when the send started. A re-key owed
     /// during the send keeps the schedule [`owe`] gave it.
     through_revision: u64,
+    /// The obligation starts at the recipient's unproven seat (A13).
+    pub(in crate::server) seat: bool,
 }
 
 /// How one send ended.
@@ -244,6 +252,10 @@ pub(in crate::server) struct RekeyObligations {
     /// The (room, survivor, owed revision) a missing payload was said for.
     missing_said: HashSet<(String, String, u64)>,
     missing_reports: u64,
+    /// Survivor re-key A13: seats re-sealed with a commit, and re-seats
+    /// whose add failed after the removal, for the status.
+    pub(in crate::server) reseats: u64,
+    pub(in crate::server) reseat_failures: u64,
     /// The name an unreadable file was set aside under at load.
     set_aside: Option<String>,
     room_cap: usize,
@@ -260,6 +272,8 @@ impl Default for RekeyObligations {
             in_flight: HashMap::new(),
             next_attempt_id: 0,
             last_sent: HashMap::new(),
+            reseats: 0,
+            reseat_failures: 0,
             missing_said: HashSet::new(),
             missing_reports: 0,
             set_aside: None,
@@ -355,6 +369,11 @@ impl RekeyObligations {
             "room_owed": room.len(),
             "room_unproven": room.iter().filter(|owed| unproven(owed)).count(),
             "unreadable_file_set_aside": self.set_aside,
+            // A13: seats owed and not yet proven, and seats re-sealed.
+            "seats": self.entries.values().filter(|owed| owed.seat).count(),
+            "room_seats": room.iter().filter(|owed| owed.seat).count(),
+            "reseats": self.reseats,
+            "reseat_failures": self.reseat_failures,
         })
     }
 
@@ -433,6 +452,7 @@ impl RekeyObligations {
                     state: ObligationState::Owed,
                     next_attempt_at_ms: soon,
                     attempt_count: 0,
+                    seat: false,
                 },
             );
         }
@@ -456,6 +476,8 @@ impl RekeyObligations {
                     .retain(|(room, member, _)| room != alias || *member != recipient);
                 changed = true;
             } else if proof.epoch >= owed.owed_epoch {
+                // A13: a proof at the seat's epoch or later shows the seat.
+                owed.seat = false;
                 owed.owed_epoch = proof.epoch.saturating_add(1);
                 if let Some(revision) = proof.revision {
                     owed.owed_revision = owed
@@ -568,6 +590,7 @@ impl RekeyObligations {
                 recipient_hex: owed.recipient_hex.clone(),
                 owed_revision: owed.owed_revision,
                 through_revision: owed.through_revision,
+                seat: owed.seat,
             });
             self.in_flight.insert(key.clone(), id);
             self.last_sent.insert(key, now_ms);
@@ -990,6 +1013,95 @@ pub(in crate::server) async fn owe_survivors(
     owe_for(state, group_key, &survivors, events).await
 }
 
+/// Survivor re-key A13: make `recipient_hex`'s obligation in `group_key`
+/// due at the next step, as a retried add asks. Returns whether one is owed.
+pub(in crate::server) async fn due_now(
+    state: &AppState,
+    group_key: &str,
+    recipient_hex: &str,
+) -> bool {
+    let mut store = state.rekey_obligations.lock().await;
+    let key = (group_key.to_string(), recipient_hex.to_ascii_lowercase());
+    let now_ms = store.clock.now_ms();
+    // Review S-2: no sooner than an edge may send (`EDGE_FLOOR_MS` after the
+    // last send), so a burst of retries does not resend the payload each time.
+    let earliest = store.last_sent.get(&key).map_or(now_ms, |sent| {
+        sent.saturating_add(EDGE_FLOOR_MS).max(now_ms)
+    });
+    match store.entries.get_mut(&key) {
+        Some(owed) => {
+            owed.next_attempt_at_ms = owed.next_attempt_at_ms.min(earliest);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Survivor re-key A13: mark `recipient_hex`'s obligation in `group_key` as
+/// starting at its own seat, on disk. A no-op when it is not owed.
+pub(in crate::server) async fn mark_seat(
+    state: &AppState,
+    group_key: &str,
+    recipient_hex: &str,
+) -> bool {
+    let mut store = state.rekey_obligations.lock().await;
+    let key = (group_key.to_string(), recipient_hex.to_ascii_lowercase());
+    let Some(owed) = store.entries.get_mut(&key) else {
+        return false;
+    };
+    owed.seat = true;
+    store.persist_or_warn("a seat obligation").await;
+    true
+}
+
+/// Whether `recipient_hex` is owed its unproven seat in `group_key`.
+pub(in crate::server) async fn owes_seat(
+    state: &AppState,
+    group_key: &str,
+    recipient_hex: &str,
+) -> bool {
+    state
+        .rekey_obligations
+        .lock()
+        .await
+        .entries
+        .get(&(group_key.to_string(), recipient_hex.to_ascii_lowercase()))
+        .is_some_and(|owed| owed.seat)
+}
+
+/// The (room, recipient) of every unproven seat (A13, for the Welcome pins).
+pub(in crate::server) async fn seats(state: &AppState) -> Vec<(String, String)> {
+    state
+        .rekey_obligations
+        .lock()
+        .await
+        .entries
+        .values()
+        .filter(|owed| owed.seat)
+        .map(|owed| (owed.group_key.clone(), owed.recipient_hex.clone()))
+        .collect()
+}
+
+/// Drop `recipient_hex`'s obligation in `group_key`, on disk: a re-seat
+/// owes its new seat afresh (A13).
+pub(in crate::server) async fn forget(state: &AppState, group_key: &str, recipient_hex: &str) {
+    let mut store = state.rekey_obligations.lock().await;
+    let key = (group_key.to_string(), recipient_hex.to_ascii_lowercase());
+    if store.entries.remove(&key).is_some() {
+        store.persist_or_warn("a re-seated member's old seat").await;
+    }
+}
+
+/// Count a re-seat whose add failed after its removal.
+pub(in crate::server) async fn count_reseat_failure(state: &AppState) {
+    state.rekey_obligations.lock().await.reseat_failures += 1;
+}
+
+/// Count a seat re-sealed with a commit (A13).
+pub(in crate::server) async fn count_reseat(state: &AppState) {
+    state.rekey_obligations.lock().await.reseats += 1;
+}
+
 /// Apply `proof` to the survivor's obligations under any of `aliases`.
 pub(in crate::server) async fn settle(state: &AppState, aliases: &[String], proof: &Proof) {
     let mut store = state.rekey_obligations.lock().await;
@@ -1315,12 +1427,15 @@ async fn payload(state: &AppState, attempt: &Attempt) -> Vec<NamedGroupMetadataE
             .collect()
     };
     events.sort_by_key(commit_bearing_event_sort_key);
+    // Review S-1: an unproven seat goes alone. A member that holds it asks
+    // for the rest itself, and one that never comes back costs one event.
+    let limit = if attempt.seat { 1 } else { EVENTS_PER_ATTEMPT };
     let mut unique: Vec<NamedGroupMetadataEvent> = Vec::with_capacity(events.len());
     for event in events {
         if !unique.contains(&event) {
             unique.push(event);
         }
-        if unique.len() >= EVENTS_PER_ATTEMPT {
+        if unique.len() >= limit {
             break;
         }
     }
@@ -1374,7 +1489,23 @@ async fn send_all(
 
 async fn run_attempt(state: Arc<AppState>, attempt: Attempt) {
     let events = payload(&state, &attempt).await;
-    let outcome = if events.is_empty() {
+    // Survivor re-key A13: a seat the log no longer reaches, or whose Welcome
+    // is no longer staged, cannot be delivered as it was; re-seat it.
+    // Review F-1: the first event must be the recipient's own seat; any
+    // other means the log lost it.
+    let seat_lost = attempt.seat
+        && match events.first() {
+            Some(seat) if super::seat_welcome_pin::names_seat(seat, &attempt.recipient_hex) => {
+                !super::seat_welcome_pin::seat_welcome_staged(&state, seat).await
+            }
+            _ => true,
+        };
+    if seat_lost {
+        super::seat_reseat::spawn(&state, &attempt.group_key, &attempt.recipient_hex);
+    }
+    let outcome = if seat_lost && !events.is_empty() {
+        Outcome::Failed
+    } else if events.is_empty() {
         Outcome::PayloadMissing
     } else {
         tokio::time::timeout(ATTEMPT_TIMEOUT, send_all(&state, &attempt, &events))
@@ -1435,6 +1566,8 @@ pub(in crate::server) async fn step(state: &Arc<AppState>) {
     for attempt in begin_due(state).await {
         let _ = state.spawn_detached(run_attempt(Arc::clone(state), attempt));
     }
+    // A13: a seat that settled, or whose member left, unpins its Welcome.
+    super::seat_welcome_pin::reconcile(state).await;
 }
 
 /// The reconcile and selection half of [`step`].

@@ -26,7 +26,12 @@ impl LeaveFixture {
 }
 
 pub(super) async fn two_member_treekem_group() -> Result<LeaveFixture> {
-    let group_id = "cd".repeat(16);
+    two_member_treekem_group_with_id("cd".repeat(16)).await
+}
+
+/// [`two_member_treekem_group`] under its own room id, for a test that
+/// must not share upstream's process-wide self-leave fences with others.
+pub(super) async fn two_member_treekem_group_with_id(group_id: String) -> Result<LeaveFixture> {
     let (state, dir) = secure_endpoint_test_state().await?;
     let admin_id = state.agent.agent_id();
     let group_id_bytes = hex::decode(&group_id)?;
@@ -651,7 +656,12 @@ impl SurvivorRelay {
 }
 
 pub(super) async fn survivor_relay_fixture() -> Result<SurvivorRelay> {
-    let mut fixture = two_member_treekem_group().await?;
+    survivor_relay_fixture_with_id("cd".repeat(16)).await
+}
+
+/// [`survivor_relay_fixture`] under its own room id.
+pub(super) async fn survivor_relay_fixture_with_id(group_id: String) -> Result<SurvivorRelay> {
+    let mut fixture = two_member_treekem_group_with_id(group_id).await?;
     let (s2, s2_dir) = secure_endpoint_test_state().await?;
     let (s1, s1_dir) = secure_endpoint_test_state().await?;
     let group_id_bytes = hex::decode(&fixture.group_id)?;

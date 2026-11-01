@@ -13,7 +13,8 @@ use super::super::signed_catchup::{page_request, sign_page_request};
 use super::catchup_routes::{call, sign_path};
 use super::epoch_ahead_catchup::{
     deliver_catchup, encrypt, live_epoch, live_treekem_group, published_removal_event,
-    signed_self_leave, survivor_relay_fixture, wait_until, SurvivorRelay,
+    signed_self_leave, survivor_relay_fixture, survivor_relay_fixture_with_id, wait_until,
+    SurvivorRelay,
 };
 use super::rekey_obligations::{
     eventually, hex_of, idle, install_deliver, owed, set_connected, settles_done, skew,
@@ -442,8 +443,9 @@ async fn ban_and_post_leave_rekey_owe_survivors() -> Result<()> {
     );
     cast.shutdown().await;
 
-    // R leaves on its own: the owner's post-leave re-key owes S1 and S2.
-    let cast = survivor_relay_fixture().await?;
+    // R leaves on its own: the owner's post-leave re-key owes S1 and S2. Its
+    // own room id keeps other tests' self-leave fences out of its seal.
+    let cast = survivor_relay_fixture_with_id("c7".repeat(16)).await?;
     let owner = &cast.fixture.state;
     let group_id = &cast.fixture.group_id;
     let leave = signed_self_leave(&cast.fixture).await?;
@@ -489,9 +491,14 @@ async fn an_add_owes_the_members_it_did_not_add() -> Result<()> {
             "every member the add did not seat is owed it"
         );
     }
-    assert!(
-        owed(owner, group_id, &newcomer_hex).await.is_none(),
-        "the newcomer gets its Welcome instead"
+    // Survivor re-key A13: the newcomer has no join result to poll, so it
+    // is owed its seat too.
+    assert_eq!(
+        owed(owner, group_id, &newcomer_hex)
+            .await
+            .map(|owed| owed.through_epoch),
+        Some(epoch),
+        "the newcomer is owed its seat"
     );
     cast.shutdown().await;
     Ok(())
@@ -788,7 +795,13 @@ async fn invite_and_approval_adds_owe_the_members_already_seated() -> Result<()>
         Some(epoch),
         "the member already seated is owed the approval"
     );
-    assert!(owed(state, group_id, &requester_hex).await.is_none());
+    assert_eq!(
+        owed(state, group_id, &requester_hex)
+            .await
+            .map(|owed| owed.through_epoch),
+        Some(epoch),
+        "A13: the requester the approval seats is owed its seat"
+    );
     Ok(())
 }
 
