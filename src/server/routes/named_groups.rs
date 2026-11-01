@@ -12170,25 +12170,24 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     // It is checked against its signer's key and this member's open round
     // alone; the transport and the claimed sender play no part.
     let mut response = response;
+    // A startup proof is only recorded here. It is weighed after this
+    // response's events apply, against the head they leave.
+    let mut startup_signer = None;
     if let Some(proof) = response.head_proof.take() {
         let signer = proof.claim.signer.clone();
+        if head_rounds::record_startup_proof(state, &response.group_id, &proof).await {
+            startup_signer = Some(signer.clone());
+        }
         let recorded = head_rounds::record_proof(state, &response.group_id, proof).await;
         tracing::debug!(
             group_id = %LogHexId::group(&response.group_id),
             signer = %LogHexId::agent(&signer),
             ?recorded,
+            startup = startup_signer.is_some(),
             "TreeKEM head proof received"
         );
-        // The #1406 startup wait: a proof stands on its signer's key, so it
-        // counts whatever transport brought it.
-        if recorded.is_ok()
-            && self_leave_startup_open(state, &response.group_id)
-            && self_leave_startup_note_admin_head(state, &[response.group_id.clone()], &signer)
-                .await
-        {
-            schedule_self_leave_rekey_if_idle(state, &response.group_id).await;
-        }
         if head_proof::is_proof_only(&response) {
+            note_startup_proof(state, &response.group_id, startup_signer.as_deref()).await;
             return;
         }
     }
@@ -12398,6 +12397,7 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
             replay_pending_treekem_events(state, &response.group_id).await;
         })
         .await;
+    note_startup_proof(state, &response.group_id, startup_signer.as_deref()).await;
     // #846: retire the armed record once the attested terminal actually
     // LINKED (the group reached its revision) — a stale record must never
     // arm the gate against a head the current hash is already past. The
@@ -13994,6 +13994,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             let Some(commit) = commit else {
                 return ApplyMetadataResult::REJECTED;
             };
+            // The A2 leaf tie checks `actor`, so `actor` must be the signer.
+            if actor != commit.committed_by {
+                return ApplyMetadataResult::REJECTED;
+            }
             let actor_role = info.caller_role(&actor);
             let actor_authorized = actor == sender_hex
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
@@ -14743,6 +14747,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             let Some(commit) = commit else {
                 return ApplyMetadataResult::REJECTED;
             };
+            // The A2 leaf tie checks `actor`, so `actor` must be the signer.
+            if actor != commit.committed_by {
+                return ApplyMetadataResult::REJECTED;
+            }
             let actor_role = info.caller_role(&actor);
             let admin_remove_auth = actor == sender_hex
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
@@ -15389,6 +15397,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             let Some(commit) = commit else {
                 return banned_reject("missing_commit", &resolved_group_key);
             };
+            // The A2 leaf tie checks `actor`, so `actor` must be the signer.
+            if actor != commit.committed_by {
+                return banned_reject("actor_not_signer", &resolved_group_key);
+            }
             let actor_role = info.caller_role(&actor);
             let actor_authorized = actor == sender_hex
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
@@ -15796,6 +15808,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             let Some(commit) = commit else {
                 return ApplyMetadataResult::REJECTED;
             };
+            // The A2 leaf tie checks `actor`, so `actor` must be the signer.
+            if actor != commit.committed_by {
+                return ApplyMetadataResult::REJECTED;
+            }
             let actor_role = info.caller_role(&actor);
             let actor_authorized = actor == sender_hex
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
@@ -27137,6 +27153,23 @@ async fn startup_peer_admins(state: &AppState, group_key: &str) -> HashSet<Strin
 /// Survivor re-key A6 (#1406 ruling): an admin ends this member's startup
 /// wait only through a head proof it signed for this member's challenge,
 /// naming the head this member's tree holds now.
+/// Weigh a recorded startup proof against the head this member holds now,
+/// and seal when it ends the wait.
+pub(in crate::server) async fn note_startup_proof(
+    state: &Arc<AppState>,
+    group_id: &str,
+    signer: Option<&str>,
+) {
+    let Some(signer) = signer else {
+        return;
+    };
+    if self_leave_startup_open(state, group_id)
+        && self_leave_startup_note_admin_head(state, &[group_id.to_string()], signer).await
+    {
+        schedule_self_leave_rekey_if_idle(state, group_id).await;
+    }
+}
+
 async fn self_leave_startup_note_admin_head(
     state: &AppState,
     group_ids: &[String],
@@ -27158,7 +27191,7 @@ async fn self_leave_startup_note_admin_head(
         let Some(key) = key else {
             continue;
         };
-        if head_rounds::admin_head_matches(state, &key, admin).await {
+        if head_rounds::startup_admin_head_matches(state, &key, admin).await {
             self_leave_startup_satisfy_peer(state, group_ids, admin);
             return true;
         }
@@ -27184,17 +27217,17 @@ async fn send_startup_self_leave_catchup(state: &Arc<AppState>, plans: &[Startup
             if !self_leave_startup_reserve_send(state, &plan.ids, &peer_hex) {
                 continue;
             }
-            // Survivor re-key A6 (#1406 ruling): an admin is asked under a
-            // head challenge, and counts only through the proof it signs.
+            // An admin is asked under a fresh head challenge and counts
+            // only through the proof it signs for it.
             if admins.contains(&peer_hex) {
                 if let Some(request) =
-                    head_rounds::startup_admin_request(state, &plan.group_key).await
+                    head_rounds::startup_admin_request(state, &plan.group_key, &peer_hex).await
                 {
                     if let Err(e) = signed_catchup::send_page_request(state, peer, request).await {
                         tracing::debug!(group_id = %LogHexId::group(&plan.group_key), peer = %LogHexId::agent(&peer_hex), "startup head challenge failed: {e}");
                     }
+                    continue;
                 }
-                continue;
             }
             let _sent = request_treekem_catchup_page(state, &plan.group_key, peer).await;
         }

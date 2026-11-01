@@ -1255,9 +1255,8 @@ async fn witness_proof(
     witness: &x0x::identity::AgentKeypair,
     head: (u64, [u8; 32]),
 ) -> HeadProof {
-    let nonce = round_view(state, group_id)
-        .expect("the startup ask opened a round")
-        .nonce;
+    let nonce = head_rounds::startup_nonce(state, group_id, &hex_id(&witness.agent_id()))
+        .expect("the startup ask carried a challenge");
     let info = state
         .named_groups
         .read()
@@ -1367,5 +1366,215 @@ async fn an_admins_startup_head_counts_only_through_its_signed_proof() -> Result
         state.shutdown_notify.send_replace(true);
         state.agent.shutdown().await;
     }
+    Ok(())
+}
+
+/// L restarts as the designated admin with a removed member's leaf live.
+/// A is an admin with a real tree, and R2 a member A can remove.
+struct LiveAdminStartup {
+    state: Arc<AppState>,
+    _dir: tempfile::TempDir,
+    group_id: String,
+    a: x0x::identity::AgentKeypair,
+    a_tree: x0x::mls::TreeKemMlsGroup,
+    r2: AgentId,
+    r2_package: Vec<u8>,
+    leaver_package: Vec<u8>,
+}
+
+async fn startup_with_live_admin(group_id: &str) -> Result<LiveAdminStartup> {
+    let (state, dir) = secure_endpoint_test_state().await?;
+    let local = state.agent.agent_id();
+    let a = loop {
+        let keypair = x0x::identity::AgentKeypair::generate()?;
+        if keypair.agent_id().as_bytes() > local.as_bytes() {
+            break keypair;
+        }
+    };
+    let group_bytes = hex::decode(group_id)?;
+    let seed = agent_treekem_seed(state.agent.as_ref(), &group_bytes);
+    let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(local, &seed)?;
+    let local_package = BASE64.encode(prepared.key_package_bytes());
+    let mut tree = x0x::mls::TreeKemMlsGroup::create_prepared(group_bytes, prepared)?;
+    let leaver = x0x::identity::AgentKeypair::generate()?.agent_id();
+    let leaver_package = x0x::mls::TreeKemMlsGroup::prepare_member(leaver, &[7u8; 32])?
+        .key_package_bytes()
+        .to_vec();
+    tree.add_member(leaver, &leaver_package)?;
+    let a_prepared = x0x::mls::TreeKemMlsGroup::prepare_member(a.agent_id(), &[8u8; 32])?;
+    let a_package = a_prepared.key_package_bytes().to_vec();
+    let a_added = tree.add_member(a.agent_id(), &a_package)?;
+    let mut a_tree = x0x::mls::TreeKemMlsGroup::join_from_welcome(a_prepared, &a_added.welcome)?;
+    let r2 = x0x::identity::AgentKeypair::generate()?.agent_id();
+    let r2_package = x0x::mls::TreeKemMlsGroup::prepare_member(r2, &[9u8; 32])?
+        .key_package_bytes()
+        .to_vec();
+    let r2_added = tree.add_member(r2, &r2_package)?;
+    a_tree.process_commit(&r2_added.commit)?;
+    let epoch = tree.epoch();
+
+    let local_hex = hex_id(&local);
+    let mut info = x0x::groups::GroupInfo::new(
+        "startup-live-admin".to_string(),
+        String::new(),
+        local,
+        group_id.to_string(),
+    );
+    info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+    info.set_member_treekem_key_package(&local_hex, local_package);
+    for (member, role, package) in [
+        (leaver, x0x::groups::GroupRole::Member, &leaver_package),
+        (a.agent_id(), x0x::groups::GroupRole::Admin, &a_package),
+        (r2, x0x::groups::GroupRole::Member, &r2_package),
+    ] {
+        let member_hex = hex_id(&member);
+        info.add_member(member_hex.clone(), role, Some(local_hex.clone()), None);
+        info.set_member_treekem_key_package(&member_hex, BASE64.encode(package));
+    }
+    let leaver_hex = hex_id(&leaver);
+    info.remove_member(&leaver_hex, Some(leaver_hex.clone()));
+    info.secret_epoch = epoch;
+    info.security_binding = Some(format!("treekem:epoch={epoch}"));
+    info.recompute_state_hash();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.to_string(), info);
+    state.treekem_groups.write().await.insert(
+        group_id.to_string(),
+        Arc::new(tokio::sync::Mutex::new(tree)),
+    );
+    Ok(LiveAdminStartup {
+        state,
+        _dir: dir,
+        group_id: group_id.to_string(),
+        a,
+        a_tree,
+        r2,
+        r2_package,
+        leaver_package,
+    })
+}
+
+/// Whether the removed member's leaf is still live, once any seal the
+/// last response scheduled has had time to run.
+async fn leaver_leaf_live(cast: &LiveAdminStartup) -> bool {
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    live_treekem_group(&cast.state, &cast.group_id)
+        .await
+        .lock()
+        .await
+        .has_key_package_leaf(&cast.leaver_package)
+}
+
+/// A's signed removal of R2, chained on L's current roster.
+async fn admin_removes_r2(cast: &mut LiveAdminStartup) -> Result<NamedGroupMetadataEvent> {
+    let a_hex = hex_id(&cast.a.agent_id());
+    let r2_hex = hex_id(&cast.r2);
+    let commit_bytes = cast
+        .a_tree
+        .remove_member_verified(cast.r2, &cast.r2_package)?;
+    let epoch = cast.a_tree.epoch();
+    let mut next = cast
+        .state
+        .named_groups
+        .read()
+        .await
+        .get(&cast.group_id)
+        .cloned()
+        .expect("group");
+    next.roster_revision = next.roster_revision.saturating_add(1);
+    let revision = next.roster_revision;
+    next.remove_member(&r2_hex, Some(a_hex.clone()));
+    next.secret_epoch = epoch;
+    next.security_binding = Some(format!(
+        "treekem:epoch={epoch}:commit={}",
+        blake3::hash(&commit_bytes).to_hex()
+    ));
+    let commit = next.seal_commit(&cast.a, now_millis_u64())?;
+    Ok(NamedGroupMetadataEvent::MemberRemoved {
+        group_id: cast.group_id.clone(),
+        revision,
+        actor: a_hex,
+        agent_id: r2_hex,
+        treekem_commit_b64: Some(BASE64.encode(commit_bytes)),
+        treekem_epoch: Some(epoch),
+        secret_epoch: None,
+        commit: Some(commit),
+    })
+}
+
+/// The startup wait never ends on a stale head: an admin's cached proof
+/// for an earlier ask does not count after a re-ask, and a fresh proof is
+/// weighed only after the page it rides on applies, against the head that
+/// page leaves.
+#[tokio::test]
+async fn a_cached_or_pre_apply_head_proof_does_not_end_the_startup_wait() -> Result<()> {
+    let mut cast = startup_with_live_admin(&"d8".repeat(16)).await?;
+    let group_id = cast.group_id.clone();
+    let a_id = cast.a.agent_id();
+    let a_hex = hex_id(&a_id);
+    startup_self_leave_rekey(&cast.state).await;
+    assert!(leaver_leaf_live(&cast).await, "setup: the wait holds");
+
+    // The first ask's answer is lost. A caches its proof for that ask.
+    let first_head = local_head(&cast.state, &group_id).await;
+    let cached = witness_proof(&cast.state, &group_id, &cast.a, first_head).await;
+    // The backoff re-asks A.
+    let _ = head_rounds::startup_admin_request(&cast.state, &group_id, &a_hex).await;
+    handle_treekem_catchup_response(
+        &cast.state,
+        &a_id,
+        true,
+        super::super::head_proof::proof_only_response(&group_id, cached),
+    )
+    .await;
+    assert!(
+        leaver_leaf_live(&cast).await,
+        "a cached proof for an earlier ask does not end the wait"
+    );
+
+    // A moved on: its fresh proof names the head before its removal of R2,
+    // and the page carries that removal.
+    let pre_apply = local_head(&cast.state, &group_id).await;
+    let proof = witness_proof(&cast.state, &group_id, &cast.a, pre_apply).await;
+    let removal = admin_removes_r2(&mut cast).await?;
+    let page = TreeKemCatchupResponse {
+        message_type: "treekem_catchup_response".to_string(),
+        group_id: group_id.clone(),
+        events: vec![removal],
+        truncated: false,
+        responder_state_hash: None,
+        log_evicted_through: None,
+        target_member_id: None,
+        target_member_key_package_b64: None,
+        signed_by: None,
+        head_proof: Some(proof),
+    };
+    handle_treekem_catchup_response(&cast.state, &a_id, true, page).await;
+    let applied = local_head(&cast.state, &group_id).await;
+    assert_eq!(applied.0, pre_apply.0 + 1, "the page's removal applied");
+    assert!(
+        leaver_leaf_live(&cast).await,
+        "a proof of the pre-apply head does not end the wait"
+    );
+
+    // A fresh ask, and A's proof of the head the page left, end it.
+    let _ = head_rounds::startup_admin_request(&cast.state, &group_id, &a_hex).await;
+    let current = witness_proof(&cast.state, &group_id, &cast.a, applied).await;
+    handle_treekem_catchup_response(
+        &cast.state,
+        &a_id,
+        true,
+        super::super::head_proof::proof_only_response(&group_id, current),
+    )
+    .await;
+    assert!(
+        !leaver_leaf_live(&cast).await,
+        "a fresh proof of the live head ends the wait and the rekey seals"
+    );
+    cast.state.shutdown_notify.send_replace(true);
+    cast.state.agent.shutdown().await;
     Ok(())
 }

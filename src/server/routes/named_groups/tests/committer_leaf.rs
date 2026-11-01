@@ -745,3 +745,53 @@ async fn a_sealer_whose_seat_commits_no_package_does_not_rekey_a_self_leave() ->
     state.agent.shutdown().await;
     Ok(())
 }
+
+/// The direct path: admin X re-sends admin Y's legacy-bound removal under
+/// its own name, carrying X's own commit. Y signed the roster commit, so
+/// the event's actor is not the commit's signer and the arm refuses it
+/// before the leaf tie, which would check X's leaf.
+#[tokio::test]
+async fn another_admins_removal_resent_under_ones_own_name_is_refused() -> Result<()> {
+    let cast = super::epoch_ahead_catchup::survivor_relay_fixture().await?;
+    let group_id = cast.fixture.group_id.clone();
+    let x_id = cast.s2.agent.agent_id();
+    let x_hex = hex::encode(x_id.as_bytes());
+    let promoted = {
+        let mut groups = cast.fixture.state.named_groups.write().await;
+        let info = groups.get_mut(&group_id).expect("group");
+        info.set_member_role(&x_hex, x0x::groups::GroupRole::Admin);
+        info.recompute_state_hash();
+        info.clone()
+    };
+    for state in [&cast.s1, &cast.s2] {
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), promoted.clone());
+    }
+    let epoch_before = live_epoch(&cast.s1, &group_id).await;
+
+    let genuine = legacy_bound_removal(&cast.fixture).await?;
+    let x_commit = {
+        let group = live_treekem_group(&cast.s2, &group_id).await;
+        let mut guard = group.lock().await;
+        guard.remove_member_verified(cast.fixture.member_id, &cast.fixture.member_key_package)?
+    };
+    let mut resent = swap_treekem_commit(&genuine, &x_commit);
+    if let NamedGroupMetadataEvent::MemberRemoved { actor, .. } = &mut resent {
+        *actor = x_hex.clone();
+    }
+    let refused = apply_named_group_metadata_event(&cast.s1, resent, x_id, true, None).await;
+    assert!(
+        !refused.accepted,
+        "another admin's commit under X's name is refused: {refused:?}"
+    );
+    assert_eq!(
+        live_epoch(&cast.s1, &group_id).await,
+        epoch_before,
+        "nothing is installed"
+    );
+    cast.shutdown().await;
+    Ok(())
+}

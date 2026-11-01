@@ -780,8 +780,15 @@ pub(in crate::server) async fn treekem_head_proof_accept(
     if let Err(response) = admitted_tree(&state, &id, &actor, false, false).await {
         return response;
     }
-    let body = match head_rounds::record_proof(&state, &id, body.proof).await {
+    let signer = body.proof.claim.signer.clone();
+    let startup = head_rounds::record_startup_proof(&state, &id, &body.proof).await;
+    let recorded = head_rounds::record_proof(&state, &id, body.proof).await;
+    if startup {
+        super::note_startup_proof(&state, &id, Some(&signer)).await;
+    }
+    let body = match recorded {
         Ok(()) => serde_json::json!({ "ok": true, "recorded": true }),
+        Err(_) if startup => serde_json::json!({ "ok": true, "recorded": true }),
         Err(reason) => serde_json::json!({
             "ok": true,
             "recorded": false,

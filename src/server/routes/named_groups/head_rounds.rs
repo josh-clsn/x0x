@@ -141,6 +141,16 @@ pub(in crate::server) struct RoundView {
 #[derive(Debug, Default)]
 pub(in crate::server) struct HeadRounds {
     rounds: HashMap<String, HeadRound>,
+    /// #1406 startup asks, per room key and admin: the challenge of the
+    /// latest ask only, and the head that admin signed for it.
+    startup: HashMap<String, HashMap<String, StartupAsk>>,
+}
+
+#[derive(Debug)]
+struct StartupAsk {
+    nonce: String,
+    head: Option<(u64, String)>,
+    conflicted: bool,
 }
 
 impl HeadRounds {
@@ -231,9 +241,10 @@ impl HeadRounds {
         Ok(())
     }
 
-    /// Drop the room `alias`'s round.
+    /// Drop the room `alias`'s round and startup asks.
     pub(in crate::server) fn wipe(&mut self, alias: &str) {
         self.rounds.remove(alias);
+        self.startup.remove(alias);
     }
 }
 
@@ -424,60 +435,162 @@ pub(in crate::server) async fn challenge_admins(
     Ok(opened)
 }
 
-/// The signed page request a #1406 startup ask sends an admin: it carries
-/// the challenge of the room's open round, opening one (without sending
-/// it) when none is open inside its deadline. The startup seal then
-/// counts that admin only through the head proof it signs back
-/// ([`admin_head_matches`]); its unsigned `responder_state_hash` is no
-/// evidence.
+/// The signed page request a #1406 startup ask sends `admin`. Every ask
+/// carries a fresh challenge, and only the latest ask's challenge counts,
+/// so an admin's cached proof for an earlier ask never ends the wait. The
+/// engine's own round is left alone.
 pub(in crate::server) async fn startup_admin_request(
     state: &Arc<AppState>,
     group_key: &str,
+    admin: &str,
 ) -> Option<super::TreeKemCatchupRequest> {
-    let open = round_view(state, group_key)
-        .filter(|round| round.opened_at.elapsed() < HEAD_ROUND_DEADLINE)
-        .map(|round| round.nonce);
-    let nonce = match open {
-        Some(nonce) => nonce,
-        None => {
-            open_challenge_round(state, group_key, &[], Duration::ZERO)
-                .await
-                .ok()?
-                .nonce
-        }
-    };
+    let counter = state
+        .treekem_head_counter
+        .lock()
+        .await
+        .next(now_millis_u64())
+        .await?;
+    let nonce = challenge_nonce(counter);
     let mut request = signed_catchup::page_request(state, group_key, None).await?;
-    request.head_challenge = Some(nonce);
+    request.head_challenge = Some(nonce.clone());
     signed_catchup::sign_page_request(state, &mut request);
+    request.signed_by.as_ref()?;
+    state
+        .treekem_head_rounds
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .startup
+        .entry(group_key.to_string())
+        .or_default()
+        .insert(
+            admin.to_string(),
+            StartupAsk {
+                nonce,
+                head: None,
+                conflicted: false,
+            },
+        );
     Some(request)
 }
 
-/// Whether `signer` signed, in the room's open round, exactly the head this
-/// member's live tree holds now (epoch and epoch authenticator), and no
-/// other head in that round.
-pub(in crate::server) async fn admin_head_matches(
+/// Record `proof` against this member's latest startup ask of its signer
+/// in `group_id`. A revoked signer's proof is refused.
+pub(in crate::server) async fn record_startup_proof(
+    state: &AppState,
+    group_id: &str,
+    proof: &HeadProof,
+) -> bool {
+    let me = hex::encode(state.agent.agent_id().as_bytes());
+    let Some((key, stable_group_id)) = room_key(state, group_id).await else {
+        return false;
+    };
+    if proof.claim.group_id != stable_group_id || proof.claim.requester != me {
+        return false;
+    }
+    if let Ok(signer) = parse_agent_id_hex(&proof.claim.signer) {
+        let revocations = state.agent.revocation_set();
+        let revoked = revocations.read().await;
+        if revoked.is_agent_revoked(&signer) || revoked.revocation_resync_required() {
+            return false;
+        }
+    } else {
+        return false;
+    }
+    let expected = {
+        let book = state
+            .treekem_head_rounds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        book.startup
+            .get(&key)
+            .and_then(|asks| asks.get(&proof.claim.signer))
+            .map(|ask| ask.nonce.clone())
+    };
+    if expected.as_deref() != Some(proof.claim.nonce.as_str()) || !verify(proof) {
+        return false;
+    }
+    let head = (
+        proof.claim.treekem_epoch,
+        proof.claim.epoch_authenticator.clone(),
+    );
+    let mut book = state
+        .treekem_head_rounds
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let Some(ask) = book
+        .startup
+        .get_mut(&key)
+        .and_then(|asks| asks.get_mut(&proof.claim.signer))
+        .filter(|ask| ask.nonce == proof.claim.nonce)
+    else {
+        return false;
+    };
+    match &ask.head {
+        Some(kept) if *kept != head => ask.conflicted = true,
+        Some(_) => {}
+        None => ask.head = Some(head),
+    }
+    true
+}
+
+/// Whether `signer` signed, for this member's latest startup ask of it,
+/// exactly the head this member's live tree holds now (epoch and epoch
+/// authenticator), and no other head for that ask.
+pub(in crate::server) async fn startup_admin_head_matches(
     state: &AppState,
     group_key: &str,
     signer: &str,
 ) -> bool {
-    let Some(round) = round_view(state, group_key) else {
+    let signed = {
+        let book = state
+            .treekem_head_rounds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        book.startup
+            .get(group_key)
+            .and_then(|asks| asks.get(signer))
+            .filter(|ask| !ask.conflicted)
+            .and_then(|ask| ask.head.clone())
+    };
+    let Some((epoch, authenticator)) = signed else {
         return false;
     };
-    if round.conflicted.contains(signer) {
-        return false;
-    }
     let Some(group) = state.treekem_groups.read().await.get(group_key).cloned() else {
         return false;
     };
-    let Ok((epoch, authenticator)) = group.lock().await.head() else {
+    let Ok(live) = group.lock().await.head() else {
         return false;
     };
-    let authenticator = hex::encode(authenticator);
-    round.heads.iter().any(|head| {
-        head.signer == signer
-            && head.treekem_epoch == epoch
-            && head.epoch_authenticator == authenticator
-    })
+    live.0 == epoch && hex::encode(live.1) == authenticator
+}
+
+/// The challenge of this member's latest startup ask of `admin`.
+#[cfg(test)]
+pub(in crate::server) fn startup_nonce(
+    state: &AppState,
+    group_key: &str,
+    admin: &str,
+) -> Option<String> {
+    state
+        .treekem_head_rounds
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .startup
+        .get(group_key)
+        .and_then(|asks| asks.get(admin))
+        .map(|ask| ask.nonce.clone())
+}
+
+async fn room_key(state: &AppState, group_id: &str) -> Option<(String, String)> {
+    let groups = state.named_groups.read().await;
+    groups
+        .get_key_value(group_id)
+        .or_else(|| {
+            groups
+                .iter()
+                .find(|(_, info)| info.stable_group_id() == group_id)
+        })
+        .map(|(key, info)| (key.clone(), info.stable_group_id().to_string()))
 }
 
 /// Record `proof`, which arrived for `group_id`, in this member's open
