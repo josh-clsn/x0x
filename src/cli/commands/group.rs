@@ -467,12 +467,16 @@ pub async fn treekem_state(
     group_id: &str,
     since_revision: u64,
     since_state_hash: Option<&str>,
+    since_presence_mark: Option<&str>,
 ) -> Result<()> {
     client.ensure_running().await?;
     let since = since_revision.to_string();
     let mut query = vec![("since_revision", since.as_str())];
     if let Some(hash) = since_state_hash {
         query.push(("since_state_hash", hash));
+    }
+    if let Some(mark) = since_presence_mark {
+        query.push(("since_presence_mark", mark));
     }
     let resp = client
         .get_query(&format!("/groups/{group_id}/treekem/catch-up"), &query)

@@ -21,6 +21,7 @@ mod delivery_gate;
 mod group_access;
 mod instance_lock;
 mod legacy_store_migration;
+mod presence_facts;
 mod rider_auth;
 mod routes;
 mod sse;
@@ -1357,7 +1358,7 @@ pub async fn serve_with_options(
         api_address: actual_api_addr,
         data_dir: config.data_dir.clone(),
         start_time: Instant::now(),
-        started_at_ms: now_millis_u64(),
+        presence: crate::server::presence_facts::PresenceFacts::system(),
         health_snapshot: Arc::new(routes::status::HealthSnapshot::default()),
         broadcast_tx,
         calls: routes::calls::new_registry(),
@@ -1490,6 +1491,29 @@ pub async fn serve_with_options(
                         snapshot_state.health_snapshot.clear_one_sided_ids();
                     }
                 };
+            }
+        }));
+    }
+
+    // Survivor re-key A8: the presence sampler. A freeze shows only as a
+    // gap between consecutive samples, so one task samples the clock pair
+    // every few seconds; a GET samples again on its own. A TTL-only
+    // platform reads no pair, so it needs no sampler.
+    if state.presence.verified() {
+        let presence_state = Arc::clone(&state);
+        let mut shutdown_rx = state.shutdown_notify.subscribe();
+        bg_tasks.push(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(presence_facts::SAMPLE_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = shutdown_rx.changed() => return,
+                }
+                if *shutdown_rx.borrow() {
+                    return;
+                }
+                presence_state.presence.sample();
             }
         }));
     }
