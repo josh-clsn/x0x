@@ -1662,6 +1662,19 @@ async fn run_attempt(state: Arc<AppState>, attempt: Attempt) {
 async fn linked(state: &AppState, recipients: Vec<String>) -> Links {
     #[cfg(test)]
     {
+        let hold = state
+            .named_group_test_recorders
+            .rekey_obligation_links_hold
+            .lock()
+            .ok()
+            .and_then(|hold| hold.clone());
+        if let Some(hold) = hold {
+            state
+                .named_group_test_recorders
+                .rekey_obligation_links_held
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _released = hold.acquire().await;
+        }
         let stand_in = state
             .named_group_test_recorders
             .rekey_obligation_connected
@@ -1699,12 +1712,17 @@ async fn linked(state: &AppState, recipients: Vec<String>) -> Links {
 /// One worker step: drop what is no longer owed, then start the sends that
 /// are due. It never waits on a send.
 pub(in crate::server) async fn step(state: &Arc<AppState>) {
-    // Selection and reconcile write the obligations and the seat pins, so
-    // they run shielded; the sends are detached.
+    // The link reads may wait on the network layer, so they run here, where
+    // shutdown can abort them. Only the selection and the reconcile, which
+    // write the obligations and the seat pins, run shielded.
+    let links = due_links(state).await;
     let selecting = Arc::clone(state);
     let Some(attempts) = state
         .run_shielded(async move {
-            let attempts = begin_due(&selecting).await;
+            let attempts = match links {
+                Some(links) => select_due(&selecting, &links).await,
+                None => Vec::new(),
+            };
             // A13: a seat that settled, or whose member left, unpins its
             // Welcome.
             super::seat_welcome_pin::reconcile(&selecting).await;
@@ -1719,17 +1737,29 @@ pub(in crate::server) async fn step(state: &Arc<AppState>) {
     }
 }
 
-/// The reconcile and selection half of [`step`].
+/// The reconcile and selection half of [`step`], with its link reads.
 pub(in crate::server) async fn begin_due(state: &AppState) -> Vec<Attempt> {
+    match due_links(state).await {
+        Some(links) => select_due(state, &links).await,
+        None => Vec::new(),
+    }
+}
+
+/// Which owed survivors are linked now; `None` when nothing is owed.
+async fn due_links(state: &AppState) -> Option<Links> {
     let recipients: Vec<String> = {
         let store = state.rekey_obligations.lock().await;
         if store.entries.is_empty() {
-            return Vec::new();
+            return None;
         }
         let distinct: HashSet<&String> = store.entries.keys().map(|(_, member)| member).collect();
         distinct.into_iter().cloned().collect()
     };
-    let links = linked(state, recipients).await;
+    Some(linked(state, recipients).await)
+}
+
+/// Drop what is no longer owed and begin the sends due, given `links`.
+async fn select_due(state: &AppState, links: &Links) -> Vec<Attempt> {
     let local = hex::encode(state.agent.agent_id().as_bytes());
     let mut store = state.rekey_obligations.lock().await;
     let dropped = {
@@ -1737,7 +1767,7 @@ pub(in crate::server) async fn begin_due(state: &AppState) -> Vec<Attempt> {
         store.retain(|owed| obligation_is_live(&groups, owed, &local))
     };
     let now_ms = store.clock.now_ms();
-    let attempts = store.begin(now_ms, &links);
+    let attempts = store.begin(now_ms, links);
     if dropped {
         store
             .persist_or_warn("dropping obligations no longer owed")

@@ -1305,7 +1305,9 @@ pub(crate) struct InboxPipeline {
     /// a v1 ACK has one gossip route, a single eager frame on the sender's
     /// inbox topic that a non-forwarding leaf bystander refuses (#380 C0,
     /// x0x#1455). The same live Direct hedge the durable path uses then
-    /// carries it too, in its own task. `None` keeps v1 exactly as it was.
+    /// carries it too, through its own bounded publisher (queue, concurrency
+    /// cap, the inbox's abort, a timeout per send). `None` keeps v1 exactly
+    /// as it was.
     v1_direct_hedge: Option<AckPublisherHandle>,
 }
 
@@ -2748,7 +2750,8 @@ impl InboxPipeline {
             })
         } else {
             // Survivor re-key A14: on a leaf, the same ACK envelope also goes
-            // on live Direct, in its own task, so this loop never waits on it
+            // on live Direct, through the bounded hedge publisher, so this loop
+            // never waits on it
             // and a refused gossip frame no longer costs the sender its whole
             // ACK budget. Direct send-ok is never a receipt: the sender's
             // waiter completes only when the envelope itself arrives.

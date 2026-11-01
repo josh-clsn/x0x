@@ -167,6 +167,20 @@ async fn shutdown_and_wait_releases_state_held_by_survivor_rekey_tasks() -> Resu
     assert!(refused.is_empty(), "setup: the obligation is owed");
     super::rekey_obligations::skew(&state, 6_000).await;
     super::super::rekey_obligations::step(&state).await;
+    // A9: a worker step whose link read stalls. The read runs outside the
+    // shielded section, so shutdown can abort it.
+    let links_hold = Arc::new(tokio::sync::Semaphore::new(0));
+    *state
+        .named_group_test_recorders
+        .rekey_obligation_links_hold
+        .lock()
+        .unwrap() = Some(Arc::clone(&links_hold));
+    {
+        let stepping = Arc::clone(&state);
+        assert!(state.spawn_detached(async move {
+            super::super::rekey_obligations::step(&stepping).await;
+        }));
+    }
     // A12: a listener answer worker.
     let room = seat_room(&state, "bb", &peer_hex).await;
     let answer_hold = Arc::new(tokio::sync::Semaphore::new(0));
@@ -226,6 +240,10 @@ async fn shutdown_and_wait_releases_state_held_by_survivor_rekey_tasks() -> Resu
                 .answer_sends_started
                 .load(std::sync::atomic::Ordering::SeqCst)
                 == 1
+            && recorders
+                .rekey_obligation_links_held
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 1
     };
     while !all_in_flight() && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -235,13 +253,38 @@ async fn shutdown_and_wait_releases_state_held_by_survivor_rekey_tasks() -> Resu
     }
     assert!(
         all_in_flight(),
-        "setup: the send, the worker and the answer are in flight"
+        "setup: the send, the stalled step, the worker and the answer are in flight"
     );
+    // A detached canary that never ends: it is dropped only when shutdown
+    // aborts the detached tasks.
+    struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let canary = Dropped(Arc::clone(&aborted));
+        assert!(state.spawn_detached(async move {
+            let _canary = canary;
+            std::future::pending::<()>().await;
+        }));
+    }
     drop(state);
 
-    // The re-seat is shielded: shutdown waits for it past the abort grace.
+    // The re-seat is shielded: shutdown waits for it after the detached
+    // tasks are aborted, so the room's lock is released only then.
     let shutdown = tokio::spawn(handle.shutdown_and_wait());
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    let deadline = std::time::Instant::now() + LIFECYCLE;
+    while !aborted.load(std::sync::atomic::Ordering::SeqCst) && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        aborted.load(std::sync::atomic::Ordering::SeqCst),
+        "setup: shutdown aborted the detached tasks"
+    );
     drop(room_lock);
     tokio::time::timeout(LIFECYCLE, shutdown)
         .await
@@ -266,6 +309,7 @@ async fn shutdown_and_wait_releases_state_held_by_survivor_rekey_tasks() -> Resu
     drop(held);
     answer_hold.close();
     send_hold.close();
+    links_hold.close();
     Ok(())
 }
 

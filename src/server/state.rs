@@ -1639,6 +1639,10 @@ pub(super) struct NamedGroupTestRecorders {
     /// here instead of to the network.
     pub(super) rekey_obligation_deliver:
         StdMutex<Option<crate::server::routes::named_groups::RekeyObligationTestDeliver>>,
+    /// Survivor re-key A9: when set, the obligation worker's link reads wait
+    /// on it, and each read that waits is counted.
+    pub(super) rekey_obligation_links_hold: StdMutex<Option<Arc<tokio::sync::Semaphore>>>,
+    pub(super) rekey_obligation_links_held: std::sync::atomic::AtomicUsize,
     /// Survivor re-key A9: when set, the survivors the obligation worker
     /// counts as linked, in place of `is_agent_connected`.
     pub(super) rekey_obligation_connected:
@@ -1655,7 +1659,7 @@ pub(super) struct NamedGroupTestRecorders {
     /// Survivor re-key A10: every bounded resend schedule started, as
     /// `(event kind, recipients)`.
     pub(super) control_redelivery_recipients: StdMutex<Vec<(&'static str, Vec<String>)>>,
-    /// Survivor re-key A12 (review m-1): seated-member resend schedules (no
+    /// Survivor re-key A12: seated-member resend schedules (no
     /// republish), as `(event kind, recipients)`.
     pub(super) seated_member_resends: StdMutex<Vec<(&'static str, Vec<String>)>>,
     /// Survivor re-key A12: every gap ask registered, as `(peer hex, the

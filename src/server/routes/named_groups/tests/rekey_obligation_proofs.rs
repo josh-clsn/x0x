@@ -1205,3 +1205,114 @@ async fn a_request_settles_only_on_the_live_head_it_names() -> Result<()> {
     cast.shutdown().await;
     Ok(())
 }
+
+/// S2's signed request from the live head, edited by `edit` and signed
+/// again by S2, after the owner removed R. S2 is owed the removal.
+async fn edited_live_request(
+    cast: &SurvivorRelay,
+    edit: impl FnOnce(&mut TreeKemCatchupRequest),
+) -> TreeKemCatchupRequest {
+    let owner = &cast.fixture.state;
+    let group_id = &cast.fixture.group_id;
+    let removal = remove(cast, &r_hex(cast)).await;
+    applies(&cast.s2, owner.agent.agent_id(), &removal).await;
+    let mut request = page_request(&cast.s2, group_id, None)
+        .await
+        .expect("S2 asks from the live head");
+    assert_eq!(
+        request.current_state_hash,
+        owner_state_hash(owner, group_id).await,
+        "setup: S2 holds the owner's head"
+    );
+    edit(&mut request);
+    sign_page_request(&cast.s2, &mut request);
+    request
+}
+
+/// The live state hash with a higher epoch settles nothing.
+#[tokio::test]
+async fn a_request_on_the_live_hash_at_a_higher_epoch_settles_nothing() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let owner = &cast.fixture.state;
+    let group_id = &cast.fixture.group_id;
+    let request = edited_live_request(&cast, |request| request.from_treekem_epoch += 1).await;
+    let before = owed(owner, group_id, &s2_hex(&cast)).await.expect("owed");
+    handle_treekem_catchup_request(owner, &cast.s2.agent.agent_id(), false, request).await;
+    assert!(super::rekey_obligations::settles_done(owner).await);
+    assert_eq!(owed(owner, group_id, &s2_hex(&cast)).await, Some(before));
+    cast.shutdown().await;
+    Ok(())
+}
+
+/// The live state hash with a higher revision settles nothing.
+#[tokio::test]
+async fn a_request_on_the_live_hash_at_a_higher_revision_settles_nothing() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let owner = &cast.fixture.state;
+    let group_id = &cast.fixture.group_id;
+    let request = edited_live_request(&cast, |request| request.from_revision += 1).await;
+    let before = owed(owner, group_id, &s2_hex(&cast)).await.expect("owed");
+    handle_treekem_catchup_request(owner, &cast.s2.agent.agent_id(), false, request).await;
+    assert!(super::rekey_obligations::settles_done(owner).await);
+    assert_eq!(owed(owner, group_id, &s2_hex(&cast)).await, Some(before));
+    cast.shutdown().await;
+    Ok(())
+}
+
+/// The relay leg (`POST /head-proof`) settles on the same rule: a replay of
+/// S2's earlier signed challenge, and a live challenge whose state hash was
+/// edited after signing, settle nothing.
+#[tokio::test]
+async fn the_relay_leg_settles_neither_a_replay_nor_an_edited_head() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let owner = &cast.fixture.state;
+    let group_id = &cast.fixture.group_id;
+    let owner_id = owner.agent.agent_id();
+    let first = remove(&cast, &r_hex(&cast)).await;
+    applies(&cast.s2, owner_id, &first).await;
+    let mut earlier = page_request(&cast.s2, group_id, None)
+        .await
+        .expect("S2 asks from the first re-key");
+    earlier.head_challenge = Some(next_challenge(&cast.s2).await);
+    sign_page_request(&cast.s2, &mut earlier);
+    let relay = |request: TreeKemCatchupRequest| async move {
+        call(
+            owner,
+            Method::POST,
+            &sign_path(group_id),
+            &owner.api_token,
+            Some(serde_json::json!({ "request": request })),
+        )
+        .await
+    };
+    let (status, body) = relay(earlier.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        eventually(|| async { owed(owner, group_id, &s2_hex(&cast)).await.is_none() }).await,
+        "control: the live challenge settles"
+    );
+
+    let second = remove(&cast, &s1_hex(&cast)).await;
+    let before = owed(owner, group_id, &s2_hex(&cast))
+        .await
+        .expect("owed the second re-key");
+    // The replay.
+    let _ = relay(earlier).await;
+    // S2's live challenge, its state hash edited after it was signed.
+    applies(&cast.s2, owner_id, &second).await;
+    let mut edited = page_request(&cast.s2, group_id, None)
+        .await
+        .expect("S2 asks from the live head");
+    edited.head_challenge = Some(next_challenge(&cast.s2).await);
+    sign_page_request(&cast.s2, &mut edited);
+    edited.current_state_hash = "cd".repeat(32);
+    let _ = relay(edited).await;
+    assert!(super::rekey_obligations::settles_done(owner).await);
+    assert_eq!(
+        owed(owner, group_id, &s2_hex(&cast)).await,
+        Some(before),
+        "a replay and an edited head settle nothing over the relay leg"
+    );
+    cast.shutdown().await;
+    Ok(())
+}
