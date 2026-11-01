@@ -245,12 +245,16 @@ browser calls. Two further served paths sit outside the registry:
 
 ```bash
 curl http://127.0.0.1:12700/health
-# {"ok":true,"status":"healthy","version":"<x.y.z>","peers":4,"send_ready_peers":4,"uptime_secs":300,"unsigned_group_cards_refused":0}
+# {"ok":true,"status":"healthy","version":"<x.y.z>","build_sha":"<40 hex>","peers":4,"send_ready_peers":4,"uptime_secs":300,"unsigned_group_cards_refused":0}
 ```
 
 `unsigned_group_cards_refused` counts GroupCards this process dropped on
 discovery, shard, contact, and metadata ingress because the signature did
 not verify. It starts at zero.
+
+`build_sha` is the commit the daemon was built from (`-dirty` appended when a
+tracked file differed from it), and is absent when the build recorded none.
+`x0xd --version --build-sha` prints it on a second line, `build <sha>`.
 
 ### Example: status
 

@@ -1,4 +1,8 @@
+#[path = "build_support/build_sha.rs"]
+mod build_sha;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    build_sha::emit();
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=X0X_UPGRADE_TEST_PUBLIC_KEY");
     #[cfg(feature = "upgrade-test-signing")]
