@@ -433,8 +433,8 @@ pub(in crate::server) struct TreeKemCatchUpTriggerRequest {
 /// `"hold": true`: the room holds, and no smaller round is ever opened.
 /// Such a refusal also closes the room's previous round, so the GET never
 /// reports a round asked of fewer agents than the engine named, except
-/// `round_too_soon`, which leaves the round opened moments ago in place. A room opens at most one round per
-/// [`head_rounds::ROUND_MIN_GAP`].
+/// `round_too_soon`, which leaves the round opened moments ago in place. A
+/// room opens at most one round per [`head_rounds::ROUND_MIN_GAP`].
 pub(in crate::server) async fn treekem_catch_up_trigger(
     State(state): State<Arc<AppState>>,
     Extension(actor): Extension<ActorContext>,

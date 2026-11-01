@@ -68,13 +68,13 @@ pub(in crate::server) const HEAD_PROOF_MAX_ADMINS: usize = 512;
 /// How many hex digits open a challenge with its counter.
 const CHALLENGE_COUNTER_HEX: usize = 16;
 
+#[cfg(all(feature = "test-rig", not(debug_assertions)))]
+compile_error!("test-rig requires debug_assertions");
+
 /// Test rig only (`cfg(test)` or the `test-rig` feature): when set to
 /// exactly `1`, this daemon signs its head proofs with the live epoch plus
 /// one and a random authenticator, playing a removed admin running a
 /// modified app. Absent from production builds; read once per process.
-#[cfg(all(feature = "test-rig", not(debug_assertions)))]
-compile_error!("test-rig requires debug_assertions");
-
 #[cfg(any(test, feature = "test-rig"))]
 pub(in crate::server) const INFLATE_KNOB: &str = "X0X_TEST_HEAD_PROOF_INFLATE";
 

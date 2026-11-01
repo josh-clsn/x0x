@@ -16990,9 +16990,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 // seat, `expected2` is the TreeKEM epoch the terminal
                 // `MemberAdded` carries, and nothing is sealed or persisted
                 // yet; the add's binding names it. An owner-axis group whose
-                // re-key event carries no mandate is refused by every enforcing member, and the
-                // refusal is silent to the returning member: it never gets
-                // its seat back.
+                // re-key event carries no mandate is refused by every
+                // enforcing member, and the refusal is silent to the
+                // returning member: it never gets its seat back.
                 let rekey_owner_mandate = mint_owner_mandate_for_seat(
                     state,
                     &next,
