@@ -41,7 +41,12 @@
 //! - at most [`MAX_WAITING_PEERS`] requesters and [`MAX_WAITING_BYTES`] of
 //!   requests wait at once; past either, a request that needs a new place is
 //!   dropped, as an overfull listener queue dropped it before;
-//! - the answer is `handle_treekem_catchup_request`, unchanged.
+//! - the answer is `handle_treekem_catchup_request`, unchanged, except that
+//!   its send is handed off ([`send_answer`], survivor re-key A14): the answer
+//!   frees its slot, and the requester's next request is answered, while the
+//!   send waits on its acknowledgement. At most [`ANSWER_SENDS`] sends, and
+//!   [`ANSWER_SENDS_PER_PEER`] to one requester, wait at once; past either,
+//!   the answer sends inline, as before.
 //!
 //! **Why four slots.** An answer holds one page (one direct message, under
 //! `x0x::dm::MAX_PAYLOAD_BYTES`), may sign one head proof, and holds one
@@ -73,12 +78,21 @@ pub(in crate::server) const PER_PEER_QUEUE: usize = 8;
 pub(in crate::server) const MAX_WAITING_PEERS: usize = 256;
 /// Bytes of requests (as received) that may wait at once.
 pub(in crate::server) const MAX_WAITING_BYTES: usize = 8 * 1024 * 1024;
+/// Answer sends waiting on their acknowledgement at once (A14).
+pub(in crate::server) const ANSWER_SENDS: usize = 32;
+/// Answer sends to one requester waiting at once (A14).
+pub(in crate::server) const ANSWER_SENDS_PER_PEER: usize = 8;
 /// Unverified requests one machine may have checked at once.
 pub(in crate::server) const UNVERIFIED_BURST: f64 = 16.0;
 /// How many more unverified requests a machine may have checked each second.
 pub(in crate::server) const UNVERIFIED_PER_SEC: f64 = 8.0;
-/// Machines the rate limiter remembers at most.
+/// Machines the rate limiter remembers at most. Past it, the machine heard
+/// from least recently is forgotten.
 const RATE_TABLE_CAP: usize = 4096;
+/// Unverified requests checked at once, from all machines together, and
+/// how many more each second: machine ids are cheap to mint.
+pub(in crate::server) const UNVERIFIED_TOTAL_BURST: f64 = 128.0;
+pub(in crate::server) const UNVERIFIED_TOTAL_PER_SEC: f64 = 64.0;
 
 /// One machine's allowance for unverified requests.
 #[derive(Debug, Clone, Copy)]
@@ -89,9 +103,20 @@ struct Bucket {
 
 impl Bucket {
     fn refilled(self, now: tokio::time::Instant) -> f64 {
-        let elapsed = now.saturating_duration_since(self.at).as_secs_f64();
-        (self.tokens + elapsed * UNVERIFIED_PER_SEC).min(UNVERIFIED_BURST)
+        self.refilled_at(now, UNVERIFIED_PER_SEC, UNVERIFIED_BURST)
     }
+
+    fn refilled_at(self, now: tokio::time::Instant, per_sec: f64, burst: f64) -> f64 {
+        let elapsed = now.saturating_duration_since(self.at).as_secs_f64();
+        (self.tokens + elapsed * per_sec).min(burst)
+    }
+}
+
+/// The per-machine buckets and the total one.
+#[derive(Debug, Default)]
+struct Rates {
+    machines: HashMap<MachineId, Bucket>,
+    total: Option<Bucket>,
 }
 
 /// What a waiting request is for: its room, and a page, a head challenge or
@@ -121,7 +146,9 @@ struct Queues {
 pub(in crate::server) struct CatchupServe {
     slots: Arc<Semaphore>,
     queues: Mutex<Queues>,
-    rates: Mutex<HashMap<MachineId, Bucket>>,
+    rates: Mutex<Rates>,
+    sends: Arc<Semaphore>,
+    sends_per_peer: Mutex<HashMap<AgentId, usize>>,
 }
 
 impl Default for CatchupServe {
@@ -130,7 +157,120 @@ impl Default for CatchupServe {
             slots: Arc::new(Semaphore::new(SERVE_SLOTS)),
             queues: Mutex::default(),
             rates: Mutex::default(),
+            sends: Arc::new(Semaphore::new(ANSWER_SENDS)),
+            sends_per_peer: Mutex::default(),
         }
+    }
+}
+
+/// A handed-off answer send's place in [`CatchupServe`]'s send bounds.
+struct SendTicket {
+    state: Arc<AppState>,
+    to: AgentId,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Drop for SendTicket {
+    fn drop(&mut self) {
+        let mut per_peer = self
+            .state
+            .treekem_catchup_serve
+            .sends_per_peer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = per_peer.get_mut(&self.to) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                per_peer.remove(&self.to);
+            }
+        }
+    }
+}
+
+fn reserve_send(state: &Arc<AppState>, to: AgentId) -> Option<SendTicket> {
+    let serve = &state.treekem_catchup_serve;
+    let mut per_peer = serve
+        .sends_per_peer
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if per_peer
+        .get(&to)
+        .is_some_and(|count| *count >= ANSWER_SENDS_PER_PEER)
+    {
+        return None;
+    }
+    // No entry is made unless a permit is taken.
+    let permit = Arc::clone(&serve.sends).try_acquire_owned().ok()?;
+    *per_peer.entry(to).or_insert(0) += 1;
+    Some(SendTicket {
+        state: Arc::clone(state),
+        to,
+        _permit: permit,
+    })
+}
+
+async fn deliver_answer(
+    state: &AppState,
+    to: AgentId,
+    payload: Vec<u8>,
+    group_id: &str,
+    what: &str,
+) {
+    #[cfg(test)]
+    {
+        state
+            .named_group_test_recorders
+            .answer_sends_started
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let hold = state
+            .named_group_test_recorders
+            .answer_send_hold
+            .lock()
+            .ok()
+            .and_then(|hold| hold.clone());
+        if let Some(hold) = hold {
+            let _released = hold.acquire().await;
+            return;
+        }
+    }
+    if let Err(e) = state
+        .agent
+        .send_direct_with_config(&to, payload, super::named_group_direct_delivery_config())
+        .await
+    {
+        tracing::warn!(
+            group_id = %LogHexId::group(group_id),
+            requester = %LogHexId::agent(&hex::encode(to.as_bytes())),
+            what,
+            "failed to send a TreeKEM catch-up answer: {e}"
+        );
+    }
+}
+
+/// Send an answer to `to` in its own task, so the answer's slot is free
+/// while the send waits on its acknowledgement (survivor re-key A14). Past
+/// [`ANSWER_SENDS`] or [`ANSWER_SENDS_PER_PEER`], it sends here, as before.
+pub(super) async fn send_answer(
+    state: &Arc<AppState>,
+    to: AgentId,
+    payload: Vec<u8>,
+    group_id: &str,
+    what: &'static str,
+) {
+    match reserve_send(state, to) {
+        Some(ticket) => {
+            let group_id = group_id.to_string();
+            let _ = state.spawn_detached(async move {
+                // A send that never returns frees its permit.
+                let _ = tokio::time::timeout(
+                    super::gap_catchup::ASK_TIMEOUT,
+                    deliver_answer(&ticket.state, to, payload, &group_id, what),
+                )
+                .await;
+                drop(ticket);
+            });
+        }
+        None => deliver_answer(state, to, payload, group_id, what).await,
     }
 }
 
@@ -250,25 +390,37 @@ impl CatchupServe {
     /// Take one unverified request's check from `machine`'s allowance.
     fn take_unverified(&self, machine: MachineId, now: tokio::time::Instant) -> bool {
         let mut rates = self.rates.lock().unwrap_or_else(PoisonError::into_inner);
-        if !rates.contains_key(&machine) && rates.len() >= RATE_TABLE_CAP {
-            rates.retain(|_, bucket| bucket.refilled(now) < UNVERIFIED_BURST);
-            if rates.len() >= RATE_TABLE_CAP {
-                return false;
+        let Rates { machines, total } = &mut *rates;
+        if !machines.contains_key(&machine) && machines.len() >= RATE_TABLE_CAP {
+            machines.retain(|_, bucket| bucket.refilled(now) < UNVERIFIED_BURST);
+            if machines.len() >= RATE_TABLE_CAP {
+                if let Some(oldest) = machines
+                    .iter()
+                    .min_by_key(|(_, bucket)| bucket.at)
+                    .map(|(id, _)| *id)
+                {
+                    machines.remove(&oldest);
+                }
             }
         }
-        let bucket = rates.entry(machine).or_insert(Bucket {
+        let bucket = machines.entry(machine).or_insert(Bucket {
             tokens: UNVERIFIED_BURST,
             at: now,
         });
         let tokens = bucket.refilled(now);
-        if tokens < 1.0 {
-            bucket.tokens = tokens;
-            bucket.at = now;
-            return false;
-        }
-        bucket.tokens = tokens - 1.0;
+        let total_bucket = total.get_or_insert(Bucket {
+            tokens: UNVERIFIED_TOTAL_BURST,
+            at: now,
+        });
+        let total_tokens =
+            total_bucket.refilled_at(now, UNVERIFIED_TOTAL_PER_SEC, UNVERIFIED_TOTAL_BURST);
+        let allowed = tokens >= 1.0 && total_tokens >= 1.0;
+        let spent = if allowed { 1.0 } else { 0.0 };
+        bucket.tokens = tokens - spent;
         bucket.at = now;
-        true
+        total_bucket.tokens = total_tokens - spent;
+        total_bucket.at = now;
+        allowed
     }
 
     fn admit(&self, requester: AgentId, waiting: Waiting) -> Dispatched {
@@ -326,6 +478,12 @@ impl CatchupServe {
             let freed: usize = queue.iter().map(|waiting| waiting.bytes).sum();
             queues.bytes -= freed;
         }
+    }
+
+    /// Whether no handed-off answer send is outstanding (tests).
+    #[cfg(test)]
+    pub(in crate::server) fn sends_idle(&self) -> bool {
+        self.sends.available_permits() == ANSWER_SENDS
     }
 
     /// Answer slots free now (tests).
@@ -618,6 +776,54 @@ mod tests {
             !at_least_as_fresh(&older, &challenge),
             "the counter decides first"
         );
+    }
+
+    #[test]
+    fn all_machines_together_share_a_total_and_a_full_table_forgets_the_least_recent() {
+        let serve = CatchupServe::default();
+        let now = tokio::time::Instant::now();
+        let machine = |n: u16| {
+            let mut id = [0u8; 32];
+            id[..2].copy_from_slice(&n.to_be_bytes());
+            MachineId(id)
+        };
+        for n in 0..128 {
+            assert!(serve.take_unverified(machine(n), now));
+        }
+        assert!(
+            !serve.take_unverified(machine(500), now),
+            "a fresh machine is refused once the total is spent"
+        );
+        let later = now + std::time::Duration::from_secs(1);
+        assert!(
+            serve.take_unverified(machine(501), later),
+            "the total refills"
+        );
+
+        let serve = CatchupServe::default();
+        for n in 0..u16::try_from(RATE_TABLE_CAP).unwrap() {
+            let at = now + std::time::Duration::from_micros(u64::from(n));
+            serve
+                .rates
+                .lock()
+                .unwrap()
+                .machines
+                .insert(machine(n), Bucket { tokens: 0.0, at });
+        }
+        serve.rates.lock().unwrap().total = None;
+        // Within a second, so no bucket has refilled to full and none is
+        // dropped as idle: the table is full of active machines.
+        let late = now + std::time::Duration::from_millis(500);
+        assert!(
+            serve.take_unverified(machine(60_000), late),
+            "a new machine is not refused"
+        );
+        let rates = serve.rates.lock().unwrap();
+        assert!(
+            !rates.machines.contains_key(&machine(0)),
+            "the least recent is forgotten"
+        );
+        assert!(rates.machines.contains_key(&machine(60_000)));
     }
 
     #[test]

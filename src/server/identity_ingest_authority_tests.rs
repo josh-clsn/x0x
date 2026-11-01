@@ -1991,3 +1991,57 @@ async fn adr0115_a_newer_local_pin_supersedes_the_announced_machine() {
         Some(m3.machine_id())
     );
 }
+
+/// ADR 0115 with survivor re-key A14: a Direct ACK is checked only against
+/// a key for a pair authority confirms. A forged class C announcement, for
+/// a warm X or a cold one, never makes the attacker's machine yield a key
+/// that verifies X's v1 ACK, and X's own machine still does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adr0115_a_forged_class_c_announce_never_verifies_a_direct_ack() {
+    let victim = Victim::start("a14").await;
+    let attacker = Attacker::new();
+    let now = now_secs();
+    let warm = Subject::new();
+    victim.announce_genuine(&warm, now).await;
+    victim.identity_barrier().await;
+    victim.expect_genuine_entry(&warm, "A14").await;
+    let key = |agent: AgentId, machine: MachineId| {
+        let agent_ref = Arc::clone(&victim.agent);
+        async move { agent_ref.direct_ack_key_for_test(agent, machine).await }
+    };
+
+    assert_eq!(
+        key(warm.id(), warm.machine_id()).await.as_deref(),
+        Some(warm.public_key()),
+        "A14 CONTROL FAILED (not the vector): X's authenticated machine yields X's key"
+    );
+    assert!(
+        key(warm.id(), attacker.machine_id()).await.is_none(),
+        "A14 CONTROL FAILED (not the vector): before any forgery a foreign machine yields none"
+    );
+
+    let cold = Subject::new();
+    let later = now + ATTACKER_LEAD_SECS;
+    victim
+        .announce(
+            &attacker.agent,
+            v2_wire(&attacker.forged_announcement(&warm, later, false)),
+        )
+        .await;
+    victim
+        .announce(&attacker.agent, attacker.forged_v3_wire(&cold, later))
+        .await;
+    victim.identity_barrier().await;
+
+    let mut open = Vec::new();
+    if key(warm.id(), attacker.machine_id()).await.is_some() {
+        open.push("warm X: a Direct ACK from the attacker's machine finds a key".to_string());
+    }
+    if key(cold.id(), attacker.machine_id()).await.is_some() {
+        open.push("cold X: a Direct ACK from the attacker's machine finds a key".to_string());
+    }
+    if key(warm.id(), warm.machine_id()).await.is_none() {
+        open.push("warm X: X's own machine no longer yields X's key".to_string());
+    }
+    assert_vector_closed("A14", &open);
+}

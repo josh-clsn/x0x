@@ -1,7 +1,9 @@
-//! Survivor re-key A2 to A6: the background work these parts spawn (the
-//! KeyPackage requests and sweep, the hole asks, the head-round sends) runs
-//! in the #1269 detached-task registry, so `shutdown_and_wait` releases the
-//! `AppState` and the `Agent` while that work is still in flight.
+//! Survivor re-key A2 to A14: the background work these parts spawn (the
+//! KeyPackage requests and sweep, the hole asks, the head-round sends, the
+//! re-key obligation worker, the catch-up follow-up asks and the handed-off
+//! catch-up answer sends) runs in the #1269 detached-task registry, so
+//! `shutdown_and_wait` releases the `AppState` and the `Agent` while that
+//! work is still in flight.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -88,6 +90,33 @@ async fn shutdown_and_wait_releases_state_held_by_survivor_rekey_tasks() -> Resu
         round_pause.reached(),
         "setup: the head-round send is in flight"
     );
+    // A12: a truncated page's follow-up ask parks at the same page request.
+    let peer_id = parse_agent_id_hex(&peer_hex).map_err(anyhow::Error::msg)?;
+    assert!(super::super::gap_catchup::spawn_follow_up(
+        &state,
+        &group_id,
+        peer_id,
+        (0, 0)
+    ));
+    // A14: a handed-off catch-up answer send parks until the hold closes.
+    let answer_hold = Arc::new(tokio::sync::Semaphore::new(0));
+    *state
+        .named_group_test_recorders
+        .answer_send_hold
+        .lock()
+        .unwrap() = Some(Arc::clone(&answer_hold));
+    super::super::catchup_serve::send_answer(&state, peer_id, vec![0], &group_id, "test").await;
+    let started = || {
+        state
+            .named_group_test_recorders
+            .answer_sends_started
+            .load(std::sync::atomic::Ordering::SeqCst)
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while started() == 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(started(), 1, "setup: the answer send is in flight");
     drop(state);
 
     tokio::time::timeout(LIFECYCLE, handle.shutdown_and_wait())
@@ -102,5 +131,6 @@ async fn shutdown_and_wait_releases_state_held_by_survivor_rekey_tasks() -> Resu
     drop(pause);
     drop(gap_pause);
     drop(round_pause);
+    answer_hold.close();
     Ok(())
 }

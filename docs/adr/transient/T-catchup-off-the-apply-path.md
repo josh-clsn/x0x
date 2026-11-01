@@ -66,7 +66,7 @@ A Noetic leaf agent's drill showed group messages stalling behind membership app
   - **On the responder:** each page is one event, and an answer holds its requester's one running slot until the send returns. A leaf catching up from a responder whose acknowledgements are lost therefore gets about one event per 24 s.
   - **On the owner:** a re-key obligation send to such a leaf holds one of the worker's 4 slots for 24 s. It counts as failed, so it backs off and is sent again rather than waiting for the 15 min cap. Delivery is not weakened.
   - A leaf whose mesh rests gives no acknowledgement at all, because the message never arrived.
-  - The `v1_ack_*` counters measure how often this happens. The fix is a v1 direct hedge in the DM layer, a separate change before the version flip.
+  - The `v1_ack_*` counters measure how often this happens. A14 (`T-v1-ack-direct-hedge.md`) hedges a leaf's v1 acknowledgement on live Direct, and an answer now frees its slot when it hands its send off, so a lost acknowledgement no longer paces a requester.
 - A member that a direct add or an approval seats is still not owed the add. After the last resend at +60 s, a member away longer is not sent its Welcome again. A seat obligation closes that; it is a separate change before the version flip.
 
 ## Tests

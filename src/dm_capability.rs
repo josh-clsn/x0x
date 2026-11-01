@@ -351,6 +351,9 @@ struct CapabilityStoreInner {
     /// extension carry different created_at stamps and arrive in either
     /// order).
     digest_exts: HashMap<[u8; 32], CachedDigestExt>,
+    /// Survivor re-key A14: the agent key that verified each agent's live
+    /// advert, for checking a Direct ACK from it.
+    advert_keys: HashMap<[u8; 32], Vec<u8>>,
 }
 
 struct CachedDigestExt {
@@ -391,6 +394,38 @@ impl Default for CapabilityStore {
 }
 
 impl CapabilityStore {
+    /// Survivor re-key A14: keep `key`, which verified `agent`'s advert just
+    /// inserted, while that advert is live. Only a key whose agent id is
+    /// `agent` is kept.
+    pub(crate) fn remember_advert_key(&self, agent: AgentId, key: &[u8]) {
+        let derives = ant_quic::MlDsaPublicKey::from_bytes(key)
+            .is_ok_and(|public| AgentId::from_public_key(&public) == agent);
+        if !derives {
+            return;
+        }
+        if let Ok(mut inner) = self.inner.lock() {
+            let CapabilityStoreInner {
+                adverts,
+                advert_keys,
+                ..
+            } = &mut *inner;
+            advert_keys.retain(|held, _| adverts.contains_key(held));
+            advert_keys.insert(*agent.as_bytes(), key.to_vec());
+        }
+    }
+
+    /// The agent key that verified `agent`'s advert, while that advert is
+    /// live (A14).
+    pub(crate) fn advert_agent_key(&self, agent: &AgentId) -> Option<Vec<u8>> {
+        let inner = self.inner.lock().ok()?;
+        let live = inner
+            .adverts
+            .get(agent.as_bytes())
+            .is_some_and(|advert| advert.verified_advert && advert.expires_at > Instant::now());
+        live.then(|| inner.advert_keys.get(agent.as_bytes()).cloned())
+            .flatten()
+    }
+
     /// Construct an empty store with the default TTL.
     #[must_use]
     pub fn new() -> Self {

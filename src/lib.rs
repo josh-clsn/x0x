@@ -6928,6 +6928,63 @@ fn raw_delivery_from_ingress(
     }
 }
 
+/// Survivor re-key A14: the first of `candidates` that is an ML-DSA key
+/// whose agent id is `sender`, to check a Direct ACK envelope from it.
+fn direct_ack_sender_key(
+    sender: &identity::AgentId,
+    candidates: impl IntoIterator<Item = Option<Vec<u8>>>,
+) -> Option<Vec<u8>> {
+    candidates.into_iter().flatten().find(|key| {
+        ant_quic::MlDsaPublicKey::from_bytes(key)
+            .is_ok_and(|public| identity::AgentId::from_public_key(&public) == *sender)
+    })
+}
+
+/// Survivor re-key A14: the key a Direct ACK envelope from `sender`, over a
+/// connection from `machine`, is checked against. ADR 0115 authority must
+/// confirm `sender` on `machine` first (`identity_authority::confirms`,
+/// pin-aware): an announced record from a class A or B announcement, the
+/// authenticated binding, or an ADR 0089 evidence record for exactly that
+/// pair. A class C announcement writes none of them, so it can never make
+/// a machine, or a key, verify an ACK. The key is then the first of the
+/// discovery entry's `agent_public_key` (a class A/B field), the evidence
+/// key and the key that verified the sender's live capability advert that
+/// derives to `sender`.
+#[allow(clippy::too_many_arguments)]
+async fn direct_ack_verifying_key(
+    discovery_cache: &tokio::sync::RwLock<
+        std::collections::HashMap<identity::AgentId, DiscoveredAgent>,
+    >,
+    evidence: Option<&peer_evidence::EvidenceRuntime>,
+    adverts: &dm_capability::CapabilityStore,
+    announced: Option<dm_inbox::AuthenticatedMachineBinding>,
+    attested: Option<dm_inbox::AuthenticatedMachineBinding>,
+    sender: identity::AgentId,
+    machine: identity::MachineId,
+) -> Option<Vec<u8>> {
+    let now_ms = dm_capability::now_unix_ms();
+    let confirmed = identity_authority::confirms(machine, announced, attested, || {
+        evidence.is_some_and(|evidence| evidence.confirms_pairing(sender, machine, now_ms))
+    });
+    if !confirmed {
+        return None;
+    }
+    let cached = {
+        let cache = discovery_cache.read().await;
+        cache
+            .get(&sender)
+            .map(|entry| entry.agent_public_key.clone())
+            .filter(|key| !key.is_empty())
+    };
+    let from_evidence = evidence.and_then(|evidence| {
+        evidence
+            .usable(sender, machine, now_ms)
+            .map(|view| view.announcement.agent_public_key.clone())
+    });
+    let from_advert = adverts.advert_agent_key(&sender);
+    direct_ack_sender_key(&sender, [cached, from_evidence, from_advert])
+}
+
 async fn dispatch_raw_direct_after_gates(
     dm: &direct::DirectMessaging,
     history_handle: Option<&history::HistoryHandle>,
@@ -19130,6 +19187,32 @@ impl Agent {
     /// fans out to all `subscribe_direct()` receiver queues.
     ///
     /// Called automatically by [`Agent::join_network`].
+    /// Survivor re-key A14 tests: the key a Direct ACK from `sender` over
+    /// `machine` would be checked against, from this agent's live stores.
+    #[cfg(test)]
+    pub(crate) async fn direct_ack_key_for_test(
+        &self,
+        sender: identity::AgentId,
+        machine: identity::MachineId,
+    ) -> Option<Vec<u8>> {
+        let announced = self.announced_machine_bindings.read().await.peek(&sender);
+        let attested = dm_inbox::authenticated_machine_binding_evidence(
+            &self.authenticated_machine_bindings,
+            &sender,
+        )
+        .await;
+        direct_ack_verifying_key(
+            &self.identity_discovery_cache,
+            Some(&self.capability_store.evidence),
+            &self.capability_store,
+            announced,
+            attested,
+            sender,
+            machine,
+        )
+        .await
+    }
+
     fn start_direct_listener(&self) {
         if self
             .direct_listener_started
@@ -19142,6 +19225,7 @@ impl Agent {
             return;
         };
         let evidence = std::sync::Arc::clone(&self.capability_store.evidence);
+        let advert_keys = std::sync::Arc::clone(&self.capability_store);
         let dm = std::sync::Arc::clone(&self.direct_messaging);
         let discovery_cache = std::sync::Arc::clone(&self.identity_discovery_cache);
         let contact_store = std::sync::Arc::clone(&self.contact_store);
@@ -19367,16 +19451,22 @@ impl Agent {
                 // as a user DM. Direct send-ok is not a sender receipt.
                 if let Ok(envelope) = dm::DmEnvelope::from_wire_bytes(&data) {
                     if matches!(envelope.body, dm::DmBody::Ack(_)) {
-                        let sender_public_key = {
-                            let cache = discovery_cache.read().await;
-                            cache
-                                .get(&sender)
-                                .map(|entry| entry.agent_public_key.clone())
-                                .filter(|key| !key.is_empty())
-                        };
-                        let sender_public_key = if sender_public_key.is_none() && evidence_ready && verified {
-                            evidence.usable(sender, machine_id, dm_capability::now_unix_ms()).map(|v| v.announcement.agent_public_key.clone())
-                        } else { sender_public_key };
+                        // Survivor re-key A14: only for a pair ADR 0115
+                        // authority confirms; the envelope signature is
+                        // still checked against the key.
+                        let sender_public_key = direct_ack_verifying_key(
+                            &discovery_cache,
+                            evidence_ready.then_some(&*evidence),
+                            &advert_keys,
+                            announced,
+                            registry,
+                            sender,
+                            machine_id,
+                        )
+                        .await;
+                        if sender_public_key.is_none() {
+                            dm.record_direct_ack_dropped_no_key();
+                        }
                         if let Some(sender_public_key) = sender_public_key {
                             let inbox = dm_inbox_service.lock().await;
                             if let Some(service) = inbox.as_ref() {
@@ -41805,6 +41895,8 @@ mod asymmetric_capability_convergence_tests;
 
 #[cfg(test)]
 mod caps_consume_only_tests;
+#[cfg(test)]
+mod v1_ack_hedge_tests;
 
 #[cfg(test)]
 mod legacy_bus_interop_tests;
