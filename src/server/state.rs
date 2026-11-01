@@ -1643,13 +1643,13 @@ pub(super) struct NamedGroupTestRecorders {
     /// counts as linked, in place of `is_agent_connected`.
     pub(super) rekey_obligation_connected:
         StdMutex<Option<std::collections::HashMap<String, Option<String>>>>,
-    /// Survivor re-key fix round m-8: settles spawned and finished, so a
+    /// Survivor re-key: settles spawned and finished, so a
     /// test waits for every settle before it asserts nothing settled.
     pub(super) settles_spawned: std::sync::atomic::AtomicUsize,
     pub(super) settles_finished: std::sync::atomic::AtomicUsize,
-    /// Survivor re-key fix round 2: page requests `prove_held` sent.
+    /// Survivor re-key: page requests `prove_held` sent.
     pub(super) held_proofs_sent: std::sync::atomic::AtomicUsize,
-    /// Survivor re-key fix round I-4: recipients `named_group_event_delivery_result`
+    /// Survivor re-key: recipients `named_group_event_delivery_result`
     /// fails for, as if the send were lost.
     pub(super) direct_delivery_drop: StdMutex<std::collections::HashSet<String>>,
     /// Survivor re-key A10: every bounded resend schedule started, as
@@ -1665,6 +1665,9 @@ pub(super) struct NamedGroupTestRecorders {
     pub(super) follow_ups_started: std::sync::atomic::AtomicUsize,
     /// Survivor re-key A13: re-seats refused as too soon.
     pub(super) reseats_too_soon: std::sync::atomic::AtomicUsize,
+    /// Survivor re-key A12: when set, a live membership apply does not
+    /// replay the parked queue, so a test can see the apply's own checks.
+    pub(super) skip_live_replay: AtomicBool,
     /// Survivor re-key A14: catch-up answer sends started, and when set, a
     /// semaphore each waits on (unsent) until it is closed.
     pub(super) answer_sends_started: std::sync::atomic::AtomicUsize,
@@ -1672,10 +1675,10 @@ pub(super) struct NamedGroupTestRecorders {
     /// Survivor re-key A13: when set, a Welcome reference is resolved from
     /// this daemon's staged Welcomes, in place of the blob transport.
     pub(super) welcome_source: StdMutex<Option<Arc<crate::server::AppState>>>,
-    /// Survivor re-key A12 fix round 2 (N-3): unverified catch-up requests
+    /// Survivor re-key A12: unverified catch-up requests
     /// whose signature `dispatch` went on to check.
     pub(super) catchup_signature_checks: std::sync::atomic::AtomicUsize,
-    /// Survivor re-key A12 fix round 2 (N-5): an event a replay pushes into
+    /// Survivor re-key A12: an event a replay pushes into
     /// the room's queue right after it drained it, as a park that lands
     /// during the replay does.
     pub(super) replay_park_during_pass:

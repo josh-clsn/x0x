@@ -351,7 +351,9 @@ async fn r2_direct_add_named_write_failure_no_aead_nonce_reuse() -> Result<()> {
     let task = {
         let state = Arc::clone(&state);
         let gid = gid.clone();
-        tokio::spawn(async move { add_treekem_named_group_member(state, gid, added, req).await })
+        tokio::spawn(
+            async move { add_treekem_named_group_member(state, None, gid, added, req).await },
+        )
     };
     for _ in 0..2000 {
         if pause.reached() {

@@ -270,13 +270,12 @@ pub(super) fn spawn_follow_up(
             {
                 Ok(true) => return,
                 Ok(false) => {}
-                Err(_) => {
-                    tracing::debug!(
-                        group_id = %LogHexId::group(&room),
-                        "paged TreeKEM catch-up request timed out"
-                    );
-                    return;
-                }
+                // A send that timed out counts as one that failed, as
+                // upstream's next-page ask does: try again.
+                Err(_) => tracing::debug!(
+                    group_id = %LogHexId::group(&room),
+                    "paged TreeKEM catch-up request timed out"
+                ),
             }
         }
         tracing::warn!(

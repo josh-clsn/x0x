@@ -1,9 +1,10 @@
-//! Survivor re-key A2 to A14: the background work these parts spawn (the
-//! KeyPackage requests and sweep, the hole asks, the head-round sends, the
-//! re-key obligation worker, the catch-up follow-up asks and the handed-off
-//! catch-up answer sends) runs in the #1269 detached-task registry, so
-//! `shutdown_and_wait` releases the `AppState` and the `Agent` while that
-//! work is still in flight.
+//! Survivor re-key A2 to A14: the background work these parts spawn runs in
+//! the #1269 registries, so `shutdown_and_wait` releases the `AppState` and
+//! the `Agent` while that work is still in flight: the KeyPackage requests
+//! and sweep, the hole asks, the head-round sends, an obligation send, a
+//! quiet survivor's proof, a gap ask, a follow-up ask, a listener answer
+//! worker and a handed-off answer send (detached), and a re-seat (shielded,
+//! so shutdown waits for it).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -90,47 +91,205 @@ async fn shutdown_and_wait_releases_state_held_by_survivor_rekey_tasks() -> Resu
         round_pause.reached(),
         "setup: the head-round send is in flight"
     );
-    // A12: a truncated page's follow-up ask parks at the same page request.
     let peer_id = parse_agent_id_hex(&peer_hex).map_err(anyhow::Error::msg)?;
+    let seam = super::super::detached_send_test_seam::arm;
+    let page_key = super::super::detached_send_test_seam::page_request_key;
+    let mut held = Vec::new();
+
+    // Each leg below has its own room, so each parks on its own seam.
+    // A12: a truncated page's follow-up ask.
+    let room = seat_room(&state, "b7", &peer_hex).await;
+    held.push((
+        "the follow-up ask",
+        seam(&page_key(&room, &peer_hex, false)),
+    ));
     assert!(super::super::gap_catchup::spawn_follow_up(
         &state,
-        &group_id,
+        &room,
         peer_id,
         (0, 0)
     ));
-    // A14: a handed-off catch-up answer send parks until the hold closes.
+    // A12: a gap ask.
+    let room = seat_room(&state, "b8", &peer_hex).await;
+    held.push(("the gap ask", seam(&page_key(&room, &peer_hex, false))));
+    super::super::gap_catchup::request_treekem_catchup_for_gap(&state, &room, vec![peer_id], None)
+        .await;
+    // A10: a quiet survivor's proof.
+    let room = seat_room(&state, "b9", &peer_hex).await;
+    held.push(("prove_held", seam(&format!("prove-held:{room}"))));
+    super::super::rekey_obligations::spawn_prove_held(
+        &state,
+        super::super::rekey_obligations::HeldRekey::for_test(&room, peer_id, 1),
+        true,
+    );
+    // A9: an obligation send, held by its delivery stand-in.
+    let room = seat_room(&state, "ba", &peer_hex).await;
+    let attempt_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let started = Arc::clone(&attempt_started);
+        super::rekey_obligations::install_deliver(
+            &state,
+            Arc::new(move |_recipient, _event| {
+                started.store(true, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(std::future::pending())
+            }),
+        );
+    }
+    let owner_hex = hex::encode(local.as_bytes());
+    state.treekem_event_log.write().await.insert(
+        room.clone(),
+        std::iter::once(NamedGroupMetadataEvent::MemberRemoved {
+            group_id: room.clone(),
+            revision: 2,
+            actor: owner_hex.clone(),
+            agent_id: "ee".repeat(32),
+            treekem_commit_b64: None,
+            treekem_epoch: Some(1),
+            secret_epoch: None,
+            commit: Some(super::fake_group_state_commit(&room, 2, &owner_hex)),
+        })
+        .collect(),
+    );
+    let refused = super::super::rekey_obligations::owe(
+        &state,
+        &room,
+        std::slice::from_ref(&peer_hex),
+        super::super::rekey_obligations::Rekey {
+            epoch: 1,
+            revision: 2,
+        },
+        super::super::rekey_obligations::Rekey {
+            epoch: 1,
+            revision: 2,
+        },
+    )
+    .await;
+    assert!(refused.is_empty(), "setup: the obligation is owed");
+    super::rekey_obligations::skew(&state, 6_000).await;
+    super::super::rekey_obligations::step(&state).await;
+    // A12: a listener answer worker.
+    let room = seat_room(&state, "bb", &peer_hex).await;
     let answer_hold = Arc::new(tokio::sync::Semaphore::new(0));
+    *state
+        .named_group_test_recorders
+        .catchup_serve_hold
+        .lock()
+        .unwrap() = Some(Arc::clone(&answer_hold));
+    let request = TreeKemCatchupRequest {
+        message_type: "treekem_catchup_request".to_string(),
+        group_id: room.clone(),
+        requester_agent_id: peer_hex.clone(),
+        from_revision: 0,
+        from_treekem_epoch: 0,
+        current_state_hash: String::new(),
+        missing_prev_state_hash: None,
+        target_member_id: None,
+        limit: 1,
+        signed_by: None,
+        head_challenge: None,
+    };
+    assert_eq!(
+        super::super::catchup_serve::dispatch(
+            &state,
+            peer_id,
+            x0x::identity::MachineId([0x5e; 32]),
+            true,
+            request,
+            1
+        ),
+        super::super::catchup_serve::Dispatched::Started,
+        "setup: the answer worker starts"
+    );
+    // A14: a handed-off catch-up answer send.
+    let send_hold = Arc::new(tokio::sync::Semaphore::new(0));
     *state
         .named_group_test_recorders
         .answer_send_hold
         .lock()
-        .unwrap() = Some(Arc::clone(&answer_hold));
-    super::super::catchup_serve::send_answer(&state, peer_id, vec![0], &group_id, "test").await;
-    let started = || {
-        state
-            .named_group_test_recorders
-            .answer_sends_started
-            .load(std::sync::atomic::Ordering::SeqCst)
-    };
+        .unwrap() = Some(Arc::clone(&send_hold));
+    super::super::catchup_serve::send_answer(&state, peer_id, vec![0], &room, "test").await;
+    // A13: a re-seat, waiting for the room's membership lock this test holds.
+    let reseat_room = seat_room(&state, "bc", &peer_hex).await;
+    let room_lock = group_membership_lock(&state, &reseat_room)
+        .await
+        .lock_owned()
+        .await;
+    super::super::seat_reseat::spawn(&state, &reseat_room, &peer_hex);
+
+    let recorders = &state.named_group_test_recorders;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while started() == 0 && std::time::Instant::now() < deadline {
+    let all_in_flight = || {
+        held.iter().all(|(_, pause)| pause.reached())
+            && attempt_started.load(std::sync::atomic::Ordering::SeqCst)
+            && !recorders.catchup_serves_started.lock().unwrap().is_empty()
+            && recorders
+                .answer_sends_started
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 1
+    };
+    while !all_in_flight() && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert_eq!(started(), 1, "setup: the answer send is in flight");
+    for (leg, pause) in &held {
+        assert!(pause.reached(), "setup: {leg} is in flight");
+    }
+    assert!(
+        all_in_flight(),
+        "setup: the send, the worker and the answer are in flight"
+    );
     drop(state);
 
-    tokio::time::timeout(LIFECYCLE, handle.shutdown_and_wait())
+    // The re-seat is shielded: shutdown waits for it past the abort grace.
+    let shutdown = tokio::spawn(handle.shutdown_and_wait());
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    drop(room_lock);
+    tokio::time::timeout(LIFECYCLE, shutdown)
         .await
         .context("shutdown returns within 60 s")?
+        .context("shutdown task")?
         .context("shutdown")?;
     assert_eq!(
         (state_weak.strong_count(), agent_weak.strong_count()),
         (0, 0),
         "the AppState and Agent are released when shutdown_and_wait returns"
     );
+    assert!(
+        super::super::seat_reseat::FINISHED_FOR_TEST
+            .lock()
+            .unwrap()
+            .contains(&reseat_room),
+        "the shielded re-seat ran to its end"
+    );
     drop(pause);
     drop(gap_pause);
     drop(round_pause);
+    drop(held);
     answer_hold.close();
+    send_hold.close();
     Ok(())
+}
+
+/// A TreeKEM room `{tag}{tag}…` holding this daemon and `peer_hex` as an
+/// admin by hash alone.
+async fn seat_room(state: &AppState, tag: &str, peer_hex: &str) -> String {
+    let local = state.agent.agent_id();
+    let room = tag.repeat(16);
+    let mut info = x0x::groups::GroupInfo::new(
+        "survivor tasks".to_string(),
+        String::new(),
+        local,
+        room.clone(),
+    );
+    info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+    info.add_member(
+        peer_hex.to_string(),
+        x0x::groups::GroupRole::Admin,
+        Some(hex::encode(local.as_bytes())),
+        None,
+    );
+    if let Some(seat) = info.members_v2.get_mut(peer_hex) {
+        seat.treekem_key_package_hash = Some("aa".repeat(32));
+    }
+    state.named_groups.write().await.insert(room.clone(), info);
+    room
 }

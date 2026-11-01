@@ -11855,12 +11855,12 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         return;
     }
     // Survivor re-key A10: a request only its requester can have sent (a
-    // verified transport, or its signature over its head) shows the epoch it
-    // holds, and that settles what this daemon owes it. A claimed sender
-    // shows nothing. The settle runs in its own task, off this listener.
+    // verified transport, or its signature over its head) names the head it
+    // holds; when that is this daemon's live head, it settles what is owed.
+    // A claimed sender shows nothing. The settle runs off this listener.
     if authorized {
-        if let Some(proof) = rekey_obligations::request_proof(&request, verified) {
-            rekey_obligations::spawn_settle(state, log_keys.clone(), proof);
+        if let Some(head) = rekey_obligations::request_head(&request, verified) {
+            rekey_obligations::spawn_settle_request(state, log_keys.clone(), head);
         }
     }
     // Issue #205: member-keyed TreeKEM KeyPackage fetch. The requester is a
@@ -13348,6 +13348,14 @@ async fn apply_named_group_metadata_event_with_binding(
 /// had arrived by gossip or a direct push. Runs with no apply guard held;
 /// the replay re-applies each event with every check, in commit order.
 async fn replay_parked_after_live_apply(state: &Arc<AppState>, event_group_id: &str) {
+    #[cfg(test)]
+    if state
+        .named_group_test_recorders
+        .skip_live_replay
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return;
+    }
     let Some(room) = local_group_key_for_parking(state, event_group_id).await else {
         return;
     };
@@ -24073,8 +24081,7 @@ pub(in crate::server) async fn add_named_group_member(
     // Serialize against concurrent membership applies + other API mutators (see
     // `AppState::group_membership_locks`). Held across the delegation to the
     // TreeKEM helper below, which must NOT re-acquire it (single-level lock).
-    let membership_lock = group_membership_lock(&state, &id).await;
-    let _membership_guard = membership_lock.lock().await;
+    let membership_guard = group_membership_lock(&state, &id).await.lock_owned().await;
 
     let (metadata_topic, event, members, epoch, bootstrap_group) = {
         let named_groups = state.named_groups.read().await;
@@ -24086,7 +24093,14 @@ pub(in crate::server) async fn add_named_group_member(
         };
         if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
             drop(named_groups);
-            return add_treekem_named_group_member(state, id, agent_id, req).await;
+            return add_treekem_named_group_member(
+                state,
+                Some(membership_guard),
+                id,
+                agent_id,
+                req,
+            )
+            .await;
         }
 
         let agent_hex = hex::encode(agent_id.as_bytes());
@@ -24259,7 +24273,12 @@ pub(in crate::server) async fn add_named_group_member(
 /// still owed but the log or the staging lost it, re-seat the member with a
 /// commit instead (`seat_reseat`). The caller holds the room's membership
 /// lock. Returns (redelivered, re-seated).
-async fn redeliver_seat(state: &Arc<AppState>, group_key: &str, member_hex: &str) -> (bool, bool) {
+async fn redeliver_seat(
+    state: &Arc<AppState>,
+    membership_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    group_key: &str,
+    member_hex: &str,
+) -> (bool, bool) {
     let seat = {
         let aliases = {
             let groups = state.named_groups.read().await;
@@ -24299,8 +24318,19 @@ async fn redeliver_seat(state: &Arc<AppState>, group_key: &str, member_hex: &str
     };
     if !deliverable {
         if rekey_obligations::owes_seat(state, group_key, member_hex).await {
-            let reseated = seat_reseat::reseat_locked(state, group_key, member_hex).await
-                == seat_reseat::Reseat::Done;
+            // The route's own guard goes with the re-seat into its shielded
+            // task. A caller that holds the lock without an owned guard (a
+            // re-seat's own add) never reaches here: its member is gone.
+            let reseated = match membership_guard {
+                Some(guard) => {
+                    seat_reseat::spawn_with_guard(state, guard, group_key, member_hex).await
+                        == Ok(seat_reseat::Reseat::Done)
+                }
+                None => {
+                    seat_reseat::reseat_locked(state, group_key, member_hex).await
+                        == seat_reseat::Reseat::Done
+                }
+            };
             return (false, reseated);
         }
         return (false, false);
@@ -24315,6 +24345,7 @@ async fn redeliver_seat(state: &Arc<AppState>, group_key: &str, member_hex: &str
 
 async fn add_treekem_named_group_member(
     state: Arc<AppState>,
+    membership_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     id: String,
     agent_id: AgentId,
     req: AddNamedGroupMemberRequest,
@@ -24370,7 +24401,7 @@ async fn add_treekem_named_group_member(
             let seated = info.has_active_member(&agent_hex);
             drop(groups);
             let (redelivered, reseated) = if seated {
-                redeliver_seat(&state, &id, &agent_hex).await
+                redeliver_seat(&state, membership_guard, &id, &agent_hex).await
             } else {
                 (false, false)
             };
@@ -34936,16 +34967,17 @@ async fn treekem_group_decrypt_for_actor(
     let epoch = guard.epoch();
     drop(guard);
     if let Some(recipient_hex) = owed_sender {
-        rekey_obligations::settle(
+        // Shielded, as the listeners' settles are: the route's caller may
+        // go away mid-write.
+        rekey_obligations::spawn_settle(
             state,
-            std::slice::from_ref(&owed_room),
-            &rekey_obligations::Proof {
+            vec![owed_room],
+            rekey_obligations::Proof {
                 recipient_hex,
                 epoch,
                 revision: None,
             },
-        )
-        .await;
+        );
     }
     record_mls_history(
         state,
@@ -42164,7 +42196,7 @@ pub(in crate::server) async fn load_join_result_staging(state: &AppState) {
         .filter(|id| welcomes.contains_key(id))
         .collect();
     cap_staging_oldest_first(&mut join_results, |p| p.created_at_ms);
-    // Review I-F1: a pinned Welcome is the oldest by definition, so it is
+    // A pinned Welcome is the oldest by definition, so it is
     // left out of the cap (the seat obligations' caps bound the pins).
     let pinned_now: HashSet<String> = state
         .seat_welcome_pins
@@ -68927,8 +68959,13 @@ pub(in crate::server) mod tests {
         let target_id = target.agent_id();
         let target_hex = hex::encode(target_id.as_bytes());
         let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(target_id, &[0xa6; 32])?;
+        let guard = group_membership_lock(&fixture.state, &fixture.group_id)
+            .await
+            .lock_owned()
+            .await;
         let (status, _) = add_treekem_named_group_member(
             Arc::clone(&fixture.state),
+            Some(guard),
             fixture.group_id.clone(),
             target_id,
             AddNamedGroupMemberRequest {

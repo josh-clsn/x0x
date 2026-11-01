@@ -1,5 +1,5 @@
 //! A seat's Welcome stays staged while the seat is owed (survivor re-key
-//! A13 fix round 1; see `docs/adr/transient/T-seat-obligation.md`).
+//! A13; see `docs/adr/transient/T-seat-obligation.md`).
 //!
 //! A member seated by a direct add or an approval is owed its seat until it
 //! proves it holds it. The seat names a Welcome staged at this daemon, which

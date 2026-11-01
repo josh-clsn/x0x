@@ -155,7 +155,10 @@ async fn evict_from_log(state: &AppState, seat: &NamedGroupMetadataEvent) {
 /// The owner's latest add naming `member`, as published.
 fn latest_add(state: &AppState, member_hex: &str) -> NamedGroupMetadataEvent {
     super::signer_delivery::published(state, |event| {
-        matches!(event, NamedGroupMetadataEvent::MemberAdded { agent_id, .. } if agent_id == member_hex)
+        matches!(
+            event,
+            NamedGroupMetadataEvent::MemberAdded { agent_id, .. } if agent_id == member_hex
+        )
     })
     .expect("the add is published")
 }
@@ -197,16 +200,25 @@ async fn seated(state: &AppState, group_id: &str, member_hex: &str) -> bool {
 /// A request from `state` at its own head, signed by it.
 async fn signed_head_request(
     state: &AppState,
+    head_of: &AppState,
     group_id: &str,
     epoch: u64,
 ) -> TreeKemCatchupRequest {
+    // A request settles only on the head it names: here `head_of`'s head.
+    let (from_revision, current_state_hash) = head_of
+        .named_groups
+        .read()
+        .await
+        .get(group_id)
+        .map(|info| (info.state_revision, info.state_hash.clone()))
+        .unwrap_or_default();
     let mut request = TreeKemCatchupRequest {
         message_type: "treekem_catchup_request".to_string(),
         group_id: group_id.to_string(),
         requester_agent_id: hex_of(&state.agent.agent_id()),
-        from_revision: 0,
+        from_revision,
         from_treekem_epoch: epoch,
-        current_state_hash: String::new(),
+        current_state_hash,
         missing_prev_state_hash: None,
         target_member_id: None,
         limit: 1,
@@ -314,7 +326,7 @@ async fn a_sibling_asleep_past_ten_minutes_is_seated_when_it_returns() -> Result
         "delivered, still unproven"
     );
 
-    // Review S-3: N, quiet, proves its seat on its own: the seat came from
+    // N, quiet, proves its seat on its own: the seat came from
     // its author, so N answered with one signed request from its new head.
     let proof = held_proof(&n.state, &owner_id).await;
     handle_treekem_catchup_request(owner, &n.id, false, proof).await;
@@ -342,17 +354,17 @@ async fn the_seat_settles_only_on_the_members_own_proof() -> Result<()> {
         owed(owner, group_id, &n.hex).await.is_none()
     };
 
-    let below = signed_head_request(&n.state, group_id, epoch - 1).await;
+    let below = signed_head_request(&n.state, owner, group_id, epoch - 1).await;
     handle_treekem_catchup_request(owner, &n.id, false, below).await;
     assert!(!settled().await, "a request below the seat's epoch");
 
-    let mut claimed = signed_head_request(&n.state, group_id, epoch).await;
+    let mut claimed = signed_head_request(&n.state, owner, group_id, epoch).await;
     claimed.signed_by = None;
     handle_treekem_catchup_request(owner, &n.id, false, claimed).await;
     assert!(!settled().await, "a claimed sender, unsigned");
 
     let forged = {
-        let mut request = signed_head_request(&n.state, group_id, epoch).await;
+        let mut request = signed_head_request(&n.state, owner, group_id, epoch).await;
         let other = x0x::identity::AgentKeypair::generate()?;
         super::super::signed_catchup::sign_page_request_with(&other, &mut request);
         request
@@ -360,7 +372,7 @@ async fn the_seat_settles_only_on_the_members_own_proof() -> Result<()> {
     handle_treekem_catchup_request(owner, &n.id, false, forged).await;
     assert!(!settled().await, "another key's signature");
 
-    let proof = signed_head_request(&n.state, group_id, epoch).await;
+    let proof = signed_head_request(&n.state, owner, group_id, epoch).await;
     handle_treekem_catchup_request(owner, &n.id, false, proof).await;
     assert!(
         eventually(|| async { owed(owner, group_id, &n.hex).await.is_none() }).await,
@@ -680,7 +692,7 @@ async fn retry_add(cast: &SurvivorRelay, n: &Sibling) -> serde_json::Value {
     serde_json::from_slice(&bytes).expect("json")
 }
 
-/// Fix round 2: the owner restarts with its staging table
+/// The owner restarts with its staging table
 /// full of newer Welcomes. The pinned seat Welcome, the oldest, is not the
 /// one the cap drops.
 #[tokio::test]
@@ -714,7 +726,7 @@ async fn a_restart_with_a_full_staging_table_keeps_the_pinned_welcome() -> Resul
     Ok(())
 }
 
-/// Fix round 2 (review concern 2): the one-a-day re-seat limit is on disk.
+/// The one-a-day re-seat limit is on disk.
 /// A daemon that restarts, as one in a crash loop would, does not re-key
 /// the room again.
 #[tokio::test]
@@ -742,7 +754,7 @@ async fn a_restart_does_not_allow_a_second_re_seat_that_day() -> Result<()> {
     Ok(())
 }
 
-/// Fix round 2 (review concern 3): a member promoted to Admin keeps its
+/// A member promoted to Admin keeps its
 /// role across a re-seat, as a returning member does.
 #[tokio::test]
 async fn an_admin_re_seated_stays_admin() -> Result<()> {
@@ -774,11 +786,78 @@ async fn an_admin_re_seated_stays_admin() -> Result<()> {
     assert!(
         super::signer_delivery::published(owner, |event| matches!(
             event,
-            NamedGroupMetadataEvent::MemberRoleUpdated { agent_id, role: x0x::groups::GroupRole::Admin, .. }
-                if *agent_id == n.hex
+            NamedGroupMetadataEvent::MemberRoleUpdated {
+                agent_id,
+                role: x0x::groups::GroupRole::Admin,
+                ..
+            } if *agent_id == n.hex
         ))
         .is_some(),
         "the restore is a signed role update the room sees"
+    );
+    cast.shutdown().await;
+    Ok(())
+}
+
+/// A retried add whose request goes away between the re-seat's removal and
+/// its add still re-seats the member: the re-seat runs shielded, so the
+/// member is never left removed.
+#[tokio::test]
+async fn a_dropped_retried_add_never_leaves_the_member_removed() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let owner = Arc::clone(&cast.fixture.state);
+    let group_id = cast.fixture.group_id.clone();
+    let n = sibling(&cast).await?;
+    let first = direct_add_route(&owner, &group_id, &n.hex, "Sibling", &n.package_b64).await;
+    evict_from_log(&owner, &first).await;
+
+    let pause = super::super::detached_send_test_seam::arm(
+        &super::super::seat_reseat::reseat_seam_key(&group_id, &n.hex),
+    );
+    let request = {
+        let (owner, group_id, hex, package) = (
+            Arc::clone(&owner),
+            group_id.clone(),
+            n.hex.clone(),
+            n.package_b64.clone(),
+        );
+        tokio::spawn(async move {
+            add_named_group_member(
+                State(owner),
+                owner_extension(),
+                Path(group_id),
+                Json(AddNamedGroupMemberRequest {
+                    agent_id: hex,
+                    display_name: Some("Sibling".to_string()),
+                    treekem_key_package_b64: Some(package),
+                }),
+            )
+            .await
+            .into_response()
+        })
+    };
+    assert!(
+        eventually(|| async { pause.reached() }).await,
+        "setup: the re-seat removed the member"
+    );
+    request.abort();
+    let _ = request.await;
+    drop(pause);
+    let seated = || async {
+        owner
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .is_some_and(|info| info.has_active_member(&n.hex))
+    };
+    assert!(
+        eventually(seated).await,
+        "the member is seated again although its request went away"
+    );
+    assert!(
+        eventually(|| async { reseats(&owner).await == 1 }).await,
+        "the re-seat is counted"
     );
     cast.shutdown().await;
     Ok(())

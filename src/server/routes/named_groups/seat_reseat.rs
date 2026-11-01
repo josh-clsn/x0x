@@ -1,5 +1,5 @@
 //! Re-seat a member whose seat can no longer be delivered (survivor re-key
-//! A13 fix rounds 1 and 2; see `docs/adr/transient/T-seat-obligation.md`).
+//! A13; see `docs/adr/transient/T-seat-obligation.md`).
 //!
 //! An unproven seat is delivered from the catch-up log, and its Welcome stays
 //! staged while it is owed (`seat_welcome_pin`). When the log no longer
@@ -28,7 +28,7 @@
 //!
 //! This restores the owner's side only. A member whose roster base predates
 //! its first seat cannot link the re-seat; that needs a member-side seat
-//! re-base (task A15).
+//! re-base, which is not built.
 
 use super::{
     add_treekem_named_group_member, group_membership_lock, now_millis_u64, parse_agent_id_hex,
@@ -156,8 +156,10 @@ async fn add_back(
     package: &str,
     display_name: Option<String>,
 ) -> Result<(), String> {
+    // The caller holds the room's membership lock.
     let (status, body) = Box::pin(add_treekem_named_group_member(
         Arc::clone(state),
+        None,
         group_key.to_string(),
         member_id,
         AddNamedGroupMemberRequest {
@@ -229,6 +231,8 @@ pub(super) async fn reseat_locked(
         return Reseat::Failed(format!("removal: {}", body.0));
     }
     rekey_obligations::forget(state, group_key, member_hex).await;
+    #[cfg(test)]
+    super::detached_send_test_seam::park(&reseat_seam_key(group_key, member_hex)).await;
     let mut added = add_back(
         state,
         group_key,
@@ -255,7 +259,8 @@ pub(super) async fn reseat_locked(
         tracing::error!(
             group_id = %LogHexId::group(group_key),
             member = %LogHexId::agent(member_hex),
-            "a re-seat removed the member but could not add it back; it stays removed until it asks again: {error}"
+            "a re-seat removed the member but could not add it back; it stays removed until it \
+            asks again: {error}"
         );
         return Reseat::Failed(format!("add: {error}"));
     }
@@ -277,6 +282,38 @@ pub(super) async fn reseat_locked(
     Reseat::Done
 }
 
+/// Rooms whose spawned re-seat ran to its end (tests).
+#[cfg(test)]
+pub(in crate::server) static FINISHED_FOR_TEST: std::sync::Mutex<Vec<String>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The test seam key between a re-seat's removal and its add.
+#[cfg(test)]
+pub(in crate::server) fn reseat_seam_key(group_key: &str, member_hex: &str) -> String {
+    format!("reseat:{group_key}:{member_hex}")
+}
+
+/// [`reseat_locked`] under `guard`, the room's membership lock the caller
+/// took, in a shielded task. The caller waits on the returned receiver: a
+/// caller that goes away, or a shutdown, never cuts the re-seat between its
+/// removal and its add. The receiver ends empty when shutdown refused the
+/// task before it started.
+pub(super) fn spawn_with_guard(
+    state: &Arc<AppState>,
+    guard: tokio::sync::OwnedMutexGuard<()>,
+    group_key: &str,
+    member_hex: &str,
+) -> tokio::sync::oneshot::Receiver<Reseat> {
+    let (done, outcome) = tokio::sync::oneshot::channel();
+    let task_state = Arc::clone(state);
+    let (group_key, member_hex) = (group_key.to_string(), member_hex.to_string());
+    let _ = state.spawn_shielded(async move {
+        let _guard = guard;
+        let _ = done.send(reseat_locked(&task_state, &group_key, &member_hex).await);
+    });
+    outcome
+}
+
 /// [`reseat_locked`] in its own task, under the room's membership lock. It
 /// seals and persists a commit, so it runs shielded: shutdown waits for it.
 pub(super) fn spawn(state: &Arc<AppState>, group_key: &str, member_hex: &str) {
@@ -288,6 +325,10 @@ pub(super) fn spawn(state: &Arc<AppState>, group_key: &str, member_hex: &str) {
         let lock = group_membership_lock(&state, &group_key).await;
         let _guard = lock.lock().await;
         let outcome = reseat_locked(&state, &group_key, &member_hex).await;
+        #[cfg(test)]
+        if let Ok(mut finished) = FINISHED_FOR_TEST.lock() {
+            finished.push(group_key.clone());
+        }
         if outcome != Reseat::Done {
             tracing::debug!(
                 group_id = %LogHexId::group(&group_key),
