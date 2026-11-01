@@ -266,6 +266,11 @@ pub(crate) async fn send_via_gossip_with_provenance(
     // backoff on a `Replaced` for the target peer.
     let mut lifecycle_hint = lifecycle_hint;
 
+    // Per send only. A daemon's `skip_legacy_dm_bus` opt-out deliberately
+    // keeps this sender-side fallback (#501: it still reaches bus-only
+    // receivers; `AgentBuilder::with_skip_legacy_dm_bus`).
+    let skip_bus_fallback = config.skip_legacy_bus_fallback;
+
     let start = Instant::now();
     for attempt in 0..=config.max_retries {
         if attempt > 0 {
@@ -304,6 +309,13 @@ pub(crate) async fn send_via_gossip_with_provenance(
         // `DmError::Timeout`.
         let attempt_tracker = Arc::clone(&tracker);
         let attempt_result = tokio::time::timeout(config.timeout_per_attempt, async {
+            tracing::debug!(
+                target: "dm.trace",
+                stage = "inbox_publish",
+                request_id = %hex::encode(request_id),
+                recipient = %hex::encode(recipient_agent_id.as_bytes()),
+                attempt,
+            );
             let primary_publish = pubsub
                 .publish_topic_id(topic.clone(), topic_id, Bytes::from(wire.clone()))
                 .await;
@@ -332,6 +344,16 @@ pub(crate) async fn send_via_gossip_with_provenance(
             }
 
             attempt_tracker.switch(StageTracker::ACK_WAIT);
+            if skip_bus_fallback {
+                if !primary_publish_ok {
+                    return Err(DmError::LocalGossipUnavailable(
+                        "primary inbox publish failed".to_string(),
+                    ));
+                }
+                return (&mut rx).await.map(Some).map_err(|_| {
+                    DmError::PublishFailed("in-flight ACK registry replaced our waiter".to_string())
+                });
+            }
             if primary_publish_ok {
                 if let Some(outcome) =
                     wait_for_ack_or_backoff(&mut rx, ACK_LEGACY_BUS_FALLBACK_DELAY).await?

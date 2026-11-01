@@ -1087,6 +1087,12 @@ pub struct DmSendConfig {
     /// than declaring the peer disconnected. Default 250ms. Setting to 0
     /// disables the grace and reverts to legacy behaviour.
     pub prefer_newest_grace_ms: u64,
+    /// If true, a gossip-inbox send never republishes the envelope on the
+    /// legacy DM bus after the short no-ACK delay: it publishes once on the
+    /// recipient's inbox topic and waits for the ACK. Defaults to `false`:
+    /// the bus fallback reaches bus-only (pre-inbox) receivers, which is also
+    /// why a daemon's `skip_legacy_dm_bus` opt-out leaves it in place.
+    pub skip_legacy_bus_fallback: bool,
 }
 
 impl Default for DmSendConfig {
@@ -1110,6 +1116,7 @@ impl Default for DmSendConfig {
             logical_request_id: None,
             // X0X-0041: 250ms is the soak-tested grace from iroh-gossip #43.
             prefer_newest_grace_ms: DEFAULT_PREFER_NEWEST_GRACE_MS,
+            skip_legacy_bus_fallback: false,
         }
     }
 }

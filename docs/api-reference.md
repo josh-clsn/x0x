@@ -1197,6 +1197,20 @@ yields two different requests. The token itself never goes on the wire.
 Reusing a `logical_id` for *different* payload bytes is a **409
 `idempotency_conflict`** — see below.
 
+Optional field `single_publish` (bool, default `false`): one request is at most
+one gossip publish. By default a gossip-inbox send publishes the envelope on
+the recipient's inbox topic, republishes it on the legacy DM bus when no ACK
+arrives within 250 ms, and repeats both on its retry after the attempt timeout
+and backoff: up to four publishes per request. With `single_publish: true` the
+envelope goes once to the inbox topic, with no legacy-bus republish and no
+retry; the call still waits for the ACK and answers the timeout as usual. It
+is meant for callers that run their own resend logic (for example, large
+pieces). A bus-only receiver (one that does not subscribe to its inbox topic)
+is not reached by a single-publish send. The daemon setting `skip_legacy_dm_bus`
+does not change this sender-side fallback; only this field does. A raw-QUIC
+send (`prefer_raw_quic_if_connected`) publishes nothing on gossip; the field
+caps only the gossip fallback.
+
 > **Removed (ADR 0030 §4): `require_gossip_ack`.** Setting this field in any
 > form — `true`, `false`, or a non-boolean — is now **400
 > `require_gossip_ack_removed`**. An explicit `null`, like omitting it, is

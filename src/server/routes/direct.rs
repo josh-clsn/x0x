@@ -105,6 +105,12 @@ pub(in crate::server) struct DirectSendRequest {
     /// different bytes is a 409 `idempotency_conflict`.
     #[serde(default)]
     pub(in crate::server) logical_id: Option<String>,
+    /// If true, one request is at most one gossip publish: the envelope goes
+    /// once to the recipient's inbox topic, with no legacy-bus republish and
+    /// no retry attempt, and the call waits for the ACK (or times out).
+    /// For callers with their own resend logic (for example large pieces).
+    #[serde(default)]
+    pub(in crate::server) single_publish: bool,
 }
 
 /// A request the route refuses before any send is attempted, carrying the
@@ -154,6 +160,10 @@ fn direct_send_config_for_request(
     }
     config.stop_fallback_on_raw_error = req.stop_fallback_on_raw_error;
     config.require_gossip = req.require_gossip;
+    if req.single_publish {
+        config.skip_legacy_bus_fallback = true;
+        config.max_retries = 0;
+    }
     // ADR 0030 §4 product tier: durable unless the caller opts out.
     config.require_durable_app_ack = req.require_durable_app_ack.unwrap_or(true);
     if let Some(raw_ack_ms) = req.raw_quic_receive_ack_ms {
@@ -693,6 +703,25 @@ mod tests {
 
     fn config_ok(value: serde_json::Value) -> x0x::dm::DmSendConfig {
         config_for(value).expect("request should be accepted")
+    }
+
+    /// `single_publish` makes one request at most one gossip publish: no
+    /// legacy-bus republish and no retry. Omitting it keeps today's sends.
+    #[test]
+    fn single_publish_maps_to_one_publish_and_defaults_off() {
+        let default = config_ok(serde_json::json!({ "agent_id": "00".repeat(32), "payload": "" }));
+        assert!(!default.skip_legacy_bus_fallback);
+        assert_eq!(
+            default.max_retries,
+            direct_message_send_config().max_retries
+        );
+        let single = config_ok(serde_json::json!({
+            "agent_id": "00".repeat(32),
+            "payload": "",
+            "single_publish": true
+        }));
+        assert!(single.skip_legacy_bus_fallback);
+        assert_eq!(single.max_retries, 0);
     }
 
     #[test]

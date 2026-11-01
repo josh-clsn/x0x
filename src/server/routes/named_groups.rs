@@ -68827,6 +68827,7 @@ pub(in crate::server) mod tests {
             // semantics keeps them testing what they were written to test.
             require_durable_app_ack: Some(false),
             logical_id: None,
+            single_publish: false,
         }
     }
 

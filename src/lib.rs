@@ -41930,3 +41930,6 @@ mod d08_tests;
 
 #[cfg(test)]
 mod issue1099_tests;
+
+#[cfg(test)]
+mod single_publish_tests;
