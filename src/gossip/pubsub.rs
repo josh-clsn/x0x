@@ -9695,7 +9695,7 @@ mod tests {
         kind_meter(manager, "eager").0 + kind_meter(manager, "ihave").0
     }
 
-    /// WHY (review F1): the headline claim is that caps still converge
+    /// WHY: the headline claim is that caps still converge
     /// between consume-only leaves through a Full node. Leaf A and leaf B
     /// are both consume-only and linked only to Full F. A's own caps must
     /// reach B on all four topics through F's forwarding, and B must take
@@ -9755,7 +9755,7 @@ mod tests {
         );
     }
 
-    /// WHY (review F1, the documented limit): with no Full node on the path,
+    /// WHY (the documented limit): with no Full node on the path,
     /// a chain of consume-only leaves A - B - C does not carry A's caps to C.
     /// B delivers them locally and forwards nothing, eager or IHAVE, so C
     /// receives none. Only the 30 s anti-entropy exchange can repair it; the

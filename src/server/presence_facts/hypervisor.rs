@@ -128,7 +128,10 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    const BARE_CPUINFO: &str = "processor\t: 0\nvendor_id\t: GenuineIntel\nflags\t\t: fpu vme de pse tsc msr sse sse2 ht\n";
+    const BARE_CPUINFO: &str = concat!(
+        "processor\t: 0\nvendor_id\t: GenuineIntel\n",
+        "flags\t\t: fpu vme de pse tsc msr sse sse2 ht\n",
+    );
 
     /// A bare-metal x86 machine, plus `extra` files.
     fn host(extra: &[(&str, &str)]) -> HashMap<String, String> {
@@ -163,7 +166,10 @@ mod tests {
         assert_eq!(probe(&host(&[]), &[]), None);
         let phone = host(&[(
             "/proc/cpuinfo",
-            "processor\t: 0\nFeatures\t: fp asimd evtstrm aes pmull sha1\nHardware\t: Qualcomm Technologies, Inc SM8550\n",
+            concat!(
+                "processor\t: 0\nFeatures\t: fp asimd evtstrm aes pmull sha1\n",
+                "Hardware\t: Qualcomm Technologies, Inc SM8550\n",
+            ),
         )]);
         assert_eq!(probe(&phone, &[]), None);
     }

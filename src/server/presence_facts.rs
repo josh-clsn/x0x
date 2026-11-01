@@ -31,12 +31,14 @@
 //!   freeze: SIGSTOP, a cgroup freezer, a stalled sampler);
 //! - B or M went backwards, or the clocks could not be read.
 //!
-//! | Platform | Clocks read | Support |
-//! |---|---|---|
-//! | Linux, Android, bare metal | `nix` `CLOCK_BOOTTIME` and `CLOCK_MONOTONIC`, and W | verified |
-//! | Linux, Android under a hypervisor or WSL ([`hypervisor`]) | the same | TTL only: a VM pause stops B and M together |
-//! | macOS | none: Apple's sleep-inclusive pair is not yet verified on a Mac | TTL only |
-//! | Windows and the rest | none: no safe suspend pair is verified | TTL only |
+//! By platform:
+//! - Linux and Android on bare metal: `nix` `CLOCK_BOOTTIME` and
+//!   `CLOCK_MONOTONIC`, and W. Verified.
+//! - Linux and Android under a hypervisor or WSL ([`hypervisor`]): the same
+//!   clocks, TTL only, because a VM pause stops B and M together.
+//! - macOS: none. Apple's sleep-inclusive pair is not yet verified on a Mac.
+//!   TTL only.
+//! - Windows and the rest: none. No safe suspend pair is verified. TTL only.
 //!
 //! On a TTL-only platform every read reports `suspended_since_last_get:
 //! true` and no connected admins, so the engine stays in TTL mode.
