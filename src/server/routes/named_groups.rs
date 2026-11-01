@@ -8,20 +8,26 @@
 
 mod catchup_page_gap;
 mod catchup_routes;
+mod catchup_serve;
 mod committer_leaf;
 mod control_blob;
 mod direct_metadata_lanes;
 mod event_log_store;
+mod gap_catchup;
 pub(in crate::server) use catchup_page_gap::GapAsks;
 pub(in crate::server) use catchup_routes::{
     treekem_catch_up_state, treekem_catch_up_trigger, treekem_head_proof_accept,
     treekem_head_proof_sign,
+};
+pub(in crate::server) use catchup_serve::{
+    on_direct_message as on_catchup_direct_message, CatchupServe,
 };
 pub(in crate::server) use committer_leaf::PackageRepulls;
 use event_log_store::{
     commit_bearing_event_frontier, commit_bearing_event_sort_key, remember_commit_bearing_event,
 };
 pub(in crate::server) use event_log_store::{load_event_log, EventLog};
+pub(in crate::server) use gap_catchup::GapCatchups;
 mod fair_admission;
 mod head_proof;
 mod head_rounds;
@@ -4154,6 +4160,48 @@ fn spawn_group_control_event_redelivery(
     extra_recipients: &[String],
     recipients_override: Option<&[String]>,
 ) {
+    spawn_group_control_event_redelivery_with(
+        state,
+        metadata_topic,
+        info,
+        event,
+        extra_recipients,
+        recipients_override,
+        true,
+    );
+}
+
+/// Survivor re-key A12: the resend schedule's direct sends to
+/// the member an add seats, with no room-wide republish. That member is not
+/// subscribed to the room's metadata topic yet, so a republish reaches only
+/// the members who hold the add already.
+fn spawn_seated_member_resends(
+    state: &Arc<AppState>,
+    metadata_topic: &str,
+    info: &x0x::groups::GroupInfo,
+    event: &NamedGroupMetadataEvent,
+    seated_hex: &str,
+) {
+    spawn_group_control_event_redelivery_with(
+        state,
+        metadata_topic,
+        info,
+        event,
+        &[],
+        Some(&[seated_hex.to_string()]),
+        false,
+    );
+}
+
+fn spawn_group_control_event_redelivery_with(
+    state: &Arc<AppState>,
+    metadata_topic: &str,
+    info: &x0x::groups::GroupInfo,
+    event: &NamedGroupMetadataEvent,
+    extra_recipients: &[String],
+    recipients_override: Option<&[String]>,
+    republish: bool,
+) {
     let recipients: Vec<String> = match recipients_override {
         Some(recipients) => {
             let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
@@ -4174,12 +4222,17 @@ fn spawn_group_control_event_redelivery(
             .collect(),
     };
     #[cfg(test)]
-    if let Ok(mut recorded) = state
-        .named_group_test_recorders
-        .control_redelivery_recipients
-        .lock()
     {
-        recorded.push((named_group_metadata_event_kind(event), recipients.clone()));
+        let recorder = if republish {
+            &state
+                .named_group_test_recorders
+                .control_redelivery_recipients
+        } else {
+            &state.named_group_test_recorders.seated_member_resends
+        };
+        if let Ok(mut recorded) = recorder.lock() {
+            recorded.push((named_group_metadata_event_kind(event), recipients.clone()));
+        }
     }
     let schedule = GROUP_CONTROL_REDELIVERY_SCHEDULE_OVERRIDE.clone();
     // #531 I1: the early return below is silent, so "resends disabled" could
@@ -4213,7 +4266,9 @@ fn spawn_group_control_event_redelivery(
         let start = tokio::time::Instant::now();
         for (index, offset) in schedule.iter().enumerate() {
             tokio::time::sleep_until(start + *offset).await;
-            publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+            if republish {
+                publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+            }
             for recipient in &recipients {
                 spawn_named_group_event_delivery(&state, recipient, &event);
             }
@@ -10386,7 +10441,13 @@ async fn queue_treekem_membership_event(
             .record_membership_event_queued_revision_gap(group_id);
     }
     tracing::warn!(group_id = %LogHexId::group(&group_id), reason, "queued TreeKEM membership event pending catch-up/replay");
-    request_treekem_catchup_for_gap(state, group_id, &event, peers).await;
+    // Survivor re-key A12: each ask is registered here and sent in its own
+    // task; nothing here waits on the network. The event is parked above, so
+    // a page that lands first still finds it.
+    let missing_prev_state_hash = treekem_membership_event_frontier(&event)
+        .and_then(|frontier| frontier.commit.prev_state_hash.clone());
+    gap_catchup::request_treekem_catchup_for_gap(state, group_id, peers, missing_prev_state_hash)
+        .await;
 }
 
 /// Validate before insertion, eviction, or preparing any catch-up destination.
@@ -10464,65 +10525,6 @@ fn admit_treekem_pending_event(
     Some(peers)
 }
 
-async fn request_treekem_catchup_for_gap(
-    state: &Arc<AppState>,
-    group_id: &str,
-    event: &NamedGroupMetadataEvent,
-    peers: Vec<AgentId>,
-) {
-    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
-    let Some(frontier) = treekem_membership_event_frontier(event) else {
-        return;
-    };
-    let (from_revision, from_epoch, current_state_hash) = {
-        let groups = state.named_groups.read().await;
-        let Some(info) = groups.get(group_id) else {
-            return;
-        };
-        if info.withdrawn {
-            return;
-        }
-        (
-            info.state_revision,
-            info.secret_epoch,
-            info.state_hash.clone(),
-        )
-    };
-    for peer in peers {
-        let peer_hex = hex::encode(peer.as_bytes());
-        let throttle_key = format!("{group_id}:{peer_hex}:{from_revision}:{from_epoch}");
-        {
-            let mut throttle = state.treekem_catchup_throttle.write().await;
-            if throttle
-                .get(&throttle_key)
-                .is_some_and(|last| last.elapsed() < TREEKEM_CATCHUP_THROTTLE)
-            {
-                continue;
-            }
-            stamp_catchup_throttle(&mut throttle, throttle_key, tokio::time::Instant::now());
-        }
-        let mut request = TreeKemCatchupRequest {
-            message_type: "treekem_catchup_request".to_string(),
-            group_id: group_id.to_string(),
-            requester_agent_id: local_agent_hex.clone(),
-            from_revision,
-            from_treekem_epoch: from_epoch,
-            current_state_hash: current_state_hash.clone(),
-            missing_prev_state_hash: frontier.commit.prev_state_hash.clone(),
-            target_member_id: None,
-            limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
-            signed_by: None,
-            head_challenge: None,
-        };
-        // Survivor re-key A5: signed, for a responder that cannot verify
-        // this member's transport.
-        signed_catchup::sign_page_request(state, &mut request);
-        if let Err(e) = signed_catchup::send_page_request(state, &peer, request).await {
-            tracing::debug!(group_id = %group_id, peer = %peer_hex, "TreeKEM catch-up request failed: {e}");
-        }
-    }
-}
-
 /// Retention for queued TreeKEM metadata events awaiting group install.
 ///
 /// Deliberately NOT derived from `PENDING_JOIN_RESULT_TTL`: when that
@@ -10531,7 +10533,40 @@ async fn request_treekem_catchup_for_gap(
 /// already covers the install races this replay exists for.
 const PENDING_TREEKEM_EVENT_TTL: Duration = Duration::from_secs(10 * 60);
 
+/// Most passes one replay runs (survivor re-key A12).
+const TREEKEM_REPLAY_PASSES: usize = 8;
+
+/// Replay the room's parked TreeKEM events, in commit order. A pass that
+/// moved the room's head while events stayed parked runs again: another
+/// replay may have requeued an event while this one was applying its
+/// predecessor, and nothing else would replay it. Order is the
+/// frontier gate's, unchanged: an event that does not link stays parked.
 async fn replay_pending_treekem_events(state: &Arc<AppState>, group_id: &str) {
+    for _ in 0..TREEKEM_REPLAY_PASSES {
+        let before = treekem_replay_head(state, group_id).await;
+        replay_pending_treekem_events_pass(state, group_id).await;
+        let parked = state
+            .treekem_pending_events
+            .read()
+            .await
+            .get(group_id)
+            .is_some_and(|queue| !queue.is_empty());
+        if !parked || treekem_replay_head(state, group_id).await == before {
+            return;
+        }
+    }
+}
+
+async fn treekem_replay_head(state: &AppState, group_id: &str) -> Option<(u64, String)> {
+    state
+        .named_groups
+        .read()
+        .await
+        .get(group_id)
+        .map(|info| (info.state_revision, info.state_hash.clone()))
+}
+
+async fn replay_pending_treekem_events_pass(state: &Arc<AppState>, group_id: &str) {
     // Set the fence before the drain. Replay empties the shared queue
     // first, and another task would otherwise see an empty queue and seal
     // between events. An empty queue does not take the fence.
@@ -10549,6 +10584,16 @@ async fn replay_pending_treekem_events(state: &Arc<AppState>, group_id: &str) {
             return;
         };
         let mut entries: Vec<_> = queue.drain(..).collect();
+        #[cfg(test)]
+        if let Some(parked) = state
+            .named_group_test_recorders
+            .replay_park_during_pass
+            .lock()
+            .ok()
+            .and_then(|mut parked| parked.take())
+        {
+            queue.push_back(parked);
+        }
         entries.retain(|pending| pending.queued_at.elapsed() < PENDING_TREEKEM_EVENT_TTL);
         entries.sort_by_key(|pending| treekem_membership_event_sort_key(&pending.event));
         entries
@@ -11658,12 +11703,48 @@ async fn member_keyed_treekem_catchup_response(
     })
 }
 
+/// #398: whether `request` is a member-keyed request its claimed requester
+/// signed over (group, requester, target).
+pub(super) fn member_keyed_request_signed(request: &TreeKemCatchupRequest) -> bool {
+    match (&request.target_member_id, &request.signed_by) {
+        (Some(target), Some(signer)) => catchup_signer_matches(
+            signer,
+            &request.requester_agent_id,
+            &member_keyed_request_sign_input(
+                &request.group_id,
+                &request.requester_agent_id,
+                target,
+            ),
+        ),
+        _ => false,
+    }
+}
+
 pub(in crate::server) async fn handle_treekem_catchup_request(
     state: &Arc<AppState>,
     sender: &AgentId,
     verified: bool,
     request: TreeKemCatchupRequest,
 ) {
+    #[cfg(test)]
+    {
+        if let Ok(mut started) = state
+            .named_group_test_recorders
+            .catchup_serves_started
+            .lock()
+        {
+            started.push(hex::encode(sender.as_bytes()));
+        }
+        let hold = state
+            .named_group_test_recorders
+            .catchup_serve_hold
+            .lock()
+            .ok()
+            .and_then(|hold| hold.clone());
+        if let Some(hold) = hold {
+            let _released = hold.acquire().await;
+        }
+    }
     if request.message_type != "treekem_catchup_request" {
         return;
     }
@@ -11675,19 +11756,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     // key is self-certifying against the requester id, so this admits
     // exactly the sender-authenticity the transport flag would have. All
     // membership gates below still apply unchanged.
-    let member_keyed_signed_ok = !verified
-        && match (&request.target_member_id, &request.signed_by) {
-            (Some(target), Some(signer)) => catchup_signer_matches(
-                signer,
-                &request.requester_agent_id,
-                &member_keyed_request_sign_input(
-                    &request.group_id,
-                    &request.requester_agent_id,
-                    target,
-                ),
-            ),
-            _ => false,
-        };
+    let member_keyed_signed_ok = !verified && member_keyed_request_signed(&request);
     // A page request proves its origin over its own domain and frontier,
     // before the #378 throttle. Verified once; a head challenge reuses it.
     let page_signed = (!verified || request.head_challenge.is_some())
@@ -12543,7 +12612,7 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     // its claimed sender for the next page only when the page moved this
     // member's head, and only when that sender is an active member here:
     // the request carries this member's head, which goes to members only.
-    let (head_after, sender_is_member) = {
+    let (head_after, epoch_after, sender_is_member) = {
         let groups = state.named_groups.read().await;
         groups
             .get(&response.group_id)
@@ -12552,8 +12621,12 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                     .values()
                     .find(|info| info.stable_group_id() == response.group_id)
             })
-            .map_or((head_before, false), |info| {
-                (info.state_revision, info.has_active_member(&sender_hex))
+            .map_or((head_before, response_info.secret_epoch, false), |info| {
+                (
+                    info.state_revision,
+                    info.secret_epoch,
+                    info.has_active_member(&sender_hex),
+                )
             })
     };
     let reporter_counts = sender_is_member && (verified || gap_report_signed);
@@ -12570,21 +12643,14 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
             verified,
             "TreeKEM catch-up response was truncated; requesting next page"
         );
-        let mut sent = false;
-        for _ in 0..SELF_LEAVE_CATCHUP_PAGE_SENDS {
-            if request_treekem_catchup_page(state, &response.group_id, sender).await {
-                sent = true;
-                break;
-            }
-        }
-        if !sent {
-            tracing::warn!(
-                group_id = %LogHexId::group(&response.group_id),
-                sender = %LogHexId::agent(&sender_hex),
-                sends = SELF_LEAVE_CATCHUP_PAGE_SENDS,
-                "TreeKEM catch-up next page was not sent; this peer's page fence stays open"
-            );
-        }
+        // Survivor re-key A12: in its own task, at most one per (room,
+        // peer), so this listener reads on while the peer is silent.
+        gap_catchup::spawn_follow_up(
+            state,
+            &response.group_id,
+            *sender,
+            (head_after, epoch_after),
+        );
     } else if !verified {
         // The self-leave fences and the startup head (#1337, #1406) read
         // verified pages only.
@@ -13239,6 +13305,9 @@ async fn apply_named_group_metadata_event_with_binding(
     // moves and installed only after every apply guard has dropped.
     let roster_sidecar = seat_cert_fetch::member_added_sidecar(&event);
     let event_group_id = named_group_metadata_event_group_id(&event).to_string();
+    // Survivor re-key A12: a membership commit that lands live
+    // may be the one parked events wait for.
+    let lands_membership_commit = treekem_membership_event_frontier(&event).is_some();
     let applied = Box::pin(apply_named_group_metadata_event_inner_serialized(
         state,
         event,
@@ -13271,9 +13340,32 @@ async fn apply_named_group_metadata_event_with_binding(
             schedule_self_leave_rekey_if_idle(state, &group_id).await;
         }
     }
+    if applied.accepted && lands_membership_commit {
+        replay_parked_after_live_apply(state, &event_group_id).await;
+    }
     refresh_group_rosters_for_gossip(state).await;
     ensure_listeners_after_local_admission(state, &event_group_id, applied.accepted).await;
     applied
+}
+
+/// Survivor re-key A12: replay the room's parked TreeKEM
+/// events after a live apply landed a membership commit, as a catch-up page
+/// does. Before, they waited for some page even when the commit they needed
+/// had arrived by gossip or a direct push. Runs with no apply guard held;
+/// the replay re-applies each event with every check, in commit order.
+async fn replay_parked_after_live_apply(state: &Arc<AppState>, event_group_id: &str) {
+    let Some(room) = local_group_key_for_parking(state, event_group_id).await else {
+        return;
+    };
+    let parked = state
+        .treekem_pending_events
+        .read()
+        .await
+        .get(&room)
+        .is_some_and(|queue| !queue.is_empty());
+    if parked {
+        replay_pending_treekem_events(state, &room).await;
+    }
 }
 
 /// #1023: install the certificate sidecar a `MemberAdded` carried onto the
@@ -24485,7 +24577,9 @@ async fn add_treekem_named_group_member(
     remember_commit_bearing_event(&state, &event).await;
     // Survivor re-key A10: every member the add did not seat is owed it
     // before the first publish; any the obligations refused get the blind
-    // schedule.
+    // schedule. A12: the member it seats has no join result to poll, so it
+    // gets the schedule's direct sends too, past +8 s, with no republish
+    // (it is not subscribed yet).
     let refused =
         rekey_obligations::owe_survivors(&state, &id, &next, &[agent_hex.as_str()], &[&event])
             .await;
@@ -24506,6 +24600,7 @@ async fn add_treekem_named_group_member(
             Some(&refused),
         );
     }
+    spawn_seated_member_resends(&state, &metadata_topic, &next, &event, &agent_hex);
     spawn_named_group_event_delivery_to_active_members(&state, &next, &member_joined_recovery, &[]);
     let recovery_deliveries = state
         .treekem_member_key_packages
@@ -33566,7 +33661,10 @@ async fn approve_treekem_join_request(
     };
     remember_commit_bearing_event(&state, &event).await;
     // Survivor re-key A10: as for any add, every member the approval did
-    // not seat is owed it before the first publish.
+    // not seat is owed it before the first publish; any the obligations
+    // refused get the blind schedule. A12: the requester it seats has no
+    // join result to poll, so it gets the schedule's direct sends too, with
+    // no republish (it is not subscribed yet).
     let refused =
         rekey_obligations::owe_survivors(&state, &id, &next, &[requester_hex.as_str()], &[&event])
             .await;
@@ -33587,6 +33685,7 @@ async fn approve_treekem_join_request(
             Some(&refused),
         );
     }
+    spawn_seated_member_resends(&state, &metadata_topic, &next, &event, &requester_hex);
     cache_treekem_member_key_package(
         &state,
         join_result_key(&id, &requester_hex),
@@ -49746,6 +49845,7 @@ pub(in crate::server) mod tests {
     mod adr0107_stuck_join_rearm;
     mod batch3_carries;
     mod cache_hardening_followup;
+    mod catchup_off_apply;
     mod catchup_routes;
     mod committer_leaf;
     mod engine_a_apply_gate;
@@ -50612,6 +50712,8 @@ pub(in crate::server) mod tests {
             treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
             treekem_package_repulls: std::sync::Mutex::default(),
             treekem_gap_asks: std::sync::Mutex::default(),
+            treekem_gap_catchups: std::sync::Mutex::default(),
+            treekem_catchup_serve: CatchupServe::default(),
             treekem_head_answers: std::sync::Mutex::default(),
             treekem_head_rounds: std::sync::Mutex::default(),
             treekem_head_counter: Mutex::new(treekem_head_counter),

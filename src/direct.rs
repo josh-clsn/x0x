@@ -505,6 +505,10 @@ struct DirectDiagnosticsCounters {
     ack_direct_hedge_saved_failure: AtomicU64,
     ack_direct_hedge_skipped: AtomicU64,
     ack_direct_hedge_failed: AtomicU64,
+    v1_ack_waits: AtomicU64,
+    v1_ack_wait_ms: AtomicU64,
+    v1_ack_wait_timeouts: AtomicU64,
+    v1_ack_wait_timeout_ms: AtomicU64,
     incoming_delivered_to_subscribe: AtomicU64,
     subscriber_channel_lagged: AtomicU64,
     subscriber_events_evicted: AtomicU64,
@@ -593,6 +597,20 @@ pub struct DmDiagnosticsStats {
     pub ack_direct_hedge_skipped: u64,
     #[serde(default)]
     pub ack_direct_hedge_failed: u64,
+    /// Survivor re-key A12: gossip-inbox sends that waited for a v1
+    /// (non-durable) recipient ACK, and the milliseconds they spent from
+    /// the first publish to the outcome.
+    #[serde(default)]
+    pub v1_ack_waits: u64,
+    #[serde(default)]
+    pub v1_ack_wait_ms: u64,
+    /// Of those, the sends that ended without the ACK (`Timeout`), and their
+    /// milliseconds. A lost ACK from a leaf recipient lands here even when
+    /// the message arrived.
+    #[serde(default)]
+    pub v1_ack_wait_timeouts: u64,
+    #[serde(default)]
+    pub v1_ack_wait_timeout_ms: u64,
     pub incoming_delivered_to_subscribe: u64,
     /// Number of oldest buffered events evicted from slow subscriber queues.
     pub subscriber_events_evicted: u64,
@@ -1116,6 +1134,25 @@ impl DirectMessaging {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Survivor re-key A12: one gossip-inbox send that waited `elapsed_ms`
+    /// for a v1 recipient ACK, and whether it ended without one.
+    pub(crate) fn record_v1_ack_wait(&self, elapsed_ms: u64, timed_out: bool) {
+        self.diagnostics
+            .v1_ack_waits
+            .fetch_add(1, Ordering::Relaxed);
+        self.diagnostics
+            .v1_ack_wait_ms
+            .fetch_add(elapsed_ms, Ordering::Relaxed);
+        if timed_out {
+            self.diagnostics
+                .v1_ack_wait_timeouts
+                .fetch_add(1, Ordering::Relaxed);
+            self.diagnostics
+                .v1_ack_wait_timeout_ms
+                .fetch_add(elapsed_ms, Ordering::Relaxed);
+        }
+    }
+
     /// #380 leaf-reverse-ACK: Direct hedge outcome counter.
     pub(crate) fn record_ack_direct_hedge(&self, outcome: AckDirectHedgeOutcomeRecord) {
         let counter = match outcome {
@@ -1241,6 +1278,16 @@ impl DirectMessaging {
             ack_direct_hedge_failed: self
                 .diagnostics
                 .ack_direct_hedge_failed
+                .load(Ordering::Relaxed),
+            v1_ack_waits: self.diagnostics.v1_ack_waits.load(Ordering::Relaxed),
+            v1_ack_wait_ms: self.diagnostics.v1_ack_wait_ms.load(Ordering::Relaxed),
+            v1_ack_wait_timeouts: self
+                .diagnostics
+                .v1_ack_wait_timeouts
+                .load(Ordering::Relaxed),
+            v1_ack_wait_timeout_ms: self
+                .diagnostics
+                .v1_ack_wait_timeout_ms
                 .load(Ordering::Relaxed),
             incoming_delivered_to_subscribe: self
                 .diagnostics
@@ -1659,6 +1706,18 @@ impl Default for DirectMessaging {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v1_ack_waits_count_every_wait_and_the_timeouts_apart() {
+        let dm = DirectMessaging::new();
+        dm.record_v1_ack_wait(40, false);
+        dm.record_v1_ack_wait(24_000, true);
+        let stats = dm.diagnostics_snapshot().stats;
+        assert_eq!(stats.v1_ack_waits, 2);
+        assert_eq!(stats.v1_ack_wait_ms, 24_040);
+        assert_eq!(stats.v1_ack_wait_timeouts, 1);
+        assert_eq!(stats.v1_ack_wait_timeout_ms, 24_000);
+    }
 
     #[test]
     fn diagnostics_snapshot_includes_last_durable_send_stages() {

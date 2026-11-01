@@ -74,10 +74,9 @@ use routes::{
     get_group_public_messages, get_group_state, get_group_state_commits, get_join_result_inline,
     get_kv_value, get_mls_group, get_named_group, get_named_group_members, get_profile,
     get_sync_devices, gossip_diagnostics, group_membership_lock, groups_diagnostics,
-    handle_control_blob_message, handle_file_message, handle_treekem_catchup_request,
-    handle_treekem_catchup_response, health, history_diagnostics, history_list, history_message,
-    history_policy, history_purge, history_retain, history_scopes, history_search, history_stats,
-    identity_revocations, identity_revoke, import_agent_card, import_group_card,
+    handle_control_blob_message, handle_file_message, health, history_diagnostics, history_list,
+    history_message, history_policy, history_purge, history_retain, history_scopes, history_search,
+    history_stats, identity_revocations, identity_revoke, import_agent_card, import_group_card,
     ingest_public_message, introduction, join_group_via_invite, join_kv_store, join_mesh,
     leave_group, list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys,
     list_kv_stores, list_machines, list_mls_groups, list_named_groups, list_revocations,
@@ -109,12 +108,12 @@ use routes::{
     ControlBlobMessage, ControlBlobState, JoinResultMessage, KvStoreDirectDelta,
     NamedGroupMetadataEvent, PendingListenerAdmission, PredecessorRelayObligation,
     PublicGroupBootstrap, SelfPublishedReleaseManifests, StartupUpdateCheckRuntime,
-    TreeKemCatchupRequest, TreeKemCatchupResponse, CAUSAL_ENVELOPE_MAX_BYTES,
-    CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
-    CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
-    DIRECTORY_RESUBSCRIBE_JITTER_MS, GROUP_PREDECESSOR_RELAY_DM_PREFIX,
-    GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE, KV_STORE_DELTA_DM_PREFIX,
+    CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
+    DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
+    GROUP_PREDECESSOR_RELAY_DM_PREFIX, GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE,
+    KV_STORE_DELTA_DM_PREFIX,
 };
 use sse::{direct_events_sse, events_sse, peer_events_handler, presence_events, SseEvent};
 pub use state::{
@@ -1378,6 +1377,8 @@ pub async fn serve_with_options(
         treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
         treekem_package_repulls: std::sync::Mutex::default(),
         treekem_gap_asks: std::sync::Mutex::default(),
+        treekem_gap_catchups: std::sync::Mutex::default(),
+        treekem_catchup_serve: crate::server::routes::named_groups::CatchupServe::default(),
         treekem_head_answers: std::sync::Mutex::default(),
         treekem_head_rounds: std::sync::Mutex::default(),
         treekem_head_counter: Mutex::new(treekem_head_counter),
@@ -2331,49 +2332,18 @@ pub async fn serve_with_options(
 
     // Background TreeKEM catch-up listener — explicit anti-entropy for
     // order-sensitive membership events that arrive before local readiness or
-    // ahead of the local epoch/state frontier.
+    // ahead of the local epoch/state frontier. Survivor re-key A12: requests
+    // are answered side by side (a bounded few at once, one per proven
+    // requester), and a response's follow-up ask runs in its own task, so
+    // this reader waits on no send.
     {
         let catchup_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
             let mut rx = catchup_state.agent.subscribe_direct();
             loop {
                 let Some(msg) = rx.recv().await else { break };
-                if let Ok(request) = serde_json::from_slice::<TreeKemCatchupRequest>(&msg.payload) {
-                    if request.message_type == "treekem_catchup_request" {
-                        handle_treekem_catchup_request(
-                            &catchup_state,
-                            &msg.sender,
-                            msg.verified,
-                            request,
-                        )
-                        .await;
-                    }
-                    continue;
-                }
-                if let Ok(response) = serde_json::from_slice::<TreeKemCatchupResponse>(&msg.payload)
-                {
-                    if response.message_type == "treekem_catchup_response" {
-                        // #1275: the response's events are applied and
-                        // persisted, so the apply runs shielded; awaiting it
-                        // keeps the responses in arrival order.
-                        let apply_state = Arc::clone(&catchup_state);
-                        let sender = msg.sender;
-                        let verified = msg.verified;
-                        let applied = catchup_state
-                            .run_shielded(Box::pin(async move {
-                                handle_treekem_catchup_response(
-                                    &apply_state,
-                                    &sender,
-                                    verified,
-                                    response,
-                                )
-                                .await;
-                            }))
-                            .await;
-                        if applied.is_none() {
-                            break;
-                        }
-                    }
+                if !routes::named_groups::on_catchup_direct_message(&catchup_state, &msg).await {
+                    break;
                 }
             }
         }));
