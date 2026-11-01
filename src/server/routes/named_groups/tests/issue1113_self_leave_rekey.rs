@@ -420,6 +420,11 @@ async fn missing_key_package_defers_until_the_bytes_return() -> Result<()> {
 
 /// A non-empty TreeKEM queue blocks the in-apply commit. The pass runs
 /// after the queue is empty and extends the head that is current then.
+///
+/// Fork (survivor re-key A12): a live membership apply replays the parked
+/// queue right after its own rekey check, as a catch-up page does. The
+/// parked copy here is this same leave, so that replay drains it, and the
+/// replay's post-batch pass commits once, on the head current then.
 #[tokio::test]
 async fn queued_treekem_event_blocks_the_rekey_until_the_queue_is_empty() -> Result<()> {
     let fixture = two_member_treekem_group().await?;
@@ -439,22 +444,27 @@ async fn queued_treekem_event_blocks_the_rekey_until_the_queue_is_empty() -> Res
         apply_named_group_metadata_event(&fixture.state, event, fixture.member_id, true, None)
             .await;
     assert!(applied.accepted, "the leave must apply: {applied:?}");
+    assert!(
+        fixture
+            .state
+            .treekem_pending_events
+            .read()
+            .await
+            .get(&fixture.group_id)
+            .is_none_or(std::collections::VecDeque::is_empty),
+        "the live apply's replay drains the parked copy"
+    );
     assert_eq!(
         live_epoch(&fixture.state, &fixture.group_id).await,
-        fixture.epoch_before,
-        "a queued TreeKEM event must block the in-apply rekey"
-    );
-    fixture.state.treekem_pending_events.write().await.clear();
-    let hash_before = stored_hash(&fixture.state, &fixture.group_id).await;
-    schedule_self_leave_rekey_if_idle(&fixture.state, &fixture.group_id).await;
-    assert!(
-        live_epoch(&fixture.state, &fixture.group_id).await > fixture.epoch_before,
-        "the pass must commit once the queue is empty"
+        fixture.epoch_before + 1,
+        "the rekey commits once, after the queue drained"
     );
     let hash_after = stored_hash(&fixture.state, &fixture.group_id).await;
-    assert_ne!(
-        hash_after, hash_before,
-        "the rekey must extend the head that was current when the queue drained"
+    schedule_self_leave_rekey_if_idle(&fixture.state, &fixture.group_id).await;
+    assert_eq!(
+        stored_hash(&fixture.state, &fixture.group_id).await,
+        hash_after,
+        "a later pass finds nothing owed"
     );
     Ok(())
 }
