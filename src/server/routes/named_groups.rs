@@ -46,7 +46,7 @@ pub(in crate::server) use seat_cert_fetch::{
 };
 use treekem_binding::{
     add_binding_names_bytes, add_extras_digest, parse_treekem_binding, removal_binding_names_bytes,
-    treekem_ban_bytes_binding, treekem_bytes_binding, treekem_removal_bytes_binding,
+    treekem_ban_bytes_binding, treekem_bytes_binding, treekem_removal_bytes_binding, AddKind,
     WelcomeContent,
 };
 pub(in crate::server) use welcome_acks::WelcomeAckTasks;
@@ -8936,7 +8936,9 @@ fn treekem_removal_binding_covers_commit(
 /// display name, KeyPackage hash, Welcome and owner mandate the event
 /// carries), then keeps the recovery record's suffix. The mandate is minted
 /// first, so the seal can name it.
+#[allow(clippy::too_many_arguments)]
 fn treekem_add_security_binding(
+    kind: AddKind,
     epoch: u64,
     commit: &[u8],
     display_name: Option<&str>,
@@ -8947,6 +8949,7 @@ fn treekem_add_security_binding(
 ) -> Option<String> {
     let hash = member_joined_recovery_record_hash(recovery)?;
     let extras = add_extras_digest(
+        kind,
         display_name,
         key_package_hash,
         Some(&WelcomeContent::of_bytes(welcome)),
@@ -8966,6 +8969,7 @@ fn treekem_add_security_binding(
 /// TreeKEM binding that is none of the written forms is refused.
 #[allow(clippy::too_many_arguments)]
 fn treekem_add_binding_admits(
+    kind: AddKind,
     signed: &x0x::groups::state_commit::GroupStateCommit,
     epoch: u64,
     commit_b64: &str,
@@ -8994,6 +8998,7 @@ fn treekem_add_binding_admits(
         return false;
     };
     add_extras_digest(
+        kind,
         display_name,
         key_package_hash,
         welcome.as_ref(),
@@ -14020,6 +14025,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             };
             if let Some((commit_b64, welcome_b64, welcome_ref, epoch)) = treekem_payload.as_ref() {
                 if !treekem_add_binding_admits(
+                    AddKind::MemberAdded,
                     &commit,
                     *epoch,
                     commit_b64,
@@ -15875,6 +15881,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 treekem_payload.as_ref()
             {
                 if !treekem_add_binding_admits(
+                    AddKind::JoinRequestApproved,
                     &commit,
                     *epoch,
                     commit_b64,
@@ -16711,7 +16718,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     return ApplyMetadataResult::REJECTED;
                 }
                 if !committer_leaf::sealer_seat_commits_package(&info, &local_agent_hex) {
-                    let _ = committer_leaf::sealer_package_uncommitted(
+                    committer_leaf::log_sealer_package_uncommitted(
                         &resolved_group_key,
                         "returning-member re-key",
                     );
@@ -17010,6 +17017,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 )
                 .await;
                 let add_binding = treekem_add_security_binding(
+                    AddKind::MemberAdded,
                     expected2,
                     &out.commit,
                     display_name.as_deref(),
@@ -17508,7 +17516,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     Err(_) => return ApplyMetadataResult::REJECTED,
                 };
                 if !committer_leaf::sealer_seat_commits_package(&next, &local_agent_hex) {
-                    let _ = committer_leaf::sealer_package_uncommitted(
+                    committer_leaf::log_sealer_package_uncommitted(
                         &resolved_group_key,
                         "invite add",
                     );
@@ -17586,6 +17594,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 )
                 .await;
                 let binding = treekem_add_security_binding(
+                    AddKind::MemberAdded,
                     expected_epoch,
                     &out.commit,
                     display_name.as_deref(),
@@ -24193,6 +24202,7 @@ async fn add_treekem_named_group_member(
     )
     .await;
     let binding = treekem_add_security_binding(
+        AddKind::MemberAdded,
         treekem_epoch,
         &out.commit,
         req.display_name.as_deref(),
@@ -27606,7 +27616,7 @@ async fn commit_treekem_self_leave_rekey_from(
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     if !committer_leaf::sealer_seat_commits_package(&info, &local_hex) {
         if self_leave_rekey_log_once(&format!("sealer-uncommitted:{group_key}")) {
-            let _ = committer_leaf::sealer_package_uncommitted(group_key, "post-leave rekey");
+            committer_leaf::log_sealer_package_uncommitted(group_key, "post-leave rekey");
         }
         return SelfLeaveRekeyStep::Deferred;
     }
@@ -33196,6 +33206,7 @@ async fn approve_treekem_join_request(
         .get(&requester_hex)
         .and_then(|member| member.treekem_key_package_hash.clone());
     let binding = treekem_add_security_binding(
+        AddKind::JoinRequestApproved,
         treekem_epoch,
         &out.commit,
         None,

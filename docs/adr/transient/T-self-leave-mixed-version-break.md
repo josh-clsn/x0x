@@ -36,7 +36,11 @@ Admin removal seals `treekem:epoch=<n>`. A v0.48 receiver applies that removal. 
 
 We will keep option 3. A self-leave rekey binds `treekem:epoch=<n>:commit=<blake3>`. A v0.48 peer hits `StateHashMismatch` and leaves a group that contains an upgraded member. Admin removal keeps `treekem:epoch=<n>`.
 
+> Fork note: this fork's admin removal seals the same `:commit=` form (`T-treekem-bytes-binding-everywhere`).
+
 `catchup_may_apply_removed_as_author` stays. A third party applies TreeKEM bytes only when the signature names those bytes.
+
+> Fork note: this fork replaces it with `signer_delivery::admit`, which keeps that rule for removals (`T-any-member-delivers-signed-commits`).
 
 This record does not fold. It does not allocate a capability bit. It does not add a numbered ADR. The A09 committer decision stays. One claim in that file now states this binding value and this break.
 

@@ -4662,7 +4662,7 @@ async fn the_ban_response_carries_the_event_that_departs_the_banned_device() -> 
 /// The same removal carried through the engine-A door. It seals a binding
 /// that names its TreeKEM bytes (A1), so the door admits it.
 #[tokio::test]
-async fn the_removal_and_ban_events_pass_the_engine_a_door() -> Result<()> {
+async fn the_removal_event_passes_the_engine_a_door() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let s = build_back_to_back(dir.path()).await?;
     wa_seat_j1_with_keys(&s).await?;
@@ -4685,6 +4685,36 @@ async fn the_removal_and_ban_events_pass_the_engine_a_door() -> Result<()> {
         wa_apply_through_the_door(&s, &s.j1, &event).await?,
         StatusCode::OK,
         "the removed device applies its own signed removal through the door"
+    );
+    Ok(())
+}
+
+/// The ban the real route seals passes the door as well: it names its
+/// TreeKEM bytes (A1), and the banned device applies it.
+#[tokio::test]
+async fn the_ban_event_passes_the_engine_a_door() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build_back_to_back(dir.path()).await?;
+    wa_seat_j1_with_keys(&s).await?;
+    let j1_hex = hex::encode(s.j1.agent.agent_id().as_bytes());
+    let (status, body) = wa_json(
+        ban_group_member(
+            State(Arc::clone(&s._authority)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
+            Path((s.group_key.clone(), j1_hex.clone())),
+        )
+        .await
+        .into_response(),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "ban: {body}");
+    let event: NamedGroupMetadataEvent = serde_json::from_value(body["event"].clone())?;
+    assert_eq!(
+        wa_apply_through_the_door(&s, &s.j1, &event).await?,
+        StatusCode::OK,
+        "the banned device applies its own signed ban through the door"
     );
     Ok(())
 }

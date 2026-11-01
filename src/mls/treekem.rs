@@ -350,6 +350,8 @@ impl TreeKemMlsGroup {
     }
 
     /// Apply a `Commit` produced by another member (add / remove / rekey).
+    /// A receiver that knows the commit's author applies it through
+    /// [`Self::process_commit_from`], which ties it to that author's leaf.
     ///
     /// # Errors
     /// Returns [`MlsError`] if the commit is malformed or fails verification.

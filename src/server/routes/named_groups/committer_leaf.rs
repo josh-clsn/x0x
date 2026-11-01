@@ -291,16 +291,21 @@ pub(super) fn sealer_seat_commits_package(info: &x0x::groups::GroupInfo, local_h
 /// The plain explanation a refused seal gives.
 pub(super) const SEALER_PACKAGE_UNCOMMITTED: &str = "this member's seat commits no TreeKEM key package (the group was made before 2026-07-11), so no other member can accept a key change it makes; nothing was changed, and the group must be made again to add or remove members";
 
-/// Log a refused seal at WARN and return the route's error.
-pub(super) fn sealer_package_uncommitted(
-    group_id: &str,
-    what: &str,
-) -> (StatusCode, Json<serde_json::Value>) {
+/// Log a refused seal at WARN.
+pub(super) fn log_sealer_package_uncommitted(group_id: &str, what: &str) {
     tracing::warn!(
         group_id = %LogHexId::group(group_id),
         what,
         "refusing to seal a TreeKEM commit: {SEALER_PACKAGE_UNCOMMITTED}"
     );
+}
+
+/// Log a refused seal at WARN and return the route's error.
+pub(super) fn sealer_package_uncommitted(
+    group_id: &str,
+    what: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    log_sealer_package_uncommitted(group_id, what);
     (
         StatusCode::CONFLICT,
         Json(serde_json::json!({

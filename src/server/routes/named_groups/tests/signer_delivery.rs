@@ -1324,6 +1324,7 @@ fn a_malformed_treekem_add_binding_is_refused() {
     ] {
         assert!(
             !treekem_add_binding_admits(
+                super::super::treekem_binding::AddKind::MemberAdded,
                 &with_binding(malformed),
                 5,
                 &commit_b64,
@@ -1337,6 +1338,7 @@ fn a_malformed_treekem_add_binding_is_refused() {
         );
     }
     assert!(treekem_add_binding_admits(
+        super::super::treekem_binding::AddKind::MemberAdded,
         &with_binding("gss:epoch=5"),
         5,
         &commit_b64,

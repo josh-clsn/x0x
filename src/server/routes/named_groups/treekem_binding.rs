@@ -8,8 +8,10 @@
 //! `treekem:epoch=<n>:commit=<blake3 of the commit>:extras=<blake3 of the extras>`
 //!
 //! A removal has no extras and seals upstream #1337's form without them,
-//! `treekem:epoch=<n>:commit=<blake3>`, so a stock member accepts it. An add with a recovery record keeps its `;member-recovery=<hash>` suffix
-//! after that. The older forms are still read: `treekem:epoch=<n>` (no
+//! `treekem:epoch=<n>:commit=<blake3>`, so a stock member accepts it.
+//!
+//! An add with a recovery record keeps its `;member-recovery=<hash>`
+//! suffix after that. The older forms are still read: `treekem:epoch=<n>` (no
 //! bytes named) and upstream #1337's `treekem:epoch=<n>:commit=<blake3>`.
 //! [`parse_treekem_binding`] is the one parser for all of them.
 
@@ -122,6 +124,14 @@ pub(super) fn empty_extras_digest() -> Option<String> {
         .map(|bytes| digest_hex(&bytes))
 }
 
+/// Which event an add's extras belong to. The tag leads the digest, so a
+/// copy cannot be re-wrapped as the other kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AddKind {
+    MemberAdded = 1,
+    JoinRequestApproved = 2,
+}
+
 /// An add's extras (F-2): the display name, the KeyPackage hash, the
 /// Welcome, and the owner mandate when the add carries one (A3 review I-1).
 /// So a deliverer cannot strip the mandate from an owner-certified add, and
@@ -129,6 +139,7 @@ pub(super) fn empty_extras_digest() -> Option<String> {
 /// keeps A1's digest. `JoinRequestApproved` carries no display name and no
 /// mandate.
 pub(super) fn add_extras_digest(
+    kind: AddKind,
     display_name: Option<&str>,
     key_package_hash: Option<&str>,
     welcome: Option<&WelcomeContent>,
@@ -136,11 +147,17 @@ pub(super) fn add_extras_digest(
 ) -> Option<String> {
     let welcome = welcome.map(|welcome| (welcome.id.as_str(), welcome.byte_len));
     let bytes = match owner_mandate {
-        None => postcard::to_stdvec(&(display_name, key_package_hash, welcome)).ok()?,
+        None => postcard::to_stdvec(&(kind as u8, display_name, key_package_hash, welcome)).ok()?,
         Some(mandate) => {
             let mandate = digest_hex(&postcard::to_stdvec(mandate).ok()?);
-            postcard::to_stdvec(&(display_name, key_package_hash, welcome, mandate.as_str()))
-                .ok()?
+            postcard::to_stdvec(&(
+                kind as u8,
+                display_name,
+                key_package_hash,
+                welcome,
+                mandate.as_str(),
+            ))
+            .ok()?
         }
     };
     Some(digest_hex(&bytes))
@@ -298,13 +315,25 @@ mod tests {
     #[test]
     fn an_add_binding_names_its_extras() {
         let welcome = WelcomeContent::of_bytes(b"welcome");
-        let extras =
-            add_extras_digest(Some("Mom"), Some("kp"), Some(&welcome), None).expect("extras");
+        let extras = add_extras_digest(
+            AddKind::MemberAdded,
+            Some("Mom"),
+            Some("kp"),
+            Some(&welcome),
+            None,
+        )
+        .expect("extras");
         let sealed = treekem_bytes_binding(5, b"commit", &extras);
         let parsed = parse_treekem_binding(&sealed).expect("parses");
         assert!(add_binding_names_bytes(&parsed, 5, b"commit", &extras));
-        let renamed =
-            add_extras_digest(Some("Mallory"), Some("kp"), Some(&welcome), None).expect("x");
+        let renamed = add_extras_digest(
+            AddKind::MemberAdded,
+            Some("Mallory"),
+            Some("kp"),
+            Some(&welcome),
+            None,
+        )
+        .expect("x");
         assert!(!add_binding_names_bytes(&parsed, 5, b"commit", &renamed));
         let upstream = format!("treekem:epoch=5:commit={}", digest_hex(b"commit"));
         let parsed = parse_treekem_binding(&upstream).expect("parses");
@@ -312,6 +341,22 @@ mod tests {
             !add_binding_names_bytes(&parsed, 5, b"commit", &extras),
             "an add must name its extras"
         );
+    }
+
+    #[test]
+    fn an_approval_and_an_add_never_share_extras() {
+        let welcome = WelcomeContent::of_bytes(b"welcome");
+        let add = add_extras_digest(AddKind::MemberAdded, None, Some("kp"), Some(&welcome), None)
+            .expect("add");
+        let approval = add_extras_digest(
+            AddKind::JoinRequestApproved,
+            None,
+            Some("kp"),
+            Some(&welcome),
+            None,
+        )
+        .expect("approval");
+        assert_ne!(add, approval);
     }
 
     #[test]

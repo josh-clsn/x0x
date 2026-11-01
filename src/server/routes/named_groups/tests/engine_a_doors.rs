@@ -816,6 +816,7 @@ fn member_added_for(
     let commit_bytes = b"commit";
     let welcome = b"WELCOME";
     let extras = super::super::add_extras_digest(
+        super::super::treekem_binding::AddKind::MemberAdded,
         None,
         None,
         Some(&super::super::WelcomeContent::of_bytes(welcome)),

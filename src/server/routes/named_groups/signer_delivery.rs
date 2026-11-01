@@ -151,6 +151,7 @@ fn non_author_copy_names_its_bytes(event: &NamedGroupMetadataEvent) -> bool {
             treekem_commit_b64.as_deref(),
             *treekem_epoch,
             AddExtras {
+                kind: super::treekem_binding::AddKind::MemberAdded,
                 display_name: display_name.as_deref(),
                 key_package_hash: treekem_key_package_hash.as_deref(),
                 welcome_b64: treekem_welcome_b64.as_deref(),
@@ -170,6 +171,7 @@ fn non_author_copy_names_its_bytes(event: &NamedGroupMetadataEvent) -> bool {
             treekem_commit_b64.as_deref(),
             *treekem_epoch,
             AddExtras {
+                kind: super::treekem_binding::AddKind::JoinRequestApproved,
                 display_name: None,
                 key_package_hash: treekem_key_package_hash.as_deref(),
                 welcome_b64: treekem_welcome_b64.as_deref(),
@@ -183,6 +185,7 @@ fn non_author_copy_names_its_bytes(event: &NamedGroupMetadataEvent) -> bool {
 
 /// The fields an add's extras digest covers, as this copy carries them.
 struct AddExtras<'a> {
+    kind: super::treekem_binding::AddKind,
     display_name: Option<&'a str>,
     key_package_hash: Option<&'a str>,
     welcome_b64: Option<&'a str>,
@@ -211,6 +214,7 @@ fn add_names_its_bytes(
         return false;
     };
     add_extras_digest(
+        extras.kind,
         extras.display_name,
         extras.key_package_hash,
         welcome.as_ref(),
@@ -838,8 +842,14 @@ mod door_tests {
     }
 
     fn named_add_binding(welcome: &[u8]) -> String {
-        let extras = add_extras_digest(None, None, Some(&WelcomeContent::of_bytes(welcome)), None)
-            .expect("extras");
+        let extras = add_extras_digest(
+            super::super::treekem_binding::AddKind::MemberAdded,
+            None,
+            None,
+            Some(&WelcomeContent::of_bytes(welcome)),
+            None,
+        )
+        .expect("extras");
         treekem_bytes_binding(2, b"commit", &extras)
     }
 

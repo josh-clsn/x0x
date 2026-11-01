@@ -28,7 +28,7 @@ Every removal (admin removal, post-leave rekey, OwnerCertified eviction, re-key 
 
 An add with a recovery record keeps its suffix after that: `...:extras=<d>;member-recovery=<hash>`. The first part is upstream's `treekem_commit_binding` with `:extras=` appended.
 
-**Extras** is the blake3 of the postcard of every field the event applies that the roster commit does not cover:
+**Extras** is the blake3 of the postcard of every field the event applies that the roster commit does not cover. An add's or approval's tuple starts with a kind tag (1 for `MemberAdded`, 2 for `JoinRequestApproved`), so one cannot be re-wrapped as the other:
 
 | Event | Extras tuple |
 |---|---|
