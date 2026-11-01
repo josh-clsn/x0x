@@ -15532,7 +15532,8 @@ impl Agent {
                     self.spawn_tracked(async move {
                         let mut interval =
                             tokio::time::interval(std::time::Duration::from_secs(30));
-                        interval.tick().await; // first tick fires immediately; startup already seeded
+                        // The first tick fires at once; startup already seeded.
+                        interval.tick().await;
                         loop {
                             tokio::select! {
                                 _ = interval.tick() => {}

@@ -20,7 +20,13 @@ use std::process::Command;
 /// Prints the cargo directives for the build sha.
 pub fn emit() {
     println!("cargo:rerun-if-env-changed=X0X_BUILD_SHA");
-    for watched in ["build.rs", "build_support", "Cargo.toml", "Cargo.lock", "src"] {
+    for watched in [
+        "build.rs",
+        "build_support",
+        "Cargo.toml",
+        "Cargo.lock",
+        "src",
+    ] {
         println!("cargo:rerun-if-changed={watched}");
     }
     let Some(dir) = std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from) else {

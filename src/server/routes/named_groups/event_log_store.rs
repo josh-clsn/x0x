@@ -5,7 +5,10 @@
 //! missed them (`handle_treekem_catchup_request`). The log lived only in
 //! memory, so a restart lost it. Each event is now also a file:
 //!
-//! `<data>/treekem/event-log/<blake3(group key)[..32]>/<revision:020>-<epoch:020>-<kind>-<blake3(event)[..16]>.json`
+//! ```text
+//! <data>/treekem/event-log/<blake3(group key)[..32]>/
+//!     <revision:020>-<epoch:020>-<kind>-<blake3(event)[..16]>.json
+//! ```
 //!
 //! - Every path component is a digest, a zero-padded number or a fixed kind
 //!   name. Nothing a peer sends becomes part of a path.
