@@ -33,7 +33,8 @@ pub(super) const GAP_REPORT_DOMAIN: &str = "x0x/treekem-catchup-gap/v1";
 /// The longest `head_challenge` a signed page request may carry.
 pub(super) const HEAD_CHALLENGE_MAX_BYTES: usize = 128;
 
-fn push_field(out: &mut Vec<u8>, bytes: &[u8]) {
+/// Append `bytes` preceded by its length as a big-endian `u64`.
+pub(super) fn push_field(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
     out.extend_from_slice(bytes);
 }

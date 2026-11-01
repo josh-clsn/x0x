@@ -430,6 +430,7 @@ fn catchup_page(s: &BackToBack) -> TreeKemCatchupResponse {
         signed_by: None,
         target_member_id: None,
         target_member_key_package_b64: None,
+        head_proof: None,
     }
 }
 
@@ -653,6 +654,7 @@ async fn issue1139_catchup_page_converges_second_joiner() -> Result<()> {
         signed_by: None,
         target_member_id: None,
         target_member_key_package_b64: None,
+        head_proof: None,
     })?
     .len();
     assert!(

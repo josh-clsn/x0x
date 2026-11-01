@@ -116,6 +116,26 @@ fn add_fixed_admin(
     admin_hex
 }
 
+/// A startup witness: an active member that is not an admin. The fork
+/// counts an admin's head only through its signed head proof (survivor
+/// re-key A6, the #1406 ruling), so upstream's unsigned-head rule is
+/// exercised with a non-admin peer; the admin branch has its own tests
+/// (`tests/head_proof.rs`).
+fn add_fixed_witness(
+    info: &mut x0x::groups::GroupInfo,
+    admin_id: x0x::identity::AgentId,
+    witness_hex: String,
+) -> String {
+    info.add_member(
+        witness_hex.clone(),
+        x0x::groups::GroupRole::Member,
+        Some(hex::encode(admin_id.as_bytes())),
+        None,
+    );
+    info.recompute_state_hash();
+    witness_hex
+}
+
 fn add_lower_admin(info: &mut x0x::groups::GroupInfo, admin_id: x0x::identity::AgentId) -> String {
     let lower_hex = fixed_admin_hex([0u8; 32], &admin_id, true);
     add_fixed_admin(info, admin_id, lower_hex)
@@ -711,6 +731,7 @@ fn empty_catchup(group_id: &str, truncated: bool) -> TreeKemCatchupResponse {
         events: Vec::new(),
         truncated,
         log_evicted_through: None,
+        head_proof: None,
         responder_state_hash: None,
     }
 }
@@ -737,6 +758,7 @@ async fn truncated_catchup_page_does_not_seal() -> Result<()> {
         events: vec![leave],
         truncated: true,
         log_evicted_through: None,
+        head_proof: None,
         responder_state_hash: None,
     };
     // The transport sender is an active peer, not the leaver. The commit
@@ -1838,6 +1860,7 @@ async fn deliver_catchup(
             events: vec![event],
             truncated: false,
             log_evicted_through: None,
+            head_proof: None,
             responder_state_hash: None,
         },
     )
@@ -2074,6 +2097,7 @@ fn catchup_page(
         events: Vec::new(),
         truncated,
         log_evicted_through: None,
+        head_proof: None,
         responder_state_hash,
     }
 }
@@ -2097,6 +2121,7 @@ fn key_package_reply(
     TreeKemCatchupResponse {
         signed_by: None,
         log_evicted_through: None,
+        head_proof: None,
         target_member_id: None,
         target_member_key_package_b64: None,
         message_type: "treekem_catchup_response".to_string(),
@@ -2134,7 +2159,7 @@ async fn startup_with_witness(group_id: &str) -> Result<(LeaveFixture, x0x::iden
     {
         let mut groups = fixture.state.named_groups.write().await;
         let info = groups.get_mut(&fixture.group_id).expect("group");
-        add_fixed_admin(info, admin_id, witness_hex);
+        add_fixed_witness(info, admin_id, witness_hex);
     }
     mark_leaver_removed(&fixture).await;
     Ok((fixture, witness))
@@ -2525,7 +2550,7 @@ async fn add_removed_leaf_group(state: &Arc<AppState>, group_id: &str) -> Result
     );
     info.remove_member(&member_hex, Some(member_hex.clone()));
     let witness_hex = fixed_admin_hex([0xff; 32], &admin_id, false);
-    add_fixed_admin(&mut info, admin_id, witness_hex);
+    add_fixed_witness(&mut info, admin_id, witness_hex);
     info.secret_epoch = epoch_before;
     info.security_binding = Some(format!("treekem:epoch={epoch_before}"));
     info.recompute_state_hash();

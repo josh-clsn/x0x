@@ -315,6 +315,7 @@ pub(super) async fn deliver_catchup(
             signed_by: None,
             responder_state_hash: None,
             log_evicted_through: None,
+            head_proof: None,
         },
     )
     .await;

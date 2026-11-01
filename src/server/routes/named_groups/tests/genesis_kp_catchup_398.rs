@@ -353,6 +353,7 @@ async fn response_gate_applies_signed_kp_without_touching_events() -> Result<()>
         target_member_id: Some(creator_hex.clone()),
         target_member_key_package_b64: Some(FAKE_KP_B64.to_string()),
         signed_by: None,
+        head_proof: None,
     };
 
     // Unsigned + unverified: dropped at the gate — nothing stored.

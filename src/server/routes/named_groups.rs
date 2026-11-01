@@ -18,6 +18,10 @@ use event_log_store::{
 };
 pub(in crate::server) use event_log_store::{load_event_log, EventLog};
 mod fair_admission;
+mod head_proof;
+mod head_rounds;
+pub(in crate::server) use head_proof::HeadAnswers;
+pub(in crate::server) use head_rounds::{load_head_counter, HeadCounter, HeadRounds};
 mod join_result_pins;
 mod seat_cert_fetch;
 mod signed_catchup;
@@ -1366,8 +1370,10 @@ pub(in crate::server) struct TreeKemCatchupRequest {
     #[serde(default)]
     signed_by: Option<CatchupSigner>,
     /// Survivor re-key A5: a fresh challenge for the responder's head
-    /// proof (A6 gives it its meaning). A page request's signature covers
-    /// it (`signed_catchup::page_request_sign_input`). Old peers ignore it.
+    /// proof. A page request's signature covers it
+    /// (`signed_catchup::page_request_sign_input`). A6: an active admin
+    /// answers it with a signed `head_proof` (`head_proof.rs`). Old peers
+    /// ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     head_challenge: Option<String>,
 }
@@ -1379,8 +1385,10 @@ pub(in crate::server) struct TreeKemCatchupResponse {
     events: Vec<NamedGroupMetadataEvent>,
     truncated: bool,
     /// Saved membership head of the responder. Absent on a KeyPackage reply
-    /// and on an old peer. A startup self-leave seal trusts this only when
-    /// it equals the local head after the page is applied.
+    /// and on an old peer. Unsigned: no evidence of freshness. A startup
+    /// self-leave seal trusts it only from a non-admin, and only when it
+    /// equals the local head after the page is applied; an admin's head
+    /// counts only through a signed `head_proof` (survivor re-key A6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     responder_state_hash: Option<String>,
     /// Survivor re-key A4: the responder's log no longer holds the events
@@ -1413,6 +1421,10 @@ pub(in crate::server) struct TreeKemCatchupResponse {
     /// parseable.
     #[serde(default)]
     signed_by: Option<CatchupSigner>,
+    /// Survivor re-key A6: an admin's signed answer to the request's
+    /// `head_challenge` (`head_proof::HeadProof`). Old peers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    head_proof: Option<head_proof::HeadProof>,
 }
 
 /// #398: ML-DSA-65 signer attachment for the member-keyed TreeKEM catch-up
@@ -11570,6 +11582,7 @@ async fn member_keyed_treekem_catchup_response(
         target_member_id: Some(target_member_id.clone()),
         target_member_key_package_b64,
         signed_by,
+        head_proof: None,
     })
 }
 
@@ -11719,7 +11732,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         {
             return;
         }
-        throttle.insert(throttle_key, tokio::time::Instant::now());
+        stamp_catchup_throttle(&mut throttle, throttle_key, tokio::time::Instant::now());
     }
     if let Some(mut response) =
         member_keyed_treekem_catchup_response(state, &log_keys, &request).await
@@ -11777,6 +11790,28 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     // re-requests of an already-served page inside the window are dropped. The
     // member-keyed serve (#205) returns above this point, so multi-member key-
     // package recovery — many distinct targets at one frontier — is unaffected.
+    // Survivor re-key A6: a head challenge is answered here, before the
+    // #378 throttle, under its own limit per (group, requester). Only a
+    // challenge the requester signed counts, whatever the transport; only
+    // an active requester is answered, and only an active admin signs; the
+    // requester's epoch, when ahead, starts this daemon's own catch-up.
+    let head_proof = match head_proof::SignedChallenge::from_request(&request) {
+        Some(challenge) if authorized && !sender_departed => {
+            match head_proof::answer_challenge(state, &challenge).await {
+                Ok(proof) => Some(proof),
+                Err(refusal) => {
+                    tracing::debug!(
+                        group_id = %LogHexId::group(&request.group_id),
+                        requester = %sender_hex,
+                        ?refusal,
+                        "TreeKEM head challenge answered without a proof"
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
     let serve_throttle_key = format!(
         "serve:{}:{}:{}:{}",
         request.group_id, sender_hex, request.from_revision, request.from_treekem_epoch
@@ -11797,6 +11832,9 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
             requester = %sender_hex,
             "throttling duplicate TreeKEM catch-up page request"
         );
+        if let Some(proof) = head_proof {
+            head_proof::send_proof_only(state, sender, &request.group_id, proof).await;
+        }
         return;
     }
     // Survivor re-key A4: every commit-bearing event this member applied,
@@ -11847,6 +11885,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         target_member_id: None,
         target_member_key_package_b64: None,
         signed_by,
+        head_proof: head_proof.clone(),
     };
     let payload = match serde_json::to_vec(&response) {
         Ok(payload) => payload,
@@ -11854,6 +11893,22 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
             tracing::warn!(group_id = %LogHexId::group(&request.group_id), "failed to serialize TreeKEM catch-up response: {e}");
             return;
         }
+    };
+    // A page and a proof that do not fit one direct message go apart.
+    let payload = match head_proof {
+        Some(proof) if payload.len() > head_proof::page_and_proof_cap(state) => {
+            head_proof::send_proof_only(state, sender, &request.group_id, proof).await;
+            let mut response = response;
+            response.head_proof = None;
+            match serde_json::to_vec(&response) {
+                Ok(payload) => payload,
+                Err(e) => {
+                    tracing::warn!(group_id = %LogHexId::group(&request.group_id), "failed to serialize TreeKEM catch-up response: {e}");
+                    return;
+                }
+            }
+        }
+        _ => payload,
     };
     #[cfg(test)]
     if let Ok(mut recorded) = state.named_group_test_recorders.catchup_responses.lock() {
@@ -12106,6 +12161,32 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     if response.message_type != "treekem_catchup_response" {
         return;
     }
+    // Survivor re-key A6: a head proof answers this member's own challenge.
+    // It is checked against its signer's key and this member's open round
+    // alone; the transport and the claimed sender play no part.
+    let mut response = response;
+    if let Some(proof) = response.head_proof.take() {
+        let signer = proof.claim.signer.clone();
+        let recorded = head_rounds::record_proof(state, &response.group_id, proof).await;
+        tracing::debug!(
+            group_id = %LogHexId::group(&response.group_id),
+            signer = %LogHexId::agent(&signer),
+            ?recorded,
+            "TreeKEM head proof received"
+        );
+        // The #1406 startup wait: a proof stands on its signer's key, so it
+        // counts whatever transport brought it.
+        if recorded.is_ok()
+            && self_leave_startup_open(state, &response.group_id)
+            && self_leave_startup_note_admin_head(state, &[response.group_id.clone()], &signer)
+                .await
+        {
+            schedule_self_leave_rekey_if_idle(state, &response.group_id).await;
+        }
+        if head_proof::is_proof_only(&response) {
+            return;
+        }
+    }
     // #398: a targeted response may self-authenticate via the carried signer
     // when the transport could not verify the sender (the mirror of the
     // request-side gate). The signature binds the served KeyPackage's blake3
@@ -12187,6 +12268,12 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
             "#398: targeted KeyPackage apply attempted"
         );
     }
+    let sender_is_admin = response_info
+        .members_v2
+        .get(&sender_hex)
+        .is_some_and(|member| {
+            member.is_active() && member.role.at_least(x0x::groups::GroupRole::Admin)
+        });
     let was_truncated = response.truncated;
     let gap_through = response.log_evicted_through;
     // A5 review I-2: over a transport that did not verify the sender, a
@@ -12411,14 +12498,20 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         // does not prove the startup catch-up head.
     } else {
         // Record this peer even when another peer's page stream is open.
-        // The aggregate fence still decides whether this pass may seal.
-        self_leave_startup_note_verified_head(
-            state,
-            &fence_ids,
-            &sender_hex,
-            reported_head.as_deref(),
-        )
-        .await;
+        // The aggregate fence still decides whether this pass may seal. An
+        // admin's unsigned head is no evidence (A6): it counts only through
+        // its signed head proof.
+        if sender_is_admin {
+            let _ = self_leave_startup_note_admin_head(state, &fence_ids, &sender_hex).await;
+        } else {
+            self_leave_startup_note_verified_head(
+                state,
+                &fence_ids,
+                &sender_hex,
+                reported_head.as_deref(),
+            )
+            .await;
+        }
         let peer_open = self_leave_rekey_fence_peer_open(&fence_ids, &sender_hex);
         let any_open = self_leave_rekey_fence_any_open(&fence_ids);
         if peer_open {
@@ -12714,7 +12807,7 @@ async fn request_treekem_catchup_round(
         });
         let now = tokio::time::Instant::now();
         for peer in &chosen {
-            throttle.insert(throttle_key(peer), now);
+            stamp_catchup_throttle(&mut throttle, throttle_key(peer), now);
         }
         // Chosen peers were stamped now, so they pass the `since` filter.
         asked.extend(peers.iter().copied().filter(|peer| {
@@ -12835,7 +12928,7 @@ async fn request_member_key_package_catchup(
             {
                 continue;
             }
-            throttle.insert(throttle_key, tokio::time::Instant::now());
+            stamp_catchup_throttle(&mut throttle, throttle_key, tokio::time::Instant::now());
         }
         let request = TreeKemCatchupRequest {
             message_type: "treekem_catchup_request".to_string(),
@@ -25074,6 +25167,20 @@ async fn wipe_local_group_crypto_material(
         }
     }
     {
+        let mut head_answers = state
+            .treekem_head_answers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut head_rounds = state
+            .treekem_head_rounds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for alias in &aliases {
+            head_answers.wipe(alias);
+            head_rounds.wipe(alias);
+        }
+    }
+    {
         let mut messages = state.public_messages.write().await;
         for alias in &aliases {
             messages.remove(alias);
@@ -27008,6 +27115,56 @@ fn install_startup_self_leave_gates(state: &AppState, plans: &[StartupSelfLeaveP
     }
 }
 
+/// The active admins of `group_key` on this member's roster.
+async fn startup_peer_admins(state: &AppState, group_key: &str) -> HashSet<String> {
+    let groups = state.named_groups.read().await;
+    groups
+        .get(group_key)
+        .map(|info| {
+            info.active_members()
+                .filter(|member| member.role.at_least(x0x::groups::GroupRole::Admin))
+                .map(|member| member.agent_id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Survivor re-key A6 (#1406 ruling): an admin ends this member's startup
+/// wait only through a head proof it signed for this member's challenge,
+/// naming the head this member's tree holds now.
+async fn self_leave_startup_note_admin_head(
+    state: &AppState,
+    group_ids: &[String],
+    admin: &str,
+) -> bool {
+    for group_id in group_ids {
+        let key = {
+            let groups = state.named_groups.read().await;
+            groups
+                .get_key_value(group_id.as_str())
+                .or_else(|| {
+                    groups.iter().find(|(_, info)| {
+                        info.stable_group_id() == group_id.as_str()
+                            || info.mls_group_id == *group_id
+                    })
+                })
+                .map(|(key, _)| key.clone())
+        };
+        let Some(key) = key else {
+            continue;
+        };
+        if head_rounds::admin_head_matches(state, &key, admin).await {
+            self_leave_startup_satisfy_peer(state, group_ids, admin);
+            return true;
+        }
+    }
+    tracing::info!(
+        peer = %LogHexId::agent(admin),
+        "startup catch-up: no signed head proof from this admin names the local head"
+    );
+    false
+}
+
 async fn send_startup_self_leave_catchup(state: &Arc<AppState>, plans: &[StartupSelfLeavePlan]) {
     for plan in plans {
         if !self_leave_startup_open(state, &plan.group_key) {
@@ -27016,9 +27173,22 @@ async fn send_startup_self_leave_catchup(state: &Arc<AppState>, plans: &[Startup
         if !self_leave_startup_sends_remaining(state, &plan.ids) {
             continue;
         }
+        let admins = startup_peer_admins(state, &plan.group_key).await;
         for peer in &plan.peers {
             let peer_hex = hex::encode(peer.as_bytes());
             if !self_leave_startup_reserve_send(state, &plan.ids, &peer_hex) {
+                continue;
+            }
+            // Survivor re-key A6 (#1406 ruling): an admin is asked under a
+            // head challenge, and counts only through the proof it signs.
+            if admins.contains(&peer_hex) {
+                if let Some(request) =
+                    head_rounds::startup_admin_request(state, &plan.group_key).await
+                {
+                    if let Err(e) = signed_catchup::send_page_request(state, peer, request).await {
+                        tracing::debug!(group_id = %LogHexId::group(&plan.group_key), peer = %LogHexId::agent(&peer_hex), "startup head challenge failed: {e}");
+                    }
+                }
                 continue;
             }
             let _sent = request_treekem_catchup_page(state, &plan.group_key, peer).await;
@@ -46507,7 +46677,7 @@ async fn handle_join_result_message_bound(
                 {
                     return;
                 }
-                throttle.insert(throttle_key, tokio::time::Instant::now());
+                stamp_catchup_throttle(&mut throttle, throttle_key, tokio::time::Instant::now());
             }
             // #447: the joiner is still polling — its certificate evidence
             // may have resolved since the last volley rejection (async blob
@@ -49242,6 +49412,7 @@ pub(in crate::server) mod tests {
     mod event_log_store;
     mod fork_quarantine;
     mod genesis_kp_catchup_398;
+    mod head_proof;
     mod home_control_payload_size;
     mod hs_f2_membership_cluster;
     mod hs_r3_invite_auth;
@@ -49930,6 +50101,7 @@ pub(in crate::server) mod tests {
             &hex::encode(agent.agent_id().as_bytes()),
         )
         .await;
+        let treekem_head_counter = load_head_counter(&treekem_dir).await;
         // ADR-0041 Tier-1: mirror daemon startup — owned agents get the
         // SyncV1 acceptor + store under `<data_dir>/sync`.
         let owner_sync = if agent.identity().user_keypair().is_some() {
@@ -50087,6 +50259,9 @@ pub(in crate::server) mod tests {
             treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
             treekem_package_repulls: std::sync::Mutex::default(),
             treekem_gap_asks: std::sync::Mutex::default(),
+            treekem_head_answers: std::sync::Mutex::default(),
+            treekem_head_rounds: std::sync::Mutex::default(),
+            treekem_head_counter: Mutex::new(treekem_head_counter),
             group_membership_locks: RwLock::new(HashMap::new()),
             treekem_groups: RwLock::new(HashMap::new()),
             treekem_dir,
@@ -63680,6 +63855,7 @@ pub(in crate::server) mod tests {
             target_member_id: None,
             target_member_key_package_b64: None,
             signed_by: None,
+            head_proof: None,
         };
         let encoded = serde_json::to_value(&response).expect("catch-up response serializes");
         assert_eq!(encoded["message_type"], "treekem_catchup_response");
@@ -68454,6 +68630,7 @@ pub(in crate::server) mod tests {
             target_member_id: None,
             target_member_key_package_b64: None,
             signed_by: None,
+            head_proof: None,
         };
         let unauthorized = x0x::identity::AgentKeypair::generate()?;
         handle_treekem_catchup_response(state, &unauthorized.agent_id(), true, response.clone())
