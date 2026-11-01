@@ -1738,6 +1738,7 @@ pub(in crate::server) async fn step(state: &Arc<AppState>) {
 }
 
 /// The reconcile and selection half of [`step`], with its link reads.
+#[cfg(test)]
 pub(in crate::server) async fn begin_due(state: &AppState) -> Vec<Attempt> {
     match due_links(state).await {
         Some(links) => select_due(state, &links).await,
