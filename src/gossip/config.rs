@@ -114,6 +114,33 @@ pub struct GossipConfig {
     #[serde(default = "default_relay_fanout_budget_msgs_per_sec")]
     pub relay_fanout_budget_msgs_per_sec: u64,
 
+    /// Consume-only for the four mesh-wide DM-capability topics
+    /// (`x0x/caps/*`, [`crate::dm_capability::CAPS_TOPIC_NAMES`]).
+    ///
+    /// When on, a Leaf still receives every advert, request and response
+    /// on those topics, delivers them to its own capability store, answers
+    /// requests addressed to it and publishes its own adverts. What it stops
+    /// doing is forwarding *other* nodes' caps messages: no eager re-publish
+    /// and no IHAVE (saorsa-gossip `ValidationAction::DeliverOnly`). Caps
+    /// forwarding was ~85% of a measured leaf's upload.
+    ///
+    /// Unset (the default) follows the daemon's `leaf_mode`: on for a
+    /// metered leaf, off otherwise. An explicit `true` or `false` overrides
+    /// that. It never applies to a Full node, which must forward; the daemon
+    /// warns and ignores a `true` there. Resolved once at startup by
+    /// [`Self::apply_caps_consume_only`]; the pub/sub layer acts only on an
+    /// explicit `Some(true)` on a Leaf.
+    ///
+    /// A value that is not a boolean reads as unset (so the `leaf_mode`
+    /// default applies), and the daemon loader warns about it; it never
+    /// stops the daemon.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_lenient_bool"
+    )]
+    pub caps_consume_only: Option<bool>,
+
     /// Operator opt-in to Full (pass-through relay) participation.
     ///
     /// TOML: `gossip.relay = true`. The `--relay` CLI flag sets the same
@@ -145,6 +172,24 @@ fn deserialize_leaf_degree<'de, D: serde::Deserializer<'de>>(
     let value = i64::deserialize(deserializer)?;
     // Preserve out-of-range status until normalization can emit a warning.
     Ok(usize::try_from(value).unwrap_or(13))
+}
+
+/// `Some(b)` for a TOML boolean; `None` (unset) for any other value, so a
+/// mistyped optional switch falls back to its default instead of failing
+/// the whole config.
+fn deserialize_lenient_bool<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<bool>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Lenient {
+        Bool(bool),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Lenient::deserialize(deserializer)? {
+        Lenient::Bool(value) => Some(value),
+        Lenient::Other(_) => None,
+    })
 }
 
 const fn default_leaf_max_eager_degree() -> usize {
@@ -180,6 +225,7 @@ impl Default for GossipConfig {
             leaf_egress_burst_bytes: default_leaf_egress_burst(),
             byte_policy: LeafBytePolicy::ObserveOnly,
             relay_fanout_budget_msgs_per_sec: default_relay_fanout_budget_msgs_per_sec(),
+            caps_consume_only: None,
             relay: false,
             participation: ParticipationMode::Leaf,
             participation_reason: String::new(),
@@ -222,6 +268,31 @@ impl GossipConfig {
     /// pass-through frames, would stay off. The metered switch wins.
     pub fn clear_relay_for_metered_leaf(&mut self) {
         self.relay = false;
+    }
+
+    /// Whether caps consume-only is in effect: the explicit key, else
+    /// `leaf_mode`, and only ever on a Leaf.
+    #[must_use]
+    pub fn resolved_caps_consume_only(&self, leaf_mode: bool) -> bool {
+        self.caps_consume_only.unwrap_or(leaf_mode)
+            && !self.resolved_participation().forwards_passthrough()
+    }
+
+    /// Resolve [`Self::caps_consume_only`] in place for this node, so the
+    /// pub/sub layer sees an explicit value. Call after
+    /// [`Self::participation`] is final.
+    ///
+    /// Returns an operator warning when an explicit `true` is ignored
+    /// because this node is Full.
+    pub fn apply_caps_consume_only(&mut self, leaf_mode: bool) -> Option<String> {
+        let effective = self.resolved_caps_consume_only(leaf_mode);
+        let warning = (self.caps_consume_only == Some(true) && !effective).then(|| {
+            "[gossip] caps_consume_only = true ignored: this node is Full \
+             (pass-through relay), and the backbone must forward caps"
+                .to_string()
+        });
+        self.caps_consume_only = Some(effective);
+        warning
     }
 
     /// Validate the budget separately so budget typos can fall back without
@@ -436,6 +507,78 @@ mod tests {
         cfg.clear_relay_for_metered_leaf();
         cfg.participation = ParticipationMode::Leaf;
         assert_eq!(cfg.resolved_participation(), ParticipationMode::Leaf);
+    }
+
+    /// Why (`[gossip] caps_consume_only`): unset must follow `leaf_mode` so
+    /// every metered leaf (desktop, Android embed, agent) gets it with no
+    /// template change, while an explicit value is the A/B and escape
+    /// hatch. Omitting the key must leave every existing config's output
+    /// unchanged, and a resolved value is what the pub/sub layer reads.
+    #[test]
+    fn caps_consume_only_unset_follows_leaf_mode_and_explicit_overrides() {
+        let unset: GossipConfig = toml::from_str("dispatch_workers = 2").expect("partial TOML");
+        assert_eq!(unset.caps_consume_only, None);
+        assert!(!toml::to_string(&unset)
+            .expect("serializes")
+            .contains("caps_consume_only"));
+        assert!(unset.resolved_caps_consume_only(true), "leaf_mode on");
+        assert!(!unset.resolved_caps_consume_only(false), "leaf_mode off");
+
+        let off: GossipConfig = toml::from_str("caps_consume_only = false").expect("false");
+        assert_eq!(off.caps_consume_only, Some(false));
+        assert!(!off.resolved_caps_consume_only(true), "explicit false wins");
+
+        let on: GossipConfig = toml::from_str("caps_consume_only = true").expect("true");
+        assert_eq!(on.caps_consume_only, Some(true));
+        assert!(on.resolved_caps_consume_only(false), "explicit true wins");
+
+        let mut applied = unset.clone();
+        assert_eq!(applied.apply_caps_consume_only(true), None);
+        assert_eq!(applied.caps_consume_only, Some(true));
+        let mut applied = unset;
+        assert_eq!(applied.apply_caps_consume_only(false), None);
+        assert_eq!(applied.caps_consume_only, Some(false));
+    }
+
+    /// Why: a mistyped `caps_consume_only` must not fail the whole config
+    /// (a restart loop over an optional switch). It reads as unset, so the
+    /// `leaf_mode` default applies; the daemon loader names the bad value.
+    #[test]
+    fn caps_consume_only_mistyped_value_reads_as_unset() {
+        for text in [
+            "caps_consume_only = \"yes\"",
+            "caps_consume_only = 1",
+            "caps_consume_only = [true]",
+            "caps_consume_only = { on = true }",
+        ] {
+            let parsed: GossipConfig = toml::from_str(text).expect("mistyped value still parses");
+            assert_eq!(parsed.caps_consume_only, None, "{text}");
+            assert!(parsed.resolved_caps_consume_only(true), "{text}");
+        }
+    }
+
+    /// Why: the backbone must forward caps, so a Full node never goes
+    /// consume-only, and an explicit `true` there is told it was ignored
+    /// rather than silently dropped.
+    #[test]
+    fn caps_consume_only_is_off_with_a_warning_on_a_full_node() {
+        let mut relay: GossipConfig =
+            toml::from_str("caps_consume_only = true\nrelay = true\n").expect("parses");
+        assert!(!relay.resolved_caps_consume_only(true));
+        let warning = relay.apply_caps_consume_only(false).expect("warns");
+        assert!(warning.contains("caps_consume_only") && warning.contains("Full"));
+        assert_eq!(relay.caps_consume_only, Some(false));
+
+        let mut resolved_full = GossipConfig {
+            participation: ParticipationMode::Full,
+            ..GossipConfig::default()
+        };
+        assert_eq!(
+            resolved_full.apply_caps_consume_only(true),
+            None,
+            "unset on Full is the ordinary default, not an operator mistake"
+        );
+        assert_eq!(resolved_full.caps_consume_only, Some(false));
     }
 
     #[test]

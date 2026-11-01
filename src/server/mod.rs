@@ -543,6 +543,27 @@ fn metered_relay_decision(
     (false, overrode.join(","))
 }
 
+/// The gossip config this daemon runs with, from its TOML and the resolved
+/// participation.
+///
+/// A metered node drops the relay opt-in, and `[gossip] caps_consume_only`
+/// is resolved here (unset follows `leaf_mode`; never on a Full node), so
+/// the pub/sub layer sees one explicit value. Returns the operator warning
+/// for an explicit `caps_consume_only = true` on a Full node.
+fn daemon_gossip_config(
+    config: &DaemonConfig,
+    participation: &x0x::gossip::ParticipationSelection,
+) -> (x0x::gossip::GossipConfig, Option<String>) {
+    let mut gossip_config = config.gossip.clone();
+    if config.leaf_mode {
+        gossip_config.clear_relay_for_metered_leaf();
+    }
+    gossip_config.participation = participation.mode;
+    gossip_config.participation_reason = participation.reason.to_string();
+    let warning = gossip_config.apply_caps_consume_only(config.leaf_mode);
+    (gossip_config, warning)
+}
+
 /// Start the x0x server in-process with explicit runtime options.
 ///
 /// All synchronous, fallible startup (data-dir create, identity load/gen,
@@ -786,12 +807,15 @@ pub async fn serve_with_options(
         bind_addr = %bind_address,
         "resolved gossip participation mode"
     );
-    let mut gossip_config = config.gossip.clone();
-    if config.leaf_mode {
-        gossip_config.clear_relay_for_metered_leaf();
+    let (gossip_config, caps_warning) = daemon_gossip_config(&config, &participation);
+    if let Some(warning) = caps_warning {
+        tracing::warn!("{warning}");
     }
-    gossip_config.participation = participation.mode;
-    gossip_config.participation_reason = participation.reason.to_string();
+    tracing::info!(
+        caps_consume_only = gossip_config.caps_consume_only == Some(true),
+        leaf_mode = config.leaf_mode,
+        "resolved [gossip] caps_consume_only"
+    );
 
     let mut builder = Agent::builder()
         .with_network_config(network_config)
@@ -5420,6 +5444,126 @@ mod metered_relay_decision_tests {
 /// hydration bridge — pre-populated cache ⇒ reconcile hydrates with no
 /// event; ring overflow (`Lagged`) ⇒ the full reconcile recovers; a second
 /// reconcile run hydrates nothing.
+#[cfg(test)]
+mod daemon_gossip_config_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::{daemon_gossip_config, DaemonConfig};
+    use crate as x0x;
+    use x0x::gossip::{ParticipationMode, ParticipationSelection};
+
+    fn leaf() -> ParticipationSelection {
+        ParticipationSelection {
+            mode: ParticipationMode::Leaf,
+            reason: "metered_leaf_mode",
+        }
+    }
+
+    fn full() -> ParticipationSelection {
+        ParticipationSelection {
+            mode: ParticipationMode::Full,
+            reason: "operator_relay",
+        }
+    }
+
+    fn resolve(toml_text: &str, selection: &ParticipationSelection) -> (Option<bool>, bool) {
+        let config: DaemonConfig = toml::from_str(toml_text).expect("config parses");
+        let (gossip, warning) = daemon_gossip_config(&config, selection);
+        (gossip.caps_consume_only, warning.is_some())
+    }
+
+    /// Why (`[gossip] caps_consume_only`): all three Noetic daemon kinds run
+    /// `leaf_mode = true` with no caps key, and must all come up
+    /// consume-only. An explicit value overrides `leaf_mode` both ways; a
+    /// Full node never goes consume-only and warns about an explicit `true`.
+    #[test]
+    fn caps_consume_only_resolves_from_leaf_mode_and_participation() {
+        assert_eq!(resolve("leaf_mode = true\n", &leaf()), (Some(true), false));
+        assert_eq!(
+            resolve(
+                "leaf_mode = true\n[gossip]\ncaps_consume_only = false\n",
+                &leaf()
+            ),
+            (Some(false), false)
+        );
+        assert_eq!(resolve("", &leaf()), (Some(false), false));
+        assert_eq!(
+            resolve("[gossip]\ncaps_consume_only = true\n", &leaf()),
+            (Some(true), false)
+        );
+        assert_eq!(resolve("", &full()), (Some(false), false));
+        assert_eq!(
+            resolve("[gossip]\ncaps_consume_only = true\n", &full()),
+            (Some(false), true)
+        );
+    }
+
+    /// Why: a mistyped `caps_consume_only` value falls back softly to the
+    /// `leaf_mode` default and the loader warns about that key by name. The
+    /// leniency is scoped to this key: a mistyped `leaf_mode` still fails
+    /// the parse as before.
+    #[test]
+    fn a_mistyped_caps_value_warns_and_falls_back_to_leaf_mode() {
+        for (text, want) in [
+            (
+                "leaf_mode = true\n[gossip]\ncaps_consume_only = \"no\"\n",
+                true,
+            ),
+            ("[gossip]\ncaps_consume_only = 1\n", false),
+        ] {
+            let (config, findings) = super::config::analyze(text).expect("still parses");
+            assert_eq!(
+                findings.ignored_values,
+                vec!["gossip.caps_consume_only".to_string()]
+            );
+            assert!(findings.ignored_keys.is_empty(), "{text}");
+            assert!(!findings.is_clean());
+            assert!(findings
+                .warning_lines()
+                .iter()
+                .any(|line| line.contains("gossip.caps_consume_only")
+                    && line.contains("true or false")));
+            let (gossip, warning) = daemon_gossip_config(&config, &leaf());
+            assert_eq!(gossip.caps_consume_only, Some(want), "{text}");
+            assert!(warning.is_none());
+        }
+
+        let (_, clean) =
+            super::config::analyze("leaf_mode = true\n[gossip]\ncaps_consume_only = false\n")
+                .expect("parses");
+        assert!(clean.is_clean(), "a boolean is not reported");
+        assert!(
+            super::config::analyze("leaf_mode = \"yes\"\n").is_err(),
+            "leaf_mode keeps strict parsing"
+        );
+    }
+
+    /// Why: like every other daemon key, a misspelt or misplaced
+    /// `caps_consume_only` must fail soft — the daemon starts on the
+    /// `leaf_mode` default and the loader names the dropped key — never a
+    /// restart loop.
+    #[test]
+    fn a_misspelt_caps_key_is_reported_and_falls_back_to_leaf_mode() {
+        for (text, dropped) in [
+            (
+                "leaf_mode = true\n[gossip]\ncaps_consume_onyl = false\n",
+                "gossip.caps_consume_onyl",
+            ),
+            (
+                "leaf_mode = true\ncaps_consume_only = false\n",
+                "caps_consume_only",
+            ),
+        ] {
+            let (config, findings) = super::config::analyze(text).expect("still parses");
+            assert!(findings.plane_error().is_none());
+            assert_eq!(findings.ignored_keys, vec![dropped.to_string()]);
+            let (gossip, warning) = daemon_gossip_config(&config, &leaf());
+            assert_eq!(gossip.caps_consume_only, Some(true), "{text}");
+            assert!(warning.is_none());
+        }
+    }
+}
+
 #[cfg(test)]
 mod member_certificate_bridge_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

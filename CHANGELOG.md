@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **A metered leaf consumes the DM-capability topics but no longer forwards
+  them (`[gossip] caps_consume_only`).** A leaf still receives every
+  `x0x/caps/*` advert, request and response, answers requests for itself and
+  publishes its own adverts, but sends no eager forward and no IHAVE for
+  other nodes' caps. Unset follows `leaf_mode`; an explicit `true` or `false`
+  overrides it, and a Full node always forwards (an explicit `true` there is
+  ignored with a warning). A value that is not a boolean is ignored with a
+  warning and the `leaf_mode` default applies. Caps forwarding was about 85% of a measured leaf's
+  upload (9.8 of 11.6 GB in 22 h). `GET /diagnostics/gossip` `relay_fanout`
+  reports `consume_only`, `consume_only_msgs` and
+  `consume_only_msgs_by_topic`. See
+  `docs/adr/transient/T-leaf-caps-consume-only.md`.
+
 ## [v0.48.1] - 2026-10-17
 
 A patch release. It pins ant-quic 0.27.61 and saorsa-gossip 0.5.90, and

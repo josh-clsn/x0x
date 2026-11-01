@@ -58,6 +58,20 @@ pub const DM_CAPABILITY_TARGETED_RESPONSE_TOPIC: &str = "x0x/caps/v1/response/ta
 /// topic-versioning pattern.
 pub const DM_CAPABILITY_DIGEST_TOPIC: &str = "x0x/caps/v2/digest";
 
+/// The four mesh-wide capability topics, in one place.
+///
+/// The advert service subscribes to exactly these, inbound attribution
+/// classes them as `caps`, and a consume-only Leaf (`[gossip]
+/// caps_consume_only`) withholds forwarding on exactly these. The service
+/// destructures this array, so adding a topic here without wiring it is a
+/// compile error rather than a silent drift.
+pub(crate) const CAPS_TOPIC_NAMES: [&str; 4] = [
+    DM_CAPABILITY_TOPIC,
+    DM_CAPABILITY_TARGETED_REQUEST_TOPIC,
+    DM_CAPABILITY_TARGETED_RESPONSE_TOPIC,
+    DM_CAPABILITY_DIGEST_TOPIC,
+];
+
 /// Domain-separation prefix for the digest-extension signature bytes.
 /// Distinct from [`ADVERT_SIGN_DOMAIN`] so an extension can never be
 /// reinterpreted as (or spliced into) an advert.

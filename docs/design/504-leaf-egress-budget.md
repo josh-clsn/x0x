@@ -719,7 +719,7 @@ with comparable peers/workload and recovery evidence, distinct from C0.
 | slice | what | depends on |
 |---|---|---|
 | 2 | Fail-soft byte shedding, including explicit Critical/Normal forwarding policy if needed. **x0x consumer side implemented** (`byte_policy`, default `observe_only`, Leaf-only); field acceptance still held | named capture + per-topic/origin/priority meters + delivery/recovery gates |
-| 3 | Consume-only / no-forward for global announce on Leaf | sg API or a carefully metered x0x fork; evidence that announce (not the bus) is the top row |
+| 3 | Consume-only / no-forward for global announce on Leaf. **Caps topics only, fork tail:** `[gossip] caps_consume_only` (default follows `leaf_mode`) returns sg `DeliverOnly` for the four `x0x/caps/*` topics on a Leaf; see `docs/adr/transient/T-leaf-caps-consume-only.md`. Identity announce not yet | sg API (`DeliverOnly`, sg ≥ 0.5.79) or a carefully metered x0x fork; evidence that announce (not the bus) is the top row |
 | 4 | #501 `skip_legacy_dm_bus` default-on-Leaf decision | #501 PR + the same capture |
 | 5 | ~~Honest HyParView mapping **or** delete dead knobs~~ **DONE**: `active_view_size` / `passive_view_size` / `arwl` / `prwl` deleted; parsed-and-warned only, so deployed TOML keeps loading | independent cleanup; does not close #504 |
 | — | #505 ant-quic MTU | other repo; only blocks some measurement hosts |
