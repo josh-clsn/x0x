@@ -12,7 +12,7 @@ A signed roster commit covers the roster root, the policy, the public metadata a
 
 - only an event's author could deliver it, because a deliverer could swap the TreeKEM bytes;
 - a member who missed a removal had to reach the remover, which is what leaves a survivor on the old key (the survivor re-key bug);
-- even the author's own copy could reach a member with its unsigned fields changed on the way (F-2).
+- even the author's own copy could reach a member with its unsigned fields changed on the way.
 
 Upstream #1337 seals only its post-leave rekey as `treekem:epoch=<n>:commit=<blake3>`.
 
@@ -32,7 +32,7 @@ An add with a recovery record keeps its suffix after that: `...:extras=<d>;membe
 
 | Event | Extras tuple |
 |---|---|
-| `MemberAdded` (direct add, invite add, re-key add) | `(display_name, treekem_key_package_hash, welcome)`, or, when the add carries an owner mandate, `(display_name, treekem_key_package_hash, welcome, blake3 of the postcard of the mandate)` (A3 review I-1) |
+| `MemberAdded` (direct add, invite add, re-key add) | `(display_name, treekem_key_package_hash, welcome)`, or, when the add carries an owner mandate, `(display_name, treekem_key_package_hash, welcome, blake3 of the postcard of the mandate)` |
 | `JoinRequestApproved` | `(None, treekem_key_package_hash, welcome)`: the event has no display name |
 | `MemberRemoved` (admin removal, post-leave rekey, OwnerCertified eviction, re-key removal) | none: sealed without `:extras=` |
 | `MemberBanned` | `()` |
@@ -77,7 +77,7 @@ At every site: take a rollback snapshot, mutate the tree, set the binding from t
 | direct add | `add_treekem_named_group_member` |
 | join approval | `approve_treekem_join_request` |
 
-The owner mandate is minted before the binding is written, so the binding can name it (A3 review I-1). It signs the previous head, the roster, the policy, the metadata and the declared epoch, not the binding, so minting it first changes nothing it covers.
+The owner mandate is minted before the binding is written, so the binding can name it. It signs the previous head, the roster, the policy, the metadata and the declared epoch, not the binding, so minting it first changes nothing it covers.
 
 The creator's recovery binding at group creation (`treekem:epoch=<n>;member-recovery=<hash>`) is unchanged: it has no TreeKEM commit and no event that carries one.
 
@@ -96,3 +96,9 @@ A test-only seam, `NamedGroupTestRecorders::seal_force_err`, fails the next `sea
 
 - New: `named_groups/tests/treekem_bytes_binding.rs` (admin removal, add and approval suffix, renamed add, swapped KeyPackage hash, seal failure), `epoch_ahead_catchup.rs` (`catchup_third_party_relays_a_digest_bound_rekey`, upstream #1337; `a_survivor_relays_an_admin_removal_by_catch_up`), `issue1139_back_to_back_join.rs` (`ban_add_eviction_and_rekey_removal_seal_the_digest_binding`, `the_rekey_link_checks_the_bytes_its_removal_names`), and parser unit tests in `treekem_binding.rs`.
 - `relayed_removal_rejects_another_members_treekem_commit` now takes its removal from the real admin route. `catchup_legacy_binding_stays_with_the_author` seals the legacy form through a fixture, as a pre-A1 daemon would.
+
+## Measured delta
+
+- **Before:** every fork seal wrote `treekem:epoch=<n>`, which names no bytes. Only an event's author could deliver it, and an add's display name, KeyPackage hash and Welcome could be changed in transit.
+- **After:** every seal writes `treekem:epoch=<n>:commit=<blake3>:extras=<blake3>`. A copy with swapped TreeKEM bytes, or with a changed name, KeyPackage hash or Welcome, is refused from any sender.
+- **Pinned by:** `ban_add_eviction_and_rekey_removal_seal_the_digest_binding` (every seal site writes the form), `the_rekey_link_checks_the_bytes_its_removal_names`, `catchup_third_party_relays_a_digest_bound_rekey` (a third party delivers it), and the parser unit tests in `treekem_binding.rs`.

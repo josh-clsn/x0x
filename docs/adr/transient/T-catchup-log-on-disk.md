@@ -19,7 +19,7 @@ A member answers a TreeKEM catch-up request from its `treekem_event_log` (`handl
 
 Every event whose `commit` is set, through `commit_bearing_event_frontier`: the nine signer-delivered kinds and `JoinRequestRejected`, except:
 
-- **`JoinRequestCreated` and `JoinRequestCancelled` are not logged.** Their author is the requester, who is not a member and never serves catch-up, and they apply only from their author (A3). No member's copy can help another member, and logging them would let any stranger fill the log of a request-access room (A4 review I-2).
+- **`JoinRequestCreated` and `JoinRequestCancelled` are not logged.** Their author is the requester, who is not a member and never serves catch-up, and they apply only from their author (A3). No member's copy can help another member, and logging them would let any stranger fill the log of a request-access room.
 - **A `GroupDeleted` is not kept:** it withdraws the room, and a withdrawn room is wiped.
 
 Each is logged where it is applied (the apply arm, after the durable persist) and by its author (the route, after the publish). The revision is the signed commit's revision, never the event's unsigned roster revision. A page is sorted by `(commit revision, TreeKEM epoch)` on both the serve and the receive side, so a rename and a removal arrive in chain order.
@@ -31,7 +31,7 @@ Each is logged where it is applied (the apply arm, after the durable persist) an
 - The group key is the event's `group_id`, as the in-memory map uses it. Every path component is a hex digest, a zero-padded number or a fixed kind name (`named_group_metadata_event_kind`). Nothing a peer sends becomes part of a path.
 - The digest in the name separates two events that share a revision, an epoch and a kind. In memory one commit is logged once: the dedup key is the kind, the revision, the epoch, the signer and the commit's state hash.
 - A room's `evicted-through` file holds the highest revision it lost (below).
-- An event over 512 KiB (`EVENT_LIMIT_BYTES`) is not kept at all, in memory or on disk, and its revision is recorded as lost at once (A4 re-review I-4: holding it in memory let one admin grow a phone's memory by up to about 1 GiB per room). Typical sizes: a Welcome-bearing add is 40-52 KiB; one carrying a full 32-certificate roster sidecar is about 360 KiB. So a room holds at most 128 × 512 KiB = 64 MiB, in memory and on disk.
+- An event over 512 KiB (`EVENT_LIMIT_BYTES`) is not kept at all, in memory or on disk, and its revision is recorded as lost at once (holding it in memory let one admin grow a phone's memory by up to about 1 GiB per room). Typical sizes: a Welcome-bearing add is 40-52 KiB; one carrying a full 32-certificate roster sidecar is about 360 KiB. So a room holds at most 128 × 512 KiB = 64 MiB, in memory and on disk.
 
 ### Writes
 
@@ -45,7 +45,7 @@ Each is logged where it is applied (the apply arm, after the durable persist) an
 Every change runs under the `treekem_event_log` write lock. The lock order is `treekem_event_log`, then `named_groups`.
 
 - **An append** takes the lock, then checks that the room is still there: it is in the local roster under that key or alias, no record of it is withdrawn, and the local agent is not banned from it (`event_log_room_accepts`).
-  - It does not require the local agent to be *active*. A returning device applies the re-key removal of itself (both link paths: the `MemberRemoved` arm and `apply_rekey_self_removal_link_checked`) just before its add re-seats it, and a joiner applies the events its join result carries (#1139) before its own add. Requiring an active member dropped those, and the device then served pages with a hole (A4 review I-1).
+  - It does not require the local agent to be *active*. A returning device applies the re-key removal of itself (both link paths: the `MemberRemoved` arm and `apply_rekey_self_removal_link_checked`) just before its add re-seats it, and a joiner applies the events its join result carries (#1139) before its own add. Requiring an active member dropped those, and the device then served pages with a hole.
   - It is still safe against a wipe: every departure (kick, leave, local-only drop, abandoned re-key row) drops the room from the roster first, a ban keeps the row but bans the local agent, and a delete tombstones it as withdrawn.
 - **A wipe** (`wipe_local_group_crypto_material`, every departure, #363 and #376) runs after the room has left the roster or been tombstoned, and removes the directory under the same lock.
 
@@ -54,7 +54,7 @@ So an append that races a wipe either is removed by it or finds the room gone. I
 ### Caps
 
 - **Per room: 128 events.** Past it, the lowest revision goes. With the per-event limit, a room holds at most 64 MiB.
-- **Daemon-wide: 256 MiB on disk.** Past it, the room with the most bytes on disk gives up its lowest revision (between equal rooms, the one whose oldest event is older), and each eviction is logged at warn. So a busy or hostile room cannot push out a quieter room's history: it is evicted first (A4 review I-2). Bounds before this change: 128 events per room in memory, with no total.
+- **Daemon-wide: 256 MiB on disk.** Past it, the room with the most bytes on disk gives up its lowest revision (between equal rooms, the one whose oldest event is older), and each eviction is logged at warn. So a busy or hostile room cannot push out a quieter room's history: it is evicted first. Bounds before this change: 128 events per room in memory, with no total.
 - **The gap.** Each eviction, each event too large to keep, and each event whose write failed raises the room's `evicted-through`. The new value is written down before the event's file is removed, so a crash in between never leaves a hole unrecorded. A request whose `from_revision` is below it would get a page with a hole, which the requester can never link. It gets no events, and the new additive response field `log_evicted_through` says why. Old peers ignore the field. A requester at or past it is served as before.
 
 ### One serving path
@@ -94,7 +94,7 @@ A5 (`T-signed-catchup-pages`) settles this. A page starts at `from_revision + 1`
 - Disk use grows by up to 256 MiB in total, and at most 64 MiB per room.
 - Memory use is bounded: up to 128 events of at most 512 KiB per room. Before this change the in-memory log had no per-event bound.
 - File I/O runs under the log's write lock: one file sync and one directory sync per logged commit, two more per eviction. That briefly holds catch-up serves and, where an apply arm logs, the membership lock.
-- A stripped copy that lands first is the copy that is logged and served after restarts (the dedup key does not cover the payload). Since A1 and I-1 that matters only on the shared-secret plane, where a non-author add arrives without its display name, KeyPackage hash or owner mandate.
+- A stripped copy that lands first is the copy that is logged and served after restarts (the dedup key does not cover the payload). Since A1 that matters only on the shared-secret plane, where a non-author add arrives without its display name, KeyPackage hash or owner mandate.
 - The new response field is additive. Since A5 the requester asks other members when it is set past its head (`T-signed-catchup-pages`).
 
 ## Validation
@@ -124,3 +124,10 @@ A5 (`T-signed-catchup-pages`) settles this. A page starts at `from_revision + 1`
 - `a4_a_joiner_logs_the_events_its_join_result_carries`.
 
 All three failed under the active-member check.
+
+## Measured delta
+
+- **Before:** the log lived in memory only and held four kinds, so a restart emptied it and a member that missed a rename, a policy or a role change could not link a later commit.
+- **After:** every commit-bearing kind is a file under `<data>/treekem/event-log/`, kept across restarts: at most 128 events and 64 MiB per room, 256 MiB in all, none over 512 KiB, with the highest lost revision recorded in `evicted-through`.
+- **Pinned by:** `event_log_survives_restart_and_serves_catchup`, `survivor_who_missed_a_rename_and_a_removal_converges` (failed at the A3 tip), `event_log_holds_every_commit_bearing_kind`, `per_room_and_daemon_wide_caps_hold`, `a_gap_past_the_cap_is_not_served_and_says_so`.
+- **Not `GroupInfo::commit_log`.** This log (`AppState::treekem_event_log`, files under `event-log/`) holds the events that carry commits. `GroupInfo::commit_log` is the #111 retained-commit history, which holds each commit with its roster. `admins_since` and the `prove_held` check read `commit_log`; catch-up serving and the re-key obligation payload read this log.

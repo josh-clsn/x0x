@@ -12,7 +12,7 @@ Before this change only a removal could reach a member through someone other tha
 
 Two more holes were open:
 
-- **Claimed senders (A1 review I-1).** The two engine-A doors (`POST /groups/:id/apply-metadata-event` and `POST /groups/:id/join-result/:member`) take the sender from their caller. fetch>it fills it from the relay's unauthenticated `author` field. Both applied the event as that sender, so a legacy-bound TreeKEM event, whose binding names no bytes, applied with no check that the claimed author sent those bytes. #1337's `transport_sender == author` shortcut had the same shape.
+- **Claimed senders.** The two engine-A doors (`POST /groups/:id/apply-metadata-event` and `POST /groups/:id/join-result/:member`) take the sender from their caller. fetch>it fills it from the relay's unauthenticated `author` field. Both applied the event as that sender, so a legacy-bound TreeKEM event, whose binding names no bytes, applied with no check that the claimed author sent those bytes. #1337's `transport_sender == author` shortcut had the same shape.
 - **The actor field.** On the author path, the arms checked `actor == sender` but not that the actor signed the commit. An admin could hand on another admin's commit as its own.
 
 ## Decision
@@ -58,11 +58,11 @@ Both doors decide through `signer_delivery::door_admit`, the one admit path. It 
 
 ### What else changed at the receiver
 
-- **A removal must take its target out (A2 review m-1).** `process_treekem_commit_after_crypto_recheck` now takes the departing member of a removal or ban. After `process_commit`, if this member holds the target's committed package and that package is still on a live leaf, the tree rolls back and the commit is refused (`departing_leaf_not_blank`). A legacy binding names no bytes, so without this the actor's other commit at the same epoch would pass every other check.
-- **The add check fails closed (A1 review m-4).** `treekem_add_binding_admits` refused only an unparseable binding that contained `:commit=`. It now refuses every `treekem:` binding that is none of the written forms (`treekem:epoch=5:Commit=…`, a junk `;` suffix). Another plane's binding (for example `gss:epoch=<n>`) names no TreeKEM bytes and is treated like a legacy one: it applies only from its author over a verified transport, because `signer_delivery` refuses any non-author copy whose binding does not name its bytes.
+- **A removal must take its target out.** `process_treekem_commit_after_crypto_recheck` now takes the departing member of a removal or ban. After `process_commit`, if this member holds the target's committed package and that package is still on a live leaf, the tree rolls back and the commit is refused (`departing_leaf_not_blank`). A legacy binding names no bytes, so without this the actor's other commit at the same epoch would pass every other check.
+- **The add check fails closed.** `treekem_add_binding_admits` refused only an unparseable binding that contained `:commit=`. It now refuses every `treekem:` binding that is none of the written forms (`treekem:epoch=5:Commit=…`, a junk `;` suffix). Another plane's binding (for example `gss:epoch=<n>`) names no TreeKEM bytes and is treated like a legacy one: it applies only from its author over a verified transport, because `signer_delivery` refuses any non-author copy whose binding does not name its bytes.
 - **`PolicyUpdated`'s revision is capped.** `policy_revision` took `max(event revision, current)`, so any copy could set it to `u64::MAX`. It now goes through the same `[current, current + 1]` clamp as the roster revision.
 
-### Unsigned-field audit (F-2)
+### Unsigned-field audit
 
 The signed roster commit covers its group id and revision, the previous state hash, the roster root (each Active or Banned member's id, role, state and certificate digest), the policy hash, the public metadata hash (name, description, tags, avatar, banner, Home digest), the security binding and `withdrawn` (`state_commit.rs`). A1's binding adds the TreeKEM commit digest and epoch, and an add's extras. Everything else an event applies is listed here.
 
@@ -81,7 +81,7 @@ The signed roster commit covers its group id and revision, the previous state ha
 | | `actor` (`added_by`) | Must be the verified signer. |
 | | `revision` | Capped. |
 | | `certificate_b64` | Covered: its digest is in the roster root, and bytes that contradict it are not installed. |
-| | `owner_mandate` | TreeKEM plane: its digest is in the extras (A3 review I-1), so a copy without the mandate it was sealed with is refused, from any deliverer and from the author alike. The receiver never warn-accepts it as absent, and the author's full copy still applies and records the capability. Shared-secret plane: no binding slot, so a deliverer can strip it and the arm warn-accepts an authority not yet seen with a mandate (known limit; Noetic rooms are TreeKEM). |
+| | `owner_mandate` | TreeKEM plane: its digest is in the extras, so a copy without the mandate it was sealed with is refused, from any deliverer and from the author alike. The receiver never warn-accepts it as absent, and the author's full copy still applies and records the capability. Shared-secret plane: no binding slot, so a deliverer can strip it and the arm warn-accepts an authority not yet seen with a mandate (known limit; Noetic rooms are TreeKEM). |
 | | `member_joined_recovery`, `member_recovery_history` | Each entry carries the authority's attestation and is verified (`verify_authority_attested_member_joined_recovery`). A deliverer can only drop entries. |
 | | `roster_certificates_b64` | Each entry is installed only when it hashes to a committed seat digest and verifies under the group owner. |
 | `MemberRemoved` | `actor` (`removed_by`) | Must be the verified signer. |
@@ -109,5 +109,11 @@ The signed roster commit covers its group id and revision, the previous state ha
 ## Validation
 
 - `named_groups/signer_delivery.rs` unit tests: the signer from any member, a forged actor, a tampered commit, TreeKEM bytes from a non-author, the lifecycle kinds, field dropping.
-- `named_groups/tests/signer_delivery.rs`: `a_survivor_delivers_a_ban`, `a_survivor_delivers_an_add`, `a_survivor_delivers_a_rename_policy_role_and_unban`, `a_legacy_bound_add_from_a_non_author_is_refused`, `a_forged_actor_field_authorises_nothing`, `join_request_lifecycle_stays_author_only`, `a_non_author_copy_applies_no_unbound_field`, the four engine-A door tests, `a_removal_whose_commit_keeps_the_target_is_refused`, and the two A2 m-4 route tests.
-- `named_groups/tests/owner_mandate.rs`: `a_copy_of_an_add_without_its_owner_mandate_is_refused` (review I-1).
+- `named_groups/tests/signer_delivery.rs`: `a_survivor_delivers_a_ban`, `a_survivor_delivers_an_add`, `a_survivor_delivers_a_rename_policy_role_and_unban`, `a_legacy_bound_add_from_a_non_author_is_refused`, `a_forged_actor_field_authorises_nothing`, `join_request_lifecycle_stays_author_only`, `a_non_author_copy_applies_no_unbound_field`, the four engine-A door tests, `a_removal_whose_commit_keeps_the_target_is_refused`, and its two route tests.
+- `named_groups/tests/owner_mandate.rs`: `a_copy_of_an_add_without_its_owner_mandate_is_refused`.
+
+## Measured delta
+
+- **Before:** only a removal could reach a member through someone other than its author. A ban, add, rename, policy, role change or unban applied only from its author, and the engine-A doors applied a legacy-bound TreeKEM event as the caller's claimed sender.
+- **After:** every commit-bearing kind applies as its verified signer from any member when its binding names its TreeKEM bytes. The engine-A doors apply only as the verified signer and answer 422 with a `reason` otherwise. The join-request lifecycle stays author-only.
+- **Pinned by:** `a_survivor_delivers_a_ban`, `a_survivor_delivers_an_add`, `a_survivor_delivers_a_rename_policy_role_and_unban`, `a_legacy_bound_add_from_a_non_author_is_refused`, `a_forged_actor_field_authorises_nothing`, `join_request_lifecycle_stays_author_only` (all in `named_groups/tests/signer_delivery.rs`).

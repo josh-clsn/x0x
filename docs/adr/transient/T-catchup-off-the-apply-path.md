@@ -1,6 +1,6 @@
 # T-catchup-off-the-apply-path: no catch-up ask blocks an apply or the catch-up listener
 
-- **Status:** Proposed (fork tail, survivor re-key A12, with fix rounds 1 and 2).
+- **Status:** Proposed (fork tail, survivor re-key A12).
 - **Date:** 2026-10-25
 - **Base:** `survivor-rekey` at `042f243f`
 - **Upstream:** none filed. Upstream's apply path asks for a gap catch-up inline in the same way, and its listener answers serially.
@@ -30,14 +30,14 @@ A Noetic leaf agent's drill showed group messages stalling behind membership app
   - An ask that is still in flight from the same head is skipped, even after the 5 s throttle window, so two gaps at one head make one ask per peer.
   - Once the head moves, a later gap asks again at once, even while an older ask waits on a silent peer.
   - A peer that only a later event names is asked at once.
-- **Replay.** Parked events replay in commit order after a page is applied (`handle_treekem_catchup_response`), as before. Since fix round 1 they also replay after a live apply lands a membership commit (`replay_parked_after_live_apply`), so a commit that arrives by gossip or a direct push frees its parked successors without waiting for a page. The replay re-applies each event with every check. Since fix round 2 (N-5), a replay pass that moved the head while events stayed parked runs again, up to 8 passes: another replay may have requeued an event while this one applied its predecessor. Order is still the frontier gate's.
+- **Replay.** Parked events replay in commit order after a page is applied (`handle_treekem_catchup_response`), as before. They also replay after a live apply lands a membership commit (`replay_parked_after_live_apply`), so a commit that arrives by gossip or a direct push frees its parked successors without waiting for a page. The replay re-applies each event with every check. A replay pass that moved the head while events stayed parked runs again, up to 8 passes: another replay may have requeued an event while this one applied its predecessor. Order is still the frontier gate's.
 - **Follow-up asks off the listener.** A truncated page's follow-up ask runs in its own task under `ASK_TIMEOUT`, with at most one in flight per (room, peer, head after the page). So a page that moved the head always asks for the next one, even while the ask for it is still waiting on its acknowledgement. A page that moved nothing asks nothing more. Pages are still applied on the listener, in arrival order.
 - **The listener answers side by side, for proven requesters only.**
   - The listener hands each message to `catchup_serve::on_direct_message`. A request goes to `dispatch`, which never waits.
   - **Who gets a queue.** A request queues under the sender if the transport verified that sender. Otherwise it queues under the requester its signature proves: the A5 page-request signature, or the #398 member-keyed one, checked at admission. A request that proves no requester is dropped there; the answer would refuse it anyway. So a peer that claims a member's id cannot touch that member's queue.
   - **Rate before the check.** An unverified request is checked only within its QUIC-authenticated machine's allowance: 16 at once, refilling at 8 a second. A flood cannot spend this daemon's CPU on signature checks.
-  - **On the roster (N-4).** The proven requester must be an active member of the room, or a joiner with no roster entry that the room's cached add names, as the answer requires. A self-made identity gets no waiting space.
-  - **Fresher replaces (N-2).** A waiting request is replaced only by one at least as fresh: a page from the same or a later (epoch, revision), a challenge with the same or a later counter. A replay of a member's older signed request is dropped, so a past recipient of its requests cannot displace its fresh one.
+  - **On the roster.** The proven requester must be an active member of the room, or a joiner with no roster entry that the room's cached add names, as the answer requires. A self-made identity gets no waiting space.
+  - **Fresher replaces.** A waiting request is replaced only by one at least as fresh: a page from the same or a later (epoch, revision), a challenge with the same or a later counter. A replay of a member's older signed request is dropped, so a past recipient of its requests cannot displace its fresh one.
   - **Bounds:**
     - at most 4 answers at once (`SERVE_SLOTS`);
     - one answer running per requester;

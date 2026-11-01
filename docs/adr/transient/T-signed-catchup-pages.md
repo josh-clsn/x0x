@@ -14,9 +14,9 @@ Before this change:
 - **A responder dropped every page request it could not verify.** Only member-keyed KeyPackage requests carried a signature (#398).
 - **A requester dropped every page it could not verify.** It kept only the hash-anchored KeyPackage from a signed targeted reply.
 
-So a phone never pulled a missed commit over x0x, and a commit its key package could not yet check healed only through the sealer's resend or later gossip (A2 review r-2). The plan review called this I-1. Its second review (N-C3) added the condition for fixing it: on an unverified transport, nothing may act on the claimed sender.
+So a phone never pulled a missed commit over x0x, and a commit its key package could not yet check healed only through the sealer's resend or later gossip. The condition for fixing it is that, on an unverified transport, nothing may act on the claimed sender.
 
-A4's review left one more item for this task (n-1). A responder served the events after the requester's revision, sorted, one a page, whether or not the first one followed the requester's head. It also served events at or below the requester's revision whose TreeKEM epoch was ahead. Such a page could not be used, and nothing made the requester ask anyone else.
+A4's review left one more item for this task. A responder served the events after the requester's revision, sorted, one a page, whether or not the first one followed the requester's head. It also served events at or below the requester's revision whose TreeKEM epoch was ahead. Such a page could not be used, and nothing made the requester ask anyone else.
 
 ## Decision
 
@@ -24,7 +24,7 @@ A4's review left one more item for this task (n-1). A responder served the event
 
 `TreeKemCatchupRequest` gains `head_challenge: Option<String>` (additive; A6 gives it its meaning, `T-treekem-head-proof`). Every page request is signed with the existing `CatchupSigner` (`signed_catchup::sign_page_request`), whatever the transport, since a requester cannot know whether the responder will verify it. The signature covers:
 
-`len(domain) ‖ "x0x/treekem-catchup-page/v1" ‖ len(group) ‖ group ‖ len(requester) ‖ requester ‖ from_revision (u64 BE) ‖ from_epoch (u64 BE) ‖ limit (u64 BE) ‖ head_challenge (0, or 1 ‖ len ‖ bytes)`
+`len(domain) ‖ "x0x/treekem-catchup-page/v1" ‖ len(group) ‖ group ‖ len(requester) ‖ requester ‖ from_revision (u64 BE) ‖ from_epoch (u64 BE) ‖ limit (u64 BE) ‖ head_challenge (0, or 1 ‖ len ‖ bytes) ‖ len ‖ current_state_hash`
 
 Every length is a u64 BE, so no two requests share an encoding. The key is self-certifying against the requester's agent id (`catchup_signer_matches`). A signed `head_challenge` longer than 128 bytes (`HEAD_CHALLENGE_MAX_BYTES`) is refused.
 
@@ -32,12 +32,12 @@ The three senders of page requests sign. Upstream's #1427 epoch-ahead ask (40e0f
 
 **Serving.** `handle_treekem_catchup_request` accepts a request it could not verify when `signed_catchup::page_request_signed` holds: no target member, and the signature verifies for the claimed requester over exactly the fields it carries. The claimed sender must still equal the requester, so the page goes to the signer. Every membership gate runs unchanged: a withdrawn room, a locally banned responder, no local roster, a departed or banned requester, and the #378 serve throttle. The signature is checked before the throttle, so a forged request cannot use up a member's throttle window. The signature check still runs before the group lookup, so a request for any group id costs one verification (A12 carries the listener's per-message cost).
 
-**Replays cannot cut a requester off** (A5 review I-1). Before this, `limit` was unsigned: anyone holding a member's signed request (a removed member it still counts active, for one) could replay it to every other member with `limit: 0`. Each would send an empty page marked truncated and start the member's 5 s serve window, so the member's own requests were dropped as duplicates, again and again. Now:
+**Replays cannot cut a requester off**. Before this, `limit` was unsigned: anyone holding a member's signed request (a removed member it still counts active, for one) could replay it to every other member with `limit: 0`. Each would send an empty page marked truncated and start the member's 5 s serve window, so the member's own requests were dropped as duplicates, again and again. Now:
 - `limit` is signed, so a changed limit fails the signature and starts no window;
 - a responder serves `limit` clamped to `1..=TREEKEM_CATCHUP_RESPONSE_EVENT_CAP` (`page_limit`), so no request is answered with an empty page cut short;
 - the serve window starts only when a page is handed to the transport, after every gate and the page are done.
 
-The fields still unsigned (`current_state_hash`, `missing_prev_state_hash`) do not change what is served. So a replay can only send the requester its own real page, which is what it asked for, and start the window that page would have started.
+The field still unsigned (`missing_prev_state_hash`) does not change what is served. `current_state_hash` is signed so that a request which settles a re-key obligation names the head it holds (`T-survivor-rekey-obligation`); it does not change what is served either. So a replay can only send the requester its own real page, which is what it asked for, and start the window that page would have started.
 
 ### On an unverified page, the claimed sender counts for nothing
 
@@ -56,9 +56,9 @@ The fields still unsigned (`current_state_hash`, `missing_prev_state_hash`) do n
 
 A signed targeted reply (#398) authenticates its sender, so its hash-anchored KeyPackage still applies, and its sender must still be an active member. Its events go through the unverified rules.
 
-**The next page.** With one event a page, a phone pulls a run of commits one page at a time, so it must ask for the next. The claimed sender is used only as the address to ask, as every request path uses one: a page request carries this member's revision, epoch and head, which it sends only to active members on its own roster (as A2 r-3 does for the sweep). It asks only when the page moved its head, so a replayed page, or a forged one, makes it send nothing, unless the head moved meanwhile for another reason (then it sends one request per real step).
+**The next page.** With one event a page, a phone pulls a run of commits one page at a time, so it must ask for the next. The claimed sender is used only as the address to ask, as every request path uses one: a page request carries this member's revision, epoch and head, which it sends only to active members on its own roster. It asks only when the page moved its head, so a replayed page, or a forged one, makes it send nothing, unless the head moved meanwhile for another reason (then it sends one request per real step).
 
-### A page never leaves a member stuck behind a hole (A4 n-1)
+### A page never leaves a member stuck behind a hole
 
 **Serving** (`catchup_page_gap::serve_page`):
 - Only events after the requester's revision are candidates. An event at or below it is never served, whatever its epoch: a commit applies only at the revision after the head (`validate_apply`), and that event sorted ahead of the one that applies. Every TreeKEM epoch change in the fork comes with a roster commit, so the old epoch clause served nothing a requester could use.
@@ -69,9 +69,9 @@ A signed targeted reply (#398) authenticates its sender, so its hash-anchored Ke
 
 **Requesting** (`catchup_page_gap::page_leaves_gap`, `spawn_ask_another_member`, `GapAsks`):
 - After applying a page, a member checks whether it is still behind a hole: the responder's `log_evicted_through` is past its head, or a served commit still sits past the one its head needs. The second case is an older responder, which still serves gapped pages.
-- **Only an authenticated member's report counts** (A5 review I-2). The responder must be an active member on the requester's roster, and its report must be authenticated: a verified transport, or a hole report it signed. A responder signs every hole report over (`"x0x/treekem-catchup-gap/v1"`, group, requester, `log_evicted_through`), in the response's `signed_by` (`sign_gap_report`, `gap_report_signed`). An older responder's gapped page counts only over a verified transport, since its events say nothing about who served them. So a stranger, or an unsigned or altered report, spends nothing.
+- **Only an authenticated member's report counts**. The responder must be an active member on the requester's roster, and its report must be authenticated: a verified transport, or a hole report it signed. A responder signs every hole report over (`"x0x/treekem-catchup-gap/v1"`, group, requester, `log_evicted_through`), in the response's `signed_by` (`sign_gap_report`, `gap_report_signed`). An older responder's gapped page counts only over a verified transport, since its events say nothing about who served them. So a stranger, or an unsigned or altered report, spends nothing.
 - It then asks other active members, admins first, at most `GAP_ASK_PEERS` (3) at a time. A member asked about a head (revision and epoch) is not asked about it again until its window ends: 5 s after the first ask, doubling each time, at most 320 s (`gap_ask_window`). So a member that was offline at its turn is asked again, and a hole no member can fill costs each member a handful of requests, spread out. The window starts when the request is handed to the transport. A member whose request was never built is not counted. A new head starts every window afresh, a member that leaves the roster leaves the record, and a room wipe drops the room (`GapAsks::wipe`).
-- Any member can sign hole reports, so a member (including a removed one the requester still counts as active) can push every other member's window to the 320 s cap by sending reports; that delay is bounded, and a new head resets every window (A5 review r-3).
+- Any member can sign hole reports, so a member (including a removed one the requester still counts as active) can push every other member's window to the 320 s cap by sending reports; that delay is bounded, and a new head resets every window.
 - It does not leave out the responder that reported the hole: the report counts only from a member, and a member asked inside its window is not asked again.
 - The requester still applies what it was served. A gapped TreeKEM membership event still goes to the #492 queue, which asks its actor and two members and replays it once the hole is filled. Every commit must link to the head it is applied on, so nothing ever applies past a hole.
 
@@ -82,14 +82,15 @@ A signed targeted reply (#398) authenticates its sender, so its hash-anchored Ke
 
 ## Consequences
 
-- A phone or resting agent can pull the commits it missed from any member, over x0x, and the A2 re-pull (`pull_again_after_package`) now reaches it too: it runs the epoch-ahead catch-up, whose requests are signed and whose pages it now reads. One exception (A5 review m-4, from A3/A4): a join-request lifecycle commit is author-only and is not served (`JoinRequestCreated` and `JoinRequestCancelled` are not logged, and an unverified page drops all three), so a member behind one cannot page past it. Noetic does not use request-access rooms.
+- A phone or resting agent can pull the commits it missed from any member, over x0x, and the A2 re-pull (`pull_again_after_package`) now reaches it too: it runs the epoch-ahead catch-up, whose requests are signed and whose pages it now reads. One exception (from A3/A4): a join-request lifecycle commit is author-only and is not served (`JoinRequestCreated` and `JoinRequestCancelled` are not logged, and an unverified page drops all three), so a member behind one cannot page past it. Noetic does not use request-access rooms.
 - Each page request carries an ML-DSA-65 key and signature (about 7 KB of base64) and costs one signature (about 1 ms). Each unverified request a responder serves costs one verification.
 - A stranger can send a member pages. Each costs one signature check per event, at most one event a page, plus a signature check on a hole report. Nothing it sends applies unless an admin signed it and it links to the member's head. A forged page makes the member send nothing: its hole report does not count, and it asks for a next page only after the page moved the head.
 - A member's hole report, true or false, makes the requester ask each other active member at most once per window per head. "Active" is the requester's own roster, so it can include a member removed by a commit the requester has not applied yet (the test fixture's S1 asks R). That member learns only a head it once held, and is refused by every member that applied its removal.
-- Hole asks live in `AppState::treekem_gap_asks`: one record per room and member, reset on a new head and dropped with the room. `treekem_catchup_throttle` is no longer only ever growing: a stamp drops the entries older than an hour once the map holds 1024 (`stamp_catchup_throttle`, which all six writers of the map use since A6, review r-2), and a room wipe drops every key of the room by prefix (`{room}:` or `serve:{room}:`; before, it removed only an exact key, which matched nothing).
-- Older daemons ignore `head_challenge` and the signature on a page request; they still drop requests they cannot verify. An older responder's gapped page is caught on the requesting side over a verified transport. Signing `limit` changed the sign input after the first A5 commit (`6792610a`): a request signed by that commit fails at this one. No daemon at that commit shipped, and both are part of the B1 flag day.
-- Two logged commits at one revision (a fork): the responder serves the first by sort order. If it does not link, the requester sees no hole and asks that responder again (A5 review m-5). This keeps fork detection over catch-up, and other paths (#492, epoch-ahead) ask other members.
-- `responder_state_hash` and the request's `current_state_hash` are unsigned, and on an unverified page attacker-chosen; neither is evidence of freshness. Only A6's signed head proof is (`T-treekem-head-proof`).
+- Hole asks live in `AppState::treekem_gap_asks`: one record per room and member, reset on a new head and dropped with the room. `treekem_catchup_throttle` is no longer only ever growing: a stamp drops the entries older than an hour once the map holds 1024 (`stamp_catchup_throttle`, which all six writers of the map use since A6), and a room wipe drops every key of the room by prefix (`{room}:` or `serve:{room}:`; before, it removed only an exact key, which matched nothing).
+- Older daemons ignore `head_challenge` and the signature on a page request; they still drop requests they cannot verify. An older responder's gapped page is caught on the requesting side over a verified transport. The sign input is part of the flag day: a request signed with an earlier form fails the current one.
+- Two logged commits at one revision (a fork): the responder serves the first by sort order. If it does not link, the requester sees no hole and asks that responder again. This keeps fork detection over catch-up, and other paths (#492, epoch-ahead) ask other members.
+- `responder_state_hash` is unsigned, and on an unverified page attacker-chosen; it is not evidence of freshness. Only A6's signed head proof is (`T-treekem-head-proof`). The request's `current_state_hash` is signed by the requester, so it names the head the requester claims; it settles a re-key obligation only when it equals the sealer's live head, read together with the revision and epoch.
+- The sign input covers `current_state_hash`. A fork build refuses a page request signed without it, and an older fork build refuses one signed with it, so the fork's devices move together (part of the flag day). A stock peer ignores the signature fields.
 
 ## Validation
 
@@ -114,3 +115,9 @@ A signed targeted reply (#398) authenticates its sender, so its hash-anchored Ke
 - `a_large_catchup_throttle_drops_expired_keys_on_the_next_stamp`
 
 Unit tests: `signed_catchup::tests::the_sign_input_names_its_domain_and_every_field`, `a_page_holds_at_least_one_event_and_at_most_the_cap`, and the `catchup_page_gap` page, hole and `GapAsks` window tests.
+
+## Measured delta
+
+- **Before:** a responder dropped every page request it could not verify, and a requester dropped every page it could not verify, so a phone never pulled a missed commit over x0x. An unsigned `limit` let a replay cut a requester off.
+- **After:** a page request carries the requester's ML-DSA-65 key and a signature (domain `x0x/treekem-catchup-page/v1`) over its head, `limit` and challenge. A responder serves a signed request over an unverified transport. A requester applies an unverified page only by each event's signer, and asks another member when a page leaves a hole.
+- **Pinned by:** `unverified_signed_page_request_is_served`, `unverified_unsigned_page_request_is_not`, `a_signed_request_from_a_removed_member_is_refused`, `a_removed_member_impersonating_the_remover_installs_nothing`, `a_hole_after_the_head_asks_another_member`, `a_replayed_request_cannot_cut_the_requester_off` (all in `named_groups/tests/signed_catchup.rs`).

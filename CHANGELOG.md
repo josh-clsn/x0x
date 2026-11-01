@@ -4,20 +4,183 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+The josh-clsn fork's tail on v0.48.1. Everything below is in addition to
+upstream's v0.48.1 notes. The registry lists 212 endpoints: upstream's 203
+plus nine this fork adds (`POST /mesh/join`, `POST /mesh/quiesce`, the three
+engine-A routes, and the four TreeKEM catch-up routes).
+
 ### Added
 
+- **A build says which commit it came from.** `build.rs` records
+  `X0X_BUILD_SHA` (the build environment's value, else `git rev-parse HEAD`
+  of the crate's own checkout, `-dirty` when a tracked file differs, and
+  nothing outside a checkout of its own). It is exposed as `x0x::BUILD_SHA`,
+  `GET /health` `build_sha` (absent when none was recorded) and a second line
+  `build <sha>` from `x0xd --version --build-sha`. `x0xd --version` alone
+  still prints one line. Two builds of one version can now be told apart.
+- **`POST /direct/send` takes `single_publish`.** With it, one request is at
+  most one gossip publish: the envelope goes once to the recipient's inbox
+  topic, with no legacy-bus republish and no retry, and the call still waits
+  for the ACK and reports a timeout. The default is unchanged (up to four
+  publishes). A bus-only receiver is not reached by a single-publish send.
+- **`leaf_mode`, and runtime `POST /mesh/join` and `POST /mesh/quiesce`.** A
+  quiesced node disconnects its mesh peers and stays off the gossip mesh until
+  a join; direct messages keep working. The quiesce latch is checked by the
+  bootstrap dial phases, the one-sided link repair, the reconnect paths and
+  the gossip send gate. A metered leaf's switch beats all three relay opt-in
+  sources.
+- **Engine-A relay-bridge doors.** `POST /groups/:id/apply-metadata-event` and
+  `GET`/`POST /groups/:id/join-result/:member` let a client app bridge group
+  events and staged join results. They need the durable API token and run
+  their applies shielded from a dropped caller.
+- **`POST /groups/:id/ban/:agent_id` and `DELETE /groups/:id/members/:agent_id`
+  answer with the signed `event` they publish**, on the GSS and TreeKEM paths.
 - **A metered leaf consumes the DM-capability topics but no longer forwards
   them (`[gossip] caps_consume_only`).** A leaf still receives every
   `x0x/caps/*` advert, request and response, answers requests for itself and
-  publishes its own adverts, but sends no eager forward and no IHAVE for
-  other nodes' caps. Unset follows `leaf_mode`; an explicit `true` or `false`
+  publishes its own adverts, but sends no eager forward and no IHAVE for other
+  nodes' caps. Unset follows `leaf_mode`; an explicit `true` or `false`
   overrides it, and a Full node always forwards (an explicit `true` there is
   ignored with a warning). A value that is not a boolean is ignored with a
-  warning and the `leaf_mode` default applies. Caps forwarding was about 85% of a measured leaf's
-  upload (9.8 of 11.6 GB in 22 h). `GET /diagnostics/gossip` `relay_fanout`
-  reports `consume_only`, `consume_only_msgs` and
+  warning and the `leaf_mode` default applies. Caps forwarding was about 85% of
+  a measured leaf's upload (9.8 of 11.6 GB in 22 h). `GET /diagnostics/gossip`
+  `relay_fanout` reports `consume_only`, `consume_only_msgs` and
   `consume_only_msgs_by_topic`. See
   `docs/adr/transient/T-leaf-caps-consume-only.md`.
+- **A re-key stays owed to every survivor until the survivor proves it holds
+  it (survivor re-key).** When this daemon removes, bans or adds a member, or
+  re-keys after a leave, it records the re-key for each other active member in
+  `<data>/treekem/rekey-obligations.json` and resends until the member proves
+  its head. A survivor proves it by a catch-up answer on this daemon's live
+  head, a signed request that names this daemon's live head (revision, state
+  hash and epoch), or a message this daemon's tree opened at its live epoch. A
+  transport acknowledgement never settles, and neither does an earlier or
+  cached head. The record survives restarts and absences longer than the old
+  60 s resend schedule. At most 4 sends run at once; caps are 256 per room and
+  4096 in all. An unreadable file is renamed aside and every other active
+  member of each room this daemon administers is owed the current epoch
+  instead. See `docs/adr/transient/T-survivor-rekey-obligation.md`.
+- **A survivor that applies a re-key sends its author a signed page request
+  from its head.** It does this once per room per 5 s, and only to an active,
+  unbanned admin. A survivor that stays quiet is also asked to prove its head.
+- **`GET /groups/:id/treekem/catch-up` reports `rekey_obligations`.** The block
+  is `{owed, unproven, room_owed, room_unproven, unreadable_file_set_aside}`.
+- **New routes for asking a room's admins where its key stands.**
+  `POST /groups/:id/treekem/catch-up` opens a round and returns the signed
+  challenge request. `GET` reports the live head and its
+  `epoch_authenticator`, the admins of every state since an anchor
+  (`admins_since`, `admins_since_complete`, `admins_since_too_large`),
+  `fork_quarantined`, `run_id`, `connected_admins`, `admin_links`,
+  `suspended_since_last_get`, `presence_mark` (passed back as
+  `since_presence_mark`) and the open round. `POST .../head-proof` signs a head
+  proof and `POST .../head-proof/accept` records one. The routes are
+  `x0x group treekem-catch-up`, `treekem-state`, `treekem-head-proof` and
+  `treekem-head-proof-accept`. Every refusal carries `reason` and `retry`
+  (`later`, `new_round` or `never`).
+- **Epoch-ahead catch-up (ported from upstream #1449 and #1464).** A member
+  whose traffic shows a later epoch asks the owner and admins first, then the
+  other members, until every candidate has been asked.
+- **A member seated by a direct add or an approved join request is owed its
+  seat until it proves it holds it.** The seat rides the re-key obligations
+  (durable, 6 s to 15 min backoff, sent at once on reconnect), so a sibling
+  device asleep through the first minute is seated when it returns. A retried
+  add answers 409 as before, with `"redelivered": true`, and sends the seat
+  again. The seat's Welcome stays staged past its 24 h TTL while the seat is
+  owed. A seat the catch-up log or the staging lost is re-seated with a
+  commit, at most once a day per member, in a task that finishes even if the
+  request is dropped. See `docs/adr/transient/T-seat-obligation.md`.
+
+### Changed
+
+- **Flag day: every TreeKEM seal now names its bytes.** The `security_binding`
+  is `treekem:epoch=<n>:commit=<blake3>:extras=<blake3>`. A daemon at the
+  previous pin refuses a removal, ban or re-key removal sealed this way, and a
+  stock 0.48.1 peer refuses this fork's extended-form adds, bans and approvals,
+  so all devices of a room must move together.
+- **Flag day: the signed page request also covers `current_state_hash`.** A
+  fork build refuses an older fork build's signed page requests as unsigned. A
+  stock peer ignores the signature fields and answers a request only over a
+  verified transport.
+- **Any member can hand on any signed commit.** A removal, ban, add, approval,
+  rename, policy, role or unban change applies as its signer when it arrives
+  from another member, if its binding names its TreeKEM bytes. A legacy-bound
+  event still applies only from its author over a verified transport. A
+  join-request lifecycle event stays with its author.
+- **A TreeKEM commit must come from the committing actor's own leaf.** A commit
+  made from another member's leaf is refused, including a removed member's own
+  commit inside a legacy-bound removal.
+- **A member keeps the commits it applied across a restart.** The catch-up log
+  is on disk under `<data>/treekem/event-log/`: at most 128 events and 64 MiB
+  per room, 256 MiB in all, none over 512 KiB. A requester told the log
+  evicted what it needs is told so.
+- **A phone or resting agent can pull missed commits over x0x.** A page request
+  is signed (`x0x/treekem-catchup-page/v1`), so a responder serves one whose
+  transport is unverified. Pages it receives on an unverified transport apply
+  by their signer, never by the claimed sender.
+- **Admins prove where a room's key stands.** A responder answers a signed
+  challenge with a signed head proof (`x0x/treekem-head-proof/v1`) carrying the
+  epoch authenticator. At most 12 answers a minute per requester and room. A
+  catch-up startup wait ends only on a proof for this daemon's own current
+  challenge, never on a cached one.
+- **`POST /groups/:id/apply-metadata-event` and
+  `POST /groups/:id/join-result/:member` answer 422 with a `reason`** for an
+  event whose TreeKEM bytes its binding does not name, and for a join-request
+  lifecycle event. An event applies only as its verified signer.
+- **A TreeKEM seal route answers 409 `sealer_key_package_uncommitted`** when
+  this daemon's own seat commits no KeyPackage hash (groups made before #220).
+- **A returning member's re-key is delivered to the device.** The re-key is
+  sealed as a real removal and a fresh add, a re-joining device is kept through
+  its own removal, an abandoned re-key departure is finished, and the invite
+  pin lives past the join-poll horizon and is persisted. A re-invite retires
+  an attempt held by our own removal (#1191).
+- **A joiner's Welcome never waits on a slow receipt.** A ChunkAck is
+  published, not awaited, and a chunk received again is acked again. A
+  Welcome's control frames ride a live direct connection when one exists.
+- **A card import never outranks a signed announcement.** An imported card's
+  addresses lead an announced contact's dial list (at most 4), a loopback card
+  address is dialed first, and a card for another machine replaces the entry
+  whole. A card is a local-user pin (ADR 0115), so it can cost dial time but
+  can neither impersonate the contact nor rebind it.
+- **A raw direct send redials and resends once after a zombie teardown,** and
+  a backpressure refusal is no longer taken for a zombie.
+- **A leaf's v1 DM acknowledgement also goes on live Direct.** A node that
+  skips the legacy DM bus hedges its v1 ACK on the same Direct path v2 ACKs
+  use, so a sender whose gossip ACK frame was refused by a non-forwarding leaf
+  no longer waits 24 s for a DM that arrived. The hedge has its own bounded
+  publisher (256 queued, 32 at once, 8 s each). A Direct ACK, v1 or v2, is
+  accepted only for an (agent, machine) pair that ADR 0115 authority confirms;
+  its key is then the discovery entry's, the evidence key, or the key that
+  verified the sender's live capability advert. Any other Direct ACK is dropped
+  and counted in `direct_ack_dropped_no_key`, and the sender waits for the
+  gossip ACK. A catch-up answer now frees its slot when it hands its send off
+  (at most 32 sends waiting, 8 per requester). See
+  `docs/adr/transient/T-v1-ack-direct-hedge.md`.
+- **No catch-up ask blocks an apply or the catch-up listener.** An event ahead
+  of the head is parked and the apply returns; each ask runs in its own task,
+  once per peer and head. A truncated page's follow-up ask runs in its own task
+  too, with upstream's bounded retry. Parked events also replay when the
+  missing commit lands live. Requests are answered 4 at a time, one at a time
+  per requester, and only a requester the transport or the request's signature
+  proves, and the room's roster holds, gets a queue; unverified requests are
+  rate-limited per machine before their signature is checked.
+  `GET /diagnostics/dm` reports `v1_ack_waits`, `v1_ack_wait_ms`,
+  `v1_ack_wait_timeouts` and `v1_ack_wait_timeout_ms`. See
+  `docs/adr/transient/T-catchup-off-the-apply-path.md`.
+
+### Interop with a stock v0.48.1 peer
+
+- A stock daemon ignores `single_publish` in a request, so its sends keep
+  making up to four publishes, and a stock `/health` carries no `build_sha`.
+  A stock peer ignores the fork's added signature fields (`signed_by`,
+  `head_challenge`) and rejects none of them.
+- A stock peer refuses this fork's extended-form adds, bans and approvals, so a
+  re-seat or an add obligation does not help a stock member. Removals in
+  upstream's `:commit=` form apply.
+- A stock leaf sends no v1 Direct ACK. A stock sender's Direct ACK is accepted
+  only for a pair this daemon's authority stores confirm; otherwise its gossip
+  ACK applies.
+- The four TreeKEM catch-up routes, the three engine-A routes and the two mesh
+  routes are local daemon routes; no peer sees them.
 
 ## [v0.48.1] - 2026-10-17
 
