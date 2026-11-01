@@ -957,6 +957,7 @@ pub(in crate::server) fn survivors(
 /// disk before this returns. Returns the survivors to keep on the blind
 /// schedule: past a cap, all of them when the record cannot be written, and
 /// all of them when this daemon no longer owes anything in the room.
+#[cfg(test)]
 pub(in crate::server) async fn owe(
     state: &AppState,
     group_key: &str,
