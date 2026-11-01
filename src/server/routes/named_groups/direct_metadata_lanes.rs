@@ -75,7 +75,7 @@ use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    apply_listener_metadata_event, named_group_metadata_event_group_id,
+    apply_direct_named_group_metadata_event, named_group_metadata_event_group_id,
     named_group_metadata_event_kind, AppState, NamedGroupMetadataEvent,
 };
 use crate as x0x;
@@ -162,7 +162,7 @@ fn listener_apply(state: &Arc<AppState>) -> ApplyFn<ListenerEvent> {
     Arc::new(move |item: ListenerEvent| {
         let state = Arc::clone(&state);
         Box::pin(async move {
-            apply_listener_metadata_event(&state, item.event, item.sender, item.verified, None)
+            apply_direct_named_group_metadata_event(&state, item.event, item.sender, item.verified)
                 .await
                 .is_some()
         })

@@ -1343,7 +1343,7 @@ async fn apply_fetched_blob(
                 return Err("control blob event group mismatch");
             }
             log_validated_for_handler(named_group_event_witness_kind(&event), reference);
-            let _ = apply_named_group_metadata_event(state, event, source, true, None).await;
+            let _ = apply_direct_named_group_metadata_event(state, event, source, true).await;
         }
         ControlBlobKind::JoinResult => {
             let result: JoinResultMessage =

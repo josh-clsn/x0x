@@ -1137,6 +1137,7 @@ pub async fn serve_with_options(
         &treekem_dir,
         &named_groups,
         &hex::encode(agent.agent_id().as_bytes()),
+        &treekem_event_log,
     )
     .await;
 
