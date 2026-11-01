@@ -805,15 +805,42 @@ async fn post_result(
     body_of(response).await
 }
 
-fn member_added_for(group_id: &str, actor: &str, member_hex: &str) -> NamedGroupMetadataEvent {
+/// A join result its inviter signed, whose binding names its TreeKEM bytes
+/// and Welcome (A1), so the door's admit passes and the inviter and member
+/// checks behind it decide.
+fn member_added_for(
+    group_id: &str,
+    inviter: &x0x::identity::AgentKeypair,
+    member_hex: &str,
+) -> NamedGroupMetadataEvent {
+    let commit_bytes = b"commit";
+    let welcome = b"WELCOME";
+    let extras = super::super::add_extras_digest(
+        None,
+        None,
+        Some(&super::super::WelcomeContent::of_bytes(welcome)),
+    )
+    .expect("extras");
+    let mut info = x0x::groups::GroupInfo::new(
+        "join-result".to_string(),
+        String::new(),
+        inviter.agent_id(),
+        group_id.to_string(),
+    );
+    info.security_binding = Some(super::super::treekem_bytes_binding(
+        2,
+        commit_bytes,
+        &extras,
+    ));
+    let commit = info.seal_commit(inviter, 1).expect("seal");
     NamedGroupMetadataEvent::MemberAdded {
         group_id: group_id.to_string(),
         revision: 2,
-        actor: actor.to_string(),
+        actor: hex::encode(inviter.agent_id().as_bytes()),
         agent_id: member_hex.to_string(),
         display_name: None,
-        treekem_commit_b64: Some("commit".into()),
-        treekem_welcome_b64: Some("V0VMQ09NRQ==".into()),
+        treekem_commit_b64: Some(BASE64.encode(commit_bytes)),
+        treekem_welcome_b64: Some(BASE64.encode(welcome)),
         welcome_ref: None,
         treekem_epoch: Some(2),
         treekem_key_package_hash: None,
@@ -822,8 +849,40 @@ fn member_added_for(group_id: &str, actor: &str, member_hex: &str) -> NamedGroup
         certificate_b64: None,
         owner_mandate: None,
         roster_certificates_b64: Vec::new(),
-        commit: None,
+        commit: Some(commit),
     }
+}
+
+/// The join-result door refuses a result no signature names (422) before
+/// any other check: the caller's sender claim cannot stand in for one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engine_a_join_result_post_refuses_an_unsigned_or_legacy_bound_result() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let group_id = "7c".repeat(32);
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let inviter = x0x::identity::AgentKeypair::generate()?;
+    let inviter_hex = hex::encode(inviter.agent_id().as_bytes());
+    let mut unsigned = member_added_for(&group_id, &inviter, &local_hex);
+    if let NamedGroupMetadataEvent::MemberAdded { commit, .. } = &mut unsigned {
+        *commit = None;
+    }
+    let (status, body) = post_result(&state, &local_hex, &unsigned, &inviter_hex).await?;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let mut legacy = member_added_for(&group_id, &inviter, &local_hex);
+    if let NamedGroupMetadataEvent::MemberAdded { commit, .. } = &mut legacy {
+        let mut info = x0x::groups::GroupInfo::new(
+            "join-result".to_string(),
+            String::new(),
+            inviter.agent_id(),
+            group_id.clone(),
+        );
+        info.security_binding = Some("treekem:epoch=2".to_string());
+        *commit = Some(info.seal_commit(&inviter, 1)?);
+    }
+    let (status, body) = post_result(&state, &local_hex, &legacy, &inviter_hex).await?;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["reason"], "needs_verified_signer_and_named_tree_bytes");
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -832,7 +891,8 @@ async fn engine_a_join_result_post_checks_the_member_and_the_expected_inviter() 
     let group_id = "7d".repeat(32);
     let local = state.agent.agent_id();
     let local_hex = hex::encode(local.as_bytes());
-    let inviter_hex = "ee".repeat(32);
+    let inviter = x0x::identity::AgentKeypair::generate()?;
+    let inviter_hex = hex::encode(inviter.agent_id().as_bytes());
     let stranger_hex = "ff".repeat(32);
     state.named_groups.write().await.insert(
         group_id.clone(),
@@ -840,7 +900,7 @@ async fn engine_a_join_result_post_checks_the_member_and_the_expected_inviter() 
     );
 
     // The result must be for this node.
-    let for_other = member_added_for(&group_id, &inviter_hex, &"aa".repeat(32));
+    let for_other = member_added_for(&group_id, &inviter, &"aa".repeat(32));
     let (status, _) = post_result(&state, &"aa".repeat(32), &for_other, &inviter_hex).await?;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
@@ -852,21 +912,31 @@ async fn engine_a_join_result_post_checks_the_member_and_the_expected_inviter() 
         .write()
         .await
         .insert(group_id.clone(), Arc::new(tokio::sync::Mutex::new(tree)));
-    let for_me = member_added_for(&group_id, &inviter_hex, &local_hex);
+    let for_me = member_added_for(&group_id, &inviter, &local_hex);
     let (status, body) = post_result(&state, &local_hex, &for_me, &inviter_hex).await?;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert!(body["error"]
         .as_str()
         .is_some_and(|e| e.contains("missing_expected_inviter")));
 
-    // An armed inviter must be the sender.
+    // An armed inviter must be the result's verified signer (A3). The
+    // claimed sender counts for nothing: the inviter's own result passes
+    // the gate whoever claims to send it, and a stranger's does not.
     record_expected_join_result_inviter(
         state.as_ref(),
         join_result_key(&group_id, &local_hex),
         inviter_hex.clone(),
     );
-    let (status, body) = post_result(&state, &local_hex, &for_me, &stranger_hex).await?;
+    let stranger = x0x::identity::AgentKeypair::generate()?;
+    let from_stranger = member_added_for(&group_id, &stranger, &local_hex);
+    let (status, body) = post_result(&state, &local_hex, &from_stranger, &inviter_hex).await?;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = post_result(&state, &local_hex, &for_me, &stranger_hex).await?;
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "past the inviter gate: {body}"
+    );
     Ok(())
 }
 
@@ -880,12 +950,13 @@ async fn engine_a_join_result_post_accepts_the_unarmed_result_of_an_unconverged_
     let group_id = "7e".repeat(32);
     let local = state.agent.agent_id();
     let local_hex = hex::encode(local.as_bytes());
-    let inviter_hex = "ee".repeat(32);
+    let inviter = x0x::identity::AgentKeypair::generate()?;
+    let inviter_hex = hex::encode(inviter.agent_id().as_bytes());
     state.named_groups.write().await.insert(
         group_id.clone(),
         treekem_metadata_group_info(local, &group_id, &group_id),
     );
-    let for_me = member_added_for(&group_id, &inviter_hex, &local_hex);
+    let for_me = member_added_for(&group_id, &inviter, &local_hex);
     let (status, body) = post_result(&state, &local_hex, &for_me, &inviter_hex).await?;
     assert_eq!(
         status,
@@ -901,7 +972,8 @@ async fn engine_a_join_result_post_answers_503_when_shutdown_refuses_the_apply()
     let group_id = "7f".repeat(32);
     let local = state.agent.agent_id();
     let local_hex = hex::encode(local.as_bytes());
-    let inviter_hex = "ee".repeat(32);
+    let inviter = x0x::identity::AgentKeypair::generate()?;
+    let inviter_hex = hex::encode(inviter.agent_id().as_bytes());
     state.named_groups.write().await.insert(
         group_id.clone(),
         treekem_metadata_group_info(local, &group_id, &group_id),
@@ -911,7 +983,7 @@ async fn engine_a_join_result_post_answers_503_when_shutdown_refuses_the_apply()
         .shielded_tasks
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-    let for_me = member_added_for(&group_id, &inviter_hex, &local_hex);
+    let for_me = member_added_for(&group_id, &inviter, &local_hex);
     let (status, body) = post_result(&state, &local_hex, &for_me, &inviter_hex).await?;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     Ok(())

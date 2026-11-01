@@ -137,6 +137,7 @@ async fn a_commit_from_another_members_leaf_is_refused() -> Result<()> {
         &roster_after,
         group,
         &admin_hex(&cast),
+        None,
         &cast.attacker_commit,
         epoch,
         "test_foreign_leaf",
@@ -217,6 +218,7 @@ async fn the_door_ties_each_commit_to_its_named_actor() -> Result<()> {
         &info,
         Arc::clone(&group),
         &admin_hex(&cast),
+        None,
         &cast.attacker_commit,
         epoch,
         "test_named_actor",
@@ -230,6 +232,7 @@ async fn the_door_ties_each_commit_to_its_named_actor() -> Result<()> {
         &info,
         group,
         &b_hex,
+        None,
         &cast.attacker_commit,
         epoch,
         "test_named_actor",
@@ -368,6 +371,7 @@ async fn an_actor_without_a_committed_package_is_refused() -> Result<()> {
         &info,
         group,
         &admin,
+        None,
         &commit_bytes,
         cast.epoch_before + 1,
         "test_no_package",
@@ -496,7 +500,7 @@ async fn a_member_who_joined_by_invite_applies_the_creators_first_removal() -> R
 
 /// Strip the victim's copy of the admin's package, keeping its committed
 /// hash: the roster of a member who joined before survivor re-key A2.
-async fn victim_holds_the_admin_by_hash(cast: &CatchupRelay) {
+pub(super) async fn victim_holds_the_admin_by_hash(cast: &CatchupRelay) {
     let admin = admin_hex(cast);
     let mut groups = cast.victim_state.named_groups.write().await;
     let info = groups.get_mut(&cast.fixture.group_id).expect("group");
@@ -612,7 +616,7 @@ async fn the_mesh_sweep_asks_for_each_package_held_by_hash_alone() -> Result<()>
     let group_id = cast.fixture.group_id.clone();
     let admin = admin_hex(&cast);
     victim_holds_the_admin_by_hash(&cast).await;
-    request_hash_only_treekem_key_packages(&cast.victim_state).await;
+    spawn_hash_only_treekem_key_package_sweep(&cast.victim_state);
     let asked_for = |member: &str| {
         let prefix = format!("{group_id}:member:{member}:");
         cast.victim_state

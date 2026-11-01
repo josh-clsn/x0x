@@ -46,7 +46,7 @@ An add with a recovery record keeps its suffix after that: `...:extras=<d>;membe
 `named_groups/treekem_binding.rs` holds `parse_treekem_binding`, the builders and the checks. Every reader uses the parser:
 
 - `treekem_removal_binding_covers_commit` (the `MemberRemoved` and `MemberBanned` arms, the re-key link);
-- `catchup_may_apply_removed_as_author` (a third party's removal names its bytes);
+- `signer_delivery::catchup_apply_sender` (a copy its author did not deliver names its bytes; A3 replaced upstream's `catchup_may_apply_removed_as_author` at its one caller);
 - `treekem_add_binding_admits` (the `MemberAdded` and `JoinRequestApproved` arms);
 - the two recovery-record verifiers, which read the `member-recovery` suffix.
 
@@ -57,7 +57,8 @@ The parser accepts exactly the written forms: `treekem:epoch=<n>` (legacy), upst
 | Binding | Removal or ban | Add or approval |
 |---|---|---|
 | Names bytes (`:commit=`) | the commit digest, the epoch and the extras (absent, or the empty-tuple digest) must match | the commit digest, the epoch and the extras must match this copy's fields |
-| Legacy, names nothing | accepted, as before (only the author can deliver it: A0's rule) | accepted, as before (author-only until A3) |
+| Legacy, names nothing | accepted, as before, from its author over a verified transport only (upstream #1337's rule, A3 for every kind) | the same (A3) |
+| A `treekem:` binding that is not one of the written forms | refused | refused (A3; before, an add admitted it unless it contained `:commit=`) |
 
 The `MemberBanned` arm had no binding check and wrote the legacy binding into the state it hashed. It now checks the bytes and keeps the signed binding, so a digest-bound ban hashes. The same applies to the two fork-only returning-member receive paths: the `awaiting_rekey_by` branch of `MemberRemoved` and `apply_rekey_self_removal_link_checked`.
 
@@ -84,9 +85,9 @@ A test-only seam, `NamedGroupTestRecorders::seal_force_err`, fails the next `sea
 
 ## Consequences
 
-- Any member can now deliver a removal on catch-up and have it applied as its signer (A0's rule now covers every fork removal, ban excepted until A3).
-- A copy of an add whose name, KeyPackage hash or Welcome was changed is refused, from any sender.
-- **Mixed versions.** A stock 0.48.1 member accepts our removals (upstream's exact form). It refuses our bans (it re-derives `treekem:epoch=<n>` in its `MemberBanned` arm) and our re-key removals' link only where its arm re-derives the legacy form. Adds and approvals carry the extended form, so the pin flip is still a flag day for every Noetic device; the PINS row names which seals a stock peer refuses.
+- Any member can now deliver a removal on catch-up and have it applied as its signer. A3 extends this to every commit-bearing kind (`T-any-member-delivers-signed-commits`).
+- A copy of an add whose name, KeyPackage hash or Welcome was changed is refused, from any sender, when the add was sealed under this binding. A legacy-bound add is not checked, so since A3 it applies only from its author over a verified transport; the engine-A doors, whose sender is a claim, refuse it.
+- **Mixed versions.** A stock 0.48.1 member accepts our removals (upstream's exact form). It refuses our bans (its `MemberBanned` arm re-derives `treekem:epoch=<n>`) and our adds and approvals, so the pin flip is still a flag day for every Noetic device; the PINS row names which seals a stock peer refuses.
 - **The engine-A door** refuses (422) every TreeKEM-bearing removal, ban, add or approval whose binding does not name its bytes.
 - **Consumers that read the epoch from the binding** must take it from the first `:`-separated field. The fetchit live tests `m6_groups_offline_live.rs` and `m6_devices_live.rs` parse `treekem:epoch=` up to `;` and must change with the pin flip.
 - A fresh-add seal that fails on a pending certificate now adds to the tree and rolls it back on each retry, where before it refused before the tree moved.

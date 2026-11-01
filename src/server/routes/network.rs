@@ -230,7 +230,7 @@ where
 
 async fn post_join_hooks(state: &Arc<AppState>) {
     // Survivor re-key A2: KeyPackages held by hash alone can be requested now.
-    super::named_groups::request_hash_only_treekem_key_packages(state).await;
+    super::named_groups::spawn_hash_only_treekem_key_package_sweep(state);
     super::named_groups::retry_startup_self_leave_catchup(state).await;
     if state.agent.mesh_quiesced() {
         return;

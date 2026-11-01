@@ -320,6 +320,7 @@ async fn apply_seal(fixture: &SealFixture) -> anyhow::Result<()> {
         &fixture.next,
         group,
         &fixture.authority_hex,
+        None,
         &fixture.commit,
         fixture.expected_epoch,
         "issue1187_seal",
