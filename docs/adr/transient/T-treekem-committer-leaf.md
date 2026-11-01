@@ -2,9 +2,8 @@
 
 - **Status:** Proposed (fork tail, survivor re-key Task A2).
 - **Date:** 2026-10-24
-- **Base:** upstream v0.48.1 after A1; ported from `survivor-rekey` 0ad6888f + 6646bd1c
 - **Builds on:** `T-treekem-bytes-binding-everywhere` (A1)
-- **Drop at:** when upstream ties a TreeKEM commit's committer leaf to the event's actor, or offer it upstream (D5)
+- **Drop at:** when upstream ties a TreeKEM commit's committer leaf to the event's actor
 
 ## Context
 
@@ -82,7 +81,7 @@ So every TreeKEM seal site refuses first when the local seat commits no package 
 
 ## Consequences
 
-- No wire change and no flag day of its own. Old daemons produce commits from their own leaf, which pass.
+- No wire change. Old daemons produce commits from their own leaf, which pass.
 - A legacy-bound TreeKEM event that carries another leaf's commit is refused at every door, including the two engine-A doors that take a claimed sender. This closes the attack of a removed member's own commit. It did not close every legacy pairing: a legacy-bound removal could still carry a different genuine commit from the same actor at the same epoch (one rolled back after publishing, or a fork). Since A3 the door also checks that a removal's or ban's commit leaves its target with no leaf, whenever this member holds the target's package (`departing_leaf_not_blank`).
 - The tests are in `named_groups/tests/committer_leaf.rs`, `named_groups/committer_leaf.rs`, `named_groups/welcome_key_packages.rs` and `src/mls/treekem.rs`.
 

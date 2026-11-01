@@ -2,7 +2,6 @@
 
 - **Status:** Proposed (fork tail, survivor re-key A13).
 - **Date:** 2026-10-25
-- **Base:** `survivor-rekey` at `ecbd071a`
 - **Upstream:** none. It extends the fork's re-key obligations (`T-survivor-rekey-obligation.md`), which upstream does not have.
 - **Drop at:** with the re-key obligations.
 
@@ -20,10 +19,10 @@ A sibling that slept through those sends was never seated and lost every message
 
 - **Owed like a survivor.** Both sites now call `owe_survivors` with nothing excluded, so the seated member is owed the event that seats it in the same durable store as A9. It is the same file (`rekey-obligations.json`), the same record, the same worker and the same backoff: 6, 15, 30 and 60 s, then doubling to 15 min, and sent at once on a connect edge.
   - It needs no new kind. The obligation sends every commit-bearing event the A4 log holds from the owed revision, and for the seated member the first of those is its own seat.
-- **Settled only by the member's own proof**, by the A10 rules:
-  - a transport-verified or self-signed request from the member at or past the seat's epoch;
-  - a challenge;
-  - a message it sealed at that epoch;
+- **Settled only by the member's own proof**, by the rules of `T-survivor-rekey-obligation` ("What settles an obligation"):
+  - a page request from the member, over a verified transport or signed over its head, that names this daemon's live revision, state hash and epoch (a challenge is a signed page request and settles the same way; an epoch at or past the seat's, on its own, settles nothing);
+  - a catch-up answer from the member on this daemon's live head;
+  - a message from the member's leaf that this daemon's tree opened at its live epoch;
   - or the member leaving the roster.
 
   A member that has not joined holds no tree at the seat's epoch, so it cannot prove it. When the author delivers the seat directly, the member's `prove_held` answers with a signed request from its new head, which settles.
@@ -35,7 +34,7 @@ A sibling that slept through those sends was never seated and lost every message
   - The pins are written in the join-result staging file, so a restart keeps them.
   - The worker's step drops a pin once no unproven seat names that member in that room: the seat settled, or the member left, or the room was wiped.
   - The Welcome joins at the seat's epoch however old it is. The joiner's KeyPackage secret is re-derived from its seed, and TreeKEM does not enforce KeyPackage lifetimes.
-  - A proof at or past the seat's epoch clears the seat mark.
+  - A settling proof clears the seat mark.
 - **An unproven seat goes alone.** While the seat is unproven, a send carries the seat event only. A member that holds it asks for the rest itself, and one that never returns costs one event per send.
 - **Re-seat with a commit, the fallback.** When the catch-up log no longer holds the seat, or its Welcome is no longer staged, the seat cannot be sent as it was. The worker (or a 409 retry) re-seats the member instead (`seat_reseat`):
   - it removes the stale leaf with the member's KeyPackage from the roster (derived from its seed, so it is the same one);
@@ -46,7 +45,7 @@ A sibling that slept through those sends was never seated and lost every message
   - at most once per member and room a day (`RESEAT_EVERY`), and only by an admin of the room. The re-seat times are written in the join-result staging file, so a restart, or a crash loop, does not re-key the room again;
   - an add that fails after the removal is tried once more. If it fails again, the day's allowance is given back, `reseat_failures` is counted, and an error is logged. The member stays removed until it asks to be admitted again; a plain add then works;
   - only an add or approval naming the recipient counts as its seat; any other first event means the log lost it;
-  - `GET .../treekem/catch-up` reports `seats`, `room_seats` and `reseats`.
+  - `GET .../treekem/catch-up` reports `seats`, `room_seats`, `reseats` and `reseat_failures` in its `rekey_obligations` block.
   - A Welcome cannot be minted at the current epoch without a commit: commits since the seat set path secrets on the member's leaf path that only a commit can hand on.
 - **`due_now` keeps the edge floor.** A burst of 409 retries does not resend the seat each time. The next send is no sooner than 60 s after the last one.
 - **Blind schedule only when refused.** A seated member the obligations refused (past a cap, or a record that could not be written) keeps A12's direct sends at 6 to 60 s, with no republish. A refused survivor keeps the republishing schedule.
@@ -57,7 +56,7 @@ A sibling that slept through those sends was never seated and lost every message
   - x0x applies a self-seat only as the next link on the member's local base;
   - the fallback fires exactly when that member cannot get there: its old seat was evicted from the log, or names a Welcome it cannot fetch.
 
-  The pin is the path that actually lands a member. Landing a member from a re-seat needs a member-side **seat re-base** (not built): the author sends a signed roster snapshot of the seat's pre-state with an unproven seat, and the member checks it against the seat's `prev_state_hash` and owner continuity, installs it as its base, applies the seat, and runs a head round. It is to be built with the engine's sibling requester (Noetic's M6.5a, not wired yet: `devices_sync_apply.rs` defers the direct-add). It does not gate the version flip, since no Noetic path issues a direct-add seat yet, but the sibling-admission lane must not ship without it.
+  The pin is the path that actually lands a member. Landing a member from a re-seat needs a member-side **seat re-base** (not built): the author sends a signed roster snapshot of the seat's pre-state with an unproven seat, and the member checks it against the seat's `prev_state_hash` and owner continuity, installs it as its base, applies the seat, and runs a head round. It is to be built with the engine's sibling requester (Noetic's M6.5a, not wired yet: `devices_sync_apply.rs` defers the direct-add). It does not gate the version flip, since no Noetic path issues a direct-add seat yet, but sibling admission must not ship without it.
 - **Pinned Welcomes are exempt from the staging cap** (256 entries, applied at load). The seat obligations' caps bound the pins. Staging has no cap at run time.
 
 - A sibling that sleeps for hours is seated when it returns. The worker sends its seat at the 15 min cap, and at once when its link comes back. No new invite is needed.

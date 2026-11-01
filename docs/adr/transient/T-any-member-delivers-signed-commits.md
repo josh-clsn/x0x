@@ -2,9 +2,8 @@
 
 - **Status:** Proposed (fork tail, survivor re-key Task A3).
 - **Date:** 2026-10-24
-- **Base:** upstream v0.48.1 after A2; ported from `survivor-rekey` 9829edcb
 - **Builds on:** upstream's `T-self-leave-catchup-author` and `T-self-leave-relay-commit-binding` (#1337), `T-treekem-bytes-binding-everywhere` (A1), `T-treekem-committer-leaf` (A2)
-- **Drop at:** when upstream applies every commit-bearing event as its verified signer from any member, or offer it upstream (D5)
+- **Drop at:** when upstream applies every commit-bearing event as its verified signer from any member
 
 ## Context
 
@@ -50,7 +49,7 @@ So `admit` is upstream's rule for removals, refuses the two cases upstream hands
 
 ### The engine-A doors
 
-Both doors decide through `signer_delivery::door_admit`, the one admit path. It is `admit` with `verified = false`, plus the reason each refusal answers 422 with (the batch 2 `engine_a_doors.rs` rules, folded in): a recovery-courier `MemberJoined`, a secure share, a group card or an unsigned event needs a verified sender; a join-request lifecycle event stays with its author; an actor that is not its commit's signer authorises nothing; and TreeKEM bytes, in a removal, ban, add or approval, must be named by the binding.
+Both doors decide through `signer_delivery::door_admit`, the one admit path. It is `admit` with `verified = false`, plus the reason each refusal answers 422 with (the `engine_a_doors.rs` rules): a recovery-courier `MemberJoined`, a secure share, a group card or an unsigned event needs a verified sender; a join-request lifecycle event stays with its author; an actor that is not its commit's signer authorises nothing; and TreeKEM bytes, in a removal, ban, add or approval, must be named by the binding.
 
 
 - **`apply-metadata-event`.** The self-signed original `MemberJoined` is still checked against the claimed sender by the joiner's own signature. Every other admitted event goes through `admit` with `verified = false`: it applies as its signer, under the non-author rules. A legacy-bound TreeKEM event and every join-request lifecycle event get 422 (`needs_verified_signer_and_named_tree_bytes`, `author_only_event_needs_verified_sender`).
@@ -97,12 +96,12 @@ The signed roster commit covers its group id and revision, the previous state ha
 | `GroupDeleted` | `actor`, `revision` | Signer (already required by its arm); capped. |
 | every kind | `group_id` | Resolves the local group. The commit's group id is checked against the group's stable id. |
 
-**The roster revision (A1 report concern 7) is capped, not bound.** It is an unauthenticated counter, separate from the signed state revision. Every apply path adopts it only through `adopt_roster_revision`, which keeps it in `[current, current + 1]`, and it is never an admission input: the signed chain (exact revision + 1 and previous-hash link) is. So the most a deliverer can do is hold one receiver's counter back by one step. Binding it is not possible for the kinds that carry no TreeKEM bytes, which have no binding slot, and would add a wire change that buys nothing.
+**The roster revision is capped, not bound.** It is an unauthenticated counter, separate from the signed state revision. Every apply path adopts it only through `adopt_roster_revision`, which keeps it in `[current, current + 1]`, and it is never an admission input: the signed chain (exact revision + 1 and previous-hash link) is. So the most a deliverer can do is hold one receiver's counter back by one step. Binding it is not possible for the kinds that carry no TreeKEM bytes, which have no binding slot, and would add a wire change that buys nothing.
 
 ## Consequences
 
 - A member who was away gets a removal, ban, add, rename, policy, role or unban change from any member that holds it. A4 (`T-catchup-log-on-disk`) keeps every commit-bearing kind in the catch-up log, on disk, so a member can serve the non-TreeKEM ones too.
-- The engine-A doors no longer apply a legacy-bound TreeKEM event or a join-request lifecycle event. A device on the old pin that relays its legacy events through the relay log is stranded by them; this joins the A1 flag day (every device moves at the pin flip, B1).
+- The engine-A doors no longer apply a legacy-bound TreeKEM event or a join-request lifecycle event. A device on the old pin that relays its legacy events through the relay log is stranded by them; every device of a room must move to the same build.
 - On the engine-A doors, a shared-secret-plane add applies without its display name and KeyPackage hash. TreeKEM groups, which are what Noetic uses, are unaffected.
 - Upstream's author shortcut (`transport_sender == author`) is kept, but only for a verified transport (`signer_delivery.rs`, `catchup_apply_sender`). On it, the author still delivers its own legacy-bound events. A claimed sender gets nothing from it.
 

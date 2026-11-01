@@ -64,7 +64,8 @@ engine-A routes, and the four TreeKEM catch-up routes).
   from its head.** It does this once per room per 5 s, and only to an active,
   unbanned admin. A survivor that stays quiet is also asked to prove its head.
 - **`GET /groups/:id/treekem/catch-up` reports `rekey_obligations`.** The block
-  is `{owed, unproven, room_owed, room_unproven, unreadable_file_set_aside}`.
+  is `{owed, unproven, room_owed, room_unproven, unreadable_file_set_aside, seats,
+  room_seats, reseats, reseat_failures}`.
 - **New routes for asking a room's admins where its key stands.**
   `POST /groups/:id/treekem/catch-up` opens a round and returns the signed
   challenge request. `GET` reports the live head and its
@@ -92,13 +93,14 @@ engine-A routes, and the four TreeKEM catch-up routes).
 
 ### Changed
 
-- **Flag day: every TreeKEM seal now names its bytes.** The `security_binding`
+- **Every TreeKEM seal now names its bytes.** The `security_binding`
   is `treekem:epoch=<n>:commit=<blake3>:extras=<blake3>`. A daemon at the
   previous pin refuses a removal, ban or re-key removal sealed this way, and a
   stock 0.48.1 peer refuses this fork's extended-form adds, bans and approvals,
   so all devices of a room must move together.
-- **Flag day: the signed page request also covers `current_state_hash`.** A
-  fork build refuses an older fork build's signed page requests as unsigned. A
+- **The signed page request also covers `current_state_hash`.** A
+  build with this field refuses signed page requests made without it, and
+  the reverse, so the fork's devices must move together. A
   stock peer ignores the signature fields and answers a request only over a
   verified transport.
 - **Any member can hand on any signed commit.** A removal, ban, add, approval,
@@ -176,9 +178,18 @@ engine-A routes, and the four TreeKEM catch-up routes).
 - A stock peer refuses this fork's extended-form adds, bans and approvals, so a
   re-seat or an add obligation does not help a stock member. Removals in
   upstream's `:commit=` form apply.
-- A stock leaf sends no v1 Direct ACK. A stock sender's Direct ACK is accepted
-  only for a pair this daemon's authority stores confirm; otherwise its gossip
-  ACK applies.
+- The catch-up request gains `signed_by` and `head_challenge`, and the catch-up
+  response gains `log_evicted_through`, `target_member_id`, `signed_by` and
+  `head_proof`. A stock peer ignores all of them. Without the signed hole
+  report a stock requester never moves on to another member.
+- `POST /groups/:id/members` answers 409 for a member already present as
+  before, now with `"redelivered": true`, and sends the seat again. A stock
+  client ignores the extra field.
+- A stock sender takes a fork leaf's v1 Direct ACK, since its Direct receive
+  path accepts any ACK whatever its version when it holds the leaf's announced
+  key. A stock leaf sends no v1 Direct ACK. A stock recipient's Direct ACK (v2)
+  is accepted by this fork only for a pair its authority stores confirm;
+  otherwise its gossip ACK applies.
 - The four TreeKEM catch-up routes, the three engine-A routes and the two mesh
   routes are local daemon routes; no peer sees them.
 

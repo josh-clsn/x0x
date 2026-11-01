@@ -1987,6 +1987,10 @@ catch-up GET reports:
 | `unproven` | of those, the ones delivered but not yet proven (`delivered_unproven`) |
 | `room_owed`, `room_unproven` | the same counts for this room |
 | `unreadable_file_set_aside` | `null`, or the name `rekey-obligations.json.unreadable-<ms>` the unreadable file was renamed to at startup. If it could not be renamed the value is `rekey-obligations.json (not set aside: <error>)` and obligations are kept in memory only |
+| `seats` | of the obligations, the seats owed to a member a direct add or an approval seated and not yet proven (`T-seat-obligation.md`) |
+| `room_seats` | the same count for this room |
+| `reseats` | seats this daemon has re-sealed with a commit since it started |
+| `reseat_failures` | re-seats whose add failed after the removal, since it started |
 
 When the file is unreadable, the daemon still starts and owes the current epoch
 to every other active member of each live TreeKEM room it administers. Caps: 256

@@ -45,6 +45,8 @@ unrecorded gap (zero across all surfaces below).
 | **Communitas Swift client** | **36 / 36** named-groups (every Rust method has a Swift counterpart) | `swift_parity.rs` — `parity_map_covers_all_rust_methods` walks `client.rs` for every public method and `swift_client_has_all_rust_methods` greps the Swift source for each one. | `swift test` — 42/42 pass. |
 | **Communitas SwiftUI** | preset picker, discover sheet, manage sheet (policy + state + roster + requests) | `swift build` clean | XCUITest queued for Phase 7. |
 
+The REST and CLI rows are upstream's count at signoff (38 named-groups routes). The GUI row is generated from the registry (48), which already differed from them upstream (41 against 38) and now also counts the seven survivor re-key and engine-A routes this fork adds.
+
 ## Embedded GUI — explicit DEFERRED list (23 endpoints)
 
 The GUI parity test enumerates every named-groups endpoint and checks

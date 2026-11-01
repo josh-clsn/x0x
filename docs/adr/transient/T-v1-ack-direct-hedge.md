@@ -2,7 +2,6 @@
 
 - **Status:** Proposed (fork tail, survivor re-key A14).
 - **Date:** 2026-10-25
-- **Base:** `survivor-rekey` at `dcfc0798`
 - **Upstream:** checked at `saorsa-labs/main` `d3b39f18` (2026-10-22). It keeps v1 acknowledgements exactly as they were: the targeted inbox publish, plus the compatibility bus only when the payload came over it (`dm_inbox.rs` "Preserve v1 exactly"). Only v2 (durable) acknowledgements get the C5 Direct hedge (`LiveDirectAckHedge`, #408). This change reuses that hedge as it is.
 - **Drop at:** when upstream hedges v1 acknowledgements, or its leaves stop skipping the only other route.
 

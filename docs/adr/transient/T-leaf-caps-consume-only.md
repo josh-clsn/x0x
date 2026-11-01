@@ -2,7 +2,6 @@
 
 - **Status:** Proposed (fork tail, leaf-quiet lane, caps part).
 - **Date:** 2026-10-25
-- **Base:** `survivor-rekey` at `c71d222e`; saorsa-gossip-pubsub `0.5.87`
 - **Upstream:** x0x#504 (Leaf egress tracker), E-D6 step 2 "S3: consume-only Leaves"; risk x0x#1455
 - **Drop at:** when upstream ships S1 (unicast caps) or S3 (consume-only Leaves), whichever lands first. Consume theirs and delete this arm. Nothing is on the wire, so no migration is needed.
 
@@ -47,4 +46,4 @@ The leaf cannot simply stop subscribing. Caps is the only way a strict (`require
 
 An A/B on the one-claude agent, 1 h per leg, `caps_consume_only = false` then the default. Expected with consume-only: upload and `participation.epidemic_forward_bytes` down at least 80%, caps eager and IHAVE rows at own-origin only, `egress_budget.leaf_egress.queue_overflow` about 0, CPU under 5% of a core, and `relay_fanout.consume_only_msgs` growing at about the caps inbound rate.
 
-The A/B must also read `pubsub_stages.outbound_by_kind.anti_entropy` on both legs. That is the residual this change leaves: cached caps ids still go out in the 30 s digests, and cached messages are still served to a digest sender that lacks them. The review estimates the digests at about 64 KB per hot topic per 30 s at worst (sg's cache is 60 s and 2048 entries at most), about 170 MB/day, against about 10 GB/day before. Nobody has measured it yet.
+The A/B must also read `pubsub_stages.outbound_by_kind.anti_entropy` on both legs. That is the residual this change leaves: cached caps ids still go out in the 30 s digests, and cached messages are still served to a digest sender that lacks them. The digests are estimated at about 64 KB per hot topic per 30 s at worst (sg's cache is 60 s and 2048 entries at most), about 170 MB/day, against about 10 GB/day before. Nobody has measured it yet.

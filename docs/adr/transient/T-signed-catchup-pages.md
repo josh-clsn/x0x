@@ -2,9 +2,8 @@
 
 - **Status:** Proposed (fork tail, survivor re-key Task A5).
 - **Date:** 2026-10-24
-- **Base:** upstream v0.48.1 (+ cherry-picked 40e0f5d4, 522911ff) after A4; ported from `survivor-rekey` 6792610a + 0234c3c7
 - **Builds on:** `T-any-member-delivers-signed-commits` (A3), `T-treekem-bytes-binding-everywhere` (A1), `T-treekem-committer-leaf` (A2), `T-catchup-log-on-disk` (A4)
-- **Drop at:** when upstream serves and applies catch-up for members whose transport is not verified, or offer it upstream (D5)
+- **Drop at:** when upstream serves and applies catch-up for members whose transport is not verified
 
 ## Context
 
@@ -16,7 +15,7 @@ Before this change:
 
 So a phone never pulled a missed commit over x0x, and a commit its key package could not yet check healed only through the sealer's resend or later gossip. The condition for fixing it is that, on an unverified transport, nothing may act on the claimed sender.
 
-A4's review left one more item for this task. A responder served the events after the requester's revision, sorted, one a page, whether or not the first one followed the requester's head. It also served events at or below the requester's revision whose TreeKEM epoch was ahead. Such a page could not be used, and nothing made the requester ask anyone else.
+A responder served the events after the requester's revision, sorted, one a page, whether or not the first one followed the requester's head. It also served events at or below the requester's revision whose TreeKEM epoch was ahead. Such a page could not be used, and nothing made the requester ask anyone else.
 
 ## Decision
 
@@ -87,10 +86,10 @@ A signed targeted reply (#398) authenticates its sender, so its hash-anchored Ke
 - A stranger can send a member pages. Each costs one signature check per event, at most one event a page, plus a signature check on a hole report. Nothing it sends applies unless an admin signed it and it links to the member's head. A forged page makes the member send nothing: its hole report does not count, and it asks for a next page only after the page moved the head.
 - A member's hole report, true or false, makes the requester ask each other active member at most once per window per head. "Active" is the requester's own roster, so it can include a member removed by a commit the requester has not applied yet (the test fixture's S1 asks R). That member learns only a head it once held, and is refused by every member that applied its removal.
 - Hole asks live in `AppState::treekem_gap_asks`: one record per room and member, reset on a new head and dropped with the room. `treekem_catchup_throttle` is no longer only ever growing: a stamp drops the entries older than an hour once the map holds 1024 (`stamp_catchup_throttle`, which all six writers of the map use since A6), and a room wipe drops every key of the room by prefix (`{room}:` or `serve:{room}:`; before, it removed only an exact key, which matched nothing).
-- Older daemons ignore `head_challenge` and the signature on a page request; they still drop requests they cannot verify. An older responder's gapped page is caught on the requesting side over a verified transport. The sign input is part of the flag day: a request signed with an earlier form fails the current one.
+- Older daemons ignore `head_challenge` and the signature on a page request; they still drop requests they cannot verify. An older responder's gapped page is caught on the requesting side over a verified transport. A request signed with an earlier form of the sign input fails the current one.
 - Two logged commits at one revision (a fork): the responder serves the first by sort order. If it does not link, the requester sees no hole and asks that responder again. This keeps fork detection over catch-up, and other paths (#492, epoch-ahead) ask other members.
 - `responder_state_hash` is unsigned, and on an unverified page attacker-chosen; it is not evidence of freshness. Only A6's signed head proof is (`T-treekem-head-proof`). The request's `current_state_hash` is signed by the requester, so it names the head the requester claims; it settles a re-key obligation only when it equals the sealer's live head, read together with the revision and epoch.
-- The sign input covers `current_state_hash`. A fork build refuses a page request signed without it, and an older fork build refuses one signed with it, so the fork's devices move together (part of the flag day). A stock peer ignores the signature fields.
+- The sign input covers `current_state_hash`. A fork build refuses a page request signed without it, and an older fork build refuses one signed with it, so the fork's devices must move together. A stock peer ignores the signature fields.
 
 ## Validation
 

@@ -2,7 +2,6 @@
 
 - **Status:** Proposed (fork tail, survivor re-key Task A4).
 - **Date:** 2026-10-24
-- **Base:** upstream v0.48.1 after A3; ported from `survivor-rekey` 79fd1913 + c81a25db + e6cf2618
 - **Builds on:** `T-any-member-delivers-signed-commits` (A3)
 - **Drop at:** when upstream's S5 (fetch-by-hash of exact evidence from any holder, ADR 0088/0111) lands: move catch-up to it and drop this log. Upstream will not keep a catch-up log on disk (D54), so this record is a stopgap, not an upstream candidate as it stands (see "Relation to upstream").
 
@@ -77,7 +76,7 @@ Upstream rejects "a persisted authority catch-up log" (ruling D54; ADR 0088 §2 
 
 This log is not an authority log: every member keeps one and serves from it, and A3 makes any member's copy apply as its verified signer. So it serves L1 rather than breaking it. It is still a second persisted store beside S5's, and ADR 0111's Context (point 1, "in memory only") no longer describes the fork. When S5 lands upstream, the fork should move to it and drop this record.
 
-For the D5 offer, present it as a stopgap for L1 until S5, not as the design. An upstream slice would still need, per ADR 0088's slice rules:
+As an upstream proposal it would be a stopgap for L1 until S5, not the design. An upstream slice would still need, per ADR 0088's slice rules:
 
 - **a W3-H reproduction first** (D16, D54; `0088:123`). Step 1 here is an in-process test only;
 - **a versioned on-disk format** (ADR 0085, `0088:125`). Today a file a newer daemon wrote with an unknown event variant does not parse on an older one, which removes it, so a downgrade empties the log. A `event-log/v1/` directory would fix both;

@@ -4,7 +4,7 @@
 - **Date:** 2026-10-23
 - **Base:** upstream v0.48.1 (#1337's `treekem_commit_binding` and relayed-removal rule; `T-self-leave-relay-commit-binding`)
 - **Ported from:** `survivor-rekey` 12d29551 (crossing to v0.48.1)
-- **Drop at:** when upstream seals every TreeKEM-bearing event under a binding that names its bytes and its unsigned fields, or offer it upstream (D5)
+- **Drop at:** when upstream seals every TreeKEM-bearing event under a binding that names its bytes and its unsigned fields
 
 ## Context
 
@@ -62,7 +62,7 @@ The parser accepts exactly the written forms: `treekem:epoch=<n>` (legacy), upst
 
 The `MemberBanned` arm had no binding check and wrote the legacy binding into the state it hashed. It now checks the bytes and keeps the signed binding, so a digest-bound ban hashes. The same applies to the two fork-only returning-member receive paths: the `awaiting_rekey_by` branch of `MemberRemoved` and `apply_rekey_self_removal_link_checked`.
 
-### Seal order (N-I6)
+### Seal order
 
 At every site: take a rollback snapshot, mutate the tree, set the binding from the commit bytes, then seal. Every failure after the mutation (the mutation itself, the epoch check, the seal, the recovery attestation, the persist) calls `rollback_treekem_group_after_failed_install` on the live guard. This is upstream's order (`d3b39f18` :25420-25462).
 
@@ -87,7 +87,7 @@ A test-only seam, `NamedGroupTestRecorders::seal_force_err`, fails the next `sea
 
 - Any member can now deliver a removal on catch-up and have it applied as its signer. A3 extends this to every commit-bearing kind (`T-any-member-delivers-signed-commits`).
 - A copy of an add whose name, KeyPackage hash or Welcome was changed is refused, from any sender, when the add was sealed under this binding. A legacy-bound add is not checked, so since A3 it applies only from its author over a verified transport; the engine-A doors, whose sender is a claim, refuse it.
-- **Mixed versions.** A stock 0.48.1 member accepts our removals (upstream's exact form). It refuses our bans (its `MemberBanned` arm re-derives `treekem:epoch=<n>`) and our adds and approvals, so the pin flip is still a flag day for every Noetic device; the PINS row names which seals a stock peer refuses.
+- **Mixed versions.** A stock 0.48.1 member accepts our removals (upstream's exact form). It refuses our bans (its `MemberBanned` arm re-derives `treekem:epoch=<n>`) and our adds and approvals, so every device of a room must move to the same build; the PINS row names which seals a stock peer refuses.
 - **The engine-A door** refuses (422) every TreeKEM-bearing removal, ban, add or approval whose binding does not name its bytes.
 - **Consumers that read the epoch from the binding** must take it from the first `:`-separated field. The fetchit live tests `m6_groups_offline_live.rs` and `m6_devices_live.rs` parse `treekem:epoch=` up to `;` and must change with the pin flip.
 - A fresh-add seal that fails on a pending certificate now adds to the tree and rolls it back on each retry, where before it refused before the tree moved.

@@ -2,12 +2,11 @@
 
 - **Status:** Proposed (fork tail, survivor re-key Task A6).
 - **Date:** 2026-10-24
-- **Base:** upstream v0.48.1 after A5; ported from `survivor-rekey` 6aaf0650 + 5859db68 + 8a3e0592
 - **Builds on:** `T-signed-catchup-pages` (A5: signed page requests carrying `head_challenge`), `T-catchup-log-on-disk` (A4), upstream #1427's epoch-ahead catch-up (cherry-picked 40e0f5d4)
 - **Consumed by:** A7 (the trigger, GET, sign and accept routes), C3 (the anchored closure and the verdict), C4 (the confirm round)
-- **Drop at:** when upstream ships signed head evidence for TreeKEM rooms, or offer it upstream (D5)
+- **Drop at:** when upstream ships signed head evidence for TreeKEM rooms
 
-## Ruling: #1406's startup wait
+## #1406's startup wait
 
 Upstream #1406 ends a designated admin's startup wait (`T-self-leave-catchup-before-seal`) when a verified page's unsigned `responder_state_hash` equals the local saved head. Here:
 
@@ -20,7 +19,7 @@ Tests: `an_admins_startup_head_counts_only_through_its_signed_proof` (admin bran
 
 A member that was away when an admin was removed may still hold the old room key and not know it. Before it seals a room message, the engine must learn, from every admin in its anchored set, that its key is the room's current key (design 3.1, 3.2). Nothing on the catch-up wire said so:
 - `responder_state_hash` (#1337) and a request's `current_state_hash` are unsigned, and on an unverified page attacker-chosen. Neither is evidence of freshness, and nothing here reads them as such.
-- The roster's `security_binding` names an epoch, not a key, so two trees at one epoch share it (plan review N-C2).
+- The roster's `security_binding` names an epoch, not a key, so two trees at one epoch share it.
 
 ## Decision
 
@@ -69,10 +68,10 @@ A challenge (`head_proof::challenge_nonce`) is the requester's counter as 16 low
    - a lower counter, or another challenge with the latest counter, is refused (`StaleChallenge`) and **not charged**;
    - the latest challenge again gets the same proof from cache, **not charged** and not signed again, **at most once per 5 s** (`TREEKEM_CATCHUP_THROTTLE`) per (room, requester); a repeat inside that window is dropped (`RepeatTooSoon`), so a replay of it cannot turn this daemon into a reflector at the requester. A latest challenge that got no proof is refused;
    - **a higher counter always becomes the latest**, so every older challenge is refused from then on; it is charged, and answered, only within 12 per 60 s, a sliding window (`Limited` is not charged).
-   So a replay of any challenge at or below the latest, by anyone who holds one (a removed admin, the relay), spends nothing. When this daemon's floor for a requester is below challenges a replayer holds, because it forgot (a restart, or the room wiped) or because it was away while the requester ran rounds, the replayer can spend at most the current window: the first of the requester's own newer challenges to arrive, even a limited one, fences off every challenge the replayer holds, and the requester's next challenge after the window is answered. The delay is at most one window plus one round. One ML-DSA-65 signature costs about 1 ms. A charged challenge that then gets no proof is logged at debug, so the rig can tell a stale replay from a lost answer (m-r3).
+   So a replay of any challenge at or below the latest, by anyone who holds one (a removed admin, the relay), spends nothing. When this daemon's floor for a requester is below challenges a replayer holds, because it forgot (a restart, or the room wiped) or because it was away while the requester ran rounds, the replayer can spend at most the current window: the first of the requester's own newer challenges to arrive, even a limited one, fences off every challenge the replayer holds, and the requester's next challenge after the window is answered. The delay is at most one window plus one round. One ML-DSA-65 signature costs about 1 ms. A charged challenge that then gets no proof is logged at debug, so the rig can tell a stale replay from a lost answer.
 4. **The tree is looked up and read on every attempt**, and the epoch and authenticator come from one borrow of it under its lock (a Welcome or re-join can replace it).
 5. The roster is read before and after the tree (`RosterHead::settled`): the revision, the hash, this daemon's admin role and **the requester's active state** must all be unchanged, else the read is repeated (at most three times). A requester removed while the tree is read is refused at the next read, so a member removed by the commit that moved the tree never gets the new epoch's authenticator from this daemon.
-6. **When the requester's signed epoch is ahead, this daemon starts its own epoch-ahead catch-up** (#1427's task), whether or not it is an admin: a member promoted while this daemon was away is challenged as an admin before it knows it is one. It starts only once a read has settled; if all three attempts see the roster move, nothing starts, and the requester's next challenge starts it (m-r4).
+6. **When the requester's signed epoch is ahead, this daemon starts its own epoch-ahead catch-up** (#1427's task), whether or not it is an admin: a member promoted while this daemon was away is challenged as an admin before it knows it is one. It starts only once a read has settled; if all three attempts see the roster move, nothing starts, and the requester's next challenge starts it.
 7. This daemon must be an active admin on its own roster (`NotAnAdmin`; A7 maps it to 409).
 
 **On the page path** (`handle_treekem_catchup_request`): a page request with `head_challenge` (A5: signed, bounded at 128 bytes) is answered after every membership gate and **before the #378 page throttle**. When the page is throttled, the proof goes alone in a response with no events (`proof_only_response`). Otherwise it rides in the page's new `head_proof` field, or goes alone first when page and proof would not fit one direct message. Member-keyed requests (#205) return before this point and get no proof: their signature does not cover a challenge.
@@ -88,7 +87,7 @@ A challenge (`head_proof::challenge_nonce`) is the requester's counter as 16 low
 - this member challenged the signer in this round;
 - the proof verifies.
 
-The claimed sender of the response plays no part. **Every distinct head (epoch, authenticator) a signer signs in a round is kept**, a duplicate once, at most four (a later epoch replaces the lowest when full), and a signer with more than one is reported as `conflicted`. A signer can show two heads in one round only by signing again after it forgot the challenge, or by equivocating, and the arrival order is not ordered: keeping every head lets C3 apply "a conflict always wins" whatever the order. **For C3: a conflicted signer counts as Behind and never as a match** (rule 1 applies to every kept head, and a conflicted signer never satisfies rule 3, even when its heads share the highest epoch). C3 must not reduce `RoundView::heads` to one head per signer. A head is kept as its claim once its proof verified, not the 7 KB signature (m-r2): the worst case is 512 signers × 4 heads × a claim naming at most 512 admins. A response that carried only a proof stops there. A room wipe drops the room's round and its answer records.
+The claimed sender of the response plays no part. **Every distinct head (epoch, authenticator) a signer signs in a round is kept**, a duplicate once, at most four (a later epoch replaces the lowest when full), and a signer with more than one is reported as `conflicted`. A signer can show two heads in one round only by signing again after it forgot the challenge, or by equivocating, and the arrival order is not ordered: keeping every head lets C3 apply "a conflict always wins" whatever the order. **For C3: a conflicted signer counts as Behind and never as a match** (rule 1 applies to every kept head, and a conflicted signer never satisfies rule 3, even when its heads share the highest epoch). C3 must not reduce `RoundView::heads` to one head per signer. A head is kept as its claim once its proof verified, not the 7 KB signature: the worst case is 512 signers × 4 heads × a claim naming at most 512 admins. A response that carried only a proof stops there. A room wipe drops the room's round and its answer records.
 
 **The round deadline is not a freshness age**. It runs on `tokio::time::Instant` (the process monotonic clock), which stops while a device sleeps, so a proof queued during a long sleep can still be recorded after resume. The proof is still fresh relative to the challenge. A7's GET does not report `opened_at` at all, and C3 measures the 60 s round deadline and the time to live from the round's opening on the sleep-inclusive clock (C2).
 
@@ -152,7 +151,7 @@ The claimed sender of the response plays no part. **Every distinct head (epoch, 
 - **Information fields and the tree**. On the seal and apply paths the next roster is installed in memory while the tree's lock is still held (`process_treekem_commit_after_crypto_recheck`, `remove_treekem_named_group_member`), so a proof cannot pair the new tree with the previous roster there. The remaining case is a `ReplacedNotDurable` persist, which installs the new roster and then rolls the tree back: a proof then pairs the old epoch with the new roster's admins, which can be fewer. Both fail closed: the closure only grows, and the requester-active re-read (step 5) keeps a just-removed member from the new head.
 - A requester can make an admin sign at most 12 proofs a minute per room, and only with challenges of its own that rise, and re-send a cached proof at most once per 5 s. Each answer costs a roster read, a tree lock and one signature; a challenge from ahead also costs at most one catch-up task per room (#1427's bound). `HeadAnswers` keeps one record per (room, active requester) that ever challenged, dropped with the room.
 - Each challenge is a page request (about 7 KB, A5), and each proof adds about 7 KB of base64 key and signature to a response.
-- Older daemons ignore `head_challenge` and `head_proof`, so a room is confirmed only through admins at A6 or later. That fits the B1 flag day.
+- Older daemons ignore `head_challenge` and `head_proof`, so a room is confirmed only through admins at A6 or later. All devices of a room must move to the same build.
 - `challenge_admins` and `round_view` are reached through A7's routes.
 
 ## Validation
@@ -206,5 +205,5 @@ Unit tests:
 ## Measured delta
 
 - **Before:** nothing on the catch-up wire proved where a room's key stands. `responder_state_hash` and a request's `current_state_hash` are unsigned, and `security_binding` names an epoch, not a key.
-- **After:** an admin signs a head proof (domain `x0x/treekem-head-proof/v1`) over the live tree's epoch authenticator, for one requester's own signed challenge. Four routes expose it (`T-treekem-head-proof`, "The routes"), the registry went from 206 to 210 endpoints, and the GET reports the head, `admins_since`, `fork_quarantined`, `run_id`, `connected_admins`, `admin_links` and `presence_mark`.
+- **After:** an admin signs a head proof (domain `x0x/treekem-head-proof/v1`) over the live tree's epoch authenticator, for one requester's own signed challenge. Four routes expose it (`T-treekem-head-proof`, "The routes"), the registry went from 208 to 212 endpoints, and the GET reports the head, `admins_since`, `fork_quarantined`, `run_id`, `connected_admins`, `admin_links` and `presence_mark`.
 - **Pinned by:** `an_admin_answers_a_challenge_with_a_signed_proof`, `a_requester_gets_at_most_twelve_proofs_a_minute`, `a_roster_full_of_admins_does_not_crowd_out_a_named_admin`, `two_heads_from_one_signer_in_a_round_are_both_kept` (`tests/head_proof.rs`); `get_reports_head_presence_and_round`, `get_reports_a_fork_quarantined_room`, `trigger_opens_at_most_one_round_per_gap` (`tests/catchup_routes.rs`); `a_link_that_flapped_between_gets_has_a_new_link_id` (`presence_facts`).

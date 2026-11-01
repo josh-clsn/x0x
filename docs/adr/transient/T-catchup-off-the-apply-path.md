@@ -2,7 +2,6 @@
 
 - **Status:** Proposed (fork tail, survivor re-key A12).
 - **Date:** 2026-10-25
-- **Base:** `survivor-rekey` at `042f243f`
 - **Upstream:** none filed. Upstream's apply path asks for a gap catch-up inline in the same way, and its listener answers serially.
 - **Drop at:** when upstream moves its catch-up asks off the apply and listener paths and answers catch-up requests concurrently for proven requesters. Take theirs and delete `gap_catchup.rs` and `catchup_serve.rs`. Nothing changes on the wire, so no migration is needed.
 
@@ -45,12 +44,12 @@ A Noetic leaf agent's drill showed group messages stalling behind membership app
     - at most 8 rooms or kinds waiting per requester (`PER_PEER_QUEUE`). Past that, a request for a further room is dropped, never another room's only request;
     - at most 256 requesters (`MAX_WAITING_PEERS`) and 8 MiB of requests (`MAX_WAITING_BYTES`) waiting.
   - Slots go out in request order, because tokio's semaphore is fair.
-  - Each answer is `handle_treekem_catchup_request`, unchanged.
+  - Each answer is `handle_treekem_catchup_request`, which hands its page, member-keyed and head-proof sends to `catchup_serve::send_answer` (`T-v1-ack-direct-hedge`).
 - **Why four slots.** An answer holds one page (one direct message, under `x0x::dm::MAX_PAYLOAD_BYTES`), may sign one head proof, and holds one send for up to its timeout.
   - With four slots, four requesters that went away time out together, and a fifth waits at most one send timeout. Before, it waited behind every request queued ahead of it.
   - Four keeps a phone's catch-up work to a few pages in memory and a few signatures at a time.
   - It matches the re-key obligation worker's sends in flight (`rekey_obligations::MAX_IN_FLIGHT`).
-- **A seated member gets the resend schedule.** The direct add and the approval put the member they seat on the schedule's direct sends at 6, 15, 30 and 60 s (`spawn_seated_member_resends`), with no room-wide republish: that member is not subscribed to the room's metadata topic yet. A survivor the obligations refused keeps the full schedule with the republish, as before.
+- **A seated member the obligations refused gets the resend schedule.** A direct add or an approval owes the member it seats its seat (`T-seat-obligation`), and sends nothing blind. Only when the obligations refuse the seat (past their caps, or the file cannot be written) is the member put on the schedule's direct sends at 6, 15, 30 and 60 s (`spawn_seated_member_resends`), with no room-wide republish: that member is not subscribed to the room's metadata topic yet. A survivor the obligations refused keeps the full schedule with the republish.
 - **A counter for v1 acknowledgement waits.** `GET /diagnostics/dm` `stats` reports:
   - `v1_ack_waits` and `v1_ack_wait_ms`: gossip-inbox sends that waited for a v1 recipient acknowledgement, and the time they took;
   - `v1_ack_wait_timeouts` and `v1_ack_wait_timeout_ms`: those that ended without one.
@@ -67,7 +66,7 @@ A Noetic leaf agent's drill showed group messages stalling behind membership app
   - **On the owner:** a re-key obligation send to such a leaf holds one of the worker's 4 slots for 24 s. It counts as failed, so it backs off and is sent again rather than waiting for the 15 min cap. Delivery is not weakened.
   - A leaf whose mesh rests gives no acknowledgement at all, because the message never arrived.
   - The `v1_ack_*` counters measure how often this happens. A14 (`T-v1-ack-direct-hedge.md`) hedges a leaf's v1 acknowledgement on live Direct, and an answer now frees its slot when it hands its send off, so a lost acknowledgement no longer paces a requester.
-- A member that a direct add or an approval seats is still not owed the add. After the last resend at +60 s, a member away longer is not sent its Welcome again. A seat obligation closes that; it is a separate change before the version flip.
+- A member that a direct add or an approval seats is owed the add by a seat obligation (`T-seat-obligation`), so a member away past the last resend at +60 s is still sent its seat and its Welcome.
 
 ## Tests
 
@@ -90,7 +89,7 @@ A Noetic leaf agent's drill showed group messages stalling behind membership app
 - `a_machine_flooding_unverified_requests_is_checked_a_burst_at_most`: 100 unverified requests from one machine get about 16 signature checks; another machine's still gets one.
 - `a_requester_off_the_roster_gets_no_place`: a self-signed or transport-verified requester the roster does not hold, and a room this daemon does not hold, get no place.
 - `a_dispatched_answer_is_the_direct_answer`: the page the listener path sends is byte for byte the page a direct call sends.
-- `a_member_an_add_seats_keeps_the_resend_schedule`: a direct add and an approval each give the seated member the direct-send schedule, with no republishing schedule.
+- `a_member_an_add_seats_keeps_the_resend_schedule`: while the seat is owed, a direct add and an approval give the seated member no blind schedule; past the obligations' cap they give it the direct-send schedule, with no republishing schedule.
 
 Unit tests:
 
@@ -101,4 +100,4 @@ Unit tests:
   - the requester and byte caps hold;
   - an unverified, unsigned request proves no one.
 
-Each integration test fails with its fix reverted. The red runs are in the A12 report.
+Each integration test fails with its fix reverted.
