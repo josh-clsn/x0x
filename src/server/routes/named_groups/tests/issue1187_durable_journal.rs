@@ -221,6 +221,7 @@ struct SealFixture {
     base_epoch: u64,
     expected_epoch: u64,
     added_hex: String,
+    authority_hex: String,
 }
 
 async fn seal_fixture(byte: u8) -> Result<SealFixture> {
@@ -229,8 +230,12 @@ async fn seal_fixture(byte: u8) -> Result<SealFixture> {
     let group_id_bytes = hex::decode(&group_id)?;
     let authority = AgentId([byte; 32]);
     let authority_hex = hex::encode(authority.as_bytes());
+    // Survivor re-key A2: the receiver ties the commit to the authority's
+    // leaf through the package its seat commits, so the seat holds it.
+    let authority_prepared = x0x::mls::TreeKemMlsGroup::prepare_member(authority, &[byte; 32])?;
+    let authority_package = authority_prepared.key_package_bytes().to_vec();
     let mut authority_group =
-        x0x::mls::TreeKemMlsGroup::create(group_id_bytes.clone(), authority, &[byte; 32])?;
+        x0x::mls::TreeKemMlsGroup::create_prepared(group_id_bytes.clone(), authority_prepared)?;
     let local_id = state.agent.agent_id();
     let local_hex = hex::encode(local_id.as_bytes());
     let local_seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
@@ -240,6 +245,7 @@ async fn seal_fixture(byte: u8) -> Result<SealFixture> {
     let base_epoch = joined.epoch();
 
     let mut info = treekem_metadata_group_info(authority, &group_id, &group_id);
+    info.set_member_treekem_key_package(&authority_hex, BASE64.encode(&authority_package));
     info.add_member(
         local_hex,
         x0x::groups::GroupRole::Member,
@@ -276,7 +282,7 @@ async fn seal_fixture(byte: u8) -> Result<SealFixture> {
     next.add_member(
         added_hex.clone(),
         x0x::groups::GroupRole::Member,
-        Some(authority_hex),
+        Some(authority_hex.clone()),
         None,
     );
     next.state_revision = info.state_revision.saturating_add(1);
@@ -293,6 +299,7 @@ async fn seal_fixture(byte: u8) -> Result<SealFixture> {
         base_epoch,
         expected_epoch,
         added_hex,
+        authority_hex,
     })
 }
 
@@ -308,10 +315,11 @@ async fn apply_seal(fixture: &SealFixture) -> anyhow::Result<()> {
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("baseline installed the TreeKEM group"))?;
     process_treekem_commit_after_crypto_recheck(
-        fixture.state.as_ref(),
+        &fixture.state,
         &fixture.group_id,
         &fixture.next,
         group,
+        &fixture.authority_hex,
         &fixture.commit,
         fixture.expected_epoch,
         "issue1187_seal",

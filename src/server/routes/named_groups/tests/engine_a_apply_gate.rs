@@ -53,6 +53,7 @@ async fn engine_a_apply_refuses_the_recovery_courier_and_admits_the_original_joi
         .await
         .insert(group_id.to_string(), Arc::clone(&group));
     let mut info = treekem_metadata_group_info(inviter, group_id, group_id);
+    seat_treekem_package(&mut info, inviter, &seed)?;
     let now_ms = now_millis_u64();
     let joiner_keypair = x0x::identity::AgentKeypair::generate()?;
     let joiner_id = joiner_keypair.agent_id();
