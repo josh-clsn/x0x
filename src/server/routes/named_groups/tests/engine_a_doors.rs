@@ -819,6 +819,7 @@ fn member_added_for(
         None,
         None,
         Some(&super::super::WelcomeContent::of_bytes(welcome)),
+        None,
     )
     .expect("extras");
     let mut info = x0x::groups::GroupInfo::new(
