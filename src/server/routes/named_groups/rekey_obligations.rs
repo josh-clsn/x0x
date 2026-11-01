@@ -1737,15 +1737,6 @@ pub(in crate::server) async fn step(state: &Arc<AppState>) {
     }
 }
 
-/// The reconcile and selection half of [`step`], with its link reads.
-#[cfg(test)]
-pub(in crate::server) async fn begin_due(state: &AppState) -> Vec<Attempt> {
-    match due_links(state).await {
-        Some(links) => select_due(state, &links).await,
-        None => Vec::new(),
-    }
-}
-
 /// Which owed survivors are linked now; `None` when nothing is owed.
 async fn due_links(state: &AppState) -> Option<Links> {
     let recipients: Vec<String> = {
