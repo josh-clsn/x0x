@@ -34,7 +34,7 @@ pub(super) fn transports_to(
         .collect()
 }
 
-fn welcome_ref_of(event: &NamedGroupMetadataEvent) -> Option<WelcomeRef> {
+pub(super) fn welcome_ref_of(event: &NamedGroupMetadataEvent) -> Option<WelcomeRef> {
     match event {
         NamedGroupMetadataEvent::MemberAdded {
             welcome_ref: Some(reference),
@@ -234,7 +234,7 @@ async fn carried_join_result(s: &Fixture, frames: &Frames) -> anyhow::Result<Joi
 
 /// The served result with its Welcome reference replaced by the bytes the
 /// joiner fetched (the joiner's own apply-time pull needs a network).
-fn with_welcome(result: JoinResultMessage, welcome: &[u8]) -> JoinResultMessage {
+pub(super) fn with_welcome(result: JoinResultMessage, welcome: &[u8]) -> JoinResultMessage {
     match result {
         JoinResultMessage::Result {
             mut event,

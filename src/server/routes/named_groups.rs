@@ -48,6 +48,7 @@ mod signer_delivery;
 mod treekem_binding;
 mod welcome_acks;
 mod welcome_key_packages;
+mod welcome_retention;
 pub(in crate::server) use control_blob::{
     handle_control_blob_message, ControlBlobMessage, ControlBlobState,
 };
@@ -48952,6 +48953,14 @@ async fn send_welcome_fetch_request(
         .map_err(classify_welcome_fetch_send_error)
 }
 
+/// The lifetime of a gossip-carried joiner control frame's envelope.
+fn welcome_control_gossip_lifetime_ms() -> u64 {
+    x0x::dm_send::DEFAULT_ENVELOPE_LIFETIME_MS
+}
+
+/// A FetchRequest for `welcome_id` went out on the gossip inbox.
+async fn note_gossip_welcome_fetch(_state: &Arc<AppState>, _welcome_id: &str) {}
+
 async fn notify_welcome_waiters(
     state: &Arc<AppState>,
     welcome_id: &str,
@@ -50375,6 +50384,7 @@ pub(in crate::server) mod tests {
     mod unsigned_group_card_1224;
     mod welcome_gossip_admission;
     mod welcome_gossip_fallback;
+    mod welcome_gossip_latency;
     mod welcome_unblock;
     mod wp_c;
     fn fake_group_state_commit(
