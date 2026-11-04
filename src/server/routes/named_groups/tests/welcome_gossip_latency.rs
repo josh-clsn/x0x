@@ -334,3 +334,125 @@ async fn duplicate_fetch_requests_inside_the_window_stream_once() -> anyhow::Res
     assert_eq!(after, 2, "a request after the window streams again");
     Ok(())
 }
+
+/// WHY: gossip-carried Welcome frames, in both directions, must outlive a
+/// phone's inbox latency (156 s seen), yet one older than that lifetime is
+/// still refused, and every other DM and the raw path keep theirs.
+#[test]
+fn gossip_welcome_frames_live_long_enough_and_no_longer() {
+    let lifetime =
+        u64::try_from(super::super::welcome_retention::WELCOME_GOSSIP_LIFETIME.as_millis())
+            .expect("lifetime");
+    assert!(lifetime >= 156_000 + x0x::dm::CLOCK_SKEW_TOLERANCE_MS);
+    let request = WelcomeBlobMessage::FetchRequest {
+        group_id: "g".to_string(),
+        welcome_id: "w".to_string(),
+    };
+    let ack = WelcomeBlobMessage::ChunkAck {
+        welcome_id: "w".to_string(),
+        sequence: 0,
+    };
+    for msg in [&request, &ack] {
+        for direct in [false, true] {
+            let config = super::super::welcome_blob_send_config(msg, direct);
+            assert_eq!(config.gossip_envelope_lifetime_ms, Some(lifetime));
+            assert_eq!(
+                config.raw_quic_receive_ack_timeout,
+                direct_message_send_config().raw_quic_receive_ack_timeout,
+                "the raw leg is unchanged"
+            );
+        }
+    }
+    assert_eq!(
+        x0x::dm::DmSendConfig::default().gossip_envelope_lifetime_ms,
+        None
+    );
+    assert_eq!(
+        direct_message_send_config().gossip_envelope_lifetime_ms,
+        None
+    );
+    let created = 1_000_000;
+    assert_eq!(
+        x0x::dm_send::admitted_publish_expiry(created, u64::MAX),
+        Some(created + lifetime)
+    );
+    assert!(x0x::dm::validate_timestamp_window(
+        created,
+        created + lifetime,
+        created + lifetime - 1
+    )
+    .is_ok());
+    assert!(
+        x0x::dm::validate_timestamp_window(created, created + lifetime, created + lifetime)
+            .is_err(),
+        "a frame older than its lifetime is refused"
+    );
+}
+
+fn gossip_receive(group: &str) -> PendingWelcomeReceive {
+    let retention = super::super::welcome_retention::WelcomeRetention {
+        gossip_fetch_sent_at: Some(tokio::time::Instant::now()),
+        ..Default::default()
+    };
+    PendingWelcomeReceive {
+        group_id: group.to_string(),
+        source: "ab".repeat(32),
+        byte_len: 64,
+        total_chunks: 1,
+        chunks: BTreeMap::new(),
+        received_bytes: 0,
+        ended_early: None,
+        retention,
+    }
+}
+
+/// WHY: retained receives are bounded: at most `MAX_RETAINED_WELCOMES` are
+/// kept (the oldest go first), each only until its overall deadline, and a
+/// receive never asked for over gossip is not retained at all.
+#[tokio::test(start_paused = true)]
+async fn retained_receives_are_capped_and_expire() -> anyhow::Result<()> {
+    use super::super::welcome_retention::{MAX_RETAINED_WELCOMES, RETAINED_WELCOME_TTL};
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let ids: Vec<String> = (0..MAX_RETAINED_WELCOMES + 2)
+        .map(|i| format!("{i:064x}"))
+        .collect();
+    for id in &ids {
+        state
+            .pending_welcome_receives
+            .write()
+            .await
+            .insert(id.clone(), gossip_receive("g"));
+        super::super::retain_or_cleanup_welcome_receive(&state, id).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    {
+        let receives = state.pending_welcome_receives.read().await;
+        assert_eq!(receives.len(), MAX_RETAINED_WELCOMES);
+        assert!(!receives.contains_key(&ids[0]) && !receives.contains_key(&ids[1]));
+        assert!(receives.values().all(|receive| receive.retention.retained));
+    }
+    let raw = "f".repeat(64);
+    let mut never_gossip = gossip_receive("g");
+    never_gossip.retention.gossip_fetch_sent_at = None;
+    state
+        .pending_welcome_receives
+        .write()
+        .await
+        .insert(raw.clone(), never_gossip);
+    super::super::retain_or_cleanup_welcome_receive(&state, &raw).await;
+    assert!(
+        !state
+            .pending_welcome_receives
+            .read()
+            .await
+            .contains_key(&raw),
+        "a raw-only receive is cleaned up as before"
+    );
+    tokio::time::sleep(RETAINED_WELCOME_TTL).await;
+    super::super::prune_retained_welcome_receives(&state).await;
+    assert!(
+        state.pending_welcome_receives.read().await.is_empty(),
+        "retained receives end at their overall deadline"
+    );
+    Ok(())
+}

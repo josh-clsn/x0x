@@ -1093,6 +1093,10 @@ pub struct DmSendConfig {
     /// the bus fallback reaches bus-only (pre-inbox) receivers, which is also
     /// why a daemon's `skip_legacy_dm_bus` opt-out leaves it in place.
     pub skip_legacy_bus_fallback: bool,
+    /// The lifetime of a gossip-inbox envelope this send builds. `None` is
+    /// [`crate::dm_send::DEFAULT_ENVELOPE_LIFETIME_MS`]; any value is capped
+    /// at [`MAX_ENVELOPE_LIFETIME_MS`]. Raw QUIC carries no envelope.
+    pub gossip_envelope_lifetime_ms: Option<u64>,
 }
 
 impl Default for DmSendConfig {
@@ -1117,6 +1121,7 @@ impl Default for DmSendConfig {
             // X0X-0041: 250ms is the soak-tested grace from iroh-gossip #43.
             prefer_newest_grace_ms: DEFAULT_PREFER_NEWEST_GRACE_MS,
             skip_legacy_bus_fallback: false,
+            gossip_envelope_lifetime_ms: None,
         }
     }
 }

@@ -160,6 +160,7 @@ async fn chunk_ack_sends_are_bounded_and_end_within_their_budget() -> anyhow::Re
         chunks: BTreeMap::new(),
         received_bytes: 0,
         ended_early: None,
+        retention: Default::default(),
     };
     joiner
         .pending_welcome_receives
@@ -525,6 +526,7 @@ async fn the_group_purge_releases_its_welcome_acks() -> anyhow::Result<()> {
             chunks: BTreeMap::new(),
             received_bytes: 0,
             ended_early: None,
+            retention: Default::default(),
         },
     );
     for frame in frames
@@ -630,6 +632,7 @@ async fn shutdown_drains_the_welcome_acks() -> anyhow::Result<()> {
             chunks: BTreeMap::new(),
             received_bytes: 0,
             ended_early: None,
+            retention: Default::default(),
         },
     );
     let chunk_frames: Vec<_> = frames
@@ -681,6 +684,7 @@ fn receive_for(
         chunks: BTreeMap::new(),
         received_bytes: 0,
         ended_early: None,
+        retention: Default::default(),
     }
 }
 

@@ -37,19 +37,28 @@ pub(crate) const PUBLISH_ONLY_REDUNDANT_REPUBLISH_DELAY: Duration = Duration::fr
 const ACK_LEGACY_BUS_FALLBACK_DELAY: Duration = Duration::from_millis(250);
 
 /// ADR 0107 gossip fallback: the longest an admitted recovery-response
-/// envelope stays acceptable to an honest recipient, on its own clock.
-/// This is hygiene, not a security bound: pubsub keeps forwarding a
-/// published frame for its 60 s cache window (a stranded-publish retry at
-/// +8 s, IWANT serves, other peers' caches), a recipient whose clock is
-/// behind accepts it later, and a malicious recipient ignores the expiry.
-/// What bounds exposure is that every published frame passed its
-/// admission while the recipient was eligible.
-pub(crate) const ADMITTED_PUBLISH_LIFETIME_MS: u64 = 30_000;
+/// envelope stays acceptable to an honest recipient, on its own clock:
+/// above a phone's observed gossip-inbox latency (156 s one way, field
+/// test 2026-11-04), with room for skew. This is hygiene, not a security
+/// bound: pubsub forwards a published frame from its 60 s cache and other
+/// peers' caches, a recipient whose clock is behind accepts it later, and
+/// a malicious recipient ignores the expiry. What bounds exposure is that
+/// every published frame passed its admission while the recipient was
+/// eligible.
+pub(crate) const ADMITTED_PUBLISH_LIFETIME_MS: u64 = 300_000;
 
-/// The shortest lifetime worth publishing: a frame that would expire
-/// sooner (its artifact deadline is that close) is refused instead, as a
-/// recipient with ordinary clock skew would drop it unseen.
-pub(crate) const ADMITTED_PUBLISH_MIN_LIFETIME_MS: u64 = 5_000;
+/// The shortest lifetime worth publishing, scaled with the lifetime (one
+/// sixth): a frame that would expire sooner (its artifact deadline is that
+/// close) is refused instead, as a slow inbox would drop it unseen.
+pub(crate) const ADMITTED_PUBLISH_MIN_LIFETIME_MS: u64 = 50_000;
+
+/// The lifetime of a gossip-inbox envelope for `config`.
+pub(crate) fn gossip_envelope_lifetime_ms(config: &DmSendConfig) -> u64 {
+    config
+        .gossip_envelope_lifetime_ms
+        .unwrap_or(DEFAULT_ENVELOPE_LIFETIME_MS)
+        .min(crate::dm::MAX_ENVELOPE_LIFETIME_MS)
+}
 
 /// The error text of an admitted publish whose artifact deadline passed.
 pub(crate) const ADMITTED_PUBLISH_EXPIRED: &str = "recovery-response deadline elapsed";
@@ -322,7 +331,7 @@ pub(crate) async fn send_via_gossip_with_provenance(
     };
 
     let created = now_unix_ms();
-    let expires = created.saturating_add(DEFAULT_ENVELOPE_LIFETIME_MS);
+    let expires = created.saturating_add(gossip_envelope_lifetime_ms(config));
     let envelope = EnvelopeBuilder::build_payload_envelope_with_version(
         protocol_version,
         request_id,
@@ -1176,7 +1185,10 @@ mod tests {
     #[test]
     fn admitted_publish_expiry_is_the_deadline_capped_at_the_lifetime() {
         let now = 1_000_000;
-        assert_eq!(admitted_publish_expiry(now, now + 5_000), Some(now + 5_000));
+        assert_eq!(
+            admitted_publish_expiry(now, now + 60_000),
+            Some(now + 60_000)
+        );
         assert_eq!(
             admitted_publish_expiry(now, u64::MAX),
             Some(now + ADMITTED_PUBLISH_LIFETIME_MS)
@@ -1191,6 +1203,27 @@ mod tests {
         assert_eq!(
             admitted_publish_expiry(now, now + ADMITTED_PUBLISH_MIN_LIFETIME_MS),
             Some(now + ADMITTED_PUBLISH_MIN_LIFETIME_MS)
+        );
+    }
+
+    #[test]
+    fn a_gossip_envelope_lifetime_defaults_and_is_capped() {
+        assert_eq!(
+            gossip_envelope_lifetime_ms(&DmSendConfig::default()),
+            DEFAULT_ENVELOPE_LIFETIME_MS
+        );
+        let config = DmSendConfig {
+            gossip_envelope_lifetime_ms: Some(300_000),
+            ..DmSendConfig::default()
+        };
+        assert_eq!(gossip_envelope_lifetime_ms(&config), 300_000);
+        let config = DmSendConfig {
+            gossip_envelope_lifetime_ms: Some(u64::MAX),
+            ..DmSendConfig::default()
+        };
+        assert_eq!(
+            gossip_envelope_lifetime_ms(&config),
+            crate::dm::MAX_ENVELOPE_LIFETIME_MS
         );
     }
 

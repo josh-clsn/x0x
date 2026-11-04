@@ -48,7 +48,7 @@ mod signer_delivery;
 mod treekem_binding;
 mod welcome_acks;
 mod welcome_key_packages;
-mod welcome_retention;
+pub(in crate::server) mod welcome_retention;
 pub(in crate::server) use control_blob::{
     handle_control_blob_message, ControlBlobMessage, ControlBlobState,
 };
@@ -1192,6 +1192,8 @@ pub(in crate::server) struct PendingWelcomeReceive {
     /// unless bytes arrived since that mark and since its own last check,
     /// which means a stream is still delivering.
     ended_early: Option<u64>,
+    /// Its life across bounded fetch attempts (a gossip-carried fetch).
+    retention: welcome_retention::WelcomeRetention,
 }
 
 #[derive(Debug, Clone)]
@@ -46609,6 +46611,30 @@ pub(super) async fn send_join_artifact(
     admission: x0x::dm::ArtifactAdmission,
     deadline: Instant,
 ) -> std::result::Result<(), String> {
+    send_join_artifact_path(
+        state, recipient, payload, group_id, kind, admission, deadline,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// The transport that carried a join-artifact frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinArtifactPath {
+    RawQuic,
+    GossipInbox,
+}
+
+/// [`send_join_artifact`], reporting which transport carried the frame.
+async fn send_join_artifact_path(
+    state: &AppState,
+    recipient: &AgentId,
+    payload: &[u8],
+    group_id: &str,
+    kind: &'static str,
+    admission: x0x::dm::ArtifactAdmission,
+    deadline: Instant,
+) -> std::result::Result<JoinArtifactPath, String> {
     let gossip = join_artifact_may_use_gossip(kind)
         && match state.agent.gossip_inbox_reach(recipient).await {
             Ok(()) => true,
@@ -46621,14 +46647,15 @@ pub(super) async fn send_join_artifact(
         return send_join_artifact_gossip(
             state, recipient, payload, group_id, kind, &admission, deadline, true,
         )
-        .await;
+        .await
+        .map(|()| JoinArtifactPath::GossipInbox);
     }
     match send_join_artifact_raw(
         state, recipient, payload, group_id, kind, &admission, deadline,
     )
     .await
     {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(JoinArtifactPath::RawQuic),
         Err(failure) if failure.unwritten_not_connected && gossip => {
             tracing::info!(
                 kind,
@@ -46640,6 +46667,7 @@ pub(super) async fn send_join_artifact(
                 state, recipient, payload, group_id, kind, &admission, deadline, false,
             )
             .await
+            .map(|()| JoinArtifactPath::GossipInbox)
             .map_err(|e| format!("{}; gossip inbox: {e}", failure.reason))
         }
         Err(failure) => Err(failure.reason),
@@ -48830,6 +48858,9 @@ fn welcome_blob_send_config(msg: &WelcomeBlobMessage, direct: bool) -> x0x::dm::
             // holds the ack's admission slot. Acks are cumulative, and the
             // publish-only path publishes twice.
             require_gossip_ack: !matches!(msg, WelcomeBlobMessage::ChunkAck { .. }),
+            // A phone's gossip inbox is minutes one way: the default 120 s
+            // envelope expired in transit (field test 2026-11-04).
+            gossip_envelope_lifetime_ms: Some(welcome_control_gossip_lifetime_ms()),
             ..direct_message_send_config()
         },
     }
@@ -48945,6 +48976,9 @@ async fn send_welcome_fetch_request(
     }
     let direct = first && state.agent.has_live_direct_connection(agent_id).await;
     log_welcome_control_send(request, welcome_control_path(direct));
+    if let (false, WelcomeBlobMessage::FetchRequest { welcome_id, .. }) = (direct, request) {
+        note_gossip_welcome_fetch(state, welcome_id).await;
+    }
     state
         .agent
         .send_direct_with_config(agent_id, payload, welcome_blob_send_config(request, direct))
@@ -48953,29 +48987,121 @@ async fn send_welcome_fetch_request(
         .map_err(classify_welcome_fetch_send_error)
 }
 
-/// The lifetime of a gossip-carried joiner control frame's envelope.
+/// The lifetime of a gossip-carried joiner control frame's envelope: the
+/// owner frames' ([`welcome_retention::WELCOME_GOSSIP_LIFETIME`]).
 fn welcome_control_gossip_lifetime_ms() -> u64 {
-    x0x::dm_send::DEFAULT_ENVELOPE_LIFETIME_MS
+    u64::try_from(welcome_retention::WELCOME_GOSSIP_LIFETIME.as_millis())
+        .unwrap_or(x0x::dm_send::ADMITTED_PUBLISH_LIFETIME_MS)
 }
 
-/// A FetchRequest for `welcome_id` went out on the gossip inbox.
-async fn note_gossip_welcome_fetch(_state: &Arc<AppState>, _welcome_id: &str) {}
+/// A FetchRequest for `welcome_id` went out on the gossip inbox: its
+/// receive may now outlive the attempt, and no attempt asks again inside
+/// the refresh window.
+async fn note_gossip_welcome_fetch(state: &Arc<AppState>, welcome_id: &str) {
+    if let Some(receive) = state
+        .pending_welcome_receives
+        .write()
+        .await
+        .get_mut(welcome_id)
+    {
+        receive.retention.gossip_fetch_sent_at = Some(tokio::time::Instant::now());
+    }
+}
 
+/// Drop the retained receives (and their acks) whose overall deadline has
+/// passed.
+async fn prune_retained_welcome_receives(state: &Arc<AppState>) {
+    let now = tokio::time::Instant::now();
+    let expired: Vec<String> = {
+        let mut receives = state.pending_welcome_receives.write().await;
+        let expired: Vec<String> = receives
+            .iter()
+            .filter(|(_, receive)| {
+                receive.retention.retained && receive.retention.past_deadline(now)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &expired {
+            receives.remove(id);
+        }
+        expired
+    };
+    for id in expired {
+        drop_retained_welcome(state, &id, "deadline");
+    }
+}
+
+fn drop_retained_welcome(state: &AppState, welcome_id: &str, reason: &'static str) {
+    state.welcome_ack_tasks.release_welcome(welcome_id);
+    tracing::info!(
+        target: "welcome.trace",
+        stage = "retained_receive_dropped",
+        welcome_id = %LogHexId::new("welcome", welcome_id),
+        reason,
+        "retained Welcome receive dropped"
+    );
+}
+
+/// A bounded fetch attempt ended without its Welcome. A receive asked for
+/// over gossip, inside its deadline, is kept for the next attempt (the
+/// owner's frames are still on their way); any other is cleaned up as
+/// before.
+async fn retain_or_cleanup_welcome_receive(state: &Arc<AppState>, welcome_id: &str) {
+    let now = tokio::time::Instant::now();
+    let dropped = {
+        let mut receives = state.pending_welcome_receives.write().await;
+        let Some(receive) = receives
+            .get_mut(welcome_id)
+            .filter(|receive| receive.retention.may_retain(now))
+        else {
+            drop(receives);
+            cleanup_welcome_fetch_state(state, welcome_id).await;
+            return;
+        };
+        receive.retention.retained = true;
+        let entries: Vec<(String, tokio::time::Instant, u64)> = receives
+            .iter()
+            .filter(|(_, receive)| receive.retention.retained)
+            .map(|(id, receive)| (id.clone(), receive.retention.started_at, receive.byte_len))
+            .collect();
+        let dropped = welcome_retention::over_cap(&entries);
+        for id in &dropped {
+            receives.remove(id);
+        }
+        dropped
+    };
+    for id in &dropped {
+        drop_retained_welcome(state, id, "cap");
+        state.pending_welcome_waiters.write().await.remove(id);
+    }
+    if !dropped.iter().any(|id| id == welcome_id) {
+        tracing::debug!(
+            target: "welcome.trace",
+            stage = "receive_retained",
+            welcome_id = %LogHexId::new("welcome", welcome_id),
+        );
+    }
+}
+
+/// Hand `result` to every attempt waiting on `welcome_id`; returns how
+/// many were still waiting.
 async fn notify_welcome_waiters(
     state: &Arc<AppState>,
     welcome_id: &str,
     result: std::result::Result<Vec<u8>, String>,
-) {
+) -> usize {
     let waiters = state
         .pending_welcome_waiters
         .write()
         .await
         .remove(welcome_id);
-    if let Some(waiters) = waiters {
-        for waiter in waiters {
-            let _ = waiter.send(result.clone());
-        }
-    }
+    waiters.map_or(0, |waiters| {
+        waiters
+            .into_iter()
+            .map(|waiter| waiter.send(result.clone()).is_ok())
+            .filter(|delivered| *delivered)
+            .count()
+    })
 }
 
 async fn cleanup_welcome_fetch_state(state: &Arc<AppState>, welcome_id: &str) {
@@ -49089,22 +49215,62 @@ where
     let source = parse_agent_id_hex(&welcome_ref.source)?;
     let total_chunks =
         x0x::files::total_chunks_for_size(welcome_ref.byte_len, x0x::files::DEFAULT_CHUNK_SIZE);
+    if let Some(bytes) = state
+        .welcome_gossip
+        .take_completed(&welcome_ref.welcome_id, tokio::time::Instant::now())
+    {
+        if bytes.len() as u64 == welcome_ref.byte_len
+            && welcome_id_for_bytes(&bytes) == welcome_ref.welcome_id
+        {
+            tracing::info!(
+                target: "welcome.trace",
+                stage = "retained_receive_used",
+                group_id = %LogHexId::group(group_id),
+                welcome_id = %LogHexId::new("welcome", &welcome_ref.welcome_id),
+                "Welcome completed from retained state"
+            );
+            return Ok(bytes);
+        }
+    }
+    prune_retained_welcome_receives(state).await;
     let (tx, mut rx) = oneshot::channel();
     let should_send_fetch = {
         let mut receives = state.pending_welcome_receives.write().await;
-        let should_send_fetch = match receives.get(&welcome_ref.welcome_id) {
-            Some(existing)
-                if existing.group_id == group_id
-                    && existing.source == welcome_ref.source
-                    && existing.byte_len == welcome_ref.byte_len
-                    && existing.total_chunks == total_chunks =>
-            {
-                tracing::debug!(
-                    target: "welcome.trace",
-                    stage = "fetch_join_inflight",
-                    group_id = %LogHexId::group(group_id),
-                    welcome_id = %LogHexId::new("welcome", &welcome_ref.welcome_id),
-                );
+        let matches = |existing: &PendingWelcomeReceive| {
+            existing.group_id == group_id
+                && existing.source == welcome_ref.source
+                && existing.byte_len == welcome_ref.byte_len
+                && existing.total_chunks == total_chunks
+        };
+        // A retained receive for another reference of this id is stale: the
+        // join moved on (a new invite or a re-seal).
+        if receives
+            .get(&welcome_ref.welcome_id)
+            .is_some_and(|existing| existing.retention.retained && !matches(existing))
+        {
+            receives.remove(&welcome_ref.welcome_id);
+            drop_retained_welcome(state, &welcome_ref.welcome_id, "superseded");
+        }
+        let should_send_fetch = match receives.get_mut(&welcome_ref.welcome_id) {
+            Some(existing) if matches(existing) => {
+                if existing.retention.retained {
+                    existing.retention.retained = false;
+                    tracing::info!(
+                        target: "welcome.trace",
+                        stage = "retained_receive_resumed",
+                        group_id = %LogHexId::group(group_id),
+                        welcome_id = %LogHexId::new("welcome", &welcome_ref.welcome_id),
+                        chunks = existing.chunks.len(),
+                        "a fetch attempt resumes a retained Welcome receive"
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "welcome.trace",
+                        stage = "fetch_join_inflight",
+                        group_id = %LogHexId::group(group_id),
+                        welcome_id = %LogHexId::new("welcome", &welcome_ref.welcome_id),
+                    );
+                }
                 false
             }
             Some(_) => {
@@ -49125,6 +49291,7 @@ where
                         chunks: BTreeMap::new(),
                         received_bytes: 0,
                         ended_early: None,
+                        retention: welcome_retention::WelcomeRetention::default(),
                     },
                 );
                 true
@@ -49208,7 +49375,26 @@ where
                 ended_early = ended_early.is_some(),
             );
         }
-        if should_send_fetch || attempt > 0 {
+        let withheld = state
+            .pending_welcome_receives
+            .read()
+            .await
+            .get(&welcome_ref.welcome_id)
+            .is_some_and(|receive| {
+                receive
+                    .retention
+                    .gossip_fetch_recent(tokio::time::Instant::now())
+            });
+        if withheld {
+            // A gossip-carried request is still on its way or being
+            // answered: asking again would only restream the Welcome.
+            tracing::debug!(
+                target: "welcome.trace",
+                stage = "fetch_request_withheld",
+                welcome_id = %LogHexId::new("welcome", &welcome_ref.welcome_id),
+                attempt,
+            );
+        } else if should_send_fetch || attempt > 0 {
             let request = WelcomeBlobMessage::FetchRequest {
                 group_id: group_id.to_string(),
                 welcome_id: welcome_ref.welcome_id.clone(),
@@ -49246,7 +49432,7 @@ where
         }
         Some(Err(_)) => return Err("TreeKEM Welcome waiter dropped".to_string()),
         None => {
-            cleanup_welcome_fetch_state(state, &welcome_ref.welcome_id).await;
+            retain_or_cleanup_welcome_receive(state, &welcome_ref.welcome_id).await;
             return Err("timed out waiting for TreeKEM Welcome blob".to_string());
         }
     };
@@ -49475,6 +49661,21 @@ async fn handle_welcome_fetch_request(
     group_id: String,
     welcome_id: String,
 ) {
+    // A slow gossip inbox delivers a joiner's repeated requests minutes
+    // late. Once this Welcome was streamed over gossip, another request
+    // inside the refresh window would only restream it into the same
+    // congestion; the joiner keeps what that stream delivers.
+    if state
+        .welcome_gossip
+        .streamed_recently(&welcome_id, tokio::time::Instant::now())
+    {
+        tracing::debug!(
+            target: "welcome.trace",
+            stage = "fetch_duplicate_inside_gossip_window",
+            welcome_id = %LogHexId::new("welcome", &welcome_id),
+        );
+        return;
+    }
     let send_state = Arc::clone(state);
     let send_recipient = *sender;
     let send_group = group_id.clone();
@@ -49528,7 +49729,7 @@ async fn handle_welcome_fetch_request(
                     welcome_id,
                     &hex::encode(send_recipient.as_bytes()),
                 );
-                let outcome = send_join_artifact(
+                let outcome = send_join_artifact_path(
                     &state,
                     &send_recipient,
                     &payload,
@@ -49538,7 +49739,12 @@ async fn handle_welcome_fetch_request(
                     deadline,
                 )
                 .await;
-                welcome_frame_delivered(&state, outcome)
+                if outcome == Ok(JoinArtifactPath::GossipInbox) {
+                    state
+                        .welcome_gossip
+                        .note_streamed(welcome_id, tokio::time::Instant::now());
+                }
+                welcome_frame_delivered(&state, outcome.map(|_| ()))
             }
         },
     )
@@ -49858,7 +50064,16 @@ async fn stream_welcome_blob_via<S, F>(
         tracing::debug!(target: "welcome.trace", stage = "chunk_sent", welcome_id, seq = sequence);
     }
 
-    if total_chunks > 0 {
+    // Over a slow gossip inbox the final ack takes two one-way trips, longer
+    // than the ack wait: the Complete goes out at once instead. The joiner
+    // assembles from its chunks whatever the order (an early Complete is
+    // kept), and verifies length and blake3.
+    let gossip_carried = state
+        .welcome_gossip
+        .streamed_recently(welcome_id, tokio::time::Instant::now());
+    if total_chunks > 0 && gossip_carried {
+        tracing::debug!(target: "welcome.trace", stage = "final_ack_wait_skipped_gossip", welcome_id, total_chunks);
+    } else if total_chunks > 0 {
         let last_seq = total_chunks - 1;
         if let Err(e) = wait_for_final_acks(&ack_slot, last_seq).await {
             tracing::warn!(welcome_id, "Welcome blob final ack wait failed: {e}");
@@ -49954,6 +50169,15 @@ async fn handle_welcome_blob_chunk(
     if !receive.chunks.contains_key(&sequence) {
         receive.received_bytes = receive.received_bytes.saturating_add(decoded.len() as u64);
         receive.chunks.insert(sequence, decoded);
+        if receive.retention.retained {
+            tracing::info!(
+                target: "welcome.trace",
+                stage = "retained_receive_chunk",
+                welcome_id = %LogHexId::new("welcome", &welcome_id),
+                seq = sequence,
+                "a retained Welcome receive picked up a chunk between attempts"
+            );
+        }
     }
     // A Complete already came, early: this chunk may be the last one it
     // was missing, and no other Complete may follow.
@@ -50165,7 +50389,30 @@ async fn handle_welcome_blob_complete(state: &Arc<AppState>, sender: &AgentId, w
         .await;
         return;
     }
-    notify_welcome_waiters(state, welcome_id, Ok(bytes)).await;
+    let retained = receive.retention.retained;
+    if notify_welcome_waiters(state, welcome_id, Ok(bytes.clone())).await == 0 && retained {
+        let dropped =
+            state
+                .welcome_gossip
+                .keep_completed(welcome_id, bytes, tokio::time::Instant::now());
+        for id in &dropped {
+            tracing::info!(
+                target: "welcome.trace",
+                stage = "retained_receive_dropped",
+                welcome_id = %LogHexId::new("welcome", id),
+                reason = "cap",
+                "retained Welcome receive dropped"
+            );
+        }
+        if !dropped.iter().any(|id| id == welcome_id) {
+            tracing::info!(
+                target: "welcome.trace",
+                stage = "retained_receive_completed",
+                welcome_id = %LogHexId::new("welcome", welcome_id),
+                "a retained Welcome receive completed between attempts"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -51151,6 +51398,7 @@ pub(in crate::server) mod tests {
             pending_join_result_processing: StdMutex::new(HashMap::new()),
             pending_welcomes: RwLock::new(HashMap::new()),
             pending_welcome_receives: RwLock::new(HashMap::new()),
+            welcome_gossip: Default::default(),
             pending_welcome_waiters: RwLock::new(HashMap::new()),
             pending_welcome_acks: RwLock::new(HashMap::new()),
             pending_welcome_streams: Mutex::new(Some(HashMap::new())),
@@ -63578,6 +63826,7 @@ pub(in crate::server) mod tests {
                 chunks: BTreeMap::new(),
                 received_bytes: 0,
                 ended_early: None,
+                retention: Default::default(),
             },
         );
         let (tx, rx) = oneshot::channel();
