@@ -210,18 +210,22 @@ impl AuthenticatedMachineBindingCache {
         self.record_with_expiry(agent_id, machine_id, announced_at, cert_not_after);
     }
 
-    /// The local user's card pin: [`Self::record`], marked `local_pin`
+    /// The local user's card pin: [`Self::record`], but not a network
+    /// write (it never sets `network_authenticated`), marked `local_pin`
     /// when it took effect (newest-wins).
     pub(crate) fn record_local_pin(&mut self, agent_id: AgentId, machine_id: MachineId, at: u64) {
-        let confirmed = self
-            .entries
-            .get(&agent_id)
-            .is_some_and(|b| b.machine_id == machine_id && b.network_authenticated);
-        self.record(agent_id, machine_id, at);
+        let existing = self.entries.get(&agent_id).copied();
+        self.upsert_binding_from(
+            agent_id,
+            machine_id,
+            at,
+            existing.and_then(|b| b.cert_digest),
+            existing.and_then(|b| b.cert_not_after),
+            false,
+        );
         if let Some(entry) = self.entries.get_mut(&agent_id) {
             if entry.machine_id == machine_id && entry.announced_at == at {
                 entry.local_pin = true;
-                entry.network_authenticated = confirmed;
             }
         }
     }
@@ -296,6 +300,8 @@ impl AuthenticatedMachineBindingCache {
         }
     }
 
+    /// A network-authenticated write: an origin attestation, or a verified
+    /// or direct-origin announcement.
     fn upsert_binding(
         &mut self,
         agent_id: AgentId,
@@ -304,22 +310,53 @@ impl AuthenticatedMachineBindingCache {
         cert_digest: Option<[u8; 32]>,
         cert_not_after: Option<u64>,
     ) {
+        self.upsert_binding_from(
+            agent_id,
+            machine_id,
+            announced_at,
+            cert_digest,
+            cert_not_after,
+            true,
+        );
+    }
+
+    /// Newest-wins: a write takes the binding's machine and fields only
+    /// when it is at least as new. `network` writes also confirm the
+    /// machine they name: they set `network_authenticated` on a binding
+    /// naming the same machine whatever their timestamp (a card pin stamped
+    /// on this clock can be newer than an attestation from a sender whose
+    /// clock runs behind; the attestation still proves that machine). A
+    /// write naming another machine never confirms the current one, and a
+    /// non-network write (a card pin) confirms nothing.
+    fn upsert_binding_from(
+        &mut self,
+        agent_id: AgentId,
+        machine_id: MachineId,
+        announced_at: u64,
+        cert_digest: Option<[u8; 32]>,
+        cert_not_after: Option<u64>,
+        network: bool,
+    ) {
         let tick = self.next_tick();
         if let Some(mut existing) = self.entries.get(&agent_id).copied() {
             self.recency
                 .remove(&(existing.last_used.0, existing.last_used.1, agent_id.0));
             existing.last_used = tick;
+            let same_machine = existing.machine_id == machine_id;
             if announced_at >= existing.announced_at {
                 self.by_machine.remove(&(existing.machine_id.0, agent_id.0));
                 self.by_machine.insert((machine_id.0, agent_id.0));
                 // A refresh naming the pinned machine keeps the pin mark;
                 // only a binding that moves the agent elsewhere clears it.
-                existing.local_pin &= existing.machine_id == machine_id;
-                existing.network_authenticated = true;
+                existing.local_pin &= same_machine;
+                existing.network_authenticated =
+                    network || (same_machine && existing.network_authenticated);
                 existing.machine_id = machine_id;
                 existing.announced_at = announced_at;
                 existing.cert_not_after = cert_not_after;
                 existing.cert_digest = cert_digest;
+            } else if network && same_machine {
+                existing.network_authenticated = true;
             }
             self.entries.insert(agent_id, existing);
             self.recency.insert((tick.0, tick.1, agent_id.0));
@@ -353,7 +390,7 @@ impl AuthenticatedMachineBindingCache {
                 cert_not_after,
                 cert_digest,
                 local_pin: false,
-                network_authenticated: true,
+                network_authenticated: network,
                 last_used: tick,
             },
         );
@@ -4434,6 +4471,74 @@ mod tests {
     /// pre-subscribes the sender's inbox topic ON RECEIPT (the authoritative
     /// moment), so the ACK publish that follows has a gossip route. Also
     /// verifies the agent→machine registration for the C5 Direct hedge.
+    #[test]
+    fn a_card_pin_is_confirmed_by_a_same_machine_attestation_in_either_order() {
+        let agent = AgentId([0x51; 32]);
+        let machine = MachineId([0x52; 32]);
+        // Pin first (stamped on this clock), then an attestation stamped
+        // earlier by a sender whose clock runs behind.
+        let mut store = AuthenticatedMachineBindingCache::default();
+        store.record_local_pin(agent, machine, 1_000);
+        assert!(!store.peek(&agent).expect("pin").network_authenticated);
+        store.record(agent, machine, 900);
+        let binding = store.peek(&agent).expect("binding");
+        assert!(
+            binding.network_authenticated,
+            "the older attestation confirms the machine"
+        );
+        assert!(binding.local_pin);
+        assert_eq!(binding.announced_at, 1_000, "the newer pin keeps its stamp");
+        // Attestation first, then a newer pin naming the same machine.
+        let mut store = AuthenticatedMachineBindingCache::default();
+        store.record(agent, machine, 900);
+        store.record_local_pin(agent, machine, 1_000);
+        assert!(store.peek(&agent).expect("binding").network_authenticated);
+        // And a newer attestation over a pin.
+        let mut store = AuthenticatedMachineBindingCache::default();
+        store.record_local_pin(agent, machine, 1_000);
+        store.record(agent, machine, 1_100);
+        assert!(store.peek(&agent).expect("binding").network_authenticated);
+    }
+
+    #[test]
+    fn a_different_machine_never_confirms_a_card_pin() {
+        let agent = AgentId([0x53; 32]);
+        let pinned = MachineId([0x54; 32]);
+        let other = MachineId([0x55; 32]);
+        // An older attestation for another machine: the pin stays, unflagged.
+        let mut store = AuthenticatedMachineBindingCache::default();
+        store.record_local_pin(agent, pinned, 1_000);
+        store.record(agent, other, 900);
+        let binding = store.peek(&agent).expect("binding");
+        assert_eq!(binding.machine_id, pinned);
+        assert!(!binding.network_authenticated);
+        // A pin that moves an attested agent elsewhere is unflagged.
+        let mut store = AuthenticatedMachineBindingCache::default();
+        store.record(agent, other, 900);
+        store.record_local_pin(agent, pinned, 1_000);
+        let binding = store.peek(&agent).expect("binding");
+        assert_eq!(binding.machine_id, pinned);
+        assert!(!binding.network_authenticated);
+        // A newer attestation for another machine takes the binding, flagged
+        // for that machine, and clears the pin mark.
+        let mut store = AuthenticatedMachineBindingCache::default();
+        store.record_local_pin(agent, pinned, 1_000);
+        store.record(agent, other, 1_100);
+        let binding = store.peek(&agent).expect("binding");
+        assert_eq!(binding.machine_id, other);
+        assert!(binding.network_authenticated && !binding.local_pin);
+    }
+
+    #[test]
+    fn a_card_pin_alone_is_never_network_authenticated() {
+        let agent = AgentId([0x56; 32]);
+        let mut store = AuthenticatedMachineBindingCache::default();
+        store.record_local_pin(agent, MachineId([0x57; 32]), 1_000);
+        store.record_local_pin(agent, MachineId([0x57; 32]), 900);
+        store.record_local_pin(agent, MachineId([0x57; 32]), 1_100);
+        assert!(!store.peek(&agent).expect("pin").network_authenticated);
+    }
+
     #[test]
     fn timestamp_window_drop_warnings_are_rate_limited() {
         assert!(timestamp_drop_may_warn(0, 5));

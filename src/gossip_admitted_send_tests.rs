@@ -576,3 +576,173 @@ async fn a_card_pin_alone_never_names_the_gossip_machine() {
     )
     .await;
 }
+
+/// The owner's stores hold nothing for `joiner`.
+async fn clear_joiner(owner: &Agent, joiner: &identity::AgentId) {
+    owner.capability_store.forget_for_testing(joiner);
+    owner.identity_discovery_cache.write().await.remove(joiner);
+    *owner.announced_machine_bindings.write().await =
+        dm_inbox::AuthenticatedMachineBindingCache::default();
+    *owner.authenticated_machine_bindings.write().await =
+        dm_inbox::AuthenticatedMachineBindingCache::default();
+}
+
+/// A card import naming `machine` for `agent`, stamped `at` (owner clock).
+async fn import_card_pin(
+    owner: &Agent,
+    agent: identity::AgentId,
+    machine: identity::MachineId,
+    at: u64,
+) {
+    owner
+        .pin_card_binding(DiscoveredAgent {
+            self_name: None,
+            agent_id: agent,
+            machine_id: machine,
+            user_id: None,
+            addresses: Vec::new(),
+            announced_at: at,
+            last_seen: at,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: None,
+            agent_certificate: None,
+            agent_public_key: Vec::new(),
+            cert_digest: None,
+        })
+        .await;
+}
+
+fn attested_writes_from(agent: &identity::AgentId) -> usize {
+    dm_inbox::ATTESTED_DM_BINDING_WRITES
+        .lock()
+        .expect("attested writes")
+        .iter()
+        .filter(|(from, _, _)| from == agent)
+        .count()
+}
+
+/// The joiner's FetchRequest over the gossip inbox; returns once the owner
+/// recorded the attested DM's binding write.
+async fn attested_fetch_request(owner: &Agent, joiner: &Agent, welcome_id: &str) {
+    let joiner_id = joiner.agent_id();
+    let before = attested_writes_from(&joiner_id);
+    let request =
+        format!(r#"{{"type":"fetch_request","group_id":"g","welcome_id":"{welcome_id}"}}"#);
+    joiner
+        .send_direct_with_config(
+            &owner.agent_id(),
+            request.into_bytes(),
+            dm::DmSendConfig {
+                require_gossip: true,
+                require_gossip_ack: false,
+                ..dm::DmSendConfig::default()
+            },
+        )
+        .await
+        .expect("the joiner's request is published");
+    tokio::time::timeout(PHASE, async {
+        while attested_writes_from(&joiner_id) == before {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the owner records the attested request");
+}
+
+/// WHY (re-review N5): Noetic imports and re-imports cards. A card pin
+/// stamped on the owner's clock AFTER the joiner's attested FetchRequest
+/// (the joiner's clock runs behind) is still confirmed by that request,
+/// which names the same machine, so gossip is reachable at once.
+#[tokio::test]
+async fn a_card_pin_newer_than_the_attested_request_is_still_confirmed() {
+    let dir = tempfile::tempdir().expect("fixture directory");
+    let owner = node(dir.path(), "owner").await;
+    let joiner = node(dir.path(), "joiner").await;
+    run(
+        async {
+            connected(&owner, &joiner).await;
+            card_key(&owner, &joiner).await;
+            card_key(&joiner, &owner).await;
+            let joiner_id = joiner.agent_id();
+            clear_joiner(&owner, &joiner_id).await;
+            let ahead = dm::now_unix_ms() / 1000 + 120;
+            import_card_pin(&owner, joiner_id, joiner.machine_id(), ahead).await;
+            attested_fetch_request(&owner, &joiner, "w3").await;
+            let binding = owner
+                .authenticated_machine_bindings
+                .read()
+                .await
+                .peek(&joiner_id)
+                .expect("the pinned binding");
+            assert_eq!(binding.announced_at, ahead, "the newer pin keeps its stamp");
+            assert!(binding.local_pin && binding.network_authenticated);
+            owner.capability_store.forget_for_testing(&joiner_id);
+            owner
+                .identity_discovery_cache
+                .write()
+                .await
+                .remove(&joiner_id);
+            assert_eq!(owner.gossip_inbox_reach(&joiner_id).await, Ok(()));
+            assert_eq!(
+                owner.gossip_recipient_source_for_testing(&joiner_id),
+                Some(GossipRecipientSource::CardWithAuthenticatedBinding)
+            );
+        },
+        [&owner, &joiner],
+    )
+    .await;
+}
+
+/// WHY (re-review N5): an attestation naming a different machine than the
+/// card pin never confirms the pin; the gossip leg finds no machine.
+#[tokio::test]
+async fn an_attestation_for_another_machine_leaves_the_card_pin_unconfirmed() {
+    let dir = tempfile::tempdir().expect("fixture directory");
+    let owner = node(dir.path(), "owner").await;
+    let joiner = node(dir.path(), "joiner").await;
+    run(
+        async {
+            connected(&owner, &joiner).await;
+            card_key(&owner, &joiner).await;
+            card_key(&joiner, &owner).await;
+            let joiner_id = joiner.agent_id();
+            clear_joiner(&owner, &joiner_id).await;
+            let claimed = identity::MachineId([0x6c; 32]);
+            let ahead = dm::now_unix_ms() / 1000 + 120;
+            import_card_pin(&owner, joiner_id, claimed, ahead).await;
+            attested_fetch_request(&owner, &joiner, "w4").await;
+            let binding = owner
+                .authenticated_machine_bindings
+                .read()
+                .await
+                .peek(&joiner_id)
+                .expect("the pinned binding");
+            assert_eq!(
+                binding.machine_id, claimed,
+                "the newer pin keeps the machine"
+            );
+            assert!(
+                !binding.network_authenticated,
+                "another machine's attestation confirmed the pin"
+            );
+            owner.capability_store.forget_for_testing(&joiner_id);
+            owner
+                .identity_discovery_cache
+                .write()
+                .await
+                .remove(&joiner_id);
+            assert_eq!(
+                owner.gossip_inbox_reach(&joiner_id).await,
+                Err(GOSSIP_UNREACHABLE_NO_MACHINE)
+            );
+        },
+        [&owner, &joiner],
+    )
+    .await;
+}
