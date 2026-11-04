@@ -103,6 +103,16 @@ struct IncomingBlob {
     created_at: Instant,
     next_sequence: u32,
     waiter: Option<oneshot::Sender<Vec<u8>>>,
+    /// Chunks no waiter took (out of order, or late from an earlier
+    /// Fetch), at most the declared length in total.
+    buffered: BTreeMap<u32, Vec<u8>>,
+    buffered_bytes: u64,
+    /// Woken on every chunk delivered or buffered.
+    arrived: Arc<tokio::sync::Notify>,
+    /// Pulled over a slow gossip inbox: routed for
+    /// [`super::welcome_retention::RETAINED_WELCOME_TTL`], not
+    /// [`FETCH_TIMEOUT`].
+    slow: bool,
 }
 
 #[derive(Default)]
@@ -136,8 +146,14 @@ impl Registry {
         });
         // Expiry removes routing only; the owning lease keeps the declared
         // bytes accounted until its task actually ends.
-        self.incoming
-            .retain(|_, entry| entry.created_at.elapsed() < FETCH_TIMEOUT);
+        self.incoming.retain(|_, entry| {
+            let lifetime = if entry.slow {
+                super::welcome_retention::RETAINED_WELCOME_TTL
+            } else {
+                FETCH_TIMEOUT
+            };
+            entry.created_at.elapsed() < lifetime
+        });
     }
 
     fn staged_bytes_for_recipient(&self, peer: &str) -> u64 {
@@ -362,6 +378,10 @@ impl ControlBlobState {
                     created_at: Instant::now(),
                     next_sequence: 0,
                     waiter: None,
+                    buffered: BTreeMap::new(),
+                    buffered_bytes: 0,
+                    arrived: Arc::new(tokio::sync::Notify::new()),
+                    slow: false,
                 },
             );
             Some(IncomingLease {
@@ -406,11 +426,53 @@ impl ControlBlobState {
             if let Some(incoming) = registry.incoming.get_mut(reference) {
                 if incoming.next_sequence == sequence {
                     if let Some(waiter) = incoming.waiter.take() {
-                        let _ = waiter.send(chunk);
+                        if let Err(chunk) = waiter.send(chunk) {
+                            buffer_chunk(incoming, reference, sequence, chunk);
+                        }
+                        incoming.arrived.notify_one();
+                        return;
                     }
                 }
+                buffer_chunk(incoming, reference, sequence, chunk);
+                incoming.arrived.notify_one();
             }
         });
+    }
+
+    /// A chunk that arrived with no waiter for it, if one is buffered for
+    /// `generation`'s reservation.
+    fn take_buffered(
+        &self,
+        reference: &ControlBlobRef,
+        generation: u64,
+        sequence: u32,
+    ) -> Option<Vec<u8>> {
+        self.with_registry(|registry| {
+            let incoming = registry
+                .incoming
+                .get_mut(reference)
+                .filter(|incoming| incoming.generation == generation)?;
+            let chunk = incoming.buffered.remove(&sequence)?;
+            incoming.buffered_bytes = incoming.buffered_bytes.saturating_sub(chunk.len() as u64);
+            Some(chunk)
+        })
+    }
+
+    /// Mark `generation`'s reservation as pulled over a slow gossip inbox
+    /// and return its arrival signal.
+    fn mark_slow(
+        &self,
+        reference: &ControlBlobRef,
+        generation: u64,
+    ) -> Option<Arc<tokio::sync::Notify>> {
+        self.with_registry(|registry| {
+            let incoming = registry
+                .incoming
+                .get_mut(reference)
+                .filter(|incoming| incoming.generation == generation)?;
+            incoming.slow = true;
+            Some(Arc::clone(&incoming.arrived))
+        })
     }
 
     /// Test/inspection helper: bytes still held by live leases.
@@ -581,11 +643,31 @@ fn control_config(message: &ControlBlobMessage) -> x0x::dm::DmSendConfig {
 fn control_request_config() -> x0x::dm::DmSendConfig {
     x0x::dm::DmSendConfig {
         prefer_raw_quic_if_connected: false,
+        // A phone's gossip inbox is minutes one way (round 5).
+        gossip_envelope_lifetime_ms: Some(x0x::dm_send::ADMITTED_PUBLISH_LIFETIME_MS),
         ..direct_message_send_config()
     }
 }
 
+/// Keep a chunk that no waiter took, bounded by the declared length.
+fn buffer_chunk(
+    incoming: &mut IncomingBlob,
+    reference: &ControlBlobRef,
+    sequence: u32,
+    chunk: Vec<u8>,
+) {
+    let len = chunk.len() as u64;
+    if incoming.buffered.contains_key(&sequence)
+        || incoming.buffered_bytes.saturating_add(len) > reference.byte_len
+    {
+        return;
+    }
+    incoming.buffered_bytes = incoming.buffered_bytes.saturating_add(len);
+    incoming.buffered.insert(sequence, chunk);
+}
+
 /// The lifetime of a gossip-carried Fetch's (or Release's) envelope.
+#[cfg(test)]
 pub(super) fn control_fetch_gossip_lifetime_ms() -> u64 {
     x0x::dm_send::gossip_envelope_lifetime_ms(&control_request_config())
 }
@@ -979,6 +1061,26 @@ pub(in crate::server) async fn handle_control_blob_message(
                     );
                     return;
                 }
+                // Over a slow gossip inbox the joiner asks for every missing
+                // chunk once per refresh window; a repeat inside the window
+                // whose chunk already went out over gossip is not resent.
+                let served_key = super::join_result_chunk_gossip_key(
+                    &reference.digest,
+                    &reference.recipient,
+                    sequence,
+                );
+                if state
+                    .welcome_gossip
+                    .streamed_recently(&served_key, tokio::time::Instant::now())
+                    && !state.agent.has_live_direct_connection(sender).await
+                {
+                    tracing::debug!(
+                        group_id = %LogHexId::group(&reference.group_id),
+                        sequence,
+                        "join-result chunk fetch inside its gossip window; not resent"
+                    );
+                    return;
+                }
                 let admission_key =
                     format!("{}:{}:{sequence}", reference.digest, reference.recipient);
                 let ticket = match state
@@ -1036,7 +1138,7 @@ pub(in crate::server) async fn handle_control_blob_message(
                                 return;
                             }
                         };
-                        match super::send_join_artifact(
+                        let sent = super::send_join_artifact_path(
                             &task_state,
                             &recipient,
                             &payload,
@@ -1045,8 +1147,13 @@ pub(in crate::server) async fn handle_control_blob_message(
                             admission,
                             deadline,
                         )
-                        .await
-                        {
+                        .await;
+                        if sent == Ok(super::JoinArtifactPath::GossipInbox) {
+                            task_state
+                                .welcome_gossip
+                                .note_streamed(&served_key, tokio::time::Instant::now());
+                        }
+                        match sent.map(|_| ()) {
                             Ok(()) => {
                                 #[cfg(test)]
                                 frame_capture::record_frame(&payload);
@@ -1249,13 +1356,26 @@ async fn fetch_blob(
     generation: u64,
 ) -> std::result::Result<(AgentId, Vec<u8>), &'static str> {
     let source = parse_agent_id_hex(&reference.source).map_err(|_| "invalid source")?;
+    // Only the gossip inbox reaches the source: its latency is minutes on a
+    // phone, so the pull takes the gossip-sized path.
+    if state.agent.gossip_inbox_reach(&source).await.is_ok()
+        && !state.agent.has_live_direct_connection(&source).await
+    {
+        let bytes = fetch_blob_over_gossip(state, reference, generation, &source).await?;
+        return finish_fetched_blob(state, reference, source, bytes);
+    }
     let deadline = tokio::time::Instant::now() + FETCH_TIMEOUT;
     let total_chunks = reference.byte_len.div_ceil(CHUNK_BYTES as u64);
     let mut bytes = Vec::new();
     for sequence in 0..total_chunks {
         let sequence = u32::try_from(sequence).map_err(|_| "too many control chunks")?;
-        let mut received = None;
+        let mut received = state
+            .control_blobs
+            .take_buffered(reference, generation, sequence);
         for _ in 0..CHUNK_RETRIES {
+            if received.is_some() {
+                break;
+            }
             if tokio::time::Instant::now() >= deadline {
                 return Err("control blob fetch deadline");
             }
@@ -1299,6 +1419,102 @@ async fn fetch_blob(
             return Err("control blob length exceeded");
         }
     }
+    finish_fetched_blob(state, reference, source, bytes)
+}
+
+/// A pull over a slow gossip inbox (no live direct connection to the
+/// source): a chunk takes minutes to come back, so up to the source's
+/// per-group chunk share of the missing chunks is asked for at once (the
+/// least-asked first), one round per refresh window, and chunks are kept in
+/// whatever order and whenever they arrive, until the retained deadline. The source answers a duplicate inside its window at most
+/// once.
+async fn fetch_blob_over_gossip(
+    state: &Arc<AppState>,
+    reference: &ControlBlobRef,
+    generation: u64,
+    source: &AgentId,
+) -> std::result::Result<Vec<u8>, &'static str> {
+    use super::welcome_retention::{RETAINED_WELCOME_TTL, WELCOME_GOSSIP_REFRESH};
+    let arrived = state
+        .control_blobs
+        .mark_slow(reference, generation)
+        .ok_or("control blob fetch cancelled")?;
+    let total_chunks = u32::try_from(reference.byte_len.div_ceil(CHUNK_BYTES as u64))
+        .map_err(|_| "too many control chunks")?;
+    let deadline = tokio::time::Instant::now() + RETAINED_WELCOME_TTL;
+    let mut chunks: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+    let mut asked: HashMap<u32, u32> = HashMap::new();
+    tracing::info!(
+        target: "welcome.trace",
+        stage = "control_blob_slow_pull",
+        group_id = %LogHexId::group(&reference.group_id),
+        byte_len = reference.byte_len,
+        total_chunks,
+        "control blob pull over the gossip inbox"
+    );
+    loop {
+        let collect = |chunks: &mut BTreeMap<u32, Vec<u8>>| {
+            for sequence in 0..total_chunks {
+                if let std::collections::btree_map::Entry::Vacant(slot) = chunks.entry(sequence) {
+                    if let Some(chunk) = state
+                        .control_blobs
+                        .take_buffered(reference, generation, sequence)
+                    {
+                        slot.insert(chunk);
+                    }
+                }
+            }
+        };
+        collect(&mut chunks);
+        if chunks.len() as u32 == total_chunks {
+            break;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err("control blob fetch deadline");
+        }
+        // The source serves a few chunks of a group at a time; ask for that
+        // many per round, those asked least often first, so none starves.
+        let mut missing: Vec<u32> = (0..total_chunks)
+            .filter(|sequence| !chunks.contains_key(sequence))
+            .collect();
+        missing.sort_by_key(|sequence| (asked.get(sequence).copied().unwrap_or(0), *sequence));
+        missing.truncate(super::JOIN_RESULT_CHUNK_PER_GROUP_CAP);
+        for sequence in missing {
+            *asked.entry(sequence).or_insert(0) += 1;
+            let fetch = ControlBlobMessage::Fetch {
+                reference: reference.clone(),
+                sequence,
+            };
+            let _ = tokio::time::timeout(
+                CHUNK_ATTEMPT_TIMEOUT,
+                send_message(&state.agent, source, &fetch),
+            )
+            .await;
+        }
+        let round_end = (now + WELCOME_GOSSIP_REFRESH).min(deadline);
+        while tokio::time::Instant::now() < round_end && (chunks.len() as u32) < total_chunks {
+            let _ = tokio::time::timeout_at(round_end, arrived.notified()).await;
+            collect(&mut chunks);
+        }
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(reference.byte_len).unwrap_or(0));
+    for chunk in chunks.into_values() {
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.len() as u64 > reference.byte_len {
+        return Err("control blob length exceeded");
+    }
+    Ok(bytes)
+}
+
+/// The end of a pull: verify, then tell the source it can free the copy.
+fn finish_fetched_blob(
+    state: &Arc<AppState>,
+    reference: &ControlBlobRef,
+    source: AgentId,
+    bytes: Vec<u8>,
+) -> std::result::Result<(AgentId, Vec<u8>), &'static str> {
     if !exact_blob_matches_ref(reference, &bytes) {
         return Err("control blob length or digest mismatch");
     }

@@ -461,6 +461,8 @@ fn control_frame(payload: &[u8]) -> Option<super::super::control_blob::ControlBl
     serde_json::from_slice(payload).ok()
 }
 
+type FrameCounts = Arc<StdMutex<HashMap<&'static str, usize>>>;
+
 /// Frames from `from`'s gossip stand-in to `to`, each handed to `to`'s
 /// real control-blob listener `delay` after it was published, unless its
 /// envelope lifetime (`lifetime`) ran out on the way. Counts the control
@@ -471,11 +473,8 @@ fn delayed_control_frames(
     mut sink: Sink,
     delay: Duration,
     lifetime: Duration,
-) -> (
-    Arc<StdMutex<HashMap<&'static str, usize>>>,
-    tokio::task::JoinHandle<()>,
-) {
-    let counts: Arc<StdMutex<HashMap<&'static str, usize>>> = Arc::default();
+) -> (FrameCounts, tokio::task::JoinHandle<()>) {
+    let counts: FrameCounts = Arc::default();
     let counted = Arc::clone(&counts);
     let from_id = from.agent.agent_id();
     let to = Arc::clone(to);
@@ -487,13 +486,25 @@ fn delayed_control_frames(
             let Some(frame) = control_frame(&payload) else {
                 continue;
             };
-            let kind = match &frame {
-                super::super::control_blob::ControlBlobMessage::Reference { .. } => "reference",
-                super::super::control_blob::ControlBlobMessage::Fetch { .. } => "fetch",
-                super::super::control_blob::ControlBlobMessage::Chunk { .. } => "chunk",
-                super::super::control_blob::ControlBlobMessage::Release { .. } => "release",
+            let (kind, reference) = match &frame {
+                super::super::control_blob::ControlBlobMessage::Reference { reference } => {
+                    ("reference", reference)
+                }
+                super::super::control_blob::ControlBlobMessage::Fetch { reference, .. } => {
+                    ("fetch", reference)
+                }
+                super::super::control_blob::ControlBlobMessage::Chunk { reference, .. } => {
+                    ("chunk", reference)
+                }
+                super::super::control_blob::ControlBlobMessage::Release { reference } => {
+                    ("release", reference)
+                }
             };
-            if let Ok(mut counts) = counted.lock() {
+            // Only the join result's pull is counted; the owner's oversized
+            // metadata events travel by reference too.
+            let join_result =
+                serde_json::to_value(reference).is_ok_and(|value| value["kind"] == "join_result");
+            if let (true, Ok(mut counts)) = (join_result, counted.lock()) {
                 *counts.entry(kind).or_default() += 1;
             }
             let to = Arc::clone(&to);
@@ -560,6 +571,26 @@ async fn an_oversized_join_result_is_pulled_through_minutes_of_gossip_latency() 
                 .await
                 .is_some()
         );
+        let j2_hex = hex::encode(s.j2.agent.agent_id().as_bytes());
+        let byte_len = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(reference) = s
+                    .authority
+                    .control_blobs
+                    .staged_join_result_refs_for_test(&j2_hex)
+                    .into_iter()
+                    .next()
+                {
+                    return serde_json::to_value(&reference)
+                        .ok()
+                        .and_then(|value| value["byte_len"].as_u64())
+                        .unwrap_or(0);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        let total = usize::try_from(byte_len.div_ceil(x0x::files::DEFAULT_CHUNK_SIZE as u64))?;
         let released = tokio::time::timeout(Duration::from_secs(1_200), async {
             while count(&joiner_counts, "release") == 0 {
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -576,11 +607,11 @@ async fn an_oversized_join_result_is_pulled_through_minutes_of_gossip_latency() 
         );
         assert!(
             released,
-            "[{delay:?}] the join result never arrived ({fetches} chunk fetches, {chunks} chunks sent)"
+            "[{delay:?}] the join result never arrived ({fetches} chunk fetches, {chunks} chunks sent, {total} chunks)"
         );
         assert!(
-            fetches <= 3 * 8 && chunks <= 2 * 8,
-            "[{delay:?}] a re-request storm: {fetches} fetches, {chunks} chunks"
+            fetches <= 3 * total && chunks <= 2 * total,
+            "[{delay:?}] a re-request storm: {fetches} fetches, {chunks} chunks for {total} chunks"
         );
     }
     Ok(())

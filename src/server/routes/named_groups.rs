@@ -46526,6 +46526,25 @@ async fn send_join_artifact_raw(
     outcome
 }
 
+/// The key of a member's join result in the owner's gossip-window record.
+fn join_result_gossip_key(group_id: &str, member_hex: &str) -> String {
+    format!("join_result:{group_id}:{member_hex}")
+}
+
+/// The key of a join-result chunk in the owner's gossip-window record.
+fn join_result_chunk_gossip_key(digest: &str, recipient: &str, sequence: u32) -> String {
+    format!("join_result_chunk:{digest}:{recipient}:{sequence}")
+}
+
+/// The key of a joiner's join-result poll to one owner, in its
+/// gossip-window record.
+fn join_result_poll_gossip_key(group_id: &str, target: &AgentId) -> String {
+    format!(
+        "join_result_poll:{group_id}:{}",
+        hex::encode(target.as_bytes())
+    )
+}
+
 /// ADR 0107 (gossip fallback, 2026-11-04): the class-R kinds that may ride
 /// the gossip inbox when the recipient has no direct path: the owner's
 /// Welcome frames and the join-result response (inline, reference and
@@ -46620,13 +46639,13 @@ pub(super) async fn send_join_artifact(
 
 /// The transport that carried a join-artifact frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JoinArtifactPath {
+pub(super) enum JoinArtifactPath {
     RawQuic,
     GossipInbox,
 }
 
 /// [`send_join_artifact`], reporting which transport carried the frame.
-async fn send_join_artifact_path(
+pub(super) async fn send_join_artifact_path(
     state: &AppState,
     recipient: &AgentId,
     payload: &[u8],
@@ -47813,6 +47832,23 @@ async fn handle_join_result_message_bound(
                 payload_len,
                 payload_hash = %payload_hash,
             );
+            // A joiner on a slow gossip inbox re-polls every few seconds;
+            // once its result went out over gossip, a repeat inside the
+            // refresh window would only send the same 50 KB again.
+            let served_key = join_result_gossip_key(&group_id, &member_agent_id);
+            if state
+                .welcome_gossip
+                .streamed_recently(&served_key, tokio::time::Instant::now())
+                && !state.agent.has_live_direct_connection(sender).await
+            {
+                tracing::debug!(
+                    target: "treekem.trace",
+                    stage = "join_result_duplicate_inside_gossip_window",
+                    group_id = %LogHexId::group(&group_id),
+                    member = %LogHexId::agent(&member_agent_id),
+                );
+                return;
+            }
             if payload_len > x0x::dm::MAX_PAYLOAD_BYTES {
                 if !verified || !accepts_control_blob_ref || attempt_id.is_none() {
                     tracing::warn!(
@@ -47908,7 +47944,7 @@ async fn handle_join_result_message_bound(
                                     &control_blob::ControlBlobMessage::Reference { reference },
                                 ) {
                                     Ok(payload) => {
-                                        send_join_artifact(
+                                        let sent = send_join_artifact_path(
                                             &task_state,
                                             &recipient,
                                             &payload,
@@ -47917,7 +47953,17 @@ async fn handle_join_result_message_bound(
                                             admission,
                                             artifact_deadline,
                                         )
-                                        .await
+                                        .await;
+                                        if sent == Ok(JoinArtifactPath::GossipInbox) {
+                                            task_state.welcome_gossip.note_streamed(
+                                                &join_result_gossip_key(
+                                                    &group_id_for_task,
+                                                    &member_for_log,
+                                                ),
+                                                tokio::time::Instant::now(),
+                                            );
+                                        }
+                                        sent.map(|_| ())
                                     }
                                     Err(reason) => Err(reason),
                                 }
@@ -48004,7 +48050,7 @@ async fn handle_join_result_message_bound(
                         &member_for_task,
                         staged_at,
                     );
-                    if let Err(e) = send_join_artifact(
+                    let sent = send_join_artifact_path(
                         &task_state,
                         &recipient,
                         &payload,
@@ -48013,8 +48059,14 @@ async fn handle_join_result_message_bound(
                         admission,
                         artifact_deadline,
                     )
-                    .await
-                    {
+                    .await;
+                    if sent == Ok(JoinArtifactPath::GossipInbox) {
+                        task_state.welcome_gossip.note_streamed(
+                            &join_result_gossip_key(&group_for_task, &member_for_task),
+                            tokio::time::Instant::now(),
+                        );
+                    }
+                    if let Err(e) = sent {
                         tracing::warn!(group_id = %LogHexId::group(&group_for_task), member = %LogHexId::agent(&member_for_task), "failed to send join-result response: {e}");
                         tracing::debug!(
                             target: "treekem.trace",
@@ -48635,11 +48687,45 @@ async fn poll_join_result_until_deadline(
                 }
             }
             for target in &targets {
-                if let Err(e) = state
-                    .agent
-                    .send_direct_with_config(target, payload.clone(), direct_message_send_config())
-                    .await
+                // A request that rode the gossip inbox is still on its way or
+                // being answered: over a slow inbox, ask again only once per
+                // refresh window. Over a live direct connection, as before.
+                let poll_key = join_result_poll_gossip_key(&event_group_id, target);
+                if state
+                    .welcome_gossip
+                    .streamed_recently(&poll_key, tokio::time::Instant::now())
+                    && !state.agent.has_live_direct_connection(target).await
                 {
+                    tracing::debug!(
+                        target: "treekem.trace",
+                        stage = "fetch_request_withheld_gossip",
+                        group_id = %group_id,
+                        member = %member_agent_id,
+                    );
+                    continue;
+                }
+                let sent = state
+                    .agent
+                    .send_direct_with_config(
+                        target,
+                        payload.clone(),
+                        x0x::dm::DmSendConfig {
+                            gossip_envelope_lifetime_ms: Some(
+                                x0x::dm_send::ADMITTED_PUBLISH_LIFETIME_MS,
+                            ),
+                            ..direct_message_send_config()
+                        },
+                    )
+                    .await;
+                if sent
+                    .as_ref()
+                    .is_ok_and(|receipt| receipt.path == x0x::dm::DmPath::GossipInbox)
+                {
+                    state
+                        .welcome_gossip
+                        .note_streamed(&poll_key, tokio::time::Instant::now());
+                }
+                if let Err(e) = sent {
                     tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch attempt failed: {e}");
                     tracing::debug!(
                         target: "treekem.trace",
