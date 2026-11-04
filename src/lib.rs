@@ -10606,9 +10606,21 @@ impl Agent {
                     }
                     sent
                 }
-                None => Err(dm::DmError::LocalGossipUnavailable(
-                    "send_direct: no gossip runtime configured".to_string(),
-                )),
+                None => {
+                    // Test builds: an agent with the in-process gossip
+                    // stand-in hands its general gossip-inbox DMs to it.
+                    #[cfg(test)]
+                    if let Some(sink) = gossip_inbox_standin(&self.identity.agent_id()) {
+                        let _ = sink.send((*to, payload));
+                        return Ok((
+                            dm_send::raw_quic_receipt_for_path(dm::DmPath::GossipInbox),
+                            None,
+                        ));
+                    }
+                    Err(dm::DmError::LocalGossipUnavailable(
+                        "send_direct: no gossip runtime configured".to_string(),
+                    ))
+                }
             }
         } else if config.require_gossip {
             Err(dm::DmError::RecipientKeyUnavailable(format!(

@@ -572,17 +572,22 @@ impl Drop for IncomingLease {
 fn control_config(message: &ControlBlobMessage) -> x0x::dm::DmSendConfig {
     match message {
         ControlBlobMessage::Chunk { .. } => file_transfer_send_config(),
-        ControlBlobMessage::Reference { .. } | ControlBlobMessage::Fetch { .. } => {
-            x0x::dm::DmSendConfig {
-                prefer_raw_quic_if_connected: false,
-                ..direct_message_send_config()
-            }
-        }
-        ControlBlobMessage::Release { .. } => x0x::dm::DmSendConfig {
-            prefer_raw_quic_if_connected: false,
-            ..direct_message_send_config()
-        },
+        ControlBlobMessage::Reference { .. }
+        | ControlBlobMessage::Fetch { .. }
+        | ControlBlobMessage::Release { .. } => control_request_config(),
     }
+}
+
+fn control_request_config() -> x0x::dm::DmSendConfig {
+    x0x::dm::DmSendConfig {
+        prefer_raw_quic_if_connected: false,
+        ..direct_message_send_config()
+    }
+}
+
+/// The lifetime of a gossip-carried Fetch's (or Release's) envelope.
+pub(super) fn control_fetch_gossip_lifetime_ms() -> u64 {
+    x0x::dm_send::gossip_envelope_lifetime_ms(&control_request_config())
 }
 
 /// One control-blob frame's wire bytes, refusing a frame over the

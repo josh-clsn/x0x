@@ -456,3 +456,132 @@ async fn retained_receives_are_capped_and_expire() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+fn control_frame(payload: &[u8]) -> Option<super::super::control_blob::ControlBlobMessage> {
+    serde_json::from_slice(payload).ok()
+}
+
+/// Frames from `from`'s gossip stand-in to `to`, each handed to `to`'s
+/// real control-blob listener `delay` after it was published, unless its
+/// envelope lifetime (`lifetime`) ran out on the way. Counts the control
+/// frames of each kind as published.
+fn delayed_control_frames(
+    from: &Arc<AppState>,
+    to: &Arc<AppState>,
+    mut sink: Sink,
+    delay: Duration,
+    lifetime: Duration,
+) -> (
+    Arc<StdMutex<HashMap<&'static str, usize>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let counts: Arc<StdMutex<HashMap<&'static str, usize>>> = Arc::default();
+    let counted = Arc::clone(&counts);
+    let from_id = from.agent.agent_id();
+    let to = Arc::clone(to);
+    let task = tokio::spawn(async move {
+        while let Some((recipient, payload)) = sink.recv().await {
+            if recipient != to.agent.agent_id() {
+                continue;
+            }
+            let Some(frame) = control_frame(&payload) else {
+                continue;
+            };
+            let kind = match &frame {
+                super::super::control_blob::ControlBlobMessage::Reference { .. } => "reference",
+                super::super::control_blob::ControlBlobMessage::Fetch { .. } => "fetch",
+                super::super::control_blob::ControlBlobMessage::Chunk { .. } => "chunk",
+                super::super::control_blob::ControlBlobMessage::Release { .. } => "release",
+            };
+            if let Ok(mut counts) = counted.lock() {
+                *counts.entry(kind).or_default() += 1;
+            }
+            let to = Arc::clone(&to);
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                if delay >= lifetime {
+                    return;
+                }
+                super::super::control_blob::handle_control_blob_message(&to, &from_id, true, frame)
+                    .await;
+            });
+        }
+    });
+    (counts, task)
+}
+
+fn count(counts: &Arc<StdMutex<HashMap<&'static str, usize>>>, kind: &str) -> usize {
+    counts
+        .lock()
+        .map(|counts| counts.get(kind).copied().unwrap_or(0))
+        .unwrap_or(0)
+}
+
+fn control_fetch_gossip_lifetime() -> Duration {
+    Duration::from_millis(super::super::control_blob::control_fetch_gossip_lifetime_ms())
+}
+
+/// WHY (round 5): a join result over `MAX_PAYLOAD_BYTES` (a Noetic room of
+/// 4 members, or a joiner whose invite predates other joins) is pulled as
+/// a control blob, chunk by chunk, with 30 s chunk waits inside a 115 s
+/// fetch. Over a gossip inbox with 90 s or 150 s of one-way latency no
+/// chunk could come back in time. The pull must complete (the joiner sends
+/// its Release after the digest verifies), without a re-request storm.
+#[tokio::test]
+async fn an_oversized_join_result_is_pulled_through_minutes_of_gossip_latency() -> anyhow::Result<()>
+{
+    for delay in [Duration::from_secs(90), Duration::from_secs(150)] {
+        let dir = tempfile::tempdir()?;
+        let s = build(dir.path()).await?;
+        known_recipient(&s.authority, &s.j2).await?;
+        known_recipient(&s.j2, &s.authority).await?;
+        let owner_sink = s
+            .authority
+            .agent
+            .route_gossip_inbox_to_standin_for_testing();
+        let joiner_sink = s.j2.agent.route_gossip_inbox_to_standin_for_testing();
+        tokio::time::pause();
+        let (owner_counts, owner_task) = delayed_control_frames(
+            &s.authority,
+            &s.j2,
+            owner_sink,
+            delay,
+            owner_gossip_lifetime(),
+        );
+        let (joiner_counts, joiner_task) = delayed_control_frames(
+            &s.j2,
+            &s.authority,
+            joiner_sink,
+            delay,
+            control_fetch_gossip_lifetime(),
+        );
+        assert!(
+            serve_result(&s.authority, &s.j2, &s.stable, &s.j2_attempt, Some(s.base))
+                .await
+                .is_some()
+        );
+        let released = tokio::time::timeout(Duration::from_secs(1_200), async {
+            while count(&joiner_counts, "release") == 0 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        })
+        .await
+        .is_ok();
+        tokio::time::resume();
+        owner_task.abort();
+        joiner_task.abort();
+        let (fetches, chunks) = (
+            count(&joiner_counts, "fetch"),
+            count(&owner_counts, "chunk"),
+        );
+        assert!(
+            released,
+            "[{delay:?}] the join result never arrived ({fetches} chunk fetches, {chunks} chunks sent)"
+        );
+        assert!(
+            fetches <= 3 * 8 && chunks <= 2 * 8,
+            "[{delay:?}] a re-request storm: {fetches} fetches, {chunks} chunks"
+        );
+    }
+    Ok(())
+}

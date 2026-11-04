@@ -50637,6 +50637,7 @@ pub(in crate::server) mod tests {
     mod unsigned_group_card_1224;
     mod welcome_gossip_admission;
     mod welcome_gossip_fallback;
+    mod welcome_gossip_join_result_size;
     mod welcome_gossip_latency;
     mod welcome_unblock;
     mod wp_c;

@@ -175,7 +175,11 @@ async fn carried_join_result(s: &Fixture, frames: &Frames) -> anyhow::Result<Joi
                 if let Ok(super::super::control_blob::ControlBlobMessage::Reference { reference }) =
                     serde_json::from_slice(&frame)
                 {
-                    return Err(reference);
+                    let join_result = serde_json::to_value(&reference)
+                        .is_ok_and(|value| value["kind"] == "join_result");
+                    if join_result {
+                        return Err(reference);
+                    }
                 }
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
