@@ -548,6 +548,15 @@ impl CapabilityStore {
         self.lookup_binding_at(agent_id, Instant::now())
     }
 
+    /// Test seam: forget `agent_id`'s cached advert. Test builds only.
+    #[cfg(test)]
+    pub(crate) fn forget_for_testing(&self, agent_id: &AgentId) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.adverts.remove(agent_id.as_bytes());
+            inner.digest_exts.remove(agent_id.as_bytes());
+        }
+    }
+
     /// Testable clock seam for [`Self::lookup_binding`].
     pub fn lookup_binding_at(&self, agent_id: &AgentId, now: Instant) -> Option<CapabilityBinding> {
         let Ok(mut inner) = self.inner.lock() else {

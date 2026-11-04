@@ -702,6 +702,55 @@ pub(crate) struct PinnedSendFailure {
     pub(crate) unwritten_not_connected: bool,
 }
 
+/// Why a gossip-capable recovery frame cannot ride the gossip inbox.
+pub(crate) const GOSSIP_UNREACHABLE_NO_RUNTIME: &str = "no_gossip_runtime";
+/// The recipient has no usable gossip-inbox KEM key.
+pub(crate) const GOSSIP_UNREACHABLE_NO_KEY: &str = "no_gossip_inbox_key";
+/// The recipient's key has no machine to run the revocation and pairing
+/// checks against.
+pub(crate) const GOSSIP_UNREACHABLE_NO_MACHINE: &str = "no_recipient_machine";
+
+/// Where the gossip fallback took a recipient's key and machine from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GossipRecipientSource {
+    /// The signed capability advert.
+    Advert,
+    /// Usable peer evidence.
+    PeerEvidence,
+    /// A contact-card key, with the recipient's verified binding.
+    CardWithVerifiedBinding,
+    /// A contact-card key, with the discovery cache's machine.
+    CardWithDiscovery,
+}
+
+/// The least time between two targeted capability refreshes the gossip
+/// fallback asks of one recipient.
+const GOSSIP_CAPABILITY_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// When the gossip fallback last asked each `(sender, recipient)` for a
+/// capability refresh.
+#[allow(clippy::type_complexity)]
+static GOSSIP_CAPABILITY_REFRESHES: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<(identity::AgentId, identity::AgentId), std::time::Instant>,
+    >,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Test builds: every capability refresh the gossip fallback asked for.
+#[cfg(test)]
+static GOSSIP_CAPABILITY_REFRESH_REQUESTS: std::sync::LazyLock<
+    std::sync::Mutex<Vec<(identity::AgentId, identity::AgentId)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Test builds: the last key source per `(sender, recipient)`.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+static GOSSIP_RECIPIENT_SOURCES: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<(identity::AgentId, identity::AgentId), GossipRecipientSource>,
+    >,
+> = std::sync::LazyLock::new(Default::default);
+
 /// Test builds: a scripted failure of a pinned send.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11105,45 +11154,71 @@ impl Agent {
     }
 
     /// ADR 0107 gossip fallback: whether a recovery-response frame to `to`
-    /// can ride this agent's gossip inbox (a gossip runtime, and a usable
-    /// gossip-inbox KEM key for the recipient).
+    /// can ride this agent's gossip inbox (a gossip runtime, a usable
+    /// gossip-inbox KEM key for the recipient, and a machine to check).
+    #[cfg(test)]
     pub(crate) async fn gossip_inbox_reachable(&self, to: &identity::AgentId) -> bool {
+        self.gossip_inbox_reach(to).await.is_ok()
+    }
+
+    /// Whether the gossip inbox can carry a frame to `to`, or why not:
+    /// `no_gossip_runtime`, `no_gossip_inbox_key` or `no_recipient_machine`.
+    pub(crate) async fn gossip_inbox_reach(
+        &self,
+        to: &identity::AgentId,
+    ) -> Result<(), &'static str> {
         #[cfg(test)]
         if self.gossip_runtime.is_none() {
-            return gossip_inbox_standin(&self.identity.agent_id()).is_some()
-                && self.discovered_machine_of(to).await.is_some();
+            if gossip_inbox_standin(&self.identity.agent_id()).is_none() {
+                return Err(GOSSIP_UNREACHABLE_NO_RUNTIME);
+            }
+            return self.standin_recipient_machine(to).await.map(|_| ());
         }
-        self.gossip_runtime.is_some() && self.gossip_inbox_recipient(to).await.is_some()
+        if self.gossip_runtime.is_none() {
+            return Err(GOSSIP_UNREACHABLE_NO_RUNTIME);
+        }
+        self.gossip_inbox_recipient(to).await.map(|_| ())
     }
 
     /// The recipient's gossip-inbox KEM key and the machine every check
-    /// runs against: the signed capability advert (machine-bound), then
-    /// usable peer evidence (machine-bound), then the contact card's key
-    /// with the machine the discovery cache names. A key with no machine is
-    /// never used: machine revocation and B/P pairing need one, as on the
-    /// raw path. Stricter than the general v1 path, which also accepts a
-    /// card key alone and does not validate the key.
+    /// runs against, in this order:
+    /// 1. the signed capability advert (key and machine bound together);
+    /// 2. usable peer evidence (likewise);
+    /// 3. the contact card's key, with the machine of the recipient's
+    ///    verified binding ([`Self::pinned_binding_now`], the raw path's
+    ///    own selection; it includes the binding a machine-key-attested DM
+    ///    from the recipient wrote), then the discovery cache's.
+    ///
+    /// A key with no machine is never used: machine revocation and B/P
+    /// pairing need one, as on the raw path. Stricter than the general v1
+    /// path, which also accepts a card key alone and does not validate the
+    /// key. With no cached advert, a targeted capability refresh is asked
+    /// for (rate-limited), so a later frame finds a machine-bound advert.
     async fn gossip_inbox_recipient(
         &self,
         to: &identity::AgentId,
-    ) -> Option<(Vec<u8>, identity::MachineId)> {
+    ) -> Result<(Vec<u8>, identity::MachineId), &'static str> {
         let ready = |caps: &dm::DmCapabilities| {
             caps.gossip_inbox && dm::validate_recipient_kem_key(&caps.kem_public_key).is_ok()
         };
-        if let Some(binding) = self.capability_store.lookup_binding(to) {
-            if ready(&binding.capabilities) {
-                return Some((
+        match self.capability_store.lookup_binding(to) {
+            Some(binding) if ready(&binding.capabilities) => {
+                self.note_gossip_recipient_source(to, GossipRecipientSource::Advert);
+                return Ok((
                     binding.capabilities.kem_public_key.clone(),
                     binding.machine_id,
                 ));
             }
+            Some(_) => {}
+            None => self.request_gossip_capability_refresh(*to),
         }
         if let Some(view) = self
             .peer_evidence()
             .usable_agent(*to, dm_capability::now_unix_ms())
         {
             if ready(&view.advert.capabilities) {
-                return Some((
+                self.note_gossip_recipient_source(to, GossipRecipientSource::PeerEvidence);
+                return Ok((
                     view.advert.capabilities.kem_public_key.clone(),
                     view.announcement.machine_id,
                 ));
@@ -11151,11 +11226,149 @@ impl Agent {
         }
         let kem = {
             let contacts = self.contact_store.read().await;
-            let caps = contacts.get(to)?.dm_capabilities.as_ref()?;
-            ready(caps).then(|| caps.kem_public_key.clone())?
-        };
-        let machine = self.discovered_machine_of(to).await?;
-        Some((kem, machine))
+            contacts
+                .get(to)
+                .and_then(|contact| contact.dm_capabilities.as_ref())
+                .filter(|caps| ready(caps))
+                .map(|caps| caps.kem_public_key.clone())
+        }
+        .ok_or(GOSSIP_UNREACHABLE_NO_KEY)?;
+        let (machine, source) = self
+            .unbound_recipient_machine(to)
+            .await
+            .ok_or(GOSSIP_UNREACHABLE_NO_MACHINE)?;
+        self.note_gossip_recipient_source(to, source);
+        Ok((kem, machine))
+    }
+
+    /// The machine for a recipient whose key carries none: its verified
+    /// binding first (announcement, machine-key attestation, an
+    /// authority-confirmed DM registry entry, or peer evidence, under
+    /// [`select_pinned_binding`]; never a bare claim), then the discovery
+    /// cache.
+    async fn unbound_recipient_machine(
+        &self,
+        to: &identity::AgentId,
+    ) -> Option<(identity::MachineId, GossipRecipientSource)> {
+        if let Some(binding) = self
+            .pinned_binding_now(to)
+            .await
+            .filter(|binding| binding.machine.0 != [0u8; 32])
+        {
+            return Some((
+                binding.machine,
+                GossipRecipientSource::CardWithVerifiedBinding,
+            ));
+        }
+        self.discovered_machine_of(to)
+            .await
+            .map(|machine| (machine, GossipRecipientSource::CardWithDiscovery))
+    }
+
+    /// The stand-in's recipient machine, from the same sources in the same
+    /// order as [`Self::gossip_inbox_recipient`] (the stand-in carries no
+    /// key, so only the machines are read). Test builds only.
+    #[cfg(test)]
+    async fn standin_recipient_machine(
+        &self,
+        to: &identity::AgentId,
+    ) -> Result<identity::MachineId, &'static str> {
+        match self.capability_store.lookup_binding(to) {
+            Some(binding) => {
+                self.note_gossip_recipient_source(to, GossipRecipientSource::Advert);
+                return Ok(binding.machine_id);
+            }
+            None => self.request_gossip_capability_refresh(*to),
+        }
+        if let Some(view) = self
+            .peer_evidence()
+            .usable_agent(*to, dm_capability::now_unix_ms())
+        {
+            self.note_gossip_recipient_source(to, GossipRecipientSource::PeerEvidence);
+            return Ok(view.announcement.machine_id);
+        }
+        let (machine, source) = self
+            .unbound_recipient_machine(to)
+            .await
+            .ok_or(GOSSIP_UNREACHABLE_NO_MACHINE)?;
+        self.note_gossip_recipient_source(to, source);
+        Ok(machine)
+    }
+
+    /// Ask the recipient's daemon for its signed capability advert (a
+    /// targeted refresh), at most once per [`GOSSIP_CAPABILITY_REFRESH_INTERVAL`]
+    /// per recipient.
+    fn request_gossip_capability_refresh(&self, to: identity::AgentId) {
+        let key = (self.identity.agent_id(), to);
+        let due = GOSSIP_CAPABILITY_REFRESHES.lock().is_ok_and(|mut sent| {
+            let now = std::time::Instant::now();
+            if sent.len() > 1024 {
+                sent.retain(|_, at| now.duration_since(*at) < GOSSIP_CAPABILITY_REFRESH_INTERVAL);
+            }
+            match sent.get(&key) {
+                Some(at) if now.duration_since(*at) < GOSSIP_CAPABILITY_REFRESH_INTERVAL => false,
+                _ => {
+                    sent.insert(key, now);
+                    true
+                }
+            }
+        });
+        if !due {
+            return;
+        }
+        #[cfg(test)]
+        if let Ok(mut requests) = GOSSIP_CAPABILITY_REFRESH_REQUESTS.lock() {
+            requests.push(key);
+        }
+        if let Some(runtime) = self.gossip_runtime.as_ref() {
+            let pubsub = std::sync::Arc::clone(runtime.pubsub());
+            tokio::spawn(async move {
+                if let Err(error) =
+                    dm_capability_service::publish_targeted_capability_request(&pubsub, to).await
+                {
+                    tracing::debug!(
+                        target: "dm.trace",
+                        recipient = %hex::encode(to.as_bytes()),
+                        %error,
+                        "gossip fallback: targeted capability refresh not published"
+                    );
+                }
+            });
+        }
+    }
+
+    fn note_gossip_recipient_source(&self, to: &identity::AgentId, source: GossipRecipientSource) {
+        #[cfg(test)]
+        if let Ok(mut sources) = GOSSIP_RECIPIENT_SOURCES.lock() {
+            sources.insert((self.identity.agent_id(), *to), source);
+        }
+        #[cfg(not(test))]
+        let _ = (to, source);
+    }
+
+    /// Test seam: the source the last gossip key selection for `to` used.
+    /// Test builds only.
+    #[cfg(test)]
+    pub(crate) fn gossip_recipient_source_for_testing(
+        &self,
+        to: &identity::AgentId,
+    ) -> Option<GossipRecipientSource> {
+        GOSSIP_RECIPIENT_SOURCES
+            .lock()
+            .ok()
+            .and_then(|sources| sources.get(&(self.identity.agent_id(), *to)).copied())
+    }
+
+    /// Test seam: whether this agent asked `to` for a capability refresh.
+    /// Test builds only.
+    #[cfg(test)]
+    pub(crate) fn gossip_capability_refresh_requested_for_testing(
+        &self,
+        to: &identity::AgentId,
+    ) -> bool {
+        GOSSIP_CAPABILITY_REFRESH_REQUESTS
+            .lock()
+            .is_ok_and(|requests| requests.contains(&(self.identity.agent_id(), *to)))
     }
 
     /// The machine the discovery cache names for `to`, if any.
@@ -11244,9 +11457,9 @@ impl Agent {
                 dm_send::ADMITTED_PUBLISH_EXPIRED.to_string(),
             ));
         }
-        let (kem, machine) = self.gossip_inbox_recipient(to).await.ok_or_else(|| {
+        let (kem, machine) = self.gossip_inbox_recipient(to).await.map_err(|reason| {
             dm::DmError::RecipientKeyUnavailable(format!(
-                "recipient {} has no machine-bound gossip DM capability",
+                "recipient {}: {reason}",
                 hex::encode(to.as_bytes())
             ))
         })?;
@@ -11308,11 +11521,10 @@ impl Agent {
                 dm::PINNED_ADMISSION_REFUSED.to_string(),
             ))
         };
-        let Some(machine) = self.discovered_machine_of(to).await else {
-            return Err(dm::DmError::RecipientKeyUnavailable(
-                "no machine for the recipient".to_string(),
-            ));
-        };
+        let machine = self
+            .standin_recipient_machine(to)
+            .await
+            .map_err(|reason| dm::DmError::RecipientKeyUnavailable(reason.to_string()))?;
         if self.recipient_pairing_denied(to, &machine).await.is_some() {
             return refused();
         }

@@ -442,3 +442,17 @@ async fn on_real_agents_a_not_connected_welcome_reaches_the_joiner_by_gossip() -
     joiner_agent.shutdown().await;
     outcome
 }
+
+#[test]
+fn the_gossip_unavailable_line_is_rate_limited_per_recipient() {
+    let now = Instant::now();
+    assert!(super::super::gossip_unavailable_may_log(None, now));
+    assert!(!super::super::gossip_unavailable_may_log(
+        Some(now),
+        now + Duration::from_secs(59)
+    ));
+    assert!(super::super::gossip_unavailable_may_log(
+        Some(now),
+        now + super::super::GOSSIP_UNAVAILABLE_LOG_INTERVAL
+    ));
+}

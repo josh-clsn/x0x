@@ -32,6 +32,12 @@ async fn node(dir: &std::path::Path, name: &str) -> Agent {
 /// Two meshed agents; `sender` holds `recipient`'s signed gossip-inbox
 /// capability advert.
 async fn meshed(sender: &Agent, recipient: &Agent) {
+    connected(sender, recipient).await;
+    learn_advert(sender, recipient).await;
+}
+
+/// Two agents with DM inboxes and a live connection between them.
+async fn connected(sender: &Agent, recipient: &Agent) {
     for agent in [sender, recipient] {
         let kem = std::sync::Arc::new(
             groups::kem_envelope::AgentKemKeypair::generate().expect("real KEM"),
@@ -61,6 +67,10 @@ async fn meshed(sender: &Agent, recipient: &Agent) {
             .refresh_topic_peers()
             .await;
     }
+}
+
+/// `sender` learns `recipient`'s signed gossip-inbox capability advert.
+async fn learn_advert(sender: &Agent, recipient: &Agent) {
     let ready = recipient.current_dm_capabilities();
     assert!(ready.gossip_inbox);
     let signing = gossip::SigningContext::from_keypair(recipient.identity.agent_keypair());
@@ -243,6 +253,179 @@ async fn a_refused_or_expired_gossip_publish_sends_nothing() {
             }
         },
         [&sender, &recipient],
+    )
+    .await;
+}
+
+/// `holder` knows `agent`'s gossip-inbox key only from a contact card.
+async fn card_key(holder: &Agent, agent: &Agent) {
+    holder.contacts().write().await.add(contacts::Contact {
+        agent_id: agent.agent_id(),
+        trust_level: contacts::TrustLevel::Trusted,
+        label: None,
+        added_at: 0,
+        last_seen: None,
+        identity_type: contacts::IdentityType::Known,
+        machines: Vec::new(),
+        dm_capabilities: Some(agent.current_dm_capabilities()),
+    });
+}
+
+/// WHY (re-review N1, the field state): the owner holds no capability
+/// advert for the joiner, no discovery entry and no announcement binding;
+/// it knows the joiner's key from a contact card, and the joiner's machine
+/// only from the machine-key attestation on a DM the joiner sent over the
+/// gossip inbox (its FetchRequest). The gossip leg takes that verified
+/// binding's machine, runs its checks against it, and the frame reaches
+/// the joiner. Before the fix the card key needed a discovery entry, so the
+/// frame was unreachable by gossip and stayed on the failing raw path.
+#[tokio::test]
+async fn a_card_key_with_only_an_attested_inbound_dm_binding_rides_gossip() {
+    let dir = tempfile::tempdir().expect("fixture directory");
+    let owner = node(dir.path(), "owner").await;
+    let joiner = node(dir.path(), "joiner").await;
+    run(
+        async {
+            connected(&owner, &joiner).await;
+            card_key(&owner, &joiner).await;
+            card_key(&joiner, &owner).await;
+            let joiner_id = joiner.agent_id();
+            // The field state: nothing names the joiner's machine but what
+            // its own attested DM will write.
+            owner.capability_store.forget_for_testing(&joiner_id);
+            owner
+                .identity_discovery_cache
+                .write()
+                .await
+                .remove(&joiner_id);
+            *owner.announced_machine_bindings.write().await =
+                dm_inbox::AuthenticatedMachineBindingCache::default();
+            *owner.authenticated_machine_bindings.write().await =
+                dm_inbox::AuthenticatedMachineBindingCache::default();
+            assert!(owner.pinned_binding_now(&joiner_id).await.is_none());
+
+            // The joiner's FetchRequest, over the gossip inbox.
+            let request = br#"{"type":"fetch_request","group_id":"g","welcome_id":"w"}"#.to_vec();
+            joiner
+                .send_direct_with_config(
+                    &owner.agent_id(),
+                    request,
+                    dm::DmSendConfig {
+                        require_gossip: true,
+                        require_gossip_ack: false,
+                        ..dm::DmSendConfig::default()
+                    },
+                )
+                .await
+                .expect("the joiner's request is published");
+            let bound = tokio::time::timeout(PHASE, async {
+                loop {
+                    if let Some(binding) = owner.pinned_binding_now(&joiner_id).await {
+                        return binding;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("the attested request binds the joiner's machine");
+            assert_eq!(bound.machine, joiner.machine_id());
+            assert_eq!(bound.source, PinnedMachineSource::AuthenticatedBinding);
+            // An advert or announcement the joiner sent meanwhile would hide
+            // the field state; drop them again (the attested binding stays).
+            owner.capability_store.forget_for_testing(&joiner_id);
+            owner
+                .identity_discovery_cache
+                .write()
+                .await
+                .remove(&joiner_id);
+            assert!(owner.capability_store.lookup_binding(&joiner_id).is_none());
+            assert!(owner
+                .identity_discovery_cache
+                .read()
+                .await
+                .get(&joiner_id)
+                .is_none());
+
+            assert!(owner.gossip_inbox_reachable(&joiner_id).await);
+            assert_eq!(
+                owner.gossip_recipient_source_for_testing(&joiner_id),
+                Some(GossipRecipientSource::CardWithVerifiedBinding)
+            );
+            assert!(
+                owner.gossip_capability_refresh_requested_for_testing(&joiner_id),
+                "with no cached advert, the owner asks the joiner for one"
+            );
+            let mut inbox = joiner.subscribe_direct();
+            let payload = br#"{"type":"complete","welcome_id":"w"}"#.to_vec();
+            owner
+                .send_direct_gossip_admitted(
+                    &joiner_id,
+                    &payload,
+                    &admission(true, true, Arc::new(AtomicUsize::new(0))),
+                    deadline_ms(Duration::from_secs(60)),
+                )
+                .await
+                .expect("the frame rides gossip");
+            let delivered = received(&mut inbox, &payload, PHASE)
+                .await
+                .expect("the joiner receives the frame");
+            assert_eq!(delivered.sender, owner.agent_id());
+            assert!(delivered.verified);
+        },
+        [&owner, &joiner],
+    )
+    .await;
+}
+
+/// WHY (re-review N1): a revoked machine named by the verified binding
+/// blocks the gossip leg as it blocks the raw path.
+#[tokio::test]
+async fn a_card_key_bound_to_a_revoked_machine_is_refused() {
+    let dir = tempfile::tempdir().expect("fixture directory");
+    let owner = node(dir.path(), "owner").await;
+    let joiner = node(dir.path(), "joiner").await;
+    run(
+        async {
+            connected(&owner, &joiner).await;
+            card_key(&owner, &joiner).await;
+            let joiner_id = joiner.agent_id();
+            owner.capability_store.forget_for_testing(&joiner_id);
+            owner
+                .identity_discovery_cache
+                .write()
+                .await
+                .remove(&joiner_id);
+            *owner.announced_machine_bindings.write().await =
+                dm_inbox::AuthenticatedMachineBindingCache::default();
+            *owner.authenticated_machine_bindings.write().await =
+                dm_inbox::AuthenticatedMachineBindingCache::default();
+            dm_inbox::record_authenticated_machine_binding(
+                &owner.authenticated_machine_bindings,
+                joiner_id,
+                joiner.machine_id(),
+                dm::now_unix_ms() / 1000,
+            )
+            .await;
+            assert!(
+                owner.gossip_inbox_reachable(&joiner_id).await,
+                "control: the verified binding names a machine"
+            );
+            owner
+                .revocation_set
+                .write()
+                .await
+                .revoke_machine_for_testing(joiner.machine_id());
+            let sent = owner
+                .send_direct_gossip_admitted(
+                    &joiner_id,
+                    b"to-a-revoked-machine",
+                    &admission(true, true, Arc::new(AtomicUsize::new(0))),
+                    deadline_ms(Duration::from_secs(60)),
+                )
+                .await;
+            assert!(sent.is_err(), "{sent:?}");
+        },
+        [&owner, &joiner],
     )
     .await;
 }

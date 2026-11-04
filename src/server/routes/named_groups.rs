@@ -46544,6 +46544,45 @@ fn join_artifact_may_use_gossip(kind: &str) -> bool {
     GOSSIP_CAPABLE_JOIN_ARTIFACTS.contains(&kind)
 }
 
+/// The least time between two "gossip unavailable" lines per recipient.
+const GOSSIP_UNAVAILABLE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+static GOSSIP_UNAVAILABLE_LOGGED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<AgentId, Instant>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Whether a "gossip unavailable" line for a recipient last logged at
+/// `last` may be logged at `now`.
+fn gossip_unavailable_may_log(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|last| now.duration_since(last) >= GOSSIP_UNAVAILABLE_LOG_INTERVAL)
+}
+
+/// A gossip-capable frame stays on raw QUIC because the gossip inbox
+/// cannot carry it: say why, once a minute per recipient, so a device log
+/// tells "gossip unavailable" apart from "gossip tried".
+fn note_join_artifact_gossip_unavailable(recipient: &AgentId, kind: &'static str, reason: &str) {
+    let due = GOSSIP_UNAVAILABLE_LOGGED.lock().is_ok_and(|mut logged| {
+        let now = Instant::now();
+        if logged.len() > 1024 {
+            logged.retain(|_, at| now.duration_since(*at) < GOSSIP_UNAVAILABLE_LOG_INTERVAL);
+        }
+        if gossip_unavailable_may_log(logged.get(recipient).copied(), now) {
+            logged.insert(*recipient, now);
+            true
+        } else {
+            false
+        }
+    });
+    if due {
+        tracing::info!(
+            kind,
+            recipient = %LogHexId::agent(&hex::encode(recipient.as_bytes())),
+            reason,
+            "join artifact: gossip inbox unavailable; raw QUIC only"
+        );
+    }
+}
+
 /// A raw join-artifact exchange that failed. `unwritten_not_connected`
 /// comes from the pinned send itself: the recipient was not connected and
 /// its seam never admitted a write, so no byte of this frame left. Only
@@ -46569,8 +46608,14 @@ pub(super) async fn send_join_artifact(
     admission: x0x::dm::ArtifactAdmission,
     deadline: Instant,
 ) -> std::result::Result<(), String> {
-    let gossip =
-        join_artifact_may_use_gossip(kind) && state.agent.gossip_inbox_reachable(recipient).await;
+    let gossip = join_artifact_may_use_gossip(kind)
+        && match state.agent.gossip_inbox_reach(recipient).await {
+            Ok(()) => true,
+            Err(reason) => {
+                note_join_artifact_gossip_unavailable(recipient, kind, reason);
+                false
+            }
+        };
     if gossip && !state.agent.has_live_direct_connection(recipient).await {
         return send_join_artifact_gossip(
             state, recipient, payload, group_id, kind, &admission, deadline, true,
