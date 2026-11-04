@@ -45627,7 +45627,11 @@ async fn purge_member_join_artifacts(state: &AppState, group_id: &str, member_he
 }
 
 /// Abort the owner-side streams of these Welcomes and wait until each has
-/// stopped (none may send another frame once this returns).
+/// stopped: none hands another frame to a transport once this returns.
+/// Frames a stream already published on the gossip inbox can still arrive
+/// later (pubsub forwards from its 60 s cache, and an honest recipient
+/// drops them only once their envelope expires on its own clock); each
+/// of those passed its admission while the recipient was eligible.
 async fn stop_welcome_streams(state: &AppState, welcome_ids: &[String]) {
     for welcome_id in welcome_ids {
         let stream = state
@@ -46423,7 +46427,7 @@ const JOIN_ARTIFACT_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 /// raw QUIC in ONE admitted physical exchange.
 ///
 /// The path is x0x's pinned single-exchange raw-QUIC send
-/// ([`Agent::send_direct_pinned_admitted`]): never an ACK-v2 exchange (whose
+/// ([`Agent::send_direct_pinned_admitted_classified`]): never an ACK-v2 exchange (whose
 /// internal retry and the X0X-0053 reissue write again without admission),
 /// never a retry. Only [`send_join_artifact`] decides whether a
 /// not-connected failure is carried on the gossip inbox instead, as a
@@ -46472,17 +46476,17 @@ async fn send_join_artifact_raw(
         );
         state
             .agent
-            .send_direct_pinned_admitted(recipient, payload, admission, resolve_within)
+            .send_direct_pinned_admitted_classified(recipient, payload, admission, resolve_within)
             .await
     };
     let outcome = match tokio::time::timeout_at(exchange_deadline.into(), exchange).await {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(RawArtifactFailure {
-            disconnected: matches!(e, x0x::dm::DmError::PeerDisconnected { .. }),
-            reason: e.to_string(),
+        Ok(Err(failure)) => Err(RawArtifactFailure {
+            unwritten_not_connected: failure.unwritten_not_connected,
+            reason: failure.error.to_string(),
         }),
         Err(_) => Err(RawArtifactFailure {
-            disconnected: false,
+            unwritten_not_connected: false,
             reason: format!("{kind} exchange deadline elapsed"),
         }),
     };
@@ -46523,23 +46527,31 @@ async fn send_join_artifact_raw(
 /// the gossip inbox when the recipient has no direct path: the owner's
 /// Welcome frames and the join-result response (inline, reference and
 /// chunks). Class-K shares stay raw-only.
+const GOSSIP_CAPABLE_JOIN_ARTIFACTS: [&str; 6] = [
+    "welcome_offer",
+    "welcome_frame",
+    "welcome_complete",
+    "join_result",
+    "join_result_reference",
+    "join_result_chunk",
+];
+
+/// The class-K kinds, which never ride gossip.
+#[cfg(test)]
+const RAW_ONLY_JOIN_ARTIFACTS: [&str; 1] = ["secure_share"];
+
 fn join_artifact_may_use_gossip(kind: &str) -> bool {
-    matches!(
-        kind,
-        "welcome_offer"
-            | "welcome_frame"
-            | "welcome_complete"
-            | "join_result"
-            | "join_result_reference"
-            | "join_result_chunk"
-    )
+    GOSSIP_CAPABLE_JOIN_ARTIFACTS.contains(&kind)
 }
 
-/// A raw join-artifact exchange that failed; `disconnected` when it failed
-/// because the recipient is not connected.
+/// A raw join-artifact exchange that failed. `unwritten_not_connected`
+/// comes from the pinned send itself: the recipient was not connected and
+/// its seam never admitted a write, so no byte of this frame left. Only
+/// then may the frame be carried on the gossip inbox; any failure after a
+/// handed-over write (or a timeout) never is.
 struct RawArtifactFailure {
     reason: String,
-    disconnected: bool,
+    unwritten_not_connected: bool,
 }
 
 /// Hand one join-artifact frame to the transport: raw QUIC
@@ -46571,7 +46583,7 @@ pub(super) async fn send_join_artifact(
     .await
     {
         Ok(()) => Ok(()),
-        Err(failure) if failure.disconnected && gossip => {
+        Err(failure) if failure.unwritten_not_connected && gossip => {
             tracing::info!(
                 kind,
                 recipient = %LogHexId::agent(&hex::encode(recipient.as_bytes())),
@@ -47948,8 +47960,10 @@ async fn handle_join_result_message_bound(
                             payload_len,
                             payload_hash = %payload_hash,
                         );
-                        // The send only reports Ok on a recipient ACK, so this is
-                        // a positive delivery: clear the member's pending_welcome.
+                        // Ok means the result was handed over (written to the
+                        // raw stream, or published on the gossip inbox), not
+                        // that the joiner received it. Clearing pending_welcome
+                        // here is a UI hint only; seating is the joiner's.
                         mark_join_result_delivered(&task_state, &key_for_task).await;
                     }
                 },
@@ -50314,6 +50328,7 @@ pub(in crate::server) mod tests {
     mod treekem_bytes_binding;
     #[path = "issue1224_unsigned_group_card.rs"]
     mod unsigned_group_card_1224;
+    mod welcome_gossip_admission;
     mod welcome_gossip_fallback;
     mod welcome_unblock;
     mod wp_c;

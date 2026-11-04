@@ -17,9 +17,12 @@ use super::adr0107_stuck_join_rearm::{
 
 type Frames = Arc<StdMutex<Vec<Vec<u8>>>>;
 
-const WAIT: Duration = Duration::from_secs(10);
+pub(super) const WAIT: Duration = Duration::from_secs(10);
 
-fn transports_to(state: &AppState, recipient: &str) -> Vec<(&'static str, &'static str)> {
+pub(super) fn transports_to(
+    state: &AppState,
+    recipient: &str,
+) -> Vec<(&'static str, &'static str)> {
     state
         .named_group_test_recorders
         .join_artifact_transports
@@ -324,6 +327,7 @@ async fn without_a_direct_path_the_welcome_and_join_result_ride_the_gossip_inbox
         .agent
         .route_gossip_inbox_to_standin_for_testing();
     let (frames, carrier) = carry(&s.authority, &s.j2, sink, true);
+    known_recipient(&s.authority, &s.j2).await?;
     let reference = welcome_ref_of(&s.j2_add).expect("J2's Welcome is staged by reference");
 
     let welcome = fetch_welcome(&s, &reference).await?;
@@ -377,12 +381,12 @@ async fn without_a_direct_path_the_welcome_and_join_result_ride_the_gossip_inbox
 }
 
 #[derive(Clone, Copy, Debug)]
-enum Invalidation {
+pub(super) enum Invalidation {
     Ban,
     Removal,
 }
 
-async fn invalidate(s: &Fixture, how: Invalidation) -> StatusCode {
+pub(super) async fn invalidate(s: &Fixture, how: Invalidation) -> StatusCode {
     let member = hex_of(&s.j2);
     let extension =
         axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true });
@@ -421,6 +425,7 @@ async fn a_ban_or_removal_mid_stream_stops_a_gossip_carried_welcome() -> anyhow:
             .agent
             .route_gossip_inbox_to_standin_for_testing();
         let (frames, carrier) = carry(&s.authority, &s.j2, sink, false);
+        known_recipient(&s.authority, &s.j2).await?;
         let frame = super::super::join_egress_test_barrier::arm(&j2_hex, "welcome_frame");
         let purge = super::super::join_egress_test_barrier::arm(&j2_hex, "purge");
         assert!(serve_welcome(&s.authority, &s.j2, &s.stable, &welcome_id).await);
@@ -464,7 +469,7 @@ async fn a_ban_or_removal_mid_stream_stops_a_gossip_carried_welcome() -> anyhow:
     Ok(())
 }
 
-fn clone_fixture(s: &Fixture) -> Fixture {
+pub(super) fn clone_fixture(s: &Fixture) -> Fixture {
     Fixture {
         dir: s.dir.clone(),
         authority: Arc::clone(&s.authority),
@@ -483,7 +488,7 @@ fn clone_fixture(s: &Fixture) -> Fixture {
 }
 
 /// An admission whose phases both pass.
-fn admit_all() -> x0x::dm::ArtifactAdmission {
+pub(super) fn admit_all() -> x0x::dm::ArtifactAdmission {
     Arc::new(|| Box::pin(async { Some(Box::new(|| true) as x0x::dm::SeamAdmission) }))
 }
 
@@ -493,7 +498,7 @@ fn refuse_at_seam() -> x0x::dm::ArtifactAdmission {
 
 /// The sender knows the recipient by a class A record and a gossip-inbox
 /// capability advert.
-async fn known_recipient(sender: &AppState, recipient: &AppState) -> anyhow::Result<()> {
+pub(super) async fn known_recipient(sender: &AppState, recipient: &AppState) -> anyhow::Result<()> {
     let kem = x0x::groups::kem_envelope::AgentKemKeypair::generate()?;
     assert!(sender.agent.capability_store().insert(
         recipient.agent.agent_id(),
@@ -616,6 +621,23 @@ async fn join_artifacts_prefer_raw_and_fall_back_to_the_gossip_inbox() -> anyhow
         ]
     );
     assert_eq!(take(&mut sink), vec![b"raw-lost".to_vec()]);
+
+    // Live, and the raw exchange fails AFTER its write was handed over: the
+    // bytes may have left, so the frame is never carried a second way.
+    sender
+        .agent
+        .script_pinned_failures_for_testing(&[x0x::InjectedPinnedFailure::AfterWrite]);
+    clear();
+    let sent = send(b"written-then-reset", "welcome_frame", admit_all()).await;
+    assert!(sent.is_err(), "{sent:?}");
+    assert_eq!(
+        transports_to(&sender, &to_hex),
+        vec![("welcome_frame", "pinned_single_exchange")]
+    );
+    assert!(
+        take(&mut sink).is_empty(),
+        "a written frame was carried again"
+    );
 
     // A class-K share stays raw-only, even with no direct connection.
     connected(false);

@@ -597,6 +597,57 @@ pub enum DmTypedPayloadCompletion {
 /// dropped channel does.
 pub type DmTypedPayloadCompletionResult = Result<DmTypedPayloadCompletion, String>;
 
+/// The least time between two warnings for DMs dropped outside their
+/// timestamp window.
+const TIMESTAMP_DROP_WARN_INTERVAL_MS: u64 = 30_000;
+
+static TIMESTAMP_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TIMESTAMP_DROP_LAST_WARN_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a drop at `now` may warn, given the last warning at `last`.
+fn timestamp_drop_may_warn(last: u64, now: u64) -> bool {
+    last == 0 || now.saturating_sub(last) >= TIMESTAMP_DROP_WARN_INTERVAL_MS
+}
+
+/// A DM outside its timestamp window is dropped unseen; say so (at most
+/// once per [`TIMESTAMP_DROP_WARN_INTERVAL_MS`], with the drops since),
+/// so an expired or clock-skewed sender leaves evidence on the receiver.
+/// `skew_ms` is the sender's creation time minus this clock.
+fn note_timestamp_window_drop(
+    envelope: &crate::dm::DmEnvelope,
+    reason: crate::dm::TimestampValidationError,
+    now: u64,
+) {
+    let drops = TIMESTAMP_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let last = TIMESTAMP_DROP_LAST_WARN_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if !timestamp_drop_may_warn(last, now)
+        || TIMESTAMP_DROP_LAST_WARN_MS
+            .compare_exchange(
+                last,
+                now,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+    {
+        return;
+    }
+    let skew_ms = i128::from(envelope.created_at_unix_ms) - i128::from(now);
+    tracing::warn!(
+        target: "dm.trace",
+        stage = "inbound_timestamp_window_dropped",
+        sender = %hex::encode(envelope.sender_agent_id),
+        reason = ?reason,
+        skew_ms,
+        lifetime_ms = envelope
+            .expires_at_unix_ms
+            .saturating_sub(envelope.created_at_unix_ms),
+        drops_total = drops,
+        "DM dropped outside its timestamp window (expired, or the sender's clock is skewed)"
+    );
+}
+
 /// A decrypted, verified DM payload routed before generic direct-message fan-out.
 ///
 /// Deliberately NOT `Clone`: `completion` holds a `oneshot::Sender`, which has
@@ -1560,13 +1611,12 @@ impl InboxPipeline {
         }
 
         let now = now_unix_ms();
-        if validate_timestamp_window(
+        if let Err(reason) = validate_timestamp_window(
             envelope.created_at_unix_ms,
             envelope.expires_at_unix_ms,
             now,
-        )
-        .is_err()
-        {
+        ) {
+            note_timestamp_window_drop(&envelope, reason, now);
             return;
         }
 
@@ -4357,6 +4407,19 @@ mod tests {
     /// pre-subscribes the sender's inbox topic ON RECEIPT (the authoritative
     /// moment), so the ACK publish that follows has a gossip route. Also
     /// verifies the agent→machine registration for the C5 Direct hedge.
+    #[test]
+    fn timestamp_window_drop_warnings_are_rate_limited() {
+        assert!(timestamp_drop_may_warn(0, 5));
+        assert!(!timestamp_drop_may_warn(
+            1_000,
+            1_000 + TIMESTAMP_DROP_WARN_INTERVAL_MS - 1
+        ));
+        assert!(timestamp_drop_may_warn(
+            1_000,
+            1_000 + TIMESTAMP_DROP_WARN_INTERVAL_MS
+        ));
+    }
+
     #[tokio::test]
     async fn leaf_receiver_of_durable_dm_pre_subscribes_sender_inbox_on_receipt() {
         let sender = test_keypair();

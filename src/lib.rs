@@ -674,24 +674,63 @@ fn gossip_inbox_standin(agent: &identity::AgentId) -> Option<GossipInboxStandinS
         .and_then(|sinks| sinks.get(agent).cloned())
 }
 
-/// Test builds: how many more pinned sends of each agent fail as a lost
-/// connection does, before any admission runs.
+/// How a pinned send ended, as the send itself observed it: whether its
+/// seam admitted a write (bytes handed to a stream), and whether it failed
+/// because the recipient was not connected.
+#[derive(Debug, Default)]
+pub(crate) struct PinnedOutcome {
+    handed: std::sync::atomic::AtomicBool,
+    not_connected: std::sync::atomic::AtomicBool,
+}
+
+impl PinnedOutcome {
+    /// A failure before any write: not connected when it says so.
+    fn note_unwritten(&self, error: &dm::DmError) {
+        if matches!(error, dm::DmError::PeerDisconnected { .. }) {
+            self.not_connected
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// A classified pinned-send failure (see
+/// [`Agent::send_direct_pinned_admitted_classified`]).
+#[derive(Debug)]
+pub(crate) struct PinnedSendFailure {
+    pub(crate) error: dm::DmError,
+    /// Not connected, and no byte was handed to a stream.
+    pub(crate) unwritten_not_connected: bool,
+}
+
+/// Test builds: a scripted failure of a pinned send.
 #[cfg(test)]
-static PINNED_STANDIN_DISCONNECTS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<identity::AgentId, usize>>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InjectedPinnedFailure {
+    /// Not connected, before any admission or write.
+    NotConnected,
+    /// The admission passes and the write is handed over, then the
+    /// transport fails (the bytes may have left).
+    AfterWrite,
+}
+
+/// Test builds: the scripted failures of each agent's next pinned sends.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+static PINNED_STANDIN_FAILURES: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<
+            identity::AgentId,
+            std::collections::VecDeque<InjectedPinnedFailure>,
+        >,
+    >,
 > = std::sync::LazyLock::new(Default::default);
 
 #[cfg(test)]
-fn take_pinned_standin_disconnect(agent: &identity::AgentId) -> bool {
-    PINNED_STANDIN_DISCONNECTS
+fn take_pinned_standin_failure(agent: &identity::AgentId) -> Option<InjectedPinnedFailure> {
+    PINNED_STANDIN_FAILURES
         .lock()
-        .is_ok_and(|mut counts| match counts.get_mut(agent) {
-            Some(left) if *left > 0 => {
-                *left -= 1;
-                true
-            }
-            _ => false,
-        })
+        .ok()
+        .and_then(|mut queues| queues.get_mut(agent).and_then(|queue| queue.pop_front()))
 }
 
 /// The core agent that participates in the x0x gossip network.
@@ -10975,12 +11014,34 @@ impl Agent {
     /// contention at the seam, writes nothing. The caller bounds the whole
     /// call with its exchange deadline, and `resolve_within` must leave
     /// part of that deadline for the exchange itself.
+    ///
+    /// Callers that may carry a failed frame another way use
+    /// [`Self::send_direct_pinned_admitted_classified`].
+    #[cfg(test)]
     pub(crate) async fn send_direct_pinned_admitted(
         &self,
         to: &identity::AgentId,
         payload: &[u8],
         admission: &dm::ArtifactAdmission,
         resolve_within: std::time::Duration,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        self.send_direct_pinned_admitted_tracked(
+            to,
+            payload,
+            admission,
+            resolve_within,
+            std::sync::Arc::new(PinnedOutcome::default()),
+        )
+        .await
+    }
+
+    async fn send_direct_pinned_admitted_tracked(
+        &self,
+        to: &identity::AgentId,
+        payload: &[u8],
+        admission: &dm::ArtifactAdmission,
+        resolve_within: std::time::Duration,
+        outcome: std::sync::Arc<PinnedOutcome>,
     ) -> Result<dm::DmReceipt, dm::DmError> {
         // ADR-0043 signing gate: the same egress refusal the general path
         // applies before any envelope or transport work.
@@ -11001,7 +11062,7 @@ impl Agent {
         // stale suspicion must not suppress the recovery.
         self.direct_messaging.record_outgoing_started(*to, None);
         let result = self
-            .send_direct_pinned_admitted_inner(to, payload, admission, resolve_within)
+            .send_direct_pinned_admitted_inner(to, payload, admission, resolve_within, outcome)
             .await;
         match &result {
             Ok(_) => self
@@ -11012,24 +11073,60 @@ impl Agent {
         result
     }
 
+    /// The pinned single-exchange send (`send_direct_pinned_admitted`), with its failure classified:
+    /// [`PinnedSendFailure::unwritten_not_connected`] is true only when the
+    /// recipient was not connected AND no byte was handed to a stream (the
+    /// seam never admitted a write). Only such a failure may be carried
+    /// another way without a second copy of the bytes.
+    pub(crate) async fn send_direct_pinned_admitted_classified(
+        &self,
+        to: &identity::AgentId,
+        payload: &[u8],
+        admission: &dm::ArtifactAdmission,
+        resolve_within: std::time::Duration,
+    ) -> Result<dm::DmReceipt, PinnedSendFailure> {
+        let outcome = std::sync::Arc::new(PinnedOutcome::default());
+        let result = self
+            .send_direct_pinned_admitted_tracked(
+                to,
+                payload,
+                admission,
+                resolve_within,
+                std::sync::Arc::clone(&outcome),
+            )
+            .await;
+        result.map_err(|error| PinnedSendFailure {
+            unwritten_not_connected: !outcome.handed.load(std::sync::atomic::Ordering::SeqCst)
+                && outcome
+                    .not_connected
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            error,
+        })
+    }
+
     /// ADR 0107 gossip fallback: whether a recovery-response frame to `to`
     /// can ride this agent's gossip inbox (a gossip runtime, and a usable
     /// gossip-inbox KEM key for the recipient).
     pub(crate) async fn gossip_inbox_reachable(&self, to: &identity::AgentId) -> bool {
         #[cfg(test)]
         if self.gossip_runtime.is_none() {
-            return gossip_inbox_standin(&self.identity.agent_id()).is_some();
+            return gossip_inbox_standin(&self.identity.agent_id()).is_some()
+                && self.discovered_machine_of(to).await.is_some();
         }
         self.gossip_runtime.is_some() && self.gossip_inbox_recipient(to).await.is_some()
     }
 
-    /// The recipient's gossip-inbox KEM key and, when known, its machine:
-    /// the signed capability advert, then usable peer evidence, then the
-    /// contact card (the order a general v1 send uses).
+    /// The recipient's gossip-inbox KEM key and the machine every check
+    /// runs against: the signed capability advert (machine-bound), then
+    /// usable peer evidence (machine-bound), then the contact card's key
+    /// with the machine the discovery cache names. A key with no machine is
+    /// never used: machine revocation and B/P pairing need one, as on the
+    /// raw path. Stricter than the general v1 path, which also accepts a
+    /// card key alone and does not validate the key.
     async fn gossip_inbox_recipient(
         &self,
         to: &identity::AgentId,
-    ) -> Option<(Vec<u8>, Option<identity::MachineId>)> {
+    ) -> Option<(Vec<u8>, identity::MachineId)> {
         let ready = |caps: &dm::DmCapabilities| {
             caps.gossip_inbox && dm::validate_recipient_kem_key(&caps.kem_public_key).is_ok()
         };
@@ -11037,7 +11134,7 @@ impl Agent {
             if ready(&binding.capabilities) {
                 return Some((
                     binding.capabilities.kem_public_key.clone(),
-                    Some(binding.machine_id),
+                    binding.machine_id,
                 ));
             }
         }
@@ -11048,13 +11145,17 @@ impl Agent {
             if ready(&view.advert.capabilities) {
                 return Some((
                     view.advert.capabilities.kem_public_key.clone(),
-                    Some(view.announcement.machine_id),
+                    view.announcement.machine_id,
                 ));
             }
         }
-        let contacts = self.contact_store.read().await;
-        let caps = contacts.get(to)?.dm_capabilities.as_ref()?;
-        ready(caps).then(|| (caps.kem_public_key.clone(), None))
+        let kem = {
+            let contacts = self.contact_store.read().await;
+            let caps = contacts.get(to)?.dm_capabilities.as_ref()?;
+            ready(caps).then(|| caps.kem_public_key.clone())?
+        };
+        let machine = self.discovered_machine_of(to).await?;
+        Some((kem, machine))
     }
 
     /// The machine the discovery cache names for `to`, if any.
@@ -11067,43 +11168,23 @@ impl Agent {
             .filter(|m| m.0 != [0u8; 32])
     }
 
-    /// The seam check of an admitted gossip publish: this agent's own
-    /// revocation and B/P pairing checks for the recipient (its machine,
-    /// when known), then the caller's. Synchronous; contention refuses.
-    fn gossip_admission_seam(
-        &self,
-        agent: identity::AgentId,
-        machine: Option<identity::MachineId>,
-        caller: dm::SeamAdmission,
-    ) -> Box<dyn FnOnce() -> bool + Send> {
-        match machine {
-            Some(machine) => Box::new(self.pinned_admission_seam(agent, machine, false, caller)),
-            None => {
-                let revocation = std::sync::Arc::clone(&self.revocation_set);
-                Box::new(move || {
-                    revocation
-                        .try_read()
-                        .is_ok_and(|revoked| !revoked.is_agent_revoked(&agent))
-                        && caller()
-                })
-            }
-        }
-    }
-
     /// ADR 0107 gossip fallback (2026-11-04): send one recovery-response
     /// frame to `to` in ONE admitted publish on its gossip inbox, for a
     /// recipient this agent has no direct path to.
     ///
-    /// Like [`Self::send_direct_pinned_admitted`], `admission` runs in two
+    /// Like [`Self::send_direct_pinned_admitted_classified`], `admission` runs in two
     /// phases: its async pre-phase after the recipient's key and pairing
     /// checks, and its seam synchronously, after the envelope is sealed and
-    /// immediately before the publish, together with this agent's own
-    /// revocation and pairing checks. Any refusal publishes nothing. The
-    /// publish is single: no ACK wait, no retry, no legacy-bus copy, so
-    /// every resend is the caller's and is admitted afresh. The envelope
-    /// expires at `expires_by_unix_ms`, capped at
-    /// [`dm_send::ADMITTED_PUBLISH_LIFETIME_MS`]: a copy gossip forwards
-    /// later is dropped by the recipient once it expires.
+    /// immediately before the publish, together with the raw path's own
+    /// seam checks (agent and machine revocation, B/P pairing) for the
+    /// recipient's machine, which must be known. Any refusal publishes
+    /// nothing. x0x publishes once: no ACK wait, no retry, no legacy-bus
+    /// copy; every further x0x copy is the caller's, admitted afresh.
+    /// Below x0x, pubsub itself re-sends the same envelope without any
+    /// admission (its stranded-publish retry at +8 s, and IWANT serves
+    /// from its 60 s cache). The envelope expires at `expires_by_unix_ms`,
+    /// capped at [`dm_send::ADMITTED_PUBLISH_LIFETIME_MS`]; only an honest
+    /// recipient enforces that, on its own clock.
     pub(crate) async fn send_direct_gossip_admitted(
         &self,
         to: &identity::AgentId,
@@ -11163,29 +11244,25 @@ impl Agent {
                 dm_send::ADMITTED_PUBLISH_EXPIRED.to_string(),
             ));
         }
-        let (kem, bound) = self.gossip_inbox_recipient(to).await.ok_or_else(|| {
+        let (kem, machine) = self.gossip_inbox_recipient(to).await.ok_or_else(|| {
             dm::DmError::RecipientKeyUnavailable(format!(
-                "recipient {} has no gossip DM capability",
+                "recipient {} has no machine-bound gossip DM capability",
                 hex::encode(to.as_bytes())
             ))
         })?;
-        let machine = match bound {
-            Some(machine) => Some(machine),
-            None => self.discovered_machine_of(to).await,
-        };
-        if let Some(machine) = machine {
-            if let Some(denial) = self.recipient_pairing_denied(to, &machine).await {
-                return Err(dm::DmError::EnvelopeConstruction(format!(
-                    "recipient pairing denied (ADR-0043 B/P): {denial:?}"
-                )));
-            }
+        if let Some(denial) = self.recipient_pairing_denied(to, &machine).await {
+            return Err(dm::DmError::EnvelopeConstruction(format!(
+                "recipient pairing denied (ADR-0043 B/P): {denial:?}"
+            )));
         }
         let Some(seam) = admission().await else {
             return Err(dm::DmError::NoConnectivity(
                 dm::PINNED_ADMISSION_REFUSED.to_string(),
             ));
         };
-        let seam = self.gossip_admission_seam(*to, machine, seam);
+        // The raw path's own seam checks (agent and machine revocation, B/P
+        // pairing), then the caller's.
+        let seam = self.pinned_admission_seam(*to, machine, false, seam);
         let signing = gossip::SigningContext::from_keypair(self.identity.agent_keypair());
         dm_send::publish_admitted_once(
             dm_send::AdmittedPublishContext {
@@ -11231,16 +11308,18 @@ impl Agent {
                 dm::PINNED_ADMISSION_REFUSED.to_string(),
             ))
         };
-        let machine = self.discovered_machine_of(to).await;
-        if let Some(machine) = machine {
-            if self.recipient_pairing_denied(to, &machine).await.is_some() {
-                return refused();
-            }
+        let Some(machine) = self.discovered_machine_of(to).await else {
+            return Err(dm::DmError::RecipientKeyUnavailable(
+                "no machine for the recipient".to_string(),
+            ));
+        };
+        if self.recipient_pairing_denied(to, &machine).await.is_some() {
+            return refused();
         }
         let Some(seam) = admission().await else {
             return refused();
         };
-        if !self.gossip_admission_seam(*to, machine, seam)() {
+        if !self.pinned_admission_seam(*to, machine, false, seam)() {
             return refused();
         }
         sink.send((*to, payload.to_vec())).map_err(|_| {
@@ -11255,7 +11334,14 @@ impl Agent {
         payload: &[u8],
         admission: &dm::ArtifactAdmission,
         resolve_within: std::time::Duration,
+        outcome: std::sync::Arc<PinnedOutcome>,
     ) -> Result<dm::DmReceipt, dm::DmError> {
+        #[cfg(test)]
+        if let Some(injected) = take_pinned_standin_failure(&self.identity.agent_id()) {
+            return self
+                .injected_pinned_failure(to, admission, injected, &outcome)
+                .await;
+        }
         #[cfg(test)]
         if self.network.is_none() {
             return self
@@ -11279,7 +11365,8 @@ impl Agent {
                 send_start,
                 deadline,
             )
-            .await?;
+            .await
+            .inspect_err(|error| outcome.note_unwritten(error))?;
         let Some(seam) = admission().await else {
             return Err(dm::DmError::NoConnectivity(
                 dm::PINNED_ADMISSION_REFUSED.to_string(),
@@ -11290,10 +11377,15 @@ impl Agent {
         let refused_at_seam = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let seam = {
             let refused_at_seam = std::sync::Arc::clone(&refused_at_seam);
+            let outcome = std::sync::Arc::clone(&outcome);
             let checks = self.pinned_admission_seam(*to, target.machine_id, true, seam);
             move || {
                 let admitted = checks();
-                if !admitted {
+                if admitted {
+                    outcome
+                        .handed
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                } else {
                     refused_at_seam.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
                 admitted
@@ -11311,6 +11403,13 @@ impl Agent {
             return Err(dm::DmError::NoConnectivity(
                 dm::PINNED_ADMISSION_REFUSED.to_string(),
             ));
+        }
+        if sent.is_err() && !outcome.handed.load(std::sync::atomic::Ordering::SeqCst) {
+            // No live generation, a changed generation, or no stream: the
+            // seam never admitted a write, so nothing left.
+            outcome
+                .not_connected
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
         sent.map_err(Self::map_raw_quic_dm_error)?;
         tracing::debug!(
@@ -11370,11 +11469,6 @@ impl Agent {
         admission: &dm::ArtifactAdmission,
         resolve_within: std::time::Duration,
     ) -> Result<dm::DmReceipt, dm::DmError> {
-        if take_pinned_standin_disconnect(&self.identity.agent_id()) {
-            return Err(Self::map_raw_quic_dm_error(
-                error::NetworkError::AgentNotConnected(to.0),
-            ));
-        }
         let strict = pinned_standin_is_strict(&self.identity.agent_id());
         let machine = if strict {
             // The real path's resolution and target selection (repair,
@@ -11474,8 +11568,56 @@ impl Agent {
     /// runs. Test builds only.
     #[cfg(test)]
     pub(crate) fn fail_pinned_sends_as_disconnected_for_testing(&self, count: usize) {
-        if let Ok(mut counts) = PINNED_STANDIN_DISCONNECTS.lock() {
-            counts.insert(self.identity.agent_id(), count);
+        self.script_pinned_failures_for_testing(&vec![InjectedPinnedFailure::NotConnected; count]);
+    }
+
+    /// Test seam: the scripted failures of this agent's next pinned sends,
+    /// in order (on a real network too). Test builds only.
+    #[cfg(test)]
+    pub(crate) fn script_pinned_failures_for_testing(&self, failures: &[InjectedPinnedFailure]) {
+        if let Ok(mut queues) = PINNED_STANDIN_FAILURES.lock() {
+            queues.insert(self.identity.agent_id(), failures.iter().copied().collect());
+        }
+    }
+
+    /// A scripted pinned failure. `AfterWrite` runs both admission phases
+    /// first, as the real path does before its write. Test builds only.
+    #[cfg(test)]
+    async fn injected_pinned_failure(
+        &self,
+        to: &identity::AgentId,
+        admission: &dm::ArtifactAdmission,
+        injected: InjectedPinnedFailure,
+        outcome: &PinnedOutcome,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        let refused = || {
+            Err(dm::DmError::NoConnectivity(
+                dm::PINNED_ADMISSION_REFUSED.to_string(),
+            ))
+        };
+        match injected {
+            InjectedPinnedFailure::NotConnected => {
+                let error =
+                    Self::map_raw_quic_dm_error(error::NetworkError::AgentNotConnected(to.0));
+                outcome.note_unwritten(&error);
+                Err(error)
+            }
+            InjectedPinnedFailure::AfterWrite => {
+                let Some(seam) = admission().await else {
+                    return refused();
+                };
+                if !seam() {
+                    return refused();
+                }
+                outcome
+                    .handed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                // A post-write reset reads as a lost connection; the
+                // classification must still refuse to carry it again.
+                Err(Self::map_raw_quic_dm_error(
+                    error::NetworkError::ConnectionReset(to.0),
+                ))
+            }
         }
     }
 

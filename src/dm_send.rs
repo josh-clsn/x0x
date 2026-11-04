@@ -37,20 +37,29 @@ pub(crate) const PUBLISH_ONLY_REDUNDANT_REPUBLISH_DELAY: Duration = Duration::fr
 const ACK_LEGACY_BUS_FALLBACK_DELAY: Duration = Duration::from_millis(250);
 
 /// ADR 0107 gossip fallback: the longest an admitted recovery-response
-/// envelope stays acceptable. Gossip may still forward a published frame
-/// after a later invalidation (a stranded-publish retry, an IWANT serve);
-/// the recipient drops it once it expires.
+/// envelope stays acceptable to an honest recipient, on its own clock.
+/// This is hygiene, not a security bound: pubsub keeps forwarding a
+/// published frame for its 60 s cache window (a stranded-publish retry at
+/// +8 s, IWANT serves, other peers' caches), a recipient whose clock is
+/// behind accepts it later, and a malicious recipient ignores the expiry.
+/// What bounds exposure is that every published frame passed its
+/// admission while the recipient was eligible.
 pub(crate) const ADMITTED_PUBLISH_LIFETIME_MS: u64 = 30_000;
+
+/// The shortest lifetime worth publishing: a frame that would expire
+/// sooner (its artifact deadline is that close) is refused instead, as a
+/// recipient with ordinary clock skew would drop it unseen.
+pub(crate) const ADMITTED_PUBLISH_MIN_LIFETIME_MS: u64 = 5_000;
 
 /// The error text of an admitted publish whose artifact deadline passed.
 pub(crate) const ADMITTED_PUBLISH_EXPIRED: &str = "recovery-response deadline elapsed";
 
 /// The expiry of an admitted publish created at `created`: the artifact's
-/// deadline, capped at [`ADMITTED_PUBLISH_LIFETIME_MS`]. `None` once the
-/// deadline has passed.
+/// deadline, capped at [`ADMITTED_PUBLISH_LIFETIME_MS`]. `None` when that
+/// leaves less than [`ADMITTED_PUBLISH_MIN_LIFETIME_MS`].
 pub(crate) fn admitted_publish_expiry(created: u64, expires_by: u64) -> Option<u64> {
     let expires = expires_by.min(created.saturating_add(ADMITTED_PUBLISH_LIFETIME_MS));
-    (expires > created).then_some(expires)
+    (expires >= created.saturating_add(ADMITTED_PUBLISH_MIN_LIFETIME_MS)).then_some(expires)
 }
 
 /// The sender's handles for [`publish_admitted_once`].
@@ -1174,6 +1183,15 @@ mod tests {
         );
         assert_eq!(admitted_publish_expiry(now, now), None);
         assert_eq!(admitted_publish_expiry(now, now - 1), None);
+        assert_eq!(
+            admitted_publish_expiry(now, now + ADMITTED_PUBLISH_MIN_LIFETIME_MS - 1),
+            None,
+            "too short to survive ordinary clock skew"
+        );
+        assert_eq!(
+            admitted_publish_expiry(now, now + ADMITTED_PUBLISH_MIN_LIFETIME_MS),
+            Some(now + ADMITTED_PUBLISH_MIN_LIFETIME_MS)
+        );
     }
 
     #[test]
