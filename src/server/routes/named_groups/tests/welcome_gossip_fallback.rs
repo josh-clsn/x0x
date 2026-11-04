@@ -47,11 +47,17 @@ fn welcome_frame(payload: &[u8]) -> Option<WelcomeBlobMessage> {
 }
 
 fn is_offer(payload: &[u8]) -> bool {
-    matches!(welcome_frame(payload), Some(WelcomeBlobMessage::Offer { .. }))
+    matches!(
+        welcome_frame(payload),
+        Some(WelcomeBlobMessage::Offer { .. })
+    )
 }
 
 fn is_chunk(payload: &[u8]) -> bool {
-    matches!(welcome_frame(payload), Some(WelcomeBlobMessage::Chunk { .. }))
+    matches!(
+        welcome_frame(payload),
+        Some(WelcomeBlobMessage::Chunk { .. })
+    )
 }
 
 /// Drain the owner's gossip stand-in. Every frame for the joiner is logged;
@@ -114,7 +120,11 @@ fn logged(frames: &Frames) -> Vec<Vec<u8>> {
     frames.lock().expect("frame log").clone()
 }
 
-async fn wait_for_frame(frames: &Frames, within: Duration, matches: impl Fn(&[u8]) -> bool) -> bool {
+async fn wait_for_frame(
+    frames: &Frames,
+    within: Duration,
+    matches: impl Fn(&[u8]) -> bool,
+) -> bool {
     tokio::time::timeout(within, async {
         while !logged(frames).iter().any(|frame| matches(frame)) {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -211,7 +221,9 @@ async fn carried_join_result(s: &Fixture, frames: &Frames) -> anyhow::Result<Joi
             }
         })
         .await
-        .map_err(|_| anyhow::anyhow!("join-result chunk {sequence} never reached the gossip inbox"))?;
+        .map_err(|_| {
+            anyhow::anyhow!("join-result chunk {sequence} never reached the gossip inbox")
+        })?;
         bytes.extend(BASE64.decode(data)?);
     }
     Ok(serde_json::from_slice(&bytes)?)
@@ -307,7 +319,10 @@ async fn without_a_direct_path_the_welcome_and_join_result_ride_the_gossip_inbox
             .await,
         "precondition: no direct path to the joiner"
     );
-    let sink = s.authority.agent.route_gossip_inbox_to_standin_for_testing();
+    let sink = s
+        .authority
+        .agent
+        .route_gossip_inbox_to_standin_for_testing();
     let (frames, carrier) = carry(&s.authority, &s.j2, sink, true);
     let reference = welcome_ref_of(&s.j2_add).expect("J2's Welcome is staged by reference");
 
@@ -326,14 +341,16 @@ async fn without_a_direct_path_the_welcome_and_join_result_ride_the_gossip_inbox
         serde_json::to_value(&served)?,
         "the gossip inbox carried the served join result"
     );
-    let applied = super::super::dispatch_join_result_message(
+    // The joiner applies it as its control-blob receive does: from the
+    // authenticated owner, bound to the attempt the reference names.
+    super::super::handle_join_result_message_bound(
         &s.j2,
         &s.authority_id,
         true,
         with_welcome(carried, &welcome),
+        Some(&s.j2_attempt),
     )
     .await;
-    assert!(applied, "the joiner's listener applied the result");
     assert_eq!(local_state(&s.j2, &s.group_key).await, "active");
     assert!(keyed(&s.j2, &s.group_key).await, "the Welcome installed");
 
@@ -347,7 +364,9 @@ async fn without_a_direct_path_the_welcome_and_join_result_ride_the_gossip_inbox
 
     let transports = transports_to(&s.authority, &j2_hex);
     assert!(
-        transports.iter().any(|(kind, _)| kind.starts_with("welcome"))
+        transports
+            .iter()
+            .any(|(kind, _)| kind.starts_with("welcome"))
             && transports
                 .iter()
                 .all(|(_, transport)| *transport == "gossip_single_publish"),
@@ -397,7 +416,10 @@ async fn a_ban_or_removal_mid_stream_stops_a_gossip_carried_welcome() -> anyhow:
         let s = build(dir.path()).await?;
         let j2_hex = hex_of(&s.j2);
         let welcome_id = welcome_id_of(&s.j2_add).expect("welcome ref");
-        let sink = s.authority.agent.route_gossip_inbox_to_standin_for_testing();
+        let sink = s
+            .authority
+            .agent
+            .route_gossip_inbox_to_standin_for_testing();
         let (frames, carrier) = carry(&s.authority, &s.j2, sink, false);
         let frame = super::super::join_egress_test_barrier::arm(&j2_hex, "welcome_frame");
         let purge = super::super::join_egress_test_barrier::arm(&j2_hex, "purge");
@@ -412,7 +434,10 @@ async fn a_ban_or_removal_mid_stream_stops_a_gossip_carried_welcome() -> anyhow:
             }
         })
         .await;
-        assert!(reached.is_ok(), "[{how:?}] the first chunk never reached egress");
+        assert!(
+            reached.is_ok(),
+            "[{how:?}] the first chunk never reached egress"
+        );
         let mutation = {
             let fixture = clone_fixture(&s);
             tokio::spawn(async move { invalidate(&fixture, how).await })
@@ -426,7 +451,10 @@ async fn a_ban_or_removal_mid_stream_stops_a_gossip_carried_welcome() -> anyhow:
         drop(frame);
         tokio::time::sleep(Duration::from_millis(500)).await;
         drop(purge);
-        assert!(mutation.await?.is_success(), "[{how:?}] the invalidation committed");
+        assert!(
+            mutation.await?.is_success(),
+            "[{how:?}] the invalidation committed"
+        );
         assert!(
             !logged(&frames).iter().any(|frame| is_chunk(frame)),
             "[{how:?}] a Welcome chunk reached the gossip inbox after the invalidation"
@@ -574,7 +602,9 @@ async fn join_artifacts_prefer_raw_and_fall_back_to_the_gossip_inbox() -> anyhow
     assert!(take(&mut sink).is_empty(), "nothing rode gossip");
 
     // Live, but the raw exchange fails as not connected: the gossip inbox.
-    sender.agent.fail_pinned_sends_as_disconnected_for_testing(1);
+    sender
+        .agent
+        .fail_pinned_sends_as_disconnected_for_testing(1);
     clear();
     let sent = send(b"raw-lost", "welcome_complete", admit_all()).await;
     assert!(sent.is_ok(), "{sent:?}");
@@ -727,14 +757,30 @@ async fn gossip_carried_frames_from_anyone_but_the_owner_are_refused() -> anyhow
     let served = serve_result(&s.authority, &s.j2, &s.stable, &s.j2_attempt, Some(s.base))
         .await
         .expect("served");
-    super::super::dispatch_join_result_message(&s.j2, &other, true, with_welcome(served, &bytes))
-        .await;
+    super::super::handle_join_result_message_bound(
+        &s.j2,
+        &other,
+        true,
+        with_welcome(served.clone(), &bytes),
+        Some(&s.j2_attempt),
+    )
+    .await;
     assert_ne!(
         local_state(&s.j2, &s.group_key).await,
         "active",
         "a join result from a non-inviter seated the joiner"
     );
     assert!(!keyed(&s.j2, &s.group_key).await);
+    // Control: the same result from the owner seats it.
+    super::super::handle_join_result_message_bound(
+        &s.j2,
+        &s.authority_id,
+        true,
+        with_welcome(served, &bytes),
+        Some(&s.j2_attempt),
+    )
+    .await;
+    assert_eq!(local_state(&s.j2, &s.group_key).await, "active");
     Ok(())
 }
 

@@ -2753,7 +2753,9 @@ async fn s8a_r4_withdrawal_landing_before_transport_admission_sends_nothing() ->
 /// WHY (review r2 P1-2): the gossip inbox's stranded-publish retry
 /// (saorsa-gossip-pubsub 0.5.86) runs DETACHED, beyond any abort of ours.
 /// Join artifacts — the inline result, Welcome frames and result chunks —
-/// must only ever be handed to a delivery path that cannot reach gossip.
+/// must only ever be handed to a delivery path that cannot reach gossip,
+/// unless the recipient has no direct path and the owner's gossip inbox can
+/// carry them (`welcome_gossip_fallback`, which has no such inbox here).
 #[tokio::test]
 async fn s8a_r4_join_artifacts_never_take_a_gossip_capable_path() -> anyhow::Result<()> {
     let paths = |state: &AppState, recipient: &str| -> Vec<(&'static str, bool)> {

@@ -683,15 +683,15 @@ static PINNED_STANDIN_DISCONNECTS: std::sync::LazyLock<
 
 #[cfg(test)]
 fn take_pinned_standin_disconnect(agent: &identity::AgentId) -> bool {
-    PINNED_STANDIN_DISCONNECTS.lock().is_ok_and(|mut counts| {
-        match counts.get_mut(agent) {
+    PINNED_STANDIN_DISCONNECTS
+        .lock()
+        .is_ok_and(|mut counts| match counts.get_mut(agent) {
             Some(left) if *left > 0 => {
                 *left -= 1;
                 true
             }
             _ => false,
-        }
-    })
+        })
 }
 
 /// The core agent that participates in the x0x gossip network.
@@ -11012,20 +11012,241 @@ impl Agent {
         result
     }
 
-    pub(crate) async fn gossip_inbox_reachable(&self, _to: &identity::AgentId) -> bool {
-        false
+    /// ADR 0107 gossip fallback: whether a recovery-response frame to `to`
+    /// can ride this agent's gossip inbox (a gossip runtime, and a usable
+    /// gossip-inbox KEM key for the recipient).
+    pub(crate) async fn gossip_inbox_reachable(&self, to: &identity::AgentId) -> bool {
+        #[cfg(test)]
+        if self.gossip_runtime.is_none() {
+            return gossip_inbox_standin(&self.identity.agent_id()).is_some();
+        }
+        self.gossip_runtime.is_some() && self.gossip_inbox_recipient(to).await.is_some()
     }
 
+    /// The recipient's gossip-inbox KEM key and, when known, its machine:
+    /// the signed capability advert, then usable peer evidence, then the
+    /// contact card (the order a general v1 send uses).
+    async fn gossip_inbox_recipient(
+        &self,
+        to: &identity::AgentId,
+    ) -> Option<(Vec<u8>, Option<identity::MachineId>)> {
+        let ready = |caps: &dm::DmCapabilities| {
+            caps.gossip_inbox && dm::validate_recipient_kem_key(&caps.kem_public_key).is_ok()
+        };
+        if let Some(binding) = self.capability_store.lookup_binding(to) {
+            if ready(&binding.capabilities) {
+                return Some((
+                    binding.capabilities.kem_public_key.clone(),
+                    Some(binding.machine_id),
+                ));
+            }
+        }
+        if let Some(view) = self
+            .peer_evidence()
+            .usable_agent(*to, dm_capability::now_unix_ms())
+        {
+            if ready(&view.advert.capabilities) {
+                return Some((
+                    view.advert.capabilities.kem_public_key.clone(),
+                    Some(view.announcement.machine_id),
+                ));
+            }
+        }
+        let contacts = self.contact_store.read().await;
+        let caps = contacts.get(to)?.dm_capabilities.as_ref()?;
+        ready(caps).then(|| (caps.kem_public_key.clone(), None))
+    }
+
+    /// The machine the discovery cache names for `to`, if any.
+    async fn discovered_machine_of(&self, to: &identity::AgentId) -> Option<identity::MachineId> {
+        self.identity_discovery_cache
+            .read()
+            .await
+            .get(to)
+            .map(|d| d.machine_id)
+            .filter(|m| m.0 != [0u8; 32])
+    }
+
+    /// The seam check of an admitted gossip publish: this agent's own
+    /// revocation and B/P pairing checks for the recipient (its machine,
+    /// when known), then the caller's. Synchronous; contention refuses.
+    fn gossip_admission_seam(
+        &self,
+        agent: identity::AgentId,
+        machine: Option<identity::MachineId>,
+        caller: dm::SeamAdmission,
+    ) -> Box<dyn FnOnce() -> bool + Send> {
+        match machine {
+            Some(machine) => Box::new(self.pinned_admission_seam(agent, machine, false, caller)),
+            None => {
+                let revocation = std::sync::Arc::clone(&self.revocation_set);
+                Box::new(move || {
+                    revocation
+                        .try_read()
+                        .is_ok_and(|revoked| !revoked.is_agent_revoked(&agent))
+                        && caller()
+                })
+            }
+        }
+    }
+
+    /// ADR 0107 gossip fallback (2026-11-04): send one recovery-response
+    /// frame to `to` in ONE admitted publish on its gossip inbox, for a
+    /// recipient this agent has no direct path to.
+    ///
+    /// Like [`Self::send_direct_pinned_admitted`], `admission` runs in two
+    /// phases: its async pre-phase after the recipient's key and pairing
+    /// checks, and its seam synchronously, after the envelope is sealed and
+    /// immediately before the publish, together with this agent's own
+    /// revocation and pairing checks. Any refusal publishes nothing. The
+    /// publish is single: no ACK wait, no retry, no legacy-bus copy, so
+    /// every resend is the caller's and is admitted afresh. The envelope
+    /// expires at `expires_by_unix_ms`, capped at
+    /// [`dm_send::ADMITTED_PUBLISH_LIFETIME_MS`]: a copy gossip forwards
+    /// later is dropped by the recipient once it expires.
     pub(crate) async fn send_direct_gossip_admitted(
         &self,
-        _to: &identity::AgentId,
-        _payload: &[u8],
-        _admission: &dm::ArtifactAdmission,
-        _expires_by_unix_ms: u64,
+        to: &identity::AgentId,
+        payload: &[u8],
+        admission: &dm::ArtifactAdmission,
+        expires_by_unix_ms: u64,
     ) -> Result<dm::DmReceipt, dm::DmError> {
-        Err(dm::DmError::NoConnectivity(
-            "gossip-inbox recovery send not available".to_string(),
-        ))
+        if !self.signing_gate_allows(&self.identity.agent_id()).await {
+            self.direct_messaging.record_outgoing_failed(*to);
+            return Err(dm::DmError::EnvelopeConstruction(
+                "signing refused: this machine is not the agent's custodian (ADR-0043 signing gate)"
+                    .to_string(),
+            ));
+        }
+        if *to == self.identity.agent_id() {
+            return Err(dm::DmError::NoConnectivity(
+                "an admitted recovery-response send is never self-addressed".to_string(),
+            ));
+        }
+        self.direct_messaging.record_outgoing_started(*to, None);
+        let result = self
+            .send_direct_gossip_admitted_inner(to, payload, admission, expires_by_unix_ms)
+            .await;
+        match &result {
+            Ok(_) => self
+                .direct_messaging
+                .record_outgoing_succeeded(*to, dm::DmPath::GossipInbox),
+            Err(_) => self.direct_messaging.record_outgoing_failed(*to),
+        }
+        result
+    }
+
+    async fn send_direct_gossip_admitted_inner(
+        &self,
+        to: &identity::AgentId,
+        payload: &[u8],
+        admission: &dm::ArtifactAdmission,
+        expires_by_unix_ms: u64,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        if payload.len() > dm::MAX_PAYLOAD_BYTES {
+            return Err(dm::DmError::PayloadTooLarge {
+                len: payload.len(),
+                max: dm::MAX_PAYLOAD_BYTES,
+            });
+        }
+        #[cfg(test)]
+        if self.gossip_runtime.is_none() {
+            return self
+                .gossip_admission_standin(to, payload, admission, expires_by_unix_ms)
+                .await;
+        }
+        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            dm::DmError::LocalGossipUnavailable("no gossip runtime configured".to_string())
+        })?;
+        if dm_send::admitted_publish_expiry(dm::now_unix_ms(), expires_by_unix_ms).is_none() {
+            return Err(dm::DmError::NoConnectivity(
+                dm_send::ADMITTED_PUBLISH_EXPIRED.to_string(),
+            ));
+        }
+        let (kem, bound) = self.gossip_inbox_recipient(to).await.ok_or_else(|| {
+            dm::DmError::RecipientKeyUnavailable(format!(
+                "recipient {} has no gossip DM capability",
+                hex::encode(to.as_bytes())
+            ))
+        })?;
+        let machine = match bound {
+            Some(machine) => Some(machine),
+            None => self.discovered_machine_of(to).await,
+        };
+        if let Some(machine) = machine {
+            if let Some(denial) = self.recipient_pairing_denied(to, &machine).await {
+                return Err(dm::DmError::EnvelopeConstruction(format!(
+                    "recipient pairing denied (ADR-0043 B/P): {denial:?}"
+                )));
+            }
+        }
+        let Some(seam) = admission().await else {
+            return Err(dm::DmError::NoConnectivity(
+                dm::PINNED_ADMISSION_REFUSED.to_string(),
+            ));
+        };
+        let seam = self.gossip_admission_seam(*to, machine, seam);
+        let signing = gossip::SigningContext::from_keypair(self.identity.agent_keypair());
+        dm_send::publish_admitted_once(
+            dm_send::AdmittedPublishContext {
+                pubsub: runtime.pubsub(),
+                signing: &signing,
+                self_agent_id: self.identity.agent_id(),
+                self_machine_id: self.identity.machine_id(),
+                machine_keypair: self.identity.machine_keypair(),
+            },
+            *to,
+            &kem,
+            payload.to_vec(),
+            expires_by_unix_ms,
+            seam,
+        )
+        .await
+    }
+
+    /// In-process stand-in for the admitted gossip publish (an agent built
+    /// without a network): the deadline, pairing and both admission phases
+    /// as the real path runs them, then the frame goes to the test's sink
+    /// instead of a gossip topic. Test builds only.
+    #[cfg(test)]
+    async fn gossip_admission_standin(
+        &self,
+        to: &identity::AgentId,
+        payload: &[u8],
+        admission: &dm::ArtifactAdmission,
+        expires_by_unix_ms: u64,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        let Some(sink) = gossip_inbox_standin(&self.identity.agent_id()) else {
+            return Err(dm::DmError::LocalGossipUnavailable(
+                "no gossip runtime configured".to_string(),
+            ));
+        };
+        if dm_send::admitted_publish_expiry(dm::now_unix_ms(), expires_by_unix_ms).is_none() {
+            return Err(dm::DmError::NoConnectivity(
+                dm_send::ADMITTED_PUBLISH_EXPIRED.to_string(),
+            ));
+        }
+        let refused = || {
+            Err(dm::DmError::NoConnectivity(
+                dm::PINNED_ADMISSION_REFUSED.to_string(),
+            ))
+        };
+        let machine = self.discovered_machine_of(to).await;
+        if let Some(machine) = machine {
+            if self.recipient_pairing_denied(to, &machine).await.is_some() {
+                return refused();
+            }
+        }
+        let Some(seam) = admission().await else {
+            return refused();
+        };
+        if !self.gossip_admission_seam(*to, machine, seam)() {
+            return refused();
+        }
+        sink.send((*to, payload.to_vec())).map_err(|_| {
+            dm::DmError::LocalGossipUnavailable("gossip stand-in closed".to_string())
+        })?;
+        Ok(dm_send::raw_quic_receipt_for_path(dm::DmPath::GossipInbox))
     }
 
     async fn send_direct_pinned_admitted_inner(

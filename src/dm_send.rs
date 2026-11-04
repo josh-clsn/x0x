@@ -36,6 +36,100 @@ pub const DEFAULT_ENVELOPE_LIFETIME_MS: u64 = 120_000;
 pub(crate) const PUBLISH_ONLY_REDUNDANT_REPUBLISH_DELAY: Duration = Duration::from_millis(250);
 const ACK_LEGACY_BUS_FALLBACK_DELAY: Duration = Duration::from_millis(250);
 
+/// ADR 0107 gossip fallback: the longest an admitted recovery-response
+/// envelope stays acceptable. Gossip may still forward a published frame
+/// after a later invalidation (a stranded-publish retry, an IWANT serve);
+/// the recipient drops it once it expires.
+pub(crate) const ADMITTED_PUBLISH_LIFETIME_MS: u64 = 30_000;
+
+/// The error text of an admitted publish whose artifact deadline passed.
+pub(crate) const ADMITTED_PUBLISH_EXPIRED: &str = "recovery-response deadline elapsed";
+
+/// The expiry of an admitted publish created at `created`: the artifact's
+/// deadline, capped at [`ADMITTED_PUBLISH_LIFETIME_MS`]. `None` once the
+/// deadline has passed.
+pub(crate) fn admitted_publish_expiry(created: u64, expires_by: u64) -> Option<u64> {
+    let expires = expires_by.min(created.saturating_add(ADMITTED_PUBLISH_LIFETIME_MS));
+    (expires > created).then_some(expires)
+}
+
+/// The sender's handles for [`publish_admitted_once`].
+pub(crate) struct AdmittedPublishContext<'a> {
+    pub(crate) pubsub: &'a PubSubManager,
+    pub(crate) signing: &'a SigningContext,
+    pub(crate) self_agent_id: AgentId,
+    pub(crate) self_machine_id: MachineId,
+    pub(crate) machine_keypair: &'a MachineKeypair,
+}
+
+/// ADR 0107 gossip fallback: seal `payload` to `recipient`, run `seam`, and
+/// publish the envelope ONCE on the recipient's inbox topic. No ACK wait,
+/// no retry, no legacy-bus copy: the caller's protocol owns every resend,
+/// and each one is admitted afresh. `seam` runs after the envelope is built
+/// and immediately before the publish; `false` publishes nothing.
+pub(crate) async fn publish_admitted_once(
+    ctx: AdmittedPublishContext<'_>,
+    recipient: AgentId,
+    recipient_kem_public_key: &[u8],
+    payload: Vec<u8>,
+    expires_by_unix_ms: u64,
+    seam: impl FnOnce() -> bool,
+) -> Result<DmReceipt, DmError> {
+    if payload.len() > MAX_PAYLOAD_BYTES {
+        return Err(DmError::PayloadTooLarge {
+            len: payload.len(),
+            max: MAX_PAYLOAD_BYTES,
+        });
+    }
+    if recipient_kem_public_key.is_empty() {
+        return Err(DmError::RecipientKeyUnavailable(
+            "recipient has no published KEM public key".to_string(),
+        ));
+    }
+    let created = now_unix_ms();
+    let Some(expires) = admitted_publish_expiry(created, expires_by_unix_ms) else {
+        return Err(DmError::NoConnectivity(
+            ADMITTED_PUBLISH_EXPIRED.to_string(),
+        ));
+    };
+    let request_id = fresh_request_id();
+    let envelope = EnvelopeBuilder::build_payload_envelope_with_version(
+        DM_PROTOCOL_V1,
+        request_id,
+        &ctx.self_agent_id,
+        &ctx.self_machine_id,
+        ctx.machine_keypair,
+        &recipient,
+        recipient_kem_public_key,
+        created,
+        expires,
+        payload,
+        |bytes| ctx.signing.sign(bytes).map_err(|e| e.to_string()),
+    )?;
+    let wire = envelope.to_wire_bytes().map_err(map_identity_err)?;
+    if !seam() {
+        return Err(DmError::NoConnectivity(
+            crate::dm::PINNED_ADMISSION_REFUSED.to_string(),
+        ));
+    }
+    ctx.pubsub
+        .publish_topic_id(
+            DmInboxService::inbox_topic_name(&recipient),
+            dm_inbox_topic(&recipient),
+            Bytes::from(wire),
+        )
+        .await
+        .map_err(|e| DmError::LocalGossipUnavailable(e.to_string()))?;
+    tracing::debug!(
+        target: "dm.trace",
+        stage = "admitted_publish_once",
+        request_id = %hex::encode(request_id),
+        recipient = %hex::encode(recipient.as_bytes()),
+        expires_in_ms = expires.saturating_sub(created),
+    );
+    Ok(gossip_publish_receipt(request_id, 0))
+}
+
 /// Stable per-sender context for [`send_via_gossip`].
 ///
 /// Groups the identity/runtime handles that are constant for a given sending
@@ -1068,6 +1162,18 @@ mod tests {
         // tautological in nextest's eyes but document the invariant.
         assert!(MAX_PAYLOAD_BYTES > 0);
         assert!(MAX_PAYLOAD_BYTES <= 1024 * 1024); // Max 1MB
+    }
+
+    #[test]
+    fn admitted_publish_expiry_is_the_deadline_capped_at_the_lifetime() {
+        let now = 1_000_000;
+        assert_eq!(admitted_publish_expiry(now, now + 5_000), Some(now + 5_000));
+        assert_eq!(
+            admitted_publish_expiry(now, u64::MAX),
+            Some(now + ADMITTED_PUBLISH_LIFETIME_MS)
+        );
+        assert_eq!(admitted_publish_expiry(now, now), None);
+        assert_eq!(admitted_publish_expiry(now, now - 1), None);
     }
 
     #[test]

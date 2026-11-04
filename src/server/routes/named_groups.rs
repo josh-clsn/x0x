@@ -46420,14 +46420,15 @@ const JOIN_ARTIFACT_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// ADR 0107 (r5, lifecycle note section 2.7): hand one recovery-response
 /// frame (an inline join result, a Welcome chunk or a join-result chunk) to
-/// the transport in ONE admitted physical exchange.
+/// raw QUIC in ONE admitted physical exchange.
 ///
-/// The only path is x0x's pinned single-exchange raw-QUIC send
-/// ([`Agent::send_direct_pinned_admitted`]): never the gossip inbox (whose
-/// stranded-publish retry runs detached), never an ACK-v2 exchange (whose
+/// The path is x0x's pinned single-exchange raw-QUIC send
+/// ([`Agent::send_direct_pinned_admitted`]): never an ACK-v2 exchange (whose
 /// internal retry and the X0X-0053 reissue write again without admission),
-/// never a retry. A failure never falls back; the joiner's fetch retries and
-/// every resend is admitted afresh. The exchange runs under
+/// never a retry. Only [`send_join_artifact`] decides whether a
+/// not-connected failure is carried on the gossip inbox instead, as a
+/// fresh admitted publish; otherwise the joiner's fetch retries and every
+/// resend is admitted afresh. The exchange runs under
 /// `min(now + JOIN_ARTIFACT_EXCHANGE_TIMEOUT, deadline)`: on timeout the
 /// future is dropped, so an unfinished stream resets. The deadline only
 /// cancels; it never purges.
@@ -46439,15 +46440,15 @@ const JOIN_ARTIFACT_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 /// `recipient_undiscovered` inside the deadline, and the rest of the budget
 /// is left for any repair, the pre-phase and the write. No membership lock
 /// is held while it waits: the pre-phase takes it after resolution.
-pub(super) async fn send_join_artifact(
+async fn send_join_artifact_raw(
     state: &AppState,
     recipient: &AgentId,
     payload: &[u8],
     group_id: &str,
     kind: &'static str,
-    admission: x0x::dm::ArtifactAdmission,
+    admission: &x0x::dm::ArtifactAdmission,
     deadline: Instant,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<(), RawArtifactFailure> {
     let exchange_deadline =
         std::cmp::min(Instant::now() + JOIN_ARTIFACT_EXCHANGE_TIMEOUT, deadline);
     #[cfg(test)]
@@ -46471,13 +46472,19 @@ pub(super) async fn send_join_artifact(
         );
         state
             .agent
-            .send_direct_pinned_admitted(recipient, payload, &admission, resolve_within)
+            .send_direct_pinned_admitted(recipient, payload, admission, resolve_within)
             .await
     };
     let outcome = match tokio::time::timeout_at(exchange_deadline.into(), exchange).await {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(_) => Err(format!("{kind} exchange deadline elapsed")),
+        Ok(Err(e)) => Err(RawArtifactFailure {
+            disconnected: matches!(e, x0x::dm::DmError::PeerDisconnected { .. }),
+            reason: e.to_string(),
+        }),
+        Err(_) => Err(RawArtifactFailure {
+            disconnected: false,
+            reason: format!("{kind} exchange deadline elapsed"),
+        }),
     };
     // Test builds: every exchange's outcome, in order (r7b).
     #[cfg(test)]
@@ -46489,7 +46496,11 @@ pub(super) async fn send_join_artifact(
         outcomes.push((
             recipient_hex.clone(),
             kind,
-            outcome.as_ref().err().cloned().unwrap_or_default(),
+            outcome
+                .as_ref()
+                .err()
+                .map(|failure| failure.reason.clone())
+                .unwrap_or_default(),
         ));
     }
     // Test builds: the in-process stand-in reports an admitted exchange
@@ -46497,7 +46508,7 @@ pub(super) async fn send_join_artifact(
     #[cfg(test)]
     if outcome
         .as_ref()
-        .is_err_and(|reason| reason.contains(x0x::dm::PINNED_STANDIN_ADMITTED))
+        .is_err_and(|failure| failure.reason.contains(x0x::dm::PINNED_STANDIN_ADMITTED))
     {
         if let Ok(mut egress) = state.named_group_test_recorders.join_artifact_egress.lock() {
             egress.push((recipient_hex, group_id.to_string(), kind));
@@ -46505,6 +46516,149 @@ pub(super) async fn send_join_artifact(
     }
     #[cfg(not(test))]
     let _ = (group_id, kind);
+    outcome
+}
+
+/// ADR 0107 (gossip fallback, 2026-11-04): the class-R kinds that may ride
+/// the gossip inbox when the recipient has no direct path: the owner's
+/// Welcome frames and the join-result response (inline, reference and
+/// chunks). Class-K shares stay raw-only.
+fn join_artifact_may_use_gossip(kind: &str) -> bool {
+    matches!(
+        kind,
+        "welcome_offer"
+            | "welcome_frame"
+            | "welcome_complete"
+            | "join_result"
+            | "join_result_reference"
+            | "join_result_chunk"
+    )
+}
+
+/// A raw join-artifact exchange that failed; `disconnected` when it failed
+/// because the recipient is not connected.
+struct RawArtifactFailure {
+    reason: String,
+    disconnected: bool,
+}
+
+/// Hand one join-artifact frame to the transport: raw QUIC
+/// ([`send_join_artifact_raw`]) over a live direct connection, or when the
+/// gossip inbox cannot carry it; otherwise, and after a raw exchange that
+/// fails as not connected, ONE admitted gossip-inbox publish
+/// ([`send_join_artifact_gossip`]). Both paths run `admission` in full
+/// before their write, under the same deadline.
+pub(super) async fn send_join_artifact(
+    state: &AppState,
+    recipient: &AgentId,
+    payload: &[u8],
+    group_id: &str,
+    kind: &'static str,
+    admission: x0x::dm::ArtifactAdmission,
+    deadline: Instant,
+) -> std::result::Result<(), String> {
+    let gossip =
+        join_artifact_may_use_gossip(kind) && state.agent.gossip_inbox_reachable(recipient).await;
+    if gossip && !state.agent.has_live_direct_connection(recipient).await {
+        return send_join_artifact_gossip(
+            state, recipient, payload, group_id, kind, &admission, deadline, true,
+        )
+        .await;
+    }
+    match send_join_artifact_raw(
+        state, recipient, payload, group_id, kind, &admission, deadline,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(failure) if failure.disconnected && gossip => {
+            tracing::info!(
+                kind,
+                recipient = %LogHexId::agent(&hex::encode(recipient.as_bytes())),
+                reason = %failure.reason,
+                "join artifact: raw exchange not connected; carrying it on the gossip inbox"
+            );
+            send_join_artifact_gossip(
+                state, recipient, payload, group_id, kind, &admission, deadline, false,
+            )
+            .await
+            .map_err(|e| format!("{}; gossip inbox: {e}", failure.reason))
+        }
+        Err(failure) => Err(failure.reason),
+    }
+}
+
+/// ADR 0107 (gossip fallback): carry one join-artifact frame in ONE
+/// admitted gossip-inbox publish ([`Agent::send_direct_gossip_admitted`]),
+/// under `min(now + JOIN_ARTIFACT_EXCHANGE_TIMEOUT, deadline)`. The sealed
+/// envelope expires by the artifact's deadline. No transport receipt is
+/// awaited: a lost frame is recovered by the joiner's ChunkAck window and
+/// fetch retry, each resend admitted afresh. `park` (test builds) holds the
+/// frame at the egress barrier, unless a raw attempt already did.
+#[allow(clippy::too_many_arguments)]
+async fn send_join_artifact_gossip(
+    state: &AppState,
+    recipient: &AgentId,
+    payload: &[u8],
+    group_id: &str,
+    kind: &'static str,
+    admission: &x0x::dm::ArtifactAdmission,
+    deadline: Instant,
+    park: bool,
+) -> std::result::Result<(), String> {
+    let now = Instant::now();
+    let exchange_deadline = std::cmp::min(now + JOIN_ARTIFACT_EXCHANGE_TIMEOUT, deadline);
+    let expires_by = now_millis_u64().saturating_add(
+        u64::try_from(deadline.saturating_duration_since(now).as_millis()).unwrap_or(u64::MAX),
+    );
+    #[cfg(test)]
+    let recipient_hex = hex::encode(recipient.as_bytes());
+    let exchange = async {
+        #[cfg(test)]
+        {
+            if park {
+                join_egress_test_barrier::park(&recipient_hex, kind).await;
+            }
+            record_join_artifact_delivery_path(state, &recipient_hex, kind, true);
+            if let Ok(mut transports) = state
+                .named_group_test_recorders
+                .join_artifact_transports
+                .lock()
+            {
+                transports.push((recipient_hex.clone(), kind, "gossip_single_publish"));
+            }
+        }
+        state
+            .agent
+            .send_direct_gossip_admitted(recipient, payload, admission, expires_by)
+            .await
+    };
+    let outcome = match tokio::time::timeout_at(exchange_deadline.into(), exchange).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!("{kind} gossip publish deadline elapsed")),
+    };
+    #[cfg(test)]
+    {
+        if let Ok(mut outcomes) = state
+            .named_group_test_recorders
+            .join_artifact_outcomes
+            .lock()
+        {
+            outcomes.push((
+                recipient_hex.clone(),
+                kind,
+                outcome.as_ref().err().cloned().unwrap_or_default(),
+            ));
+        }
+        if outcome.is_ok() {
+            if let Ok(mut egress) = state.named_group_test_recorders.join_artifact_egress.lock() {
+                egress.push((recipient_hex, group_id.to_string(), kind));
+            }
+        }
+    }
+    #[cfg(not(test))]
+    let _ = (group_id, park);
     outcome
 }
 
