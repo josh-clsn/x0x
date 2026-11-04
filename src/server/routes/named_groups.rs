@@ -50160,6 +50160,7 @@ pub(in crate::server) mod tests {
     mod treekem_bytes_binding;
     #[path = "issue1224_unsigned_group_card.rs"]
     mod unsigned_group_card_1224;
+    mod welcome_gossip_fallback;
     mod welcome_unblock;
     mod wp_c;
     fn fake_group_state_commit(

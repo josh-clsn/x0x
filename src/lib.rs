@@ -655,6 +655,45 @@ fn pinned_standin_is_strict(agent: &identity::AgentId) -> bool {
         .is_ok_and(|agents| agents.contains(agent))
 }
 
+/// Test builds: the in-process gossip-inbox stand-in of an agent built
+/// without a network. Every admitted recovery-response publish is handed to
+/// the sink as `(recipient, payload)`.
+#[cfg(test)]
+type GossipInboxStandinSink = tokio::sync::mpsc::UnboundedSender<(identity::AgentId, Vec<u8>)>;
+
+#[cfg(test)]
+static GOSSIP_INBOX_STANDIN: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<identity::AgentId, GossipInboxStandinSink>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+fn gossip_inbox_standin(agent: &identity::AgentId) -> Option<GossipInboxStandinSink> {
+    GOSSIP_INBOX_STANDIN
+        .lock()
+        .ok()
+        .and_then(|sinks| sinks.get(agent).cloned())
+}
+
+/// Test builds: how many more pinned sends of each agent fail as a lost
+/// connection does, before any admission runs.
+#[cfg(test)]
+static PINNED_STANDIN_DISCONNECTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<identity::AgentId, usize>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+fn take_pinned_standin_disconnect(agent: &identity::AgentId) -> bool {
+    PINNED_STANDIN_DISCONNECTS.lock().is_ok_and(|mut counts| {
+        match counts.get_mut(agent) {
+            Some(left) if *left > 0 => {
+                *left -= 1;
+                true
+            }
+            _ => false,
+        }
+    })
+}
+
 /// The core agent that participates in the x0x gossip network.
 ///
 /// Each agent is a peer — there is no client/server distinction.
@@ -10973,6 +11012,22 @@ impl Agent {
         result
     }
 
+    pub(crate) async fn gossip_inbox_reachable(&self, _to: &identity::AgentId) -> bool {
+        false
+    }
+
+    pub(crate) async fn send_direct_gossip_admitted(
+        &self,
+        _to: &identity::AgentId,
+        _payload: &[u8],
+        _admission: &dm::ArtifactAdmission,
+        _expires_by_unix_ms: u64,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        Err(dm::DmError::NoConnectivity(
+            "gossip-inbox recovery send not available".to_string(),
+        ))
+    }
+
     async fn send_direct_pinned_admitted_inner(
         &self,
         to: &identity::AgentId,
@@ -11094,6 +11149,11 @@ impl Agent {
         admission: &dm::ArtifactAdmission,
         resolve_within: std::time::Duration,
     ) -> Result<dm::DmReceipt, dm::DmError> {
+        if take_pinned_standin_disconnect(&self.identity.agent_id()) {
+            return Err(Self::map_raw_quic_dm_error(
+                error::NetworkError::AgentNotConnected(to.0),
+            ));
+        }
         let strict = pinned_standin_is_strict(&self.identity.agent_id());
         let machine = if strict {
             // The real path's resolution and target selection (repair,
@@ -11172,6 +11232,30 @@ impl Agent {
     #[cfg(test)]
     pub(crate) fn pinned_standin_strict_for_testing(&self) -> bool {
         pinned_standin_is_strict(&self.identity.agent_id())
+    }
+
+    /// Test seam: give this agent (built without a network) an in-process
+    /// gossip inbox. Its admitted recovery-response publishes arrive on the
+    /// returned receiver as `(recipient, payload)`. Test builds only.
+    #[cfg(test)]
+    pub(crate) fn route_gossip_inbox_to_standin_for_testing(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<(identity::AgentId, Vec<u8>)> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        if let Ok(mut sinks) = GOSSIP_INBOX_STANDIN.lock() {
+            sinks.insert(self.identity.agent_id(), tx);
+        }
+        rx
+    }
+
+    /// Test seam: the next `count` pinned sends of this agent fail as a
+    /// lost connection does (`PeerDisconnected`), before any admission
+    /// runs. Test builds only.
+    #[cfg(test)]
+    pub(crate) fn fail_pinned_sends_as_disconnected_for_testing(&self, count: usize) {
+        if let Ok(mut counts) = PINNED_STANDIN_DISCONNECTS.lock() {
+            counts.insert(self.identity.agent_id(), count);
+        }
     }
 
     /// Test seam (x0x #1150, r7b): the transport the strict stand-in's
@@ -41940,6 +42024,9 @@ mod issue1099_tests;
 
 #[cfg(test)]
 mod single_publish_tests;
+
+#[cfg(test)]
+mod gossip_admitted_send_tests;
 
 #[cfg(test)]
 mod build_sha_tests;
