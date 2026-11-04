@@ -49375,7 +49375,7 @@ where
                 ended_early = ended_early.is_some(),
             );
         }
-        let withheld = state
+        let gossip_fetch_recent = state
             .pending_welcome_receives
             .read()
             .await
@@ -49385,6 +49385,10 @@ where
                     .retention
                     .gossip_fetch_recent(tokio::time::Instant::now())
             });
+        // Over a live direct connection the owner answers at once; only a
+        // request that would again wait on the slow inbox is withheld.
+        let withheld =
+            gossip_fetch_recent && !state.agent.has_live_direct_connection(&source).await;
         if withheld {
             // A gossip-carried request is still on its way or being
             // answered: asking again would only restream the Welcome.
@@ -49668,6 +49672,7 @@ async fn handle_welcome_fetch_request(
     if state
         .welcome_gossip
         .streamed_recently(&welcome_id, tokio::time::Instant::now())
+        && !state.agent.has_live_direct_connection(sender).await
     {
         tracing::debug!(
             target: "welcome.trace",
@@ -49977,6 +49982,7 @@ async fn stream_welcome_blob_via<S, F>(
     S: FnMut(WelcomeBlobMessage) -> F,
     F: std::future::Future<Output = std::result::Result<(), String>>,
 {
+    let stream_started = tokio::time::Instant::now();
     let chunk_size = x0x::files::DEFAULT_CHUNK_SIZE;
     let total_chunks = x0x::files::total_chunks_for_size(pending.bytes.len() as u64, chunk_size);
     let ack_slot = Arc::new(FileChunkAckSlot::new());
@@ -50070,7 +50076,7 @@ async fn stream_welcome_blob_via<S, F>(
     // kept), and verifies length and blake3.
     let gossip_carried = state
         .welcome_gossip
-        .streamed_recently(welcome_id, tokio::time::Instant::now());
+        .streamed_since(welcome_id, stream_started);
     if total_chunks > 0 && gossip_carried {
         tracing::debug!(target: "welcome.trace", stage = "final_ack_wait_skipped_gossip", welcome_id, total_chunks);
     } else if total_chunks > 0 {

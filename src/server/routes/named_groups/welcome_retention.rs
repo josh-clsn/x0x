@@ -106,7 +106,9 @@ pub(super) fn over_cap(entries: &[(String, Instant, u64)]) -> Vec<String> {
 #[derive(Debug, Default)]
 pub(in crate::server) struct WelcomeGossipState {
     completed: Mutex<HashMap<String, (Vec<u8>, Instant)>>,
-    streamed: Mutex<HashMap<String, Instant>>,
+    /// Per Welcome: when its refresh window opened, and when a frame of it
+    /// last took the gossip inbox.
+    streamed: Mutex<HashMap<String, (Instant, Instant)>>,
 }
 
 impl WelcomeGossipState {
@@ -146,18 +148,31 @@ impl WelcomeGossipState {
     /// refresh window.
     pub(super) fn streamed_recently(&self, welcome_id: &str, now: Instant) -> bool {
         self.streamed.lock().is_ok_and(|streamed| {
-            streamed
-                .get(welcome_id)
-                .is_some_and(|at| now.saturating_duration_since(*at) < WELCOME_GOSSIP_REFRESH)
+            streamed.get(welcome_id).is_some_and(|(opened, _)| {
+                now.saturating_duration_since(*opened) < WELCOME_GOSSIP_REFRESH
+            })
         })
     }
 
-    /// The owner's stream for `welcome_id` took the gossip inbox: its
-    /// window starts now, unless one is already open.
+    /// A frame of `welcome_id` took the gossip inbox at or after `since`
+    /// (the start of the stream asking).
+    pub(super) fn streamed_since(&self, welcome_id: &str, since: Instant) -> bool {
+        self.streamed.lock().is_ok_and(|streamed| {
+            streamed
+                .get(welcome_id)
+                .is_some_and(|(_, last)| *last >= since)
+        })
+    }
+
+    /// A frame of the owner's stream for `welcome_id` took the gossip
+    /// inbox: its refresh window opens now, unless one is already open.
     pub(super) fn note_streamed(&self, welcome_id: &str, now: Instant) {
         if let Ok(mut streamed) = self.streamed.lock() {
-            streamed.retain(|_, at| now.saturating_duration_since(*at) < WELCOME_GOSSIP_REFRESH);
-            streamed.entry(welcome_id.to_string()).or_insert(now);
+            streamed.retain(|_, (opened, _)| {
+                now.saturating_duration_since(*opened) < WELCOME_GOSSIP_REFRESH
+            });
+            let entry = streamed.entry(welcome_id.to_string()).or_insert((now, now));
+            entry.1 = now;
         }
     }
 }
@@ -240,5 +255,7 @@ mod tests {
         state.note_streamed("w", now + Duration::from_secs(10));
         assert!(state.streamed_recently("w", now + WELCOME_GOSSIP_REFRESH - Duration::from_secs(1)));
         assert!(!state.streamed_recently("w", now + WELCOME_GOSSIP_REFRESH));
+        assert!(state.streamed_since("w", now + Duration::from_secs(10)));
+        assert!(!state.streamed_since("w", now + Duration::from_secs(11)));
     }
 }
