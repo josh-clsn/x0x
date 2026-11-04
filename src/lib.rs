@@ -717,8 +717,9 @@ pub(crate) enum GossipRecipientSource {
     Advert,
     /// Usable peer evidence.
     PeerEvidence,
-    /// A contact-card key, with the recipient's verified binding.
-    CardWithVerifiedBinding,
+    /// A contact-card key, with the recipient's network-authenticated
+    /// binding (never a bare card pin).
+    CardWithAuthenticatedBinding,
     /// A contact-card key, with the discovery cache's machine.
     CardWithDiscovery,
 }
@@ -11185,9 +11186,11 @@ impl Agent {
     /// 1. the signed capability advert (key and machine bound together);
     /// 2. usable peer evidence (likewise);
     /// 3. the contact card's key, with the machine of the recipient's
-    ///    verified binding ([`Self::pinned_binding_now`], the raw path's
-    ///    own selection; it includes the binding a machine-key-attested DM
-    ///    from the recipient wrote), then the discovery cache's.
+    ///    network-authenticated binding
+    ///    ([`Self::gossip_authenticated_binding`]: the raw path's selection
+    ///    without bare card pins; it includes the binding a
+    ///    machine-key-attested DM from the recipient wrote), then the
+    ///    discovery cache's.
     ///
     /// A key with no machine is never used: machine revocation and B/P
     /// pairing need one, as on the raw path. Stricter than the general v1
@@ -11241,23 +11244,21 @@ impl Agent {
         Ok((kem, machine))
     }
 
-    /// The machine for a recipient whose key carries none: its verified
-    /// binding first (announcement, machine-key attestation, an
-    /// authority-confirmed DM registry entry, or peer evidence, under
-    /// [`select_pinned_binding`]; never a bare claim), then the discovery
-    /// cache.
+    /// The machine for a recipient whose key carries none: its
+    /// network-authenticated binding first
+    /// ([`Self::gossip_authenticated_binding`]), then the discovery cache.
     async fn unbound_recipient_machine(
         &self,
         to: &identity::AgentId,
     ) -> Option<(identity::MachineId, GossipRecipientSource)> {
         if let Some(binding) = self
-            .pinned_binding_now(to)
+            .gossip_authenticated_binding(to)
             .await
             .filter(|binding| binding.machine.0 != [0u8; 32])
         {
             return Some((
                 binding.machine,
-                GossipRecipientSource::CardWithVerifiedBinding,
+                GossipRecipientSource::CardWithAuthenticatedBinding,
             ));
         }
         self.discovered_machine_of(to)
@@ -11371,12 +11372,16 @@ impl Agent {
             .is_ok_and(|requests| requests.contains(&(self.identity.agent_id(), *to)))
     }
 
-    /// The machine the discovery cache names for `to`, if any.
+    /// The machine the discovery cache names for `to` from an identity
+    /// announcement. An entry a card import made (`announced_at` 0, see
+    /// `record_card_routing_hint`) does not count: its machine may be an
+    /// unsigned card field.
     async fn discovered_machine_of(&self, to: &identity::AgentId) -> Option<identity::MachineId> {
         self.identity_discovery_cache
             .read()
             .await
             .get(to)
+            .filter(|d| d.announced_at > 0)
             .map(|d| d.machine_id)
             .filter(|m| m.0 != [0u8; 32])
     }
@@ -11857,6 +11862,49 @@ impl Agent {
         let now_ms = dm_capability::now_unix_ms();
         // ADR 0115 §2: the DM registry names the machine only
         // when an authority store confirms it, never alone.
+        let registry = self
+            .direct_messaging
+            .get_machine_id(to)
+            .await
+            .filter(|machine| {
+                identity_authority::confirms(*machine, announced, attested, || {
+                    self.peer_evidence()
+                        .try_confirms_pairing(*to, *machine, now_ms)
+                        == Some(true)
+                })
+            });
+        select_pinned_binding(
+            announced,
+            attested,
+            registry,
+            || {
+                self.peer_evidence()
+                    .try_usable_agent(*to, now_ms)
+                    .ok()
+                    .flatten()
+                    .map(|view| view.announcement.machine_id)
+            },
+            now_ms / 1000,
+        )
+    }
+
+    /// [`Self::pinned_binding_now`] without bare card pins: a binding a card
+    /// import wrote (`pin_card_binding`, whose machine may be an unsigned
+    /// card field) counts only once a network-authenticated write named the
+    /// same machine. The sources are a verified identity announcement, a
+    /// machine-key origin attestation or a direct-origin announcement, a DM
+    /// registry entry one of those (or peer evidence) confirms, and peer
+    /// evidence. For the gossip fallback only; the raw path's selection is
+    /// unchanged.
+    async fn gossip_authenticated_binding(&self, to: &identity::AgentId) -> Option<PinnedBinding> {
+        let announced = self.announced_machine_bindings.read().await.peek(to);
+        let attested = self
+            .authenticated_machine_bindings
+            .read()
+            .await
+            .peek(to)
+            .filter(|binding| binding.network_authenticated);
+        let now_ms = dm_capability::now_unix_ms();
         let registry = self
             .direct_messaging
             .get_machine_id(to)

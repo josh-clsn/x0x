@@ -142,6 +142,11 @@ pub(crate) struct AuthenticatedMachineBinding {
     /// later write that replaces it with another machine clears the mark; a
     /// refresh naming the same machine keeps it.
     pub(crate) local_pin: bool,
+    /// A network-authenticated write (a machine-key origin attestation, a
+    /// verified or direct-origin announcement) named the current machine.
+    /// False only for a card pin no such write has confirmed: the pin's
+    /// machine may be an unsigned card field.
+    pub(crate) network_authenticated: bool,
     last_used: (std::time::Instant, u64),
 }
 
@@ -208,10 +213,15 @@ impl AuthenticatedMachineBindingCache {
     /// The local user's card pin: [`Self::record`], marked `local_pin`
     /// when it took effect (newest-wins).
     pub(crate) fn record_local_pin(&mut self, agent_id: AgentId, machine_id: MachineId, at: u64) {
+        let confirmed = self
+            .entries
+            .get(&agent_id)
+            .is_some_and(|b| b.machine_id == machine_id && b.network_authenticated);
         self.record(agent_id, machine_id, at);
         if let Some(entry) = self.entries.get_mut(&agent_id) {
             if entry.machine_id == machine_id && entry.announced_at == at {
                 entry.local_pin = true;
+                entry.network_authenticated = confirmed;
             }
         }
     }
@@ -305,6 +315,7 @@ impl AuthenticatedMachineBindingCache {
                 // A refresh naming the pinned machine keeps the pin mark;
                 // only a binding that moves the agent elsewhere clears it.
                 existing.local_pin &= existing.machine_id == machine_id;
+                existing.network_authenticated = true;
                 existing.machine_id = machine_id;
                 existing.announced_at = announced_at;
                 existing.cert_not_after = cert_not_after;
@@ -342,6 +353,7 @@ impl AuthenticatedMachineBindingCache {
                 cert_not_after,
                 cert_digest,
                 local_pin: false,
+                network_authenticated: true,
                 last_used: tick,
             },
         );
@@ -596,6 +608,13 @@ pub enum DmTypedPayloadCompletion {
 /// carries a reason for the trace; it withholds the ACK exactly like a
 /// dropped channel does.
 pub type DmTypedPayloadCompletionResult = Result<DmTypedPayloadCompletion, String>;
+
+/// Test builds: every binding an attested inbound DM wrote, as
+/// `(sender, machine, announced_at)`.
+#[cfg(test)]
+pub(crate) static ATTESTED_DM_BINDING_WRITES: std::sync::LazyLock<
+    std::sync::Mutex<Vec<(AgentId, MachineId, u64)>>,
+> = std::sync::LazyLock::new(Default::default);
 
 /// The least time between two warnings for DMs dropped outside their
 /// timestamp window.
@@ -1746,6 +1765,14 @@ impl InboxPipeline {
                     envelope.created_at_unix_ms / 1000,
                 )
                 .await;
+                #[cfg(test)]
+                if let Ok(mut writes) = ATTESTED_DM_BINDING_WRITES.lock() {
+                    writes.push((
+                        sender_agent_id,
+                        attested_machine,
+                        envelope.created_at_unix_ms / 1000,
+                    ));
+                }
                 (attested_machine, true)
             }
             Err(rejection) => {

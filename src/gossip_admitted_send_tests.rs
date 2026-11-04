@@ -17,6 +17,10 @@ async fn node(dir: &std::path::Path, name: &str) -> Agent {
         .with_agent_key_path(dir.join(format!("{name}-agent")))
         .with_contact_store_path(dir.join(format!("{name}-contacts.json")))
         .with_peer_cache_disabled()
+        // No heartbeat re-announcement inside a test: a direct-origin
+        // announcement would write the same binding store an attested DM
+        // writes (re-review N4).
+        .with_heartbeat_interval(3_600)
         .with_network_config(network::NetworkConfig {
             bind_addr: Some("127.0.0.1:0".parse().expect("loopback")),
             bootstrap_nodes: vec![],
@@ -330,6 +334,7 @@ async fn a_card_key_with_only_an_attested_inbound_dm_binding_rides_gossip() {
             .expect("the attested request binds the joiner's machine");
             assert_eq!(bound.machine, joiner.machine_id());
             assert_eq!(bound.source, PinnedMachineSource::AuthenticatedBinding);
+            assert_binding_is_the_attested_dm(&owner, &joiner).await;
             // An advert or announcement the joiner sent meanwhile would hide
             // the field state; drop them again (the attested binding stays).
             owner.capability_store.forget_for_testing(&joiner_id);
@@ -349,7 +354,7 @@ async fn a_card_key_with_only_an_attested_inbound_dm_binding_rides_gossip() {
             assert!(owner.gossip_inbox_reachable(&joiner_id).await);
             assert_eq!(
                 owner.gossip_recipient_source_for_testing(&joiner_id),
-                Some(GossipRecipientSource::CardWithVerifiedBinding)
+                Some(GossipRecipientSource::CardWithAuthenticatedBinding)
             );
             assert!(
                 owner.gossip_capability_refresh_requested_for_testing(&joiner_id),
@@ -424,6 +429,148 @@ async fn a_card_key_bound_to_a_revoked_machine_is_refused() {
                 )
                 .await;
             assert!(sent.is_err(), "{sent:?}");
+        },
+        [&owner, &joiner],
+    )
+    .await;
+}
+
+/// The owner's binding for `joiner` is the one the joiner's attested DM
+/// wrote: no verified identity announcement was processed since the stores
+/// were cleared (a direct-origin announcement would also land in the
+/// announced store), and the stored stamp and machine are the attested
+/// DM's (its envelope `created_at`, in seconds).
+async fn assert_binding_is_the_attested_dm(owner: &Agent, joiner: &Agent) {
+    let joiner_id = joiner.agent_id();
+    assert!(
+        owner
+            .announced_machine_bindings
+            .read()
+            .await
+            .peek(&joiner_id)
+            .is_none(),
+        "an identity announcement from the joiner was processed"
+    );
+    let stored = owner
+        .authenticated_machine_bindings
+        .read()
+        .await
+        .peek(&joiner_id)
+        .expect("a stored binding");
+    let attested = dm_inbox::ATTESTED_DM_BINDING_WRITES
+        .lock()
+        .expect("attested writes")
+        .iter()
+        .rev()
+        .find(|(agent, _, _)| *agent == joiner_id)
+        .copied()
+        .expect("the joiner's DM wrote an attested binding");
+    assert_eq!(attested.1, joiner.machine_id());
+    assert_eq!(
+        (stored.machine_id, stored.announced_at),
+        (attested.1, attested.2),
+        "the stored binding is the attested DM's"
+    );
+    assert!(stored.network_authenticated && !stored.local_pin);
+}
+
+/// WHY (re-review N3): a card import pins the card's machine, which may be
+/// an unsigned card field. That pin alone never names the gossip leg's
+/// machine (the raw path's selection still sees it). Once the joiner's
+/// attested DM names the same machine, the binding is network-authenticated
+/// and the gossip leg uses it.
+#[tokio::test]
+async fn a_card_pin_alone_never_names_the_gossip_machine() {
+    let dir = tempfile::tempdir().expect("fixture directory");
+    let owner = node(dir.path(), "owner").await;
+    let joiner = node(dir.path(), "joiner").await;
+    run(
+        async {
+            connected(&owner, &joiner).await;
+            card_key(&owner, &joiner).await;
+            card_key(&joiner, &owner).await;
+            let joiner_id = joiner.agent_id();
+            owner.capability_store.forget_for_testing(&joiner_id);
+            owner
+                .identity_discovery_cache
+                .write()
+                .await
+                .remove(&joiner_id);
+            *owner.announced_machine_bindings.write().await =
+                dm_inbox::AuthenticatedMachineBindingCache::default();
+            *owner.authenticated_machine_bindings.write().await =
+                dm_inbox::AuthenticatedMachineBindingCache::default();
+            let now = dm::now_unix_ms() / 1000;
+            owner
+                .pin_card_binding(DiscoveredAgent {
+                    self_name: None,
+                    agent_id: joiner_id,
+                    machine_id: joiner.machine_id(),
+                    user_id: None,
+                    addresses: Vec::new(),
+                    announced_at: now.saturating_sub(60),
+                    last_seen: now,
+                    machine_public_key: Vec::new(),
+                    nat_type: None,
+                    can_receive_direct: None,
+                    is_relay: None,
+                    is_coordinator: None,
+                    reachable_via: Vec::new(),
+                    relay_candidates: Vec::new(),
+                    cert_not_after: None,
+                    agent_certificate: None,
+                    agent_public_key: Vec::new(),
+                    cert_digest: None,
+                })
+                .await;
+            owner.capability_store.forget_for_testing(&joiner_id);
+            assert!(
+                owner.pinned_binding_now(&joiner_id).await.is_some(),
+                "the raw path's selection is unchanged: it sees the pin"
+            );
+            assert_eq!(
+                owner.gossip_inbox_reach(&joiner_id).await,
+                Err(GOSSIP_UNREACHABLE_NO_MACHINE),
+                "a card pin alone names no gossip machine"
+            );
+
+            let request = br#"{"type":"fetch_request","group_id":"g","welcome_id":"w2"}"#.to_vec();
+            joiner
+                .send_direct_with_config(
+                    &owner.agent_id(),
+                    request,
+                    dm::DmSendConfig {
+                        require_gossip: true,
+                        require_gossip_ack: false,
+                        ..dm::DmSendConfig::default()
+                    },
+                )
+                .await
+                .expect("the joiner's request is published");
+            tokio::time::timeout(PHASE, async {
+                while !owner
+                    .authenticated_machine_bindings
+                    .read()
+                    .await
+                    .peek(&joiner_id)
+                    .is_some_and(|binding| binding.network_authenticated)
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("the attested request confirms the pinned machine");
+            owner.capability_store.forget_for_testing(&joiner_id);
+            owner
+                .identity_discovery_cache
+                .write()
+                .await
+                .remove(&joiner_id);
+            assert_eq!(owner.gossip_inbox_reach(&joiner_id).await, Ok(()));
+            assert_eq!(
+                owner.gossip_recipient_source_for_testing(&joiner_id),
+                Some(GossipRecipientSource::CardWithAuthenticatedBinding)
+            );
         },
         [&owner, &joiner],
     )
