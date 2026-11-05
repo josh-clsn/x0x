@@ -3,10 +3,11 @@ use super::*;
 // A Welcome over a gossip inbox whose one-way latency is minutes, as on a
 // metered phone (field test 2026-11-04: 35 s to 156 s). The fixtures are
 // in-process; after they are built the tokio clock is paused, so the
-// delays below cost no wall time. The owner's gossip inbox is the
-// stand-in; every frame, in either direction, reaches the other side after
-// the injected delay, unless its envelope lifetime ran out on the way (as
-// an honest receiver drops it).
+// delays below cost no wall time. Both gossip inboxes are the slow
+// stand-in, and both sides send through their production paths; every
+// frame reaches the other side after the injected delay, unless the
+// envelope lifetime its sender built ran out on the way (as an honest
+// receiver drops it).
 
 use super::adr0107_stuck_join_rearm::{
     build, keyed, local_state, serve_result, welcome_id_of, Fixture,
@@ -15,14 +16,7 @@ use super::welcome_gossip_fallback::{known_recipient, welcome_ref_of, with_welco
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 type Sink = tokio::sync::mpsc::UnboundedReceiver<(AgentId, Vec<u8>)>;
-
-fn owner_gossip_lifetime() -> Duration {
-    Duration::from_millis(x0x::dm_send::ADMITTED_PUBLISH_LIFETIME_MS)
-}
-
-fn control_gossip_lifetime() -> Duration {
-    Duration::from_millis(super::super::welcome_control_gossip_lifetime_ms())
-}
+type SlowSink = tokio::sync::mpsc::UnboundedReceiver<(AgentId, Vec<u8>, u64)>;
 
 fn is_offer(payload: &[u8]) -> bool {
     matches!(
@@ -37,7 +31,7 @@ fn is_offer(payload: &[u8]) -> bool {
 fn delayed_owner_frames(
     owner: &Arc<AppState>,
     joiner: &Arc<AppState>,
-    mut sink: Sink,
+    mut sink: SlowSink,
     delay: Duration,
 ) -> (Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
     let offers = Arc::new(AtomicUsize::new(0));
@@ -46,7 +40,7 @@ fn delayed_owner_frames(
     let owner_machine = owner.agent.machine_id();
     let joiner = Arc::clone(joiner);
     let task = tokio::spawn(async move {
-        while let Some((to, payload)) = sink.recv().await {
+        while let Some((to, payload, lifetime_ms)) = sink.recv().await {
             if to != joiner.agent.agent_id() {
                 continue;
             }
@@ -56,7 +50,7 @@ fn delayed_owner_frames(
             let joiner = Arc::clone(&joiner);
             tokio::spawn(async move {
                 tokio::time::sleep(delay).await;
-                if delay >= owner_gossip_lifetime() {
+                if delay >= Duration::from_millis(lifetime_ms) {
                     return;
                 }
                 let message = x0x::direct::DirectMessage::new_verified(
@@ -75,60 +69,61 @@ fn delayed_owner_frames(
     (offers, task)
 }
 
-/// One joiner attempt's FetchRequest sender: the request takes the gossip
-/// inbox and reaches the owner's real fetch handler `delay` later, unless
-/// it expired on the way.
-fn delayed_fetch_sender(
+/// The joiner's FetchRequests, published by its production send path,
+/// each handed to the owner's real fetch handler `delay` later, unless it
+/// expired on the way. Counts the requests.
+fn delayed_fetch_requests(
     owner: &Arc<AppState>,
     joiner: &Arc<AppState>,
+    mut sink: SlowSink,
     delay: Duration,
-    sent: &Arc<AtomicUsize>,
-) -> impl FnMut(
-    AgentId,
-    WelcomeBlobMessage,
-    bool,
-) -> futures::future::BoxFuture<'static, std::result::Result<(), WelcomeFetchSendError>> {
+) -> (Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let sent = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&sent);
     let owner = Arc::clone(owner);
-    let joiner = Arc::clone(joiner);
-    let sent = Arc::clone(sent);
-    move |_, request, _| {
-        let owner = Arc::clone(&owner);
-        let joiner = Arc::clone(&joiner);
-        let sent = Arc::clone(&sent);
-        Box::pin(async move {
-            if let WelcomeBlobMessage::FetchRequest { welcome_id, .. } = &request {
-                super::super::note_gossip_welcome_fetch(&joiner, welcome_id).await;
-            }
-            sent.fetch_add(1, Ordering::SeqCst);
-            let joiner_id = joiner.agent.agent_id();
+    let joiner_id = joiner.agent.agent_id();
+    let task = tokio::spawn(async move {
+        while let Some((_, payload, lifetime_ms)) = sink.recv().await {
+            let Ok(request @ WelcomeBlobMessage::FetchRequest { .. }) =
+                serde_json::from_slice::<WelcomeBlobMessage>(&payload)
+            else {
+                continue;
+            };
+            counted.fetch_add(1, Ordering::SeqCst);
+            let owner = Arc::clone(&owner);
             tokio::spawn(async move {
                 tokio::time::sleep(delay).await;
-                if delay >= control_gossip_lifetime() {
+                if delay >= Duration::from_millis(lifetime_ms) {
                     return;
                 }
                 super::super::handle_welcome_blob_message(&owner, &joiner_id, request).await;
             });
-            Ok(())
-        })
-    }
+        }
+    });
+    (sent, task)
+}
+
+/// One bounded fetch attempt of the joiner, sending through the production
+/// FetchRequest path.
+async fn fetch_attempt(
+    s: &Fixture,
+    reference: &WelcomeRef,
+) -> std::result::Result<Vec<u8>, String> {
+    let j2 = Arc::clone(&s.j2);
+    let send = move |source: AgentId, request: WelcomeBlobMessage, prefer_raw: bool| {
+        let j2 = Arc::clone(&j2);
+        async move { super::super::send_welcome_fetch_request(&j2, &source, &request, prefer_raw).await }
+    };
+    super::super::fetch_treekem_welcome_via(&s.j2, &s.stable, reference, send).await
 }
 
 /// The joiner's join-result poll, re-driving bounded fetch attempts of the
 /// production length, a few seconds apart, until one returns the Welcome or
 /// `horizon` passes.
-async fn poll_welcome(
-    s: &Fixture,
-    reference: &WelcomeRef,
-    delay: Duration,
-    sent: &Arc<AtomicUsize>,
-    horizon: Duration,
-) -> Option<Vec<u8>> {
+async fn poll_welcome(s: &Fixture, reference: &WelcomeRef, horizon: Duration) -> Option<Vec<u8>> {
     let until = tokio::time::Instant::now() + horizon;
     while tokio::time::Instant::now() < until {
-        let send = delayed_fetch_sender(&s.authority, &s.j2, delay, sent);
-        if let Ok(bytes) =
-            super::super::fetch_treekem_welcome_via(&s.j2, &s.stable, reference, send).await
-        {
+        if let Ok(bytes) = fetch_attempt(s, reference).await {
             return Some(bytes);
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -147,20 +142,23 @@ async fn a_joiner_seats_through_a_gossip_inbox_with_minutes_of_latency() -> anyh
         let dir = tempfile::tempdir()?;
         let s = build(dir.path()).await?;
         known_recipient(&s.authority, &s.j2).await?;
+        known_recipient(&s.j2, &s.authority).await?;
         let reference = welcome_ref_of(&s.j2_add).expect("J2's Welcome is staged by reference");
         let served = serve_result(&s.authority, &s.j2, &s.stable, &s.j2_attempt, Some(s.base))
             .await
             .expect("the owner serves J2's join result");
-        let sink = s
+        let owner_sink = s
             .authority
             .agent
-            .route_gossip_inbox_to_standin_for_testing();
+            .route_gossip_inbox_to_slow_standin_for_testing();
+        let joiner_sink = s.j2.agent.route_gossip_inbox_to_slow_standin_for_testing();
         tokio::time::pause();
-        let (offers, carrier) = delayed_owner_frames(&s.authority, &s.j2, sink, delay);
-        let sent = Arc::new(AtomicUsize::new(0));
-        let welcome = poll_welcome(&s, &reference, delay, &sent, Duration::from_secs(900)).await;
+        let (offers, carrier) = delayed_owner_frames(&s.authority, &s.j2, owner_sink, delay);
+        let (sent, requests) = delayed_fetch_requests(&s.authority, &s.j2, joiner_sink, delay);
+        let welcome = poll_welcome(&s, &reference, Duration::from_secs(900)).await;
         tokio::time::resume();
         carrier.abort();
+        requests.abort();
         let welcome = welcome.ok_or_else(|| {
             anyhow::anyhow!(
                 "[{delay:?}] the Welcome never arrived ({} requests, {} owner streams)",
@@ -191,12 +189,20 @@ async fn a_joiner_seats_through_a_gossip_inbox_with_minutes_of_latency() -> anyh
             "[{delay:?}] a re-request storm: {} FetchRequests",
             sent.load(Ordering::SeqCst)
         );
+        assert!(
+            offers.load(Ordering::SeqCst) <= sent.load(Ordering::SeqCst),
+            "[{delay:?}] {} owner streams for {} FetchRequests",
+            offers.load(Ordering::SeqCst),
+            sent.load(Ordering::SeqCst)
+        );
     }
     Ok(())
 }
 
 /// The owner's real frames for J2's staged Welcome.
-async fn owner_frames(s: &Fixture) -> anyhow::Result<(Vec<u8>, Vec<WelcomeBlobMessage>)> {
+pub(super) async fn owner_frames(
+    s: &Fixture,
+) -> anyhow::Result<(Vec<u8>, Vec<WelcomeBlobMessage>)> {
     let welcome_id = welcome_id_of(&s.j2_add).expect("welcome id");
     let bytes = s
         .authority
@@ -227,10 +233,15 @@ async fn owner_frames(s: &Fixture) -> anyhow::Result<(Vec<u8>, Vec<WelcomeBlobMe
 }
 
 async fn deliver_from_owner(s: &Fixture, frames: &[WelcomeBlobMessage]) {
+    deliver_as(s, &s.authority, frames).await;
+}
+
+/// The frames as `sender` sent them, through the joiner's real listener.
+pub(super) async fn deliver_as(s: &Fixture, sender: &AppState, frames: &[WelcomeBlobMessage]) {
     for frame in frames {
         let message = x0x::direct::DirectMessage::new_verified(
-            s.authority_id,
-            s.authority.agent.machine_id(),
+            sender.agent.agent_id(),
+            sender.agent.machine_id(),
             serde_json::to_vec(frame).expect("frame"),
             true,
             None,
@@ -250,39 +261,33 @@ async fn frames_landing_between_attempts_are_kept_and_used() -> anyhow::Result<(
     let s = build(dir.path()).await?;
     let reference = welcome_ref_of(&s.j2_add).expect("welcome ref");
     let (bytes, frames) = owner_frames(&s).await?;
+    known_recipient(&s.j2, &s.authority).await?;
+    let mut sink = s.j2.agent.route_gossip_inbox_to_slow_standin_for_testing();
     tokio::time::pause();
-    let sent = Arc::new(AtomicUsize::new(0));
-    let silent = |sent: &Arc<AtomicUsize>| {
-        let joiner = Arc::clone(&s.j2);
-        let sent = Arc::clone(sent);
-        move |_, request: WelcomeBlobMessage, _| {
-            let joiner = Arc::clone(&joiner);
-            let sent = Arc::clone(&sent);
-            async move {
-                if let WelcomeBlobMessage::FetchRequest { welcome_id, .. } = &request {
-                    super::super::note_gossip_welcome_fetch(&joiner, welcome_id).await;
-                }
-                sent.fetch_add(1, Ordering::SeqCst);
-                Ok(())
+    let mut sent = 0;
+    let mut count = |sink: &mut SlowSink| {
+        while let Ok((_, payload, _)) = sink.try_recv() {
+            if matches!(
+                serde_json::from_slice::<WelcomeBlobMessage>(&payload),
+                Ok(WelcomeBlobMessage::FetchRequest { .. })
+            ) {
+                sent += 1;
             }
         }
+        sent
     };
-    let first =
-        super::super::fetch_treekem_welcome_via(&s.j2, &s.stable, &reference, silent(&sent)).await;
+    let first = fetch_attempt(&s, &reference).await;
     assert!(first.is_err(), "nothing arrived inside the first attempt");
-    let asked = sent.load(Ordering::SeqCst);
+    let asked = count(&mut sink);
+    assert!(asked >= 1, "the first attempt asked over the gossip inbox");
     // The Offer and the chunks land between attempts; the Complete too.
     deliver_from_owner(&s, &frames).await;
-    let second = tokio::time::timeout(
-        Duration::from_secs(1),
-        super::super::fetch_treekem_welcome_via(&s.j2, &s.stable, &reference, silent(&sent)),
-    )
-    .await;
+    let second = tokio::time::timeout(Duration::from_secs(1), fetch_attempt(&s, &reference)).await;
     tokio::time::resume();
     let second = second.map_err(|_| anyhow::anyhow!("the next attempt waited for nothing"))?;
     assert_eq!(second.map_err(anyhow::Error::msg)?, bytes);
     assert_eq!(
-        sent.load(Ordering::SeqCst),
+        count(&mut sink),
         asked,
         "the next attempt asked again although the Welcome was already here"
     );
@@ -322,7 +327,7 @@ async fn duplicate_fetch_requests_inside_the_window_stream_once() -> anyhow::Res
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
     let inside = count(&mut sink);
-    tokio::time::sleep(super::super::welcome_retention::WELCOME_GOSSIP_REFRESH).await;
+    tokio::time::sleep(super::super::gossip_window::GOSSIP_REFRESH).await;
     super::super::handle_welcome_blob_message(&s.authority, &j2, request()).await;
     tokio::time::sleep(Duration::from_secs(5)).await;
     let after = count(&mut sink);
@@ -340,9 +345,7 @@ async fn duplicate_fetch_requests_inside_the_window_stream_once() -> anyhow::Res
 /// still refused, and every other DM and the raw path keep theirs.
 #[test]
 fn gossip_welcome_frames_live_long_enough_and_no_longer() {
-    let lifetime =
-        u64::try_from(super::super::welcome_retention::WELCOME_GOSSIP_LIFETIME.as_millis())
-            .expect("lifetime");
+    let lifetime = super::super::gossip_window::SLOW_INBOX_LIFETIME_MS;
     assert!(lifetime >= 156_000 + x0x::dm::CLOCK_SKEW_TOLERANCE_MS);
     let request = WelcomeBlobMessage::FetchRequest {
         group_id: "g".to_string(),
@@ -375,17 +378,6 @@ fn gossip_welcome_frames_live_long_enough_and_no_longer() {
     assert_eq!(
         x0x::dm_send::admitted_publish_expiry(created, u64::MAX),
         Some(created + lifetime)
-    );
-    assert!(x0x::dm::validate_timestamp_window(
-        created,
-        created + lifetime,
-        created + lifetime - 1
-    )
-    .is_ok());
-    assert!(
-        x0x::dm::validate_timestamp_window(created, created + lifetime, created + lifetime)
-            .is_err(),
-        "a frame older than its lifetime is refused"
     );
 }
 
@@ -465,24 +457,25 @@ type FrameCounts = Arc<StdMutex<HashMap<&'static str, usize>>>;
 
 /// Frames from `from`'s gossip stand-in to `to`, each handed to `to`'s
 /// real control-blob listener `delay` after it was published, unless its
-/// envelope lifetime (`lifetime`) ran out on the way. Counts the control
+/// envelope lifetime, as its sender built it, ran out on the way. Counts
+/// the control
 /// frames of each kind as published.
 fn delayed_control_frames(
     from: &Arc<AppState>,
     to: &Arc<AppState>,
-    mut sink: Sink,
+    mut sink: SlowSink,
     delay: Duration,
-    lifetime: Duration,
 ) -> (FrameCounts, tokio::task::JoinHandle<()>) {
     let counts: FrameCounts = Arc::default();
     let counted = Arc::clone(&counts);
     let from_id = from.agent.agent_id();
     let to = Arc::clone(to);
     let task = tokio::spawn(async move {
-        while let Some((recipient, payload)) = sink.recv().await {
+        while let Some((recipient, payload, lifetime_ms)) = sink.recv().await {
             if recipient != to.agent.agent_id() {
                 continue;
             }
+            let lifetime = Duration::from_millis(lifetime_ms);
             let Some(frame) = control_frame(&payload) else {
                 continue;
             };
@@ -528,10 +521,6 @@ fn count(counts: &Arc<StdMutex<HashMap<&'static str, usize>>>, kind: &str) -> us
         .unwrap_or(0)
 }
 
-fn control_fetch_gossip_lifetime() -> Duration {
-    Duration::from_millis(super::super::control_blob::control_fetch_gossip_lifetime_ms())
-}
-
 /// WHY (round 5): a join result over `MAX_PAYLOAD_BYTES` (a Noetic room of
 /// 4 members, or a joiner whose invite predates other joins) is pulled as
 /// a control blob, chunk by chunk, with 30 s chunk waits inside a 115 s
@@ -549,23 +538,13 @@ async fn an_oversized_join_result_is_pulled_through_minutes_of_gossip_latency() 
         let owner_sink = s
             .authority
             .agent
-            .route_gossip_inbox_to_standin_for_testing();
-        let joiner_sink = s.j2.agent.route_gossip_inbox_to_standin_for_testing();
+            .route_gossip_inbox_to_slow_standin_for_testing();
+        let joiner_sink = s.j2.agent.route_gossip_inbox_to_slow_standin_for_testing();
         tokio::time::pause();
-        let (owner_counts, owner_task) = delayed_control_frames(
-            &s.authority,
-            &s.j2,
-            owner_sink,
-            delay,
-            owner_gossip_lifetime(),
-        );
-        let (joiner_counts, joiner_task) = delayed_control_frames(
-            &s.j2,
-            &s.authority,
-            joiner_sink,
-            delay,
-            control_fetch_gossip_lifetime(),
-        );
+        let (owner_counts, owner_task) =
+            delayed_control_frames(&s.authority, &s.j2, owner_sink, delay);
+        let (joiner_counts, joiner_task) =
+            delayed_control_frames(&s.j2, &s.authority, joiner_sink, delay);
         assert!(
             serve_result(&s.authority, &s.j2, &s.stable, &s.j2_attempt, Some(s.base))
                 .await

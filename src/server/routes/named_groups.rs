@@ -40,6 +40,7 @@ pub(in crate::server) use rekey_obligations::TestDeliver as RekeyObligationTestD
 pub(in crate::server) use rekey_obligations::{
     load_rekey_obligations, spawn_worker as spawn_rekey_obligation_worker, RekeyObligations,
 };
+pub(in crate::server) mod gossip_window;
 mod seat_cert_fetch;
 mod seat_reseat;
 mod seat_welcome_pin;
@@ -25639,15 +25640,27 @@ async fn wipe_local_group_crypto_material(
             !drop
         });
     }
+    let mut retained_purged = Vec::new();
     {
         let mut receives = state.pending_welcome_receives.write().await;
         receives.retain(|welcome_id, pending| {
             let drop = group_id_matches_any_alias(&pending.group_id, &aliases);
             if drop {
                 welcome_ids.push(welcome_id.clone());
+                if pending.retention.retained {
+                    retained_purged.push(welcome_id.clone());
+                }
             }
             !drop
         });
+    }
+    retained_purged.extend(
+        state
+            .welcome_gossip
+            .purge_groups(|group| group_id_matches_any_alias(group, &aliases)),
+    );
+    for welcome_id in &retained_purged {
+        drop_retained_welcome(state, welcome_id, "purge");
     }
     // The purged receives' acks can no longer help them.
     for welcome_id in &welcome_ids {
@@ -44292,6 +44305,7 @@ async fn finalize_join_attempt_with_reason_inner(
     state
         .control_blobs
         .cancel_attempt(event_group_id, member_agent_id, attempt_id);
+    drop_retained_welcomes_for_groups(state, &[local_group_key, event_group_id]).await;
     // The pin was cleared or marked under the registry mutex above (#1191);
     // persist it now that the mutex is released.
     persist_join_result_pins(state).await;
@@ -47832,13 +47846,12 @@ async fn handle_join_result_message_bound(
                 payload_len,
                 payload_hash = %payload_hash,
             );
-            // A joiner on a slow gossip inbox re-polls every few seconds;
-            // once its result went out over gossip, a repeat inside the
-            // refresh window would only send the same 50 KB again.
+            // A repeat poll that lands while the result is still going out
+            // over gossip would only send the same 50 KB again.
             let served_key = join_result_gossip_key(&group_id, &member_agent_id);
             if state
-                .welcome_gossip
-                .streamed_recently(&served_key, tokio::time::Instant::now())
+                .gossip_windows
+                .served_recently(&served_key, tokio::time::Instant::now())
                 && !state.agent.has_live_direct_connection(sender).await
             {
                 tracing::debug!(
@@ -47955,7 +47968,7 @@ async fn handle_join_result_message_bound(
                                         )
                                         .await;
                                         if sent == Ok(JoinArtifactPath::GossipInbox) {
-                                            task_state.welcome_gossip.note_streamed(
+                                            task_state.gossip_windows.note_served(
                                                 &join_result_gossip_key(
                                                     &group_id_for_task,
                                                     &member_for_log,
@@ -48061,7 +48074,7 @@ async fn handle_join_result_message_bound(
                     )
                     .await;
                     if sent == Ok(JoinArtifactPath::GossipInbox) {
-                        task_state.welcome_gossip.note_streamed(
+                        task_state.gossip_windows.note_served(
                             &join_result_gossip_key(&group_for_task, &member_for_task),
                             tokio::time::Instant::now(),
                         );
@@ -48691,10 +48704,11 @@ async fn poll_join_result_until_deadline(
                 // being answered: over a slow inbox, ask again only once per
                 // refresh window. Over a live direct connection, as before.
                 let poll_key = join_result_poll_gossip_key(&event_group_id, target);
-                if state
-                    .welcome_gossip
-                    .streamed_recently(&poll_key, tokio::time::Instant::now())
-                    && !state.agent.has_live_direct_connection(target).await
+                let live = state.agent.has_live_direct_connection(target).await;
+                if !live
+                    && state
+                        .gossip_windows
+                        .requested_recently(&poll_key, tokio::time::Instant::now())
                 {
                     tracing::debug!(
                         target: "treekem.trace",
@@ -48711,8 +48725,14 @@ async fn poll_join_result_until_deadline(
                         payload.clone(),
                         x0x::dm::DmSendConfig {
                             gossip_envelope_lifetime_ms: Some(
-                                x0x::dm_send::ADMITTED_PUBLISH_LIFETIME_MS,
+                                gossip_window::SLOW_INBOX_LIFETIME_MS,
                             ),
+                            // With no live connection the request is
+                            // published, not acked: over a slow inbox the
+                            // ack takes two minutes-long trips, longer than
+                            // the send waits, and a timed-out send would
+                            // read as never sent.
+                            require_gossip_ack: live,
                             ..direct_message_send_config()
                         },
                     )
@@ -48722,8 +48742,8 @@ async fn poll_join_result_until_deadline(
                     .is_ok_and(|receipt| receipt.path == x0x::dm::DmPath::GossipInbox)
                 {
                     state
-                        .welcome_gossip
-                        .note_streamed(&poll_key, tokio::time::Instant::now());
+                        .gossip_windows
+                        .note_requested(&poll_key, tokio::time::Instant::now());
                 }
                 if let Err(e) = sent {
                     tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch attempt failed: {e}");
@@ -48942,11 +48962,18 @@ fn welcome_blob_send_config(msg: &WelcomeBlobMessage, direct: bool) -> x0x::dm::
             // receipt-driven resend fires after the joiner's bounded fetch
             // has ended, so it cannot help that fetch, and the wait only
             // holds the ack's admission slot. Acks are cumulative, and the
-            // publish-only path publishes twice.
-            require_gossip_ack: !matches!(msg, WelcomeBlobMessage::ChunkAck { .. }),
+            // publish-only path publishes twice. A FetchRequest that prefers
+            // the gossip inbox is published too: over a slow inbox its ack
+            // takes two minutes-long trips, and the request is recorded from
+            // its receipt's path.
+            require_gossip_ack: match msg {
+                WelcomeBlobMessage::ChunkAck { .. } => false,
+                WelcomeBlobMessage::FetchRequest { .. } => direct,
+                _ => true,
+            },
             // A phone's gossip inbox is minutes one way: the default 120 s
             // envelope expired in transit (field test 2026-11-04).
-            gossip_envelope_lifetime_ms: Some(welcome_control_gossip_lifetime_ms()),
+            gossip_envelope_lifetime_ms: Some(gossip_window::SLOW_INBOX_LIFETIME_MS),
             ..direct_message_send_config()
         },
     }
@@ -49042,17 +49069,19 @@ fn classify_welcome_fetch_send_error(error: x0x::dm::DmError) -> WelcomeFetchSen
     }
 }
 
-/// Send one FetchRequest. A fetch's first scheduled request takes raw QUIC
-/// over a live connection to the owner's authority-confirmed machine
-/// (`first`). A stalled retry, and the first request of a fetch that joined
-/// one in flight (itself a retry), take the gossip inbox, whose signed
-/// envelope the owner can attribute even when its cold caches cannot yet
-/// bind our raw frames to us (a restarted owner).
+/// Send one FetchRequest. With `prefer_raw` it takes raw QUIC over a live
+/// connection to the owner's authority-confirmed machine: a fetch's first
+/// scheduled request, and a retry while a gossip-carried one is still
+/// inside its refresh window. Any other retry, and the first request of a
+/// fetch that joined one in flight (itself a retry), takes the gossip
+/// inbox, whose signed envelope the owner can attribute even when its cold
+/// caches cannot yet bind our raw frames to us (a restarted owner). A
+/// request is recorded as gossip-carried from its receipt's path.
 async fn send_welcome_fetch_request(
     state: &Arc<AppState>,
     agent_id: &AgentId,
     request: &WelcomeBlobMessage,
-    first: bool,
+    prefer_raw: bool,
 ) -> std::result::Result<(), WelcomeFetchSendError> {
     let payload = welcome_blob_payload(request).map_err(WelcomeFetchSendError::Failed)?;
     #[cfg(test)]
@@ -49060,24 +49089,19 @@ async fn send_welcome_fetch_request(
         detached_send_test_seam::park(&detached_send_test_seam::welcome_fetch_key(welcome_id))
             .await;
     }
-    let direct = first && state.agent.has_live_direct_connection(agent_id).await;
+    let direct = prefer_raw && state.agent.has_live_direct_connection(agent_id).await;
     log_welcome_control_send(request, welcome_control_path(direct));
-    if let (false, WelcomeBlobMessage::FetchRequest { welcome_id, .. }) = (direct, request) {
-        note_gossip_welcome_fetch(state, welcome_id).await;
-    }
-    state
+    let receipt = state
         .agent
         .send_direct_with_config(agent_id, payload, welcome_blob_send_config(request, direct))
         .await
-        .map(|_| ())
-        .map_err(classify_welcome_fetch_send_error)
-}
-
-/// The lifetime of a gossip-carried joiner control frame's envelope: the
-/// owner frames' ([`welcome_retention::WELCOME_GOSSIP_LIFETIME`]).
-fn welcome_control_gossip_lifetime_ms() -> u64 {
-    u64::try_from(welcome_retention::WELCOME_GOSSIP_LIFETIME.as_millis())
-        .unwrap_or(x0x::dm_send::ADMITTED_PUBLISH_LIFETIME_MS)
+        .map_err(classify_welcome_fetch_send_error)?;
+    if let (x0x::dm::DmPath::GossipInbox, WelcomeBlobMessage::FetchRequest { welcome_id, .. }) =
+        (receipt.path, request)
+    {
+        note_gossip_welcome_fetch(state, welcome_id).await;
+    }
+    Ok(())
 }
 
 /// A FetchRequest for `welcome_id` went out on the gossip inbox: its
@@ -49114,6 +49138,35 @@ async fn prune_retained_welcome_receives(state: &Arc<AppState>) {
     };
     for id in expired {
         drop_retained_welcome(state, &id, "deadline");
+    }
+}
+
+/// A finalized join attempt: the receives it left retained, and the
+/// Welcomes that completed for it with no attempt waiting, go now instead
+/// of at their deadline.
+async fn drop_retained_welcomes_for_groups(state: &AppState, groups: &[&str]) {
+    let in_groups = |group: &str| groups.contains(&group);
+    let mut dropped: Vec<String> = {
+        let mut receives = state.pending_welcome_receives.write().await;
+        let ids: Vec<String> = receives
+            .iter()
+            .filter(|(_, receive)| receive.retention.retained && in_groups(&receive.group_id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &ids {
+            receives.remove(id);
+        }
+        ids
+    };
+    if !dropped.is_empty() {
+        let mut waiters = state.pending_welcome_waiters.write().await;
+        for id in &dropped {
+            waiters.remove(id);
+        }
+    }
+    dropped.extend(state.welcome_gossip.purge_groups(in_groups));
+    for id in &dropped {
+        drop_retained_welcome(state, id, "finalized");
     }
 }
 
@@ -49383,13 +49436,11 @@ where
                 true
             }
         };
-        state
-            .pending_welcome_waiters
-            .write()
-            .await
-            .entry(welcome_ref.welcome_id.clone())
-            .or_default()
-            .push(tx);
+        let mut waiters = state.pending_welcome_waiters.write().await;
+        let waiting = waiters.entry(welcome_ref.welcome_id.clone()).or_default();
+        // Attempts that ended leave their closed waiters behind.
+        waiting.retain(|waiter| !waiter.is_closed());
+        waiting.push(tx);
         should_send_fetch
     };
 
@@ -49471,8 +49522,9 @@ where
                     .retention
                     .gossip_fetch_recent(tokio::time::Instant::now())
             });
-        // Over a live direct connection the owner answers at once; only a
-        // request that would again wait on the slow inbox is withheld.
+        // Over a live direct connection a retry inside the window takes it,
+        // and the owner answers at once; without one the retry would ride
+        // the slow inbox again, so it is withheld.
         let withheld =
             gossip_fetch_recent && !state.agent.has_live_direct_connection(&source).await;
         if withheld {
@@ -49490,8 +49542,9 @@ where
                 welcome_id: welcome_ref.welcome_id.clone(),
             };
             // Only the first scheduled attempt is a first request; joining a
-            // fetch in flight sends its first one as a retry.
-            requests.push(send(source, request, attempt == 0));
+            // fetch in flight sends its first one as a retry. A retry inside
+            // a gossip request's window prefers the live connection.
+            requests.push(send(source, request, attempt == 0 || gossip_fetch_recent));
         }
     }
     if received.is_none() {
@@ -49690,7 +49743,7 @@ pub(in crate::server) async fn handle_welcome_blob_message(
             blake3_hex,
         } => {
             let source = hex::encode(sender.as_bytes());
-            let mismatch = {
+            let (mismatch, retained) = {
                 let receives = state.pending_welcome_receives.read().await;
                 let Some(receive) = receives.get(&welcome_id) else {
                     tracing::debug!(welcome_id, "ignoring unsolicited Welcome blob offer");
@@ -49700,11 +49753,14 @@ pub(in crate::server) async fn handle_welcome_blob_message(
                     tracing::debug!(welcome_id, sender = %source, "ignoring Welcome blob offer from unexpected source");
                     return;
                 }
-                receive.group_id != group_id
-                    || receive.byte_len != byte_len
-                    || receive.total_chunks != total_chunks
-                    || chunk_size != x0x::files::DEFAULT_CHUNK_SIZE
-                    || blake3_hex != welcome_id
+                (
+                    receive.group_id != group_id
+                        || receive.byte_len != byte_len
+                        || receive.total_chunks != total_chunks
+                        || chunk_size != x0x::files::DEFAULT_CHUNK_SIZE
+                        || blake3_hex != welcome_id,
+                    receive.retention.retained,
+                )
             };
             if mismatch {
                 state
@@ -49712,6 +49768,9 @@ pub(in crate::server) async fn handle_welcome_blob_message(
                     .write()
                     .await
                     .remove(&welcome_id);
+                if retained {
+                    drop_retained_welcome(state, &welcome_id, "mismatch");
+                }
                 state.welcome_ack_tasks.release_welcome(&welcome_id);
                 notify_welcome_waiters(
                     state,
@@ -49751,13 +49810,12 @@ async fn handle_welcome_fetch_request(
     group_id: String,
     welcome_id: String,
 ) {
-    // A slow gossip inbox delivers a joiner's repeated requests minutes
-    // late. Once this Welcome was streamed over gossip, another request
-    // inside the refresh window would only restream it into the same
+    // A repeat request that lands while this Welcome is still going out
+    // over gossip, or just after, would only restream it into the same
     // congestion; the joiner keeps what that stream delivers.
     if state
-        .welcome_gossip
-        .streamed_recently(&welcome_id, tokio::time::Instant::now())
+        .gossip_windows
+        .served_recently(&welcome_id, tokio::time::Instant::now())
         && !state.agent.has_live_direct_connection(sender).await
     {
         tracing::debug!(
@@ -49832,8 +49890,8 @@ async fn handle_welcome_fetch_request(
                 .await;
                 if outcome == Ok(JoinArtifactPath::GossipInbox) {
                     state
-                        .welcome_gossip
-                        .note_streamed(welcome_id, tokio::time::Instant::now());
+                        .gossip_windows
+                        .note_served(welcome_id, tokio::time::Instant::now());
                 }
                 welcome_frame_delivered(&state, outcome.map(|_| ()))
             }
@@ -50161,8 +50219,8 @@ async fn stream_welcome_blob_via<S, F>(
     // assembles from its chunks whatever the order (an early Complete is
     // kept), and verifies length and blake3.
     let gossip_carried = state
-        .welcome_gossip
-        .streamed_since(welcome_id, stream_started);
+        .gossip_windows
+        .served_since(welcome_id, stream_started);
     if total_chunks > 0 && gossip_carried {
         tracing::debug!(target: "welcome.trace", stage = "final_ack_wait_skipped_gossip", welcome_id, total_chunks);
     } else if total_chunks > 0 {
@@ -50253,6 +50311,12 @@ async fn handle_welcome_blob_chunk(
     };
     if receive.source != sender_hex {
         tracing::debug!(target: "welcome.trace", stage = "chunk_recv_wrong_source", welcome_id = %welcome_id, seq = sequence);
+        return;
+    }
+    if receive.retention.retained && receive.retention.past_deadline(tokio::time::Instant::now()) {
+        receives.remove(&welcome_id);
+        drop(receives);
+        drop_retained_welcome(state, &welcome_id, "deadline");
         return;
     }
     if sequence >= receive.total_chunks {
@@ -50422,6 +50486,14 @@ async fn handle_welcome_blob_complete(state: &Arc<AppState>, sender: &AgentId, w
         if receive.source != sender_hex {
             return;
         }
+        if receive.retention.retained
+            && receive.retention.past_deadline(tokio::time::Instant::now())
+        {
+            receives.remove(welcome_id);
+            drop(receives);
+            drop_retained_welcome(state, welcome_id, "deadline");
+            return;
+        }
         // A Complete before every chunk is in ends a stream early, not this
         // receive: it can be a replaced stream's Complete, still in flight
         // when the next fetch registered its receive. Keep waiting; the
@@ -50473,6 +50545,9 @@ async fn handle_welcome_blob_complete(state: &Arc<AppState>, sender: &AgentId, w
     }
     let actual = welcome_id_for_bytes(&bytes);
     if actual != welcome_id {
+        if receive.retention.retained {
+            drop_retained_welcome(state, welcome_id, "mismatch");
+        }
         notify_welcome_waiters(
             state,
             welcome_id,
@@ -50483,10 +50558,13 @@ async fn handle_welcome_blob_complete(state: &Arc<AppState>, sender: &AgentId, w
     }
     let retained = receive.retention.retained;
     if notify_welcome_waiters(state, welcome_id, Ok(bytes.clone())).await == 0 && retained {
-        let dropped =
-            state
-                .welcome_gossip
-                .keep_completed(welcome_id, bytes, tokio::time::Instant::now());
+        let dropped = state.welcome_gossip.keep_completed(
+            welcome_id,
+            &receive.group_id,
+            bytes,
+            receive.retention.started_at,
+            tokio::time::Instant::now(),
+        );
         for id in &dropped {
             tracing::info!(
                 target: "welcome.trace",
@@ -51493,6 +51571,7 @@ pub(in crate::server) mod tests {
             pending_welcomes: RwLock::new(HashMap::new()),
             pending_welcome_receives: RwLock::new(HashMap::new()),
             welcome_gossip: Default::default(),
+            gossip_windows: Default::default(),
             pending_welcome_waiters: RwLock::new(HashMap::new()),
             pending_welcome_acks: RwLock::new(HashMap::new()),
             pending_welcome_streams: Mutex::new(Some(HashMap::new())),
@@ -64575,12 +64654,15 @@ pub(in crate::server) mod tests {
         let fetch_config = welcome_blob_send_config(&fetch, false);
         assert!(!fetch_config.prefer_raw_quic_if_connected);
         assert!(!fetch_config.stop_fallback_on_raw_error);
-        // Only the FetchRequest awaits its gossip-inbox receipt.
+        // Only a FetchRequest that prefers raw QUIC awaits its gossip-inbox
+        // receipt (its fallback leg); one that prefers the gossip inbox is
+        // published, as a ChunkAck is.
         let ack = WelcomeBlobMessage::ChunkAck {
             welcome_id: "bb".repeat(32),
             sequence: 0,
         };
-        assert!(fetch_config.require_gossip_ack);
+        assert!(!fetch_config.require_gossip_ack);
+        assert!(welcome_blob_send_config(&fetch, true).require_gossip_ack);
         assert!(!welcome_blob_send_config(&ack, false).require_gossip_ack);
         // Over a live connection a control frame prefers raw QUIC with the
         // receive ACK, and still falls back to the gossip inbox.

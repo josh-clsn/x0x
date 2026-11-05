@@ -8,6 +8,7 @@ use super::*;
 
 use super::adr0107_stuck_join_rearm::{build, welcome_id_of, Fixture};
 use super::welcome_gossip_fallback::{known_recipient, welcome_ref_of};
+use super::welcome_gossip_latency::{deliver_as, owner_frames};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 type SlowSink = tokio::sync::mpsc::UnboundedReceiver<(AgentId, Vec<u8>, u64)>;
@@ -334,6 +335,157 @@ async fn over_a_live_connection_retries_do_not_flood_the_gossip_inbox() -> anyho
     assert!(
         gossip <= 1,
         "{gossip} FetchRequests took the gossip inbox inside one refresh window"
+    );
+    Ok(())
+}
+
+/// One bounded attempt that asks over the slow inbox and gets nothing, so
+/// its receive is retained.
+async fn retained_attempt(s: &Fixture, reference: &WelcomeRef) {
+    let j2 = Arc::clone(&s.j2);
+    let send = move |source: AgentId, request: WelcomeBlobMessage, prefer_raw: bool| {
+        let j2 = Arc::clone(&j2);
+        async move { super::super::send_welcome_fetch_request(&j2, &source, &request, prefer_raw).await }
+    };
+    let attempt = super::super::fetch_treekem_welcome_via(&s.j2, &s.stable, reference, send).await;
+    assert!(attempt.is_err(), "nothing answers");
+    assert!(
+        s.j2.pending_welcome_receives
+            .read()
+            .await
+            .get(&reference.welcome_id)
+            .is_some_and(|receive| receive.retention.retained),
+        "the receive is retained"
+    );
+}
+
+/// WHY (review L3, L8): attempts that end in retention leave no closed
+/// waiters behind, and a retained receive takes frames only from the
+/// Welcome's source.
+#[tokio::test]
+async fn retained_receives_shed_dead_waiters_and_ignore_other_sources() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    known_recipient(&s.j2, &s.authority).await?;
+    let _sink: SlowSink = s.j2.agent.route_gossip_inbox_to_slow_standin_for_testing();
+    let reference = welcome_ref_of(&s.j2_add).expect("welcome ref");
+    let (bytes, frames) = owner_frames(&s).await?;
+    tokio::time::pause();
+    for _ in 0..4 {
+        retained_attempt(&s, &reference).await;
+    }
+    let waiters =
+        s.j2.pending_welcome_waiters
+            .read()
+            .await
+            .get(&reference.welcome_id)
+            .map_or(0, Vec::len);
+    deliver_as(&s, &s.j1, &frames).await;
+    let foreign_taken =
+        s.j2.welcome_gossip
+            .take_completed(&reference.welcome_id, tokio::time::Instant::now());
+    deliver_as(&s, &s.authority, &frames).await;
+    let owner_taken =
+        s.j2.welcome_gossip
+            .take_completed(&reference.welcome_id, tokio::time::Instant::now());
+    tokio::time::resume();
+    assert!(waiters <= 1, "{waiters} waiters left by ended attempts");
+    assert!(
+        foreign_taken.is_none(),
+        "frames from another source completed it"
+    );
+    assert_eq!(owner_taken, Some(bytes), "the source's frames complete it");
+    Ok(())
+}
+
+/// WHY (review L2): a retained receive past its overall deadline takes no
+/// more frames, and no Welcome completes from it.
+#[tokio::test]
+async fn a_retained_receive_past_its_deadline_takes_no_frames() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    known_recipient(&s.j2, &s.authority).await?;
+    let _sink: SlowSink = s.j2.agent.route_gossip_inbox_to_slow_standin_for_testing();
+    let reference = welcome_ref_of(&s.j2_add).expect("welcome ref");
+    let (_, frames) = owner_frames(&s).await?;
+    tokio::time::pause();
+    retained_attempt(&s, &reference).await;
+    tokio::time::sleep(super::super::welcome_retention::RETAINED_WELCOME_TTL).await;
+    let (complete, chunks) = frames.split_last().expect("frames");
+    deliver_as(&s, &s.authority, chunks).await;
+    let took_chunks =
+        s.j2.pending_welcome_receives
+            .read()
+            .await
+            .get(&reference.welcome_id)
+            .is_some_and(|receive| !receive.chunks.is_empty());
+    deliver_as(&s, &s.authority, std::slice::from_ref(complete)).await;
+    let held = s.j2.welcome_gossip.take_completed(
+        &reference.welcome_id,
+        tokio::time::Instant::now() - Duration::from_secs(1),
+    );
+    let receive =
+        s.j2.pending_welcome_receives
+            .read()
+            .await
+            .contains_key(&reference.welcome_id);
+    tokio::time::resume();
+    assert!(!took_chunks, "the expired receive took chunks");
+    assert!(
+        held.is_none(),
+        "a Welcome completed past its receive's deadline"
+    );
+    assert!(!receive, "the expired receive is dropped");
+    Ok(())
+}
+
+/// WHY (review L8): a retained receive for another reference of the same
+/// id is dropped as superseded when a fetch for the current one begins.
+#[tokio::test]
+async fn a_retained_receive_for_another_reference_is_superseded() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    known_recipient(&s.j2, &s.authority).await?;
+    let _sink: SlowSink = s.j2.agent.route_gossip_inbox_to_slow_standin_for_testing();
+    let reference = welcome_ref_of(&s.j2_add).expect("welcome ref");
+    tokio::time::pause();
+    let retention = super::super::welcome_retention::WelcomeRetention {
+        gossip_fetch_sent_at: Some(tokio::time::Instant::now()),
+        retained: true,
+        ..Default::default()
+    };
+    s.j2.pending_welcome_receives.write().await.insert(
+        reference.welcome_id.clone(),
+        PendingWelcomeReceive {
+            group_id: s.stable.clone(),
+            source: reference.source.clone(),
+            byte_len: reference.byte_len + 1,
+            total_chunks: 1,
+            chunks: BTreeMap::new(),
+            received_bytes: 0,
+            ended_early: None,
+            retention,
+        },
+    );
+    let attempt = tokio::time::timeout(
+        Duration::from_secs(1),
+        super::super::fetch_treekem_welcome_via(&s.j2, &s.stable, &reference, |_, _, _| async {
+            Ok(())
+        }),
+    )
+    .await;
+    let byte_len =
+        s.j2.pending_welcome_receives
+            .read()
+            .await
+            .get(&reference.welcome_id)
+            .map(|receive| receive.byte_len);
+    tokio::time::resume();
+    assert!(attempt.is_err(), "the new fetch is under way, not refused");
+    assert_eq!(
+        byte_len,
+        Some(reference.byte_len),
+        "the stale receive was replaced"
     );
     Ok(())
 }

@@ -2,38 +2,25 @@
 //!
 //! On a metered phone the gossip inbox is tens of seconds to minutes one
 //! way (field test 2026-11-04: 35 s to 156 s), longer than a joiner's
-//! bounded fetch attempt. So:
-//! - a joiner keeps a Welcome receive it asked for over gossip across its
-//!   attempts ([`WelcomeRetention`]), and keeps a Welcome that completed
-//!   between attempts until the next one takes it;
-//! - while such a request is younger than [`WELCOME_GOSSIP_REFRESH`] the
-//!   joiner does not ask again, and an owner that streamed the Welcome over
-//!   gossip inside that window does not stream it again
-//!   ([`WelcomeGossipState`]).
+//! bounded fetch attempt. So a joiner keeps a Welcome receive it asked for
+//! over gossip across its attempts ([`WelcomeRetention`]), and keeps a
+//! Welcome that completed between attempts until the next one takes it
+//! ([`WelcomeGossipState`]), each within the receive's overall deadline.
+//! The request and answer windows are in [`super::gossip_window`].
 //!
 //! Raw QUIC keeps its behaviour: nothing here applies to a request that
 //! did not take the gossip inbox.
 
+use super::gossip_window::{GOSSIP_REFRESH, SLOW_INBOX_DEADLINE};
 use std::collections::HashMap;
 use std::sync::Mutex;
+#[cfg(test)]
 use std::time::Duration;
 use tokio::time::Instant;
 
-/// The lifetime of a gossip-carried Welcome frame, in either direction:
-/// above the observed one-way latency (156 s), with room for skew.
-pub(super) const WELCOME_GOSSIP_LIFETIME: Duration =
-    Duration::from_millis(crate::dm_send::ADMITTED_PUBLISH_LIFETIME_MS);
-
-/// While a gossip-carried request is younger than this, a joiner does not
-/// ask again, and an owner does not stream the Welcome again.
-pub(super) const WELCOME_GOSSIP_REFRESH: Duration =
-    Duration::from_millis(crate::dm_send::ADMITTED_PUBLISH_LIFETIME_MS / 2);
-
-/// How long a joiner keeps a gossip-carried receive across attempts: two
-/// full lifetimes, one for the request to reach the owner and one for the
-/// stream to come back, so a request sent at the last moment before a
-/// refresh is still answered into the same receive.
-pub(super) const RETAINED_WELCOME_TTL: Duration = Duration::from_secs(600);
+/// How long a joiner keeps a gossip-carried receive across attempts,
+/// counted from the attempt that began it.
+pub(super) const RETAINED_WELCOME_TTL: std::time::Duration = SLOW_INBOX_DEADLINE;
 
 /// The most retained receives, and separately completed Welcomes, a joiner
 /// holds.
@@ -67,7 +54,7 @@ impl WelcomeRetention {
     /// A gossip-carried request is still on its way or being answered.
     pub(super) fn gossip_fetch_recent(&self, now: Instant) -> bool {
         self.gossip_fetch_sent_at
-            .is_some_and(|sent| now.saturating_duration_since(sent) < WELCOME_GOSSIP_REFRESH)
+            .is_some_and(|sent| now.saturating_duration_since(sent) < GOSSIP_REFRESH)
     }
 
     /// The receive may outlive its attempt: it was asked for over gossip,
@@ -100,34 +87,53 @@ pub(super) fn over_cap(entries: &[(String, Instant, u64)]) -> Vec<String> {
     drop
 }
 
-/// Process-local Welcome state for the gossip inbox: a joiner's Welcomes
-/// that completed between attempts, and the owner's gossip-carried
-/// streams.
+/// A Welcome that completed with no attempt waiting.
+#[derive(Debug)]
+struct CompletedWelcome {
+    group_id: String,
+    bytes: Vec<u8>,
+    /// When its receive began: the receive's overall deadline still holds.
+    started_at: Instant,
+}
+
+/// A joiner's Welcomes that completed between attempts.
 #[derive(Debug, Default)]
 pub(in crate::server) struct WelcomeGossipState {
-    completed: Mutex<HashMap<String, (Vec<u8>, Instant)>>,
-    /// Per Welcome: when its refresh window opened, and when a frame of it
-    /// last took the gossip inbox.
-    streamed: Mutex<HashMap<String, (Instant, Instant)>>,
+    completed: Mutex<HashMap<String, CompletedWelcome>>,
+}
+
+fn live(entry: &CompletedWelcome, now: Instant) -> bool {
+    now.saturating_duration_since(entry.started_at) < RETAINED_WELCOME_TTL
 }
 
 impl WelcomeGossipState {
-    /// Keep a Welcome that completed with no attempt waiting. Returns the
-    /// ids dropped to stay within the caps (the oldest; possibly this one).
+    /// Keep a Welcome that completed with no attempt waiting, until the
+    /// deadline of the receive that began at `started_at`. Returns the ids
+    /// dropped to stay within the caps (the oldest; possibly this one).
     pub(super) fn keep_completed(
         &self,
         welcome_id: &str,
+        group_id: &str,
         bytes: Vec<u8>,
+        started_at: Instant,
         now: Instant,
     ) -> Vec<String> {
         let Ok(mut completed) = self.completed.lock() else {
             return vec![welcome_id.to_string()];
         };
-        completed.retain(|_, (_, at)| now.saturating_duration_since(*at) < RETAINED_WELCOME_TTL);
-        completed.insert(welcome_id.to_string(), (bytes, now));
+        completed.retain(|_, entry| live(entry, now));
+        let entry = CompletedWelcome {
+            group_id: group_id.to_string(),
+            bytes,
+            started_at,
+        };
+        if !live(&entry, now) {
+            return vec![welcome_id.to_string()];
+        }
+        completed.insert(welcome_id.to_string(), entry);
         let entries: Vec<(String, Instant, u64)> = completed
             .iter()
-            .map(|(id, (bytes, at))| (id.clone(), *at, bytes.len() as u64))
+            .map(|(id, entry)| (id.clone(), entry.started_at, entry.bytes.len() as u64))
             .collect();
         let dropped = over_cap(&entries);
         for id in &dropped {
@@ -140,40 +146,24 @@ impl WelcomeGossipState {
     /// still inside its deadline.
     pub(super) fn take_completed(&self, welcome_id: &str, now: Instant) -> Option<Vec<u8>> {
         let mut completed = self.completed.lock().ok()?;
-        completed.retain(|_, (_, at)| now.saturating_duration_since(*at) < RETAINED_WELCOME_TTL);
-        completed.remove(welcome_id).map(|(bytes, _)| bytes)
+        completed.retain(|_, entry| live(entry, now));
+        completed.remove(welcome_id).map(|entry| entry.bytes)
     }
 
-    /// The owner streamed `welcome_id` over the gossip inbox inside the
-    /// refresh window.
-    pub(super) fn streamed_recently(&self, welcome_id: &str, now: Instant) -> bool {
-        self.streamed.lock().is_ok_and(|streamed| {
-            streamed.get(welcome_id).is_some_and(|(opened, _)| {
-                now.saturating_duration_since(*opened) < WELCOME_GOSSIP_REFRESH
-            })
-        })
-    }
-
-    /// A frame of `welcome_id` took the gossip inbox at or after `since`
-    /// (the start of the stream asking).
-    pub(super) fn streamed_since(&self, welcome_id: &str, since: Instant) -> bool {
-        self.streamed.lock().is_ok_and(|streamed| {
-            streamed
-                .get(welcome_id)
-                .is_some_and(|(_, last)| *last >= since)
-        })
-    }
-
-    /// A frame of the owner's stream for `welcome_id` took the gossip
-    /// inbox: its refresh window opens now, unless one is already open.
-    pub(super) fn note_streamed(&self, welcome_id: &str, now: Instant) {
-        if let Ok(mut streamed) = self.streamed.lock() {
-            streamed.retain(|_, (opened, _)| {
-                now.saturating_duration_since(*opened) < WELCOME_GOSSIP_REFRESH
-            });
-            let entry = streamed.entry(welcome_id.to_string()).or_insert((now, now));
-            entry.1 = now;
+    /// Drop every held Welcome whose group `matches`; returns their ids.
+    pub(super) fn purge_groups(&self, matches: impl Fn(&str) -> bool) -> Vec<String> {
+        let Ok(mut completed) = self.completed.lock() else {
+            return Vec::new();
+        };
+        let ids: Vec<String> = completed
+            .iter()
+            .filter(|(_, entry)| matches(&entry.group_id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &ids {
+            completed.remove(id);
         }
+        ids
     }
 }
 
@@ -216,7 +206,7 @@ mod tests {
         };
         assert!(retention.may_retain(now));
         assert!(retention.gossip_fetch_recent(now));
-        assert!(!retention.gossip_fetch_recent(now + WELCOME_GOSSIP_REFRESH));
+        assert!(!retention.gossip_fetch_recent(now + GOSSIP_REFRESH));
         assert!(retention.may_retain(now + RETAINED_WELCOME_TTL - Duration::from_secs(1)));
         assert!(!retention.may_retain(now + RETAINED_WELCOME_TTL));
         assert!(retention.past_deadline(now + RETAINED_WELCOME_TTL));
@@ -227,11 +217,8 @@ mod tests {
         let state = WelcomeGossipState::default();
         let now = Instant::now();
         for i in 0..MAX_RETAINED_WELCOMES + 1 {
-            let dropped = state.keep_completed(
-                &format!("w{i}"),
-                vec![0; 4],
-                now + Duration::from_secs(i as u64),
-            );
+            let at = now + Duration::from_secs(i as u64);
+            let dropped = state.keep_completed(&format!("w{i}"), "g", vec![0; 4], at, at);
             if i < MAX_RETAINED_WELCOMES {
                 assert!(dropped.is_empty());
             } else {
@@ -246,16 +233,41 @@ mod tests {
             .is_none());
     }
 
+    /// WHY (review L2): a Welcome that completes late keeps its receive's
+    /// overall deadline; it does not start a fresh one.
     #[tokio::test(start_paused = true)]
-    async fn an_owner_streams_once_per_refresh_window() {
+    async fn a_completed_welcome_keeps_its_receives_deadline() {
+        let state = WelcomeGossipState::default();
+        let started = Instant::now();
+        let late = started + RETAINED_WELCOME_TTL - Duration::from_secs(10);
+        assert!(state
+            .keep_completed("w", "g", vec![1], started, late)
+            .is_empty());
+        assert!(
+            state
+                .take_completed("w", started + RETAINED_WELCOME_TTL)
+                .is_none(),
+            "held past the receive's deadline"
+        );
+        assert_eq!(
+            state.keep_completed("x", "g", vec![1], started, started + RETAINED_WELCOME_TTL),
+            vec!["x".to_string()],
+            "a Welcome completing after its deadline is not kept"
+        );
+    }
+
+    /// WHY (review L4): a group purge drops its held Welcomes.
+    #[tokio::test(start_paused = true)]
+    async fn a_group_purge_drops_its_completed_welcomes() {
         let state = WelcomeGossipState::default();
         let now = Instant::now();
-        assert!(!state.streamed_recently("w", now));
-        state.note_streamed("w", now);
-        state.note_streamed("w", now + Duration::from_secs(10));
-        assert!(state.streamed_recently("w", now + WELCOME_GOSSIP_REFRESH - Duration::from_secs(1)));
-        assert!(!state.streamed_recently("w", now + WELCOME_GOSSIP_REFRESH));
-        assert!(state.streamed_since("w", now + Duration::from_secs(10)));
-        assert!(!state.streamed_since("w", now + Duration::from_secs(11)));
+        state.keep_completed("a", "g1", vec![1], now, now);
+        state.keep_completed("b", "g2", vec![1], now, now);
+        assert_eq!(
+            state.purge_groups(|group| group == "g1"),
+            vec!["a".to_string()]
+        );
+        assert!(state.take_completed("a", now).is_none());
+        assert!(state.take_completed("b", now).is_some());
     }
 }

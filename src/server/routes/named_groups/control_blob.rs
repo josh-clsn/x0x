@@ -110,8 +110,8 @@ struct IncomingBlob {
     /// Woken on every chunk delivered or buffered.
     arrived: Arc<tokio::sync::Notify>,
     /// Pulled over a slow gossip inbox: routed for
-    /// [`super::welcome_retention::RETAINED_WELCOME_TTL`], not
-    /// [`FETCH_TIMEOUT`].
+    /// [`super::gossip_window::SLOW_INBOX_DEADLINE`], not [`FETCH_TIMEOUT`],
+    /// and chunks no waiter took are kept.
     slow: bool,
 }
 
@@ -148,7 +148,7 @@ impl Registry {
         // bytes accounted until its task actually ends.
         self.incoming.retain(|_, entry| {
             let lifetime = if entry.slow {
-                super::welcome_retention::RETAINED_WELCOME_TTL
+                super::gossip_window::SLOW_INBOX_DEADLINE
             } else {
                 FETCH_TIMEOUT
             };
@@ -435,12 +435,10 @@ impl ControlBlobState {
                         if let Err(chunk) = waiter.send(chunk) {
                             buffer_chunk(incoming, reference, sequence, chunk);
                         }
-                        incoming.arrived.notify_one();
                         return;
                     }
                 }
                 buffer_chunk(incoming, reference, sequence, chunk);
-                incoming.arrived.notify_one();
             }
         });
     }
@@ -650,12 +648,23 @@ fn control_request_config() -> x0x::dm::DmSendConfig {
     x0x::dm::DmSendConfig {
         prefer_raw_quic_if_connected: false,
         // A phone's gossip inbox is minutes one way (round 5).
-        gossip_envelope_lifetime_ms: Some(x0x::dm_send::ADMITTED_PUBLISH_LIFETIME_MS),
+        gossip_envelope_lifetime_ms: Some(super::gossip_window::SLOW_INBOX_LIFETIME_MS),
         ..direct_message_send_config()
     }
 }
 
-/// Keep a chunk that no waiter took, bounded by the declared length.
+/// A slow pull's Fetch and Release: published, not acked. The ack of a
+/// gossip-carried frame takes two minutes-long trips, longer than any send
+/// waits; the pull's own rounds are its retries.
+fn control_slow_config() -> x0x::dm::DmSendConfig {
+    x0x::dm::DmSendConfig {
+        require_gossip_ack: false,
+        ..control_request_config()
+    }
+}
+
+/// Keep a chunk that no waiter took, bounded by the declared length, for a
+/// slow pull only; the short pull drops it, as before.
 fn buffer_chunk(
     incoming: &mut IncomingBlob,
     reference: &ControlBlobRef,
@@ -663,19 +672,15 @@ fn buffer_chunk(
     chunk: Vec<u8>,
 ) {
     let len = chunk.len() as u64;
-    if incoming.buffered.contains_key(&sequence)
+    if !incoming.slow
+        || incoming.buffered.contains_key(&sequence)
         || incoming.buffered_bytes.saturating_add(len) > reference.byte_len
     {
         return;
     }
     incoming.buffered_bytes = incoming.buffered_bytes.saturating_add(len);
     incoming.buffered.insert(sequence, chunk);
-}
-
-/// The lifetime of a gossip-carried Fetch's (or Release's) envelope.
-#[cfg(test)]
-pub(super) fn control_fetch_gossip_lifetime_ms() -> u64 {
-    x0x::dm_send::gossip_envelope_lifetime_ms(&control_request_config())
+    incoming.arrived.notify_one();
 }
 
 /// One control-blob frame's wire bytes, refusing a frame over the
@@ -771,9 +776,18 @@ async fn send_message(
     recipient: &AgentId,
     message: &ControlBlobMessage,
 ) -> std::result::Result<(), String> {
+    send_message_with(agent, recipient, message, control_config(message)).await
+}
+
+async fn send_message_with(
+    agent: &Agent,
+    recipient: &AgentId,
+    message: &ControlBlobMessage,
+    config: x0x::dm::DmSendConfig,
+) -> std::result::Result<(), String> {
     let bytes = encode_message(message)?;
     agent
-        .send_direct_with_config(recipient, bytes, control_config(message))
+        .send_direct_with_config(recipient, bytes, config)
         .await
         .map(|_| ())
         .map_err(|e| e.to_string())
@@ -1067,17 +1081,17 @@ pub(in crate::server) async fn handle_control_blob_message(
                     );
                     return;
                 }
-                // Over a slow gossip inbox the joiner asks for every missing
-                // chunk once per refresh window; a repeat inside the window
-                // whose chunk already went out over gossip is not resent.
+                // Over a slow gossip inbox the joiner asks for a missing
+                // chunk once per refresh window; a repeat that lands while
+                // the chunk is still going out over gossip is not resent.
                 let served_key = super::join_result_chunk_gossip_key(
                     &reference.digest,
                     &reference.recipient,
                     sequence,
                 );
                 if state
-                    .welcome_gossip
-                    .streamed_recently(&served_key, tokio::time::Instant::now())
+                    .gossip_windows
+                    .served_recently(&served_key, tokio::time::Instant::now())
                     && !state.agent.has_live_direct_connection(sender).await
                 {
                     tracing::debug!(
@@ -1156,8 +1170,8 @@ pub(in crate::server) async fn handle_control_blob_message(
                         .await;
                         if sent == Ok(super::JoinArtifactPath::GossipInbox) {
                             task_state
-                                .welcome_gossip
-                                .note_streamed(&served_key, tokio::time::Instant::now());
+                                .gossip_windows
+                                .note_served(&served_key, tokio::time::Instant::now());
                         }
                         match sent.map(|_| ()) {
                             Ok(()) => {
@@ -1362,22 +1376,25 @@ async fn fetch_blob(
     generation: u64,
 ) -> std::result::Result<(AgentId, Vec<u8>), &'static str> {
     let source = parse_agent_id_hex(&reference.source).map_err(|_| "invalid source")?;
-    // Only the gossip inbox reaches the source: its latency is minutes on a
-    // phone, so the pull takes the gossip-sized path.
-    if state.agent.gossip_inbox_reach(&source).await.is_ok()
+    // A join result whose source only the gossip inbox reaches: its latency
+    // is minutes on a phone, so the pull takes the gossip-sized path. Only
+    // a join result: its reference passed the current-attempt and
+    // expected-inviter check, and its chunks may ride the gossip inbox. A
+    // metadata event's chunks are raw-only, so a long pull of one could
+    // only hold a fetch slot.
+    if reference.kind == ControlBlobKind::JoinResult
+        && state.agent.gossip_inbox_reach(&source).await.is_ok()
         && !state.agent.has_live_direct_connection(&source).await
     {
         let bytes = fetch_blob_over_gossip(state, reference, generation, &source).await?;
-        return finish_fetched_blob(state, reference, source, bytes);
+        return finish_fetched_blob(state, reference, source, bytes, control_slow_config());
     }
     let deadline = tokio::time::Instant::now() + FETCH_TIMEOUT;
     let total_chunks = reference.byte_len.div_ceil(CHUNK_BYTES as u64);
     let mut bytes = Vec::new();
     for sequence in 0..total_chunks {
         let sequence = u32::try_from(sequence).map_err(|_| "too many control chunks")?;
-        let mut received = state
-            .control_blobs
-            .take_buffered(reference, generation, sequence);
+        let mut received = None;
         for _ in 0..CHUNK_RETRIES {
             if received.is_some() {
                 break;
@@ -1425,29 +1442,32 @@ async fn fetch_blob(
             return Err("control blob length exceeded");
         }
     }
-    finish_fetched_blob(state, reference, source, bytes)
+    let release = control_config(&ControlBlobMessage::Release {
+        reference: reference.clone(),
+    });
+    finish_fetched_blob(state, reference, source, bytes, release)
 }
 
-/// A pull over a slow gossip inbox (no live direct connection to the
-/// source): a chunk takes minutes to come back, so up to the source's
-/// per-group chunk share of the missing chunks is asked for at once (the
-/// least-asked first), one round per refresh window, and chunks are kept in
-/// whatever order and whenever they arrive, until the retained deadline. The source answers a duplicate inside its window at most
-/// once.
+/// A join-result pull over a slow gossip inbox (no live direct connection
+/// to the source). A chunk takes minutes to come back, so:
+/// - each round, one per refresh window, asks for up to the source's
+///   per-group chunk share of the missing chunks, the least-asked first;
+/// - chunks are kept in whatever order and whenever they arrive;
+/// - the pull ends at the slow-inbox deadline.
 async fn fetch_blob_over_gossip(
     state: &Arc<AppState>,
     reference: &ControlBlobRef,
     generation: u64,
     source: &AgentId,
 ) -> std::result::Result<Vec<u8>, &'static str> {
-    use super::welcome_retention::{RETAINED_WELCOME_TTL, WELCOME_GOSSIP_REFRESH};
+    use super::gossip_window::{GOSSIP_REFRESH, SLOW_INBOX_DEADLINE};
     let arrived = state
         .control_blobs
         .mark_slow(reference, generation)
         .ok_or("control blob fetch cancelled")?;
     let total_chunks = u32::try_from(reference.byte_len.div_ceil(CHUNK_BYTES as u64))
         .map_err(|_| "too many control chunks")?;
-    let deadline = tokio::time::Instant::now() + RETAINED_WELCOME_TTL;
+    let deadline = tokio::time::Instant::now() + SLOW_INBOX_DEADLINE;
     let mut chunks: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
     let mut asked: HashMap<u32, u32> = HashMap::new();
     tracing::info!(
@@ -1486,19 +1506,22 @@ async fn fetch_blob_over_gossip(
             .collect();
         missing.sort_by_key(|sequence| (asked.get(sequence).copied().unwrap_or(0), *sequence));
         missing.truncate(super::JOIN_RESULT_CHUNK_PER_GROUP_CAP);
-        for sequence in missing {
+        let fetches = missing.into_iter().map(|sequence| {
             *asked.entry(sequence).or_insert(0) += 1;
             let fetch = ControlBlobMessage::Fetch {
                 reference: reference.clone(),
                 sequence,
             };
-            let _ = tokio::time::timeout(
-                CHUNK_ATTEMPT_TIMEOUT,
-                send_message(&state.agent, source, &fetch),
-            )
-            .await;
-        }
-        let round_end = (now + WELCOME_GOSSIP_REFRESH).min(deadline);
+            async move {
+                let _ = tokio::time::timeout(
+                    CHUNK_ATTEMPT_TIMEOUT,
+                    send_message_with(&state.agent, source, &fetch, control_slow_config()),
+                )
+                .await;
+            }
+        });
+        futures::future::join_all(fetches.collect::<Vec<_>>()).await;
+        let round_end = (now + GOSSIP_REFRESH).min(deadline);
         while tokio::time::Instant::now() < round_end && (chunks.len() as u32) < total_chunks {
             let _ = tokio::time::timeout_at(round_end, arrived.notified()).await;
             collect(&mut chunks);
@@ -1514,12 +1537,14 @@ async fn fetch_blob_over_gossip(
     Ok(bytes)
 }
 
-/// The end of a pull: verify, then tell the source it can free the copy.
+/// The end of a pull: verify, then tell the source it can free the copy
+/// (the Release sent with `release`).
 fn finish_fetched_blob(
     state: &Arc<AppState>,
     reference: &ControlBlobRef,
     source: AgentId,
     bytes: Vec<u8>,
+    release: x0x::dm::DmSendConfig,
 ) -> std::result::Result<(AgentId, Vec<u8>), &'static str> {
     if !exact_blob_matches_ref(reference, &bytes) {
         return Err("control blob length or digest mismatch");
@@ -1536,10 +1561,12 @@ fn finish_fetched_blob(
     let release_reference = reference.clone();
     // #1269: shutdown-owned; the notice holds the AppState.
     state.spawn_detached(async move {
-        let release = ControlBlobMessage::Release {
+        let message = ControlBlobMessage::Release {
             reference: release_reference,
         };
-        if let Err(reason) = send_message(&release_state.agent, &release_source, &release).await {
+        if let Err(reason) =
+            send_message_with(&release_state.agent, &release_source, &message, release).await
+        {
             tracing::debug!(
                 reason,
                 "control blob release notice failed (TTL still applies)"
@@ -2086,6 +2113,26 @@ mod tests {
         store.prune_groups(&aliases);
         assert!(store.staged_chunk(&reference, 0).is_none());
         assert!(store.reserve_incoming(&reference).is_some());
+    }
+
+    /// WHY (review L7): only a slow pull keeps chunks no waiter took; the
+    /// short pull drops them, as before.
+    #[test]
+    fn only_a_slow_pull_keeps_unawaited_chunks() {
+        let bytes = vec![0x41; x0x::dm::MAX_PAYLOAD_BYTES + 1];
+        let reference = reference(&bytes);
+        let store = ControlBlobState::default();
+        let lease = store.reserve_incoming(&reference).expect("reserve");
+        store.deliver_chunk(&reference, 1, vec![0x41]);
+        assert!(store
+            .take_buffered(&reference, lease.generation, 1)
+            .is_none());
+        assert!(store.mark_slow(&reference, lease.generation).is_some());
+        store.deliver_chunk(&reference, 1, vec![0x41]);
+        assert_eq!(
+            store.take_buffered(&reference, lease.generation, 1),
+            Some(vec![0x41])
+        );
     }
 
     #[test]

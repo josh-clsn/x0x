@@ -1316,6 +1316,7 @@ pub async fn serve_with_options(
         pending_welcomes: RwLock::new(HashMap::new()),
         pending_welcome_receives: RwLock::new(HashMap::new()),
         welcome_gossip: Default::default(),
+        gossip_windows: Default::default(),
         pending_welcome_waiters: RwLock::new(HashMap::new()),
         pending_welcome_acks: RwLock::new(HashMap::new()),
         pending_welcome_streams: Mutex::new(Some(HashMap::new())),

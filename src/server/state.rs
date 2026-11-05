@@ -1003,10 +1003,12 @@ pub(super) struct AppState {
     pub(super) pending_welcomes: RwLock<HashMap<String, PendingWelcome>>,
     /// In-progress pulled TreeKEM Welcome blob receives, keyed by blake3 id.
     pub(super) pending_welcome_receives: RwLock<HashMap<String, PendingWelcomeReceive>>,
-    /// Welcomes over a slow gossip inbox: a joiner's Welcomes that
-    /// completed between attempts, and an owner's gossip-carried streams.
+    /// A joiner's Welcomes that completed between attempts over a slow
+    /// gossip inbox.
     pub(super) welcome_gossip:
         crate::server::routes::named_groups::welcome_retention::WelcomeGossipState,
+    /// Join-artifact request and answer windows over a slow gossip inbox.
+    pub(super) gossip_windows: crate::server::routes::named_groups::gossip_window::GossipWindows,
     /// Waiters blocked on a Welcome blob receive completing.
     pub(super) pending_welcome_waiters: RwLock<HashMap<String, Vec<WelcomeFetchWaiter>>>,
     /// Per-active Welcome blob transfer ack slots.

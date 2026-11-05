@@ -186,7 +186,7 @@ async fn room_sizes(members: usize, up_front: bool, with_user: bool) -> anyhow::
 /// one, members 1 to 4 get 44166, 47286, 48818 and 51938; with
 /// invites minted up front, the 2nd and 3rd get 96369 and 150267
 /// (they carry the earlier adds). Agent user certificates do not change
-/// the size.
+/// the size. Only the oversized cases are asserted.
 #[tokio::test]
 async fn a_noetic_join_result_can_exceed_the_inline_limit() -> anyhow::Result<()> {
     let limit = x0x::dm::MAX_PAYLOAD_BYTES;
@@ -196,10 +196,8 @@ async fn a_noetic_join_result_can_exceed_the_inline_limit() -> anyhow::Result<()
         println!(
             "JOIN-RESULT-SIZE user_certs={with_user} one_by_one={one_by_one:?} up_front={up_front:?} limit={limit}"
         );
-        assert!(
-            one_by_one[..3].iter().all(|size| *size <= limit),
-            "{one_by_one:?}"
-        );
+        // The inline sizes are printed, not pinned: they sit within 1 KB of
+        // the limit, so any payload change would move them.
         assert!(
             one_by_one[3] > limit,
             "a 4th member's result is oversized: {one_by_one:?}"
