@@ -185,6 +185,12 @@ impl Default for ControlBlobState {
 }
 
 impl ControlBlobState {
+    /// Test/inspection helper: the global fetch slots not held by a pull.
+    #[cfg(test)]
+    pub(in crate::server) fn free_fetch_slots_for_test(&self) -> usize {
+        self.0.fetch_slots.available_permits()
+    }
+
     fn with_registry<R>(&self, f: impl FnOnce(&mut Registry) -> R) -> R {
         let mut guard = self
             .0

@@ -659,7 +659,25 @@ fn pinned_standin_is_strict(agent: &identity::AgentId) -> bool {
 /// without a network. Every admitted recovery-response publish is handed to
 /// the sink as `(recipient, payload)`.
 #[cfg(test)]
-type GossipInboxStandinSink = tokio::sync::mpsc::UnboundedSender<(identity::AgentId, Vec<u8>)>;
+#[derive(Clone)]
+enum GossipInboxStandinSink {
+    /// Sends needing a gossip ack get it at once.
+    Fast(tokio::sync::mpsc::UnboundedSender<(identity::AgentId, Vec<u8>)>),
+    /// A slow inbox: every publish is handed over with its envelope
+    /// lifetime (ms), and a send that waits for a gossip ack times out, as
+    /// one whose ack needs two minutes-long trips does.
+    Slow(tokio::sync::mpsc::UnboundedSender<(identity::AgentId, Vec<u8>, u64)>),
+}
+
+#[cfg(test)]
+impl GossipInboxStandinSink {
+    fn send(&self, to: identity::AgentId, payload: Vec<u8>, lifetime_ms: u64) -> Result<(), ()> {
+        match self {
+            Self::Fast(sink) => sink.send((to, payload)).map_err(|_| ()),
+            Self::Slow(sink) => sink.send((to, payload, lifetime_ms)).map_err(|_| ()),
+        }
+    }
+}
 
 #[cfg(test)]
 static GOSSIP_INBOX_STANDIN: std::sync::LazyLock<
@@ -10611,7 +10629,18 @@ impl Agent {
                     // stand-in hands its general gossip-inbox DMs to it.
                     #[cfg(test)]
                     if let Some(sink) = gossip_inbox_standin(&self.identity.agent_id()) {
-                        let _ = sink.send((*to, payload));
+                        let slow = matches!(sink, GossipInboxStandinSink::Slow(_));
+                        let _ =
+                            sink.send(*to, payload, dm_send::gossip_envelope_lifetime_ms(&config));
+                        if slow && config.require_gossip_ack {
+                            let attempts = u32::from(config.max_retries) + 1;
+                            let waited = config.timeout_per_attempt.saturating_mul(attempts);
+                            tokio::time::sleep(waited).await;
+                            return Err(dm::DmError::Timeout {
+                                retries: config.max_retries,
+                                elapsed: waited,
+                            });
+                        }
                         return Ok((
                             dm_send::raw_quic_receipt_for_path(dm::DmPath::GossipInbox),
                             None,
@@ -11551,7 +11580,10 @@ impl Agent {
         if !self.pinned_admission_seam(*to, machine, false, seam)() {
             return refused();
         }
-        sink.send((*to, payload.to_vec())).map_err(|_| {
+        let now = dm::now_unix_ms();
+        let lifetime_ms = dm_send::admitted_publish_expiry(now, expires_by_unix_ms)
+            .map_or(0, |expires| expires.saturating_sub(now));
+        sink.send(*to, payload.to_vec(), lifetime_ms).map_err(|_| {
             dm::DmError::LocalGossipUnavailable("gossip stand-in closed".to_string())
         })?;
         Ok(dm_send::raw_quic_receipt_for_path(dm::DmPath::GossipInbox))
@@ -11787,7 +11819,22 @@ impl Agent {
     ) -> tokio::sync::mpsc::UnboundedReceiver<(identity::AgentId, Vec<u8>)> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         if let Ok(mut sinks) = GOSSIP_INBOX_STANDIN.lock() {
-            sinks.insert(self.identity.agent_id(), tx);
+            sinks.insert(self.identity.agent_id(), GossipInboxStandinSink::Fast(tx));
+        }
+        rx
+    }
+
+    /// Test seam: as [`Self::route_gossip_inbox_to_standin_for_testing`],
+    /// for a slow inbox. Each publish arrives as `(recipient, payload,
+    /// envelope lifetime ms)`, and a send that waits for a gossip ack times
+    /// out after its full ack wait. Test builds only.
+    #[cfg(test)]
+    pub(crate) fn route_gossip_inbox_to_slow_standin_for_testing(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<(identity::AgentId, Vec<u8>, u64)> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        if let Ok(mut sinks) = GOSSIP_INBOX_STANDIN.lock() {
+            sinks.insert(self.identity.agent_id(), GossipInboxStandinSink::Slow(tx));
         }
         rx
     }

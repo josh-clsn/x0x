@@ -50725,6 +50725,7 @@ pub(in crate::server) mod tests {
     mod welcome_gossip_fallback;
     mod welcome_gossip_join_result_size;
     mod welcome_gossip_latency;
+    mod welcome_gossip_slow_paths;
     mod welcome_unblock;
     mod wp_c;
     fn fake_group_state_commit(
