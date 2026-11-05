@@ -13867,6 +13867,19 @@ impl Agent {
             .unwrap_or(0)
     }
 
+    /// Test seam: this agent's next `count` ACKed raw sends are refused at
+    /// once by the remote's receive pipeline (backpressure), as on a
+    /// connection that reads as live but takes no writes.
+    #[cfg(test)]
+    pub(crate) fn inject_backpressure_ack_failures_for_testing(&self, count: usize) {
+        if let Ok(mut failures) = INJECTED_ZOMBIE_ACK_FAILURES.lock() {
+            failures.insert(
+                self.identity.agent_id(),
+                std::iter::repeat_n((std::time::Duration::ZERO, true), count).collect(),
+            );
+        }
+    }
+
     /// Test seam: this agent's next ACKed raw send is refused by the
     /// remote's receive pipeline (backpressure) after `delay`.
     #[cfg(test)]

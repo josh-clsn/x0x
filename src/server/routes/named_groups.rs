@@ -49091,11 +49091,35 @@ async fn send_welcome_fetch_request(
     }
     let direct = prefer_raw && state.agent.has_live_direct_connection(agent_id).await;
     log_welcome_control_send(request, welcome_control_path(direct));
-    let receipt = state
+    let mut config = welcome_blob_send_config(request, direct);
+    // A retry inside a gossip request's window: that request is still on
+    // its way, so a raw failure (a connection that reads as live but takes
+    // no writes) must not put another acked copy on the gossip inbox.
+    let gossip_outstanding = match request {
+        WelcomeBlobMessage::FetchRequest { welcome_id, .. } if direct => state
+            .pending_welcome_receives
+            .read()
+            .await
+            .get(welcome_id)
+            .is_some_and(|receive| {
+                receive
+                    .retention
+                    .gossip_fetch_recent(tokio::time::Instant::now())
+            }),
+        _ => false,
+    };
+    config.stop_fallback_on_raw_error |= gossip_outstanding;
+    let receipt = match state
         .agent
-        .send_direct_with_config(agent_id, payload, welcome_blob_send_config(request, direct))
+        .send_direct_with_config(agent_id, payload, config)
         .await
-        .map_err(classify_welcome_fetch_send_error)?;
+    {
+        Ok(receipt) => receipt,
+        Err(error) if gossip_outstanding => {
+            return Err(WelcomeFetchSendError::ReceiptUnconfirmed(error.to_string()));
+        }
+        Err(error) => return Err(classify_welcome_fetch_send_error(error)),
+    };
     if let (x0x::dm::DmPath::GossipInbox, WelcomeBlobMessage::FetchRequest { welcome_id, .. }) =
         (receipt.path, request)
     {

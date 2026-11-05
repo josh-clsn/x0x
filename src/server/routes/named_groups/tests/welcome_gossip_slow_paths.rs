@@ -489,3 +489,169 @@ async fn a_retained_receive_for_another_reference_is_superseded() -> anyhow::Res
     );
     Ok(())
 }
+
+/// The joiner discovers the owner's machine but holds no gossip-inbox key
+/// for it, so a send to it can only take raw QUIC.
+async fn discovered_without_gossip_key(sender: &AppState, recipient: &AppState) {
+    let now = now_millis_u64() / 1000;
+    sender
+        .agent
+        .insert_discovered_agent_for_testing(x0x::DiscoveredAgent {
+            self_name: None,
+            agent_id: recipient.agent.agent_id(),
+            machine_id: recipient.agent.machine_id(),
+            user_id: None,
+            addresses: Vec::new(),
+            announced_at: now,
+            last_seen: now,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: None,
+            agent_certificate: None,
+            agent_public_key: Vec::new(),
+            cert_digest: None,
+        })
+        .await;
+}
+
+/// WHY (review L1): a FetchRequest was marked as gossip-carried before it
+/// was sent. A retry that prefers the gossip inbox still goes raw when the
+/// owner has no gossip-inbox key; its receive must then not be retained as
+/// if it waited on the slow inbox.
+#[tokio::test]
+async fn a_request_that_went_raw_is_not_marked_as_gossip_carried() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    discovered_without_gossip_key(&s.j2, &s.authority).await;
+    s.j2.agent
+        .set_pinned_standin_strict_resolution_for_testing(true);
+    assert!(
+        s.j2.agent.has_live_direct_connection(&s.authority_id).await,
+        "precondition: a live direct connection"
+    );
+    let reference = welcome_ref_of(&s.j2_add).expect("welcome ref");
+    let raw_before = raw_fetch_requests(&s);
+    tokio::time::pause();
+    let attempt = super::super::fetch_treekem_welcome_via(
+        &s.j2,
+        &s.stable,
+        &reference,
+        |source: AgentId, request: WelcomeBlobMessage, prefer_raw: bool| {
+            let j2 = Arc::clone(&s.j2);
+            async move {
+                super::super::send_welcome_fetch_request(&j2, &source, &request, prefer_raw).await
+            }
+        },
+    )
+    .await;
+    let retained =
+        s.j2.pending_welcome_receives
+            .read()
+            .await
+            .contains_key(&reference.welcome_id);
+    tokio::time::resume();
+    assert!(attempt.is_err(), "nobody answers");
+    assert!(
+        raw_fetch_requests(&s) >= raw_before + 2,
+        "the first request and the retry went raw"
+    );
+    assert!(
+        !retained,
+        "a receive asked for only over raw QUIC was retained"
+    );
+    Ok(())
+}
+
+fn raw_fetch_requests(s: &Fixture) -> usize {
+    s.j2.agent
+        .general_raw_standin_deliveries_for_testing()
+        .iter()
+        .filter(|(to, _, payload)| *to == s.authority_id && is_fetch_request(payload))
+        .count()
+}
+
+/// WHY (review N2): over a connection that reads as live but takes no
+/// writes, every retry inside a gossip request's window failed raw and
+/// fell back to the gossip inbox with an ack wait. Inside the window a raw
+/// failure must not add gossip copies.
+#[tokio::test]
+async fn a_live_connection_that_takes_no_writes_does_not_flood_the_gossip_inbox(
+) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    known_recipient(&s.j2, &s.authority).await?;
+    s.j2.agent
+        .set_pinned_standin_strict_resolution_for_testing(true);
+    s.j2.agent.inject_backpressure_ack_failures_for_testing(64);
+    let mut sink: SlowSink = s.j2.agent.route_gossip_inbox_to_slow_standin_for_testing();
+    assert!(
+        s.j2.agent.has_live_direct_connection(&s.authority_id).await,
+        "precondition: a live direct connection"
+    );
+    let reference = welcome_ref_of(&s.j2_add).expect("welcome ref");
+    tokio::time::pause();
+    let welcome = fetch_welcome_until(&s, &reference, Duration::from_secs(140)).await;
+    let mut gossip = 0;
+    while let Ok((to, payload, _)) = sink.try_recv() {
+        if to == s.authority_id && is_fetch_request(&payload) {
+            gossip += 1;
+        }
+    }
+    tokio::time::resume();
+    assert!(welcome.is_none(), "nobody answers in this test");
+    assert!(
+        gossip <= 2,
+        "{gossip} FetchRequests took the gossip inbox inside one refresh window"
+    );
+    Ok(())
+}
+
+/// WHY (review L2): a finalized join attempt drops the Welcome state it
+/// left retained, instead of holding it to the deadline.
+#[tokio::test]
+async fn a_finalized_attempt_drops_its_retained_welcome_state() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let s = build(dir.path()).await?;
+    known_recipient(&s.j2, &s.authority).await?;
+    let _sink: SlowSink = s.j2.agent.route_gossip_inbox_to_slow_standin_for_testing();
+    let reference = welcome_ref_of(&s.j2_add).expect("welcome ref");
+    tokio::time::pause();
+    retained_attempt(&s, &reference).await;
+    let now = tokio::time::Instant::now();
+    s.j2.welcome_gossip
+        .keep_completed("c".repeat(64).as_str(), &s.stable, vec![1], now, now);
+    abort_own_polls(&s);
+    super::super::finalize_join_attempt(
+        &s.j2,
+        &s.group_key,
+        &s.stable,
+        &hex_of(&s.j2),
+        &s.j2_attempt,
+        super::super::JoinAttemptOutcome::TimedOut,
+        super::super::JoinFinalizeGuard::Unlocked,
+    )
+    .await;
+    let receive =
+        s.j2.pending_welcome_receives
+            .read()
+            .await
+            .contains_key(&reference.welcome_id);
+    let completed =
+        s.j2.welcome_gossip
+            .take_completed(&"c".repeat(64), tokio::time::Instant::now());
+    tokio::time::resume();
+    assert!(
+        !receive,
+        "the retained receive outlived its finalized attempt"
+    );
+    assert!(
+        completed.is_none(),
+        "the completed Welcome outlived its finalized attempt"
+    );
+    Ok(())
+}
