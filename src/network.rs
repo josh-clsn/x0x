@@ -2314,6 +2314,11 @@ pub struct NetworkNode {
     /// and the re-sweep task can tell when a newer transition superseded
     /// the latch it was spawned for ([`Self::quiesce_epoch_current`]).
     mesh_transitions: Arc<Mutex<u64>>,
+    /// Demand-dial leases: peers the quiesce re-sweep spares until the
+    /// stored instant ([`Self::spared_by_resweep`]). Every quiesce clears
+    /// them. A lease spares a link from the re-sweep only: the accept loop
+    /// still rejects every inbound link and the gossip gates still drop.
+    demand_leases: Arc<Mutex<HashMap<AntPeerId, tokio::time::Instant>>>,
 }
 
 /// #1277 test seam: the worker reports on the sender that it cleared the
@@ -2708,6 +2713,7 @@ impl NetworkNode {
             registry_clear_pause_for_test: Arc::new(Mutex::new(None)),
             mesh_quiesced: Arc::new(AtomicBool::new(false)),
             mesh_transitions: Arc::new(Mutex::new(0)),
+            demand_leases: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let receiver = network_node.spawn_receiver();
@@ -4596,11 +4602,13 @@ impl NetworkNode {
     /// [`Self::unlatch_mesh_if_current`]). Returns `Some(epoch)` when this
     /// call performed the false→true transition — the caller owns spawning
     /// the re-sweep task for that epoch — and `None` when already latched.
+    /// Either way it clears every demand lease.
     pub fn latch_mesh_quiesced(&self) -> Option<u64> {
         let mut epoch = match self.mesh_transitions.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
+        self.clear_demand_leases();
         if self.mesh_quiesced.load(Ordering::Relaxed) {
             return None;
         }
@@ -4652,6 +4660,47 @@ impl NetworkNode {
             Err(poisoned) => *poisoned.into_inner(),
         };
         current == epoch && self.mesh_quiesced.load(Ordering::Relaxed)
+    }
+
+    /// Spare `peer` from the quiesce re-sweep until `until`. A later lease
+    /// for the same peer only extends it.
+    pub fn lease_demand_peer(&self, peer: AntPeerId, until: tokio::time::Instant) {
+        let mut leases = self.demand_leases_guard();
+        let now = tokio::time::Instant::now();
+        leases.retain(|_, end| *end > now);
+        let end = leases.entry(peer).or_insert(until);
+        if *end < until {
+            *end = until;
+        }
+    }
+
+    /// Whether `peer` holds a demand lease that is unexpired at `now`.
+    #[must_use]
+    pub fn demand_leased(&self, peer: &AntPeerId, now: tokio::time::Instant) -> bool {
+        self.demand_leases_guard()
+            .get(peer)
+            .is_some_and(|end| *end > now)
+    }
+
+    /// Drop every demand lease.
+    pub fn clear_demand_leases(&self) {
+        self.demand_leases_guard().clear();
+    }
+
+    fn demand_leases_guard(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<AntPeerId, tokio::time::Instant>> {
+        match self.demand_leases.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// The quiesce re-sweep's one exemption hook: whether the periodic
+    /// re-sweep leaves `peer` connected at `now`. Demand leases today.
+    #[must_use]
+    pub fn spared_by_resweep(&self, peer: &AntPeerId, now: tokio::time::Instant) -> bool {
+        self.demand_leased(peer, now)
     }
 
     /// Returns `true` while the mesh-off latch is set.
@@ -9127,6 +9176,131 @@ mod tests {
         assert!(err.to_string().contains("mesh quiesced"), "{err}");
         assert!(!admitted.load(Ordering::Relaxed));
         assert!(node.close().await.is_ok());
+    }
+
+    /// A demand lease holds until its instant, a later lease only extends
+    /// it, and any quiesce (fresh or re-asserted) clears every lease.
+    #[tokio::test(start_paused = true)]
+    async fn demand_leases_expire_extend_and_clear_on_every_quiesce() {
+        let node = NetworkNode::new(NetworkConfig::default(), None, None)
+            .await
+            .unwrap();
+        let peer = test_ant_peer(51);
+        let other = test_ant_peer(52);
+        let now = tokio::time::Instant::now();
+        node.lease_demand_peer(peer, now + Duration::from_secs(90));
+        node.lease_demand_peer(peer, now + Duration::from_secs(30));
+        assert!(node.demand_leased(&peer, now + Duration::from_secs(89)));
+        assert!(!node.demand_leased(&peer, now + Duration::from_secs(90)));
+        assert!(!node.demand_leased(&other, now));
+        assert!(node.spared_by_resweep(&peer, now));
+        assert!(!node.spared_by_resweep(&other, now));
+
+        assert!(node.latch_mesh_quiesced().is_some());
+        assert!(
+            !node.demand_leased(&peer, now),
+            "a fresh latch clears leases"
+        );
+
+        node.lease_demand_peer(other, now + Duration::from_secs(300));
+        assert!(node.latch_mesh_quiesced().is_none());
+        assert!(
+            !node.demand_leased(&other, now),
+            "a re-asserted quiesce clears leases"
+        );
+        assert!(node.close().await.is_ok());
+    }
+
+    /// Two quiesced-node sim fixtures on `plane`: `a` latched, holding a
+    /// leased outbound link to `b`.
+    async fn leased_link_pair(
+        plane: &str,
+        seed: u64,
+        subnet: u8,
+    ) -> (Arc<sim::SimFabric>, NetworkNode, NetworkNode, AntPeerId) {
+        let fabric = sim::SimFabric::new(seed);
+        sim::register(plane, &fabric);
+        let config = |host: u8| NetworkConfig {
+            bind_addr: Some(SocketAddr::from(([198, 18, subnet, host], 5483))),
+            network_id: Some(plane.to_string()),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..NetworkConfig::default()
+        };
+        let a = NetworkNode::new(config(1), None, None).await.unwrap();
+        let b = NetworkNode::new(config(2), None, None).await.unwrap();
+        assert!(a.latch_mesh_quiesced().is_some());
+        let peer_b = a
+            .connect_addr(SocketAddr::from(([198, 18, subnet, 2], 5483)))
+            .await
+            .unwrap();
+        a.lease_demand_peer(
+            peer_b,
+            tokio::time::Instant::now() + Duration::from_secs(300),
+        );
+        assert!(a.demand_leased(&peer_b, tokio::time::Instant::now()));
+        (fabric, a, b, peer_b)
+    }
+
+    /// A lease never opens the accept loop: a leased peer that dials the
+    /// quiesced node is rejected like any other.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn leased_peer_inbound_redial_is_still_rejected() {
+        let (_fabric, a, b, peer_b) = leased_link_pair("lease-inbound", 1801, 4).await;
+        let peer_a = a.peer_id();
+        a.disconnect(&peer_b).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!a.is_connected(&peer_b).await);
+        assert!(a.demand_leased(&peer_b, tokio::time::Instant::now()));
+
+        let _ = b
+            .connect_addr(SocketAddr::from(([198, 18, 4, 1], 5483)))
+            .await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            !a.is_connected(&peer_b).await,
+            "the quiesced node rejected the leased peer's inbound link"
+        );
+        assert!(!b.is_connected(&peer_a).await);
+    }
+
+    /// Gossip stays dropped on a leased link, in both directions.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn leased_link_gossip_is_dropped_both_ways() {
+        use saorsa_gossip_transport::{GossipStreamType, GossipTransport};
+
+        let (_fabric, a, b, peer_b) = leased_link_pair("lease-gossip", 1802, 5).await;
+        let gossip_a = ant_to_gossip_peer_id(&a.peer_id());
+        let gossip_b = ant_to_gossip_peer_id(&peer_b);
+        assert!(a
+            .send_to_peer(
+                gossip_b,
+                GossipStreamType::PubSub,
+                bytes::Bytes::from_static(b"out")
+            )
+            .await
+            .is_ok());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), b.receive_message())
+                .await
+                .is_err(),
+            "the quiesced node sent no gossip on the leased link"
+        );
+        b.send_to_peer(
+            gossip_a,
+            GossipStreamType::PubSub,
+            bytes::Bytes::from_static(b"in"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), a.receive_message())
+                .await
+                .is_err(),
+            "the quiesced node dropped the leased peer's gossip"
+        );
+        assert!(a.is_connected(&peer_b).await, "the leased link stays up");
     }
 
     #[test]

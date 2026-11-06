@@ -42,6 +42,18 @@ pub(in crate::server) fn direct_message_send_config() -> x0x::dm::DmSendConfig {
 pub(in crate::server) struct ConnectAgentRequest {
     /// Agent ID as 64-character hex string.
     agent_id: String,
+    /// Seconds the quiesce re-sweep leaves this link up while the mesh is
+    /// quiesced, capped at `x0x::MAX_DEMAND_LEASE_SECS`. Omitted or 0: no
+    /// lease. The next `POST /mesh/quiesce` ends every lease.
+    #[serde(default)]
+    lease_secs: Option<u64>,
+}
+
+/// The lease a `POST /agents/connect` asks for, capped: `None` for no lease.
+fn granted_lease_secs(requested: Option<u64>) -> Option<u64> {
+    requested
+        .filter(|secs| *secs > 0)
+        .map(|secs| secs.min(x0x::MAX_DEMAND_LEASE_SECS))
 }
 
 /// POST /machines/connect request body.
@@ -219,14 +231,23 @@ pub(in crate::server) async fn connect_agent(
     // Apply a 60-second overall timeout to prevent indefinite hangs when
     // the agent has multiple unreachable addresses (each with its own 30s
     // QUIC timeout).
-    let connect_result = tokio::time::timeout(
-        std::time::Duration::from_secs(60),
-        state.agent.connect_to_agent(&agent_id),
-    )
-    .await;
+    let lease_secs = granted_lease_secs(req.lease_secs);
+    let connect = async {
+        match lease_secs {
+            Some(secs) => {
+                state
+                    .agent
+                    .connect_to_agent_leased(&agent_id, std::time::Duration::from_secs(secs))
+                    .await
+            }
+            None => state.agent.connect_to_agent(&agent_id).await,
+        }
+    };
+    let connect_result = tokio::time::timeout(std::time::Duration::from_secs(60), connect).await;
 
     match connect_result {
         Ok(Ok(outcome)) => {
+            let leased = lease_secs.filter(|_| outcome.is_live_path());
             let (outcome_str, addr) = match outcome {
                 x0x::connectivity::ConnectOutcome::Direct(a) => ("Direct", Some(a.to_string())),
                 x0x::connectivity::ConnectOutcome::Coordinated(a) => {
@@ -241,7 +262,8 @@ pub(in crate::server) async fn connect_agent(
                 Json(serde_json::json!({
                     "ok": true,
                     "outcome": outcome_str,
-                    "addr": addr
+                    "addr": addr,
+                    "lease_secs": leased
                 })),
             )
         }
@@ -642,6 +664,17 @@ fn attach_recipient_ack_diagnostics(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn connect_lease_is_capped_and_zero_is_none() {
+        use super::granted_lease_secs;
+        assert_eq!(granted_lease_secs(None), None);
+        assert_eq!(granted_lease_secs(Some(0)), None);
+        assert_eq!(granted_lease_secs(Some(45)), Some(45));
+        assert_eq!(granted_lease_secs(Some(300)), Some(300));
+        assert_eq!(granted_lease_secs(Some(301)), Some(300));
+        assert_eq!(granted_lease_secs(Some(u64::MAX)), Some(300));
+    }
+
     /// N12 round 2 pin: the static production-prefix table the raw dispatch
     /// consults before the DM inbox exists must cover every prefix the
     /// inbox registers in `start_dm_inbox_when_gossip_ready` — including

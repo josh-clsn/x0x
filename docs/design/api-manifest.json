@@ -1638,6 +1638,12 @@
             "in": "body",
             "name": "agent_id",
             "required": true
+          },
+          {
+            "cli": "--lease-secs",
+            "in": "body",
+            "name": "lease_secs",
+            "required": false
           }
         ],
         "kind": "fields"

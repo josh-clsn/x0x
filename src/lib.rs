@@ -8281,6 +8281,43 @@ impl Agent {
             .await
     }
 
+    /// [`Self::connect_to_agent`], and on a live outcome a demand lease of
+    /// `lease` (capped at [`MAX_DEMAND_LEASE_SECS`]) on the machine reached:
+    /// while the mesh is quiesced, the periodic re-sweep leaves that link up
+    /// until the lease ends or the next [`Self::quiesce_mesh`] call. A
+    /// zero lease, or a link to a machine the dial could not authenticate
+    /// as the agent's, records nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::connect_to_agent`].
+    pub async fn connect_to_agent_leased(
+        &self,
+        agent_id: &identity::AgentId,
+        lease: std::time::Duration,
+    ) -> error::Result<connectivity::ConnectOutcome> {
+        let lease = lease.min(std::time::Duration::from_secs(MAX_DEMAND_LEASE_SECS));
+        let (outcome, machine) = DIALED_MACHINE
+            .scope(std::cell::Cell::new(None), async {
+                let outcome = self.connect_to_agent(agent_id).await;
+                (outcome, DIALED_MACHINE.with(std::cell::Cell::get))
+            })
+            .await;
+        let outcome = outcome?;
+        if let (true, false, Some(machine), Some(network)) = (
+            outcome.is_live_path(),
+            lease.is_zero(),
+            machine,
+            self.network.as_ref(),
+        ) {
+            network.lease_demand_peer(
+                ant_quic::PeerId(machine.0),
+                tokio::time::Instant::now() + lease,
+            );
+        }
+        Ok(outcome)
+    }
+
     /// [`Self::connect_to_agent`] for a send whose cold-recipient handling
     /// is `cold` (x0x #1207). An opted-in send never takes a blocking
     /// peer-evidence check or runs a Lookup on itself
@@ -8343,6 +8380,7 @@ impl Agent {
         let network = self.network.as_ref()?;
         let peer = ant_quic::PeerId(machine.0);
         if network.is_connected(&peer).await {
+            note_dialed_machine(machine);
             return Some(connectivity::ConnectOutcome::AlreadyConnected);
         }
         let addrs = filter_discovery_announcement_addrs(
@@ -8365,6 +8403,7 @@ impl Agent {
         }
         Some(match result {
             Ok(Ok((addr, connected))) if connected == peer => {
+                note_dialed_machine(machine);
                 connectivity::ConnectOutcome::Direct(addr)
             }
             _ => connectivity::ConnectOutcome::Unreachable,
@@ -8383,6 +8422,7 @@ impl Agent {
         machine_id: identity::MachineId,
         nonblocking_evidence: bool,
     ) {
+        note_dialed_machine(machine_id);
         if !self
             .authority_confirms_with(agent_id, &machine_id, nonblocking_evidence)
             .await
@@ -16515,7 +16555,10 @@ impl Agent {
     ///   the latch itself gates the proactive-reconnect path instead;
     /// - a tracked re-sweep task disconnects any peer that reappears (e.g.
     ///   via a demand dial) every [`QUIESCE_RESWEEP_SECS`] while the latch
-    ///   holds;
+    ///   holds, except a peer dialled with an unexpired lease
+    ///   ([`connect_to_agent_leased`](Agent::connect_to_agent_leased));
+    /// - every call, including one while already latched, clears all leases
+    ///   and sweeps every peer: that is how a caller ends a check-in burst;
     /// - leaf-mode gates already stop announcement and proactive redials;
     /// - contacts still return via explicit demand (per-send dials — the DM
     ///   plane is not gated), and a full re-join is one
@@ -16531,7 +16574,8 @@ impl Agent {
         // Latch BEFORE the sweep so a peer reconnecting mid-sweep is already
         // rejected at accept and silenced at the gossip transport. `None`
         // means an earlier quiesce already latched — its re-sweep task is
-        // still running and owns the state; this call just re-sweeps.
+        // still running and owns the state; this call just re-sweeps (the
+        // latch call has cleared every demand lease either way).
         //
         // The re-sweep task is spawned BEFORE the first sweep awaits:
         // this method runs inside an axum handler future, and a client
@@ -16541,32 +16585,14 @@ impl Agent {
         // task exits the moment its epoch stops owning the latch, so mesh
         // flapping cannot accumulate duplicates.
         if let Some(epoch) = network.latch_mesh_quiesced() {
-            let network = std::sync::Arc::clone(network);
-            let shutdown = self.shutdown_token.clone();
-            self.spawn_tracked(async move {
-                let period = std::time::Duration::from_secs(QUIESCE_RESWEEP_SECS);
-                let mut tick =
-                    tokio::time::interval_at(tokio::time::Instant::now() + period, period);
-                loop {
-                    tokio::select! {
-                        () = shutdown.cancelled() => break,
-                        _ = tick.tick() => {}
-                    }
-                    if !network.quiesce_epoch_current(epoch) {
-                        break;
-                    }
-                    let swept = sweep_mesh_peers(&network).await;
-                    if swept > 0 {
-                        tracing::info!(
-                            swept,
-                            "quiesce_mesh: re-sweep disconnected reappeared peers"
-                        );
-                    }
-                }
-            });
+            self.spawn_tracked(quiesce_resweep_loop(
+                std::sync::Arc::clone(network),
+                epoch,
+                self.shutdown_token.clone(),
+            ));
         }
 
-        let disconnected = sweep_mesh_peers(network).await;
+        let disconnected = sweep_mesh_peers(network, false).await;
         tracing::info!(disconnected, "quiesce_mesh: swept mesh connections");
         Ok(disconnected)
     }
@@ -22462,6 +22488,22 @@ fn announcement_should_auto_connect(
     !leaf_mode && !mesh_quiesced && !reconnect_suppressed && !already_connected
 }
 
+/// Longest demand lease [`Agent::connect_to_agent_leased`] grants.
+pub const MAX_DEMAND_LEASE_SECS: u64 = 300;
+
+tokio::task_local! {
+    /// The peer-authenticated machine the enclosing
+    /// [`Agent::connect_to_agent_leased`] call reached, set by each success
+    /// path of the connector.
+    static DIALED_MACHINE: std::cell::Cell<Option<identity::MachineId>>;
+}
+
+/// Record `machine` as the one the current leased connect reached (a no-op
+/// outside [`Agent::connect_to_agent_leased`]).
+fn note_dialed_machine(machine: identity::MachineId) {
+    let _ = DIALED_MACHINE.try_with(|dialed| dialed.set(Some(machine)));
+}
+
 /// Cadence of the quiesce re-sweep task ([`Agent::quiesce_mesh`]): while the
 /// quiesce latch holds, any peer that reappears (a demand dial, or an inbound
 /// that raced the latch) is disconnected again this often. Long enough that
@@ -22479,10 +22521,18 @@ const QUIESCE_RESWEEP_SECS: u64 = 60;
 /// tombstone refuses OUTBOUND demand dials too, which would silently break
 /// DMs-while-quiesced and the `/mesh/join` re-dial — the latch, not a
 /// tombstone, keeps the mesh quiet.
-async fn sweep_mesh_peers(network: &network::NetworkNode) -> usize {
+///
+/// `spare` is set by the periodic re-sweep only: it leaves connected every
+/// peer [`network::NetworkNode::spared_by_resweep`] names (a demand lease).
+/// A quiesce request, fresh or re-asserted, sweeps everyone.
+async fn sweep_mesh_peers(network: &network::NetworkNode, spare: bool) -> usize {
     let peers = network.connected_peers().await;
+    let now = tokio::time::Instant::now();
     let mut disconnected = 0usize;
     for peer in peers {
+        if spare && network.spared_by_resweep(&peer, now) {
+            continue;
+        }
         match network
             .disconnect_with_reason(&peer, network::DisconnectReason::Quiesce)
             .await
@@ -22497,6 +22547,35 @@ async fn sweep_mesh_peers(network: &network::NetworkNode) -> usize {
         }
     }
     disconnected
+}
+
+/// The quiesce re-sweep task for the latch taken at `epoch`: every
+/// [`QUIESCE_RESWEEP_SECS`] it sweeps, sparing leased peers, and it exits
+/// once a newer transition owns the mesh state. The first tick is a full
+/// period after the latch.
+async fn quiesce_resweep_loop(
+    network: std::sync::Arc<network::NetworkNode>,
+    epoch: u64,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    let period = std::time::Duration::from_secs(QUIESCE_RESWEEP_SECS);
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => break,
+            _ = tick.tick() => {}
+        }
+        if !network.quiesce_epoch_current(epoch) {
+            break;
+        }
+        let swept = sweep_mesh_peers(&network, true).await;
+        if swept > 0 {
+            tracing::info!(
+                swept,
+                "quiesce_mesh: re-sweep disconnected reappeared peers"
+            );
+        }
+    }
 }
 
 /// Whether this node runs proactive post-disconnect reconnects.
@@ -30717,6 +30796,195 @@ mod tests {
             node.mesh_quiesced(),
             false,
             false
+        ));
+    }
+
+    /// Sim fixture for the re-sweep: `a` latched at the returned epoch with
+    /// live outbound links to `b` and `c`.
+    async fn resweep_fixture(
+        plane: &str,
+        seed: u64,
+        subnet: u8,
+    ) -> (
+        std::sync::Arc<network::sim::SimFabric>,
+        std::sync::Arc<network::NetworkNode>,
+        [network::NetworkNode; 2],
+        [ant_quic::PeerId; 2],
+        u64,
+    ) {
+        let fabric = network::sim::SimFabric::new(seed);
+        network::sim::register(plane, &fabric);
+        let addr = |host: u8| std::net::SocketAddr::from(([198, 18, subnet, host], 5483));
+        let config = |host: u8| network::NetworkConfig {
+            bind_addr: Some(addr(host)),
+            network_id: Some(plane.to_string()),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..network::NetworkConfig::default()
+        };
+        let a = std::sync::Arc::new(
+            network::NetworkNode::new(config(1), None, None)
+                .await
+                .expect("a"),
+        );
+        let b = network::NetworkNode::new(config(2), None, None)
+            .await
+            .expect("b");
+        let c = network::NetworkNode::new(config(3), None, None)
+            .await
+            .expect("c");
+        let epoch = a.latch_mesh_quiesced().expect("fresh latch");
+        let peer_b = a.connect_addr(addr(2)).await.expect("dial b");
+        let peer_c = a.connect_addr(addr(3)).await.expect("dial c");
+        (fabric, a, [b, c], [peer_b, peer_c], epoch)
+    }
+
+    /// While latched, a leased demand dial survives two re-sweep ticks and
+    /// an unleased one is cut at each.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn resweep_spares_a_leased_peer_for_two_ticks() {
+        let (_fabric, a, _nodes, [peer_b, peer_c], epoch) =
+            resweep_fixture("f8-resweep-two", 1803, 6).await;
+        a.lease_demand_peer(
+            peer_b,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(300),
+        );
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(quiesce_resweep_loop(
+            std::sync::Arc::clone(&a),
+            epoch,
+            shutdown.clone(),
+        ));
+        let period = std::time::Duration::from_secs(QUIESCE_RESWEEP_SECS);
+        tokio::time::sleep(period + std::time::Duration::from_secs(1)).await;
+        assert!(a.is_connected(&peer_b).await, "leased: survives tick 1");
+        assert!(!a.is_connected(&peer_c).await, "unleased: swept at tick 1");
+
+        let redialed = a
+            .connect_addr(std::net::SocketAddr::from(([198, 18, 6, 3], 5483)))
+            .await
+            .expect("redial c");
+        assert_eq!(redialed, peer_c);
+        tokio::time::sleep(period).await;
+        assert!(a.is_connected(&peer_b).await, "leased: survives tick 2");
+        assert!(!a.is_connected(&peer_c).await, "unleased: swept at tick 2");
+        shutdown.cancel();
+        task.await.expect("re-sweep task");
+    }
+
+    /// A lease that ends between two ticks is swept on the next one.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn resweep_sweeps_an_expired_lease_on_the_next_tick() {
+        let (_fabric, a, _nodes, [peer_b, _peer_c], epoch) =
+            resweep_fixture("f8-resweep-expiry", 1804, 7).await;
+        a.lease_demand_peer(
+            peer_b,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(70),
+        );
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn(quiesce_resweep_loop(
+            std::sync::Arc::clone(&a),
+            epoch,
+            shutdown.clone(),
+        ));
+        let period = std::time::Duration::from_secs(QUIESCE_RESWEEP_SECS);
+        tokio::time::sleep(period + std::time::Duration::from_secs(1)).await;
+        assert!(a.is_connected(&peer_b).await, "lease live at tick 1");
+        tokio::time::sleep(period).await;
+        assert!(!a.is_connected(&peer_b).await, "lease over by tick 2");
+        shutdown.cancel();
+        task.await.expect("re-sweep task");
+    }
+
+    async fn await_disconnected(network: &network::NetworkNode, peer: &ant_quic::PeerId) {
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(10) * test_time_multiplier();
+        while network.is_connected(peer).await {
+            assert!(tokio::time::Instant::now() < deadline, "peer stayed up");
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    /// A leased connect records the lease on the machine it reached, capped
+    /// at [`MAX_DEMAND_LEASE_SECS`]; a fresh quiesce sweeps that peer anyway
+    /// and clears the lease.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn leased_connect_is_capped_and_a_fresh_quiesce_clears_it() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (alice, bob, _bob_addr) = leaf_and_peer(dir.path()).await;
+        let network = std::sync::Arc::clone(alice.network().expect("network"));
+        let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(20) * test_time_multiplier(),
+            alice.connect_to_agent_leased(&bob.agent_id(), std::time::Duration::from_secs(10_000)),
+        )
+        .await
+        .expect("the connect ends")
+        .expect("the connect runs");
+        assert!(outcome.is_live_path(), "{outcome:?}");
+        let now = tokio::time::Instant::now();
+        let cap = std::time::Duration::from_secs(MAX_DEMAND_LEASE_SECS);
+        assert!(network.demand_leased(&bob_peer, now + cap - std::time::Duration::from_secs(5)));
+        assert!(
+            !network.demand_leased(&bob_peer, now + cap + std::time::Duration::from_secs(1)),
+            "a lease over the cap is clamped"
+        );
+
+        alice.quiesce_mesh().await.expect("quiesce");
+        assert!(
+            !network.demand_leased(&bob_peer, now),
+            "a fresh latch clears leases"
+        );
+        await_disconnected(&network, &bob_peer).await;
+    }
+
+    /// A burst: while latched, a leased dial survives the re-sweep's sweep,
+    /// and a re-asserted quiesce clears the lease and sweeps the peer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reasserted_quiesce_ends_a_leased_burst() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (alice, bob, _bob_addr) = leaf_and_peer(dir.path()).await;
+        let network = std::sync::Arc::clone(alice.network().expect("network"));
+        let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+        alice.quiesce_mesh().await.expect("latch");
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(20) * test_time_multiplier(),
+            alice.connect_to_agent_leased(&bob.agent_id(), std::time::Duration::from_secs(120)),
+        )
+        .await
+        .expect("the connect ends")
+        .expect("the connect runs");
+        assert!(outcome.is_live_path(), "{outcome:?}");
+        assert!(network.demand_leased(&bob_peer, tokio::time::Instant::now()));
+        assert!(network.is_connected(&bob_peer).await);
+        assert_eq!(
+            sweep_mesh_peers(&network, true).await,
+            0,
+            "the re-sweep spares it"
+        );
+        assert!(network.is_connected(&bob_peer).await);
+
+        alice.quiesce_mesh().await.expect("re-assert");
+        assert!(alice.mesh_quiesced());
+        assert!(!network.demand_leased(&bob_peer, tokio::time::Instant::now()));
+        await_disconnected(&network, &bob_peer).await;
+    }
+
+    /// A zero lease records nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn zero_lease_connect_records_nothing() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (alice, bob, _bob_addr) = leaf_and_peer(dir.path()).await;
+        let network = std::sync::Arc::clone(alice.network().expect("network"));
+        let outcome = alice
+            .connect_to_agent_leased(&bob.agent_id(), std::time::Duration::ZERO)
+            .await
+            .expect("the connect runs");
+        assert!(outcome.is_live_path(), "{outcome:?}");
+        assert!(!network.demand_leased(
+            &ant_quic::PeerId(bob.machine_id().0),
+            tokio::time::Instant::now()
         ));
     }
 

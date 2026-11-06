@@ -1042,7 +1042,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "direct connect",
         description: "Connect to agent",
         category: "direct",
-        request: RequestSpec::Fields(&[RequestField::body_as("agent_id", true, "AGENT_ID")]),
+        request: RequestSpec::Fields(&[RequestField::body_as("agent_id", true, "AGENT_ID"), RequestField::body_as("lease_secs", false, "--lease-secs")]),
     },
     EndpointDef {
         method: Method::Post,

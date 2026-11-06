@@ -1324,6 +1324,10 @@ enum DirectSub {
     Connect {
         /// Agent ID (hex).
         agent_id: String,
+        /// While the mesh is quiesced, keep this link up through the
+        /// re-sweep for this many seconds (capped at 300).
+        #[arg(long)]
+        lease_secs: Option<u64>,
     },
     /// Send a direct message to an agent.
     Send {
@@ -2815,7 +2819,10 @@ async fn run(
             }
         },
         Commands::Direct { sub } => match sub {
-            DirectSub::Connect { agent_id } => commands::direct::connect(&client, &agent_id).await,
+            DirectSub::Connect {
+                agent_id,
+                lease_secs,
+            } => commands::direct::connect(&client, &agent_id, lease_secs).await,
             DirectSub::Send {
                 agent_id,
                 message,

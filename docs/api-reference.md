@@ -947,7 +947,7 @@ or an illegal placement; `501` ceremony disabled.
 | GET | `/network/status` | `x0x network status` | NAT and connectivity diagnostics |
 | GET | `/network/bootstrap-cache` | `x0x network cache` | Bootstrap cache stats |
 | POST | `/mesh/join` | `x0x mesh join` | Dial the gossip mesh (bootstrap phases); returns immediately with `status: "dialing"` |
-| POST | `/mesh/quiesce` | `x0x mesh quiesce` | Disconnect all mesh peers and latch the mesh off (inbound rejected, gossip sends dropped, reappearing peers re-swept) until `/mesh/join`; returns `disconnected` count |
+| POST | `/mesh/quiesce` | `x0x mesh quiesce` | Disconnect all mesh peers and latch the mesh off (inbound rejected, gossip sends dropped, reappearing peers re-swept except [leased](#demand-leases) ones) until `/mesh/join`; ends every demand lease; returns `disconnected` count |
 | GET | `/peers/:peer_id/health` | `x0x peer health <peer_id>` | Connection health snapshot for a peer |
 | POST | `/peers/:peer_id/probe` | `x0x peer probe <peer_id>` | Active `probe_peer` liveness + RTT check |
 | GET | `/peers/events` | `x0x peer events` | SSE stream of peer lifecycle events |
@@ -1069,7 +1069,7 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
-| POST | `/agents/connect` | `x0x direct connect <agent_id>` | Establish a direct connection |
+| POST | `/agents/connect` | `x0x direct connect <agent_id> [--lease-secs <s>]` | Establish a direct connection; see [Demand leases](#demand-leases) |
 | POST | `/machines/connect` | `x0x machines connect <machine_id>` | Establish a machine-id transport connection |
 | POST | `/direct/send` | `x0x direct send <agent_id> <message> [--require-ack-ms <ms>] [--prefer-raw-quic-if-connected <BOOL>] [--raw-quic-receive-ack-ms <ms>] [--stop-fallback-on-raw-error] [--require-gossip] [--no-durable-ack] [--logical-id <token>]` | Send a direct base64 payload. Durable-by-default since v0.38.0 |
 | GET | `/direct/connections` | `x0x direct connections` | List active direct connections |
@@ -1122,6 +1122,17 @@ machine (an agent-authenticated beat signed inside the clock-skew bound)
 leaves the entry as it is. A dial binds the machine it reaches only when an
 authority store confirms it, so a card's address can cost dial time but can
 neither impersonate the contact nor rebind it.
+
+### Demand leases
+
+While the mesh is quiesced (`POST /mesh/quiesce`), the re-sweep disconnects
+every connected peer once a minute. `lease_secs` in the `/agents/connect`
+body (at most 300; larger values are capped, 0 means none) asks the re-sweep
+to leave the link to the machine reached up for that long. The response
+echoes the granted `lease_secs` on a live outcome, else `null`. The next
+`POST /mesh/quiesce`, including one while already quiesced, ends every lease
+and sweeps every peer. A lease changes nothing else: inbound links are still
+refused and gossip frames are still dropped on the leased link.
 
 ### Direct send request body
 
