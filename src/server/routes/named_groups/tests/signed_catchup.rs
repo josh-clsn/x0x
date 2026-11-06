@@ -96,7 +96,7 @@ fn page_requests(state: &AppState) -> Vec<(String, TreeKemCatchupRequest)> {
 
 /// The owner removes R through its route and S2 applies the removal. S1
 /// was away.
-async fn removal_s1_missed(cast: &SurvivorRelay) -> NamedGroupMetadataEvent {
+pub(super) async fn removal_s1_missed(cast: &SurvivorRelay) -> NamedGroupMetadataEvent {
     let owner = &cast.fixture.state;
     let group_id = &cast.fixture.group_id;
     let r_hex = hex_id(&cast.fixture.member_id);

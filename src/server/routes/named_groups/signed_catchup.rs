@@ -18,7 +18,7 @@
 //!   committer-leaf rule, and anything else is dropped.
 
 use super::{
-    build_catchup_signer, catchup_signer_matches, named_group_direct_delivery_config, AppState,
+    build_catchup_signer, catchup_delivery_config, catchup_signer_matches, AppState,
     NamedGroupMetadataEvent, TreeKemCatchupRequest, TreeKemCatchupResponse,
     TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
 };
@@ -218,7 +218,7 @@ pub(super) async fn send_page_request(
     }
     state
         .agent
-        .send_direct_with_config(peer, payload, named_group_direct_delivery_config())
+        .send_direct_with_config(peer, payload, catchup_delivery_config(state, peer).await)
         .await
         .map(|_| ())
         .map_err(|e| e.to_string())

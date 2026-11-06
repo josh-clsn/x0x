@@ -565,6 +565,24 @@ pub(in crate::server) fn named_group_direct_delivery_config() -> x0x::dm::DmSend
     config
 }
 
+/// The delivery config for a catch-up page request or answer to `peer`
+/// (F8): raw QUIC first, under its receive ACK, while a live direct link to
+/// `peer` exists; the gossip inbox when there is none, or after a raw
+/// failure, as [`named_group_direct_delivery_config`]. Catch-up needs no
+/// verified transport (survivor re-key A5: requests are signed, and an
+/// unverified page applies each event as its verified commit signer), so
+/// the reason that config keeps gossip first does not apply here. This is
+/// what lets a latched member, which drops all gossip, catch up over a
+/// demand-dialled link.
+pub(in crate::server) async fn catchup_delivery_config(
+    state: &AppState,
+    peer: &AgentId,
+) -> x0x::dm::DmSendConfig {
+    let mut config = named_group_direct_delivery_config();
+    config.prefer_raw_quic_if_connected = state.agent.has_live_direct_connection(peer).await;
+    config
+}
+
 /// A predecessor relay can only count a recipient application ACK. Raw QUIC's
 /// receive-pipeline ACK is produced before the typed route admits the item.
 /// #942 r3 (B4): the strict-v2 delivery config, following the durable
@@ -50779,6 +50797,7 @@ pub(in crate::server) mod tests {
     }
 
     mod event_log_store;
+    mod f8_catchup_raw;
     mod fork_quarantine;
     mod genesis_kp_catchup_398;
     mod head_proof;

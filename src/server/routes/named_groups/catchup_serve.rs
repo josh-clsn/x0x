@@ -235,7 +235,11 @@ async fn deliver_answer(
     }
     if let Err(e) = state
         .agent
-        .send_direct_with_config(&to, payload, super::named_group_direct_delivery_config())
+        .send_direct_with_config(
+            &to,
+            payload,
+            super::catchup_delivery_config(state, &to).await,
+        )
         .await
     {
         tracing::warn!(

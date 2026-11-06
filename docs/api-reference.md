@@ -1134,6 +1134,13 @@ echoes the granted `lease_secs` on a live outcome, else `null`. The next
 and sweeps every peer. A lease changes nothing else: inbound links are still
 refused and gossip frames are still dropped on the leased link.
 
+While quiesced, a node's own gossip publishes go nowhere. A non-durable
+direct send whose path would be the recipient's gossip inbox therefore goes
+over raw QUIC when a live direct link to the recipient exists, and
+otherwise fails at once as no connectivity instead of publishing into the
+latch. Room catch-up page requests and answers go raw first over any live
+direct link, quiesced or not.
+
 ### Direct send request body
 
 ```json

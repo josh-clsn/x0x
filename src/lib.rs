@@ -640,6 +640,13 @@ fn pinned_standin_transport(agent: &identity::AgentId) -> std::sync::Arc<PinnedT
         .unwrap_or_default()
 }
 
+/// F8 (test builds): agents built without a network whose gossip leg reads
+/// as latched (`Agent::quiesce_gossip_leg_for_testing`).
+#[cfg(test)]
+static GOSSIP_LEG_QUIESCED_STANDIN: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<identity::AgentId>>,
+> = std::sync::LazyLock::new(Default::default);
+
 /// x0x #1150 (g10-1190a): agents whose in-process pinned stand-in resolves
 /// the recipient's machine strictly, as the real path does (see
 /// `Agent::set_pinned_standin_strict_resolution_for_testing`).
@@ -10504,6 +10511,28 @@ impl Agent {
             stages.strict_gate_ms = dm::millis_since(send_started);
         }
 
+        // F8: a latched node drops every gossip frame it sends, so its
+        // gossip leg would publish nothing and report success. Over a live
+        // direct link such a send goes raw instead; with none it fails here.
+        // The receiver's rule is unchanged: a raw frame is verified only for
+        // a machine it holds a binding for, so this applies only where the
+        // gossip leg could never have delivered.
+        let gossip_ok = if gossip_ok
+            && !config.require_durable_app_ack
+            && self.gossip_leg_quiesced()
+        {
+            if config.require_gossip || !self.has_live_direct_connection(to).await {
+                self.direct_messaging.record_outgoing_failed(*to);
+                return Err(dm::DmError::NoConnectivity(
+                    "mesh quiesced: the gossip inbox cannot carry this send and no direct link is live"
+                        .to_string(),
+                ));
+            }
+            false
+        } else {
+            gossip_ok
+        };
+
         // X0X-0070b: seed the relay fallback. Only retain the payload + KEM
         // key clone when the engine is enabled AND we have a key to seal
         // a fresh envelope with. With the default disabled policy this
@@ -11841,6 +11870,35 @@ impl Agent {
                 agents.remove(&self.identity.agent_id());
             }
         }
+    }
+
+    /// Test seam (F8): make this network-less agent's gossip leg read as
+    /// latched, as `quiesce_mesh` makes a real node's. Test builds only.
+    #[cfg(test)]
+    pub(crate) fn quiesce_gossip_leg_for_testing(&self, quiesced: bool) {
+        if let Ok(mut agents) = GOSSIP_LEG_QUIESCED_STANDIN.lock() {
+            if quiesced {
+                agents.insert(self.identity.agent_id());
+            } else {
+                agents.remove(&self.identity.agent_id());
+            }
+        }
+    }
+
+    /// Whether the quiesce latch silences this node's gossip leg: every
+    /// gossip frame it sends is dropped at the transport
+    /// ([`network::NetworkNode::mesh_quiesced`]).
+    fn gossip_leg_quiesced(&self) -> bool {
+        #[cfg(test)]
+        if GOSSIP_LEG_QUIESCED_STANDIN
+            .lock()
+            .is_ok_and(|agents| agents.contains(&self.identity.agent_id()))
+        {
+            return true;
+        }
+        self.network
+            .as_ref()
+            .is_some_and(|network| network.mesh_quiesced())
     }
 
     /// Test seam (x0x #1150, r7h): whether this agent's pinned stand-in is
@@ -30986,6 +31044,136 @@ mod tests {
             &ant_quic::PeerId(bob.machine_id().0),
             tokio::time::Instant::now()
         ));
+    }
+
+    /// The room-bookkeeping send shape (`named_group_direct_delivery_config`):
+    /// gossip inbox first, raw only as a fallback, a v1 gossip ACK.
+    fn bookkeeping_config() -> dm::DmSendConfig {
+        dm::DmSendConfig {
+            prefer_raw_quic_if_connected: false,
+            raw_quic_receive_ack_timeout: Some(std::time::Duration::from_secs(8)),
+            require_gossip_ack: true,
+            require_durable_app_ack: false,
+            ..dm::DmSendConfig::default()
+        }
+    }
+
+    fn advertise_gossip_inbox(sender: &Agent, recipient: &Agent) {
+        let kem = groups::kem_envelope::AgentKemKeypair::generate().expect("kem");
+        assert!(sender.capability_store().insert(
+            recipient.agent_id(),
+            recipient.machine_id(),
+            dm::DmCapabilities::v1_gossip_ready(kem.public_bytes.clone()),
+            dm::now_unix_ms(),
+        ));
+    }
+
+    /// F8: a latched node's bookkeeping send to a recipient with a gossip
+    /// advert goes raw over its live demand-dialled link, and the dialler
+    /// marks the answer from the machine it dialled verified.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_latched_bookkeeping_send_goes_raw_over_a_dialled_link() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (alice, bob, _bob_addr) = leaf_and_peer(dir.path()).await;
+        alice.start_direct_listener();
+        advertise_gossip_inbox(&alice, &bob);
+        advertise_gossip_inbox(&bob, &alice);
+        alice.quiesce_mesh().await.expect("latch");
+        let outcome = alice
+            .connect_to_agent_leased(&bob.agent_id(), std::time::Duration::from_secs(120))
+            .await
+            .expect("the connect runs");
+        assert!(outcome.is_live_path(), "{outcome:?}");
+        assert!(alice.has_live_direct_connection(&bob.agent_id()).await);
+
+        let mut bob_rx = bob.subscribe_direct();
+        let receipt = alice
+            .send_direct_with_config(
+                &bob.agent_id(),
+                b"page-request".to_vec(),
+                bookkeeping_config(),
+            )
+            .await
+            .expect("the latched node's send goes raw");
+        assert_eq!(receipt.path, dm::DmPath::RawQuicAcked);
+        let got = tokio::time::timeout(std::time::Duration::from_secs(10), bob_rx.recv())
+            .await
+            .expect("bob receives it")
+            .expect("bob's stream is open");
+        assert_eq!(got.payload, b"page-request");
+
+        let mut alice_rx = alice.subscribe_direct();
+        let config = dm::DmSendConfig {
+            prefer_raw_quic_if_connected: true,
+            ..bookkeeping_config()
+        };
+        let receipt = bob
+            .send_direct_with_config(&alice.agent_id(), b"page-answer".to_vec(), config)
+            .await
+            .expect("bob answers over the link");
+        assert_eq!(receipt.path, dm::DmPath::RawQuicAcked);
+        let got = tokio::time::timeout(std::time::Duration::from_secs(10), alice_rx.recv())
+            .await
+            .expect("alice receives it")
+            .expect("alice's stream is open");
+        assert_eq!(got.payload, b"page-answer");
+        assert!(
+            got.verified,
+            "the dialler has a binding for the dialled machine"
+        );
+        assert!(alice.mesh_quiesced());
+    }
+
+    /// A raw frame from a machine the receiver holds no binding for is
+    /// delivered unverified.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_raw_frame_from_an_unbound_machine_is_not_verified() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (alice, _bob, _bob_addr) = leaf_and_peer(dir.path()).await;
+        alice.start_direct_listener();
+        let carol = Agent::builder()
+            .with_machine_key(dir.path().join("carol-machine.key"))
+            .with_agent_key_path(dir.path().join("carol-agent.key"))
+            .with_contact_store_path(dir.path().join("carol-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("carol-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("carol");
+        carol.start_direct_listener();
+        let alice_net = std::sync::Arc::clone(alice.network().expect("network"));
+        let carol_net = std::sync::Arc::clone(carol.network().expect("network"));
+        let alice_addr = normalize_loopback_addr(alice_net.bound_addr().await.expect("bound"));
+        let carol_addr = normalize_loopback_addr(carol_net.bound_addr().await.expect("bound"));
+        let now = Agent::unix_timestamp_secs();
+        carol
+            .insert_discovered_agent_for_testing(DiscoveredAgent {
+                can_receive_direct: Some(true),
+                ..card_pin(alice.agent_id(), alice.machine_id(), vec![alice_addr], now)
+            })
+            .await;
+        alice.quiesce_mesh().await.expect("latch");
+        let reached = alice_net
+            .connect_addr(carol_addr)
+            .await
+            .expect("dial carol");
+        assert_eq!(reached.0, carol.machine_id().0);
+
+        let mut alice_rx = alice.subscribe_direct();
+        let config = dm::DmSendConfig {
+            prefer_raw_quic_if_connected: true,
+            ..bookkeeping_config()
+        };
+        carol
+            .send_direct_with_config(&alice.agent_id(), b"unbound".to_vec(), config)
+            .await
+            .expect("carol sends raw");
+        let got = tokio::time::timeout(std::time::Duration::from_secs(10), alice_rx.recv())
+            .await
+            .expect("alice receives it")
+            .expect("alice's stream is open");
+        assert_eq!(got.payload, b"unbound");
+        assert!(!got.verified, "no binding for carol's machine");
     }
 
     #[tokio::test]
