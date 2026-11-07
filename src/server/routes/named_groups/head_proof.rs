@@ -744,6 +744,7 @@ pub(in crate::server) async fn send_proof_only(
     requester: &AgentId,
     group_id: &str,
     proof: HeadProof,
+    reply_raw: bool,
 ) {
     let payload = match serde_json::to_vec(&proof_only_response(group_id, proof)) {
         Ok(payload) => payload,
@@ -757,7 +758,15 @@ pub(in crate::server) async fn send_proof_only(
         recorded.push(payload.clone());
     }
     // Survivor re-key A14: handed off, as a page is.
-    super::catchup_serve::send_answer(state, *requester, payload, group_id, "head proof").await;
+    super::catchup_serve::send_answer(
+        state,
+        *requester,
+        payload,
+        group_id,
+        "head proof",
+        reply_raw,
+    )
+    .await;
 }
 
 #[cfg(test)]

@@ -2318,7 +2318,18 @@ pub struct NetworkNode {
     /// stored instant ([`Self::spared_by_resweep`]). Every quiesce clears
     /// them. A lease spares a link from the re-sweep only: the accept loop
     /// still rejects every inbound link and the gossip gates still drop.
-    demand_leases: Arc<Mutex<HashMap<AntPeerId, tokio::time::Instant>>>,
+    demand_leases: Arc<Mutex<DemandLeases>>,
+}
+
+/// Most peers that may hold a demand lease at once.
+pub const MAX_DEMAND_LEASES: usize = 64;
+
+/// The demand-lease table and its generation, bumped by every clear so a
+/// lease granted against an older generation is refused.
+#[derive(Debug, Default)]
+struct DemandLeases {
+    generation: u64,
+    until: HashMap<AntPeerId, tokio::time::Instant>,
 }
 
 /// #1277 test seam: the worker reports on the sender that it cleared the
@@ -2713,7 +2724,7 @@ impl NetworkNode {
             registry_clear_pause_for_test: Arc::new(Mutex::new(None)),
             mesh_quiesced: Arc::new(AtomicBool::new(false)),
             mesh_transitions: Arc::new(Mutex::new(0)),
-            demand_leases: Arc::new(Mutex::new(HashMap::new())),
+            demand_leases: Arc::new(Mutex::new(DemandLeases::default())),
         };
 
         let receiver = network_node.spawn_receiver();
@@ -4597,7 +4608,7 @@ impl NetworkNode {
     /// Latch the mesh quiesced (see the [`Self::mesh_quiesced`] field docs
     /// for exactly what the latch gates).
     ///
-    /// Transitions are epoch-ordered under [`Self::mesh_transitions`] so a
+    /// Transitions are epoch-ordered under `mesh_transitions` so a
     /// stale mesh-on command can never undo a newer quiesce (see
     /// [`Self::unlatch_mesh_if_current`]). Returns `Some(epoch)` when this
     /// call performed the false→true transition — the caller owns spawning
@@ -4663,33 +4674,62 @@ impl NetworkNode {
     }
 
     /// Spare `peer` from the quiesce re-sweep until `until`. A later lease
-    /// for the same peer only extends it.
-    pub fn lease_demand_peer(&self, peer: AntPeerId, until: tokio::time::Instant) {
+    /// for the same peer only extends it. Returns whether `peer` is leased:
+    /// a new peer is refused once [`MAX_DEMAND_LEASES`] hold a lease.
+    pub fn lease_demand_peer(&self, peer: AntPeerId, until: tokio::time::Instant) -> bool {
+        let generation = self.demand_lease_generation();
+        self.lease_demand_peer_if(generation, peer, until)
+    }
+
+    /// The current demand-lease generation. Read it before a dial and pass
+    /// it to [`Self::lease_demand_peer_if`], so a clear during the dial
+    /// wins.
+    #[must_use]
+    pub fn demand_lease_generation(&self) -> u64 {
+        self.demand_leases_guard().generation
+    }
+
+    /// [`Self::lease_demand_peer`], refused when any clear happened since
+    /// `generation` was read.
+    pub fn lease_demand_peer_if(
+        &self,
+        generation: u64,
+        peer: AntPeerId,
+        until: tokio::time::Instant,
+    ) -> bool {
         let mut leases = self.demand_leases_guard();
+        if leases.generation != generation {
+            return false;
+        }
         let now = tokio::time::Instant::now();
-        leases.retain(|_, end| *end > now);
-        let end = leases.entry(peer).or_insert(until);
+        leases.until.retain(|_, end| *end > now);
+        if !leases.until.contains_key(&peer) && leases.until.len() >= MAX_DEMAND_LEASES {
+            return false;
+        }
+        let end = leases.until.entry(peer).or_insert(until);
         if *end < until {
             *end = until;
         }
+        true
     }
 
     /// Whether `peer` holds a demand lease that is unexpired at `now`.
     #[must_use]
     pub fn demand_leased(&self, peer: &AntPeerId, now: tokio::time::Instant) -> bool {
         self.demand_leases_guard()
+            .until
             .get(peer)
             .is_some_and(|end| *end > now)
     }
 
-    /// Drop every demand lease.
+    /// Drop every demand lease and start a new generation.
     pub fn clear_demand_leases(&self) {
-        self.demand_leases_guard().clear();
+        let mut leases = self.demand_leases_guard();
+        leases.generation = leases.generation.wrapping_add(1);
+        leases.until.clear();
     }
 
-    fn demand_leases_guard(
-        &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<AntPeerId, tokio::time::Instant>> {
+    fn demand_leases_guard(&self) -> std::sync::MutexGuard<'_, DemandLeases> {
         match self.demand_leases.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -9208,6 +9248,46 @@ mod tests {
             !node.demand_leased(&other, now),
             "a re-asserted quiesce clears leases"
         );
+        assert!(node.close().await.is_ok());
+    }
+
+    /// The lease table holds at most [`MAX_DEMAND_LEASES`] peers; a held
+    /// lease still extends.
+    #[tokio::test(start_paused = true)]
+    async fn demand_lease_table_is_capped() {
+        let node = NetworkNode::new(NetworkConfig::default(), None, None)
+            .await
+            .unwrap();
+        let until = tokio::time::Instant::now() + Duration::from_secs(60);
+        let peer = |i: usize| {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            ant_quic::PeerId(bytes)
+        };
+        for i in 0..MAX_DEMAND_LEASES {
+            assert!(node.lease_demand_peer(peer(i), until), "lease {i}");
+        }
+        assert!(!node.lease_demand_peer(peer(MAX_DEMAND_LEASES), until));
+        assert!(!node.demand_leased(&peer(MAX_DEMAND_LEASES), tokio::time::Instant::now()));
+        assert!(node.lease_demand_peer(peer(0), until + Duration::from_secs(60)));
+        assert!(node.close().await.is_ok());
+    }
+
+    /// A lease read against a generation a clear has since ended is
+    /// refused: a quiesce that ends the burst during a dial wins.
+    #[tokio::test(start_paused = true)]
+    async fn a_clear_during_a_dial_refuses_its_lease() {
+        let node = NetworkNode::new(NetworkConfig::default(), None, None)
+            .await
+            .unwrap();
+        let peer = test_ant_peer(53);
+        let until = tokio::time::Instant::now() + Duration::from_secs(60);
+        let before = node.demand_lease_generation();
+        assert!(node.latch_mesh_quiesced().is_some());
+        assert!(!node.lease_demand_peer_if(before, peer, until));
+        assert!(!node.demand_leased(&peer, tokio::time::Instant::now()));
+        let now_gen = node.demand_lease_generation();
+        assert!(node.lease_demand_peer_if(now_gen, peer, until));
         assert!(node.close().await.is_ok());
     }
 

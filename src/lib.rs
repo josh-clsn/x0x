@@ -8304,6 +8304,10 @@ impl Agent {
         lease: std::time::Duration,
     ) -> error::Result<connectivity::ConnectOutcome> {
         let lease = lease.min(std::time::Duration::from_secs(MAX_DEMAND_LEASE_SECS));
+        let generation = self
+            .network
+            .as_ref()
+            .map(|network| network.demand_lease_generation());
         let (outcome, machine) = DIALED_MACHINE
             .scope(std::cell::Cell::new(None), async {
                 let outcome = self.connect_to_agent(agent_id).await;
@@ -8311,13 +8315,16 @@ impl Agent {
             })
             .await;
         let outcome = outcome?;
-        if let (true, false, Some(machine), Some(network)) = (
+        if let (true, false, Some(machine), Some(network), Some(generation)) = (
             outcome.is_live_path(),
             lease.is_zero(),
             machine,
             self.network.as_ref(),
+            generation,
         ) {
-            network.lease_demand_peer(
+            // A quiesce that ended the burst during the dial wins.
+            network.lease_demand_peer_if(
+                generation,
                 ant_quic::PeerId(machine.0),
                 tokio::time::Instant::now() + lease,
             );
@@ -8429,7 +8436,6 @@ impl Agent {
         machine_id: identity::MachineId,
         nonblocking_evidence: bool,
     ) {
-        note_dialed_machine(machine_id);
         if !self
             .authority_confirms_with(agent_id, &machine_id, nonblocking_evidence)
             .await
@@ -8442,6 +8448,7 @@ impl Agent {
             );
             return;
         }
+        note_dialed_machine(machine_id);
         {
             let mut cache = self.identity_discovery_cache.write().await;
             if let Some(entry) = cache.get_mut(agent_id) {
@@ -10512,26 +10519,25 @@ impl Agent {
         }
 
         // F8: a latched node drops every gossip frame it sends, so its
-        // gossip leg would publish nothing and report success. Over a live
-        // direct link such a send goes raw instead; with none it fails here.
-        // The receiver's rule is unchanged: a raw frame is verified only for
-        // a machine it holds a binding for, so this applies only where the
-        // gossip leg could never have delivered.
-        let gossip_ok = if gossip_ok
-            && !config.require_durable_app_ack
-            && self.gossip_leg_quiesced()
-        {
-            if config.require_gossip || !self.has_live_direct_connection(to).await {
-                self.direct_messaging.record_outgoing_failed(*to);
-                return Err(dm::DmError::NoConnectivity(
-                    "mesh quiesced: the gossip inbox cannot carry this send and no direct link is live"
-                        .to_string(),
-                ));
-            }
-            false
-        } else {
-            gossip_ok
-        };
+        // gossip leg would publish nothing and report success. A send whose
+        // caller chose raw first keeps its raw attempt, with the full
+        // resolver, and loses only the dead gossip fallback. Any other send
+        // fails here: a raw frame is verified only where the receiver holds
+        // a binding for this node, so rerouting a send that relies on the
+        // gossip inbox's verified envelope could report success for a frame
+        // the receiver then rejects.
+        let gossip_ok =
+            if gossip_ok && !config.require_durable_app_ack && self.gossip_leg_quiesced() {
+                if config.require_gossip || !config.prefer_raw_quic_if_connected {
+                    self.direct_messaging.record_outgoing_failed(*to);
+                    return Err(dm::DmError::NoConnectivity(
+                        "mesh quiesced: the gossip inbox cannot carry this send".to_string(),
+                    ));
+                }
+                false
+            } else {
+                gossip_ok
+            };
 
         // X0X-0070b: seed the relay fallback. Only retain the payload + KEM
         // key clone when the engine is enabled AND we have a key to seal
@@ -11888,7 +11894,7 @@ impl Agent {
     /// Whether the quiesce latch silences this node's gossip leg: every
     /// gossip frame it sends is dropped at the transport
     /// ([`network::NetworkNode::mesh_quiesced`]).
-    fn gossip_leg_quiesced(&self) -> bool {
+    pub(crate) fn gossip_leg_quiesced(&self) -> bool {
         #[cfg(test)]
         if GOSSIP_LEG_QUIESCED_STANDIN
             .lock()
@@ -13864,8 +13870,8 @@ impl Agent {
     /// routing entry's machine through `authorized_routing_machine_with`,
     /// and the DM registry's (which the connect paths, card imports and the
     /// peer's own verified raw frames write) through
-    /// `authorized_registry_machine`. Never dials and never blocks on the
-    /// evidence store.
+    /// `authorized_registry_machine`, and usable peer evidence. Never dials
+    /// and never blocks on the evidence store.
     pub(crate) async fn has_live_direct_connection(&self, agent_id: &identity::AgentId) -> bool {
         let transport = match self.network.as_ref() {
             Some(network) => RawQuicTransport::Network(network),
@@ -13885,7 +13891,15 @@ impl Agent {
             .authorized_routing_machine_with(agent_id, routing, true)
             .await;
         let registry = self.authorized_registry_machine(agent_id, true).await;
-        for machine in [routed, registry].into_iter().flatten() {
+        // F8: a dial from peer evidence (ADR 0089) writes no binding, so the
+        // evidence's machine counts here as the raw resolver counts it.
+        let evidence = self
+            .peer_evidence()
+            .try_usable_agent(*agent_id, dm_capability::now_unix_ms())
+            .ok()
+            .flatten()
+            .map(|view| view.announcement.machine_id);
+        for machine in [routed, registry, evidence].into_iter().flatten() {
             if transport.is_connected(&ant_quic::PeerId(machine.0)).await {
                 return true;
             }
@@ -16612,7 +16626,7 @@ impl Agent {
     ///   outbound dial gate and break demand DMs and the re-join dial);
     ///   the latch itself gates the proactive-reconnect path instead;
     /// - a tracked re-sweep task disconnects any peer that reappears (e.g.
-    ///   via a demand dial) every [`QUIESCE_RESWEEP_SECS`] while the latch
+    ///   via a demand dial) every `QUIESCE_RESWEEP_SECS` (60 s) while the latch
     ///   holds, except a peer dialled with an unexpired lease
     ///   ([`connect_to_agent_leased`](Agent::connect_to_agent_leased));
     /// - every call, including one while already latched, clears all leases
@@ -31068,11 +31082,14 @@ mod tests {
         ));
     }
 
-    /// F8: a latched node's bookkeeping send to a recipient with a gossip
-    /// advert goes raw over its live demand-dialled link, and the dialler
-    /// marks the answer from the machine it dialled verified.
+    /// F8: a latched node's send to a recipient with a gossip advert fails
+    /// as no connectivity unless its caller chose raw first, so the gossip
+    /// inbox's verified envelope is never swapped for a raw frame behind
+    /// the caller's back. With raw first it goes raw over the dialled link,
+    /// and the dialler marks the answer from the machine it dialled
+    /// verified.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_latched_bookkeeping_send_goes_raw_over_a_dialled_link() {
+    async fn a_latched_send_goes_raw_only_when_its_caller_chose_raw() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let (alice, bob, _bob_addr) = leaf_and_peer(dir.path()).await;
         alice.start_direct_listener();
@@ -31087,28 +31104,31 @@ mod tests {
         assert!(alice.has_live_direct_connection(&bob.agent_id()).await);
 
         let mut bob_rx = bob.subscribe_direct();
+        let refused = alice
+            .send_direct_with_config(&bob.agent_id(), b"metadata".to_vec(), bookkeeping_config())
+            .await;
+        assert!(
+            matches!(refused, Err(dm::DmError::NoConnectivity(_))),
+            "{refused:?}"
+        );
+        let raw_first = dm::DmSendConfig {
+            prefer_raw_quic_if_connected: true,
+            ..bookkeeping_config()
+        };
         let receipt = alice
-            .send_direct_with_config(
-                &bob.agent_id(),
-                b"page-request".to_vec(),
-                bookkeeping_config(),
-            )
+            .send_direct_with_config(&bob.agent_id(), b"page-request".to_vec(), raw_first.clone())
             .await
-            .expect("the latched node's send goes raw");
+            .expect("a raw-first send goes raw");
         assert_eq!(receipt.path, dm::DmPath::RawQuicAcked);
         let got = tokio::time::timeout(std::time::Duration::from_secs(10), bob_rx.recv())
             .await
             .expect("bob receives it")
             .expect("bob's stream is open");
-        assert_eq!(got.payload, b"page-request");
+        assert_eq!(got.payload, b"page-request", "the refused send never left");
 
         let mut alice_rx = alice.subscribe_direct();
-        let config = dm::DmSendConfig {
-            prefer_raw_quic_if_connected: true,
-            ..bookkeeping_config()
-        };
         let receipt = bob
-            .send_direct_with_config(&alice.agent_id(), b"page-answer".to_vec(), config)
+            .send_direct_with_config(&alice.agent_id(), b"page-answer".to_vec(), raw_first)
             .await
             .expect("bob answers over the link");
         assert_eq!(receipt.path, dm::DmPath::RawQuicAcked);
@@ -31122,6 +31142,96 @@ mod tests {
             "the dialler has a binding for the dialled machine"
         );
         assert!(alice.mesh_quiesced());
+    }
+
+    /// I1: a latched sender whose receiver holds no binding for it is never
+    /// told its gossip-first send succeeded, and nothing reaches the
+    /// receiver (which would read it as unverified and drop a metadata
+    /// event).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_latched_send_to_a_receiver_without_its_binding_is_not_ok() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (alice, _bob, _bob_addr) = leaf_and_peer(dir.path()).await;
+        let carol = Agent::builder()
+            .with_machine_key(dir.path().join("carol-machine.key"))
+            .with_agent_key_path(dir.path().join("carol-agent.key"))
+            .with_contact_store_path(dir.path().join("carol-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("carol-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("carol");
+        carol.start_direct_listener();
+        let carol_net = std::sync::Arc::clone(carol.network().expect("network"));
+        let carol_addr = normalize_loopback_addr(carol_net.bound_addr().await.expect("bound"));
+        let now = Agent::unix_timestamp_secs();
+        alice
+            .insert_discovered_agent_for_testing(DiscoveredAgent {
+                can_receive_direct: Some(true),
+                ..card_pin(carol.agent_id(), carol.machine_id(), vec![carol_addr], now)
+            })
+            .await;
+        advertise_gossip_inbox(&alice, &carol);
+        alice.quiesce_mesh().await.expect("latch");
+        let outcome = alice
+            .connect_to_agent_leased(&carol.agent_id(), std::time::Duration::from_secs(120))
+            .await
+            .expect("the connect runs");
+        assert!(outcome.is_live_path(), "{outcome:?}");
+
+        let mut carol_rx = carol.subscribe_direct();
+        let sent = alice
+            .send_direct_with_config(
+                &carol.agent_id(),
+                b"member-added".to_vec(),
+                bookkeeping_config(),
+            )
+            .await;
+        assert!(
+            matches!(sent, Err(dm::DmError::NoConnectivity(_))),
+            "the sender must not be told Ok: {sent:?}"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), carol_rx.recv())
+                .await
+                .is_err(),
+            "nothing reached the receiver"
+        );
+    }
+
+    /// L1: a dial that reached a machine no authority store names for the
+    /// agent records no lease. A card for an agent with no machine is
+    /// dialled address-only and reaches Bob's machine.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lease_needs_an_authenticated_machine() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (alice, bob, bob_addr) = leaf_and_peer(dir.path()).await;
+        let network = std::sync::Arc::clone(alice.network().expect("network"));
+        let stranger = identity::AgentId([0x77; 32]);
+        let now = Agent::unix_timestamp_secs();
+        alice
+            .insert_discovered_agent_for_testing(DiscoveredAgent {
+                can_receive_direct: Some(true),
+                ..card_pin(
+                    stranger,
+                    identity::MachineId([0u8; 32]),
+                    vec![bob_addr],
+                    now,
+                )
+            })
+            .await;
+        let outcome = alice
+            .connect_to_agent_leased(&stranger, std::time::Duration::from_secs(120))
+            .await
+            .expect("the connect runs");
+        assert!(outcome.is_live_path(), "the address answered: {outcome:?}");
+        assert!(
+            !network.demand_leased(
+                &ant_quic::PeerId(bob.machine_id().0),
+                tokio::time::Instant::now()
+            ),
+            "an unauthenticated machine got a lease"
+        );
     }
 
     /// A raw frame from a machine the receiver holds no binding for is

@@ -565,21 +565,32 @@ pub(in crate::server) fn named_group_direct_delivery_config() -> x0x::dm::DmSend
     config
 }
 
-/// The delivery config for a catch-up page request or answer to `peer`
-/// (F8): raw QUIC first, under its receive ACK, while a live direct link to
-/// `peer` exists; the gossip inbox when there is none, or after a raw
-/// failure, as [`named_group_direct_delivery_config`]. Catch-up needs no
-/// verified transport (survivor re-key A5: requests are signed, and an
-/// unverified page applies each event as its verified commit signer), so
-/// the reason that config keeps gossip first does not apply here. This is
-/// what lets a latched member, which drops all gossip, catch up over a
-/// demand-dialled link.
-pub(in crate::server) async fn catchup_delivery_config(
+/// The delivery config for a catch-up page request (F8): raw QUIC first,
+/// under its receive ACK, while this node's gossip leg is latched; else
+/// [`named_group_direct_delivery_config`]. Catch-up needs no verified
+/// transport (survivor re-key A5: requests are signed, and an unverified
+/// page applies each event as its verified commit signer), so the reason
+/// that config keeps gossip first does not hold for a node whose gossip
+/// cannot leave. A meshed pair keeps the gossip inbox's verified envelope.
+pub(in crate::server) fn catchup_request_delivery_config(
     state: &AppState,
-    peer: &AgentId,
 ) -> x0x::dm::DmSendConfig {
     let mut config = named_group_direct_delivery_config();
-    config.prefer_raw_quic_if_connected = state.agent.has_live_direct_connection(peer).await;
+    config.prefer_raw_quic_if_connected = state.agent.gossip_leg_quiesced();
+    config
+}
+
+/// The delivery config for a catch-up answer to `peer` (F8): raw first
+/// over a live direct link when the request said its requester is latched
+/// (`reply_raw`); else [`named_group_direct_delivery_config`].
+pub(in crate::server) async fn catchup_answer_delivery_config(
+    state: &AppState,
+    peer: &AgentId,
+    reply_raw: bool,
+) -> x0x::dm::DmSendConfig {
+    let mut config = named_group_direct_delivery_config();
+    config.prefer_raw_quic_if_connected =
+        reply_raw && state.agent.has_live_direct_connection(peer).await;
     config
 }
 
@@ -1417,6 +1428,11 @@ pub(in crate::server) struct TreeKemCatchupRequest {
     /// ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     head_challenge: Option<String>,
+    /// F8: the requester's gossip leg is latched, so answer raw first over
+    /// a live direct link. Unsigned: it only picks between two carriers the
+    /// answer may already take.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    reply_raw: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -11948,8 +11964,15 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
             }
         }
         // Survivor re-key A14: handed off, so this answer frees its slot.
-        catchup_serve::send_answer(state, *sender, payload, &request.group_id, "member-keyed")
-            .await;
+        catchup_serve::send_answer(
+            state,
+            *sender,
+            payload,
+            &request.group_id,
+            "member-keyed",
+            request.reply_raw,
+        )
+        .await;
         return;
     }
     // Issue #378: the regular event-log serve below is a peer-driven amplifier —
@@ -12002,7 +12025,8 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
             "throttling duplicate TreeKEM catch-up page request"
         );
         if let Some(proof) = head_proof {
-            head_proof::send_proof_only(state, sender, &request.group_id, proof).await;
+            head_proof::send_proof_only(state, sender, &request.group_id, proof, request.reply_raw)
+                .await;
         }
         return;
     }
@@ -12066,7 +12090,8 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     // A page and a proof that do not fit one direct message go apart.
     let payload = match head_proof {
         Some(proof) if payload.len() > head_proof::page_and_proof_cap(state) => {
-            head_proof::send_proof_only(state, sender, &request.group_id, proof).await;
+            head_proof::send_proof_only(state, sender, &request.group_id, proof, request.reply_raw)
+                .await;
             let mut response = response;
             response.head_proof = None;
             match serde_json::to_vec(&response) {
@@ -12090,7 +12115,15 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     );
     // Survivor re-key A14: handed off, so this answer frees its slot while
     // the send waits on its acknowledgement.
-    catchup_serve::send_answer(state, *sender, payload, &request.group_id, "page").await;
+    catchup_serve::send_answer(
+        state,
+        *sender,
+        payload,
+        &request.group_id,
+        "page",
+        request.reply_raw,
+    )
+    .await;
 }
 
 /// How long a `treekem_catchup_throttle` entry is kept. Every reader looks
@@ -13121,6 +13154,7 @@ async fn request_member_key_package_catchup(
                 &member_keyed_request_sign_input(group_id, &local_agent_hex, member_agent_id),
             ),
             head_challenge: None,
+            reply_raw: false,
         };
         let payload = match serde_json::to_vec(&request) {
             Ok(payload) => payload,
@@ -65258,6 +65292,7 @@ pub(in crate::server) mod tests {
             limit: 8,
             signed_by: None,
             head_challenge: None,
+            reply_raw: false,
         };
         let encoded = serde_json::to_value(&request).expect("catch-up request serializes");
         assert_eq!(encoded["message_type"], "treekem_catchup_request");
@@ -66304,6 +66339,7 @@ pub(in crate::server) mod tests {
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
             signed_by: None,
             head_challenge: None,
+            reply_raw: false,
         };
         let log_keys = vec![fixture.group_id.clone(), fixture.stable_group_id.clone()];
         let response = member_keyed_treekem_catchup_response(&restarted, &log_keys, &request)
@@ -66393,6 +66429,7 @@ pub(in crate::server) mod tests {
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
             signed_by: None,
             head_challenge: None,
+            reply_raw: false,
         };
         handle_treekem_catchup_request(state, sender, true, request).await;
         // Survivor re-key A14: the answer hands its send off; count it once
@@ -66580,6 +66617,7 @@ pub(in crate::server) mod tests {
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
             signed_by: None,
             head_challenge: None,
+            reply_raw: false,
         };
         handle_treekem_catchup_request(state, sender, true, request).await;
         // Survivor re-key A14: the answer hands its send off; count it once
@@ -68211,6 +68249,7 @@ pub(in crate::server) mod tests {
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
             signed_by: None,
             head_challenge: None,
+            reply_raw: false,
         };
         let log_keys = vec![group_id.clone(), stable_group_id.clone()];
         let response = member_keyed_treekem_catchup_response(&restarted, &log_keys, &request)
@@ -68437,6 +68476,7 @@ pub(in crate::server) mod tests {
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
             signed_by: None,
             head_challenge: None,
+            reply_raw: false,
         };
         let log_keys = vec![group_id.clone(), stable_group_id];
         let response = member_keyed_treekem_catchup_response(&w_state, &log_keys, &request)

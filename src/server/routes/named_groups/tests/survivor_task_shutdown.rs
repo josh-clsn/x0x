@@ -201,6 +201,7 @@ async fn shutdown_and_wait_releases_state_held_by_survivor_rekey_tasks() -> Resu
         limit: 1,
         signed_by: None,
         head_challenge: None,
+        reply_raw: false,
     };
     assert_eq!(
         super::super::catchup_serve::dispatch(
@@ -221,7 +222,7 @@ async fn shutdown_and_wait_releases_state_held_by_survivor_rekey_tasks() -> Resu
         .answer_send_hold
         .lock()
         .unwrap() = Some(Arc::clone(&send_hold));
-    super::super::catchup_serve::send_answer(&state, peer_id, vec![0], &room, "test").await;
+    super::super::catchup_serve::send_answer(&state, peer_id, vec![0], &room, "test", false).await;
     // F-1: a `POST /mesh/join` dial and its hooks.
     held.push((
         "the mesh join",

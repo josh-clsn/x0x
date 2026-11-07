@@ -1135,11 +1135,12 @@ and sweeps every peer. A lease changes nothing else: inbound links are still
 refused and gossip frames are still dropped on the leased link.
 
 While quiesced, a node's own gossip publishes go nowhere. A non-durable
-direct send whose path would be the recipient's gossip inbox therefore goes
-over raw QUIC when a live direct link to the recipient exists, and
-otherwise fails at once as no connectivity instead of publishing into the
-latch. Room catch-up page requests and answers go raw first over any live
-direct link, quiesced or not.
+direct send whose path would be the recipient's gossip inbox therefore
+fails at once as no connectivity instead of publishing into the latch,
+unless it set `prefer_raw_quic_if_connected`: then only its raw attempt
+runs, with no gossip fallback. A quiesced member's room catch-up page
+request goes raw first and asks for a raw answer; between meshed members
+catch-up keeps the gossip inbox.
 
 ### Direct send request body
 

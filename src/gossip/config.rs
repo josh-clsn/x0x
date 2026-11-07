@@ -115,7 +115,7 @@ pub struct GossipConfig {
     pub relay_fanout_budget_msgs_per_sec: u64,
 
     /// Consume-only for the four mesh-wide DM-capability topics
-    /// (`x0x/caps/*`, [`crate::dm_capability::CAPS_TOPIC_NAMES`]).
+    /// (`x0x/caps/*`, `dm_capability::CAPS_TOPIC_NAMES`).
     ///
     /// When on, a Leaf still receives every advert, request and response
     /// on those topics, delivers them to its own capability store, answers

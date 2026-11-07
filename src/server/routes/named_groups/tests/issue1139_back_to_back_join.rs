@@ -5179,6 +5179,7 @@ async fn a4_served_page(
         limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
         signed_by: None,
         head_challenge: None,
+        reply_raw: false,
     };
     let before = server
         .named_group_test_recorders

@@ -224,6 +224,7 @@ async fn signed_head_request(
         limit: 1,
         signed_by: None,
         head_challenge: None,
+        reply_raw: false,
     };
     super::super::signed_catchup::sign_page_request(state, &mut request);
     request

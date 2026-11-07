@@ -18,7 +18,7 @@
 //!   committer-leaf rule, and anything else is dropped.
 
 use super::{
-    build_catchup_signer, catchup_delivery_config, catchup_signer_matches, AppState,
+    build_catchup_signer, catchup_request_delivery_config, catchup_signer_matches, AppState,
     NamedGroupMetadataEvent, TreeKemCatchupRequest, TreeKemCatchupResponse,
     TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
 };
@@ -173,6 +173,7 @@ pub(super) async fn page_request(
         limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
         signed_by: None,
         head_challenge: None,
+        reply_raw: false,
     };
     sign_page_request(state, &mut request);
     Some(request)
@@ -187,6 +188,7 @@ pub(super) async fn send_page_request(
     if request.signed_by.is_none() {
         sign_page_request(state, &mut request);
     }
+    request.reply_raw = state.agent.gossip_leg_quiesced();
     let payload = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
     #[cfg(test)]
     super::detached_send_test_seam::park(&super::detached_send_test_seam::page_request_key(
@@ -218,7 +220,7 @@ pub(super) async fn send_page_request(
     }
     state
         .agent
-        .send_direct_with_config(peer, payload, catchup_delivery_config(state, peer).await)
+        .send_direct_with_config(peer, payload, catchup_request_delivery_config(state))
         .await
         .map(|_| ())
         .map_err(|e| e.to_string())

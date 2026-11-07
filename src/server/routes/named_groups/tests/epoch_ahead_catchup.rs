@@ -355,6 +355,7 @@ pub(super) fn catchup_request_from(
         limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
         signed_by: None,
         head_challenge: None,
+        reply_raw: false,
     }
 }
 

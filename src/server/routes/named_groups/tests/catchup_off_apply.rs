@@ -540,6 +540,7 @@ fn bare_request(
         limit: 1,
         signed_by: None,
         head_challenge: None,
+        reply_raw: false,
     }
 }
 

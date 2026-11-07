@@ -2310,6 +2310,7 @@ async fn cold_responder_newer_head_does_not_clear_the_startup_gate() -> Result<(
             missing_prev_state_hash: None,
             target_member_id: None,
             limit: 8,
+            reply_raw: false,
         },
     )
     .await;
@@ -3888,6 +3889,7 @@ async fn epoch_ahead_ciphertext_requests_catchup_and_converges() -> Result<()> {
             missing_prev_state_hash: None,
             target_member_id: None,
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+            reply_raw: false,
         }
     };
     handle_treekem_catchup_request(admin, &victim_id, true, request).await;
@@ -4166,6 +4168,7 @@ async fn newer_epoch_observation_survives_a_late_older_epoch_page() -> Result<()
             missing_prev_state_hash: None,
             target_member_id: None,
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+            reply_raw: false,
         }
     };
     handle_treekem_catchup_request(admin, &victim_id, true, request).await;

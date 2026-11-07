@@ -590,6 +590,7 @@ async fn a_refused_removal_heals_by_catch_up_without_a_resend() -> Result<()> {
         limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
         signed_by: None,
         head_challenge: None,
+        reply_raw: false,
     };
     let package = member_keyed_treekem_catchup_response(
         &cast.fixture.state,

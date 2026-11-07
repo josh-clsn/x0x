@@ -1884,6 +1884,34 @@ mod tests {
             .unwrap()
     }
 
+    async fn wildcard_test_agent(path: &std::path::Path) -> crate::Agent {
+        std::fs::create_dir_all(path).unwrap();
+        crate::Agent::builder()
+            .with_identity_dir(path)
+            .with_machine_key(path.join("machine.key"))
+            .with_agent_key_path(path.join("agent.key"))
+            .with_user_key_path(path.join("user.key"))
+            .with_agent_cert_path(path.join("agent.cert"))
+            .with_contact_store_path(path.join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(crate::network::NetworkConfig {
+                // A fixed port: an evidence record's hints take the
+                // configured port, and 0 yields none.
+                bind_addr: Some(
+                    std::net::UdpSocket::bind("0.0.0.0:0")
+                        .and_then(|socket| socket.local_addr())
+                        .unwrap(),
+                ),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap()
+    }
+
     fn ready_test_context(agent: &crate::Agent) -> Arc<Context> {
         Arc::new(Context {
             bindings: Arc::clone(&agent.authenticated_machine_bindings),
@@ -1942,6 +1970,85 @@ mod tests {
         });
         assert_eq!(policy.eligible(&context, b.machine_id()), Some(true));
         policy
+    }
+
+    /// F8 (I4): fifteen minutes into an outage the latched phone's discovery
+    /// entry for its desktop is gone and the dial runs from peer evidence.
+    /// That dial still records the lease, and the link counts as live at
+    /// once though the dial writes no binding (ADR 0089), so a burst's
+    /// raw-first send goes raw straight away, and the answer is verified
+    /// through the evidence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn f8_an_evidence_dial_leases_and_counts_as_live_for_a_burst() {
+        let dir = tempfile::tempdir().unwrap();
+        // Bound to every interface: an evidence record carries interface
+        // hints, never loopback, so this needs a private interface.
+        let a = wildcard_test_agent(&dir.path().join("a")).await;
+        let b = wildcard_test_agent(&dir.path().join("b")).await;
+        let _policy = ready_test_policy(&a, &b, &dir.path().join("evidence")).await;
+        assert!(a
+            .identity_discovery_cache
+            .read()
+            .await
+            .get(&b.agent_id())
+            .is_none());
+        a.start_direct_listener();
+        b.start_direct_listener();
+        let a_network = Arc::clone(a.network.as_ref().unwrap());
+        let mut a_addr = a_network.bound_addr().await.unwrap();
+        if a_addr.ip().is_unspecified() {
+            a_addr.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
+        }
+        let now = crate::Agent::unix_timestamp_secs();
+        let mut entry = crate::discovered_agent_fixture(1, now, &[], None);
+        entry.agent_id = a.agent_id();
+        entry.machine_id = a.machine_id();
+        entry.addresses = vec![a_addr];
+        entry.can_receive_direct = Some(true);
+        b.insert_discovered_agent_for_testing(entry).await;
+
+        a.quiesce_mesh().await.unwrap();
+        let outcome = a
+            .connect_to_agent_leased(&b.agent_id(), Duration::from_secs(120))
+            .await
+            .unwrap();
+        assert!(outcome.is_live_path(), "{outcome:?}");
+        let b_peer = ant_quic::PeerId(b.machine_id().0);
+        assert!(a_network.demand_leased(&b_peer, tokio::time::Instant::now()));
+        assert!(
+            a.has_live_direct_connection(&b.agent_id()).await,
+            "the evidence dial counts as a live link at once"
+        );
+
+        let config = crate::dm::DmSendConfig {
+            prefer_raw_quic_if_connected: true,
+            raw_quic_receive_ack_timeout: Some(Duration::from_secs(8)),
+            ..crate::dm::DmSendConfig::default()
+        };
+        let mut b_rx = b.subscribe_direct();
+        let receipt = a
+            .send_direct_with_config(&b.agent_id(), b"page-request".to_vec(), config.clone())
+            .await
+            .unwrap();
+        assert_eq!(receipt.path, crate::dm::DmPath::RawQuicAcked);
+        let got = tokio::time::timeout(Duration::from_secs(10), b_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.payload, b"page-request");
+
+        let mut a_rx = a.subscribe_direct();
+        let receipt = b
+            .send_direct_with_config(&a.agent_id(), b"page-answer".to_vec(), config)
+            .await
+            .unwrap();
+        assert_eq!(receipt.path, crate::dm::DmPath::RawQuicAcked);
+        let got = tokio::time::timeout(Duration::from_secs(10), a_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.payload, b"page-answer");
+        assert!(got.verified, "verified through the stored evidence");
     }
 
     #[tokio::test]

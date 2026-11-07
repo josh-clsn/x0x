@@ -197,6 +197,7 @@ pub(super) async fn request_treekem_catchup_for_gap(
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
             signed_by: None,
             head_challenge: None,
+            reply_raw: false,
         };
         let end = EndOnDrop {
             state: Arc::clone(state),

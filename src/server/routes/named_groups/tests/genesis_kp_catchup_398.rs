@@ -60,6 +60,7 @@ async fn targeted_catchup_serves_roster_fallback_for_genesis_member() -> Result<
         limit: 8,
         signed_by: None,
         head_challenge: None,
+        reply_raw: false,
     };
     let response = member_keyed_treekem_catchup_response(&state, &[group_id], &request)
         .await
@@ -106,6 +107,7 @@ async fn targeted_catchup_serves_nothing_without_roster_package() -> Result<()> 
         limit: 8,
         signed_by: None,
         head_challenge: None,
+        reply_raw: false,
     };
     let response = member_keyed_treekem_catchup_response(&state, &[group_id], &request)
         .await
@@ -231,6 +233,7 @@ async fn targeted_response_carries_valid_signer() -> Result<()> {
         limit: 8,
         signed_by: None,
         head_challenge: None,
+        reply_raw: false,
     };
     let response =
         member_keyed_treekem_catchup_response(&state, std::slice::from_ref(&group_id), &request)
@@ -287,6 +290,7 @@ async fn request_gate_admits_signed_and_drops_unsigned_when_unverified() -> Resu
         limit: 8,
         signed_by: None,
         head_challenge: None,
+        reply_raw: false,
     };
     handle_treekem_catchup_request(&state, &creator, false, request.clone()).await;
     let throttle_key = format!("{group_id}:mk-serve:{creator_hex}:{target}");

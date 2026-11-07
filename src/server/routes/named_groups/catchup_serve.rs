@@ -215,6 +215,7 @@ async fn deliver_answer(
     payload: Vec<u8>,
     group_id: &str,
     what: &str,
+    reply_raw: bool,
 ) {
     #[cfg(test)]
     {
@@ -238,7 +239,7 @@ async fn deliver_answer(
         .send_direct_with_config(
             &to,
             payload,
-            super::catchup_delivery_config(state, &to).await,
+            super::catchup_answer_delivery_config(state, &to, reply_raw).await,
         )
         .await
     {
@@ -260,6 +261,7 @@ pub(super) async fn send_answer(
     payload: Vec<u8>,
     group_id: &str,
     what: &'static str,
+    reply_raw: bool,
 ) {
     match reserve_send(state, to) {
         Some(ticket) => {
@@ -268,13 +270,13 @@ pub(super) async fn send_answer(
                 // A send that never returns frees its permit.
                 let _ = tokio::time::timeout(
                     super::gap_catchup::ASK_TIMEOUT,
-                    deliver_answer(&ticket.state, to, payload, &group_id, what),
+                    deliver_answer(&ticket.state, to, payload, &group_id, what, reply_raw),
                 )
                 .await;
                 drop(ticket);
             });
         }
-        None => deliver_answer(state, to, payload, group_id, what).await,
+        None => deliver_answer(state, to, payload, group_id, what, reply_raw).await,
     }
 }
 
@@ -686,6 +688,7 @@ mod tests {
             limit: 1,
             signed_by: None,
             head_challenge: None,
+            reply_raw: false,
         }
     }
 
