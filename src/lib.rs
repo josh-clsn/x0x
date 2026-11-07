@@ -8292,8 +8292,10 @@ impl Agent {
     /// `lease` (capped at [`MAX_DEMAND_LEASE_SECS`]) on the machine reached:
     /// while the mesh is quiesced, the periodic re-sweep leaves that link up
     /// until the lease ends or the next [`Self::quiesce_mesh`] call. A
-    /// zero lease, or a link to a machine the dial could not authenticate
-    /// as the agent's, records nothing.
+    /// zero lease, a link to a machine the dial could not authenticate as
+    /// the agent's, a quiesce during the dial, or a full lease table
+    /// ([`network::MAX_DEMAND_LEASES`]) records nothing. Returns the outcome
+    /// and whether a lease was recorded.
     ///
     /// # Errors
     ///
@@ -8302,7 +8304,7 @@ impl Agent {
         &self,
         agent_id: &identity::AgentId,
         lease: std::time::Duration,
-    ) -> error::Result<connectivity::ConnectOutcome> {
+    ) -> error::Result<(connectivity::ConnectOutcome, bool)> {
         let lease = lease.min(std::time::Duration::from_secs(MAX_DEMAND_LEASE_SECS));
         let generation = self
             .network
@@ -8315,21 +8317,13 @@ impl Agent {
             })
             .await;
         let outcome = outcome?;
-        if let (true, false, Some(machine), Some(network), Some(generation)) = (
-            outcome.is_live_path(),
-            lease.is_zero(),
-            machine,
-            self.network.as_ref(),
-            generation,
-        ) {
-            // A quiesce that ended the burst during the dial wins.
-            network.lease_demand_peer_if(
-                generation,
-                ant_quic::PeerId(machine.0),
-                tokio::time::Instant::now() + lease,
-            );
-        }
-        Ok(outcome)
+        let leased = match (self.network.as_ref(), generation) {
+            (Some(network), Some(generation)) => {
+                record_demand_lease(network, generation, &outcome, machine, lease)
+            }
+            _ => false,
+        };
+        Ok((outcome, leased))
     }
 
     /// [`Self::connect_to_agent`] for a send whose cold-recipient handling
@@ -12606,8 +12600,7 @@ impl Agent {
         )
         .await?;
 
-        let evidence_machine = if cached_machine_id.is_none()
-            && registry_machine_id.is_none()
+        let evidence_machine = if evidence_counts_for_raw(cached_machine_id, registry_machine_id)
             && Self::cold_bounded(cold, agent_id, "evidence", self.peer_evidence().wait(0)).await?
         {
             let now = dm_capability::now_unix_ms();
@@ -13892,13 +13885,17 @@ impl Agent {
             .await;
         let registry = self.authorized_registry_machine(agent_id, true).await;
         // F8: a dial from peer evidence (ADR 0089) writes no binding, so the
-        // evidence's machine counts here as the raw resolver counts it.
-        let evidence = self
-            .peer_evidence()
-            .try_usable_agent(*agent_id, dm_capability::now_unix_ms())
-            .ok()
-            .flatten()
-            .map(|view| view.announcement.machine_id);
+        // evidence's machine counts here exactly when the raw resolver
+        // would use it.
+        let evidence = if evidence_counts_for_raw(routed, registry) {
+            self.peer_evidence()
+                .try_usable_agent(*agent_id, dm_capability::now_unix_ms())
+                .ok()
+                .flatten()
+                .map(|view| view.announcement.machine_id)
+        } else {
+            None
+        };
         for machine in [routed, registry, evidence].into_iter().flatten() {
             if transport.is_connected(&ant_quic::PeerId(machine.0)).await {
                 return true;
@@ -22570,6 +22567,39 @@ tokio::task_local! {
     static DIALED_MACHINE: std::cell::Cell<Option<identity::MachineId>>;
 }
 
+/// Lease `machine` for `lease` after a leased connect ended in `outcome`.
+/// Returns whether a lease was recorded: never for a dead outcome, a zero
+/// lease, no authenticated machine, a clear since `generation` (a quiesce
+/// that ended the burst during the dial wins) or a full table.
+fn record_demand_lease(
+    network: &network::NetworkNode,
+    generation: u64,
+    outcome: &connectivity::ConnectOutcome,
+    machine: Option<identity::MachineId>,
+    lease: std::time::Duration,
+) -> bool {
+    match machine {
+        Some(machine) if outcome.is_live_path() && !lease.is_zero() => network
+            .lease_demand_peer_if(
+                generation,
+                ant_quic::PeerId(machine.0),
+                tokio::time::Instant::now() + lease,
+            ),
+        _ => false,
+    }
+}
+
+/// Whether a raw-QUIC reader consults peer evidence for a recipient: only
+/// when no authority-confirmed routing or registry machine exists. Shared
+/// by the raw resolver and [`Agent::has_live_direct_connection`] so the two
+/// agree on which machine is the recipient's.
+fn evidence_counts_for_raw(
+    routed: Option<identity::MachineId>,
+    registry: Option<identity::MachineId>,
+) -> bool {
+    routed.is_none() && registry.is_none()
+}
+
 /// Record `machine` as the one the current leased connect reached (a no-op
 /// outside [`Agent::connect_to_agent_leased`]).
 fn note_dialed_machine(machine: identity::MachineId) {
@@ -30987,13 +31017,14 @@ mod tests {
         let (alice, bob, _bob_addr) = leaf_and_peer(dir.path()).await;
         let network = std::sync::Arc::clone(alice.network().expect("network"));
         let bob_peer = ant_quic::PeerId(bob.machine_id().0);
-        let outcome = tokio::time::timeout(
+        let (outcome, leased) = tokio::time::timeout(
             std::time::Duration::from_secs(20) * test_time_multiplier(),
             alice.connect_to_agent_leased(&bob.agent_id(), std::time::Duration::from_secs(10_000)),
         )
         .await
         .expect("the connect ends")
         .expect("the connect runs");
+        assert!(leased, "the lease was recorded");
         assert!(outcome.is_live_path(), "{outcome:?}");
         let now = tokio::time::Instant::now();
         let cap = std::time::Duration::from_secs(MAX_DEMAND_LEASE_SECS);
@@ -31020,13 +31051,14 @@ mod tests {
         let network = std::sync::Arc::clone(alice.network().expect("network"));
         let bob_peer = ant_quic::PeerId(bob.machine_id().0);
         alice.quiesce_mesh().await.expect("latch");
-        let outcome = tokio::time::timeout(
+        let (outcome, leased) = tokio::time::timeout(
             std::time::Duration::from_secs(20) * test_time_multiplier(),
             alice.connect_to_agent_leased(&bob.agent_id(), std::time::Duration::from_secs(120)),
         )
         .await
         .expect("the connect ends")
         .expect("the connect runs");
+        assert!(leased, "the lease was recorded");
         assert!(outcome.is_live_path(), "{outcome:?}");
         assert!(network.demand_leased(&bob_peer, tokio::time::Instant::now()));
         assert!(network.is_connected(&bob_peer).await);
@@ -31049,10 +31081,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tmpdir");
         let (alice, bob, _bob_addr) = leaf_and_peer(dir.path()).await;
         let network = std::sync::Arc::clone(alice.network().expect("network"));
-        let outcome = alice
+        let (outcome, leased) = alice
             .connect_to_agent_leased(&bob.agent_id(), std::time::Duration::ZERO)
             .await
             .expect("the connect runs");
+        assert!(!leased, "no lease is reported");
         assert!(outcome.is_live_path(), "{outcome:?}");
         assert!(!network.demand_leased(
             &ant_quic::PeerId(bob.machine_id().0),
@@ -31096,10 +31129,11 @@ mod tests {
         advertise_gossip_inbox(&alice, &bob);
         advertise_gossip_inbox(&bob, &alice);
         alice.quiesce_mesh().await.expect("latch");
-        let outcome = alice
+        let (outcome, leased) = alice
             .connect_to_agent_leased(&bob.agent_id(), std::time::Duration::from_secs(120))
             .await
             .expect("the connect runs");
+        assert!(leased, "the lease was recorded");
         assert!(outcome.is_live_path(), "{outcome:?}");
         assert!(alice.has_live_direct_connection(&bob.agent_id()).await);
 
@@ -31173,10 +31207,11 @@ mod tests {
             .await;
         advertise_gossip_inbox(&alice, &carol);
         alice.quiesce_mesh().await.expect("latch");
-        let outcome = alice
+        let (outcome, leased) = alice
             .connect_to_agent_leased(&carol.agent_id(), std::time::Duration::from_secs(120))
             .await
             .expect("the connect runs");
+        assert!(leased, "the lease was recorded");
         assert!(outcome.is_live_path(), "{outcome:?}");
 
         let mut carol_rx = carol.subscribe_direct();
@@ -31220,10 +31255,11 @@ mod tests {
                 )
             })
             .await;
-        let outcome = alice
+        let (outcome, leased) = alice
             .connect_to_agent_leased(&stranger, std::time::Duration::from_secs(120))
             .await
             .expect("the connect runs");
+        assert!(!leased, "no lease is reported");
         assert!(outcome.is_live_path(), "the address answered: {outcome:?}");
         assert!(
             !network.demand_leased(
@@ -31232,6 +31268,104 @@ mod tests {
             ),
             "an unauthenticated machine got a lease"
         );
+    }
+
+    /// N2: a full lease table refuses the lease, and the leased connect
+    /// says so.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_full_lease_table_reports_no_lease() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (alice, bob, _bob_addr) = leaf_and_peer(dir.path()).await;
+        let network = std::sync::Arc::clone(alice.network().expect("network"));
+        let until = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+        for i in 0..network::MAX_DEMAND_LEASES {
+            let mut bytes = [0xEEu8; 32];
+            bytes[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            assert!(network.lease_demand_peer(ant_quic::PeerId(bytes), until));
+        }
+        let (outcome, leased) = alice
+            .connect_to_agent_leased(&bob.agent_id(), std::time::Duration::from_secs(120))
+            .await
+            .expect("the connect runs");
+        assert!(outcome.is_live_path(), "{outcome:?}");
+        assert!(!leased, "a refused lease is not reported");
+        assert!(!network.demand_leased(
+            &ant_quic::PeerId(bob.machine_id().0),
+            tokio::time::Instant::now()
+        ));
+    }
+
+    /// N2: a quiesce between the generation read and the lease refuses it.
+    #[tokio::test(start_paused = true)]
+    async fn a_quiesce_during_the_dial_reports_no_lease() {
+        let node = network::NetworkNode::new(network::NetworkConfig::default(), None, None)
+            .await
+            .expect("node");
+        let machine = identity::MachineId([0x31; 32]);
+        let live = connectivity::ConnectOutcome::AlreadyConnected;
+        let lease = std::time::Duration::from_secs(60);
+        let before = node.demand_lease_generation();
+        assert!(node.latch_mesh_quiesced().is_some());
+        assert!(!record_demand_lease(
+            &node,
+            before,
+            &live,
+            Some(machine),
+            lease
+        ));
+        let now_gen = node.demand_lease_generation();
+        assert!(record_demand_lease(
+            &node,
+            now_gen,
+            &live,
+            Some(machine),
+            lease
+        ));
+        assert!(!record_demand_lease(&node, now_gen, &live, None, lease));
+        assert!(!record_demand_lease(
+            &node,
+            now_gen,
+            &connectivity::ConnectOutcome::Unreachable,
+            Some(machine),
+            lease
+        ));
+    }
+
+    /// N3: readers consult peer evidence only when no authority-confirmed
+    /// routing or registry machine exists.
+    #[test]
+    fn evidence_counts_only_without_a_routed_or_registry_machine() {
+        let m = Some(identity::MachineId([1; 32]));
+        assert!(evidence_counts_for_raw(None, None));
+        assert!(!evidence_counts_for_raw(m, None));
+        assert!(!evidence_counts_for_raw(None, m));
+        assert!(!evidence_counts_for_raw(m, m));
+    }
+
+    /// N1: a latched node's gossip-first send to a peer it has no live link
+    /// to fails at once and does not dial it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_latched_send_with_no_live_link_does_not_dial() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (alice, bob, _bob_addr) = leaf_and_peer(dir.path()).await;
+        advertise_gossip_inbox(&alice, &bob);
+        let network = std::sync::Arc::clone(alice.network().expect("network"));
+        let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+        alice.quiesce_mesh().await.expect("latch");
+        assert!(!network.is_connected(&bob_peer).await);
+        let sent = alice
+            .send_direct_with_config(
+                &bob.agent_id(),
+                b"page-request".to_vec(),
+                bookkeeping_config(),
+            )
+            .await;
+        assert!(
+            matches!(sent, Err(dm::DmError::NoConnectivity(ref reason)) if reason.contains("mesh quiesced")),
+            "{sent:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(!network.is_connected(&bob_peer).await, "no dial was made");
     }
 
     /// A raw frame from a machine the receiver holds no binding for is

@@ -220,7 +220,11 @@ pub(super) async fn send_page_request(
     }
     state
         .agent
-        .send_direct_with_config(peer, payload, catchup_request_delivery_config(state))
+        .send_direct_with_config(
+            peer,
+            payload,
+            catchup_request_delivery_config(state, peer).await,
+        )
         .await
         .map(|_| ())
         .map_err(|e| e.to_string())

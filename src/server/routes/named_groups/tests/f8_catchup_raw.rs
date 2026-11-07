@@ -8,6 +8,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use super::super::signed_catchup::{page_request, send_page_request};
+use super::super::{catchup_request_delivery_config, request_member_key_package_catchup};
 use super::epoch_ahead_catchup::{survivor_relay_fixture, wait_until, SurvivorRelay};
 use super::signed_catchup::removal_s1_missed;
 use super::signer_delivery::s1_follows_the_owner;
@@ -151,7 +152,10 @@ async fn a_latched_member_with_no_live_link_reports_the_send_failed() -> Result<
         .await
         .expect("S1 asks from its head");
     let sent = send_page_request(&s1, &s2.agent.agent_id(), request).await;
-    assert!(sent.is_err(), "{sent:?}");
+    assert!(
+        sent.as_ref().is_err_and(|e| e.contains("mesh quiesced")),
+        "a latched member with no live link fails at once, without a raw attempt: {sent:?}"
+    );
     assert!(drained(&mut s1_gossip).is_empty(), "nothing was published");
     assert!(raw_to(&s1, &s2, s1_raw).is_empty(), "nothing went raw");
     s1.agent.quiesce_gossip_leg_for_testing(false);
@@ -193,6 +197,63 @@ async fn a_meshed_pair_with_a_live_link_keeps_the_gossip_inbox() -> Result<()> {
     .await;
     assert_eq!(answers.len(), 1, "the answer rode gossip");
     assert!(raw_to(&s2, &s1, s2_raw).is_empty(), "nothing went raw");
+    cast.shutdown().await;
+    Ok(())
+}
+
+/// N1: a latched requester goes raw first only over a live direct link.
+/// With none it keeps the plain config, so the send layer fails it at once
+/// and never dials on the requester's behalf.
+#[tokio::test]
+async fn a_latched_request_goes_raw_first_only_over_a_live_link() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let _sinks = burst_pair(&cast).await?;
+    let (s1, s2) = (Arc::clone(&cast.s1), Arc::clone(&cast.s2));
+    let to = s2.agent.agent_id();
+    s1.agent.quiesce_gossip_leg_for_testing(true);
+    link(&s1, &s2, false);
+    assert!(
+        !catchup_request_delivery_config(&s1, &to)
+            .await
+            .prefer_raw_quic_if_connected
+    );
+    link(&s1, &s2, true);
+    assert!(
+        catchup_request_delivery_config(&s1, &to)
+            .await
+            .prefer_raw_quic_if_connected
+    );
+    s1.agent.quiesce_gossip_leg_for_testing(false);
+    assert!(
+        !catchup_request_delivery_config(&s1, &to)
+            .await
+            .prefer_raw_quic_if_connected
+    );
+    cast.shutdown().await;
+    Ok(())
+}
+
+/// N5: a latched member's member-keyed KeyPackage request rides a live
+/// demand link raw and asks for a raw answer; to a member with no link it
+/// fails at once and nothing is published.
+#[tokio::test]
+async fn a_latched_member_keyed_request_rides_the_live_link() -> Result<()> {
+    let cast = survivor_relay_fixture().await?;
+    let group_id = cast.fixture.group_id.clone();
+    let (mut s1_gossip, _s2_gossip) = burst_pair(&cast).await?;
+    let (s1, s2) = (Arc::clone(&cast.s1), Arc::clone(&cast.s2));
+    link(&s1, &s2, true);
+    s1.agent.quiesce_gossip_leg_for_testing(true);
+    let s1_raw = raw_to(&s1, &s2, 0).len();
+    let owner_hex = hex::encode(cast.fixture.state.agent.agent_id().as_bytes());
+
+    request_member_key_package_catchup(&s1, &group_id, &owner_hex, 8).await;
+    let sent = raw_to(&s1, &s2, s1_raw);
+    assert_eq!(sent.len(), 1, "the member-keyed request went raw to S2");
+    let request: TreeKemCatchupRequest = serde_json::from_slice(&sent[0])?;
+    assert!(request.reply_raw, "it asks for a raw answer");
+    assert!(drained(&mut s1_gossip).is_empty(), "nothing rode gossip");
+    s1.agent.quiesce_gossip_leg_for_testing(false);
     cast.shutdown().await;
     Ok(())
 }

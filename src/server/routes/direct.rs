@@ -49,6 +49,12 @@ pub(in crate::server) struct ConnectAgentRequest {
     lease_secs: Option<u64>,
 }
 
+/// The `lease_secs` a `POST /agents/connect` answers with: the granted
+/// value only when a lease was actually recorded, else `null`.
+fn echoed_lease_secs(granted: Option<u64>, recorded: bool) -> Option<u64> {
+    granted.filter(|_| recorded)
+}
+
 /// The lease a `POST /agents/connect` asks for, capped: `None` for no lease.
 fn granted_lease_secs(requested: Option<u64>) -> Option<u64> {
     requested
@@ -240,14 +246,18 @@ pub(in crate::server) async fn connect_agent(
                     .connect_to_agent_leased(&agent_id, std::time::Duration::from_secs(secs))
                     .await
             }
-            None => state.agent.connect_to_agent(&agent_id).await,
+            None => state
+                .agent
+                .connect_to_agent(&agent_id)
+                .await
+                .map(|outcome| (outcome, false)),
         }
     };
     let connect_result = tokio::time::timeout(std::time::Duration::from_secs(60), connect).await;
 
     match connect_result {
-        Ok(Ok(outcome)) => {
-            let leased = lease_secs.filter(|_| outcome.is_live_path());
+        Ok(Ok((outcome, recorded))) => {
+            let leased = echoed_lease_secs(lease_secs, recorded);
             let (outcome_str, addr) = match outcome {
                 x0x::connectivity::ConnectOutcome::Direct(a) => ("Direct", Some(a.to_string())),
                 x0x::connectivity::ConnectOutcome::Coordinated(a) => {
@@ -664,6 +674,16 @@ fn attach_recipient_ack_diagnostics(
 
 #[cfg(test)]
 mod tests {
+    /// A refused lease (unauthenticated machine, a quiesce during the dial,
+    /// a full table) is never reported as granted.
+    #[test]
+    fn connect_reports_only_a_recorded_lease() {
+        use super::echoed_lease_secs;
+        assert_eq!(echoed_lease_secs(Some(120), true), Some(120));
+        assert_eq!(echoed_lease_secs(Some(120), false), None);
+        assert_eq!(echoed_lease_secs(None, false), None);
+    }
+
     #[test]
     fn connect_lease_is_capped_and_zero_is_none() {
         use super::granted_lease_secs;

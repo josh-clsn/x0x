@@ -565,18 +565,23 @@ pub(in crate::server) fn named_group_direct_delivery_config() -> x0x::dm::DmSend
     config
 }
 
-/// The delivery config for a catch-up page request (F8): raw QUIC first,
-/// under its receive ACK, while this node's gossip leg is latched; else
+/// The delivery config for a catch-up request to `peer` (F8): raw QUIC
+/// first, under its receive ACK, while this node's gossip leg is latched
+/// and a live direct link to `peer` exists; else
 /// [`named_group_direct_delivery_config`]. Catch-up needs no verified
 /// transport (survivor re-key A5: requests are signed, and an unverified
 /// page applies each event as its verified commit signer), so the reason
 /// that config keeps gossip first does not hold for a node whose gossip
-/// cannot leave. A meshed pair keeps the gossip inbox's verified envelope.
-pub(in crate::server) fn catchup_request_delivery_config(
+/// cannot leave. With no live link a latched node fails at once rather
+/// than dial: the embedder owns when a latched node dials. A meshed pair
+/// keeps the gossip inbox's verified envelope.
+pub(in crate::server) async fn catchup_request_delivery_config(
     state: &AppState,
+    peer: &AgentId,
 ) -> x0x::dm::DmSendConfig {
     let mut config = named_group_direct_delivery_config();
-    config.prefer_raw_quic_if_connected = state.agent.gossip_leg_quiesced();
+    config.prefer_raw_quic_if_connected =
+        state.agent.gossip_leg_quiesced() && state.agent.has_live_direct_connection(peer).await;
     config
 }
 
@@ -13154,7 +13159,7 @@ async fn request_member_key_package_catchup(
                 &member_keyed_request_sign_input(group_id, &local_agent_hex, member_agent_id),
             ),
             head_challenge: None,
-            reply_raw: false,
+            reply_raw: state.agent.gossip_leg_quiesced(),
         };
         let payload = match serde_json::to_vec(&request) {
             Ok(payload) => payload,
@@ -13172,7 +13177,11 @@ async fn request_member_key_package_catchup(
         .await;
         if let Err(e) = state
             .agent
-            .send_direct_with_config(&peer, payload, named_group_direct_delivery_config())
+            .send_direct_with_config(
+                &peer,
+                payload,
+                catchup_request_delivery_config(state, &peer).await,
+            )
             .await
         {
             tracing::debug!(group_id = %group_id, member = %LogHexId::agent(&member_agent_id), peer = %candidate_hex, "member-keyed TreeKEM catch-up request failed: {e}");

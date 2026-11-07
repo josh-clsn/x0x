@@ -1138,9 +1138,10 @@ While quiesced, a node's own gossip publishes go nowhere. A non-durable
 direct send whose path would be the recipient's gossip inbox therefore
 fails at once as no connectivity instead of publishing into the latch,
 unless it set `prefer_raw_quic_if_connected`: then only its raw attempt
-runs, with no gossip fallback. A quiesced member's room catch-up page
-request goes raw first and asks for a raw answer; between meshed members
-catch-up keeps the gossip inbox.
+runs, with no gossip fallback. A quiesced member's room catch-up requests
+(pages and member-keyed KeyPackage fetches) go raw first over a live
+direct link and ask for a raw answer; with no live link they fail at once
+and dial nothing. Between meshed members catch-up keeps the gossip inbox.
 
 ### Direct send request body
 

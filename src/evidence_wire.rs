@@ -1884,32 +1884,49 @@ mod tests {
             .unwrap()
     }
 
+    /// The private interface addresses an evidence record would carry for
+    /// a node bound to every interface on `port`.
+    fn private_interface_hints(port: u16) -> Vec<std::net::SocketAddr> {
+        crate::filter_local_discovery_addrs(crate::bind_dialable_interface_hints(
+            Some(std::net::SocketAddr::from(([0, 0, 0, 0], port))),
+            port,
+        ))
+    }
+
+    /// An agent bound to every interface on a fixed port. An evidence
+    /// record's hints take the configured port, so port 0 would give none;
+    /// a port taken between the probe and the bind is retried.
     async fn wildcard_test_agent(path: &std::path::Path) -> crate::Agent {
         std::fs::create_dir_all(path).unwrap();
-        crate::Agent::builder()
-            .with_identity_dir(path)
-            .with_machine_key(path.join("machine.key"))
-            .with_agent_key_path(path.join("agent.key"))
-            .with_user_key_path(path.join("user.key"))
-            .with_agent_cert_path(path.join("agent.cert"))
-            .with_contact_store_path(path.join("contacts.json"))
-            .with_peer_cache_disabled()
-            .with_network_config(crate::network::NetworkConfig {
-                // A fixed port: an evidence record's hints take the
-                // configured port, and 0 yields none.
-                bind_addr: Some(
-                    std::net::UdpSocket::bind("0.0.0.0:0")
-                        .and_then(|socket| socket.local_addr())
-                        .unwrap(),
-                ),
-                bootstrap_nodes: Vec::new(),
-                mdns_enabled: false,
-                port_mapping_enabled: false,
-                ..Default::default()
-            })
-            .build()
-            .await
-            .unwrap()
+        let mut last = None;
+        for _ in 0..5 {
+            let port = std::net::UdpSocket::bind("0.0.0.0:0")
+                .and_then(|socket| socket.local_addr())
+                .unwrap()
+                .port();
+            match crate::Agent::builder()
+                .with_identity_dir(path)
+                .with_machine_key(path.join("machine.key"))
+                .with_agent_key_path(path.join("agent.key"))
+                .with_user_key_path(path.join("user.key"))
+                .with_agent_cert_path(path.join("agent.cert"))
+                .with_contact_store_path(path.join("contacts.json"))
+                .with_peer_cache_disabled()
+                .with_network_config(crate::network::NetworkConfig {
+                    bind_addr: Some(std::net::SocketAddr::from(([0, 0, 0, 0], port))),
+                    bootstrap_nodes: Vec::new(),
+                    mdns_enabled: false,
+                    port_mapping_enabled: false,
+                    ..Default::default()
+                })
+                .build()
+                .await
+            {
+                Ok(agent) => return agent,
+                Err(e) => last = Some(e),
+            }
+        }
+        panic!("no free port after five tries: {last:?}");
     }
 
     fn ready_test_context(agent: &crate::Agent) -> Arc<Context> {
@@ -1980,9 +1997,13 @@ mod tests {
     /// through the evidence.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn f8_an_evidence_dial_leases_and_counts_as_live_for_a_burst() {
-        let dir = tempfile::tempdir().unwrap();
         // Bound to every interface: an evidence record carries interface
         // hints, never loopback, so this needs a private interface.
+        if private_interface_hints(9).is_empty() {
+            eprintln!("skipped: this host has no private non-loopback interface");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
         let a = wildcard_test_agent(&dir.path().join("a")).await;
         let b = wildcard_test_agent(&dir.path().join("b")).await;
         let _policy = ready_test_policy(&a, &b, &dir.path().join("evidence")).await;
@@ -2008,10 +2029,11 @@ mod tests {
         b.insert_discovered_agent_for_testing(entry).await;
 
         a.quiesce_mesh().await.unwrap();
-        let outcome = a
+        let (outcome, leased) = a
             .connect_to_agent_leased(&b.agent_id(), Duration::from_secs(120))
             .await
             .unwrap();
+        assert!(leased, "the lease was recorded");
         assert!(outcome.is_live_path(), "{outcome:?}");
         let b_peer = ant_quic::PeerId(b.machine_id().0);
         assert!(a_network.demand_leased(&b_peer, tokio::time::Instant::now()));
