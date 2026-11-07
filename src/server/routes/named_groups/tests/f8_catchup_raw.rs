@@ -234,8 +234,7 @@ async fn a_latched_request_goes_raw_first_only_over_a_live_link() -> Result<()> 
 }
 
 /// N5: a latched member's member-keyed KeyPackage request rides a live
-/// demand link raw and asks for a raw answer; to a member with no link it
-/// fails at once and nothing is published.
+/// demand link raw, asks for a raw answer, and publishes nothing.
 #[tokio::test]
 async fn a_latched_member_keyed_request_rides_the_live_link() -> Result<()> {
     let cast = survivor_relay_fixture().await?;

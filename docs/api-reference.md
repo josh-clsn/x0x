@@ -1129,7 +1129,9 @@ While the mesh is quiesced (`POST /mesh/quiesce`), the re-sweep disconnects
 every connected peer once a minute. `lease_secs` in the `/agents/connect`
 body (at most 300; larger values are capped, 0 means none) asks the re-sweep
 to leave the link to the machine reached up for that long. The response
-echoes the granted `lease_secs` on a live outcome, else `null`. The next
+echoes the granted `lease_secs` only when the lease was recorded; a refused
+lease (an unauthenticated machine, a quiesce during the dial, or a full lease
+table) and a non-live outcome echo `null`. The next
 `POST /mesh/quiesce`, including one while already quiesced, ends every lease
 and sweeps every peer. A lease changes nothing else: inbound links are still
 refused and gossip frames are still dropped on the leased link.
