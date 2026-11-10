@@ -22816,6 +22816,11 @@ fn reconnect_blocked(network: &network::NetworkNode, peer_id_bytes: [u8; 32]) ->
 ///   task.
 /// - Is **bounded** to `RECONNECT_BACKOFF_DELAYS.len()` attempts with
 ///   exponential backoff, preventing reconnect storms.
+/// - Counts a dial the peer closes straight away as a failed attempt (F-D):
+///   the next ladder resumes one step on, and holds the failure cooldown
+///   once the steps run out, so a latched peer that accepts and drops every
+///   inbound costs at most `RECONNECT_BACKOFF_DELAYS.len()` handshakes per
+///   cooldown rather than one a second.
 fn schedule_reconnect(
     network: std::sync::Arc<network::NetworkNode>,
     machine_cache: std::sync::Arc<
@@ -22844,6 +22849,11 @@ fn schedule_reconnect(
         return;
     }
 
+    // F-D: a peer that closed the ladder's last dial straight away (a
+    // latched node accepts and drops every inbound) resumes the backoff
+    // where it was, instead of a fresh 1 s ladder per close.
+    let start = network.reconnect_ladder_start(peer_id_bytes, RECONNECT_BACKOFF_DELAYS.len());
+
     let tracker_clone = std::sync::Arc::clone(&active_reconnects);
     let handle = tokio::spawn(async move {
         let peer_id = ant_quic::PeerId(peer_id_bytes);
@@ -22860,7 +22870,30 @@ fn schedule_reconnect(
             "scheduling proactive reconnect for disconnected peer",
         );
 
-        'attempts: for (attempt, &delay) in RECONNECT_BACKOFF_DELAYS.iter().enumerate() {
+        if start.cooldown_first {
+            tracing::info!(
+                target: "x0x::connect",
+                peer_id_prefix = %prefix,
+                "peer closed every redial at once; holding the failure cooldown",
+            );
+            tokio::select! {
+                _ = shutdown_token.cancelled() => {}
+                _ = tokio::time::sleep(RECONNECT_FAILURE_COOLDOWN) => {}
+            }
+        } else if start.first_step > 0 {
+            tracing::debug!(
+                target: "x0x::connect",
+                peer_id_prefix = %prefix,
+                first_step = start.first_step + 1,
+                "peer closed the last redial at once; resuming the backoff",
+            );
+        }
+
+        'attempts: for (attempt, &delay) in RECONNECT_BACKOFF_DELAYS
+            .iter()
+            .enumerate()
+            .skip(start.first_step)
+        {
             // A one-sided repair disconnects with Transport, which reaches
             // this scheduler. That repair already dialled (or is dialling).
             // Wait out its backoff before this ladder's first dial so the
@@ -23049,6 +23082,7 @@ fn schedule_reconnect(
                         *phase1_dials.entry(peer_id_bytes).or_insert(0) += 1;
                     }
                 }
+                network.note_reconnect_dial(peer_id_bytes, attempt);
                 let dial_result = tokio::select! {
                     biased;
                     _ = attempt_cancel.cancelled() => None,
@@ -23155,6 +23189,7 @@ fn schedule_reconnect(
                         *phase2_dials.entry(peer_id_bytes).or_insert(0) += 1;
                     }
                 }
+                network.note_reconnect_dial(peer_id_bytes, attempt);
                 let phase2_result = tokio::select! {
                     biased;
                     _ = attempt_cancel.cancelled() => None,
@@ -34264,6 +34299,108 @@ mod tests {
         assert!(
             alice_network.is_connected(&bob_peer).await,
             "Transport disconnect must be redialed within the backoff window"
+        );
+    }
+
+    /// F-D: a latched peer accepts each proactive redial and closes it at
+    /// once. That close used to start a fresh ladder at its first, 1 s step
+    /// (the dial's `PeerConnected` had aborted the old ladder before its
+    /// cooldown), so the dialler handshook the latched peer about once a
+    /// second for as long as the latch held. A connection the peer closes
+    /// straight after the dial is a failed attempt: the next ladder resumes
+    /// the backoff. Dial `k` (from 0) then waits at least
+    /// `0.8 * (1 + 2 + .. + 2^k)` s, so the fourth dial cannot come before
+    /// 12 s, and an 11 s window holds at most three.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_latched_peer_closing_each_redial_backs_the_dialler_off() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let alice = Agent::builder()
+            .with_machine_key(dir.path().join("alice-machine.key"))
+            .with_agent_key_path(dir.path().join("alice-agent.key"))
+            .with_contact_store_path(dir.path().join("alice-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("alice-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("alice");
+        alice.start_network_event_listener();
+        let alice_network = alice.network().expect("alice network");
+
+        let bob = Agent::builder()
+            .with_machine_key(dir.path().join("bob-machine.key"))
+            .with_agent_key_path(dir.path().join("bob-agent.key"))
+            .with_contact_store_path(dir.path().join("bob-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("bob-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("bob");
+        let bob_addr = normalize_loopback_addr(
+            bob.network()
+                .expect("bob net")
+                .bound_addr()
+                .await
+                .expect("bob bound"),
+        );
+        let bob_id = bob.machine_id().0;
+        let bob_peer = ant_quic::PeerId(bob_id);
+
+        alice_network
+            .connect_addr(bob_addr)
+            .await
+            .expect("alice connects to bob");
+        let reg = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(5) * test_time_multiplier();
+        while !alice_network.is_connected(&bob_peer).await {
+            assert!(
+                tokio::time::Instant::now() < reg,
+                "bob connected before the latch"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        await_quiesced_connection(
+            alice_network,
+            &bob_peer,
+            std::time::Duration::from_secs(1) * test_time_multiplier(),
+        )
+        .await;
+
+        let dials = || {
+            let phase1 = RECONNECT_PHASE1_DIALS
+                .lock()
+                .expect("phase1 dial counter lock")
+                .get(&bob_id)
+                .copied()
+                .unwrap_or(0);
+            let phase2 = RECONNECT_PHASE2_DIALS
+                .lock()
+                .expect("phase2 dial counter lock")
+                .get(&bob_id)
+                .copied()
+                .unwrap_or(0);
+            phase1 + phase2
+        };
+        let before = dials();
+
+        // Bob latches: he sweeps alice, and his accept loop closes every
+        // inbound connection from now on.
+        bob.quiesce_mesh().await.expect("bob latches");
+        let window = std::time::Duration::from_secs(11);
+        tokio::time::sleep(window).await;
+        let made = dials() - before;
+
+        assert!(
+            made >= 1,
+            "alice's proactive reconnect must still try the peer that dropped her"
+        );
+        assert!(
+            made <= 3,
+            "a peer that closes each redial at once must back the dialler off: \
+             {made} dials in {window:?}"
+        );
+        assert!(
+            !alice_network.is_reconnect_suppressed(bob_id),
+            "the back-off is not a tombstone: demand dials stay open"
         );
     }
 

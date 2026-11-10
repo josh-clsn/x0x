@@ -25,8 +25,11 @@
 use crate::error::{NetworkError, NetworkResult};
 
 mod churn;
+mod redial_flaps;
 use self::churn::ChurnCounters;
 pub use self::churn::ChurnSnapshot;
+pub(crate) use self::redial_flaps::LadderStart;
+use self::redial_flaps::RedialFlaps;
 mod link;
 use self::link::LinkNode;
 mod stream;
@@ -2183,6 +2186,9 @@ pub struct NetworkNode {
     /// Connection-churn observation counters (#368 gate 2). Arc so the
     /// Clone derive shares state; fed by the spawn_observer task.
     churn: Arc<ChurnCounters>,
+    /// F-D: when the reconnect ladder last dialled each peer, kept outside
+    /// the ladder task so a `PeerConnected` abort does not clear it.
+    redial_flaps: Arc<RedialFlaps>,
     /// Receiver channel for direct messages (separate from gossip).
     direct_tx: mpsc::Sender<DirectEvent>,
     direct_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<DirectEvent>>>,
@@ -2686,6 +2692,7 @@ impl NetworkNode {
             #[cfg(test)]
             receiver_captured_priority: Arc::new(OnceLock::new()),
             churn: Arc::new(ChurnCounters::default()),
+            redial_flaps: Arc::new(RedialFlaps::default()),
             direct_tx,
             direct_rx: Arc::new(tokio::sync::Mutex::new(direct_rx)),
             relayed_dm_tx,
@@ -4741,6 +4748,21 @@ impl NetworkNode {
     #[must_use]
     pub fn spared_by_resweep(&self, peer: &AntPeerId, now: tokio::time::Instant) -> bool {
         self.demand_leased(peer, now)
+    }
+
+    /// The proactive-reconnect ladder is about to dial `peer` at backoff
+    /// index `step` (F-D).
+    pub(crate) fn note_reconnect_dial(&self, peer: [u8; 32], step: usize) {
+        self.redial_flaps
+            .note_dial(peer, step, tokio::time::Instant::now());
+    }
+
+    /// Where a reconnect ladder for `peer` with `steps` backoff steps starts:
+    /// one step past its last dial when the peer closed that dial at once
+    /// (F-D), otherwise at once from the first step.
+    pub(crate) fn reconnect_ladder_start(&self, peer: [u8; 32], steps: usize) -> LadderStart {
+        self.redial_flaps
+            .ladder_start(peer, steps, tokio::time::Instant::now())
     }
 
     /// Returns `true` while the mesh-off latch is set.
