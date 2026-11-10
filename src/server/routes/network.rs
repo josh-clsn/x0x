@@ -485,6 +485,7 @@ where
 /// - What NAT type has ant-quic detected?
 /// - Direct vs relayed connection counts, hole-punch success rate, avg RTT.
 /// - mDNS browsing/advertising state and discovered peer count.
+/// - MASQUE relay sessions this node opened as a client (`relay_client`).
 ///
 /// This is the primary observability surface for the 100%-connectivity
 /// guarantee ant-quic is responsible for.
@@ -656,6 +657,10 @@ pub(in crate::server) async fn connectivity_diagnostics(
                     "sessions": ns.relay_sessions,
                     "bytes_forwarded": ns.relay_bytes_forwarded,
                 },
+                // R-3: relay sessions this node opened as a client. Their
+                // connection is not a peer row above, and ant-quic gives x0x
+                // no byte counts for it; this records that one was opened.
+                "relay_client": network.relay_client_snapshot(),
                 "coordinator": {
                     "is_coordinating": ns.is_coordinating,
                     "sessions": ns.coordination_sessions,

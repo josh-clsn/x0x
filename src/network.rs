@@ -26,10 +26,13 @@ use crate::error::{NetworkError, NetworkResult};
 
 mod churn;
 mod redial_flaps;
+mod relay_client;
 use self::churn::ChurnCounters;
 pub use self::churn::ChurnSnapshot;
 pub(crate) use self::redial_flaps::LadderStart;
 use self::redial_flaps::RedialFlaps;
+use self::relay_client::RelayClientCounters;
+pub use self::relay_client::RelayClientSnapshot;
 mod link;
 use self::link::LinkNode;
 mod stream;
@@ -2189,6 +2192,8 @@ pub struct NetworkNode {
     /// F-D: when the reconnect ladder last dialled each peer, kept outside
     /// the ladder task so a `PeerConnected` abort does not clear it.
     redial_flaps: Arc<RedialFlaps>,
+    /// R-3: MASQUE relay sessions ant-quic opened for this node as a client.
+    relay_client: Arc<RelayClientCounters>,
     /// Receiver channel for direct messages (separate from gossip).
     direct_tx: mpsc::Sender<DirectEvent>,
     direct_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<DirectEvent>>>,
@@ -2693,6 +2698,7 @@ impl NetworkNode {
             receiver_captured_priority: Arc::new(OnceLock::new()),
             churn: Arc::new(ChurnCounters::default()),
             redial_flaps: Arc::new(RedialFlaps::default()),
+            relay_client: Arc::new(RelayClientCounters::default()),
             direct_tx,
             direct_rx: Arc::new(tokio::sync::Mutex::new(direct_rx)),
             relayed_dm_tx,
@@ -2763,6 +2769,8 @@ impl NetworkNode {
             .and_then(LinkNode::quic)
         {
             Arc::clone(&network_node.churn).spawn_observer(node);
+            Arc::clone(&network_node.relay_client)
+                .spawn_observer(node, Arc::clone(&network_node.mesh_quiesced));
         }
 
         network_node
@@ -4748,6 +4756,13 @@ impl NetworkNode {
     #[must_use]
     pub fn spared_by_resweep(&self, peer: &AntPeerId, now: tokio::time::Instant) -> bool {
         self.demand_leased(peer, now)
+    }
+
+    /// MASQUE relay sessions ant-quic opened for this node as a client, and
+    /// how many of them came while the mesh-off latch held (R-3).
+    #[must_use]
+    pub fn relay_client_snapshot(&self) -> RelayClientSnapshot {
+        self.relay_client.snapshot()
     }
 
     /// The proactive-reconnect ladder is about to dial `peer` at backoff
