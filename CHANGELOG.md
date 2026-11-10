@@ -90,6 +90,12 @@ engine-A routes, and the four TreeKEM catch-up routes).
   owed. A seat the catch-up log or the staging lost is re-seated with a
   commit, at most once a day per member, in a task that finishes even if the
   request is dropped. See `docs/adr/transient/T-seat-obligation.md`.
+- **`GET /diagnostics/connectivity` reports `relay_client`.** It counts the
+  MASQUE relay sessions ant-quic opened for this node as a client
+  (`sessions_established`), the ones whose setup finished while the mesh-off
+  latch held (`established_while_quiesced`, also logged as a warning),
+  `last_relay_addr`, `last_established_ago_ms` and `events_lagged`. Such a
+  session is no peer connection, so no `per_peer_transport` row shows it.
 
 ### Changed
 
@@ -168,6 +174,15 @@ engine-A routes, and the four TreeKEM catch-up routes).
   `GET /diagnostics/dm` reports `v1_ack_waits`, `v1_ack_wait_ms`,
   `v1_ack_wait_timeouts` and `v1_ack_wait_timeout_ms`. See
   `docs/adr/transient/T-catchup-off-the-apply-path.md`.
+- **A connection the peer closes at once is a failed reconnect attempt.** A
+  latched node completes each inbound handshake and then closes it; a
+  non-leaf dialler used to redial it about once a second. A connection that
+  the peer closes within 5 s of coming up, by any dial path, now makes the
+  next reconnect ladder resume its backoff (2, 4, 8, 16 s) and then hold the
+  60 s cooldown: at most five handshakes per about 91 s. A real peer whose
+  connections keep dying within 5 s waits out the same cooldown. Any
+  connection to the peer, or an identity announcement from it, ends the
+  hold; demand dials are never held, and no tombstone is written.
 
 ### Interop with a stock v0.48.1 peer
 

@@ -4772,6 +4772,26 @@ impl NetworkNode {
             .note_dial(peer, step, tokio::time::Instant::now());
     }
 
+    /// A connection to `peer` came up, by any path (F-D): its settle time
+    /// runs from now.
+    pub(crate) fn note_reconnect_connected(&self, peer: [u8; 32]) {
+        self.redial_flaps
+            .note_connected(peer, tokio::time::Instant::now());
+    }
+
+    /// `peer` is meshed again (it announced): forget its redial record and
+    /// end a held reconnect cooldown (F-D).
+    pub(crate) fn lift_reconnect_backoff(&self, peer: [u8; 32]) {
+        self.redial_flaps.lift(peer);
+    }
+
+    /// Hold `peer`'s reconnect ladder for `duration`, or until
+    /// [`Self::lift_reconnect_backoff`] lifts it. Returns whether it was
+    /// lifted.
+    pub(crate) async fn hold_reconnect(&self, peer: [u8; 32], duration: Duration) -> bool {
+        self.redial_flaps.hold(peer, duration).await
+    }
+
     /// Where a reconnect ladder for `peer` with `steps` backoff steps starts:
     /// one step past its last dial when the peer closed that dial at once
     /// (F-D), otherwise at once from the first step.

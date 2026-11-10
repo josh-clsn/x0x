@@ -15859,6 +15859,11 @@ impl Agent {
                 // is already connected (for example an inbound accept that happened before
                 // this announcement reached us).
                 if let Some(ref net) = &network {
+                    // F-D: a latched node sends no announcements, so one
+                    // means its latch lifted. Forget its redial backoff.
+                    if announcement.agent_id != own_agent_id {
+                        net.lift_reconnect_backoff(announcement.machine_id.0);
+                    }
                     let ant_peer_id = ant_quic::PeerId(announcement.machine_id.0);
                     if net.is_connected(&ant_peer_id).await {
                         direct_messaging
@@ -19827,6 +19832,9 @@ impl Agent {
                                 }
                             }
                         }
+                        // F-D: the settle time of this connection runs from
+                        // now, whichever path dialled it.
+                        network.note_reconnect_connected(peer_id);
                         // Cancel any pending proactive reconnect for this peer
                         // — the connection is back, no need to keep trying.
                         if let Ok(mut tracker) = active_reconnects.lock() {
@@ -22816,11 +22824,17 @@ fn reconnect_blocked(network: &network::NetworkNode, peer_id_bytes: [u8; 32]) ->
 ///   task.
 /// - Is **bounded** to `RECONNECT_BACKOFF_DELAYS.len()` attempts with
 ///   exponential backoff, preventing reconnect storms.
-/// - Counts a dial the peer closes straight away as a failed attempt (F-D):
-///   the next ladder resumes one step on, and holds the failure cooldown
-///   once the steps run out, so a latched peer that accepts and drops every
-///   inbound costs at most `RECONNECT_BACKOFF_DELAYS.len()` handshakes per
-///   cooldown rather than one a second.
+/// - Counts a connection the peer closes within 5 s of it coming up, by any
+///   path, as a failed attempt (F-D): the next ladder resumes one step on,
+///   and holds the failure cooldown once the steps run out, so a latched
+///   peer that accepts and drops every inbound costs at most
+///   `RECONNECT_BACKOFF_DELAYS.len()` handshakes per cooldown rather than
+///   one a second. The cost: a real peer whose connections keep dying
+///   within 5 s also waits out the cooldown (up to 60 s) before the next
+///   proactive redial, and so does a latched peer that has just unlatched.
+///   Any `PeerConnected` for the peer ends the hold, an identity
+///   announcement from it lifts the backoff, and demand dials are never
+///   held.
 fn schedule_reconnect(
     network: std::sync::Arc<network::NetworkNode>,
     machine_cache: std::sync::Arc<
@@ -22878,7 +22892,15 @@ fn schedule_reconnect(
             );
             tokio::select! {
                 _ = shutdown_token.cancelled() => {}
-                _ = tokio::time::sleep(RECONNECT_FAILURE_COOLDOWN) => {}
+                lifted = network.hold_reconnect(peer_id_bytes, RECONNECT_FAILURE_COOLDOWN) => {
+                    if lifted {
+                        tracing::debug!(
+                            target: "x0x::connect",
+                            peer_id_prefix = %prefix,
+                            "peer announced; the failure cooldown is lifted",
+                        );
+                    }
+                }
             }
         } else if start.first_step > 0 {
             tracing::debug!(

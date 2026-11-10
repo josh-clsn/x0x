@@ -25,6 +25,7 @@ use ant_quic::P2pEvent;
 pub(crate) struct RelayClientCounters {
     established: AtomicU64,
     established_while_quiesced: AtomicU64,
+    events_lagged: AtomicU64,
     last: Mutex<Option<(SocketAddr, Instant)>>,
 }
 
@@ -33,8 +34,17 @@ pub(crate) struct RelayClientCounters {
 pub struct RelayClientSnapshot {
     /// Relay sessions ant-quic opened for this node since start.
     pub sessions_established: u64,
-    /// Of those, the sessions opened while the mesh-off latch held.
+    /// Of those, the sessions whose `RelayEstablished` arrived while the
+    /// mesh-off latch held. This does not cover everything a latched node
+    /// should not do: a session opened just before the latch and still up
+    /// under it is not counted here, the latch is read when the setup has
+    /// finished (not when it began), and failed setups, which still send
+    /// traffic to each seed tried, are not counted at all. Compare
+    /// `last_established_ago_ms` with the latch time too.
     pub established_while_quiesced: u64,
+    /// Endpoint event batches this observer missed because its channel
+    /// lagged. Non-zero means the counts above may be low.
+    pub events_lagged: u64,
     /// The public address the latest session gave this node.
     pub last_relay_addr: Option<String>,
     /// How long ago the latest session was opened.
@@ -62,8 +72,13 @@ impl RelayClientCounters {
         }
     }
 
+    fn note_lag(&self, skipped: u64) {
+        self.events_lagged.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(skipped, "relay-client observer lagged");
+    }
+
     /// Spawn the observer over the endpoint's events. It exits when the
-    /// stream closes (endpoint shutdown); lag is skipped.
+    /// stream closes (endpoint shutdown); lag is counted.
     pub(crate) fn spawn_observer(
         self: Arc<Self>,
         node: &ant_quic::Node,
@@ -74,7 +89,9 @@ impl RelayClientCounters {
             loop {
                 match rx.recv().await {
                     Ok(event) => self.observe(&event, quiesced.load(Ordering::Relaxed)),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        self.note_lag(skipped);
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
@@ -91,6 +108,7 @@ impl RelayClientCounters {
         RelayClientSnapshot {
             sessions_established: self.established.load(Ordering::Relaxed),
             established_while_quiesced: self.established_while_quiesced.load(Ordering::Relaxed),
+            events_lagged: self.events_lagged.load(Ordering::Relaxed),
             last_relay_addr: last.map(|(addr, _)| addr.to_string()),
             last_established_ago_ms: last
                 .map(|(_, at)| u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX)),
@@ -126,6 +144,13 @@ mod tests {
         assert_eq!(snap.established_while_quiesced, 1);
         assert_eq!(snap.last_relay_addr.as_deref(), Some("203.0.113.7:4001"));
         assert!(snap.last_established_ago_ms.is_some());
+    }
+
+    #[test]
+    fn a_lag_is_counted() {
+        let counters = RelayClientCounters::default();
+        counters.note_lag(12);
+        assert_eq!(counters.snapshot().events_lagged, 1);
     }
 
     #[test]
