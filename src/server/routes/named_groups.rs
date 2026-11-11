@@ -55298,69 +55298,76 @@ pub(in crate::server) mod tests {
         /// poll then exits WITHOUT ever handing a fetch to the transport.
         #[tokio::test]
         async fn wp_b_t6c_finalized_attempt_poll_never_fetches() {
-            let (state, _keep) = fresh_state().await;
-            let group = "fa".repeat(16);
-            let event_group = group.clone();
-            let member = hex::encode(state.agent.agent_id().as_bytes());
-            seed_pending_attempt(&state, &group, &event_group, &member, "a6c", String::new()).await;
-            let lock_arc = group_membership_lock_for_known_group(&state, &group)
-                .await
-                .expect("known group");
-            let held = lock_arc.lock().await;
-            let _poll_window = set_join_poll_window_override(&group, "a6c", 2_000);
-            let poll = tokio::spawn(poll_join_result_until_membership_confirmed(
-                Arc::clone(&state),
-                group.clone(),
-                event_group.clone(),
-                vec![crate::identity::AgentId([7; 32])],
-                member.clone(),
-                false,
-                None,
-                "a6c".into(),
-            ));
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            assert_eq!(
-                fetches_sent_for(&group),
-                0,
-                "the poll is parked on the membership lock — no fetch before the currency check"
-            );
-            assert!(!poll.is_finished(), "the poll is blocked, not exited");
-            // Finalize the attempt UNDER the held guard (a refusal arm does
-            // exactly this), then release.
-            let disposition = finalize_join_attempt_with_reason(
-                &state,
-                &group,
-                &event_group,
-                &member,
-                "a6c",
-                JoinAttemptOutcome::Refused,
-                Some("invite_secret_consumed"),
-                JoinFinalizeGuard::Owned(held),
-            )
-            .await;
-            assert_eq!(disposition, JoinFinalizeDisposition::Finalized);
-            let joined = tokio::time::timeout(std::time::Duration::from_secs(5), poll).await;
-            assert!(
-                matches!(joined, Ok(Ok(()))),
-                "the poll exits on its own (not aborted, not timed out): {joined:?}"
-            );
-            assert_eq!(
-                fetches_sent_for(&group),
-                0,
-                "a finalized attempt never transmits a fetch"
-            );
-            assert_eq!(
-                counter_for(&state, &group, |c| c.join_attempts_timed_out),
-                0,
-                "the exiting poll owns nothing — no timeout counted"
-            );
-            let outcome = state
-                .last_join_outcomes
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .get(&group)
-                .map(|o| o.outcome);
-            assert_eq!(outcome, Some("refused"), "the refusal outcome stands");
+            // A stall fails this test within a minute instead of hanging
+            // the whole run (seen once under full-suite load).
+            tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                let (state, _keep) = fresh_state().await;
+                let group = "fa".repeat(16);
+                let event_group = group.clone();
+                let member = hex::encode(state.agent.agent_id().as_bytes());
+                seed_pending_attempt(&state, &group, &event_group, &member, "a6c", String::new())
+                    .await;
+                let lock_arc = group_membership_lock_for_known_group(&state, &group)
+                    .await
+                    .expect("known group");
+                let held = lock_arc.lock().await;
+                let _poll_window = set_join_poll_window_override(&group, "a6c", 2_000);
+                let poll = tokio::spawn(poll_join_result_until_membership_confirmed(
+                    Arc::clone(&state),
+                    group.clone(),
+                    event_group.clone(),
+                    vec![crate::identity::AgentId([7; 32])],
+                    member.clone(),
+                    false,
+                    None,
+                    "a6c".into(),
+                ));
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                assert_eq!(
+                    fetches_sent_for(&group),
+                    0,
+                    "the poll is parked on the membership lock — no fetch before the currency check"
+                );
+                assert!(!poll.is_finished(), "the poll is blocked, not exited");
+                // Finalize the attempt UNDER the held guard (a refusal arm does
+                // exactly this), then release.
+                let disposition = finalize_join_attempt_with_reason(
+                    &state,
+                    &group,
+                    &event_group,
+                    &member,
+                    "a6c",
+                    JoinAttemptOutcome::Refused,
+                    Some("invite_secret_consumed"),
+                    JoinFinalizeGuard::Owned(held),
+                )
+                .await;
+                assert_eq!(disposition, JoinFinalizeDisposition::Finalized);
+                let joined = tokio::time::timeout(std::time::Duration::from_secs(5), poll).await;
+                assert!(
+                    matches!(joined, Ok(Ok(()))),
+                    "the poll exits on its own (not aborted, not timed out): {joined:?}"
+                );
+                assert_eq!(
+                    fetches_sent_for(&group),
+                    0,
+                    "a finalized attempt never transmits a fetch"
+                );
+                assert_eq!(
+                    counter_for(&state, &group, |c| c.join_attempts_timed_out),
+                    0,
+                    "the exiting poll owns nothing — no timeout counted"
+                );
+                let outcome = state
+                    .last_join_outcomes
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(&group)
+                    .map(|o| o.outcome);
+                assert_eq!(outcome, Some("refused"), "the refusal outcome stands");
+            })
+            .await
+            .expect("wp_b_t6c stalled for 60 s");
         }
 
         /// #477 (r7 item 2): EVERY task the REAL route spawns for the
