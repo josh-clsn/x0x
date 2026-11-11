@@ -15859,10 +15859,17 @@ impl Agent {
                 // is already connected (for example an inbound accept that happened before
                 // this announcement reached us).
                 if let Some(ref net) = &network {
-                    // F-D: a latched node sends no announcements, so one
-                    // means its latch lifted. Forget its redial backoff.
-                    if announcement.agent_id != own_agent_id {
-                        net.lift_reconnect_backoff(announcement.machine_id.0);
+                    // F-D: a latched node sends no announcements, so one it
+                    // signed after it last refused us means its latch lifted.
+                    // An older copy (forwarded or repaired from before the
+                    // latch) lifts nothing.
+                    if announcement.agent_id != own_agent_id
+                        && identity_announcement_has_direct_agent_origin(&msg, &announcement)
+                    {
+                        net.lift_reconnect_backoff(
+                            announcement.machine_id.0,
+                            announcement.announced_at,
+                        );
                     }
                     let ant_peer_id = ant_quic::PeerId(announcement.machine_id.0);
                     if net.is_connected(&ant_peer_id).await {
@@ -22833,8 +22840,8 @@ fn reconnect_blocked(network: &network::NetworkNode, peer_id_bytes: [u8; 32]) ->
 ///   within 5 s also waits out the cooldown (up to 60 s) before the next
 ///   proactive redial, and so does a latched peer that has just unlatched.
 ///   Any `PeerConnected` for the peer ends the hold, an identity
-///   announcement from it lifts the backoff, and demand dials are never
-///   held.
+///   announcement it signed after it last refused us lifts the backoff,
+///   and demand dials are never held.
 fn schedule_reconnect(
     network: std::sync::Arc<network::NetworkNode>,
     machine_cache: std::sync::Arc<
@@ -22892,7 +22899,11 @@ fn schedule_reconnect(
             );
             tokio::select! {
                 _ = shutdown_token.cancelled() => {}
-                lifted = network.hold_reconnect(peer_id_bytes, RECONNECT_FAILURE_COOLDOWN) => {
+                lifted = network.hold_reconnect(
+                    peer_id_bytes,
+                    RECONNECT_FAILURE_COOLDOWN,
+                    start.lifts_seen,
+                ) => {
                     if lifted {
                         tracing::debug!(
                             target: "x0x::connect",

@@ -25,8 +25,9 @@
 //! within the settle window also reaches the cooldown after five flaps, and
 //! proactive reconnect to it then waits up to 60 s. A peer that comes back
 //! by any path (`PeerConnected`) ends the hold, demand dials are never
-//! held, and an identity announcement from the peer, which a latched node
-//! never sends, lifts the backoff ([`RedialFlaps::lift`]).
+//! held, and a fresh identity announcement from the peer, signed after it
+//! last refused us (a latched node sends none), lifts the backoff
+//! ([`RedialFlaps::lift`]).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -62,6 +63,9 @@ pub(crate) struct LadderStart {
     pub(crate) cooldown_first: bool,
     /// Index into the backoff delays of the first attempt.
     pub(crate) first_step: usize,
+    /// The peer's lift count when the ladder was scheduled; pass it to
+    /// [`RedialFlaps::hold`] so a lift before the hold starts is not missed.
+    pub(crate) lifts_seen: u64,
 }
 
 /// Per-peer record of the reconnect ladder's last dial and connection.
@@ -71,6 +75,9 @@ pub(crate) struct RedialFlaps {
     /// Per-peer count of [`Self::lift`] calls, read by a held ladder.
     lifts: Mutex<HashMap<[u8; 32], u64>>,
     lifted: Notify,
+    /// Per-peer unix time (seconds) of the latest close that counted as a
+    /// refusal. Only an announcement signed after it lifts the backoff.
+    refused_at: Mutex<HashMap<[u8; 32], u64>>,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -116,22 +123,34 @@ impl RedialFlaps {
     /// resumes one step past it; past the last of `steps` it holds the
     /// cooldown first and then starts over. Anything else starts at once
     /// from the first step and forgets the old record.
-    pub(crate) fn ladder_start(&self, peer: [u8; 32], steps: usize, now: Instant) -> LadderStart {
+    pub(crate) fn ladder_start(
+        &self,
+        peer: [u8; 32],
+        steps: usize,
+        now: Instant,
+        now_unix: u64,
+    ) -> LadderStart {
+        let lifts_seen = self.lift_count(&peer);
         let mut last = locked(&self.last);
         let flapped = last
             .get(&peer)
             .filter(|redial| now.saturating_duration_since(redial.at) < REDIAL_SETTLE_WINDOW)
             .map(|redial| redial.step + 1);
+        if flapped.is_some() {
+            self.note_refused(peer, now_unix);
+        }
         match flapped {
             Some(next) if next < steps => LadderStart {
                 cooldown_first: false,
                 first_step: next,
+                lifts_seen,
             },
             Some(_) => {
                 last.remove(&peer);
                 LadderStart {
                     cooldown_first: true,
                     first_step: 0,
+                    lifts_seen,
                 }
             }
             None => {
@@ -139,18 +158,41 @@ impl RedialFlaps {
                 LadderStart {
                     cooldown_first: false,
                     first_step: 0,
+                    lifts_seen,
                 }
             }
         }
+    }
+
+    fn note_refused(&self, peer: [u8; 32], now_unix: u64) {
+        let mut refused = locked(&self.refused_at);
+        if refused.len() >= MAX_TRACKED_REDIALS && !refused.contains_key(&peer) {
+            // Losing an entry only means a later announcement cannot lift
+            // that peer early; its cooldown still ends on time.
+            refused.clear();
+        }
+        refused.insert(peer, now_unix);
     }
 
     fn lift_count(&self, peer: &[u8; 32]) -> u64 {
         locked(&self.lifts).get(peer).copied().unwrap_or(0)
     }
 
-    /// The peer is meshed again (it announced): forget its record and end a
-    /// held cooldown now.
-    pub(crate) fn lift(&self, peer: [u8; 32]) {
+    /// The peer announced, in a message signed at `announced_at` (unix
+    /// seconds). If that is after it last refused us, it is meshed again:
+    /// forget its record and end a held cooldown now. An older copy, such as
+    /// a pre-latch announcement still being forwarded or repaired, changes
+    /// nothing. Returns whether it lifted.
+    pub(crate) fn lift(&self, peer: [u8; 32], announced_at: u64) -> bool {
+        {
+            let mut refused = locked(&self.refused_at);
+            match refused.get(&peer) {
+                Some(at) if announced_at > *at => {
+                    refused.remove(&peer);
+                }
+                _ => return false,
+            }
+        }
         locked(&self.last).remove(&peer);
         {
             let mut lifts = locked(&self.lifts);
@@ -163,13 +205,15 @@ impl RedialFlaps {
             *count = count.wrapping_add(1);
         }
         self.lifted.notify_waiters();
+        true
     }
 
-    /// Hold `peer`'s ladder for `duration`, or until [`Self::lift`] is
-    /// called for it. Returns whether it was lifted.
-    pub(crate) async fn hold(&self, peer: [u8; 32], duration: Duration) -> bool {
+    /// Hold `peer`'s ladder for `duration`, or until it is lifted after
+    /// `lifts_seen` (the count [`Self::ladder_start`] read). Returns whether
+    /// it was lifted.
+    pub(crate) async fn hold(&self, peer: [u8; 32], duration: Duration, lifts_seen: u64) -> bool {
         let deadline = Instant::now() + duration;
-        let before = self.lift_count(&peer);
+        let before = lifts_seen;
         loop {
             let notified = self.lifted.notified();
             tokio::pin!(notified);
@@ -191,18 +235,25 @@ mod tests {
 
     const PEER: [u8; 32] = [7; 32];
     const STEPS: usize = 5;
+    /// Unix time (seconds) the tests' refusals happen at.
+    const REFUSED_AT: u64 = 1_000;
 
-    fn fresh() -> LadderStart {
-        LadderStart {
-            cooldown_first: false,
-            first_step: 0,
-        }
+    fn start(flaps: &RedialFlaps, peer: [u8; 32], now: Instant) -> LadderStart {
+        flaps.ladder_start(peer, STEPS, now, REFUSED_AT)
+    }
+
+    fn at(first_step: usize, cooldown_first: bool) -> (bool, usize) {
+        (cooldown_first, first_step)
+    }
+
+    fn shape(start: LadderStart) -> (bool, usize) {
+        (start.cooldown_first, start.first_step)
     }
 
     #[test]
     fn a_peer_never_dialled_starts_the_ladder_at_once() {
         let flaps = RedialFlaps::default();
-        assert_eq!(flaps.ladder_start(PEER, STEPS, Instant::now()), fresh());
+        assert_eq!(shape(start(&flaps, PEER, Instant::now())), at(0, false));
     }
 
     #[test]
@@ -213,24 +264,18 @@ mod tests {
             flaps.note_dial(PEER, step, now);
             flaps.note_connected(PEER, now);
             assert_eq!(
-                flaps.ladder_start(PEER, STEPS, now + Duration::from_millis(50)),
-                LadderStart {
-                    cooldown_first: false,
-                    first_step: step + 1,
-                }
+                shape(start(&flaps, PEER, now + Duration::from_millis(50))),
+                at(step + 1, false)
             );
         }
         flaps.note_dial(PEER, STEPS - 1, now);
         flaps.note_connected(PEER, now);
         assert_eq!(
-            flaps.ladder_start(PEER, STEPS, now + Duration::from_millis(50)),
-            LadderStart {
-                cooldown_first: true,
-                first_step: 0,
-            }
+            shape(start(&flaps, PEER, now + Duration::from_millis(50))),
+            at(0, true)
         );
         // The cooldown consumed the record: the ladder after it is fresh.
-        assert_eq!(flaps.ladder_start(PEER, STEPS, now), fresh());
+        assert_eq!(shape(start(&flaps, PEER, now)), at(0, false));
     }
 
     /// I-1: a slow redial (the connection comes up 30 s after the dial
@@ -243,11 +288,8 @@ mod tests {
         let up = dial + Duration::from_secs(30);
         flaps.note_connected(PEER, up);
         assert_eq!(
-            flaps.ladder_start(PEER, STEPS, up + Duration::from_millis(50)),
-            LadderStart {
-                cooldown_first: false,
-                first_step: 3,
-            }
+            shape(start(&flaps, PEER, up + Duration::from_millis(50))),
+            at(3, false)
         );
     }
 
@@ -259,9 +301,7 @@ mod tests {
         let up = Instant::now();
         flaps.note_connected(PEER, up);
         assert_eq!(
-            flaps
-                .ladder_start(PEER, STEPS, up + Duration::from_millis(50))
-                .first_step,
+            start(&flaps, PEER, up + Duration::from_millis(50)).first_step,
             1
         );
     }
@@ -273,7 +313,7 @@ mod tests {
         flaps.note_dial(PEER, 3, dial);
         let up = dial + DIAL_SPAN;
         flaps.note_connected(PEER, up);
-        assert_eq!(flaps.ladder_start(PEER, STEPS, up).first_step, 1);
+        assert_eq!(start(&flaps, PEER, up).first_step, 1);
     }
 
     #[test]
@@ -283,11 +323,11 @@ mod tests {
         flaps.note_dial(PEER, 3, now);
         flaps.note_connected(PEER, now);
         assert_eq!(
-            flaps.ladder_start(PEER, STEPS, now + REDIAL_SETTLE_WINDOW),
-            fresh()
+            shape(start(&flaps, PEER, now + REDIAL_SETTLE_WINDOW)),
+            at(0, false)
         );
         // And the stale record is gone.
-        assert_eq!(flaps.ladder_start(PEER, STEPS, now), fresh());
+        assert_eq!(shape(start(&flaps, PEER, now)), at(0, false));
     }
 
     #[test]
@@ -295,49 +335,98 @@ mod tests {
         let flaps = RedialFlaps::default();
         let now = Instant::now();
         flaps.note_dial(PEER, 2, now);
-        assert_eq!(flaps.ladder_start([8; 32], STEPS, now), fresh());
-        assert_eq!(flaps.ladder_start(PEER, STEPS, now).first_step, 3);
+        assert_eq!(shape(start(&flaps, [8; 32], now)), at(0, false));
+        assert_eq!(start(&flaps, PEER, now).first_step, 3);
     }
 
     #[test]
     fn the_table_is_bounded_and_prunes_stale_entries_first() {
         let flaps = RedialFlaps::default();
-        let start = Instant::now();
+        let begin = Instant::now();
         for i in 0..MAX_TRACKED_REDIALS {
             let mut peer = [0u8; 32];
             peer[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            flaps.note_dial(peer, 0, start);
+            flaps.note_dial(peer, 0, begin);
         }
-        let later = start + DIAL_SPAN;
+        let later = begin + DIAL_SPAN;
         flaps.note_dial(PEER, 1, later);
         assert_eq!(locked(&flaps.last).len(), 1, "stale entries were pruned");
-        assert_eq!(flaps.ladder_start(PEER, STEPS, later).first_step, 2);
+        assert_eq!(start(&flaps, PEER, later).first_step, 2);
     }
 
-    /// L-2: an announcement from the peer forgets its record and ends a
-    /// held cooldown; another peer's lift does not.
+    /// Five quick closes, then the ladder that holds the cooldown.
+    fn refuse_until_held(flaps: &RedialFlaps) -> LadderStart {
+        let now = Instant::now();
+        for step in 0..STEPS {
+            flaps.note_dial(PEER, step, now);
+            flaps.note_connected(PEER, now);
+            let next = start(flaps, PEER, now + Duration::from_millis(50));
+            if next.cooldown_first {
+                return next;
+            }
+        }
+        unreachable!("the fifth close holds the cooldown")
+    }
+
+    /// L-2: a fresh announcement from the peer ends a held cooldown and
+    /// forgets the record; another peer's lift does not.
     #[tokio::test(start_paused = true)]
-    async fn a_lift_ends_the_hold_and_forgets_the_record() {
+    async fn a_fresh_announcement_ends_the_hold_and_forgets_the_record() {
         let flaps = std::sync::Arc::new(RedialFlaps::default());
-        let held = tokio::spawn({
+        let held = refuse_until_held(&flaps);
+        let task = tokio::spawn({
             let flaps = std::sync::Arc::clone(&flaps);
-            async move { flaps.hold(PEER, Duration::from_secs(60)).await }
+            async move {
+                flaps
+                    .hold(PEER, Duration::from_secs(60), held.lifts_seen)
+                    .await
+            }
         });
         tokio::time::sleep(Duration::from_secs(1)).await;
-        flaps.lift([8; 32]);
+        assert!(!flaps.lift([8; 32], REFUSED_AT + 5), "nothing to lift");
         tokio::time::sleep(Duration::from_secs(1)).await;
-        assert!(!held.is_finished(), "another peer's lift leaves the hold");
+        assert!(!task.is_finished(), "another peer's lift leaves the hold");
         flaps.note_dial(PEER, 4, Instant::now());
-        flaps.lift(PEER);
-        assert!(held.await.expect("hold task"), "the lift ends the hold");
-        assert_eq!(flaps.ladder_start(PEER, STEPS, Instant::now()), fresh());
+        assert!(flaps.lift(PEER, REFUSED_AT + 5));
+        assert!(task.await.expect("hold task"), "the lift ends the hold");
+        assert_eq!(shape(start(&flaps, PEER, Instant::now())), at(0, false));
+    }
+
+    /// L-7: an announcement signed before the peer last refused us (a
+    /// pre-latch copy still being forwarded) does not lift.
+    #[test]
+    fn an_announcement_older_than_the_refusal_does_not_lift() {
+        let flaps = RedialFlaps::default();
+        let _held = refuse_until_held(&flaps);
+        assert!(!flaps.lift(PEER, REFUSED_AT - 30));
+        assert!(
+            !flaps.lift(PEER, REFUSED_AT),
+            "the same second is not after"
+        );
+        assert!(flaps.lift(PEER, REFUSED_AT + 1));
+    }
+
+    /// L-8: a lift between scheduling the ladder and the hold's first poll
+    /// is not missed.
+    #[tokio::test(start_paused = true)]
+    async fn a_lift_before_the_hold_starts_is_not_missed() {
+        let flaps = RedialFlaps::default();
+        let held = refuse_until_held(&flaps);
+        assert!(flaps.lift(PEER, REFUSED_AT + 1));
+        let begin = Instant::now();
+        assert!(
+            flaps
+                .hold(PEER, Duration::from_secs(60), held.lifts_seen)
+                .await
+        );
+        assert_eq!(Instant::now(), begin, "the hold returns at once");
     }
 
     #[tokio::test(start_paused = true)]
     async fn an_unlifted_hold_runs_its_full_time() {
         let flaps = RedialFlaps::default();
-        let start = Instant::now();
-        assert!(!flaps.hold(PEER, Duration::from_secs(60)).await);
-        assert!(Instant::now() >= start + Duration::from_secs(60));
+        let begin = Instant::now();
+        assert!(!flaps.hold(PEER, Duration::from_secs(60), 0).await);
+        assert!(Instant::now() >= begin + Duration::from_secs(60));
     }
 }

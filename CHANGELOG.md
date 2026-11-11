@@ -181,8 +181,9 @@ engine-A routes, and the four TreeKEM catch-up routes).
   next reconnect ladder resume its backoff (2, 4, 8, 16 s) and then hold the
   60 s cooldown: at most five handshakes per about 91 s. A real peer whose
   connections keep dying within 5 s waits out the same cooldown. Any
-  connection to the peer, or an identity announcement from it, ends the
-  hold; demand dials are never held, and no tombstone is written.
+  connection to the peer, or an identity announcement it signed after it
+  last refused us, ends the hold; demand dials are never held, and no
+  tombstone is written.
 
 ### Interop with a stock v0.48.1 peer
 

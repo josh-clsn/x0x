@@ -4779,25 +4779,34 @@ impl NetworkNode {
             .note_connected(peer, tokio::time::Instant::now());
     }
 
-    /// `peer` is meshed again (it announced): forget its redial record and
-    /// end a held reconnect cooldown (F-D).
-    pub(crate) fn lift_reconnect_backoff(&self, peer: [u8; 32]) {
-        self.redial_flaps.lift(peer);
+    /// `peer` announced in a message signed at `announced_at` (unix
+    /// seconds). If that is after it last refused us, it is meshed again:
+    /// forget its redial record and end a held reconnect cooldown (F-D).
+    pub(crate) fn lift_reconnect_backoff(&self, peer: [u8; 32], announced_at: u64) -> bool {
+        self.redial_flaps.lift(peer, announced_at)
     }
 
     /// Hold `peer`'s reconnect ladder for `duration`, or until
     /// [`Self::lift_reconnect_backoff`] lifts it. Returns whether it was
     /// lifted.
-    pub(crate) async fn hold_reconnect(&self, peer: [u8; 32], duration: Duration) -> bool {
-        self.redial_flaps.hold(peer, duration).await
+    pub(crate) async fn hold_reconnect(
+        &self,
+        peer: [u8; 32],
+        duration: Duration,
+        lifts_seen: u64,
+    ) -> bool {
+        self.redial_flaps.hold(peer, duration, lifts_seen).await
     }
 
     /// Where a reconnect ladder for `peer` with `steps` backoff steps starts:
     /// one step past its last dial when the peer closed that dial at once
     /// (F-D), otherwise at once from the first step.
     pub(crate) fn reconnect_ladder_start(&self, peer: [u8; 32], steps: usize) -> LadderStart {
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
         self.redial_flaps
-            .ladder_start(peer, steps, tokio::time::Instant::now())
+            .ladder_start(peer, steps, tokio::time::Instant::now(), now_unix)
     }
 
     /// Returns `true` while the mesh-off latch is set.
