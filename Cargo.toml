@@ -137,6 +137,9 @@ voice = ["dep:saorsa-webrtc-core", "dep:saorsa-webrtc-codecs"]
 fips204 = { version = "0.4.6", optional = true, default-features = false, features = ["ml-dsa-65", "default-rng"] }
 
 [dev-dependencies]
+# The carried ant-quic patch's loopback test hook (forces the symmetric-NAT
+# verdict) for the R-3 relay-switch tests. Test builds only.
+ant-quic = { version = "=0.27.61", features = ["test-hooks"] }
 # `start_paused` virtual-clock tests for the state-request bootstrap tail
 # (issue #238) — multi-minute retry schedules run in milliseconds.
 tokio = { version = "1", features = ["full", "test-util"] }
@@ -239,3 +242,16 @@ strip = "none"
 # Embed debuginfo in the binary so gdb / perf on remote VPS can resolve
 # Rust symbols without needing the .dwo files shipped alongside.
 split-debuginfo = "off"
+
+# Carried patch (fork tail): ant-quic 0.27.61 plus the relay switches
+# (`set_proactive_relay_allowed`, `set_relay_fallback_allowed`,
+# `set_coordinator_policy`, `relay_client_stats`), one commit on
+# the v0.27.61 tag; see CHANGELOG "Carried patches". A [patch.crates-io]
+# entry, not a git dependency: it replaces ant-quic for every crate in the
+# graph, the saorsa-gossip crates included, so there is one ant-quic. A
+# [patch] applies only in the root workspace that declares it, so
+# `crates/fetchit-ffi` (which builds x0x as a git dependency for the Android
+# embed) must carry the same entry at the same rev. The desktop x0xd and
+# noetic-agent build from this checkout, where this entry applies.
+[patch.crates-io]
+ant-quic = { git = "https://github.com/josh-clsn/ant-quic", rev = "77c1c1acb484f1c4bfce58ba38ba2ba7e209bf21" }

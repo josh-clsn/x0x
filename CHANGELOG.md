@@ -94,8 +94,25 @@ engine-A routes, and the four TreeKEM catch-up routes).
   MASQUE relay sessions ant-quic opened for this node as a client
   (`sessions_established`), the ones whose setup finished while the mesh-off
   latch held (`established_while_quiesced`, also logged as a warning),
-  `last_relay_addr`, `last_established_ago_ms` and `events_lagged`. Such a
-  session is no peer connection, so no `per_peer_transport` row shows it.
+  `last_relay_addr`, `last_established_ago_ms` and `events_lagged`, and from
+  the carried ant-quic patch `proactive_relay_allowed`, `active_sessions`,
+  `relay_servers`, `bytes_sent` and `bytes_received`. Such a session is no
+  peer connection, so no `per_peer_transport` row shows it.
+- **The mesh-off latch keeps ant-quic off seeds and relays.** While latched
+  (bursts included) ant-quic opens no symmetric-NAT relay session through a
+  seed, and a connect skips its relay stage instead of relaying through a
+  cached relay or seed: public nodes never relay a latched node's data.
+  Latching closes any client relay session the node holds, whenever and on
+  whichever network it was opened, withdrawing the advertised relay address
+  from peers. At rest a latched node dials nothing to coordinate a hole
+  punch. A burst dial (`connect_to_agent_leased`) may use one hole-punch
+  introducer per target per burst: first a coordinator the target announced
+  in `reachable_via`, then a seed. The introducer connection is closed as
+  soon as the punch resolves. A contact that only a relay reaches is not
+  reached in a burst. Lifting the latch allows all of it again.
+  `relay_client` adds `relay_fallback_allowed`, `coordinator_policy`
+  (`any`, `connected_only` or `introducer`), `introducer_dials`,
+  `introducer_bytes_sent` and `introducer_bytes_received`.
 
 ### Changed
 
@@ -184,6 +201,18 @@ engine-A routes, and the four TreeKEM catch-up routes).
   connection to the peer, or an identity announcement it signed after it
   last refused us, ends the hold; demand dials are never held, and no
   tombstone is written.
+
+### Carried patches
+
+- **ant-quic 0.27.61 + relay switches** (`[patch.crates-io]` in
+  `Cargo.toml`: `git = "https://github.com/josh-clsn/ant-quic"`, one commit on
+  the 0.27.61 release tag `6fe2a52`). Adds `set_proactive_relay_allowed`,
+  `set_relay_fallback_allowed`, `set_coordinator_policy` (with
+  `set_peer_introducers`, `reset_introducer_budget` and `introducer_stats`),
+  `relay_client_stats` and a `test-hooks` feature. The patch replaces
+  ant-quic for the whole graph, the saorsa-gossip crates included. A
+  `[patch]` applies only in the root workspace that declares it, so
+  `crates/fetchit-ffi` must carry the same entry at the same rev.
 
 ### Interop with a stock v0.48.1 peer
 

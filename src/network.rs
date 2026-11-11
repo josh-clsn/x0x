@@ -2194,6 +2194,13 @@ pub struct NetworkNode {
     redial_flaps: Arc<RedialFlaps>,
     /// R-3: MASQUE relay sessions ant-quic opened for this node as a client.
     relay_client: Arc<RelayClientCounters>,
+    /// R-3: the ant-quic endpoint whose proactive relay the mesh-off latch
+    /// switches (set once at assembly; empty on the test simulation link).
+    relay_switch: Arc<OnceLock<Arc<ant_quic::P2pEndpoint>>>,
+    /// Burst dials in flight ([`NetworkNode::begin_burst_dial`]). While the
+    /// mesh is latched, a burst dial may use one hole-punch introducer per
+    /// target; outside one, nothing is dialled to coordinate.
+    burst_dials: Arc<std::sync::atomic::AtomicUsize>,
     /// Receiver channel for direct messages (separate from gossip).
     direct_tx: mpsc::Sender<DirectEvent>,
     direct_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<DirectEvent>>>,
@@ -2699,6 +2706,8 @@ impl NetworkNode {
             churn: Arc::new(ChurnCounters::default()),
             redial_flaps: Arc::new(RedialFlaps::default()),
             relay_client: Arc::new(RelayClientCounters::default()),
+            relay_switch: Arc::new(OnceLock::new()),
+            burst_dials: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             direct_tx,
             direct_rx: Arc::new(tokio::sync::Mutex::new(direct_rx)),
             relayed_dm_tx,
@@ -2771,6 +2780,10 @@ impl NetworkNode {
             Arc::clone(&network_node.churn).spawn_observer(node);
             Arc::clone(&network_node.relay_client)
                 .spawn_observer(node, Arc::clone(&network_node.mesh_quiesced));
+            let _ = network_node
+                .relay_switch
+                .set(Arc::clone(node.inner_endpoint()));
+            network_node.sync_proactive_relay();
         }
 
         network_node
@@ -4635,11 +4648,20 @@ impl NetworkNode {
             Err(poisoned) => poisoned.into_inner(),
         };
         self.clear_demand_leases();
+        // Every latch call ends a burst: the next burst gets a fresh
+        // introducer budget (one per target).
+        if let Some(endpoint) = self.relay_switch.get() {
+            endpoint.reset_introducer_budget();
+        }
         if self.mesh_quiesced.load(Ordering::Relaxed) {
+            // Every call closes the client relay again: a session a burst's
+            // relay fallback opened ends with the burst.
+            self.sync_proactive_relay();
             return None;
         }
         *epoch += 1;
         self.mesh_quiesced.store(true, Ordering::Relaxed);
+        self.sync_proactive_relay();
         Some(*epoch)
     }
 
@@ -4668,6 +4690,7 @@ impl NetworkNode {
             if self.mesh_quiesced.load(Ordering::Relaxed) {
                 *epoch += 1;
                 self.mesh_quiesced.store(false, Ordering::Relaxed);
+                self.sync_proactive_relay();
             }
             true
         } else {
@@ -4762,7 +4785,83 @@ impl NetworkNode {
     /// how many of them came while the mesh-off latch held (R-3).
     #[must_use]
     pub fn relay_client_snapshot(&self) -> RelayClientSnapshot {
-        self.relay_client.snapshot()
+        let transport = self
+            .relay_switch
+            .get()
+            .map(|endpoint| relay_client::TransportRelay {
+                proactive_relay_allowed: endpoint.proactive_relay_allowed(),
+                relay_fallback_allowed: endpoint.relay_fallback_allowed(),
+                coordinator_policy: endpoint.coordinator_policy(),
+                stats: endpoint.relay_client_stats(),
+                introducers: endpoint.introducer_stats(),
+            });
+        self.relay_client.snapshot(transport)
+    }
+
+    /// R-3: while the mesh is latched (bursts included), ant-quic never
+    /// relays data and contacts no peer the node has not chosen:
+    /// - proactive relay is off, and turning it off closes every client
+    ///   relay session the endpoint holds, whenever and on whichever network
+    ///   it was opened, and withdraws the advertised relay address;
+    /// - relay fallback is off, so a connect skips the relay stage instead
+    ///   of opening a MASQUE session through a cached relay or seed;
+    /// - at rest, only an already-connected peer may coordinate a hole punch
+    ///   (`ConnectedOnly`), and a peer-id-only connect dials no known peer;
+    /// - during a burst dial (`Introducer`), a target that needs a punch may
+    ///   use one introducer per burst, its own announced coordinators first,
+    ///   then a seed; ant-quic hangs up on it as soon as the punch resolves.
+    ///   Introducers only coordinate: with relay fallback off they carry no
+    ///   data.
+    ///
+    /// Everything is allowed again (`Any`) when the latch lifts.
+    fn sync_proactive_relay(&self) {
+        if let Some(endpoint) = self.relay_switch.get() {
+            let latched = self.mesh_quiesced.load(Ordering::Relaxed);
+            let bursting = self.burst_dials.load(Ordering::SeqCst) > 0;
+            endpoint.set_relay_fallback_allowed(!latched);
+            endpoint.set_coordinator_policy(match (latched, bursting) {
+                (false, _) => ant_quic::CoordinatorPolicy::Any,
+                (true, true) => ant_quic::CoordinatorPolicy::Introducer,
+                (true, false) => ant_quic::CoordinatorPolicy::ConnectedOnly,
+            });
+            endpoint.set_proactive_relay_allowed(!latched);
+        }
+    }
+
+    /// A burst dial starts: while it is in flight (the guard lives), a
+    /// latched node may use one hole-punch introducer per target. Outside
+    /// a burst dial a latched node dials nothing to coordinate.
+    ///
+    /// The policy is endpoint-wide, not per dial: while any burst dial holds
+    /// a guard, every other connect on the node runs under `Introducer` too.
+    /// That includes x0x's own raw-send redial (`resolve_raw_quic_target`
+    /// reaching `connect_to_agent` when a burst link drops before a
+    /// `/direct/send`). Such a connect can spend its target's one introducer
+    /// for the burst; it still never relays and never dials a seed beyond
+    /// that one introducer. A connect while latched with no burst dial in
+    /// flight runs under `ConnectedOnly` and dials only the target's own
+    /// addresses.
+    pub(crate) fn begin_burst_dial(&self) -> BurstDialGuard {
+        self.burst_dials.fetch_add(1, Ordering::SeqCst);
+        self.sync_switches_under_lock();
+        BurstDialGuard { node: self.clone() }
+    }
+
+    fn sync_switches_under_lock(&self) {
+        let _epoch = match self.mesh_transitions.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.sync_proactive_relay();
+    }
+
+    /// Record the hole-punch introducers `peer` named for itself (the
+    /// addresses of the coordinators it announces it is reachable through).
+    /// A burst dial tries them before a seed.
+    pub(crate) fn set_peer_introducers(&self, peer: AntPeerId, introducers: Vec<SocketAddr>) {
+        if let Some(endpoint) = self.relay_switch.get() {
+            endpoint.set_peer_introducers(peer, introducers);
+        }
     }
 
     /// The proactive-reconnect ladder is about to dial `peer` at backoff
@@ -7683,6 +7782,18 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
     }
 }
 
+/// Held for the length of a burst dial ([`NetworkNode::begin_burst_dial`]).
+pub(crate) struct BurstDialGuard {
+    node: NetworkNode,
+}
+
+impl Drop for BurstDialGuard {
+    fn drop(&mut self) {
+        self.node.burst_dials.fetch_sub(1, Ordering::SeqCst);
+        self.node.sync_switches_under_lock();
+    }
+}
+
 /// Why a peer disconnected, carried on [`NetworkEvent::PeerDisconnected`].
 ///
 /// The proactive-reconnect scheduler keys off this value: only
@@ -8338,6 +8449,266 @@ mod tests {
         assert!(error
             .to_string()
             .contains("release failed after caller cancellation"));
+    }
+
+    fn loopback_quic_config(bootstrap: Vec<SocketAddr>) -> NetworkConfig {
+        NetworkConfig {
+            bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+            bootstrap_nodes: bootstrap,
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..NetworkConfig::default()
+        }
+    }
+
+    async fn force_symmetric_nat(node: &NetworkNode) {
+        node.node
+            .read()
+            .await
+            .as_ref()
+            .and_then(LinkNode::quic)
+            .expect("a QUIC node")
+            .force_symmetric_nat_for_testing();
+    }
+
+    async fn relay_sessions_within(node: &NetworkNode, want: usize, within: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            if node.relay_client_snapshot().active_sessions == want {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// R-3 / R-3b: a client relay session opened before the latch (here
+    /// through the node's only bootstrap seed, as on Wi-Fi before a move to
+    /// mobile data) is closed when the mesh latches. No new one opens while
+    /// latched, neither on a symmetric-NAT trigger nor on a burst's demand
+    /// dial, and lifting the latch allows one again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn latching_closes_the_client_relay_and_none_opens_while_latched() {
+        let seed = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("seed");
+        let seed_addr = seed.bound_addr().await.expect("seed bound");
+        let contact = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("contact");
+        let contact_addr = contact.bound_addr().await.expect("contact bound");
+        let phone = NetworkNode::new(loopback_quic_config(vec![seed_addr]), None, None)
+            .await
+            .expect("phone");
+        phone
+            .connect_addr(seed_addr)
+            .await
+            .expect("phone reaches its seed");
+
+        assert_eq!(
+            phone.relay_client_snapshot().proactive_relay_allowed,
+            Some(true)
+        );
+        force_symmetric_nat(&phone).await;
+        assert!(
+            relay_sessions_within(&phone, 1, Duration::from_secs(10)).await,
+            "the phone opens a relay session through its seed before the latch"
+        );
+
+        let epoch = phone.latch_mesh_quiesced().expect("fresh latch");
+        let latched = phone.relay_client_snapshot();
+        assert_eq!(
+            latched.active_sessions, 0,
+            "the latch closes the session opened before it"
+        );
+        assert_eq!(latched.proactive_relay_allowed, Some(false));
+        assert!(latched.relay_servers.is_empty());
+
+        // While latched: a symmetric-NAT trigger, and a burst's leased
+        // demand dial (a PeerConnected, which also triggers ant-quic's relay
+        // manager), open no session.
+        force_symmetric_nat(&phone).await;
+        let _leased = phone.lease_demand_peer(
+            contact.peer_id(),
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        );
+        let _ = phone.connect_addr(contact_addr).await;
+        assert!(
+            !relay_sessions_within(&phone, 1, Duration::from_millis(1500)).await,
+            "no relay session may open while latched or during a burst"
+        );
+        // Ending the burst latches again; still none.
+        assert!(phone.latch_mesh_quiesced().is_none());
+        assert_eq!(phone.relay_client_snapshot().active_sessions, 0);
+
+        assert!(phone.unlatch_mesh_if_current(phone.mesh_transition_epoch()));
+        assert!(epoch < phone.mesh_transition_epoch());
+        assert_eq!(
+            phone.relay_client_snapshot().proactive_relay_allowed,
+            Some(true)
+        );
+        assert!(
+            relay_sessions_within(&phone, 1, Duration::from_secs(10)).await,
+            "with the latch lifted a relay session is allowed again"
+        );
+
+        let _ = phone.try_shutdown().await;
+        let _ = contact.try_shutdown().await;
+        let _ = seed.try_shutdown().await;
+    }
+
+    /// Inbound connections `node` has accepted since start (cumulative, so
+    /// a connection that opened and closed during a dial still counts).
+    async fn inbound_connects(node: &NetworkNode) -> u64 {
+        node.transport_diagnostics()
+            .await
+            .churn
+            .map_or(0, |churn| churn.connects_inbound)
+    }
+
+    /// I-3, L-15: a latched phone at rest (no burst dial) dialling a contact
+    /// no direct path reaches gives up after the direct stage. It neither
+    /// relays through its seed nor dials it (or anyone) to coordinate: the
+    /// seed's cumulative inbound count stays at zero.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_latched_demand_dial_never_contacts_the_seed() {
+        let seed = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("seed");
+        let seed_addr = seed.bound_addr().await.expect("seed bound");
+        let contact = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("contact");
+        let phone = NetworkNode::new(loopback_quic_config(vec![seed_addr]), None, None)
+            .await
+            .expect("phone");
+        assert_eq!(inbound_connects(&seed).await, 0);
+
+        phone.latch_mesh_quiesced().expect("fresh latch");
+
+        // The contact is real, but the address the phone has for it is dead.
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind silent");
+        let silent_addr = silent.local_addr().expect("silent addr");
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            phone.connect_peer_with_addrs(contact.peer_id(), vec![silent_addr]),
+        )
+        .await;
+        assert!(
+            !matches!(result, Ok(Ok(_))),
+            "the dead address cannot connect"
+        );
+
+        assert_eq!(
+            inbound_connects(&seed).await,
+            0,
+            "a latched phone at rest must never contact its seed"
+        );
+        let after = phone.relay_client_snapshot();
+        assert_eq!(after.active_sessions, 0);
+        assert_eq!(after.bytes_sent, 0);
+        assert_eq!(after.introducer_dials, 0, "no introducer at rest");
+        assert_eq!(after.relay_fallback_allowed, Some(false));
+        assert_eq!(after.coordinator_policy.as_deref(), Some("connected_only"));
+
+        drop(silent);
+        let _ = phone.try_shutdown().await;
+        let _ = contact.try_shutdown().await;
+        let _ = seed.try_shutdown().await;
+    }
+
+    /// Josh 11/10: a burst may use a public node as a hole-punch introducer,
+    /// never as a relay. A latched phone's burst dial to a contact that
+    /// needs a punch uses exactly one introducer, the one the contact
+    /// announced (not the seed), hangs up on it once the punch resolves,
+    /// and counts its bytes. A second burst dial to the same contact in the
+    /// same burst dials no introducer, and no relay session ever opens.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_latched_burst_dial_uses_one_introducer_and_hangs_up() {
+        let seed = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("seed");
+        let seed_addr = seed.bound_addr().await.expect("seed bound");
+        let introducer = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("introducer");
+        let introducer_addr = introducer.bound_addr().await.expect("introducer bound");
+        let contact = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("contact");
+        let phone = NetworkNode::new(loopback_quic_config(vec![seed_addr]), None, None)
+            .await
+            .expect("phone");
+        phone.latch_mesh_quiesced().expect("fresh latch");
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind silent");
+        let silent_addr = silent.local_addr().expect("silent addr");
+
+        let dial = |phone: &NetworkNode| {
+            let phone = phone.clone();
+            let contact = contact.peer_id();
+            async move {
+                let _burst = phone.begin_burst_dial();
+                let policy = phone.relay_client_snapshot().coordinator_policy;
+                phone.set_peer_introducers(contact, vec![introducer_addr]);
+                let result = tokio::time::timeout(
+                    Duration::from_secs(60),
+                    phone.connect_peer_with_addrs(contact, vec![silent_addr]),
+                )
+                .await;
+                assert!(
+                    !matches!(result, Ok(Ok(_))),
+                    "the dead address cannot connect"
+                );
+                policy
+            }
+        };
+
+        let policy = dial(&phone).await;
+        assert_eq!(
+            inbound_connects(&introducer).await,
+            1,
+            "exactly one introducer"
+        );
+        assert_eq!(
+            policy.as_deref(),
+            Some("introducer"),
+            "a burst dial's policy"
+        );
+        assert_eq!(
+            inbound_connects(&seed).await,
+            0,
+            "the contact's own introducer came first"
+        );
+        let snap = phone.relay_client_snapshot();
+        assert_eq!(snap.introducer_dials, 1);
+        assert!(snap.introducer_bytes_sent > 0 && snap.introducer_bytes_received > 0);
+        assert_eq!(snap.active_sessions, 0, "an introducer never relays");
+        assert_eq!(snap.coordinator_policy.as_deref(), Some("connected_only"));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while phone.is_connected(&introducer.peer_id()).await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the phone hangs up on the introducer after the punch"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        dial(&phone).await;
+        assert_eq!(
+            inbound_connects(&introducer).await,
+            1,
+            "one per contact per burst"
+        );
+        assert_eq!(inbound_connects(&seed).await, 0);
+        assert_eq!(phone.relay_client_snapshot().introducer_dials, 1);
+
+        drop(silent);
+        let _ = phone.try_shutdown().await;
+        let _ = contact.try_shutdown().await;
+        let _ = introducer.try_shutdown().await;
+        let _ = seed.try_shutdown().await;
     }
 
     fn session_registry_len(node: &NetworkNode) -> usize {

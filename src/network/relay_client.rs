@@ -3,15 +3,18 @@
 //! When ant-quic sees two different external ports for this node it treats
 //! the path as a symmetric NAT and, on its own, opens a MASQUE relay session
 //! through one of its known peers or bootstrap seeds
-//! (`P2pEndpoint::spawn_proactive_relay_manager`). x0x cannot gate that from
-//! its configuration: the manager is switched only by ant-quic's static
-//! `NatConfig::enable_relay_fallback`, which `NodeConfig` does not expose.
-//! The session's own connection is not a peer connection, so it shows in no
-//! per-peer transport row either.
+//! (`P2pEndpoint::spawn_proactive_relay_manager`). Stock ant-quic 0.27.61
+//! gives x0x no switch for it. The session's own connection is not a peer
+//! connection, so it shows in no per-peer transport row either.
 //!
 //! What x0x can see is ant-quic's `P2pEvent::RelayEstablished`. This counter
 //! records each one, and whether the mesh-off latch held when it came, for
 //! `GET /diagnostics/connectivity`.
+//!
+//! With the carried ant-quic patch (`set_proactive_relay_allowed`,
+//! `relay_client_stats`), the latch now switches proactive relay off and
+//! closes any client session (`NetworkNode::sync_proactive_relay`), and the
+//! snapshot adds the switch, the sessions held and their stream bytes.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -27,6 +30,17 @@ pub(crate) struct RelayClientCounters {
     established_while_quiesced: AtomicU64,
     events_lagged: AtomicU64,
     last: Mutex<Option<(SocketAddr, Instant)>>,
+}
+
+/// What the ant-quic endpoint reports about its relay switches and client
+/// sessions.
+#[derive(Debug, Clone)]
+pub(crate) struct TransportRelay {
+    pub(crate) proactive_relay_allowed: bool,
+    pub(crate) relay_fallback_allowed: bool,
+    pub(crate) coordinator_policy: ant_quic::CoordinatorPolicy,
+    pub(crate) stats: ant_quic::RelayClientStats,
+    pub(crate) introducers: ant_quic::IntroducerStats,
 }
 
 /// Serialized relay-client snapshot.
@@ -45,6 +59,37 @@ pub struct RelayClientSnapshot {
     /// Endpoint event batches this observer missed because its channel
     /// lagged. Non-zero means the counts above may be low.
     pub events_lagged: u64,
+    /// Whether ant-quic may hold a proactive relay session now (false while
+    /// the mesh-off latch holds). `None` without a QUIC endpoint.
+    pub proactive_relay_allowed: Option<bool>,
+    /// Whether a connect may fall back to a relay now (false while latched).
+    pub relay_fallback_allowed: Option<bool>,
+    /// Which hole-punch coordinators ant-quic may use now: `any` (meshed),
+    /// `connected_only` (latched, at rest: nothing is dialled to
+    /// coordinate) or `introducer` (latched, during a burst dial: one
+    /// introducer per target per burst, closed once the punch resolves).
+    pub coordinator_policy: Option<String>,
+    /// Hole-punch introducer connections dialled since start.
+    pub introducer_dials: u64,
+    /// UDP bytes sent on introducer connections, counted as each closed.
+    pub introducer_bytes_sent: u64,
+    /// UDP bytes received on introducer connections, counted as each
+    /// closed.
+    pub introducer_bytes_received: u64,
+    /// Client relay sessions open now, of any kind (proactive or opened by
+    /// a relay fallback dial).
+    pub active_sessions: usize,
+    /// The relay server of each open session (those `active_sessions`
+    /// counts).
+    pub relay_servers: Vec<String>,
+    /// Bytes written to relay streams since start, closed sessions
+    /// included (frame bytes; QUIC overhead on the relay connection is not
+    /// counted). When a session reuses the node's existing connection to the
+    /// relay, these bytes are also inside that peer's `per_peer_transport`
+    /// row: do not add the two.
+    pub bytes_sent: u64,
+    /// Bytes read from relay streams since start, counted the same way.
+    pub bytes_received: u64,
     /// The public address the latest session gave this node.
     pub last_relay_addr: Option<String>,
     /// How long ago the latest session was opened.
@@ -98,9 +143,26 @@ impl RelayClientCounters {
         });
     }
 
-    /// Snapshot for `GET /diagnostics/connectivity` → `relay_client`.
+    /// Snapshot for `GET /diagnostics/connectivity` → `relay_client`, with
+    /// the endpoint's switch and session stats when there is one.
     #[must_use]
-    pub(crate) fn snapshot(&self) -> RelayClientSnapshot {
+    pub(crate) fn snapshot(&self, transport: Option<TransportRelay>) -> RelayClientSnapshot {
+        let switches = transport.as_ref().map(|t| {
+            (
+                t.proactive_relay_allowed,
+                t.relay_fallback_allowed,
+                match t.coordinator_policy {
+                    ant_quic::CoordinatorPolicy::Any => "any",
+                    ant_quic::CoordinatorPolicy::ConnectedOnly => "connected_only",
+                    ant_quic::CoordinatorPolicy::Introducer => "introducer",
+                },
+            )
+        });
+        let introducers = transport
+            .as_ref()
+            .map(|t| t.introducers)
+            .unwrap_or_default();
+        let stats = transport.map(|t| t.stats).unwrap_or_default();
         let last = match self.last.lock() {
             Ok(last) => *last,
             Err(poisoned) => *poisoned.into_inner(),
@@ -109,6 +171,20 @@ impl RelayClientCounters {
             sessions_established: self.established.load(Ordering::Relaxed),
             established_while_quiesced: self.established_while_quiesced.load(Ordering::Relaxed),
             events_lagged: self.events_lagged.load(Ordering::Relaxed),
+            proactive_relay_allowed: switches.map(|s| s.0),
+            relay_fallback_allowed: switches.map(|s| s.1),
+            coordinator_policy: switches.map(|s| s.2.to_string()),
+            introducer_dials: introducers.dials,
+            introducer_bytes_sent: introducers.bytes_sent,
+            introducer_bytes_received: introducers.bytes_received,
+            active_sessions: stats.active_sessions,
+            relay_servers: stats
+                .relay_servers
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            bytes_sent: stats.bytes_sent,
+            bytes_received: stats.bytes_received,
             last_relay_addr: last.map(|(addr, _)| addr.to_string()),
             last_established_ago_ms: last
                 .map(|(_, at)| u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX)),
@@ -129,7 +205,7 @@ mod tests {
     #[test]
     fn nothing_recorded_before_a_session() {
         assert_eq!(
-            RelayClientCounters::default().snapshot(),
+            RelayClientCounters::default().snapshot(None),
             RelayClientSnapshot::default()
         );
     }
@@ -139,7 +215,7 @@ mod tests {
         let counters = RelayClientCounters::default();
         counters.observe(&relay(4000), false);
         counters.observe(&relay(4001), true);
-        let snap = counters.snapshot();
+        let snap = counters.snapshot(None);
         assert_eq!(snap.sessions_established, 2);
         assert_eq!(snap.established_while_quiesced, 1);
         assert_eq!(snap.last_relay_addr.as_deref(), Some("203.0.113.7:4001"));
@@ -150,7 +226,7 @@ mod tests {
     fn a_lag_is_counted() {
         let counters = RelayClientCounters::default();
         counters.note_lag(12);
-        assert_eq!(counters.snapshot().events_lagged, 1);
+        assert_eq!(counters.snapshot(None).events_lagged, 1);
     }
 
     #[test]
@@ -162,6 +238,6 @@ mod tests {
             },
             true,
         );
-        assert_eq!(counters.snapshot(), RelayClientSnapshot::default());
+        assert_eq!(counters.snapshot(None), RelayClientSnapshot::default());
     }
 }

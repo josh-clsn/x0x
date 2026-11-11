@@ -5301,6 +5301,24 @@ fn observe_discovered_machine_address(
 /// Reconnect tries most-recently-observed addresses first.
 ///
 /// `addresses` is LRU→MRU after [`observe_discovered_machine_address`].
+/// Introducer addresses for a burst dial: for each coordinator the target
+/// announced (`reachable_via`, in its order), the two addresses this node
+/// saw most recently (`addresses` is kept oldest to newest).
+fn burst_introducer_addrs(
+    reachable_via: &[identity::MachineId],
+    machines: &std::collections::HashMap<identity::MachineId, DiscoveredMachine>,
+) -> Vec<std::net::SocketAddr> {
+    let mut addrs = Vec::new();
+    for machine in reachable_via.iter().filter_map(|id| machines.get(id)) {
+        for addr in machine.addresses.iter().rev().take(2) {
+            if !addrs.contains(addr) {
+                addrs.push(*addr);
+            }
+        }
+    }
+    addrs
+}
+
 fn reconnect_candidate_addrs(addresses: &[std::net::SocketAddr]) -> Vec<std::net::SocketAddr> {
     addresses.iter().copied().rev().collect()
 }
@@ -8310,6 +8328,14 @@ impl Agent {
             .network
             .as_ref()
             .map(|network| network.demand_lease_generation());
+        // A leased dial is a burst dial: while latched it may use one
+        // hole-punch introducer for this target, the coordinators the
+        // target announced first.
+        let _burst = self
+            .network
+            .as_ref()
+            .map(|network| network.begin_burst_dial());
+        self.note_burst_introducers(agent_id).await;
         let (outcome, machine) = DIALED_MACHINE
             .scope(std::cell::Cell::new(None), async {
                 let outcome = self.connect_to_agent(agent_id).await;
@@ -8324,6 +8350,26 @@ impl Agent {
             _ => false,
         };
         Ok((outcome, leased))
+    }
+
+    /// Hand ant-quic the coordinators `agent_id`'s machine announced it is
+    /// reachable through (`reachable_via`), as that target's introducers.
+    async fn note_burst_introducers(&self, agent_id: &identity::AgentId) {
+        let Some(network) = self.network.as_ref() else {
+            return;
+        };
+        let entry = {
+            let cache = self.identity_discovery_cache.read().await;
+            cache.get(agent_id).cloned()
+        };
+        let Some(entry) = entry else {
+            return;
+        };
+        let introducers = {
+            let machines = self.machine_discovery_cache.read().await;
+            burst_introducer_addrs(&entry.reachable_via, &machines)
+        };
+        network.set_peer_introducers(ant_quic::PeerId(entry.machine_id.0), introducers);
     }
 
     /// [`Self::connect_to_agent`] for a send whose cold-recipient handling
@@ -34333,6 +34379,43 @@ mod tests {
             alice_network.is_connected(&bob_peer).await,
             "Transport disconnect must be redialed within the backoff window"
         );
+    }
+
+    /// A burst dial's introducers are the coordinators the target announced,
+    /// in its order, each by the addresses seen most recently.
+    #[test]
+    fn burst_introducers_are_the_targets_own_coordinators() {
+        let a = identity::MachineId([1; 32]);
+        let b = identity::MachineId([2; 32]);
+        let unknown = identity::MachineId([3; 32]);
+        let addr = |port: u16| std::net::SocketAddr::from(([203, 0, 113, 1], port));
+        let machine =
+            |id: identity::MachineId, addresses: Vec<std::net::SocketAddr>| DiscoveredMachine {
+                machine_id: id,
+                addresses,
+                announced_at: 0,
+                last_seen: 0,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                machine_kem_public_key: None,
+                placement_digests: Vec::new(),
+                agent_ids: Vec::new(),
+                user_ids: Vec::new(),
+            };
+        let machines = std::collections::HashMap::from([
+            (a, machine(a, vec![addr(1), addr(2), addr(3)])),
+            (b, machine(b, vec![addr(9)])),
+        ]);
+        assert_eq!(
+            burst_introducer_addrs(&[b, unknown, a], &machines),
+            vec![addr(9), addr(3), addr(2)]
+        );
+        assert!(burst_introducer_addrs(&[], &machines).is_empty());
     }
 
     /// F-D: a latched peer accepts each proactive redial and closes it at
