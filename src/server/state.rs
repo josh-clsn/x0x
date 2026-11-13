@@ -334,8 +334,9 @@ pub struct DaemonConfig {
     /// bootstrap seed as its hole-punch introducer when the target announced
     /// no introducer of its own. The seed then learns this node's address and
     /// whom it is calling; it never relays data. With `false` such a target
-    /// gets no hole punch while latched. Default `true` (the 11/10 rule:
-    /// public nodes may introduce). Meshed dials are not affected.
+    /// gets no hole punch while latched. Default `false`: a seed learns whom
+    /// the node calls, so the person turns this on. Meshed dials are not
+    /// affected.
     #[serde(default = "default_latched_seed_introducers")]
     pub latched_seed_introducers: bool,
 
@@ -589,7 +590,7 @@ fn default_port_mapping_enabled() -> bool {
 }
 
 fn default_latched_seed_introducers() -> bool {
-    true
+    false
 }
 
 /// #417: mDNS stays on by default so shipped daemons keep the LAN discovery
@@ -876,7 +877,7 @@ impl Default for DaemonConfig {
             api_watchdog: super::ApiWatchdogConfig::default(),
             leaf_mode: false,
             defer_mesh_join: false,
-            latched_seed_introducers: true,
+            latched_seed_introducers: false,
         }
     }
 }
@@ -1940,13 +1941,13 @@ mod tests {
     }
 
     #[test]
-    fn daemon_config_latched_seed_introducers_defaults_true() {
-        assert!(DaemonConfig::default().latched_seed_introducers);
+    fn daemon_config_latched_seed_introducers_defaults_false() {
+        assert!(!DaemonConfig::default().latched_seed_introducers);
         let cfg: DaemonConfig = toml::from_str("").expect("empty TOML parses");
-        assert!(cfg.latched_seed_introducers);
-        let cfg: DaemonConfig = toml::from_str("latched_seed_introducers = false")
-            .expect("latched_seed_introducers TOML parses");
         assert!(!cfg.latched_seed_introducers);
+        let cfg: DaemonConfig = toml::from_str("latched_seed_introducers = true")
+            .expect("latched_seed_introducers TOML parses");
+        assert!(cfg.latched_seed_introducers);
     }
 
     #[test]

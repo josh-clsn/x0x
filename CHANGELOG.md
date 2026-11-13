@@ -128,13 +128,17 @@ engine-A routes, and the four TreeKEM catch-up routes).
   further leased connects 409 `burst_cap_reached` until the next
   `POST /mesh/quiesce`. `GET /diagnostics/connectivity` `burst_cap` reports
   it. CLI `x0x direct connect --max-bytes`.
-- **Seed introducer dials are counted, and `latched_seed_introducers` can
-  refuse them (M-3).** `relay_client` gains `introducer_seed_dials`,
-  `introducer_dials_24h`, `introducer_seed_dials_24h`,
-  `seed_introducers_allowed` and `latched_seed_introducers`. The new daemon
-  setting `latched_seed_introducers` (default `true`, today's behaviour)
-  set to `false` stops a latched burst dial from using a seed as its
-  hole-punch introducer (ant-quic `set_known_peer_introducers_allowed`).
+- **Seed introducer dials are counted, and off unless asked for (M-3).**
+  `relay_client` gains `introducer_seed_dials`, `introducer_dials_24h`,
+  `introducer_seed_dials_24h`, `seed_introducers_allowed` and
+  `latched_seed_introducers`. A latched burst dial no longer uses a seed as
+  its hole-punch introducer, since the seed learns whom the node calls; the
+  new daemon setting `latched_seed_introducers = true` allows it (ant-quic
+  `set_known_peer_introducers_allowed`).
+- **A metered leaf never serves relay or coordination (audit OQ5).** With
+  `leaf_mode = true`, ant-quic's relay service stays off from start, meshed
+  or latched, so a phone on Wi-Fi serves no MASQUE relay session and
+  coordinates no hole punch for anyone.
 
 ### Changed
 

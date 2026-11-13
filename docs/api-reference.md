@@ -1184,10 +1184,14 @@ While quiesced, the node serves nobody: a CONNECT-UDP request on any link is
 refused, no hole punch is coordinated for anyone, the node plays no target
 role in a punch a linked peer coordinates (its own punches still work), and
 an enabled peer relay forwards no relayed DM. In a burst, a target
-that announced no introducer of its own may use a bootstrap seed as its one
-hole-punch introducer; the seed learns this node's address and whom it is
-calling, and never relays data. The daemon setting `latched_seed_introducers`
-(TOML, default `true`) set to `false` refuses that fallback while latched.
+that announced no introducer of its own gets no hole punch unless the daemon
+setting `latched_seed_introducers` (TOML, default `false`) is `true`: then a
+bootstrap seed may be its one hole-punch introducer. The seed learns this
+node's address and whom it is calling, and never relays data.
+
+With `leaf_mode = true` the node never serves a relay session or coordinates
+a hole punch for anyone, meshed or latched; its own dials and punches, and
+punches others coordinate to reach it while meshed, still work.
 `GET /diagnostics/connectivity` → `relay_client` reports
 `relay_service_allowed`, `inbound_punch_allowed`, `seed_introducers_allowed`,
 `latched_seed_introducers`, `introducer_seed_dials` (since start),

@@ -2816,7 +2816,7 @@ impl NetworkNode {
             own_peer_request: Arc::new(Mutex::new(OwnPeerRequest::default())),
             burst_hint_machines: Arc::new(Mutex::new(HashMap::new())),
             introducer_day: Arc::new(Mutex::new(introducer_day::IntroducerDay::default())),
-            latched_seed_introducers: Arc::new(AtomicBool::new(true)),
+            latched_seed_introducers: Arc::new(AtomicBool::new(false)),
             burst_cap: Arc::new(Mutex::new(BurstCapState::default())),
             direct_tx,
             direct_rx: Arc::new(tokio::sync::Mutex::new(direct_rx)),
@@ -5269,7 +5269,7 @@ impl NetworkNode {
 
     /// M-3: allow or refuse a seed as the hole-punch introducer of a
     /// latched burst dial (a target that announced no introducer of its own
-    /// then gets no punch). Allowed by default. Takes effect at once.
+    /// then gets no punch). Refused by default. Takes effect at once.
     pub fn set_latched_seed_introducers_allowed(&self, allowed: bool) {
         self.latched_seed_introducers
             .store(allowed, Ordering::SeqCst);
@@ -9242,11 +9242,12 @@ mod tests {
     }
 
     /// M-3: a latched burst dial to a contact that announced no introducer
-    /// falls back to the seed, and that shows in the last day's counts. With
-    /// the `latched_seed_introducers` setting off, the next burst never
-    /// contacts the seed; meshed, the setting has no effect.
+    /// never contacts a seed by default. With the `latched_seed_introducers`
+    /// setting on it falls back to the seed, and that shows in the last
+    /// day's counts; turned off again, the next burst never contacts the
+    /// seed; meshed, the setting has no effect.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn seed_introducer_dials_are_counted_and_the_setting_turns_them_off() {
+    async fn seed_introducers_are_off_by_default_and_counted_when_on() {
         let seed = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
             .await
             .expect("seed");
@@ -9273,6 +9274,18 @@ mod tests {
             }
         };
 
+        let snap = phone.relay_client_snapshot();
+        assert!(!snap.latched_seed_introducers, "off by default");
+        assert_eq!(snap.seed_introducers_allowed, Some(false));
+        burst_dial(&phone, ant_quic::PeerId([0x70; 32])).await;
+        assert_eq!(
+            inbound_connects(&seed).await,
+            0,
+            "by default a latched burst never contacts the seed"
+        );
+
+        phone.set_latched_seed_introducers_allowed(true);
+        assert!(phone.latch_mesh_quiesced().is_none(), "a new burst");
         burst_dial(&phone, ant_quic::PeerId([0x71; 32])).await;
         assert_eq!(inbound_connects(&seed).await, 1, "the seed fallback");
         let snap = phone.relay_client_snapshot();
