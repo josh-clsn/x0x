@@ -33971,11 +33971,6 @@ mod tests {
         // (None were spawned here, so the registry is empty-but-closed.)
     }
 
-    /// Once `begin_shutdown()` has closed the registry, `spawn_tracked` must be
-    /// a no-op: the handle is NOT pushed. This is the invariant that defeats a
-    /// racing `join_network` from leaking heartbeat/reaper/presence tasks past
-    /// the subsequent `shutdown()` (the registry drains empty because nothing
-    // new can enter after close).
     /// L-3: an agent whose network starts quiesced (the daemon's
     /// `defer_mesh_join`) is latched before any call.
     #[tokio::test]
@@ -34006,6 +34001,11 @@ mod tests {
         );
     }
 
+    /// Once `begin_shutdown()` has closed the registry, `spawn_tracked` must be
+    /// a no-op: the handle is NOT pushed. This is the invariant that defeats a
+    /// racing `join_network` from leaking heartbeat/reaper/presence tasks past
+    /// the subsequent `shutdown()` (the registry drains empty because nothing
+    // new can enter after close).
     #[tokio::test]
     async fn spawn_tracked_refuses_after_begin_shutdown() {
         let dir = tempfile::tempdir().expect("tmpdir");
