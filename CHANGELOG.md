@@ -244,6 +244,18 @@ engine-A routes, and the four TreeKEM catch-up routes).
   is acted on unless it is for a punch the node asked for. The node's own
   burst punches still connect. `relay_client.inbound_punch_allowed` reports
   the switch.
+- **After the burst cap trips, nothing dials until the burst ends (review
+  M-1, L-2, L-4, L-6).** Every connect, the raw-send redial included,
+  answers `burst_cap_reached`, and the cap's task closes any link that comes
+  up within a tick, until the next latch call or the latch lifting. Before a
+  close it rechecks, under the cap's lock, that the cap and the latch still
+  hold. An armed cap that has not tripped ends once no lease remains and no
+  burst dial is in flight; any cap ends 300 s after its latest arm. The task
+  is held by the cap and aborted when the cap is cleared.
+- **The burst cap counts by connection stable id (review L-3).** A link's
+  bytes are keyed by its stable id, and a new connection under a reused key
+  keeps its predecessor's share.
+- **`max_bytes: 0` is refused with 400 (review L-5).**
 - **Own agent ids resolve through the authority stores (review M-2).** An
   agent id becomes an own peer only when an authority store confirms its
   machine (ADR 0115); otherwise it is listed in `unresolved_agent_ids`.

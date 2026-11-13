@@ -50,9 +50,9 @@ pub(in crate::server) struct ConnectAgentRequest {
     /// The burst's byte cap (M-5), with a lease while the mesh is quiesced:
     /// UDP bytes sent plus received over every link from now on. Once they
     /// reach it the daemon closes every link, ends the leases and refuses
-    /// leased connects until the next `POST /mesh/quiesce`. A later connect
-    /// in the same burst can only lower it. Ignored without a lease or while
-    /// the mesh is on.
+    /// connects until the next `POST /mesh/quiesce`. A later connect in the
+    /// same burst can only lower it. Ignored without a lease or while the
+    /// mesh is on; 0 is refused with 400 (omit it for no cap).
     #[serde(default)]
     max_bytes: Option<u64>,
 }
@@ -61,6 +61,11 @@ pub(in crate::server) struct ConnectAgentRequest {
 /// value only when a lease was actually recorded, else `null`.
 fn echoed_lease_secs(granted: Option<u64>, recorded: bool) -> Option<u64> {
     granted.filter(|_| recorded)
+}
+
+/// A `max_bytes` of 0 would trip at once and close the burst; it is refused.
+fn max_bytes_is_valid(requested: Option<u64>) -> bool {
+    requested != Some(0)
 }
 
 /// The `max_bytes` a `POST /agents/connect` answers with: the burst cap in
@@ -252,18 +257,23 @@ pub(in crate::server) async fn connect_agent(
     // the agent has multiple unreachable addresses (each with its own 30s
     // QUIC timeout).
     let lease_secs = granted_lease_secs(req.lease_secs);
-    if lease_secs.is_some()
-        && state
-            .agent
-            .network()
-            .is_some_and(|network| network.burst_cap_tripped())
+    if !max_bytes_is_valid(req.max_bytes) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "max_bytes must be at least 1 (omit it for no cap)",
+        );
+    }
+    if state
+        .agent
+        .network()
+        .is_some_and(|network| network.burst_cap_tripped())
     {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "ok": false,
                 "error": "burst_cap_reached",
-                "detail": "the burst byte cap was reached; leased connects resume after POST /mesh/quiesce"
+                "detail": "the burst byte cap was reached; connects resume after POST /mesh/quiesce"
             })),
         );
     }
@@ -740,6 +750,14 @@ mod tests {
             echoed_max_bytes(Some(8192), x0x::network::BurstCapSnapshot::default()),
             None
         );
+    }
+
+    #[test]
+    fn a_zero_burst_cap_is_refused() {
+        use super::max_bytes_is_valid;
+        assert!(!max_bytes_is_valid(Some(0)));
+        assert!(max_bytes_is_valid(Some(1)));
+        assert!(max_bytes_is_valid(None));
     }
 
     #[test]

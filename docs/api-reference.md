@@ -1146,20 +1146,28 @@ A leased `/agents/connect` may also carry `max_bytes`, the burst's byte cap:
 ```
 
 While the mesh is quiesced, the first such connect since the last
-`POST /mesh/quiesce` arms the cap before it dials; a later one in the same
-burst can only lower it. From then on the daemon counts the UDP bytes sent
-and received on every link (a link already up counts from its counters at
-arming; one that comes up later from zero) and reads them every 10 ms. Once
-the sum reaches the cap it ends every lease, closes every link and refuses
-leased connects (`409 {"ok": false, "error": "burst_cap_reached"}`) until the
-next `POST /mesh/quiesce`, which ends the burst and clears the cap. The answer
-echoes the cap in force as `max_bytes` (else `null`). Without a lease, or while
-the mesh is on, `max_bytes` is ignored. CLI: `x0x direct connect --lease-secs
-90 --max-bytes 1048576`.
+`POST /mesh/quiesce` arms the cap as it dials; a later one in the same burst
+can only lower it. `max_bytes: 0` is refused with 400 (omit it for no cap).
+From then on the daemon counts the UDP bytes sent and received on every link
+(a link already up counts from its counters at arming; one that comes up
+later from zero) and reads them every 10 ms. Once the sum reaches the cap it
+ends every lease and closes every link. Until the cap is cleared it keeps
+closing any link that comes up within a tick, and every connect, leased or
+not (the raw-send redial of `/direct/send` included), is refused with
+`409 {"ok": false, "error": "burst_cap_reached"}`. The answer echoes the cap
+in force as `max_bytes` (else `null`). Without a lease, or while the mesh is
+on, `max_bytes` is ignored. CLI: `x0x direct connect --lease-secs 90
+--max-bytes 1048576`.
 
-Overshoot is bounded by the link rate times about 10 to 20 ms (one counter
-read and the close), plus what the peers already had in flight: about 100 to
-200 KB on a 50 Mbit/s link, against seconds of traffic before.
+The cap is cleared by the next `POST /mesh/quiesce` (which ends the burst)
+or `POST /mesh/join`. An armed cap that has not tripped also ends once no
+lease remains and no leased connect is in flight, and any cap ends 300 s
+(`MAX_DEMAND_LEASE_SECS`) after its latest arm, so a burst whose end never
+landed leaves nothing running.
+
+Measured overshoot: about 200 KB over a 1 MiB cap with a peer streaming at
+30 MB/s over loopback, roughly 7 ms of its traffic, against seconds of
+traffic before.
 
 `GET /diagnostics/connectivity` → `burst_cap` reports it: `armed`,
 `max_bytes`, `counted_bytes`, `tripped` and `tripped_after_ms`.

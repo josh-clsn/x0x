@@ -8355,15 +8355,12 @@ impl Agent {
         lease: std::time::Duration,
         max_bytes: Option<u64>,
     ) -> error::Result<(connectivity::ConnectOutcome, bool)> {
-        if let Some(network) = self.network.as_ref() {
-            if network.burst_cap_tripped() {
-                return Err(error::IdentityError::Storage(std::io::Error::other(
-                    "the burst byte cap was reached; no leased dial until the burst ends",
-                )));
-            }
-            if let Some(max_bytes) = max_bytes {
-                network.arm_burst_cap(max_bytes).await;
-            }
+        if self
+            .network
+            .as_ref()
+            .is_some_and(|network| network.burst_cap_tripped())
+        {
+            return Err(burst_cap_reached_error());
         }
         let lease = lease.min(std::time::Duration::from_secs(MAX_DEMAND_LEASE_SECS));
         let generation = self
@@ -8377,6 +8374,10 @@ impl Agent {
             .network
             .as_ref()
             .map(|network| network.begin_burst_dial());
+        // Armed inside the burst dial, so the cap's idle check sees the dial.
+        if let (Some(network), Some(max_bytes)) = (self.network.as_ref(), max_bytes) {
+            network.arm_burst_cap(max_bytes).await;
+        }
         self.note_burst_introducers(agent_id).await;
         self.refresh_own_peers().await;
         let (outcome, machine) = DIALED_MACHINE
@@ -8513,6 +8514,16 @@ impl Agent {
         agent_id: &identity::AgentId,
         cold: ColdResolution,
     ) -> error::Result<connectivity::ConnectOutcome> {
+        // M-5: once the burst's byte cap is reached, no dial runs until the
+        // burst ends (the raw-send redial included). Introducer dials are
+        // ant-quic's own and do not come through here.
+        if self
+            .network
+            .as_ref()
+            .is_some_and(|network| network.burst_cap_tripped())
+        {
+            return Err(burst_cap_reached_error());
+        }
         let outcome = self.connect_to_agent_inner(agent_id, cold).await?;
         if outcome.is_live_path() {
             self.maybe_warm_reverse_ack_topics(agent_id).await;
@@ -22764,6 +22775,13 @@ tokio::task_local! {
 /// Returns whether a lease was recorded: never for a dead outcome, a zero
 /// lease, no authenticated machine, a clear since `generation` (a quiesce
 /// that ended the burst during the dial wins) or a full table.
+/// The error a dial gets once the burst's byte cap is reached (M-5).
+fn burst_cap_reached_error() -> error::IdentityError {
+    error::IdentityError::Storage(std::io::Error::other(
+        "burst_cap_reached: the burst byte cap was reached; no dial until the burst ends",
+    ))
+}
+
 fn record_demand_lease(
     network: &network::NetworkNode,
     generation: u64,
@@ -31331,6 +31349,54 @@ mod tests {
         assert!(alice.mesh_quiesced());
         assert!(!network.demand_leased(&bob_peer, tokio::time::Instant::now()));
         await_disconnected(&network, &bob_peer).await;
+    }
+
+    /// M-5 (review M-1): once the burst cap trips, no dial runs until the
+    /// burst ends. The raw-send redial (`connect_to_agent`, which
+    /// `/direct/send` takes when the link is gone) fails fast with
+    /// `burst_cap_reached`, and no link comes up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn after_the_burst_cap_trips_no_dial_runs_until_the_burst_ends() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (alice, bob, _bob_addr) = leaf_and_peer(dir.path()).await;
+        let network = std::sync::Arc::clone(alice.network().expect("network"));
+        let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+        alice.quiesce_mesh().await.expect("latch");
+        // A 1-byte cap: the handshake alone passes it.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(20) * test_time_multiplier(),
+            alice.connect_to_agent_leased_capped(
+                &bob.agent_id(),
+                std::time::Duration::from_secs(120),
+                Some(1),
+            ),
+        )
+        .await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !network.burst_cap_tripped() {
+            assert!(tokio::time::Instant::now() < deadline, "the cap trips");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        await_disconnected(&network, &bob_peer).await;
+
+        let started = std::time::Instant::now();
+        let refused = alice.connect_to_agent(&bob.agent_id()).await;
+        let error = refused.expect_err("no dial after the cap tripped");
+        assert!(error.to_string().contains("burst_cap_reached"), "{error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "it fails fast"
+        );
+        for _ in 0..20 {
+            assert!(!network.is_connected(&bob_peer).await, "no link comes up");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        alice.quiesce_mesh().await.expect("the burst ends");
+        assert!(
+            !network.burst_cap_tripped(),
+            "the next latch call clears it"
+        );
     }
 
     /// M-2 (review): an own agent id resolves only through the authority

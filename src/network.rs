@@ -2382,8 +2382,13 @@ struct BurstCapState {
     /// The armed cap and what counts toward it.
     count: Option<burst_cap::BurstCapCount>,
     armed_at: Option<tokio::time::Instant>,
+    /// The latest arm or lowering; the cap ends [`crate::MAX_DEMAND_LEASE_SECS`]
+    /// after it whatever else happens.
+    last_armed_at: Option<tokio::time::Instant>,
     /// When the cap was reached and the links were closed.
     tripped_at: Option<tokio::time::Instant>,
+    /// The enforcement task, aborted when the cap is cleared.
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// M-5: the current burst's byte cap, for `GET /diagnostics/connectivity`
@@ -4875,18 +4880,23 @@ impl NetworkNode {
         }
     }
 
-    /// M-5: arm the current burst's byte cap. Only while latched: returns
-    /// false when the mesh is on, or when this burst's cap was already
-    /// reached. A second call in the same burst can only lower the cap.
+    /// M-5: arm the current burst's byte cap. Only while latched and for a
+    /// cap above zero: returns false when the mesh is on, for 0, or when this
+    /// burst's cap was already reached. A second call in the same burst can
+    /// only lower the cap.
     ///
     /// From now on every link's UDP bytes (sent plus received) count toward
     /// it, a link up now from its counters now. A task reads the counters
-    /// every 10 ms (`BURST_CAP_TICK`); when the sum reaches the cap it
-    /// ends every demand lease and closes every link, and leased dials are
-    /// refused until the next latch call ([`Self::latch_mesh_quiesced`])
-    /// clears the cap.
+    /// every 10 ms (`BURST_CAP_TICK`); when the sum reaches the cap it ends
+    /// every demand lease and closes every link, then keeps closing any link
+    /// that comes up, and leased dials are refused, until the cap is cleared.
+    /// The cap is cleared by the next latch call
+    /// ([`Self::latch_mesh_quiesced`]) or the latch lifting; an armed cap
+    /// that has not tripped also ends once no demand lease remains and no
+    /// burst dial is in flight, and any cap ends [`crate::MAX_DEMAND_LEASE_SECS`]
+    /// after its latest arm.
     pub async fn arm_burst_cap(&self, max_bytes: u64) -> bool {
-        if !self.mesh_quiesced.load(Ordering::Relaxed) {
+        if max_bytes == 0 || !self.mesh_quiesced.load(Ordering::Relaxed) {
             return false;
         }
         {
@@ -4896,37 +4906,67 @@ impl NetworkNode {
             }
             if let Some(count) = state.count.as_mut() {
                 count.lower_to(max_bytes);
+                state.last_armed_at = Some(tokio::time::Instant::now());
                 return true;
             }
         }
         let links = self.link_byte_counters().await;
-        let generation = {
-            let mut state = self.burst_cap_guard();
-            if !self.mesh_quiesced.load(Ordering::Relaxed) || state.tripped_at.is_some() {
-                return false;
-            }
-            if let Some(count) = state.count.as_mut() {
-                count.lower_to(max_bytes);
-                return true;
-            }
-            state.generation = state.generation.wrapping_add(1);
-            state.count = Some(burst_cap::BurstCapCount::arm(max_bytes, links));
-            state.armed_at = Some(tokio::time::Instant::now());
-            state.generation
-        };
+        let mut state = self.burst_cap_guard();
+        if !self.mesh_quiesced.load(Ordering::Relaxed) || state.tripped_at.is_some() {
+            return false;
+        }
+        let now = tokio::time::Instant::now();
+        if let Some(count) = state.count.as_mut() {
+            count.lower_to(max_bytes);
+            state.last_armed_at = Some(now);
+            return true;
+        }
+        state.generation = state.generation.wrapping_add(1);
+        state.count = Some(burst_cap::BurstCapCount::arm(max_bytes, links));
+        state.armed_at = Some(now);
+        state.last_armed_at = Some(now);
         let node = self.clone();
-        tokio::spawn(async move { node.enforce_burst_cap(generation).await });
+        let generation = state.generation;
+        state.task = Some(tokio::spawn(async move {
+            node.enforce_burst_cap(generation).await;
+        }));
         true
     }
 
-    /// M-5: drop the burst's cap (every latch call ends a burst).
+    /// M-5: drop the burst's cap and stop its task (every latch call ends a
+    /// burst).
     fn clear_burst_cap(&self) {
         let mut state = self.burst_cap_guard();
+        if let Some(task) = state.task.take() {
+            task.abort();
+        }
         let generation = state.generation.wrapping_add(1);
         *state = BurstCapState {
             generation,
             ..BurstCapState::default()
         };
+    }
+
+    /// M-5: the enforcement task of `generation` ends its own cap.
+    fn end_burst_cap_from_task(&self, generation: u64) {
+        let mut state = self.burst_cap_guard();
+        if state.generation != generation {
+            return;
+        }
+        // This task is the one ending; dropping its handle detaches it.
+        drop(state.task.take());
+        *state = BurstCapState {
+            generation: generation.wrapping_add(1),
+            ..BurstCapState::default()
+        };
+    }
+
+    /// Whether any demand lease is unexpired at `now`.
+    fn any_demand_lease(&self, now: tokio::time::Instant) -> bool {
+        self.demand_leases_guard()
+            .until
+            .values()
+            .any(|end| *end > now)
     }
 
     /// M-5: whether this burst's cap was reached.
@@ -4961,7 +5001,7 @@ impl NetworkNode {
     }
 
     /// Every live link's UDP bytes, sent plus received, by peer and
-    /// connection generation.
+    /// connection stable id.
     async fn link_byte_counters(&self) -> Vec<(burst_cap::LinkKey, u64)> {
         let Some(node) = self.node.read().await.as_ref().cloned() else {
             return Vec::new();
@@ -4969,26 +5009,85 @@ impl NetworkNode {
         let Some(quic) = node.quic() else {
             return Vec::new();
         };
+        let endpoint = quic.inner_endpoint();
         let mut links = Vec::new();
         for conn in quic.connected_peers().await {
-            if let Some(stats) = quic.connection_transport_stats(&conn.peer_id).await {
+            if let Ok(Some(connection)) = endpoint.get_quic_connection(&conn.peer_id) {
+                let stats = connection.stats();
                 links.push((
-                    (conn.peer_id.0, stats.generation),
-                    stats.udp_tx_bytes.saturating_add(stats.udp_rx_bytes),
+                    (conn.peer_id.0, connection.stable_id()),
+                    stats.udp_tx.bytes.saturating_add(stats.udp_rx.bytes),
                 ));
             }
         }
         links
     }
 
+    /// M-5: whether the tripped cap of `generation` still owns a latched
+    /// node, so its task may close links.
+    fn burst_cap_may_close(&self, generation: u64) -> bool {
+        let state = self.burst_cap_guard();
+        state.generation == generation
+            && state.tripped_at.is_some()
+            && self.mesh_quiesced.load(Ordering::Relaxed)
+    }
+
+    /// M-5: close every link while the tripped cap of `generation` still
+    /// owns a latched node (checked before each close). Returns how many.
+    async fn close_links_for_burst_cap(&self, generation: u64) -> usize {
+        let mut closed = 0usize;
+        for peer in self.connected_peers().await {
+            if !self.burst_cap_may_close(generation) {
+                break;
+            }
+            if self
+                .disconnect_with_reason(&peer, DisconnectReason::Quiesce)
+                .await
+                .is_ok()
+            {
+                closed += 1;
+            }
+        }
+        closed
+    }
+
     /// M-5: read the counters every tick while the cap of `generation` is
-    /// armed; once it is reached, end the leases and close every link.
+    /// armed. Once it is reached, end the leases and close every link, then
+    /// keep closing any link that comes up until the cap is cleared.
     async fn enforce_burst_cap(self, generation: u64) {
+        let lifetime = std::time::Duration::from_secs(crate::MAX_DEMAND_LEASE_SECS);
         let mut tick = tokio::time::interval(burst_cap::BURST_CAP_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
             if self.node.read().await.is_none() {
+                return;
+            }
+            let now = tokio::time::Instant::now();
+            let (tripped, expired) = {
+                let state = self.burst_cap_guard();
+                if state.generation != generation {
+                    return;
+                }
+                (
+                    state.tripped_at.is_some(),
+                    state
+                        .last_armed_at
+                        .is_some_and(|at| now.saturating_duration_since(at) >= lifetime),
+                )
+            };
+            if expired {
+                self.end_burst_cap_from_task(generation);
+                return;
+            }
+            if tripped {
+                self.close_links_for_burst_cap(generation).await;
+                continue;
+            }
+            if !self.any_demand_lease(now) && self.burst_dials.load(Ordering::SeqCst) == 0 {
+                // The burst's links are gone and nothing is dialling: the cap
+                // has nothing left to guard.
+                self.end_burst_cap_from_task(generation);
                 return;
             }
             let links = self.link_byte_counters().await;
@@ -5011,16 +5110,7 @@ impl NetworkNode {
                 counted
             };
             self.clear_demand_leases();
-            let mut closed = 0usize;
-            for peer in self.connected_peers().await {
-                if self
-                    .disconnect_with_reason(&peer, DisconnectReason::Quiesce)
-                    .await
-                    .is_ok()
-                {
-                    closed += 1;
-                }
-            }
+            let closed = self.close_links_for_burst_cap(generation).await;
             tracing::info!(
                 target: "x0x::connect",
                 counted_bytes = counted.0,
@@ -5028,7 +5118,6 @@ impl NetworkNode {
                 closed,
                 "burst byte cap reached: leases ended and links closed"
             );
-            return;
         }
     }
 
@@ -9172,11 +9261,11 @@ mod tests {
             .expect("peer");
         let peer_addr = peer.bound_addr().await.expect("peer bound");
         phone.latch_mesh_quiesced().expect("fresh latch");
-        assert!(phone.arm_burst_cap(CAP).await, "armed while latched");
         assert!(phone.lease_demand_peer(
             peer.peer_id(),
             tokio::time::Instant::now() + Duration::from_secs(60),
         ));
+        assert!(phone.arm_burst_cap(CAP).await, "armed while latched");
         phone
             .connect_addr(peer_addr)
             .await
@@ -9253,10 +9342,14 @@ mod tests {
                     .max(0.001)
         });
         let bound = CAP + (rate * 0.05) as u64 + 256 * 1024;
-        eprintln!(
-            "burst cap: received {got} B against {CAP} B, counted {} B, cut {} ms after arming, rate {rate:.0} B/s, bound {bound} B",
-            snap.counted_bytes,
-            snap.tripped_after_ms.unwrap_or(0)
+        tracing::info!(
+            received = got,
+            cap = CAP,
+            counted = snap.counted_bytes,
+            cut_after_ms = snap.tripped_after_ms.unwrap_or(0),
+            rate_bytes_per_s = rate,
+            bound,
+            "burst cap measurement"
         );
         assert!(
             got <= bound,
@@ -9274,6 +9367,17 @@ mod tests {
             !phone.arm_burst_cap(CAP).await,
             "no new cap in the same burst"
         );
+        // A link that comes up after the cap tripped is closed within a tick
+        // or two.
+        let _ = phone.connect_addr(peer_addr).await;
+        let redial_deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        while phone.is_connected(&peer.peer_id()).await {
+            assert!(
+                tokio::time::Instant::now() < redial_deadline,
+                "a link after the trip must be closed at once"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
         assert!(phone.latch_mesh_quiesced().is_none(), "the burst ends");
         let cleared = phone.burst_cap_snapshot();
         assert!(!cleared.tripped && !cleared.armed, "{cleared:?}");
@@ -9292,6 +9396,11 @@ mod tests {
             .expect("node");
         assert!(!node.arm_burst_cap(1024).await, "meshed: no cap");
         node.latch_mesh_quiesced().expect("fresh latch");
+        assert!(node.lease_demand_peer(
+            ant_quic::PeerId([0x61; 32]),
+            tokio::time::Instant::now() + Duration::from_secs(60),
+        ));
+        assert!(!node.arm_burst_cap(0).await, "a zero cap is refused");
         assert!(node.arm_burst_cap(4096).await);
         assert!(node.arm_burst_cap(8192).await);
         assert_eq!(
@@ -9304,6 +9413,38 @@ mod tests {
             !node.burst_cap_snapshot().armed,
             "the latch lifting clears it"
         );
+        let _ = node.try_shutdown().await;
+    }
+
+    /// M-5 (L-2): an armed cap that has not tripped ends by itself once no
+    /// demand lease remains and no burst dial is in flight, so a burst whose
+    /// end never landed leaves no task running and no cap behind.
+    #[tokio::test]
+    async fn an_idle_burst_cap_disarms_itself() {
+        let node = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("node");
+        node.latch_mesh_quiesced().expect("fresh latch");
+        let burst = node.begin_burst_dial();
+        assert!(node.arm_burst_cap(4096).await);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(node.burst_cap_snapshot().armed, "a burst dial is in flight");
+        assert!(node.lease_demand_peer(
+            ant_quic::PeerId([0x62; 32]),
+            tokio::time::Instant::now() + Duration::from_millis(300),
+        ));
+        drop(burst);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(node.burst_cap_snapshot().armed, "a lease remains");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while node.burst_cap_snapshot().armed {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the cap ends once the lease expires"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(node.burst_cap_guard().task.is_none(), "its task is gone");
         let _ = node.try_shutdown().await;
     }
 

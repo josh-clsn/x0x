@@ -11,12 +11,14 @@
 //! burst.
 //!
 //! This module is the accounting only: what counts toward the cap.
-//! - Every connection counts, by (peer, connection generation): the bytes it
+//! - Every connection counts, by (peer, connection stable id): the bytes it
 //!   moved (UDP sent plus received) since the cap was armed. A connection up
 //!   when the cap was armed counts from its counters at that moment; one that
 //!   came up later counts from zero.
 //! - A connection that went away keeps the bytes it was last seen with, so a
-//!   closed link cannot take its share out of the sum.
+//!   closed link cannot take its share out of the sum. Counters that go
+//!   backwards under the same key (a new connection) retire the old share
+//!   into a running total instead of overwriting it.
 //!
 //! What the sum cannot see: bytes in the last tick of a connection that
 //! closed between two reads, and packets that reach the socket after the
@@ -29,8 +31,8 @@ use std::time::Duration;
 /// How often the daemon reads the counters while a cap is armed.
 pub(crate) const BURST_CAP_TICK: Duration = Duration::from_millis(10);
 
-/// One connection: a peer's machine id and the connection's generation.
-pub(crate) type LinkKey = ([u8; 32], Option<u64>);
+/// One connection: a peer's machine id and the connection's stable id.
+pub(crate) type LinkKey = ([u8; 32], usize);
 
 /// The bytes counted toward an armed cap.
 #[derive(Debug, Clone)]
@@ -40,6 +42,8 @@ pub(crate) struct BurstCapCount {
     base: HashMap<LinkKey, u64>,
     /// Bytes each connection has moved since arming, as last seen.
     moved: HashMap<LinkKey, u64>,
+    /// Shares of connections whose key came back with lower counters.
+    retired: u64,
 }
 
 impl BurstCapCount {
@@ -50,6 +54,7 @@ impl BurstCapCount {
             max_bytes,
             base: now.into_iter().collect(),
             moved: HashMap::new(),
+            retired: 0,
         }
     }
 
@@ -67,22 +72,23 @@ impl BurstCapCount {
     /// Record one connection's current counters (sent plus received).
     pub(crate) fn observe(&mut self, link: LinkKey, total: u64) {
         let base = self.base.get(&link).copied().unwrap_or(0);
-        if total < base {
+        let previous = self.moved.get(&link).copied().unwrap_or(0);
+        if total < base.saturating_add(previous) {
             // Counters went backwards: a new connection under a reused key.
-            // Count it from zero.
+            // Its predecessor's share is kept; the new one counts from zero.
+            self.retired = self.retired.saturating_add(previous);
             self.base.insert(link, 0);
             self.moved.insert(link, total);
             return;
         }
-        let moved = self.moved.entry(link).or_insert(0);
-        *moved = (*moved).max(total - base);
+        self.moved.insert(link, total - base);
     }
 
     /// Bytes moved since arming, over every connection seen.
     pub(crate) fn counted(&self) -> u64 {
         self.moved
             .values()
-            .fold(0, |sum, bytes| sum.saturating_add(*bytes))
+            .fold(self.retired, |sum, bytes| sum.saturating_add(*bytes))
     }
 
     /// Whether the counted bytes reached the cap.
@@ -95,8 +101,8 @@ impl BurstCapCount {
 mod tests {
     use super::*;
 
-    fn link(byte: u8, generation: u64) -> LinkKey {
-        ([byte; 32], Some(generation))
+    fn link(byte: u8, stable_id: usize) -> LinkKey {
+        ([byte; 32], stable_id)
     }
 
     #[test]
@@ -133,6 +139,26 @@ mod tests {
         let mut count = BurstCapCount::arm(1000, [(link(4, 1), 900)]);
         count.observe(link(4, 1), 100);
         assert_eq!(count.counted(), 100);
+    }
+
+    #[test]
+    fn a_new_connection_under_a_reused_key_keeps_the_old_share() {
+        let mut count = BurstCapCount::arm(10_000, []);
+        count.observe(link(5, 9), 700);
+        // The same key comes back with lower counters: a new connection.
+        count.observe(link(5, 9), 200);
+        assert_eq!(count.counted(), 900, "700 retired plus 200 new");
+        count.observe(link(5, 9), 450);
+        assert_eq!(count.counted(), 1150);
+    }
+
+    #[test]
+    fn a_link_up_at_arming_never_counts_its_history() {
+        // Tens of MB moved before the burst; only bytes since arming count.
+        let mut count = BurstCapCount::arm(1000, [(link(6, 3), 40_000_000)]);
+        count.observe(link(6, 3), 40_000_100);
+        assert_eq!(count.counted(), 100);
+        assert!(!count.reached());
     }
 
     #[test]
