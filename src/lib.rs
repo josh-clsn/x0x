@@ -27862,6 +27862,17 @@ fn spawn_relay_dm_listener(
                     }
                 }
                 peer_relay::RelayDisposition::Forward { dst_agent_id } => {
+                    // A latched node serves nobody: no pass-through
+                    // forwarding while the mesh-off latch holds.
+                    if network.mesh_quiesced() {
+                        tracing::debug!(
+                            target: "x0x::relay",
+                            stage = "refuse",
+                            relay_peer = ?relay_peer_id,
+                            "RelayedDm forward refused: the mesh is latched"
+                        );
+                        continue;
+                    }
                     let dst = identity::AgentId(dst_agent_id);
                     let dst_machine_id = {
                         let cache = identity_discovery_cache.read().await;

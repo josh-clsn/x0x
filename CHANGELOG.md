@@ -260,6 +260,8 @@ engine-A routes, and the four TreeKEM catch-up routes).
   agent id becomes an own peer only when an authority store confirms its
   machine (ADR 0115); otherwise it is listed in `unresolved_agent_ids`.
 - **A target gone from discovery leaves no introducer hints (review L-7).**
+- **A latched peer relay forwards nothing (review L-9).** The `peer_relay`
+  forward arm refuses while the mesh-off latch holds.
 
 ### Carried patches
 

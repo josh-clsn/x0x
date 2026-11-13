@@ -1436,3 +1436,121 @@ async fn v2_then_v1_downgrade_is_rejected_but_converging_v1_is_not() {
         Ok(msg) => panic!("downgraded frame must NOT be delivered, got {msg:?}"),
     }
 }
+
+/// Fork-latch hardening (review L-9): a latched relay serves nobody. While
+/// Charlie's mesh-off latch holds, a relayed DM addressed onward to Bob is
+/// not forwarded (no forward accounting, nothing reaches Bob). With the
+/// latch lifted, the same kind of frame is forwarded and Bob receives it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_latched_relay_forwards_nothing() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let relay_config = || PeerRelayConfig {
+        enabled: true,
+        require_contact_to_relay: false,
+        fail_threshold: 3,
+        fail_window_ms: 60_000,
+        candidates: Vec::new(),
+        ..Default::default()
+    };
+    let charlie = match build_agent(&dir, "charlie", relay_config())
+        .await
+        .expect("build charlie")
+    {
+        Some(agent) => agent,
+        None => {
+            eprintln!("skipping latched_relay: bind permission unavailable");
+            return;
+        }
+    };
+    let bob = match build_agent(&dir, "bob", relay_config())
+        .await
+        .expect("build bob")
+    {
+        Some(agent) => agent,
+        None => {
+            eprintln!("skipping latched_relay: bob bind permission unavailable");
+            return;
+        }
+    };
+    bob.join_network().await.expect("bob join_network");
+    charlie.join_network().await.expect("charlie join_network");
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let bob_addr = normalize_loopback(
+        bob.network()
+            .expect("bob network")
+            .bound_addr()
+            .await
+            .expect("bob bound"),
+    );
+    let charlie_addr = normalize_loopback(
+        charlie
+            .network()
+            .expect("charlie network")
+            .bound_addr()
+            .await
+            .expect("charlie bound"),
+    );
+    charlie
+        .insert_discovered_agent_for_testing(discovered_for(&bob, bob_addr, now_secs))
+        .await;
+    bob.insert_discovered_agent_for_testing(discovered_for(&charlie, charlie_addr, now_secs))
+        .await;
+    let charlie_network = charlie.network().expect("charlie network");
+    charlie_network
+        .connect_addr(bob_addr)
+        .await
+        .expect("charlie connects to bob");
+    wait_until_connected(
+        &charlie,
+        ant_quic::PeerId(bob.machine_id().0),
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let mallory = AgentKeypair::generate().expect("mallory keypair");
+    let mut bob_sub = bob.subscribe_direct();
+    let frame = |nonce: u8| {
+        signed_relayed(
+            &mallory,
+            bob.agent_id(),
+            opaque_inner(mallory.agent_id().0, [nonce; 32], vec![0u8; 8]),
+        )
+    };
+
+    let epoch = charlie_network
+        .latch_mesh_quiesced()
+        .expect("a fresh latch");
+    let forwarded_before = charlie.peer_relay().stats().snapshot().relay_forwarded;
+    assert!(
+        charlie
+            .push_relayed_dm_for_testing(ant_quic::PeerId([0x33; 32]), frame(0x41))
+            .await,
+        "seam must accept the synthetic relayed DM"
+    );
+    match tokio::time::timeout(Duration::from_millis(1500), bob_sub.recv()).await {
+        Err(_) => {}
+        Ok(msg) => panic!("a latched relay must not forward, got {msg:?}"),
+    }
+    assert_eq!(
+        charlie.peer_relay().stats().snapshot().relay_forwarded,
+        forwarded_before,
+        "no forward is spent while latched"
+    );
+
+    assert!(charlie_network.unlatch_mesh_if_current(epoch));
+    assert!(
+        charlie
+            .push_relayed_dm_for_testing(ant_quic::PeerId([0x33; 32]), frame(0x42))
+            .await,
+        "seam must accept the synthetic relayed DM"
+    );
+    let delivered = tokio::time::timeout(Duration::from_secs(3), bob_sub.recv())
+        .await
+        .expect("unlatched, the frame is forwarded to Bob")
+        .expect("bob subscription open");
+    assert_eq!(delivered.sender, charlie.agent_id());
+}

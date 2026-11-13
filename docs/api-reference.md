@@ -1175,7 +1175,9 @@ traffic before.
 #### Latched dials and seeds
 
 While quiesced, the node serves nobody: a CONNECT-UDP request on any link is
-refused and no hole punch is coordinated for anyone. In a burst, a target
+refused, no hole punch is coordinated for anyone, the node plays no target
+role in a punch a linked peer coordinates (its own punches still work), and
+an enabled peer relay forwards no relayed DM. In a burst, a target
 that announced no introducer of its own may use a bootstrap seed as its one
 hole-punch introducer; the seed learns this node's address and whom it is
 calling, and never relays data. The daemon setting `latched_seed_introducers`
