@@ -1154,7 +1154,8 @@ later from zero) and reads them every `clamp(headroom / 125 MB/s, 10 ms,
 250 ms)`, where the headroom is the bytes left before the cap: 10 ms near the
 cap, up to 250 ms far from it. Above the 10 ms floor a link at the assumed
 worst case of 1 Gbit/s cannot pass the cap between two reads, so overshoot
-still builds up only in the last 10 ms tick. Once the sum reaches the cap it
+is bounded by the link rate times one 10 ms tick plus the counter read and
+the close, plus what the peer already had in flight. Once the sum reaches the cap it
 ends every lease and closes every link. Until the cap is cleared it keeps
 closing any link that comes up within a tick, and every connect, leased or
 not (the raw-send redial of `/direct/send` included), is refused with
@@ -1170,9 +1171,9 @@ ends 300 s
 (`MAX_DEMAND_LEASE_SECS`) after its latest arm, so a burst whose end never
 landed leaves nothing running.
 
-Measured overshoot: about 200 KB over a 1 MiB cap with a peer streaming at
-30 MB/s over loopback, roughly 7 ms of its traffic, against seconds of
-traffic before.
+Measured overshoot: about 0.25 to 1.6 MB, median about 0.5 MB, over a 1 MiB
+cap with a peer streaming 30 to 85 MB/s over loopback in a debug build,
+against seconds of traffic before. Overshoot scales with the link rate.
 
 `GET /diagnostics/connectivity` → `burst_cap` reports it: `armed`,
 `max_bytes`, `counted_bytes`, `tripped` and `tripped_after_ms`.

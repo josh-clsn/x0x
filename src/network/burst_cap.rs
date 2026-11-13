@@ -44,8 +44,9 @@ pub(crate) const BURST_CAP_ASSUMED_RATE: u64 = 125_000_000;
 ///
 /// Above the 10 ms floor, a link at the assumed rate cannot move more than
 /// the headroom before the next read, so the cap is never passed between two
-/// reads; overshoot can only build up in the last 10 ms tick, as with a fixed
-/// 10 ms tick. Far from the cap the task wakes up to 25 times less often.
+/// reads; overshoot stays within one 10 ms tick plus the counter read and the
+/// close, plus what the peer already had in flight, as with a fixed 10 ms tick.
+/// Far from the cap the task wakes up to 25 times less often.
 pub(crate) fn burst_cap_tick(headroom: u64) -> Duration {
     let micros = u128::from(headroom) * 1_000_000 / u128::from(BURST_CAP_ASSUMED_RATE);
     let micros = u64::try_from(micros).unwrap_or(u64::MAX);
