@@ -1137,6 +1137,19 @@ table) and a non-live outcome echo `null`. The next
 and sweeps every peer. A lease changes nothing else: inbound links are still
 refused and gossip frames are still dropped on the leased link.
 
+#### Latched dials and seeds
+
+While quiesced, the node serves nobody: a CONNECT-UDP request on any link is
+refused and no hole punch is coordinated for anyone. In a burst, a target
+that announced no introducer of its own may use a bootstrap seed as its one
+hole-punch introducer; the seed learns this node's address and whom it is
+calling, and never relays data. The daemon setting `latched_seed_introducers`
+(TOML, default `true`) set to `false` refuses that fallback while latched.
+`GET /diagnostics/connectivity` → `relay_client` reports
+`relay_service_allowed`, `seed_introducers_allowed`,
+`latched_seed_introducers`, `introducer_seed_dials` (since start),
+`introducer_dials_24h` and `introducer_seed_dials_24h`.
+
 ### Own peers
 
 `PUT /mesh/own-peers` names this account's own devices, replacing the

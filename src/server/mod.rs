@@ -1957,6 +1957,9 @@ pub async fn serve_with_options(
     if defer_mesh_join {
         agent.mark_mesh_join_deferred();
     }
+    if let Some(network) = agent.network() {
+        network.set_latched_seed_introducers_allowed(config.latched_seed_introducers);
+    }
 
     // Start the DM inbox as soon as join_network has created the gossip
     // runtime. join_network may keep working through slow bootstrap/cache

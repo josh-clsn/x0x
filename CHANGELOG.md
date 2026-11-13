@@ -120,6 +120,13 @@ engine-A routes, and the four TreeKEM catch-up routes).
   live peer did, so one contact's device learned whom the phone was calling.
   Body `{"agent_ids": [...], "machine_ids": [...]}`, replacing the list;
   agent ids are resolved at every burst dial. CLI `x0x mesh own-peers`.
+- **Seed introducer dials are counted, and `latched_seed_introducers` can
+  refuse them (M-3).** `relay_client` gains `introducer_seed_dials`,
+  `introducer_dials_24h`, `introducer_seed_dials_24h`,
+  `seed_introducers_allowed` and `latched_seed_introducers`. The new daemon
+  setting `latched_seed_introducers` (default `true`, today's behaviour)
+  set to `false` stops a latched burst dial from using a seed as its
+  hole-punch introducer (ant-quic `set_known_peer_introducers_allowed`).
 
 ### Changed
 
@@ -222,7 +229,10 @@ engine-A routes, and the four TreeKEM catch-up routes).
   the 0.27.61 release tag `6fe2a52`). Adds `set_proactive_relay_allowed`,
   `set_relay_fallback_allowed`, `set_coordinator_policy` (with
   `set_peer_introducers`, `reset_introducer_budget` and `introducer_stats`),
-  `relay_client_stats` and a `test-hooks` feature. The patch replaces
+  `relay_client_stats` and a `test-hooks` feature. The latch-hardening
+  commits on top add `set_relay_service_allowed`, `set_own_peers`,
+  `set_known_peer_introducers_allowed`, `IntroducerStats::known_peer_dials`
+  and an introducer hint table that evicts its oldest target. The patch replaces
   ant-quic for the whole graph, the saorsa-gossip crates included. A
   `[patch]` applies only in the root workspace that declares it, so
   `crates/fetchit-ffi` must carry the same entry at the same rev.

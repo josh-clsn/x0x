@@ -39,6 +39,7 @@ pub(crate) struct TransportRelay {
     pub(crate) proactive_relay_allowed: bool,
     pub(crate) relay_fallback_allowed: bool,
     pub(crate) relay_service_allowed: bool,
+    pub(crate) known_peer_introducers_allowed: bool,
     pub(crate) coordinator_policy: ant_quic::CoordinatorPolicy,
     pub(crate) stats: ant_quic::RelayClientStats,
     pub(crate) introducers: ant_quic::IntroducerStats,
@@ -75,6 +76,22 @@ pub struct RelayClientSnapshot {
     pub coordinator_policy: Option<String>,
     /// Hole-punch introducer connections dialled since start.
     pub introducer_dials: u64,
+    /// Of those, dials to a seed: a known peer taken because the target
+    /// announced no introducer of its own (M-3). The seed learns this
+    /// node's address and whom it is calling.
+    pub introducer_seed_dials: u64,
+    /// Introducer dials in the last 24 hours (each stamped when a sample
+    /// first saw it: at the end of a burst dial, at a latch call or at a
+    /// read of this snapshot).
+    pub introducer_dials_24h: u64,
+    /// Of those, dials to a seed.
+    pub introducer_seed_dials_24h: u64,
+    /// Whether ant-quic may take a seed as an introducer now: false while
+    /// latched when `latched_seed_introducers` is off.
+    pub seed_introducers_allowed: Option<bool>,
+    /// The daemon setting `latched_seed_introducers`: whether a latched
+    /// burst dial may fall back to a seed as its introducer.
+    pub latched_seed_introducers: bool,
     /// UDP bytes sent on introducer connections, counted as each closed.
     pub introducer_bytes_sent: u64,
     /// UDP bytes received on introducer connections, counted as each
@@ -150,12 +167,18 @@ impl RelayClientCounters {
     /// Snapshot for `GET /diagnostics/connectivity` → `relay_client`, with
     /// the endpoint's switch and session stats when there is one.
     #[must_use]
-    pub(crate) fn snapshot(&self, transport: Option<TransportRelay>) -> RelayClientSnapshot {
+    pub(crate) fn snapshot(
+        &self,
+        transport: Option<TransportRelay>,
+        day: super::introducer_day::IntroducerDayCounts,
+        latched_seed_introducers: bool,
+    ) -> RelayClientSnapshot {
         let switches = transport.as_ref().map(|t| {
             (
                 t.proactive_relay_allowed,
                 t.relay_fallback_allowed,
                 t.relay_service_allowed,
+                t.known_peer_introducers_allowed,
                 match t.coordinator_policy {
                     ant_quic::CoordinatorPolicy::Any => "any",
                     ant_quic::CoordinatorPolicy::ConnectedOnly => "connected_only",
@@ -179,8 +202,13 @@ impl RelayClientCounters {
             proactive_relay_allowed: switches.map(|s| s.0),
             relay_fallback_allowed: switches.map(|s| s.1),
             relay_service_allowed: switches.map(|s| s.2),
-            coordinator_policy: switches.map(|s| s.3.to_string()),
+            coordinator_policy: switches.map(|s| s.4.to_string()),
             introducer_dials: introducers.dials,
+            introducer_seed_dials: introducers.known_peer_dials,
+            introducer_dials_24h: day.dials,
+            introducer_seed_dials_24h: day.seed_dials,
+            seed_introducers_allowed: switches.map(|s| s.3),
+            latched_seed_introducers,
             introducer_bytes_sent: introducers.bytes_sent,
             introducer_bytes_received: introducers.bytes_received,
             active_sessions: stats.active_sessions,
@@ -211,7 +239,7 @@ mod tests {
     #[test]
     fn nothing_recorded_before_a_session() {
         assert_eq!(
-            RelayClientCounters::default().snapshot(None),
+            RelayClientCounters::default().snapshot(None, Default::default(), false),
             RelayClientSnapshot::default()
         );
     }
@@ -221,7 +249,7 @@ mod tests {
         let counters = RelayClientCounters::default();
         counters.observe(&relay(4000), false);
         counters.observe(&relay(4001), true);
-        let snap = counters.snapshot(None);
+        let snap = counters.snapshot(None, Default::default(), false);
         assert_eq!(snap.sessions_established, 2);
         assert_eq!(snap.established_while_quiesced, 1);
         assert_eq!(snap.last_relay_addr.as_deref(), Some("203.0.113.7:4001"));
@@ -232,7 +260,12 @@ mod tests {
     fn a_lag_is_counted() {
         let counters = RelayClientCounters::default();
         counters.note_lag(12);
-        assert_eq!(counters.snapshot(None).events_lagged, 1);
+        assert_eq!(
+            counters
+                .snapshot(None, Default::default(), false)
+                .events_lagged,
+            1
+        );
     }
 
     #[test]
@@ -244,6 +277,9 @@ mod tests {
             },
             true,
         );
-        assert_eq!(counters.snapshot(None), RelayClientSnapshot::default());
+        assert_eq!(
+            counters.snapshot(None, Default::default(), false),
+            RelayClientSnapshot::default()
+        );
     }
 }

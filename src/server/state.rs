@@ -330,6 +330,15 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub defer_mesh_join: bool,
 
+    /// M-3: whether a burst dial made while the mesh is latched may use a
+    /// bootstrap seed as its hole-punch introducer when the target announced
+    /// no introducer of its own. The seed then learns this node's address and
+    /// whom it is calling; it never relays data. With `false` such a target
+    /// gets no hole punch while latched. Default `true` (the 11/10 rule:
+    /// public nodes may introduce). Meshed dials are not affected.
+    #[serde(default = "default_latched_seed_introducers")]
+    pub latched_seed_introducers: bool,
+
     /// X0X-0062 reviewer P2 #2: enable or disable ant-quic's best-effort
     /// UPnP IGD port-mapping. Default `true` (matches ant-quic). Set to
     /// `false` in the daemon TOML (`port_mapping_enabled = false`) or via
@@ -576,6 +585,10 @@ fn default_bootstrap_peers() -> Vec<SocketAddr> {
 }
 
 fn default_port_mapping_enabled() -> bool {
+    true
+}
+
+fn default_latched_seed_introducers() -> bool {
     true
 }
 
@@ -863,6 +876,7 @@ impl Default for DaemonConfig {
             api_watchdog: super::ApiWatchdogConfig::default(),
             leaf_mode: false,
             defer_mesh_join: false,
+            latched_seed_introducers: true,
         }
     }
 }
@@ -1923,6 +1937,16 @@ mod tests {
         let both: DaemonConfig = toml::from_str("leaf_mode = true\nskip_legacy_dm_bus = true\n")
             .expect("both keys parse");
         assert!(both.skips_legacy_dm_bus());
+    }
+
+    #[test]
+    fn daemon_config_latched_seed_introducers_defaults_true() {
+        assert!(DaemonConfig::default().latched_seed_introducers);
+        let cfg: DaemonConfig = toml::from_str("").expect("empty TOML parses");
+        assert!(cfg.latched_seed_introducers);
+        let cfg: DaemonConfig = toml::from_str("latched_seed_introducers = false")
+            .expect("latched_seed_introducers TOML parses");
+        assert!(!cfg.latched_seed_introducers);
     }
 
     #[test]

@@ -25,6 +25,7 @@
 use crate::error::{NetworkError, NetworkResult};
 
 mod churn;
+mod introducer_day;
 mod redial_flaps;
 mod relay_client;
 use self::churn::ChurnCounters;
@@ -2204,6 +2205,11 @@ pub struct NetworkNode {
     /// M-2: the own peers the embedder named (`PUT /mesh/own-peers`), kept
     /// so agent ids not yet resolved to a machine can be resolved later.
     own_peer_request: Arc<Mutex<OwnPeerRequest>>,
+    /// M-3: introducer dials in the last day, sampled from ant-quic.
+    introducer_day: Arc<Mutex<introducer_day::IntroducerDay>>,
+    /// M-3: whether a latched burst dial may fall back to a seed as its
+    /// hole-punch introducer (daemon setting `latched_seed_introducers`).
+    latched_seed_introducers: Arc<AtomicBool>,
     /// Receiver channel for direct messages (separate from gossip).
     direct_tx: mpsc::Sender<DirectEvent>,
     direct_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<DirectEvent>>>,
@@ -2726,6 +2732,8 @@ impl NetworkNode {
             relay_switch: Arc::new(OnceLock::new()),
             burst_dials: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             own_peer_request: Arc::new(Mutex::new(OwnPeerRequest::default())),
+            introducer_day: Arc::new(Mutex::new(introducer_day::IntroducerDay::default())),
+            latched_seed_introducers: Arc::new(AtomicBool::new(true)),
             direct_tx,
             direct_rx: Arc::new(tokio::sync::Mutex::new(direct_rx)),
             relayed_dm_tx,
@@ -4668,6 +4676,7 @@ impl NetworkNode {
         self.clear_demand_leases();
         // Every latch call ends a burst: the next burst gets a fresh
         // introducer budget (one per target).
+        self.sample_introducer_day();
         if let Some(endpoint) = self.relay_switch.get() {
             endpoint.reset_introducer_budget();
         }
@@ -4803,6 +4812,11 @@ impl NetworkNode {
     /// how many of them came while the mesh-off latch held (R-3).
     #[must_use]
     pub fn relay_client_snapshot(&self) -> RelayClientSnapshot {
+        self.sample_introducer_day();
+        let day = match self.introducer_day.lock() {
+            Ok(mut day) => day.counts(tokio::time::Instant::now()),
+            Err(poisoned) => poisoned.into_inner().counts(tokio::time::Instant::now()),
+        };
         let transport = self
             .relay_switch
             .get()
@@ -4810,11 +4824,16 @@ impl NetworkNode {
                 proactive_relay_allowed: endpoint.proactive_relay_allowed(),
                 relay_fallback_allowed: endpoint.relay_fallback_allowed(),
                 relay_service_allowed: endpoint.relay_service_allowed(),
+                known_peer_introducers_allowed: endpoint.known_peer_introducers_allowed(),
                 coordinator_policy: endpoint.coordinator_policy(),
                 stats: endpoint.relay_client_stats(),
                 introducers: endpoint.introducer_stats(),
             });
-        self.relay_client.snapshot(transport)
+        self.relay_client.snapshot(
+            transport,
+            day,
+            self.latched_seed_introducers.load(Ordering::SeqCst),
+        )
     }
 
     /// R-3: while the mesh is latched (bursts included), ant-quic never
@@ -4849,6 +4868,37 @@ impl NetworkNode {
             });
             endpoint.set_proactive_relay_allowed(!latched);
             endpoint.set_relay_service_allowed(!latched);
+            let seeds_allowed = self.latched_seed_introducers.load(Ordering::SeqCst);
+            endpoint.set_known_peer_introducers_allowed(!latched || seeds_allowed);
+        }
+    }
+
+    /// M-3: allow or refuse a seed as the hole-punch introducer of a
+    /// latched burst dial (a target that announced no introducer of its own
+    /// then gets no punch). Allowed by default. Takes effect at once.
+    pub fn set_latched_seed_introducers_allowed(&self, allowed: bool) {
+        self.latched_seed_introducers
+            .store(allowed, Ordering::SeqCst);
+        self.sync_switches_under_lock();
+    }
+
+    /// M-3: take ant-quic's introducer totals into the last-day window.
+    fn sample_introducer_day(&self) {
+        let Some(endpoint) = self.relay_switch.get() else {
+            return;
+        };
+        let stats = endpoint.introducer_stats();
+        match self.introducer_day.lock() {
+            Ok(mut day) => day.sample(
+                tokio::time::Instant::now(),
+                stats.dials,
+                stats.known_peer_dials,
+            ),
+            Err(poisoned) => poisoned.into_inner().sample(
+                tokio::time::Instant::now(),
+                stats.dials,
+                stats.known_peer_dials,
+            ),
         }
     }
 
@@ -7851,6 +7901,7 @@ pub(crate) struct BurstDialGuard {
 impl Drop for BurstDialGuard {
     fn drop(&mut self) {
         self.node.burst_dials.fetch_sub(1, Ordering::SeqCst);
+        self.node.sample_introducer_day();
         self.node.sync_switches_under_lock();
     }
 }
@@ -8761,6 +8812,77 @@ mod tests {
         let _ = phone.try_shutdown().await;
         let _ = contact_a.try_shutdown().await;
         let _ = introducer.try_shutdown().await;
+    }
+
+    /// M-3: a latched burst dial to a contact that announced no introducer
+    /// falls back to the seed, and that shows in the last day's counts. With
+    /// the `latched_seed_introducers` setting off, the next burst never
+    /// contacts the seed; meshed, the setting has no effect.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn seed_introducer_dials_are_counted_and_the_setting_turns_them_off() {
+        let seed = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("seed");
+        let seed_addr = seed.bound_addr().await.expect("seed bound");
+        let phone = NetworkNode::new(loopback_quic_config(vec![seed_addr]), None, None)
+            .await
+            .expect("phone");
+        phone.latch_mesh_quiesced().expect("fresh latch");
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind silent");
+        let silent_addr = silent.local_addr().expect("silent addr");
+        let burst_dial = |phone: &NetworkNode, contact: AntPeerId| {
+            let phone = phone.clone();
+            async move {
+                let _burst = phone.begin_burst_dial();
+                let result = tokio::time::timeout(
+                    Duration::from_secs(60),
+                    phone.connect_peer_with_addrs(contact, vec![silent_addr]),
+                )
+                .await;
+                assert!(
+                    !matches!(result, Ok(Ok(_))),
+                    "the dead address cannot connect"
+                );
+            }
+        };
+
+        burst_dial(&phone, ant_quic::PeerId([0x71; 32])).await;
+        assert_eq!(inbound_connects(&seed).await, 1, "the seed fallback");
+        let snap = phone.relay_client_snapshot();
+        assert_eq!(snap.introducer_seed_dials, 1);
+        assert_eq!(
+            (snap.introducer_dials_24h, snap.introducer_seed_dials_24h),
+            (1, 1),
+            "{snap:?}"
+        );
+        assert!(snap.latched_seed_introducers);
+        assert_eq!(snap.seed_introducers_allowed, Some(true));
+
+        phone.set_latched_seed_introducers_allowed(false);
+        assert!(phone.latch_mesh_quiesced().is_none(), "a new burst");
+        assert_eq!(
+            phone.relay_client_snapshot().seed_introducers_allowed,
+            Some(false)
+        );
+        burst_dial(&phone, ant_quic::PeerId([0x72; 32])).await;
+        assert_eq!(
+            inbound_connects(&seed).await,
+            1,
+            "with the setting off a latched burst never contacts the seed"
+        );
+        let snap = phone.relay_client_snapshot();
+        assert_eq!(snap.introducer_seed_dials_24h, 1);
+        assert!(!snap.latched_seed_introducers);
+
+        assert!(phone.unlatch_mesh_if_current(phone.mesh_transition_epoch()));
+        assert_eq!(
+            phone.relay_client_snapshot().seed_introducers_allowed,
+            Some(true)
+        );
+
+        drop(silent);
+        let _ = phone.try_shutdown().await;
+        let _ = seed.try_shutdown().await;
     }
 
     /// Inbound connections `node` has accepted since start (cumulative, so
