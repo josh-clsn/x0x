@@ -2382,6 +2382,9 @@ struct BurstCapState {
     /// The armed cap and what counts toward it.
     count: Option<burst_cap::BurstCapCount>,
     armed_at: Option<tokio::time::Instant>,
+    /// Bumped on every arm and lowering, so an idle end decided before a
+    /// concurrent arm does not clear the cap that arm relies on.
+    arm_seq: u64,
     /// The latest arm or lowering; the cap ends [`crate::MAX_DEMAND_LEASE_SECS`]
     /// after it whatever else happens.
     last_armed_at: Option<tokio::time::Instant>,
@@ -4907,6 +4910,7 @@ impl NetworkNode {
             if let Some(count) = state.count.as_mut() {
                 count.lower_to(max_bytes);
                 state.last_armed_at = Some(tokio::time::Instant::now());
+                state.arm_seq = state.arm_seq.wrapping_add(1);
                 return true;
             }
         }
@@ -4919,12 +4923,14 @@ impl NetworkNode {
         if let Some(count) = state.count.as_mut() {
             count.lower_to(max_bytes);
             state.last_armed_at = Some(now);
+            state.arm_seq = state.arm_seq.wrapping_add(1);
             return true;
         }
         state.generation = state.generation.wrapping_add(1);
         state.count = Some(burst_cap::BurstCapCount::arm(max_bytes, links));
         state.armed_at = Some(now);
         state.last_armed_at = Some(now);
+        state.arm_seq = state.arm_seq.wrapping_add(1);
         let node = self.clone();
         let generation = state.generation;
         state.task = Some(tokio::spawn(async move {
@@ -4947,12 +4953,34 @@ impl NetworkNode {
         };
     }
 
-    /// M-5: the enforcement task of `generation` ends its own cap.
+    /// M-5: the enforcement task of `generation` ends its own cap at the
+    /// lifetime backstop.
     fn end_burst_cap_from_task(&self, generation: u64) {
         let mut state = self.burst_cap_guard();
         if state.generation != generation {
             return;
         }
+        Self::end_burst_cap_locked(&mut state, generation);
+    }
+
+    /// M-5: end the idle cap of `generation`, as seen at arm `seen_arm_seq`.
+    /// Rechecked under the cap's lock: nothing armed or lowered it since, no
+    /// burst dial is in flight (a connect arms inside its burst dial) and no
+    /// demand lease is unexpired. Returns whether it ended.
+    fn end_burst_cap_if_idle(&self, generation: u64, seen_arm_seq: u64) -> bool {
+        let mut state = self.burst_cap_guard();
+        if state.generation != generation
+            || state.arm_seq != seen_arm_seq
+            || self.burst_dials.load(Ordering::SeqCst) != 0
+            || self.any_demand_lease(tokio::time::Instant::now())
+        {
+            return false;
+        }
+        Self::end_burst_cap_locked(&mut state, generation);
+        true
+    }
+
+    fn end_burst_cap_locked(state: &mut BurstCapState, generation: u64) {
         // This task is the one ending; dropping its handle detaches it.
         drop(state.task.take());
         *state = BurstCapState {
@@ -5064,7 +5092,7 @@ impl NetworkNode {
                 return;
             }
             let now = tokio::time::Instant::now();
-            let (tripped, expired) = {
+            let (tripped, expired, arm_seq) = {
                 let state = self.burst_cap_guard();
                 if state.generation != generation {
                     return;
@@ -5074,6 +5102,7 @@ impl NetworkNode {
                     state
                         .last_armed_at
                         .is_some_and(|at| now.saturating_duration_since(at) >= lifetime),
+                    state.arm_seq,
                 )
             };
             if expired {
@@ -5084,10 +5113,13 @@ impl NetworkNode {
                 self.close_links_for_burst_cap(generation).await;
                 continue;
             }
-            if !self.any_demand_lease(now) && self.burst_dials.load(Ordering::SeqCst) == 0 {
-                // The burst's links are gone and nothing is dialling: the cap
-                // has nothing left to guard.
-                self.end_burst_cap_from_task(generation);
+            if !self.any_demand_lease(now)
+                && self.burst_dials.load(Ordering::SeqCst) == 0
+                && self.connected_peers().await.is_empty()
+                && self.end_burst_cap_if_idle(generation, arm_seq)
+            {
+                // No lease, nothing dialling and no link left: the cap has
+                // nothing left to guard.
                 return;
             }
             let links = self.link_byte_counters().await;
@@ -9414,6 +9446,93 @@ mod tests {
             "the latch lifting clears it"
         );
         let _ = node.try_shutdown().await;
+    }
+
+    /// A latched phone with a live, unleased link to a peer and an armed cap
+    /// (no burst dial in flight, no lease).
+    async fn latched_phone_with_live_link_and_cap() -> (NetworkNode, NetworkNode) {
+        let peer = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("peer");
+        let phone = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("phone");
+        phone.latch_mesh_quiesced().expect("fresh latch");
+        let burst = phone.begin_burst_dial();
+        phone
+            .connect_addr(peer.bound_addr().await.expect("peer bound"))
+            .await
+            .expect("the phone reaches the peer");
+        assert!(phone.arm_burst_cap(1 << 30).await);
+        drop(burst);
+        (phone, peer)
+    }
+
+    /// M-5 (re-review N-1): the idle end waits for the burst's links. With a
+    /// link still up (here unleased, as after a failed end-of-burst quiesce)
+    /// the cap stays armed; once the link is gone it ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_idle_end_waits_for_live_links() {
+        let (phone, peer) = latched_phone_with_live_link_and_cap().await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(phone.is_connected(&peer.peer_id()).await);
+        assert!(
+            phone.burst_cap_snapshot().armed,
+            "a live link keeps the cap armed"
+        );
+
+        phone
+            .disconnect(&peer.peer_id())
+            .await
+            .expect("the link closes");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while phone.burst_cap_snapshot().armed {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "with the link gone the cap ends"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = phone.try_shutdown().await;
+        let _ = peer.try_shutdown().await;
+    }
+
+    /// M-5 (re-review N-2): an idle end decided before a concurrent arm does
+    /// not clear the cap. The end is rechecked under the cap's lock: a stale
+    /// arm sequence (an arm or lowering since the task's read) or a burst
+    /// dial in flight keeps the cap. The race is replayed deterministically
+    /// by calling the end with the task's earlier view; the live link keeps
+    /// the task itself from ending the cap meanwhile.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_idle_end_never_clears_a_cap_armed_after_its_read() {
+        let (phone, peer) = latched_phone_with_live_link_and_cap().await;
+        let (generation, seen) = {
+            let state = phone.burst_cap_guard();
+            (state.generation, state.arm_seq)
+        };
+
+        // A connect arms (lowers) the cap after the task's read.
+        let burst = phone.begin_burst_dial();
+        assert!(phone.arm_burst_cap(1 << 20).await);
+        assert!(
+            !phone.end_burst_cap_if_idle(generation, seen),
+            "a burst dial is in flight"
+        );
+        drop(burst);
+        assert!(
+            !phone.end_burst_cap_if_idle(generation, seen),
+            "the cap was armed after the task's read"
+        );
+        assert_eq!(phone.burst_cap_snapshot().max_bytes, Some(1 << 20));
+
+        let current = phone.burst_cap_guard().arm_seq;
+        assert!(
+            phone.end_burst_cap_if_idle(generation, current),
+            "with nothing since, the idle end goes ahead"
+        );
+        assert!(!phone.burst_cap_snapshot().armed);
+        let _ = phone.try_shutdown().await;
+        let _ = peer.try_shutdown().await;
     }
 
     /// M-5 (L-2): an armed cap that has not tripped ends by itself once no

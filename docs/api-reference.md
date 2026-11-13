@@ -1161,7 +1161,8 @@ on, `max_bytes` is ignored. CLI: `x0x direct connect --lease-secs 90
 
 The cap is cleared by the next `POST /mesh/quiesce` (which ends the burst)
 or `POST /mesh/join`. An armed cap that has not tripped also ends once no
-lease remains and no leased connect is in flight, and any cap ends 300 s
+lease remains, no leased connect is in flight and no link is up, and any cap
+ends 300 s
 (`MAX_DEMAND_LEASE_SECS`) after its latest arm, so a burst whose end never
 landed leaves nothing running.
 
