@@ -283,8 +283,8 @@ pub(in crate::server) async fn mesh_quiesce(
 /// PUT /mesh/own-peers request body: this account's own devices.
 #[derive(Debug, serde::Deserialize)]
 pub(in crate::server) struct OwnPeersRequest {
-    /// Own devices by agent id (64-char hex). Resolved to machines from the
-    /// discovery cache now and again at every burst dial.
+    /// Own devices by agent id (64-char hex). Resolved to machines through
+    /// the authority stores (ADR 0115) now and again at every burst dial.
     #[serde(default)]
     agent_ids: Vec<String>,
     /// Own devices by machine id (64-char hex).

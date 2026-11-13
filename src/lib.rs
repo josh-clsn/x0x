@@ -22771,10 +22771,6 @@ tokio::task_local! {
     static DIALED_MACHINE: std::cell::Cell<Option<identity::MachineId>>;
 }
 
-/// Lease `machine` for `lease` after a leased connect ended in `outcome`.
-/// Returns whether a lease was recorded: never for a dead outcome, a zero
-/// lease, no authenticated machine, a clear since `generation` (a quiesce
-/// that ended the burst during the dial wins) or a full table.
 /// The error a dial gets once the burst's byte cap is reached (M-5).
 fn burst_cap_reached_error() -> error::IdentityError {
     error::IdentityError::Storage(std::io::Error::other(
@@ -22782,6 +22778,10 @@ fn burst_cap_reached_error() -> error::IdentityError {
     ))
 }
 
+/// Lease `machine` for `lease` after a leased connect ended in `outcome`.
+/// Returns whether a lease was recorded: never for a dead outcome, a zero
+/// lease, no authenticated machine, a clear since `generation` (a quiesce
+/// that ended the burst during the dial wins) or a full table.
 fn record_demand_lease(
     network: &network::NetworkNode,
     generation: u64,
