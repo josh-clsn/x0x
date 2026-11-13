@@ -2712,8 +2712,10 @@ impl NetworkNode {
                 "ant-quic peer ID does not match pub-sub signer".to_string(),
             ));
         }
-        // L-3: a node that starts latched sets the latched switches before
-        // anything else runs; assembly then syncs them from the latch.
+        // OQ5 and L-3: these switches are set before anything else runs, and
+        // assembly then syncs them from the latch. ant-quic has no builder
+        // option for them, so the endpoint listens with its defaults for the
+        // few statements between `Node::with_config` returning and here.
         if config.metered_leaf {
             node.inner_endpoint().set_relay_service_allowed(false);
         }
@@ -9701,6 +9703,34 @@ mod tests {
             "lifting the latch does not turn it on"
         );
         assert_eq!(snap.coordinator_policy.as_deref(), Some("any"));
+
+        assert!(phone.latch_mesh_quiesced().is_some(), "latched again");
+        {
+            let _burst = phone.begin_burst_dial();
+            let snap = phone.relay_client_snapshot();
+            assert_eq!(snap.coordinator_policy.as_deref(), Some("introducer"));
+            assert_eq!(snap.relay_service_allowed, Some(false), "off in a burst");
+        }
+        assert!(phone.unlatch_mesh_if_current(phone.mesh_transition_epoch()));
+
+        let latched_leaf = NetworkNode::new(
+            NetworkConfig {
+                metered_leaf: true,
+                start_quiesced: true,
+                ..loopback_quic_config(Vec::new())
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("latched leaf");
+        assert!(latched_leaf.unlatch_mesh_if_current(latched_leaf.mesh_transition_epoch()));
+        assert_eq!(
+            latched_leaf.relay_client_snapshot().relay_service_allowed,
+            Some(false),
+            "a leaf that starts latched stays off once meshed"
+        );
+        let _ = latched_leaf.try_shutdown().await;
 
         let desktop = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
             .await
