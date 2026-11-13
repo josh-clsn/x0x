@@ -147,7 +147,7 @@ dependencies = [
 [[package]]
 name = "ant-quic"
 version = "0.27.61"
-source = "git+https://github.com/josh-clsn/ant-quic?rev=77c1c1acb484f1c4bfce58ba38ba2ba7e209bf21#77c1c1acb484f1c4bfce58ba38ba2ba7e209bf21"
+source = "git+https://github.com/josh-clsn/ant-quic?rev=fa9c90fe31c6901e692782cc9373470956172b44#fa9c90fe31c6901e692782cc9373470956172b44"
 dependencies = [
  "anyhow",
  "async-trait",
