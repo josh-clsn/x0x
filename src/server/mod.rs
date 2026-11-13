@@ -742,6 +742,9 @@ pub async fn serve_with_options(
         peer_relay: config.peer_relay.clone(),
         network_id,
         observed_prefix_enabled: config.observed_prefix_enabled,
+        // L-3: a deferred mesh join starts latched inside the daemon, so no
+        // window exists before the embedder's first latch call.
+        start_quiesced: config.defer_mesh_join,
     };
 
     let contacts_path = config.data_dir.join("contacts.json");

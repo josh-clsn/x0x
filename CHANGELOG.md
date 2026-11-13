@@ -229,6 +229,11 @@ engine-A routes, and the four TreeKEM catch-up routes).
   one the node dialled itself included, is refused, the relay sessions it was
   serving end, and it coordinates no hole punch. `GET /diagnostics/connectivity`
   `relay_client.relay_service_allowed` reports the switch.
+- **`defer_mesh_join` starts the daemon latched (L-3).** The network node
+  is built quiesced (`NetworkConfig::start_quiesced`), with ant-quic's
+  switches set before anything runs and the latch's re-sweep started, so no
+  window exists between start and the embedder's first `POST /mesh/quiesce`.
+  `POST /mesh/join` lifts it as before.
 
 ### Carried patches
 

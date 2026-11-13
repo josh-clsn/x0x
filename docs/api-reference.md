@@ -1177,6 +1177,10 @@ calling, and never relays data. The daemon setting `latched_seed_introducers`
 `latched_seed_introducers`, `introducer_seed_dials` (since start),
 `introducer_dials_24h` and `introducer_seed_dials_24h`.
 
+With `defer_mesh_join = true` the daemon starts latched: the node is
+quiesced, with the switches above set, from its first moment, before any
+`POST /mesh/quiesce`. `POST /mesh/join` lifts it as usual.
+
 ### Own peers
 
 `PUT /mesh/own-peers` names this account's own devices, replacing the

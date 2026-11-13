@@ -630,6 +630,12 @@ pub struct NetworkConfig {
     /// `/peers`.
     #[serde(default)]
     pub observed_prefix_enabled: bool,
+    /// L-3: start with the mesh-off latch already held (mesh quiesced and
+    /// ant-quic's switches set), so no window exists between start and the
+    /// embedder's first latch call. The daemon sets it for
+    /// `defer_mesh_join`. Default `false`.
+    #[serde(default)]
+    pub start_quiesced: bool,
 }
 
 /// X0X-0070b: TOML-shaped configuration for the peer-relay fallback
@@ -866,6 +872,7 @@ impl Default for NetworkConfig {
             peer_relay: PeerRelayConfig::default(),
             network_id: None,
             observed_prefix_enabled: false,
+            start_quiesced: false,
         }
     }
 }
@@ -2678,6 +2685,15 @@ impl NetworkNode {
                 "ant-quic peer ID does not match pub-sub signer".to_string(),
             ));
         }
+        // L-3: a node that starts latched sets the latched switches before
+        // anything else runs; assembly then syncs them from the latch.
+        if config.start_quiesced {
+            let endpoint = node.inner_endpoint();
+            endpoint.set_relay_service_allowed(false);
+            endpoint.set_proactive_relay_allowed(false);
+            endpoint.set_relay_fallback_allowed(false);
+            endpoint.set_coordinator_policy(ant_quic::CoordinatorPolicy::ConnectedOnly);
+        }
         // Share the endpoint's cache instance (never a second handle on the
         // same file). The endpoint runs cache maintenance itself.
         let bootstrap_cache = Some(node.bootstrap_cache());
@@ -2746,6 +2762,7 @@ impl NetworkNode {
                 .map(|_| node.subscribe_all_peer_events()),
         ));
 
+        let start_quiesced = config.start_quiesced;
         let network_node = Self {
             node: Arc::new(RwLock::new(Some(node))),
             config,
@@ -2805,8 +2822,8 @@ impl NetworkNode {
             sim_link,
             #[cfg(test)]
             registry_clear_pause_for_test: Arc::new(Mutex::new(None)),
-            mesh_quiesced: Arc::new(AtomicBool::new(false)),
-            mesh_transitions: Arc::new(Mutex::new(0)),
+            mesh_quiesced: Arc::new(AtomicBool::new(start_quiesced)),
+            mesh_transitions: Arc::new(Mutex::new(u64::from(start_quiesced))),
             demand_leases: Arc::new(Mutex::new(DemandLeases::default())),
         };
 
@@ -9241,6 +9258,55 @@ mod tests {
         let _ = node.try_shutdown().await;
     }
 
+    /// L-3: a node configured to start quiesced is latched from its first
+    /// moment: mesh quiesced, every ant-quic switch in its latched state, an
+    /// inbound dial refused, and a later mesh-on with the current epoch
+    /// lifts it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_node_started_quiesced_is_latched_from_the_start() {
+        let phone = NetworkNode::new(
+            NetworkConfig {
+                start_quiesced: true,
+                ..loopback_quic_config(Vec::new())
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("phone");
+        assert!(phone.mesh_quiesced(), "latched at start");
+        let snap = phone.relay_client_snapshot();
+        assert_eq!(snap.proactive_relay_allowed, Some(false));
+        assert_eq!(snap.relay_fallback_allowed, Some(false));
+        assert_eq!(snap.relay_service_allowed, Some(false));
+        assert_eq!(snap.coordinator_policy.as_deref(), Some("connected_only"));
+
+        let peer = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("peer");
+        let _ = peer
+            .connect_addr(phone.bound_addr().await.expect("phone bound"))
+            .await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while phone.is_connected(&peer.peer_id()).await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a node latched at start refuses an inbound dial"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        assert!(phone.unlatch_mesh_if_current(phone.mesh_transition_epoch()));
+        assert!(!phone.mesh_quiesced());
+        assert_eq!(
+            phone.relay_client_snapshot().relay_service_allowed,
+            Some(true)
+        );
+
+        let _ = peer.try_shutdown().await;
+        let _ = phone.try_shutdown().await;
+    }
+
     /// Inbound connections `node` has accepted since start (cumulative, so
     /// a connection that opened and closed during a dial still counts).
     async fn inbound_connects(node: &NetworkNode) -> u64 {
@@ -11821,6 +11887,7 @@ async fn test_mesh_connections_are_bidirectional() {
             peer_relay: PeerRelayConfig::default(),
             network_id: None,
             observed_prefix_enabled: false,
+            start_quiesced: false,
         };
 
         let node = NetworkNode::new(config, None, None).await.unwrap();

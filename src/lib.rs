@@ -24399,7 +24399,7 @@ impl AgentBuilder {
         // struct — the blob responder serves this pair to fetchers.
         let own_pair_user = identity.user_id();
         let own_pair_cert = identity.agent_certificate().cloned();
-        Ok(Agent {
+        let agent = Agent {
             move_state,
             move_state_load_failed,
             move_ceremony_enabled: self.move_ceremony_enabled,
@@ -24491,7 +24491,19 @@ impl AgentBuilder {
                 connect::ConnectPolicy::default(),
             ))),
             owner_trust,
-        })
+        };
+        // L-3: a network that starts latched (`start_quiesced`) gets the
+        // latch's re-sweep at once, as `quiesce_mesh` would start it.
+        if let Some(network) = agent.network.as_ref() {
+            if network.mesh_quiesced() {
+                agent.spawn_tracked(quiesce_resweep_loop(
+                    std::sync::Arc::clone(network),
+                    network.mesh_transition_epoch(),
+                    agent.shutdown_token.clone(),
+                ));
+            }
+        }
+        Ok(agent)
     }
 }
 
@@ -33789,6 +33801,36 @@ mod tests {
     /// racing `join_network` from leaking heartbeat/reaper/presence tasks past
     /// the subsequent `shutdown()` (the registry drains empty because nothing
     // new can enter after close).
+    /// L-3: an agent whose network starts quiesced (the daemon's
+    /// `defer_mesh_join`) is latched before any call.
+    #[tokio::test]
+    async fn an_agent_started_quiesced_is_latched_before_any_call() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("addr")),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                start_quiesced: true,
+                ..Default::default()
+            })
+            .build()
+            .await
+            .expect("agent");
+        assert!(agent.mesh_quiesced(), "latched at build");
+        assert!(agent.mesh_off());
+        let network = agent.network().expect("network");
+        assert_eq!(
+            network.relay_client_snapshot().relay_service_allowed,
+            Some(false)
+        );
+    }
+
     #[tokio::test]
     async fn spawn_tracked_refuses_after_begin_shutdown() {
         let dir = tempfile::tempdir().expect("tmpdir");
