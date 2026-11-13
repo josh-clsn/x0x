@@ -244,6 +244,9 @@ engine-A routes, and the four TreeKEM catch-up routes).
   is acted on unless it is for a punch the node asked for. The node's own
   burst punches still connect. `relay_client.inbound_punch_allowed` reports
   the switch.
+- **Own agent ids resolve through the authority stores (review M-2).** An
+  agent id becomes an own peer only when an authority store confirms its
+  machine (ADR 0115); otherwise it is listed in `unresolved_agent_ids`.
 
 ### Carried patches
 

@@ -1191,18 +1191,20 @@ previous list:
 ```
 
 Both fields are optional (at most 64 each); `{}` clears the list. Agent ids
-are resolved to machines from the discovery cache, now and again at every
-leased `/agents/connect`. The answer is
+are resolved to machines through the authority stores (ADR 0115: the
+discovery cache's machine counts only when an authority store confirms it),
+now and again at every leased `/agents/connect`. The answer is
 `{"ok": true, "machine_ids": [...], "unresolved_agent_ids": [...]}`: the
-machines in force and the agent ids with no known machine yet. Bad hex or an
-oversized list answers 400.
+machines in force and the agent ids no authority store confirms a machine
+for yet. Bad hex or an oversized list answers 400.
 
-Why: a coordination request names the target. In a burst (a leased
-`/agents/connect` while quiesced) a live peer coordinates a hole punch only
-when it is one of these machines or the target announced it as one of its
-own coordinators (`reachable_via`); otherwise the dial uses the target's
-announced introducers. So a contact whose device the phone is linked to
-never learns whom else the phone is calling. Own devices are preferred.
+Why: a coordination request names the target. While quiesced (any dial,
+in a burst or not) a live peer coordinates a hole punch only when it is one
+of these machines or the target announced it as one of its own coordinators
+(`reachable_via`). Otherwise a burst dial uses the target's announced
+introducers, and a dial outside a burst ends after its direct stage. So a
+contact whose device the phone is linked to never learns whom else the
+phone is calling. Own devices are preferred.
 
 While quiesced, a node's own gossip publishes go nowhere. A non-durable
 direct send whose path would be the recipient's gossip inbox therefore

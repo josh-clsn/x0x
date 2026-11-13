@@ -8399,9 +8399,10 @@ impl Agent {
     /// both), replacing the previous list. While latched, a live peer
     /// coordinates a hole punch only when it is one of these or the target
     /// announced it, so no contact's device learns whom this node is
-    /// calling. Agent ids are resolved to machines from the discovery cache
-    /// now and again at every burst dial; the answer lists the machines in
-    /// force and the agent ids not resolved yet.
+    /// calling. Agent ids are resolved to machines through the authority
+    /// stores (ADR 0115) now and again at every burst dial; the answer lists
+    /// the machines in force and the agent ids no authority store confirms
+    /// a machine for yet.
     pub async fn set_own_peers(
         &self,
         agents: Vec<identity::AgentId>,
@@ -8414,6 +8415,23 @@ impl Agent {
             });
         }
         self.refresh_own_peers().await
+    }
+
+    /// The machine an own agent id is on, for [`Self::refresh_own_peers`]:
+    /// an own peer may coordinate every dial while latched, which is an
+    /// authority decision (ADR 0115 §2). The discovery cache's machine
+    /// counts only when an authority store confirms it; with no cache entry
+    /// the authority stores' own binding is used. `None` when no authority
+    /// store names a machine.
+    async fn own_peer_machine(&self, agent: &identity::AgentId) -> Option<identity::MachineId> {
+        let routing = {
+            let cache = self.identity_discovery_cache.read().await;
+            cache.get(agent).map(|entry| entry.machine_id)
+        };
+        match routing {
+            Some(_) => self.authorized_routing_machine(agent, routing).await,
+            None => self.authority_machine(agent).await,
+        }
     }
 
     /// Resolve the own peers the embedder named ([`Self::set_own_peers`])
@@ -8430,18 +8448,15 @@ impl Agent {
             .map(identity::MachineId)
             .collect();
         let mut unresolved_agent_ids = Vec::new();
-        {
-            let cache = self.identity_discovery_cache.read().await;
-            for agent in request.agents {
-                let agent = identity::AgentId(agent);
-                match cache.get(&agent) {
-                    Some(entry) => {
-                        if !machine_ids.contains(&entry.machine_id) {
-                            machine_ids.push(entry.machine_id);
-                        }
+        for agent in request.agents {
+            let agent = identity::AgentId(agent);
+            match self.own_peer_machine(&agent).await {
+                Some(machine) => {
+                    if !machine_ids.contains(&machine) {
+                        machine_ids.push(machine);
                     }
-                    None => unresolved_agent_ids.push(agent),
                 }
+                None => unresolved_agent_ids.push(agent),
             }
         }
         network.set_own_peers(
@@ -31303,6 +31318,41 @@ mod tests {
         assert!(alice.mesh_quiesced());
         assert!(!network.demand_leased(&bob_peer, tokio::time::Instant::now()));
         await_disconnected(&network, &bob_peer).await;
+    }
+
+    /// M-2 (review): an own agent id resolves only through the authority
+    /// stores (ADR 0115). A discovery entry no authority store confirms does
+    /// not make its machine an own peer; once an authenticated binding
+    /// confirms it, it does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn own_peers_resolve_only_through_the_authority_stores() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (alice, _bob, _bob_addr) = leaf_and_peer(dir.path()).await;
+        let network = std::sync::Arc::clone(alice.network().expect("network"));
+        let device = identity::AgentId([0x6e; 32]);
+        let machine = identity::MachineId([0x6f; 32]);
+        alice.identity_discovery_cache.write().await.insert(
+            device,
+            card_pin(
+                device,
+                machine,
+                vec!["127.0.0.1:9".parse().expect("addr")],
+                Agent::unix_timestamp_secs(),
+            ),
+        );
+
+        let own = alice.set_own_peers(vec![device], Vec::new()).await;
+        assert!(own.machine_ids.is_empty(), "{own:?}");
+        assert_eq!(own.unresolved_agent_ids, vec![device]);
+        assert!(network.own_peers().is_empty());
+
+        alice
+            .record_authenticated_machine_binding_for_testing(device, machine)
+            .await;
+        let own = alice.refresh_own_peers().await;
+        assert_eq!(own.machine_ids, vec![machine]);
+        assert!(own.unresolved_agent_ids.is_empty());
+        assert_eq!(network.own_peers(), vec![ant_quic::PeerId(machine.0)]);
     }
 
     /// A zero lease records nothing.
