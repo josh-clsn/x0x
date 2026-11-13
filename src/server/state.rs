@@ -340,6 +340,13 @@ pub struct DaemonConfig {
     #[serde(default = "default_latched_seed_introducers")]
     pub latched_seed_introducers: bool,
 
+    /// OQ5 (audit): never serve a relay session or coordinate a hole punch
+    /// for any peer, meshed or latched; this node's own dials and punches
+    /// are unaffected. For a phone. Not implied by `leaf_mode`, because a
+    /// desktop leaf coordinates its own phone's punches. Default `false`.
+    #[serde(default)]
+    pub relay_service_disabled: bool,
+
     /// X0X-0062 reviewer P2 #2: enable or disable ant-quic's best-effort
     /// UPnP IGD port-mapping. Default `true` (matches ant-quic). Set to
     /// `false` in the daemon TOML (`port_mapping_enabled = false`) or via
@@ -878,6 +885,7 @@ impl Default for DaemonConfig {
             leaf_mode: false,
             defer_mesh_join: false,
             latched_seed_introducers: false,
+            relay_service_disabled: false,
         }
     }
 }
@@ -1938,6 +1946,19 @@ mod tests {
         let both: DaemonConfig = toml::from_str("leaf_mode = true\nskip_legacy_dm_bus = true\n")
             .expect("both keys parse");
         assert!(both.skips_legacy_dm_bus());
+    }
+
+    #[test]
+    fn daemon_config_relay_service_disabled_defaults_false_and_leaf_does_not_imply_it() {
+        assert!(!DaemonConfig::default().relay_service_disabled);
+        let leaf: DaemonConfig = toml::from_str("leaf_mode = true").expect("leaf TOML parses");
+        assert!(
+            !leaf.relay_service_disabled,
+            "a desktop leaf still serves its phone"
+        );
+        let phone: DaemonConfig = toml::from_str("leaf_mode = true\nrelay_service_disabled = true")
+            .expect("phone TOML parses");
+        assert!(phone.relay_service_disabled);
     }
 
     #[test]

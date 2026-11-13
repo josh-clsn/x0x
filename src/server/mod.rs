@@ -745,8 +745,9 @@ pub async fn serve_with_options(
         // L-3: a deferred mesh join starts latched inside the daemon, so no
         // window exists before the embedder's first latch call.
         start_quiesced: config.defer_mesh_join,
-        // OQ5: a metered leaf serves no relay or coordination, even meshed.
-        metered_leaf: config.leaf_mode,
+        // OQ5: not `leaf_mode`, which desktops run too: a desktop leaf still
+        // coordinates its own phone's hole punches.
+        relay_service_disabled: config.relay_service_disabled,
     };
 
     let contacts_path = config.data_dir.join("contacts.json");

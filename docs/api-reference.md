@@ -1189,11 +1189,13 @@ setting `latched_seed_introducers` (TOML, default `false`) is `true`: then a
 bootstrap seed may be its one hole-punch introducer. The seed learns this
 node's address and whom it is calling, and never relays data.
 
-With `leaf_mode = true` the node never serves a relay session or coordinates
-a hole punch for anyone, meshed or latched, so no peer can use it as an
+With the daemon setting `relay_service_disabled = true` (TOML, default
+`false`, for a phone) the node never serves a relay session or coordinates a
+hole punch for anyone, meshed or latched, so no peer can use it as an
 introducer. Its own dials and punches still work, and while meshed it still
-answers a punch another node coordinates to reach it. A library embedder
-that builds `NetworkConfig` itself sets `metered_leaf` for the same rule.
+answers a punch another node coordinates to reach it. `leaf_mode` does not
+imply it: a desktop leaf coordinates its own phone's punches. A library
+embedder that builds `NetworkConfig` itself sets `relay_service_disabled`.
 `GET /diagnostics/connectivity` → `relay_client` reports
 `relay_service_allowed`, `inbound_punch_allowed`, `seed_introducers_allowed`,
 `latched_seed_introducers`, `introducer_seed_dials` (since start),

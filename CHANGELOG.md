@@ -135,10 +135,11 @@ engine-A routes, and the four TreeKEM catch-up routes).
   its hole-punch introducer, since the seed learns whom the node calls; the
   new daemon setting `latched_seed_introducers = true` allows it (ant-quic
   `set_known_peer_introducers_allowed`).
-- **A metered leaf never serves relay or coordination (audit OQ5).** With
-  `leaf_mode = true`, ant-quic's relay service stays off from start, meshed
-  or latched, so a phone on Wi-Fi serves no MASQUE relay session and
-  coordinates no hole punch for anyone.
+- **A phone can refuse to serve relay or coordination (audit OQ5).** The
+  new daemon setting `relay_service_disabled = true` keeps ant-quic's relay
+  service off from start, meshed or latched, so a phone on Wi-Fi serves no
+  MASQUE relay session and coordinates no hole punch for anyone. Not implied
+  by `leaf_mode`: a desktop leaf coordinates its own phone's punches.
 
 ### Changed
 
