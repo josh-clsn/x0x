@@ -247,6 +247,7 @@ engine-A routes, and the four TreeKEM catch-up routes).
 - **Own agent ids resolve through the authority stores (review M-2).** An
   agent id becomes an own peer only when an authority store confirms its
   machine (ADR 0115); otherwise it is listed in `unresolved_agent_ids`.
+- **A target gone from discovery leaves no introducer hints (review L-7).**
 
 ### Carried patches
 
@@ -257,8 +258,9 @@ engine-A routes, and the four TreeKEM catch-up routes).
   `set_peer_introducers`, `reset_introducer_budget` and `introducer_stats`),
   `relay_client_stats` and a `test-hooks` feature. The latch-hardening
   commits on top add `set_relay_service_allowed`, `set_own_peers`,
-  `set_known_peer_introducers_allowed`, `IntroducerStats::known_peer_dials`
-  and an introducer hint table that evicts its oldest target. The patch replaces
+  `set_known_peer_introducers_allowed`, `IntroducerStats::known_peer_dials`,
+  `set_inbound_punch_allowed`, `peer_introducers` and an introducer hint
+  table that evicts its oldest target. The patch replaces
   ant-quic for the whole graph, the saorsa-gossip crates included. A
   `[patch]` applies only in the root workspace that declares it, so
   `crates/fetchit-ffi` must carry the same entry at the same rev.

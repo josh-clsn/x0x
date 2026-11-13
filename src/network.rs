@@ -2213,6 +2213,10 @@ pub struct NetworkNode {
     /// M-2: the own peers the embedder named (`PUT /mesh/own-peers`), kept
     /// so agent ids not yet resolved to a machine can be resolved later.
     own_peer_request: Arc<Mutex<OwnPeerRequest>>,
+    /// L-7 (review): for each agent whose introducers a burst dial handed
+    /// ant-quic, the machine they were recorded under, so they can be
+    /// forgotten once the agent drops out of discovery.
+    burst_hint_machines: Arc<Mutex<HashMap<[u8; 32], AntPeerId>>>,
     /// M-3: introducer dials in the last day, sampled from ant-quic.
     introducer_day: Arc<Mutex<introducer_day::IntroducerDay>>,
     /// M-3: whether a latched burst dial may fall back to a seed as its
@@ -2364,6 +2368,10 @@ pub const MAX_DEMAND_LEASES: usize = 64;
 /// Most own peers `PUT /mesh/own-peers` takes, per kind (agent ids, machine
 /// ids).
 pub const MAX_OWN_PEERS: usize = 64;
+
+/// Most agents whose introducer machines [`NetworkNode`] remembers, the
+/// size of ant-quic's own hint table.
+const MAX_BURST_HINT_AGENTS: usize = 4096;
 
 /// M-5: the current burst's byte cap.
 #[derive(Debug, Default)]
@@ -2784,6 +2792,7 @@ impl NetworkNode {
             relay_switch: Arc::new(OnceLock::new()),
             burst_dials: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             own_peer_request: Arc::new(Mutex::new(OwnPeerRequest::default())),
+            burst_hint_machines: Arc::new(Mutex::new(HashMap::new())),
             introducer_day: Arc::new(Mutex::new(introducer_day::IntroducerDay::default())),
             latched_seed_introducers: Arc::new(AtomicBool::new(true)),
             burst_cap: Arc::new(Mutex::new(BurstCapState::default())),
@@ -5191,6 +5200,39 @@ impl NetworkNode {
         self.relay_switch
             .get()
             .map(|endpoint| endpoint.own_peers())
+            .unwrap_or_default()
+    }
+
+    /// Record that `agent`'s introducers were handed to ant-quic under
+    /// `machine` (bounded at [`MAX_BURST_HINT_AGENTS`]).
+    pub(crate) fn note_burst_hint_machine(&self, agent: [u8; 32], machine: AntPeerId) {
+        let mut map = match self.burst_hint_machines.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if map.len() >= MAX_BURST_HINT_AGENTS && !map.contains_key(&agent) {
+            if let Some(evict) = map.keys().next().copied() {
+                map.remove(&evict);
+            }
+        }
+        map.insert(agent, machine);
+    }
+
+    /// Forget where `agent`'s introducers were recorded, returning the
+    /// machine.
+    pub(crate) fn take_burst_hint_machine(&self, agent: &[u8; 32]) -> Option<AntPeerId> {
+        match self.burst_hint_machines.lock() {
+            Ok(mut guard) => guard.remove(agent),
+            Err(poisoned) => poisoned.into_inner().remove(agent),
+        }
+    }
+
+    /// The introducers ant-quic holds for `peer`.
+    #[must_use]
+    pub fn peer_introducers(&self, peer: &AntPeerId) -> Vec<SocketAddr> {
+        self.relay_switch
+            .get()
+            .map(|endpoint| endpoint.peer_introducers(peer))
             .unwrap_or_default()
     }
 

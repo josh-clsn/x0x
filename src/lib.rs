@@ -8482,13 +8482,26 @@ impl Agent {
             cache.get(agent_id).cloned()
         };
         let Some(entry) = entry else {
+            // L-7 (review): an agent gone from discovery leaves no hints
+            // behind: a stale hint would let whoever holds its address now
+            // coordinate.
+            if let Some(machine) = network.take_burst_hint_machine(&agent_id.0) {
+                network.set_peer_introducers(machine, Vec::new());
+            }
             return;
         };
         let introducers = {
             let machines = self.machine_discovery_cache.read().await;
             burst_introducer_addrs(&entry.reachable_via, &machines)
         };
-        network.set_peer_introducers(ant_quic::PeerId(entry.machine_id.0), introducers);
+        let machine = ant_quic::PeerId(entry.machine_id.0);
+        if let Some(previous) = network.take_burst_hint_machine(&agent_id.0) {
+            if previous != machine {
+                network.set_peer_introducers(previous, Vec::new());
+            }
+        }
+        network.note_burst_hint_machine(agent_id.0, machine);
+        network.set_peer_introducers(machine, introducers);
     }
 
     /// [`Self::connect_to_agent`] for a send whose cold-recipient handling
@@ -31353,6 +31366,52 @@ mod tests {
         assert_eq!(own.machine_ids, vec![machine]);
         assert!(own.unresolved_agent_ids.is_empty());
         assert_eq!(network.own_peers(), vec![ant_quic::PeerId(machine.0)]);
+    }
+
+    /// L-7 (review): a burst dial hands ant-quic the target's announced
+    /// introducers; once the target drops out of discovery, the next burst
+    /// dial to it clears them, so a stale hint confers nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_target_gone_from_discovery_leaves_no_introducer_hints() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (alice, _bob, _bob_addr) = leaf_and_peer(dir.path()).await;
+        let network = std::sync::Arc::clone(alice.network().expect("network"));
+        let now = Agent::unix_timestamp_secs();
+        let relay_agent = identity::AgentId([0x71; 32]);
+        let relay_machine = identity::MachineId([0x72; 32]);
+        let relay_addr: std::net::SocketAddr = "127.0.0.1:9201".parse().expect("addr");
+        alice
+            .insert_discovered_agent_for_testing(card_pin(
+                relay_agent,
+                relay_machine,
+                vec![relay_addr],
+                now,
+            ))
+            .await;
+        let target = identity::AgentId([0x73; 32]);
+        let target_machine = identity::MachineId([0x74; 32]);
+        alice
+            .insert_discovered_agent_for_testing(DiscoveredAgent {
+                reachable_via: vec![relay_machine],
+                ..card_pin(
+                    target,
+                    target_machine,
+                    vec!["127.0.0.1:9202".parse().expect("addr")],
+                    now,
+                )
+            })
+            .await;
+        let target_peer = ant_quic::PeerId(target_machine.0);
+
+        alice.note_burst_introducers(&target).await;
+        assert_eq!(network.peer_introducers(&target_peer), vec![relay_addr]);
+
+        alice.identity_discovery_cache.write().await.remove(&target);
+        alice.note_burst_introducers(&target).await;
+        assert!(
+            network.peer_introducers(&target_peer).is_empty(),
+            "the stale hints are forgotten"
+        );
     }
 
     /// A zero lease records nothing.
