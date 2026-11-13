@@ -948,7 +948,7 @@ or an illegal placement; `501` ceremony disabled.
 | GET | `/network/bootstrap-cache` | `x0x network cache` | Bootstrap cache stats |
 | POST | `/mesh/join` | `x0x mesh join` | Dial the gossip mesh (bootstrap phases); returns immediately with `status: "dialing"` |
 | POST | `/mesh/quiesce` | `x0x mesh quiesce` | Disconnect all mesh peers and latch the mesh off (inbound rejected, gossip sends dropped, reappearing peers re-swept except [leased](#demand-leases) ones) until `/mesh/join`; ends every demand lease; returns `disconnected` count |
-| PUT | `/mesh/own-peers` | `x0x mesh own-peers [--agent ID]... [--machine ID]...` | Name this account's own devices (replaces the list); in a burst only they, or the target's own introducers, coordinate a hole punch. See [Own peers](#own-peers) |
+| PUT | `/mesh/own-peers` | `x0x mesh own-peers [--agent ID]... [--machine ID]...` | Name this account's own devices (replaces the list); while latched only they, or the target's own coordinators, coordinate a hole punch. See [Own peers](#own-peers) |
 | GET | `/peers/:peer_id/health` | `x0x peer health <peer_id>` | Connection health snapshot for a peer |
 | POST | `/peers/:peer_id/probe` | `x0x peer probe <peer_id>` | Active `probe_peer` liveness + RTT check |
 | GET | `/peers/events` | `x0x peer events` | SSE stream of peer lifecycle events |

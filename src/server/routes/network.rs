@@ -293,7 +293,7 @@ pub(in crate::server) struct OwnPeersRequest {
 }
 
 /// PUT /mesh/own-peers — name this account's own devices (M-2), replacing
-/// the previous list. In a burst, a live peer coordinates a hole punch only
+/// the previous list. While latched, a live peer coordinates a hole punch only
 /// when it is one of these or the target announced it, so no contact's
 /// device learns whom this node is calling. Answers with the machines in
 /// force and the agent ids not resolved yet. At most

@@ -5175,7 +5175,7 @@ impl NetworkNode {
         }
     }
 
-    /// M-2: the machines that are this account's own. In a burst, a live
+    /// M-2: the machines that are this account's own. While latched, a live
     /// peer coordinates a hole punch only when it is one of these or the
     /// target announced it as its own coordinator, so no contact's device
     /// learns whom this node is calling. Replaces the previous list.
@@ -9313,6 +9313,70 @@ mod tests {
 
         let _ = peer.try_shutdown().await;
         let _ = phone.try_shutdown().await;
+    }
+
+    /// H-1 and M-3 (review): latched with no burst dial in flight
+    /// (`ConnectedOnly`), a phone linked to contact A never asks A to
+    /// coordinate its dial to contact B, so the dial ends after its direct
+    /// stage. With A marked as the phone's own device, A coordinates and the
+    /// phone's own punch reaches B, although the latched phone refuses the
+    /// target role of punches others coordinate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_latched_dial_outside_a_burst_asks_only_an_own_device_to_coordinate() {
+        let contact_a = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("contact A");
+        let a_addr = contact_a.bound_addr().await.expect("A bound");
+        let contact_b = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("contact B");
+        contact_b
+            .connect_addr(a_addr)
+            .await
+            .expect("B is linked to A");
+        let phone = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("phone");
+        phone.latch_mesh_quiesced().expect("fresh latch");
+        assert!(phone.lease_demand_peer(
+            contact_a.peer_id(),
+            tokio::time::Instant::now() + Duration::from_secs(120),
+        ));
+        phone
+            .connect_addr(a_addr)
+            .await
+            .expect("the phone reaches A");
+        let snap = phone.relay_client_snapshot();
+        assert_eq!(snap.coordinator_policy.as_deref(), Some("connected_only"));
+        assert_eq!(snap.inbound_punch_allowed, Some(false));
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind silent");
+        let silent_addr = silent.local_addr().expect("silent addr");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            phone.connect_peer_with_addrs(contact_b.peer_id(), vec![silent_addr]),
+        )
+        .await;
+        assert!(
+            !matches!(result, Ok(Ok(_))),
+            "contact A must not coordinate the dial to B"
+        );
+
+        phone.set_own_peers(vec![contact_a.peer_id()]);
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            phone.connect_peer_with_addrs(contact_b.peer_id(), vec![silent_addr]),
+        )
+        .await;
+        assert!(
+            matches!(result, Ok(Ok(_))),
+            "an own device coordinates, and the phone's own punch reaches B: {result:?}"
+        );
+
+        drop(silent);
+        let _ = phone.try_shutdown().await;
+        let _ = contact_b.try_shutdown().await;
+        let _ = contact_a.try_shutdown().await;
     }
 
     /// Inbound connections `node` has accepted since start (cumulative, so

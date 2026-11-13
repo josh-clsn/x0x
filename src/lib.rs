@@ -8396,7 +8396,7 @@ impl Agent {
     }
 
     /// M-2: name this account's own devices (by agent id, by machine id or
-    /// both), replacing the previous list. In a burst, a live peer
+    /// both), replacing the previous list. While latched, a live peer
     /// coordinates a hole punch only when it is one of these or the target
     /// announced it, so no contact's device learns whom this node is
     /// calling. Agent ids are resolved to machines from the discovery cache

@@ -234,6 +234,10 @@ engine-A routes, and the four TreeKEM catch-up routes).
   switches set before anything runs and the latch's re-sweep started, so no
   window exists between start and the embedder's first `POST /mesh/quiesce`.
   `POST /mesh/join` lifts it as before.
+- **The own-peer rule holds for every latched dial (review H-1).** A latched
+  dial outside a burst (ant-quic `ConnectedOnly`) also takes only an own or
+  target-named live peer as its coordinator; with neither it ends after its
+  direct stage.
 - **A latched node plays no target role in a hole punch (review M-3).** The
   latch also sets ant-quic's `set_inbound_punch_allowed(false)`: no offer is
   answered, no initiator a coordinator names is dialled, and no PUNCH_ME_NOW

@@ -641,7 +641,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Put,
         path: "/mesh/own-peers",
         cli_name: "mesh own-peers",
-        description: "Name this account's own devices: in a burst only they (or the target's own introducers) coordinate a hole punch",
+        description: "Name this account's own devices: while latched only they (or the target's own coordinators) coordinate a hole punch",
         category: "network",
         request: RequestSpec::Fields(&[RequestField::body_as("agent_ids", false, "--agent"), RequestField::body_as("machine_ids", false, "--machine")]),
     },

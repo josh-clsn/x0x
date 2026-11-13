@@ -841,7 +841,7 @@ enum MeshSub {
     /// Disconnect all mesh peers without stopping the daemon.
     Quiesce,
     /// Name this account's own devices (replaces the list; none clears it).
-    /// In a burst only they, or the target's own introducers, coordinate a
+    /// While latched only they, or the target's own coordinators, coordinate a
     /// hole punch.
     OwnPeers {
         /// Own device by agent id (hex; repeatable).
