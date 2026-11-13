@@ -38,6 +38,7 @@ pub(crate) struct RelayClientCounters {
 pub(crate) struct TransportRelay {
     pub(crate) proactive_relay_allowed: bool,
     pub(crate) relay_fallback_allowed: bool,
+    pub(crate) relay_service_allowed: bool,
     pub(crate) coordinator_policy: ant_quic::CoordinatorPolicy,
     pub(crate) stats: ant_quic::RelayClientStats,
     pub(crate) introducers: ant_quic::IntroducerStats,
@@ -64,6 +65,9 @@ pub struct RelayClientSnapshot {
     pub proactive_relay_allowed: Option<bool>,
     /// Whether a connect may fall back to a relay now (false while latched).
     pub relay_fallback_allowed: Option<bool>,
+    /// Whether this node serves others now: MASQUE relay sessions and
+    /// hole-punch coordination (false while latched, bursts included).
+    pub relay_service_allowed: Option<bool>,
     /// Which hole-punch coordinators ant-quic may use now: `any` (meshed),
     /// `connected_only` (latched, at rest: nothing is dialled to
     /// coordinate) or `introducer` (latched, during a burst dial: one
@@ -151,6 +155,7 @@ impl RelayClientCounters {
             (
                 t.proactive_relay_allowed,
                 t.relay_fallback_allowed,
+                t.relay_service_allowed,
                 match t.coordinator_policy {
                     ant_quic::CoordinatorPolicy::Any => "any",
                     ant_quic::CoordinatorPolicy::ConnectedOnly => "connected_only",
@@ -173,7 +178,8 @@ impl RelayClientCounters {
             events_lagged: self.events_lagged.load(Ordering::Relaxed),
             proactive_relay_allowed: switches.map(|s| s.0),
             relay_fallback_allowed: switches.map(|s| s.1),
-            coordinator_policy: switches.map(|s| s.2.to_string()),
+            relay_service_allowed: switches.map(|s| s.2),
+            coordinator_policy: switches.map(|s| s.3.to_string()),
             introducer_dials: introducers.dials,
             introducer_bytes_sent: introducers.bytes_sent,
             introducer_bytes_received: introducers.bytes_received,

@@ -4791,6 +4791,7 @@ impl NetworkNode {
             .map(|endpoint| relay_client::TransportRelay {
                 proactive_relay_allowed: endpoint.proactive_relay_allowed(),
                 relay_fallback_allowed: endpoint.relay_fallback_allowed(),
+                relay_service_allowed: endpoint.relay_service_allowed(),
                 coordinator_policy: endpoint.coordinator_policy(),
                 stats: endpoint.relay_client_stats(),
                 introducers: endpoint.introducer_stats(),
@@ -4811,7 +4812,11 @@ impl NetworkNode {
     ///   use one introducer per burst, its own announced coordinators first,
     ///   then a seed; ant-quic hangs up on it as soon as the punch resolves.
     ///   Introducers only coordinate: with relay fallback off they carry no
-    ///   data.
+    ///   data;
+    /// - relay service is off (M-1): the node serves no MASQUE relay session
+    ///   and coordinates no hole punch for anyone, on any link, including a
+    ///   link it dialled itself in a burst. Turning it off ends the sessions
+    ///   it was serving.
     ///
     /// Everything is allowed again (`Any`) when the latch lifts.
     fn sync_proactive_relay(&self) {
@@ -4825,6 +4830,7 @@ impl NetworkNode {
                 (true, false) => ant_quic::CoordinatorPolicy::ConnectedOnly,
             });
             endpoint.set_proactive_relay_allowed(!latched);
+            endpoint.set_relay_service_allowed(!latched);
         }
     }
 
@@ -8557,6 +8563,63 @@ mod tests {
         let _ = phone.try_shutdown().await;
         let _ = contact.try_shutdown().await;
         let _ = seed.try_shutdown().await;
+    }
+
+    /// M-1: a latched phone serves no relay and coordinates for nobody,
+    /// not even for a peer it dialled itself in a burst: that peer's
+    /// CONNECT-UDP request over the phone's own link is refused and no
+    /// session opens. Lifting the latch serves again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_latched_node_serves_no_relay_to_a_peer_it_dialled() {
+        let phone = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("phone");
+        let phone_addr = phone.bound_addr().await.expect("phone bound");
+        // The peer knows the phone as its seed, so its relay manager asks
+        // the phone for a session.
+        let peer = NetworkNode::new(loopback_quic_config(vec![phone_addr]), None, None)
+            .await
+            .expect("peer");
+        let peer_addr = peer.bound_addr().await.expect("peer bound");
+        phone.latch_mesh_quiesced().expect("fresh latch");
+
+        let burst = phone.begin_burst_dial();
+        assert!(phone.lease_demand_peer(
+            peer.peer_id(),
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        ));
+        phone
+            .connect_addr(peer_addr)
+            .await
+            .expect("the phone dials the peer");
+        force_symmetric_nat(&peer).await;
+        assert!(
+            !relay_sessions_within(&peer, 1, Duration::from_secs(3)).await,
+            "a latched phone must not serve a relay session, even to a peer it dialled"
+        );
+        let status = phone.node_status().await.expect("phone status");
+        assert_eq!(status.relay_sessions, 0, "no session on the phone");
+        assert!(!status.relay_service_enabled);
+        assert!(!status.coordinator_service_enabled);
+        assert_eq!(
+            phone.relay_client_snapshot().relay_service_allowed,
+            Some(false)
+        );
+        drop(burst);
+
+        assert!(phone.unlatch_mesh_if_current(phone.mesh_transition_epoch()));
+        assert_eq!(
+            phone.relay_client_snapshot().relay_service_allowed,
+            Some(true)
+        );
+        force_symmetric_nat(&peer).await;
+        assert!(
+            relay_sessions_within(&peer, 1, Duration::from_secs(10)).await,
+            "with the latch lifted the phone serves again"
+        );
+
+        let _ = peer.try_shutdown().await;
+        let _ = phone.try_shutdown().await;
     }
 
     /// Inbound connections `node` has accepted since start (cumulative, so

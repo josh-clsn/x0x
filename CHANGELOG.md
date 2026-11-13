@@ -201,11 +201,17 @@ engine-A routes, and the four TreeKEM catch-up routes).
   connection to the peer, or an identity announcement it signed after it
   last refused us, ends the hold; demand dials are never held, and no
   tombstone is written.
+- **A latched node serves nobody (M-1).** While the mesh-off latch holds
+  (bursts included) ant-quic's relay service is off
+  (`set_relay_service_allowed(false)`): a CONNECT-UDP request on any link,
+  one the node dialled itself included, is refused, the relay sessions it was
+  serving end, and it coordinates no hole punch. `GET /diagnostics/connectivity`
+  `relay_client.relay_service_allowed` reports the switch.
 
 ### Carried patches
 
 - **ant-quic 0.27.61 + relay switches** (`[patch.crates-io]` in
-  `Cargo.toml`: `git = "https://github.com/josh-clsn/ant-quic"`, one commit on
+  `Cargo.toml`: `git = "https://github.com/josh-clsn/ant-quic"`, a commit tail on
   the 0.27.61 release tag `6fe2a52`). Adds `set_proactive_relay_allowed`,
   `set_relay_fallback_allowed`, `set_coordinator_policy` (with
   `set_peer_introducers`, `reset_introducer_budget` and `introducer_stats`),
