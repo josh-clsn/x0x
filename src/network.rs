@@ -24,6 +24,7 @@
 
 use crate::error::{NetworkError, NetworkResult};
 
+mod burst_cap;
 mod churn;
 mod introducer_day;
 mod redial_flaps;
@@ -2210,6 +2211,8 @@ pub struct NetworkNode {
     /// M-3: whether a latched burst dial may fall back to a seed as its
     /// hole-punch introducer (daemon setting `latched_seed_introducers`).
     latched_seed_introducers: Arc<AtomicBool>,
+    /// M-5: the byte cap of the current burst, enforced by the daemon.
+    burst_cap: Arc<Mutex<BurstCapState>>,
     /// Receiver channel for direct messages (separate from gossip).
     direct_tx: mpsc::Sender<DirectEvent>,
     direct_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<DirectEvent>>>,
@@ -2354,6 +2357,37 @@ pub const MAX_DEMAND_LEASES: usize = 64;
 /// Most own peers `PUT /mesh/own-peers` takes, per kind (agent ids, machine
 /// ids).
 pub const MAX_OWN_PEERS: usize = 64;
+
+/// M-5: the current burst's byte cap.
+#[derive(Debug, Default)]
+struct BurstCapState {
+    /// Bumped on every arm and clear; the enforcement task stops when it
+    /// changes.
+    generation: u64,
+    /// The armed cap and what counts toward it.
+    count: Option<burst_cap::BurstCapCount>,
+    armed_at: Option<tokio::time::Instant>,
+    /// When the cap was reached and the links were closed.
+    tripped_at: Option<tokio::time::Instant>,
+}
+
+/// M-5: the current burst's byte cap, for `GET /diagnostics/connectivity`
+/// → `burst_cap`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct BurstCapSnapshot {
+    /// Whether a cap is armed (a leased `/agents/connect` with `max_bytes`
+    /// since the last latch call).
+    pub armed: bool,
+    /// The cap, in UDP bytes sent plus received over every link.
+    pub max_bytes: Option<u64>,
+    /// Bytes counted toward it since it was armed.
+    pub counted_bytes: u64,
+    /// Whether the cap was reached: every link was closed, the leases ended
+    /// and further leased dials are refused until the next latch call.
+    pub tripped: bool,
+    /// How long after arming the cap was reached.
+    pub tripped_after_ms: Option<u64>,
+}
 
 /// M-2: the own peers the embedder named: devices of the same account, by
 /// agent id (resolved to a machine when known) or by machine id.
@@ -2734,6 +2768,7 @@ impl NetworkNode {
             own_peer_request: Arc::new(Mutex::new(OwnPeerRequest::default())),
             introducer_day: Arc::new(Mutex::new(introducer_day::IntroducerDay::default())),
             latched_seed_introducers: Arc::new(AtomicBool::new(true)),
+            burst_cap: Arc::new(Mutex::new(BurstCapState::default())),
             direct_tx,
             direct_rx: Arc::new(tokio::sync::Mutex::new(direct_rx)),
             relayed_dm_tx,
@@ -4677,6 +4712,7 @@ impl NetworkNode {
         // Every latch call ends a burst: the next burst gets a fresh
         // introducer budget (one per target).
         self.sample_introducer_day();
+        self.clear_burst_cap();
         if let Some(endpoint) = self.relay_switch.get() {
             endpoint.reset_introducer_budget();
         }
@@ -4717,6 +4753,7 @@ impl NetworkNode {
             if self.mesh_quiesced.load(Ordering::Relaxed) {
                 *epoch += 1;
                 self.mesh_quiesced.store(false, Ordering::Relaxed);
+                self.clear_burst_cap();
                 self.sync_proactive_relay();
             }
             true
@@ -4762,6 +4799,9 @@ impl NetworkNode {
         peer: AntPeerId,
         until: tokio::time::Instant,
     ) -> bool {
+        if self.burst_cap_tripped() {
+            return false;
+        }
         let mut leases = self.demand_leases_guard();
         if leases.generation != generation {
             return false;
@@ -4798,6 +4838,170 @@ impl NetworkNode {
         match self.demand_leases.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn burst_cap_guard(&self) -> std::sync::MutexGuard<'_, BurstCapState> {
+        match self.burst_cap.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// M-5: arm the current burst's byte cap. Only while latched: returns
+    /// false when the mesh is on, or when this burst's cap was already
+    /// reached. A second call in the same burst can only lower the cap.
+    ///
+    /// From now on every link's UDP bytes (sent plus received) count toward
+    /// it, a link up now from its counters now. A task reads the counters
+    /// every 10 ms (`BURST_CAP_TICK`); when the sum reaches the cap it
+    /// ends every demand lease and closes every link, and leased dials are
+    /// refused until the next latch call ([`Self::latch_mesh_quiesced`])
+    /// clears the cap.
+    pub async fn arm_burst_cap(&self, max_bytes: u64) -> bool {
+        if !self.mesh_quiesced.load(Ordering::Relaxed) {
+            return false;
+        }
+        {
+            let mut state = self.burst_cap_guard();
+            if state.tripped_at.is_some() {
+                return false;
+            }
+            if let Some(count) = state.count.as_mut() {
+                count.lower_to(max_bytes);
+                return true;
+            }
+        }
+        let links = self.link_byte_counters().await;
+        let generation = {
+            let mut state = self.burst_cap_guard();
+            if !self.mesh_quiesced.load(Ordering::Relaxed) || state.tripped_at.is_some() {
+                return false;
+            }
+            if let Some(count) = state.count.as_mut() {
+                count.lower_to(max_bytes);
+                return true;
+            }
+            state.generation = state.generation.wrapping_add(1);
+            state.count = Some(burst_cap::BurstCapCount::arm(max_bytes, links));
+            state.armed_at = Some(tokio::time::Instant::now());
+            state.generation
+        };
+        let node = self.clone();
+        tokio::spawn(async move { node.enforce_burst_cap(generation).await });
+        true
+    }
+
+    /// M-5: drop the burst's cap (every latch call ends a burst).
+    fn clear_burst_cap(&self) {
+        let mut state = self.burst_cap_guard();
+        let generation = state.generation.wrapping_add(1);
+        *state = BurstCapState {
+            generation,
+            ..BurstCapState::default()
+        };
+    }
+
+    /// M-5: whether this burst's cap was reached.
+    #[must_use]
+    pub fn burst_cap_tripped(&self) -> bool {
+        self.burst_cap_guard().tripped_at.is_some()
+    }
+
+    /// M-5: the current burst's cap.
+    #[must_use]
+    pub fn burst_cap_snapshot(&self) -> BurstCapSnapshot {
+        let state = self.burst_cap_guard();
+        BurstCapSnapshot {
+            armed: state.count.is_some(),
+            max_bytes: state
+                .count
+                .as_ref()
+                .map(burst_cap::BurstCapCount::max_bytes),
+            counted_bytes: state
+                .count
+                .as_ref()
+                .map_or(0, burst_cap::BurstCapCount::counted),
+            tripped: state.tripped_at.is_some(),
+            tripped_after_ms: state
+                .tripped_at
+                .zip(state.armed_at)
+                .map(|(tripped, armed)| {
+                    u64::try_from(tripped.saturating_duration_since(armed).as_millis())
+                        .unwrap_or(u64::MAX)
+                }),
+        }
+    }
+
+    /// Every live link's UDP bytes, sent plus received, by peer and
+    /// connection generation.
+    async fn link_byte_counters(&self) -> Vec<(burst_cap::LinkKey, u64)> {
+        let Some(node) = self.node.read().await.as_ref().cloned() else {
+            return Vec::new();
+        };
+        let Some(quic) = node.quic() else {
+            return Vec::new();
+        };
+        let mut links = Vec::new();
+        for conn in quic.connected_peers().await {
+            if let Some(stats) = quic.connection_transport_stats(&conn.peer_id).await {
+                links.push((
+                    (conn.peer_id.0, stats.generation),
+                    stats.udp_tx_bytes.saturating_add(stats.udp_rx_bytes),
+                ));
+            }
+        }
+        links
+    }
+
+    /// M-5: read the counters every tick while the cap of `generation` is
+    /// armed; once it is reached, end the leases and close every link.
+    async fn enforce_burst_cap(self, generation: u64) {
+        let mut tick = tokio::time::interval(burst_cap::BURST_CAP_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if self.node.read().await.is_none() {
+                return;
+            }
+            let links = self.link_byte_counters().await;
+            let counted = {
+                let mut state = self.burst_cap_guard();
+                if state.generation != generation {
+                    return;
+                }
+                let Some(count) = state.count.as_mut() else {
+                    return;
+                };
+                for (link, total) in links {
+                    count.observe(link, total);
+                }
+                if !count.reached() {
+                    continue;
+                }
+                let counted = (count.counted(), count.max_bytes());
+                state.tripped_at = Some(tokio::time::Instant::now());
+                counted
+            };
+            self.clear_demand_leases();
+            let mut closed = 0usize;
+            for peer in self.connected_peers().await {
+                if self
+                    .disconnect_with_reason(&peer, DisconnectReason::Quiesce)
+                    .await
+                    .is_ok()
+                {
+                    closed += 1;
+                }
+            }
+            tracing::info!(
+                target: "x0x::connect",
+                counted_bytes = counted.0,
+                max_bytes = counted.1,
+                closed,
+                "burst byte cap reached: leases ended and links closed"
+            );
+            return;
         }
     }
 
@@ -8883,6 +9087,158 @@ mod tests {
         drop(silent);
         let _ = phone.try_shutdown().await;
         let _ = seed.try_shutdown().await;
+    }
+
+    /// M-5: a peer that streams to a latched phone as fast as loopback goes
+    /// is cut close to the burst's byte cap by the daemon itself. Bound: the
+    /// cap plus what one counter tick and the close let through at the
+    /// measured rate, plus 256 KiB in flight. Once cut, leases are refused
+    /// until the next latch call clears the cap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_peer_streaming_at_full_speed_is_cut_close_to_the_burst_cap() {
+        use tokio::io::AsyncReadExt;
+        const CAP: u64 = 1024 * 1024;
+        let phone = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("phone");
+        let peer = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("peer");
+        let peer_addr = peer.bound_addr().await.expect("peer bound");
+        phone.latch_mesh_quiesced().expect("fresh latch");
+        assert!(phone.arm_burst_cap(CAP).await, "armed while latched");
+        assert!(phone.lease_demand_peer(
+            peer.peer_id(),
+            tokio::time::Instant::now() + Duration::from_secs(60),
+        ));
+        phone
+            .connect_addr(peer_addr)
+            .await
+            .expect("the phone dials the peer");
+
+        // The phone reads every byte the peer sends.
+        let received = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sink = tokio::spawn({
+            let phone = phone.clone();
+            let received = Arc::clone(&received);
+            async move {
+                while let Ok((_, _send, mut recv)) = phone.accept_bi().await {
+                    let received = Arc::clone(&received);
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 64 * 1024];
+                        while let Ok(n) = recv.read(&mut buf).await {
+                            if n == 0 {
+                                break;
+                            }
+                            received.fetch_add(n as u64, Ordering::SeqCst);
+                        }
+                    });
+                }
+            }
+        });
+        let phone_id = phone.peer_id();
+        let source = tokio::spawn({
+            let peer = peer.clone();
+            async move {
+                // The peer registers the phone's inbound link a moment
+                // after the phone's dial returns.
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                let (mut send, _recv) = loop {
+                    match peer.open_bi_raw_for_testing(&phone_id).await {
+                        Ok(stream) => break stream,
+                        Err(_) if tokio::time::Instant::now() < deadline => {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                        Err(e) => panic!("the peer cannot open a stream: {e}"),
+                    }
+                };
+                let chunk = vec![0x5a; 64 * 1024];
+                while send.write_all(&chunk).await.is_ok() {}
+            }
+        });
+
+        let started = tokio::time::Instant::now();
+        let mut half_cap_at = None;
+        let deadline = started + Duration::from_secs(20);
+        while phone.is_connected(&peer.peer_id()).await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the daemon must cut the link at the cap: received {}, {:?}",
+                received.load(Ordering::SeqCst),
+                phone.burst_cap_snapshot()
+            );
+            if half_cap_at.is_none() && received.load(Ordering::SeqCst) >= CAP / 2 {
+                half_cap_at = Some(tokio::time::Instant::now());
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let cut_at = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let got = received.load(Ordering::SeqCst);
+        let snap = phone.burst_cap_snapshot();
+        assert!(snap.tripped, "{snap:?}");
+        assert!(snap.counted_bytes >= CAP, "{snap:?}");
+        // The rate the peer reached before the cut (payload bytes/s).
+        let rate = half_cap_at.map_or(0.0, |at| {
+            (CAP / 2) as f64
+                / cut_at
+                    .saturating_duration_since(at)
+                    .as_secs_f64()
+                    .max(0.001)
+        });
+        let bound = CAP + (rate * 0.05) as u64 + 256 * 1024;
+        eprintln!(
+            "burst cap: received {got} B against {CAP} B, counted {} B, cut {} ms after arming, rate {rate:.0} B/s, bound {bound} B",
+            snap.counted_bytes,
+            snap.tripped_after_ms.unwrap_or(0)
+        );
+        assert!(
+            got <= bound,
+            "received {got} bytes against a cap of {CAP} (bound {bound}, rate {rate:.0} B/s)"
+        );
+
+        assert!(
+            !phone.lease_demand_peer(
+                peer.peer_id(),
+                tokio::time::Instant::now() + Duration::from_secs(60),
+            ),
+            "no lease after the cap"
+        );
+        assert!(
+            !phone.arm_burst_cap(CAP).await,
+            "no new cap in the same burst"
+        );
+        assert!(phone.latch_mesh_quiesced().is_none(), "the burst ends");
+        let cleared = phone.burst_cap_snapshot();
+        assert!(!cleared.tripped && !cleared.armed, "{cleared:?}");
+
+        source.abort();
+        sink.abort();
+        let _ = peer.try_shutdown().await;
+        let _ = phone.try_shutdown().await;
+    }
+
+    /// M-5: a cap is armed only while latched.
+    #[tokio::test]
+    async fn a_burst_cap_is_armed_only_while_latched() {
+        let node = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("node");
+        assert!(!node.arm_burst_cap(1024).await, "meshed: no cap");
+        node.latch_mesh_quiesced().expect("fresh latch");
+        assert!(node.arm_burst_cap(4096).await);
+        assert!(node.arm_burst_cap(8192).await);
+        assert_eq!(
+            node.burst_cap_snapshot().max_bytes,
+            Some(4096),
+            "only lowered"
+        );
+        assert!(node.unlatch_mesh_if_current(node.mesh_transition_epoch()));
+        assert!(
+            !node.burst_cap_snapshot().armed,
+            "the latch lifting clears it"
+        );
+        let _ = node.try_shutdown().await;
     }
 
     /// Inbound connections `node` has accepted since start (cumulative, so

@@ -120,6 +120,14 @@ engine-A routes, and the four TreeKEM catch-up routes).
   live peer did, so one contact's device learned whom the phone was calling.
   Body `{"agent_ids": [...], "machine_ids": [...]}`, replacing the list;
   agent ids are resolved at every burst dial. CLI `x0x mesh own-peers`.
+- **The daemon enforces a burst's byte cap (M-5).** A leased
+  `POST /agents/connect` takes `max_bytes`: while quiesced it arms the
+  burst's cap before the dial (a later connect can only lower it). The daemon
+  reads every link's UDP counters every 10 ms and, once the bytes since
+  arming reach the cap, ends the leases, closes every link and answers
+  further leased connects 409 `burst_cap_reached` until the next
+  `POST /mesh/quiesce`. `GET /diagnostics/connectivity` `burst_cap` reports
+  it. CLI `x0x direct connect --max-bytes`.
 - **Seed introducer dials are counted, and `latched_seed_introducers` can
   refuse them (M-3).** `relay_client` gains `introducer_seed_dials`,
   `introducer_dials_24h`, `introducer_seed_dials_24h`,

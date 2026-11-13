@@ -8333,6 +8333,38 @@ impl Agent {
         agent_id: &identity::AgentId,
         lease: std::time::Duration,
     ) -> error::Result<(connectivity::ConnectOutcome, bool)> {
+        self.connect_to_agent_leased_capped(agent_id, lease, None)
+            .await
+    }
+
+    /// [`Self::connect_to_agent_leased`] with the burst's byte cap (M-5).
+    /// With `max_bytes` while the mesh is latched, the cap is armed before
+    /// the dial ([`network::NetworkNode::arm_burst_cap`]): from then on the
+    /// daemon counts every link's bytes and, once they reach the cap,
+    /// closes every link, ends the leases and refuses leased dials until the
+    /// next [`Self::quiesce_mesh`] call. A later call in the same burst can
+    /// only lower the cap.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::connect_to_agent`], and an error without dialling once
+    /// this burst's cap was reached.
+    pub async fn connect_to_agent_leased_capped(
+        &self,
+        agent_id: &identity::AgentId,
+        lease: std::time::Duration,
+        max_bytes: Option<u64>,
+    ) -> error::Result<(connectivity::ConnectOutcome, bool)> {
+        if let Some(network) = self.network.as_ref() {
+            if network.burst_cap_tripped() {
+                return Err(error::IdentityError::Storage(std::io::Error::other(
+                    "the burst byte cap was reached; no leased dial until the burst ends",
+                )));
+            }
+            if let Some(max_bytes) = max_bytes {
+                network.arm_burst_cap(max_bytes).await;
+            }
+        }
         let lease = lease.min(std::time::Duration::from_secs(MAX_DEMAND_LEASE_SECS));
         let generation = self
             .network

@@ -725,6 +725,7 @@ pub(in crate::server) async fn connectivity_diagnostics(
                 // connection is not a peer row above, and ant-quic gives x0x
                 // no byte counts for it; this records that one was opened.
                 "relay_client": network.relay_client_snapshot(),
+                "burst_cap": network.burst_cap_snapshot(),
                 "coordinator": {
                     "is_coordinating": ns.is_coordinating,
                     "sessions": ns.coordination_sessions,

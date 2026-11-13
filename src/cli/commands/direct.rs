@@ -5,11 +5,19 @@ use anyhow::Result;
 use base64::Engine;
 
 /// `x0x direct connect` — POST /agents/connect
-pub async fn connect(client: &DaemonClient, agent_id: &str, lease_secs: Option<u64>) -> Result<()> {
+pub async fn connect(
+    client: &DaemonClient,
+    agent_id: &str,
+    lease_secs: Option<u64>,
+    max_bytes: Option<u64>,
+) -> Result<()> {
     client.ensure_running().await?;
     let mut body = serde_json::json!({ "agent_id": agent_id });
     if let Some(secs) = lease_secs {
         body["lease_secs"] = serde_json::json!(secs);
+    }
+    if let Some(max_bytes) = max_bytes {
+        body["max_bytes"] = serde_json::json!(max_bytes);
     }
     let resp = client.post("/agents/connect", &body).await?;
     print_value(client.format(), &resp);
@@ -140,7 +148,7 @@ mod tests {
         let mock_resp = serde_json::json!({"outcome": "Connected"});
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
-        let result = connect(&client, &"aa".repeat(32), Some(60)).await;
+        let result = connect(&client, &"aa".repeat(32), Some(60), Some(1_048_576)).await;
         assert!(result.is_ok(), "connect should succeed: {:?}", result);
     }
 

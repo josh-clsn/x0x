@@ -1137,6 +1137,33 @@ table) and a non-live outcome echo `null`. The next
 and sweeps every peer. A lease changes nothing else: inbound links are still
 refused and gossip frames are still dropped on the leased link.
 
+#### Burst byte cap
+
+A leased `/agents/connect` may also carry `max_bytes`, the burst's byte cap:
+
+```json
+{ "agent_id": "<64 hex>", "lease_secs": 90, "max_bytes": 1048576 }
+```
+
+While the mesh is quiesced, the first such connect since the last
+`POST /mesh/quiesce` arms the cap before it dials; a later one in the same
+burst can only lower it. From then on the daemon counts the UDP bytes sent
+and received on every link (a link already up counts from its counters at
+arming; one that comes up later from zero) and reads them every 10 ms. Once
+the sum reaches the cap it ends every lease, closes every link and refuses
+leased connects (`409 {"ok": false, "error": "burst_cap_reached"}`) until the
+next `POST /mesh/quiesce`, which ends the burst and clears the cap. The answer
+echoes the cap in force as `max_bytes` (else `null`). Without a lease, or while
+the mesh is on, `max_bytes` is ignored. CLI: `x0x direct connect --lease-secs
+90 --max-bytes 1048576`.
+
+Overshoot is bounded by the link rate times about 10 to 20 ms (one counter
+read and the close), plus what the peers already had in flight: about 100 to
+200 KB on a 50 Mbit/s link, against seconds of traffic before.
+
+`GET /diagnostics/connectivity` → `burst_cap` reports it: `armed`,
+`max_bytes`, `counted_bytes`, `tripped` and `tripped_after_ms`.
+
 #### Latched dials and seeds
 
 While quiesced, the node serves nobody: a CONNECT-UDP request on any link is

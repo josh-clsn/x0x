@@ -1339,6 +1339,11 @@ enum DirectSub {
         /// re-sweep for this many seconds (capped at 300).
         #[arg(long)]
         lease_secs: Option<u64>,
+        /// With a lease: the burst's byte cap. Once every link's bytes reach
+        /// it the daemon closes them and refuses leased connects until the
+        /// next mesh quiesce.
+        #[arg(long)]
+        max_bytes: Option<u64>,
     },
     /// Send a direct message to an agent.
     Send {
@@ -2836,7 +2841,8 @@ async fn run(
             DirectSub::Connect {
                 agent_id,
                 lease_secs,
-            } => commands::direct::connect(&client, &agent_id, lease_secs).await,
+                max_bytes,
+            } => commands::direct::connect(&client, &agent_id, lease_secs, max_bytes).await,
             DirectSub::Send {
                 agent_id,
                 message,

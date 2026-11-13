@@ -47,12 +47,26 @@ pub(in crate::server) struct ConnectAgentRequest {
     /// lease. The next `POST /mesh/quiesce` ends every lease.
     #[serde(default)]
     lease_secs: Option<u64>,
+    /// The burst's byte cap (M-5), with a lease while the mesh is quiesced:
+    /// UDP bytes sent plus received over every link from now on. Once they
+    /// reach it the daemon closes every link, ends the leases and refuses
+    /// leased connects until the next `POST /mesh/quiesce`. A later connect
+    /// in the same burst can only lower it. Ignored without a lease or while
+    /// the mesh is on.
+    #[serde(default)]
+    max_bytes: Option<u64>,
 }
 
 /// The `lease_secs` a `POST /agents/connect` answers with: the granted
 /// value only when a lease was actually recorded, else `null`.
 fn echoed_lease_secs(granted: Option<u64>, recorded: bool) -> Option<u64> {
     granted.filter(|_| recorded)
+}
+
+/// The `max_bytes` a `POST /agents/connect` answers with: the burst cap in
+/// force when this connect asked for one and a cap is armed, else `null`.
+fn echoed_max_bytes(requested: Option<u64>, cap: x0x::network::BurstCapSnapshot) -> Option<u64> {
+    requested.and(cap.max_bytes).filter(|_| cap.armed)
 }
 
 /// The lease a `POST /agents/connect` asks for, capped: `None` for no lease.
@@ -238,12 +252,31 @@ pub(in crate::server) async fn connect_agent(
     // the agent has multiple unreachable addresses (each with its own 30s
     // QUIC timeout).
     let lease_secs = granted_lease_secs(req.lease_secs);
+    if lease_secs.is_some()
+        && state
+            .agent
+            .network()
+            .is_some_and(|network| network.burst_cap_tripped())
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "burst_cap_reached",
+                "detail": "the burst byte cap was reached; leased connects resume after POST /mesh/quiesce"
+            })),
+        );
+    }
     let connect = async {
         match lease_secs {
             Some(secs) => {
                 state
                     .agent
-                    .connect_to_agent_leased(&agent_id, std::time::Duration::from_secs(secs))
+                    .connect_to_agent_leased_capped(
+                        &agent_id,
+                        std::time::Duration::from_secs(secs),
+                        req.max_bytes,
+                    )
                     .await
             }
             None => state
@@ -258,6 +291,14 @@ pub(in crate::server) async fn connect_agent(
     match connect_result {
         Ok(Ok((outcome, recorded))) => {
             let leased = echoed_lease_secs(lease_secs, recorded);
+            let max_bytes = echoed_max_bytes(
+                lease_secs.and(req.max_bytes),
+                state
+                    .agent
+                    .network()
+                    .map(|network| network.burst_cap_snapshot())
+                    .unwrap_or_default(),
+            );
             let (outcome_str, addr) = match outcome {
                 x0x::connectivity::ConnectOutcome::Direct(a) => ("Direct", Some(a.to_string())),
                 x0x::connectivity::ConnectOutcome::Coordinated(a) => {
@@ -273,7 +314,8 @@ pub(in crate::server) async fn connect_agent(
                     "ok": true,
                     "outcome": outcome_str,
                     "addr": addr,
-                    "lease_secs": leased
+                    "lease_secs": leased,
+                    "max_bytes": max_bytes
                 })),
             )
         }
@@ -682,6 +724,22 @@ mod tests {
         assert_eq!(echoed_lease_secs(Some(120), true), Some(120));
         assert_eq!(echoed_lease_secs(Some(120), false), None);
         assert_eq!(echoed_lease_secs(None, false), None);
+    }
+
+    #[test]
+    fn connect_echoes_only_an_armed_burst_cap() {
+        use super::echoed_max_bytes;
+        let armed = x0x::network::BurstCapSnapshot {
+            armed: true,
+            max_bytes: Some(4096),
+            ..Default::default()
+        };
+        assert_eq!(echoed_max_bytes(Some(8192), armed.clone()), Some(4096));
+        assert_eq!(echoed_max_bytes(None, armed), None);
+        assert_eq!(
+            echoed_max_bytes(Some(8192), x0x::network::BurstCapSnapshot::default()),
+            None
+        );
     }
 
     #[test]
