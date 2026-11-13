@@ -100,6 +100,19 @@ pub async fn mesh_quiesce(client: &DaemonClient) -> Result<()> {
     Ok(())
 }
 
+/// `x0x mesh own-peers` — PUT /mesh/own-peers
+pub async fn mesh_own_peers(
+    client: &DaemonClient,
+    agents: Vec<String>,
+    machines: Vec<String>,
+) -> Result<()> {
+    client.ensure_running().await?;
+    let body = serde_json::json!({ "agent_ids": agents, "machine_ids": machines });
+    let resp = client.put("/mesh/own-peers", &body).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
 /// `x0x diagnostics connectivity` — GET /diagnostics/connectivity
 ///
 /// Prints the ant-quic NodeStatus snapshot as JSON. Includes UPnP port-mapping

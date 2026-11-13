@@ -638,6 +638,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         request: RequestSpec::None,
     },
     EndpointDef {
+        method: Method::Put,
+        path: "/mesh/own-peers",
+        cli_name: "mesh own-peers",
+        description: "Name this account's own devices: in a burst only they (or the target's own introducers) coordinate a hole punch",
+        category: "network",
+        request: RequestSpec::Fields(&[RequestField::body_as("agent_ids", false, "--agent"), RequestField::body_as("machine_ids", false, "--machine")]),
+    },
+    EndpointDef {
         method: Method::Get,
         path: "/diagnostics/connectivity",
         cli_name: "diagnostics connectivity",

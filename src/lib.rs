@@ -2715,6 +2715,16 @@ impl DiscoveredUser {
     }
 }
 
+/// M-2: the own peers in force after [`Agent::set_own_peers`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnPeers {
+    /// The machines ant-quic treats as this account's own.
+    pub machine_ids: Vec<identity::MachineId>,
+    /// Named agent ids with no known machine yet; retried at every burst
+    /// dial.
+    pub unresolved_agent_ids: Vec<identity::AgentId>,
+}
+
 /// Cached discovery data derived from identity announcements.
 #[derive(Debug, Clone)]
 pub struct DiscoveredAgent {
@@ -8336,6 +8346,7 @@ impl Agent {
             .as_ref()
             .map(|network| network.begin_burst_dial());
         self.note_burst_introducers(agent_id).await;
+        self.refresh_own_peers().await;
         let (outcome, machine) = DIALED_MACHINE
             .scope(std::cell::Cell::new(None), async {
                 let outcome = self.connect_to_agent(agent_id).await;
@@ -8350,6 +8361,67 @@ impl Agent {
             _ => false,
         };
         Ok((outcome, leased))
+    }
+
+    /// M-2: name this account's own devices (by agent id, by machine id or
+    /// both), replacing the previous list. In a burst, a live peer
+    /// coordinates a hole punch only when it is one of these or the target
+    /// announced it, so no contact's device learns whom this node is
+    /// calling. Agent ids are resolved to machines from the discovery cache
+    /// now and again at every burst dial; the answer lists the machines in
+    /// force and the agent ids not resolved yet.
+    pub async fn set_own_peers(
+        &self,
+        agents: Vec<identity::AgentId>,
+        machines: Vec<identity::MachineId>,
+    ) -> OwnPeers {
+        if let Some(network) = self.network.as_ref() {
+            network.set_own_peer_request(network::OwnPeerRequest {
+                agents: agents.iter().map(|agent| agent.0).collect(),
+                machines: machines.iter().map(|machine| machine.0).collect(),
+            });
+        }
+        self.refresh_own_peers().await
+    }
+
+    /// Resolve the own peers the embedder named ([`Self::set_own_peers`])
+    /// and hand ant-quic the machines.
+    pub async fn refresh_own_peers(&self) -> OwnPeers {
+        let Some(network) = self.network.as_ref() else {
+            return OwnPeers::default();
+        };
+        let request = network.own_peer_request();
+        let mut machine_ids: Vec<identity::MachineId> = request
+            .machines
+            .iter()
+            .copied()
+            .map(identity::MachineId)
+            .collect();
+        let mut unresolved_agent_ids = Vec::new();
+        {
+            let cache = self.identity_discovery_cache.read().await;
+            for agent in request.agents {
+                let agent = identity::AgentId(agent);
+                match cache.get(&agent) {
+                    Some(entry) => {
+                        if !machine_ids.contains(&entry.machine_id) {
+                            machine_ids.push(entry.machine_id);
+                        }
+                    }
+                    None => unresolved_agent_ids.push(agent),
+                }
+            }
+        }
+        network.set_own_peers(
+            machine_ids
+                .iter()
+                .map(|machine| ant_quic::PeerId(machine.0))
+                .collect(),
+        );
+        OwnPeers {
+            machine_ids,
+            unresolved_agent_ids,
+        }
     }
 
     /// Hand ant-quic the coordinators `agent_id`'s machine announced it is

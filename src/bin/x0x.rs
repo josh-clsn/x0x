@@ -840,6 +840,17 @@ enum MeshSub {
     Join,
     /// Disconnect all mesh peers without stopping the daemon.
     Quiesce,
+    /// Name this account's own devices (replaces the list; none clears it).
+    /// In a burst only they, or the target's own introducers, coordinate a
+    /// hole punch.
+    OwnPeers {
+        /// Own device by agent id (hex; repeatable).
+        #[arg(long = "agent", value_name = "AGENT_ID")]
+        agents: Vec<String>,
+        /// Own device by machine id (hex; repeatable).
+        #[arg(long = "machine", value_name = "MACHINE_ID")]
+        machines: Vec<String>,
+    },
 }
 
 /// Peer subcommands (ant-quic 0.27 surface).
@@ -2578,6 +2589,9 @@ async fn run(
         Commands::Mesh { sub } => match sub {
             MeshSub::Join => commands::network::mesh_join(&client).await,
             MeshSub::Quiesce => commands::network::mesh_quiesce(&client).await,
+            MeshSub::OwnPeers { agents, machines } => {
+                commands::network::mesh_own_peers(&client, agents, machines).await
+            }
         },
         Commands::Peer { sub } => match sub {
             PeerSub::Probe {

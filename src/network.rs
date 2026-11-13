@@ -2201,6 +2201,9 @@ pub struct NetworkNode {
     /// mesh is latched, a burst dial may use one hole-punch introducer per
     /// target; outside one, nothing is dialled to coordinate.
     burst_dials: Arc<std::sync::atomic::AtomicUsize>,
+    /// M-2: the own peers the embedder named (`PUT /mesh/own-peers`), kept
+    /// so agent ids not yet resolved to a machine can be resolved later.
+    own_peer_request: Arc<Mutex<OwnPeerRequest>>,
     /// Receiver channel for direct messages (separate from gossip).
     direct_tx: mpsc::Sender<DirectEvent>,
     direct_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<DirectEvent>>>,
@@ -2341,6 +2344,20 @@ pub struct NetworkNode {
 
 /// Most peers that may hold a demand lease at once.
 pub const MAX_DEMAND_LEASES: usize = 64;
+
+/// Most own peers `PUT /mesh/own-peers` takes, per kind (agent ids, machine
+/// ids).
+pub const MAX_OWN_PEERS: usize = 64;
+
+/// M-2: the own peers the embedder named: devices of the same account, by
+/// agent id (resolved to a machine when known) or by machine id.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnPeerRequest {
+    /// Own devices by agent id.
+    pub agents: Vec<[u8; 32]>,
+    /// Own devices by machine id.
+    pub machines: Vec<[u8; 32]>,
+}
 
 /// The demand-lease table and its generation, bumped by every clear so a
 /// lease granted against an older generation is refused.
@@ -2708,6 +2725,7 @@ impl NetworkNode {
             relay_client: Arc::new(RelayClientCounters::default()),
             relay_switch: Arc::new(OnceLock::new()),
             burst_dials: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            own_peer_request: Arc::new(Mutex::new(OwnPeerRequest::default())),
             direct_tx,
             direct_rx: Arc::new(tokio::sync::Mutex::new(direct_rx)),
             relayed_dm_tx,
@@ -4859,6 +4877,43 @@ impl NetworkNode {
             Err(poisoned) => poisoned.into_inner(),
         };
         self.sync_proactive_relay();
+    }
+
+    /// M-2: keep the own peers the embedder named, replacing the previous
+    /// request. [`Self::set_own_peers`] applies the resolved machines.
+    pub fn set_own_peer_request(&self, request: OwnPeerRequest) {
+        match self.own_peer_request.lock() {
+            Ok(mut guard) => *guard = request,
+            Err(poisoned) => *poisoned.into_inner() = request,
+        }
+    }
+
+    /// The own peers the embedder named ([`Self::set_own_peer_request`]).
+    #[must_use]
+    pub fn own_peer_request(&self) -> OwnPeerRequest {
+        match self.own_peer_request.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// M-2: the machines that are this account's own. In a burst, a live
+    /// peer coordinates a hole punch only when it is one of these or the
+    /// target announced it as its own coordinator, so no contact's device
+    /// learns whom this node is calling. Replaces the previous list.
+    pub fn set_own_peers(&self, peers: Vec<AntPeerId>) {
+        if let Some(endpoint) = self.relay_switch.get() {
+            endpoint.set_own_peers(peers);
+        }
+    }
+
+    /// The machines marked as own ([`Self::set_own_peers`]).
+    #[must_use]
+    pub fn own_peers(&self) -> Vec<AntPeerId> {
+        self.relay_switch
+            .get()
+            .map(|endpoint| endpoint.own_peers())
+            .unwrap_or_default()
     }
 
     /// Record the hole-punch introducers `peer` named for itself (the
@@ -8620,6 +8675,92 @@ mod tests {
 
         let _ = peer.try_shutdown().await;
         let _ = phone.try_shutdown().await;
+    }
+
+    /// A latched phone in a burst with a live link to one contact, and the
+    /// introducer another contact announced.
+    async fn phone_with_live_contact_and_introducer() -> (NetworkNode, NetworkNode, NetworkNode) {
+        let contact_a = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("contact A");
+        let introducer = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("introducer");
+        let phone = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("phone");
+        phone.latch_mesh_quiesced().expect("fresh latch");
+        assert!(phone.lease_demand_peer(
+            contact_a.peer_id(),
+            tokio::time::Instant::now() + Duration::from_secs(60),
+        ));
+        phone
+            .connect_addr(contact_a.bound_addr().await.expect("A bound"))
+            .await
+            .expect("the phone reaches contact A");
+        (phone, contact_a, introducer)
+    }
+
+    /// Burst-dial contact B at a dead address, with B's announced
+    /// introducer.
+    async fn burst_dial_unreachable(phone: &NetworkNode, b: AntPeerId, introducer: SocketAddr) {
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind silent");
+        let silent_addr = silent.local_addr().expect("silent addr");
+        let _burst = phone.begin_burst_dial();
+        phone.set_peer_introducers(b, vec![introducer]);
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            phone.connect_peer_with_addrs(b, vec![silent_addr]),
+        )
+        .await;
+        assert!(
+            !matches!(result, Ok(Ok(_))),
+            "the dead address cannot connect"
+        );
+    }
+
+    /// M-2: in a burst, contact A's live device is never asked to
+    /// coordinate the dial to contact B (the request would tell A whom the
+    /// phone is calling); B's own introducer is used instead. Marked as the
+    /// phone's own device, the same live peer may coordinate, and then no
+    /// introducer is dialled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_burst_asks_only_an_own_device_or_the_targets_introducer_to_coordinate() {
+        let (phone, contact_a, introducer) = phone_with_live_contact_and_introducer().await;
+        let introducer_addr = introducer.bound_addr().await.expect("introducer bound");
+        let contact_b = ant_quic::PeerId([0x6a; 32]);
+
+        burst_dial_unreachable(&phone, contact_b, introducer_addr).await;
+        assert_eq!(
+            inbound_connects(&introducer).await,
+            1,
+            "B's own introducer coordinates, not live contact A"
+        );
+
+        // A new burst; now A's machine is one of the phone's own devices.
+        assert!(phone.latch_mesh_quiesced().is_none());
+        phone.set_own_peers(vec![contact_a.peer_id()]);
+        assert!(phone.lease_demand_peer(
+            contact_a.peer_id(),
+            tokio::time::Instant::now() + Duration::from_secs(60),
+        ));
+        if !phone.is_connected(&contact_a.peer_id()).await {
+            phone
+                .connect_addr(contact_a.bound_addr().await.expect("A bound"))
+                .await
+                .expect("the phone reaches its own device");
+        }
+        burst_dial_unreachable(&phone, ant_quic::PeerId([0x6b; 32]), introducer_addr).await;
+        assert_eq!(
+            inbound_connects(&introducer).await,
+            1,
+            "the own device coordinates; no introducer is dialled"
+        );
+        assert_eq!(phone.own_peers(), vec![contact_a.peer_id()]);
+
+        let _ = phone.try_shutdown().await;
+        let _ = contact_a.try_shutdown().await;
+        let _ = introducer.try_shutdown().await;
     }
 
     /// Inbound connections `node` has accepted since start (cumulative, so

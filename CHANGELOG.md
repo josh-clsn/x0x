@@ -5,8 +5,9 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 The josh-clsn fork's tail on v0.48.1. Everything below is in addition to
-upstream's v0.48.1 notes. The registry lists 212 endpoints: upstream's 203
-plus nine this fork adds (`POST /mesh/join`, `POST /mesh/quiesce`, the three
+upstream's v0.48.1 notes. The registry lists 213 endpoints: upstream's 203
+plus ten this fork adds (`POST /mesh/join`, `POST /mesh/quiesce`,
+`PUT /mesh/own-peers`, the three
 engine-A routes, and the four TreeKEM catch-up routes).
 
 ### Added
@@ -113,6 +114,12 @@ engine-A routes, and the four TreeKEM catch-up routes).
   `relay_client` adds `relay_fallback_allowed`, `coordinator_policy`
   (`any`, `connected_only` or `introducer`), `introducer_dials`,
   `introducer_bytes_sent` and `introducer_bytes_received`.
+- **`PUT /mesh/own-peers` names this account's own devices (M-2).** In a
+  burst a live peer now coordinates a hole punch only when it is one of them
+  or the target announced it (ant-quic `set_own_peers`); before, the first
+  live peer did, so one contact's device learned whom the phone was calling.
+  Body `{"agent_ids": [...], "machine_ids": [...]}`, replacing the list;
+  agent ids are resolved at every burst dial. CLI `x0x mesh own-peers`.
 
 ### Changed
 

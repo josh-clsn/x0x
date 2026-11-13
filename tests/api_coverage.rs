@@ -134,6 +134,11 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Post, "/mesh/join", daemon_api_mesh_join),
     covered!(Post, "/mesh/quiesce", daemon_api_mesh_quiesce),
     covered!(
+        Put,
+        "/mesh/own-peers",
+        mesh_own_peers_sets_and_reports_own_machines
+    ),
+    covered!(
         Get,
         "/diagnostics/connectivity",
         daemon_api_diagnostics_connectivity

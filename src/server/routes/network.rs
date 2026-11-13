@@ -280,6 +280,70 @@ pub(in crate::server) async fn mesh_quiesce(
     }
 }
 
+/// PUT /mesh/own-peers request body: this account's own devices.
+#[derive(Debug, serde::Deserialize)]
+pub(in crate::server) struct OwnPeersRequest {
+    /// Own devices by agent id (64-char hex). Resolved to machines from the
+    /// discovery cache now and again at every burst dial.
+    #[serde(default)]
+    agent_ids: Vec<String>,
+    /// Own devices by machine id (64-char hex).
+    #[serde(default)]
+    machine_ids: Vec<String>,
+}
+
+/// PUT /mesh/own-peers — name this account's own devices (M-2), replacing
+/// the previous list. In a burst, a live peer coordinates a hole punch only
+/// when it is one of these or the target announced it, so no contact's
+/// device learns whom this node is calling. Answers with the machines in
+/// force and the agent ids not resolved yet. At most
+/// [`x0x::network::MAX_OWN_PEERS`] of each kind; an empty body clears it.
+pub(in crate::server) async fn mesh_own_peers(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<OwnPeersRequest>,
+) -> impl IntoResponse {
+    if req.agent_ids.len() > x0x::network::MAX_OWN_PEERS
+        || req.machine_ids.len() > x0x::network::MAX_OWN_PEERS
+    {
+        return bad_request(format!(
+            "at most {} agent_ids and {} machine_ids",
+            x0x::network::MAX_OWN_PEERS,
+            x0x::network::MAX_OWN_PEERS
+        ));
+    }
+    let mut agents = Vec::with_capacity(req.agent_ids.len());
+    for hex in &req.agent_ids {
+        match super::super::parse_agent_id_hex(hex) {
+            Ok(agent) => agents.push(agent),
+            Err(e) => return bad_request(format!("agent_ids: {e}")),
+        }
+    }
+    let mut machines = Vec::with_capacity(req.machine_ids.len());
+    for hex in &req.machine_ids {
+        match super::super::parse_machine_id_hex(hex) {
+            Ok(machine) => machines.push(machine),
+            Err(e) => return bad_request(format!("machine_ids: {e}")),
+        }
+    }
+    let own = state.agent.set_own_peers(agents, machines).await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "machine_ids": own
+                .machine_ids
+                .iter()
+                .map(|machine| hex::encode(machine.0))
+                .collect::<Vec<_>>(),
+            "unresolved_agent_ids": own
+                .unresolved_agent_ids
+                .iter()
+                .map(|agent| hex::encode(agent.0))
+                .collect::<Vec<_>>(),
+        })),
+    )
+}
+
 /// GET /network/bootstrap-cache — bootstrap peer cache statistics.
 pub(in crate::server) async fn bootstrap_cache_stats(
     State(state): State<Arc<AppState>>,
@@ -1661,5 +1725,100 @@ mod join_hook_tests {
         let ran = join_mesh_with(&agent, agent.dial_bootstrap_superseding(stale), hooks).await;
         assert!(!ran, "a superseded join runs no hooks");
         assert_eq!(runs.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[cfg(test)]
+mod own_peers_tests {
+    use super::*;
+    use axum::{body::Body, http::Request, routing::put, Router};
+    use tower::ServiceExt;
+
+    async fn put_own_peers(
+        app: &Router,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::put("/mesh/own-peers")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or_default())
+    }
+
+    /// M-2: `PUT /mesh/own-peers` hands ant-quic the named machines,
+    /// reports agent ids it cannot resolve yet, replaces the previous list,
+    /// and refuses bad ids and oversized lists.
+    #[tokio::test]
+    async fn mesh_own_peers_sets_and_reports_own_machines() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = Arc::new(
+            x0x::Agent::builder()
+                .with_identity_dir(dir.path().join("identity"))
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key(x0x::identity::AgentKeypair::generate().unwrap())
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .with_network_config(x0x::network::NetworkConfig {
+                    bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+                    bootstrap_nodes: Vec::new(),
+                    mdns_enabled: false,
+                    port_mapping_enabled: false,
+                    ..Default::default()
+                })
+                .build()
+                .await
+                .unwrap(),
+        );
+        let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+            dir.path(),
+            Arc::clone(&agent),
+        )
+        .await
+        .unwrap();
+        let app = Router::new()
+            .route("/mesh/own-peers", put(mesh_own_peers))
+            .with_state(state);
+        let machine = "ab".repeat(32);
+        let unknown_agent = "cd".repeat(32);
+
+        let (status, json) = put_own_peers(
+            &app,
+            serde_json::json!({"machine_ids": [machine], "agent_ids": [unknown_agent]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["machine_ids"], serde_json::json!([machine]));
+        assert_eq!(
+            json["unresolved_agent_ids"],
+            serde_json::json!([unknown_agent])
+        );
+        let network = agent.network().unwrap();
+        assert_eq!(network.own_peers(), vec![ant_quic::PeerId([0xab; 32])]);
+
+        let (status, json) = put_own_peers(&app, serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert!(
+            network.own_peers().is_empty(),
+            "an empty body clears the list"
+        );
+
+        let (status, _) = put_own_peers(&app, serde_json::json!({"machine_ids": ["zz"]})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let too_many: Vec<String> = (0..=x0x::network::MAX_OWN_PEERS)
+            .map(|i| format!("{i:064x}"))
+            .collect();
+        let (status, _) = put_own_peers(&app, serde_json::json!({"machine_ids": too_many})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }

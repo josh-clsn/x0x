@@ -221,9 +221,9 @@ The Home Suite campaign (ADRs 0036–0043, plus the 0044–0058 backfills) added
   `GET /diagnostics/ws`.
 
 Open issues for this release are listed in the README's *Known limitations*
-table (#446–#451). `x0x routes` prints 212 endpoints: upstream's 203 plus nine
-this fork adds. This reference documents the two runtime mesh flips and the
-four TreeKEM catch-up routes among them. The other three are the engine-A
+table (#446–#451). `x0x routes` prints 213 endpoints: upstream's 203 plus ten
+this fork adds. This reference documents the two runtime mesh flips, the
+own-peers list and the four TreeKEM catch-up routes among them. The other three are the engine-A
 control-plane routes (`POST /groups/:id/apply-metadata-event` and
 `GET`/`POST /groups/:id/join-result/:member`), which client apps bridge and no
 browser calls. Two further served paths sit outside the registry:
@@ -948,6 +948,7 @@ or an illegal placement; `501` ceremony disabled.
 | GET | `/network/bootstrap-cache` | `x0x network cache` | Bootstrap cache stats |
 | POST | `/mesh/join` | `x0x mesh join` | Dial the gossip mesh (bootstrap phases); returns immediately with `status: "dialing"` |
 | POST | `/mesh/quiesce` | `x0x mesh quiesce` | Disconnect all mesh peers and latch the mesh off (inbound rejected, gossip sends dropped, reappearing peers re-swept except [leased](#demand-leases) ones) until `/mesh/join`; ends every demand lease; returns `disconnected` count |
+| PUT | `/mesh/own-peers` | `x0x mesh own-peers [--agent ID]... [--machine ID]...` | Name this account's own devices (replaces the list); in a burst only they, or the target's own introducers, coordinate a hole punch. See [Own peers](#own-peers) |
 | GET | `/peers/:peer_id/health` | `x0x peer health <peer_id>` | Connection health snapshot for a peer |
 | POST | `/peers/:peer_id/probe` | `x0x peer probe <peer_id>` | Active `probe_peer` liveness + RTT check |
 | GET | `/peers/events` | `x0x peer events` | SSE stream of peer lifecycle events |
@@ -1135,6 +1136,29 @@ table) and a non-live outcome echo `null`. The next
 `POST /mesh/quiesce`, including one while already quiesced, ends every lease
 and sweeps every peer. A lease changes nothing else: inbound links are still
 refused and gossip frames are still dropped on the leased link.
+
+### Own peers
+
+`PUT /mesh/own-peers` names this account's own devices, replacing the
+previous list:
+
+```json
+{ "agent_ids": ["<64 hex>", "..."], "machine_ids": ["<64 hex>", "..."] }
+```
+
+Both fields are optional (at most 64 each); `{}` clears the list. Agent ids
+are resolved to machines from the discovery cache, now and again at every
+leased `/agents/connect`. The answer is
+`{"ok": true, "machine_ids": [...], "unresolved_agent_ids": [...]}`: the
+machines in force and the agent ids with no known machine yet. Bad hex or an
+oversized list answers 400.
+
+Why: a coordination request names the target. In a burst (a leased
+`/agents/connect` while quiesced) a live peer coordinates a hole punch only
+when it is one of these machines or the target announced it as one of its
+own coordinators (`reachable_via`); otherwise the dial uses the target's
+announced introducers. So a contact whose device the phone is linked to
+never learns whom else the phone is calling. Own devices are preferred.
 
 While quiesced, a node's own gossip publishes go nowhere. A non-durable
 direct send whose path would be the recipient's gossip inbox therefore
