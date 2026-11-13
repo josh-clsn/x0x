@@ -636,6 +636,11 @@ pub struct NetworkConfig {
     /// `defer_mesh_join`. Default `false`.
     #[serde(default)]
     pub start_quiesced: bool,
+    /// OQ5 (audit): a metered leaf (the daemon's `leaf_mode`) never serves
+    /// a relay session or coordinates a hole punch for anyone, meshed or
+    /// latched; its own dials and punches are unaffected. Default `false`.
+    #[serde(default)]
+    pub metered_leaf: bool,
 }
 
 /// X0X-0070b: TOML-shaped configuration for the peer-relay fallback
@@ -873,6 +878,7 @@ impl Default for NetworkConfig {
             network_id: None,
             observed_prefix_enabled: false,
             start_quiesced: false,
+            metered_leaf: false,
         }
     }
 }
@@ -2708,6 +2714,9 @@ impl NetworkNode {
         }
         // L-3: a node that starts latched sets the latched switches before
         // anything else runs; assembly then syncs them from the latch.
+        if config.metered_leaf {
+            node.inner_endpoint().set_relay_service_allowed(false);
+        }
         if config.start_quiesced {
             let endpoint = node.inner_endpoint();
             endpoint.set_relay_service_allowed(false);
@@ -5238,7 +5247,8 @@ impl NetworkNode {
     ///   dialled, no PUNCH_ME_NOW acted on unless it is for a punch the node
     ///   asked for). Its own burst punches still work.
     ///
-    /// Everything is allowed again (`Any`) when the latch lifts.
+    /// Everything is allowed again (`Any`) when the latch lifts, except
+    /// relay service on a metered leaf (OQ5), which stays off.
     fn sync_proactive_relay(&self) {
         if let Some(endpoint) = self.relay_switch.get() {
             let latched = self.mesh_quiesced.load(Ordering::Relaxed);
@@ -5250,7 +5260,7 @@ impl NetworkNode {
                 (true, false) => ant_quic::CoordinatorPolicy::ConnectedOnly,
             });
             endpoint.set_proactive_relay_allowed(!latched);
-            endpoint.set_relay_service_allowed(!latched);
+            endpoint.set_relay_service_allowed(!latched && !self.config.metered_leaf);
             endpoint.set_inbound_punch_allowed(!latched);
             let seeds_allowed = self.latched_seed_introducers.load(Ordering::SeqCst);
             endpoint.set_known_peer_introducers_allowed(!latched || seeds_allowed);
@@ -9643,6 +9653,55 @@ mod tests {
         let _ = phone.try_shutdown().await;
     }
 
+    /// OQ5 (audit): a metered leaf (daemon `leaf_mode`) serves no relay
+    /// session and coordinates no hole punch for anyone, meshed or latched,
+    /// from the moment it starts. A node that is not a metered leaf serves
+    /// while meshed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_metered_leaf_never_serves_relay_or_coordination_even_meshed() {
+        let phone = NetworkNode::new(
+            NetworkConfig {
+                metered_leaf: true,
+                ..loopback_quic_config(Vec::new())
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("phone");
+        assert!(!phone.mesh_quiesced(), "meshed");
+        let snap = phone.relay_client_snapshot();
+        assert_eq!(
+            snap.relay_service_allowed,
+            Some(false),
+            "off from the start"
+        );
+        assert_eq!(snap.inbound_punch_allowed, Some(true), "still reachable");
+
+        assert!(phone.latch_mesh_quiesced().is_some(), "fresh latch");
+        assert!(phone.unlatch_mesh_if_current(phone.mesh_transition_epoch()));
+        assert!(!phone.mesh_quiesced());
+        let snap = phone.relay_client_snapshot();
+        assert_eq!(
+            snap.relay_service_allowed,
+            Some(false),
+            "lifting the latch does not turn it on"
+        );
+        assert_eq!(snap.coordinator_policy.as_deref(), Some("any"));
+
+        let desktop = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("desktop");
+        assert_eq!(
+            desktop.relay_client_snapshot().relay_service_allowed,
+            Some(true),
+            "a node that is not a metered leaf serves while meshed"
+        );
+
+        let _ = desktop.try_shutdown().await;
+        let _ = phone.try_shutdown().await;
+    }
+
     /// H-1 and M-3 (review): latched with no burst dial in flight
     /// (`ConnectedOnly`), a phone linked to contact A never asks A to
     /// coordinate its dial to contact B, so the dial ends after its direct
@@ -12288,6 +12347,7 @@ async fn test_mesh_connections_are_bidirectional() {
             network_id: None,
             observed_prefix_enabled: false,
             start_quiesced: false,
+            metered_leaf: false,
         };
 
         let node = NetworkNode::new(config, None, None).await.unwrap();
