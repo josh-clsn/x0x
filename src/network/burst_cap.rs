@@ -5,7 +5,8 @@
 //! and end the burst when their sum passed the cap, so a peer sending at
 //! line speed got seconds of traffic through first. Now the cap rides on the
 //! burst's lease (`POST /agents/connect` with `max_bytes`) and the daemon
-//! checks it every [`BURST_CAP_TICK`] in its own task: once the bytes moved
+//! checks it in its own task, every 10 ms near the cap and up to every 250 ms
+//! far from it ([`burst_cap_tick`]): once the bytes moved
 //! since the cap was armed pass it, every link is closed, the demand leases
 //! end, and no further leased dial runs until the next latch call ends the
 //! burst.
@@ -28,8 +29,28 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-/// How often the daemon reads the counters while a cap is armed.
+/// The fastest counter read, used near the cap (and while tripped).
 pub(crate) const BURST_CAP_TICK: Duration = Duration::from_millis(10);
+
+/// The slowest counter read, used far from the cap.
+pub(crate) const BURST_CAP_SLOW_TICK: Duration = Duration::from_millis(250);
+
+/// The worst-case line rate the tick assumes: 125 MB/s (1 Gbit/s), above any
+/// phone link and the loopback rate the full-speed test reaches.
+pub(crate) const BURST_CAP_ASSUMED_RATE: u64 = 125_000_000;
+
+/// How long until the next counter read, with `headroom` bytes left before
+/// the cap: `clamp(headroom / BURST_CAP_ASSUMED_RATE, 10 ms, 250 ms)`.
+///
+/// Above the 10 ms floor, a link at the assumed rate cannot move more than
+/// the headroom before the next read, so the cap is never passed between two
+/// reads; overshoot can only build up in the last 10 ms tick, as with a fixed
+/// 10 ms tick. Far from the cap the task wakes up to 25 times less often.
+pub(crate) fn burst_cap_tick(headroom: u64) -> Duration {
+    let micros = u128::from(headroom) * 1_000_000 / u128::from(BURST_CAP_ASSUMED_RATE);
+    let micros = u64::try_from(micros).unwrap_or(u64::MAX);
+    Duration::from_micros(micros).clamp(BURST_CAP_TICK, BURST_CAP_SLOW_TICK)
+}
 
 /// One connection: a peer's machine id and the connection's stable id.
 pub(crate) type LinkKey = ([u8; 32], usize);
@@ -159,6 +180,34 @@ mod tests {
         count.observe(link(6, 3), 40_000_100);
         assert_eq!(count.counted(), 100);
         assert!(!count.reached());
+    }
+
+    #[test]
+    fn the_tick_is_slow_far_from_the_cap_and_10_ms_near_it() {
+        assert_eq!(burst_cap_tick(u64::MAX), BURST_CAP_SLOW_TICK, "far away");
+        assert_eq!(burst_cap_tick(100_000_000), BURST_CAP_SLOW_TICK);
+        assert_eq!(burst_cap_tick(5_000_000), Duration::from_millis(40));
+        assert_eq!(burst_cap_tick(1_000_000), BURST_CAP_TICK, "near");
+        assert_eq!(burst_cap_tick(0), BURST_CAP_TICK);
+    }
+
+    #[test]
+    fn a_link_at_the_assumed_rate_never_passes_the_cap_between_reads() {
+        // Above the 10 ms floor, the bytes the assumed rate moves in one tick
+        // stay within the headroom; at the floor they stay within one 10 ms
+        // tick's worth, the documented bound.
+        let floor_bytes = BURST_CAP_ASSUMED_RATE / 100;
+        let mut headroom = 1u64;
+        while headroom < 1 << 40 {
+            let tick = burst_cap_tick(headroom);
+            assert!(tick >= BURST_CAP_TICK && tick <= BURST_CAP_SLOW_TICK);
+            let moved = u128::from(BURST_CAP_ASSUMED_RATE) * tick.as_micros() / 1_000_000;
+            assert!(
+                moved <= u128::from(headroom.max(floor_bytes)),
+                "headroom {headroom}: {moved} bytes in {tick:?}"
+            );
+            headroom = headroom * 3 / 2 + 1;
+        }
     }
 
     #[test]

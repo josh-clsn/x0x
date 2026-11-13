@@ -2390,6 +2390,9 @@ struct BurstCapState {
     last_armed_at: Option<tokio::time::Instant>,
     /// When the cap was reached and the links were closed.
     tripped_at: Option<tokio::time::Instant>,
+    /// Wakes the enforcement task early when the cap is lowered, so a slow
+    /// tick computed for the old cap never outlives it.
+    wake: Option<Arc<tokio::sync::Notify>>,
     /// The enforcement task. It is never aborted: a clear changes the
     /// generation and the task ends itself at its next tick, so it never
     /// stops halfway through a disconnect.
@@ -4892,7 +4895,9 @@ impl NetworkNode {
     ///
     /// From now on every link's UDP bytes (sent plus received) count toward
     /// it, a link up now from its counters now. A task reads the counters
-    /// every 10 ms (`BURST_CAP_TICK`); when the sum reaches the cap it ends
+    /// every 10 ms near the cap and up to every 250 ms far from it (the time
+    /// a 1 Gbit/s link needs to close the gap,
+    /// `clamp(headroom / 125 MB/s, 10 ms, 250 ms)`); when the sum reaches the cap it ends
     /// every demand lease and closes every link, then keeps closing any link
     /// that comes up, and leased dials are refused, until the cap is cleared.
     /// The cap is cleared by the next latch call
@@ -4913,6 +4918,9 @@ impl NetworkNode {
                 count.lower_to(max_bytes);
                 state.last_armed_at = Some(tokio::time::Instant::now());
                 state.arm_seq = state.arm_seq.wrapping_add(1);
+                if let Some(wake) = state.wake.as_ref() {
+                    wake.notify_one();
+                }
                 return true;
             }
         }
@@ -4926,6 +4934,9 @@ impl NetworkNode {
             count.lower_to(max_bytes);
             state.last_armed_at = Some(now);
             state.arm_seq = state.arm_seq.wrapping_add(1);
+            if let Some(wake) = state.wake.as_ref() {
+                wake.notify_one();
+            }
             return true;
         }
         state.generation = state.generation.wrapping_add(1);
@@ -4935,8 +4946,10 @@ impl NetworkNode {
         state.arm_seq = state.arm_seq.wrapping_add(1);
         let node = self.clone();
         let generation = state.generation;
+        let wake = Arc::new(tokio::sync::Notify::new());
+        state.wake = Some(Arc::clone(&wake));
         state.task = Some(tokio::spawn(async move {
-            node.enforce_burst_cap(generation).await;
+            node.enforce_burst_cap(generation, wake).await;
         }));
         true
     }
@@ -5083,12 +5096,21 @@ impl NetworkNode {
     /// M-5: read the counters every tick while the cap of `generation` is
     /// armed. Once it is reached, end the leases and close every link, then
     /// keep closing any link that comes up until the cap is cleared.
-    async fn enforce_burst_cap(self, generation: u64) {
+    async fn enforce_burst_cap(self, generation: u64, wake: Arc<tokio::sync::Notify>) {
         let lifetime = std::time::Duration::from_secs(crate::MAX_DEMAND_LEASE_SECS);
-        let mut tick = tokio::time::interval(burst_cap::BURST_CAP_TICK);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut wait = std::time::Duration::ZERO;
+        let mut read_at = tokio::time::Instant::now();
         loop {
-            tick.tick().await;
+            // The next read is due `wait` after the last one began, so the
+            // time a read takes does not stretch the tick.
+            tokio::select! {
+                () = tokio::time::sleep_until(read_at + wait) => {}
+                () = wake.notified() => {}
+            }
+            read_at = tokio::time::Instant::now();
+            // Near the cap, while tripped and until the headroom is known:
+            // the 10 ms floor.
+            wait = burst_cap::BURST_CAP_TICK;
             if self.node.read().await.is_none() {
                 return;
             }
@@ -5136,6 +5158,9 @@ impl NetworkNode {
                     count.observe(link, total);
                 }
                 if !count.reached() {
+                    wait = burst_cap::burst_cap_tick(
+                        count.max_bytes().saturating_sub(count.counted()),
+                    );
                     continue;
                 }
                 let counted = (count.counted(), count.max_bytes());

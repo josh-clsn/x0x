@@ -254,6 +254,11 @@ engine-A routes, and the four TreeKEM catch-up routes).
   so an arm racing the end keeps the cap; any cap ends 300 s after its
   latest arm. The task is never aborted: a cleared cap's task ends itself at
   its next tick, so a disconnect it is making completes.
+- **The burst cap's counter read scales with the headroom (re-review
+  N-7).** It reads every `clamp(headroom / 125 MB/s, 10 ms, 250 ms)`: 10 ms
+  near the cap, up to 250 ms far from it. Above the floor a link at the
+  assumed worst case of 1 Gbit/s cannot pass the cap between two reads, so
+  the overshoot bound is unchanged. Lowering the cap wakes the task at once.
 - **The burst cap counts by connection stable id (review L-3).** A link's
   bytes are keyed by its stable id, and a new connection under a reused key
   keeps its predecessor's share.

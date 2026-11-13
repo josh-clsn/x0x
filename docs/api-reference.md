@@ -1150,7 +1150,11 @@ While the mesh is quiesced, the first such connect since the last
 can only lower it. `max_bytes: 0` is refused with 400 (omit it for no cap).
 From then on the daemon counts the UDP bytes sent and received on every link
 (a link already up counts from its counters at arming; one that comes up
-later from zero) and reads them every 10 ms. Once the sum reaches the cap it
+later from zero) and reads them every `clamp(headroom / 125 MB/s, 10 ms,
+250 ms)`, where the headroom is the bytes left before the cap: 10 ms near the
+cap, up to 250 ms far from it. Above the 10 ms floor a link at the assumed
+worst case of 1 Gbit/s cannot pass the cap between two reads, so overshoot
+still builds up only in the last 10 ms tick. Once the sum reaches the cap it
 ends every lease and closes every link. Until the cap is cleared it keeps
 closing any link that comes up within a tick, and every connect, leased or
 not (the raw-send redial of `/direct/send` included), is refused with
