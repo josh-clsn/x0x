@@ -234,6 +234,12 @@ engine-A routes, and the four TreeKEM catch-up routes).
   switches set before anything runs and the latch's re-sweep started, so no
   window exists between start and the embedder's first `POST /mesh/quiesce`.
   `POST /mesh/join` lifts it as before.
+- **A latched node plays no target role in a hole punch (review M-3).** The
+  latch also sets ant-quic's `set_inbound_punch_allowed(false)`: no offer is
+  answered, no initiator a coordinator names is dialled, and no PUNCH_ME_NOW
+  is acted on unless it is for a punch the node asked for. The node's own
+  burst punches still connect. `relay_client.inbound_punch_allowed` reports
+  the switch.
 
 ### Carried patches
 

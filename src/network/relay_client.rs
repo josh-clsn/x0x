@@ -39,6 +39,7 @@ pub(crate) struct TransportRelay {
     pub(crate) proactive_relay_allowed: bool,
     pub(crate) relay_fallback_allowed: bool,
     pub(crate) relay_service_allowed: bool,
+    pub(crate) inbound_punch_allowed: bool,
     pub(crate) known_peer_introducers_allowed: bool,
     pub(crate) coordinator_policy: ant_quic::CoordinatorPolicy,
     pub(crate) stats: ant_quic::RelayClientStats,
@@ -69,6 +70,10 @@ pub struct RelayClientSnapshot {
     /// Whether this node serves others now: MASQUE relay sessions and
     /// hole-punch coordination (false while latched, bursts included).
     pub relay_service_allowed: Option<bool>,
+    /// Whether this node plays the target role of a hole punch a linked
+    /// peer coordinates (false while latched, bursts included; its own
+    /// punches still work).
+    pub inbound_punch_allowed: Option<bool>,
     /// Which hole-punch coordinators ant-quic may use now: `any` (meshed),
     /// `connected_only` (latched, at rest: nothing is dialled to
     /// coordinate) or `introducer` (latched, during a burst dial: one
@@ -179,6 +184,7 @@ impl RelayClientCounters {
                 t.relay_fallback_allowed,
                 t.relay_service_allowed,
                 t.known_peer_introducers_allowed,
+                t.inbound_punch_allowed,
                 match t.coordinator_policy {
                     ant_quic::CoordinatorPolicy::Any => "any",
                     ant_quic::CoordinatorPolicy::ConnectedOnly => "connected_only",
@@ -202,7 +208,8 @@ impl RelayClientCounters {
             proactive_relay_allowed: switches.map(|s| s.0),
             relay_fallback_allowed: switches.map(|s| s.1),
             relay_service_allowed: switches.map(|s| s.2),
-            coordinator_policy: switches.map(|s| s.4.to_string()),
+            inbound_punch_allowed: switches.map(|s| s.4),
+            coordinator_policy: switches.map(|s| s.5.to_string()),
             introducer_dials: introducers.dials,
             introducer_seed_dials: introducers.known_peer_dials,
             introducer_dials_24h: day.dials,

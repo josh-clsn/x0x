@@ -2690,6 +2690,7 @@ impl NetworkNode {
         if config.start_quiesced {
             let endpoint = node.inner_endpoint();
             endpoint.set_relay_service_allowed(false);
+            endpoint.set_inbound_punch_allowed(false);
             endpoint.set_proactive_relay_allowed(false);
             endpoint.set_relay_fallback_allowed(false);
             endpoint.set_coordinator_policy(ant_quic::CoordinatorPolicy::ConnectedOnly);
@@ -5045,6 +5046,7 @@ impl NetworkNode {
                 proactive_relay_allowed: endpoint.proactive_relay_allowed(),
                 relay_fallback_allowed: endpoint.relay_fallback_allowed(),
                 relay_service_allowed: endpoint.relay_service_allowed(),
+                inbound_punch_allowed: endpoint.inbound_punch_allowed(),
                 known_peer_introducers_allowed: endpoint.known_peer_introducers_allowed(),
                 coordinator_policy: endpoint.coordinator_policy(),
                 stats: endpoint.relay_client_stats(),
@@ -5074,7 +5076,11 @@ impl NetworkNode {
     /// - relay service is off (M-1): the node serves no MASQUE relay session
     ///   and coordinates no hole punch for anyone, on any link, including a
     ///   link it dialled itself in a burst. Turning it off ends the sessions
-    ///   it was serving.
+    ///   it was serving;
+    /// - inbound punches are off: the node plays no target role in a hole
+    ///   punch a linked peer coordinates (no offer answered, no initiator
+    ///   dialled, no PUNCH_ME_NOW acted on unless it is for a punch the node
+    ///   asked for). Its own burst punches still work.
     ///
     /// Everything is allowed again (`Any`) when the latch lifts.
     fn sync_proactive_relay(&self) {
@@ -5089,6 +5095,7 @@ impl NetworkNode {
             });
             endpoint.set_proactive_relay_allowed(!latched);
             endpoint.set_relay_service_allowed(!latched);
+            endpoint.set_inbound_punch_allowed(!latched);
             let seeds_allowed = self.latched_seed_introducers.load(Ordering::SeqCst);
             endpoint.set_known_peer_introducers_allowed(!latched || seeds_allowed);
         }
@@ -9279,6 +9286,7 @@ mod tests {
         assert_eq!(snap.proactive_relay_allowed, Some(false));
         assert_eq!(snap.relay_fallback_allowed, Some(false));
         assert_eq!(snap.relay_service_allowed, Some(false));
+        assert_eq!(snap.inbound_punch_allowed, Some(false));
         assert_eq!(snap.coordinator_policy.as_deref(), Some("connected_only"));
 
         let peer = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)

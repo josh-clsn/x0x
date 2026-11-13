@@ -1173,7 +1173,7 @@ hole-punch introducer; the seed learns this node's address and whom it is
 calling, and never relays data. The daemon setting `latched_seed_introducers`
 (TOML, default `true`) set to `false` refuses that fallback while latched.
 `GET /diagnostics/connectivity` → `relay_client` reports
-`relay_service_allowed`, `seed_introducers_allowed`,
+`relay_service_allowed`, `inbound_punch_allowed`, `seed_introducers_allowed`,
 `latched_seed_introducers`, `introducer_seed_dials` (since start),
 `introducer_dials_24h` and `introducer_seed_dials_24h`.
 
