@@ -249,9 +249,11 @@ engine-A routes, and the four TreeKEM catch-up routes).
   answers `burst_cap_reached`, and the cap's task closes any link that comes
   up within a tick, until the next latch call or the latch lifting. Before a
   close it rechecks, under the cap's lock, that the cap and the latch still
-  hold. An armed cap that has not tripped ends once no lease remains and no
-  burst dial is in flight; any cap ends 300 s after its latest arm. The task
-  is held by the cap and aborted when the cap is cleared.
+  hold. An armed cap that has not tripped ends once no lease remains, no
+  burst dial is in flight and no link is up, rechecked under the cap's lock
+  so an arm racing the end keeps the cap; any cap ends 300 s after its
+  latest arm. The task is never aborted: a cleared cap's task ends itself at
+  its next tick, so a disconnect it is making completes.
 - **The burst cap counts by connection stable id (review L-3).** A link's
   bytes are keyed by its stable id, and a new connection under a reused key
   keeps its predecessor's share.

@@ -2390,7 +2390,9 @@ struct BurstCapState {
     last_armed_at: Option<tokio::time::Instant>,
     /// When the cap was reached and the links were closed.
     tripped_at: Option<tokio::time::Instant>,
-    /// The enforcement task, aborted when the cap is cleared.
+    /// The enforcement task. It is never aborted: a clear changes the
+    /// generation and the task ends itself at its next tick, so it never
+    /// stops halfway through a disconnect.
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -4939,13 +4941,12 @@ impl NetworkNode {
         true
     }
 
-    /// M-5: drop the burst's cap and stop its task (every latch call ends a
-    /// burst).
+    /// M-5: drop the burst's cap (every latch call ends a burst). Its task
+    /// sees the new generation and ends itself at its next tick; it is not
+    /// aborted, so a disconnect it is making completes.
     fn clear_burst_cap(&self) {
         let mut state = self.burst_cap_guard();
-        if let Some(task) = state.task.take() {
-            task.abort();
-        }
+        drop(state.task.take());
         let generation = state.generation.wrapping_add(1);
         *state = BurstCapState {
             generation,
