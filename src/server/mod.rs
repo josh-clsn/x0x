@@ -38,6 +38,8 @@ mod issue1229_delivery;
 #[cfg(test)]
 mod issue1288_ws_shutdown;
 #[cfg(test)]
+mod relay_service_setting;
+#[cfg(test)]
 mod shutdown_regression;
 
 // Re-export the public server API surface so `x0x::server::*` paths are
