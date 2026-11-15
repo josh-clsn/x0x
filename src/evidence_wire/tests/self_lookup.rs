@@ -86,7 +86,10 @@ fn publishes(agent: &Agent) -> Option<u64> {
     agent.gossip_stats().map(|stats| stats.publish_total)
 }
 
-/// Every file under `dir` with its length and modification time.
+/// Every file under `dir` with its length and modification time, except
+/// the bootstrap peer cache, which the transport connection itself updates
+/// and saves on its own schedule. The peer cache is checked separately
+/// (`self_evidence_never_reaches_the_peer_cache`).
 fn snapshot(dir: &std::path::Path) -> Vec<(std::path::PathBuf, u64, std::time::SystemTime)> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -95,7 +98,9 @@ fn snapshot(dir: &std::path::Path) -> Vec<(std::path::PathBuf, u64, std::time::S
             let entry = entry.unwrap();
             let meta = entry.metadata().unwrap();
             if meta.is_dir() {
-                stack.push(entry.path());
+                if entry.file_name() != "peers" {
+                    stack.push(entry.path());
+                }
             } else {
                 out.push((entry.path(), meta.len(), meta.modified().unwrap()));
             }
@@ -1018,5 +1023,379 @@ async fn the_send_reads_evidence_stored_by_the_self_lookup() {
             .map(|(_, machine, _)| *machine)
             .collect::<Vec<_>>(),
         vec![device.1]
+    );
+}
+
+/// `from` dials `to` by address only: no discovery entry, so `from` stays
+/// an undiscovered machine at `to`.
+async fn dial(from: &Agent, to: &Agent) {
+    let mut addr = to.network().unwrap().bound_addr().await.unwrap();
+    if addr.ip().is_unspecified() {
+        addr.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
+    }
+    from.network().unwrap().connect_addr(addr).await.unwrap();
+    let seen = ant_quic::PeerId(from.machine_id().0);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !to
+            .network()
+            .unwrap()
+            .connected_peers()
+            .await
+            .contains(&seen)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the dialled side sees the connection");
+}
+
+async fn bound_to(agent: &Agent, target: AgentId, machine: MachineId) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while agent
+            .authenticated_machine_bindings
+            .read()
+            .await
+            .peek(&target)
+            .map(|binding| binding.machine_id)
+            != Some(machine)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the self-evidence lands");
+}
+
+/// R1-L1: accepting a stranger's self-evidence puts nothing in the
+/// bootstrap peer cache, in memory or after a save. The receiver is not
+/// connected to that machine, so only the self-evidence path could add it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn self_evidence_never_reaches_the_peer_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = node(dir.path(), "device").await;
+    let fresh = node_with(dir.path(), "fresh", false, true).await;
+    let cache = Arc::clone(fresh.bootstrap_cache.as_ref().unwrap());
+    let before = cache.peer_count().await;
+    let record = decoded(&context(&device).own_answer(true).unwrap());
+    let store = fresh.peer_evidence().store().unwrap();
+    let self_lookup::SelfFound::Stranger(view) = self_lookup::verify_self_found(
+        &store,
+        &Limits::default(),
+        device.agent_id(),
+        device.machine_id(),
+        record,
+        dm_capability::now_unix_ms(),
+    )
+    .unwrap() else {
+        panic!("a stranger's answer is not stored");
+    };
+    assert!(
+        context(&fresh)
+            .accept_self_evidence(&view, device.machine_id())
+            .await
+    );
+    let peer = ant_quic::PeerId(device.machine_id().0);
+    assert!(cache.get_peer(&peer).await.is_none());
+    assert_eq!(cache.peer_count().await, before);
+    cache.save().await.unwrap();
+    assert!(cache.get_peer(&peer).await.is_none());
+}
+
+/// R1-L3(a): three Sybil claimants of the device's agent whose Lookups
+/// went out first do not cool the device's own route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sybil_claimants_cannot_cool_the_devices_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let friend = node(dir.path(), "friend").await;
+    let device = node(dir.path(), "device").await;
+    dial(&device, &friend).await;
+    let runtime = Arc::clone(friend.peer_evidence());
+    let mut sybils = Vec::new();
+    for i in 0..3 {
+        let sybil = node(dir.path(), &format!("sybil-{i}")).await;
+        dial(&sybil, &friend).await;
+        runtime
+            .lookup_from_frame(device.agent_id(), sybil.machine_id())
+            .await;
+        sybils.push(sybil);
+    }
+    assert!(counter(&friend, "evidence_self_lookup_sent") >= 1);
+    runtime
+        .lookup_from_frame(device.agent_id(), device.machine_id())
+        .await;
+    bound_to(&friend, device.agent_id(), device.machine_id()).await;
+}
+
+/// R1-L3(b): four strangers holding the whole stranger allocation pool do
+/// not block the self-only pull to the frame's own machine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stranger_pool_holders_cannot_block_the_frames_pull() {
+    let dir = tempfile::tempdir().unwrap();
+    let friend = node(dir.path(), "friend").await;
+    let device = node(dir.path(), "device").await;
+    dial(&device, &friend).await;
+    let limits = Arc::clone(&friend.peer_evidence().wire_limits);
+    let held: Vec<_> = (0..4u8)
+        .map(|i| limits.admit(MachineId([0x90 + i; 32]), false).unwrap())
+        .collect();
+    assert!(limits.admit(MachineId([0x9f; 32]), false).is_none());
+    friend
+        .peer_evidence()
+        .lookup_from_frame(device.agent_id(), device.machine_id())
+        .await;
+    bound_to(&friend, device.agent_id(), device.machine_id()).await;
+    drop(held);
+}
+
+/// R1-L3(c): sixteen machines flooding claims cannot flush the device's
+/// hint, so a send still finds it, starts the self-lookup and goes raw.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hint_flushers_cannot_hide_the_devices_machine() {
+    let dir = tempfile::tempdir().unwrap();
+    let friend = node(dir.path(), "friend").await;
+    let device = node(dir.path(), "device").await;
+    dial(&device, &friend).await;
+    let hints = &friend.peer_evidence().lookup_hints;
+    hints.record(device.agent_id(), device.machine_id());
+    for flusher in 0..16u8 {
+        for claim in 0..8u8 {
+            hints.record(AgentId([claim; 32]), MachineId([0xa0 + flusher; 32]));
+        }
+    }
+    let mut device_rx = device.subscribe_direct();
+    let sent = friend
+        .send_direct_with_config(&device.agent_id(), b"found you".to_vec(), raw())
+        .await;
+    assert!(sent.is_ok(), "{sent:?}");
+    assert_eq!(receive(&mut device_rx).await.payload, b"found you");
+}
+
+/// R1-L4: a relationship that ends while its full answer is being minted
+/// never lets that answer leave, though the node is public.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relationship_ending_mid_sign_never_sends_the_full_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let responder = node_with(dir.path(), "responder", true, false).await;
+    let requester = node(dir.path(), "requester").await;
+    dial(&requester, &responder).await;
+    crate::dm_inbox::record_authenticated_machine_binding(
+        &responder.authenticated_machine_bindings,
+        requester.agent_id(),
+        requester.machine_id(),
+        crate::Agent::unix_timestamp_secs(),
+    )
+    .await;
+    let related = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let pair = [responder.agent_id(), requester.agent_id()];
+    let flag = Arc::clone(&related);
+    responder
+        .peer_evidence()
+        .set_group_context(Arc::new(move |a, b| {
+            Some(
+                flag.load(std::sync::atomic::Ordering::SeqCst)
+                    && pair.contains(&a)
+                    && pair.contains(&b),
+            )
+        }));
+    let ask = || {
+        let network = Arc::clone(requester.network().unwrap());
+        let limits = Arc::clone(&requester.peer_evidence().wire_limits);
+        let (machine, target) = (responder.machine_id(), responder.agent_id());
+        async move {
+            let (mut send, mut recv) = network.open_bi(&ant_quic::PeerId(machine.0)).await.unwrap();
+            send.write_u8(StreamProtocol::EvidenceV1.as_u8())
+                .await
+                .unwrap();
+            let body = codec().serialize(&target).unwrap();
+            write_message(&mut send, &limits, machine, LOOKUP, &body)
+                .await
+                .unwrap();
+            read_message(&mut recv, &limits).await.unwrap()
+        }
+    };
+    let (kind, body) = ask().await;
+    assert_eq!(kind, FOUND, "control: the relationship gets its answer");
+    assert!(decode::found(&body).unwrap().certificate.is_some());
+
+    // The responder takes one Lookup per machine per 2 s.
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    let (reached_tx, reached) = std::sync::mpsc::channel();
+    let (resume, resume_rx) = std::sync::mpsc::channel();
+    *responder
+        .peer_evidence()
+        .self_lookup
+        .mint_pause
+        .lock()
+        .unwrap() = Some((reached_tx, resume_rx));
+    let pending = tokio::spawn(ask());
+    tokio::task::spawn_blocking(move || reached.recv().unwrap())
+        .await
+        .unwrap();
+    related.store(false, std::sync::atomic::Ordering::SeqCst);
+    resume.send(()).unwrap();
+    let (kind, _) = pending.await.unwrap();
+    assert_eq!(kind, NOT_FOUND, "the full answer must not leave");
+}
+
+/// R1-L5: the share-grant gate's Lookup (`EvidenceRuntime::lookup`) keeps
+/// its routing hint but never asks the connecting machine for its own
+/// evidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_share_grant_lookup_never_takes_the_self_only_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let friend = node(dir.path(), "friend").await;
+    let device = node(dir.path(), "device").await;
+    dial(&device, &friend).await;
+    let runtime = friend.peer_evidence();
+    runtime
+        .lookup(device.agent_id(), Some(device.machine_id()))
+        .await;
+    assert_eq!(counter(&friend, "evidence_self_lookup_sent"), 0);
+    assert_eq!(
+        runtime.lookup_hints.machines(device.agent_id()),
+        vec![device.machine_id()]
+    );
+    assert!(friend
+        .authenticated_machine_bindings
+        .read()
+        .await
+        .peek(&device.agent_id())
+        .is_none());
+}
+
+/// R1-L5: a binding only self-evidence wrote does not satisfy share-grant
+/// access; the same pairing from a network announcement does.
+#[tokio::test]
+async fn a_self_evidence_binding_does_not_satisfy_share_grant_access() {
+    use crate::share_grant::{Grantee, ShareCap, ShareGrant, ShareGrantStore};
+    let local = AgentId([0x31; 32]);
+    let peer = (AgentId([0x32; 32]), MachineId([0x33; 32]));
+    let owner = crate::identity::UserKeypair::generate().unwrap();
+    let now = crate::Agent::unix_timestamp_secs();
+    let grants = ShareGrantStore::in_memory(local, Some(owner.user_id()));
+    grants
+        .accept(
+            ShareGrant::sign(
+                &owner,
+                [0x34; 32],
+                Grantee::Agent(peer.0),
+                vec![local],
+                vec![ShareCap::Dm],
+                now - 1,
+                now + 60,
+            )
+            .unwrap(),
+            now,
+        )
+        .await
+        .unwrap();
+    let bindings = Arc::new(tokio::sync::RwLock::new(
+        crate::dm_inbox::AuthenticatedMachineBindingCache::default(),
+    ));
+    let discovery = tokio::sync::RwLock::new(HashMap::new());
+    let revoked = tokio::sync::RwLock::new(crate::revocation::RevocationSet::new());
+    let access = || {
+        crate::share_grant::evaluate_grant_access_with_evidence(
+            &grants, &bindings, &discovery, &revoked, &peer.0, &peer.1, now, None,
+        )
+    };
+    crate::dm_inbox::record_self_evidence_machine_binding(&bindings, peer.0, peer.1, now, None)
+        .await;
+    assert!(access().await.is_empty(), "self-evidence grants nothing");
+    crate::dm_inbox::record_authenticated_machine_binding(&bindings, peer.0, peer.1, now).await;
+    assert!(access().await.dm, "a network announcement still does");
+    crate::dm_inbox::record_self_evidence_machine_binding(&bindings, peer.0, peer.1, now + 1, None)
+        .await;
+    assert!(
+        access().await.dm,
+        "a later self-evidence refresh does not undo the announcement"
+    );
+}
+
+/// R1-L2: a binding that lands during the send's wait (a heartbeat naming
+/// the current machine) wins over the stored evidence for an older machine.
+#[tokio::test]
+async fn a_binding_landing_during_the_wait_beats_stored_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let friend = offline(dir.path()).await;
+    let peer = crate::identity::Identity::new(
+        crate::identity::MachineKeypair::generate().unwrap(),
+        crate::identity::AgentKeypair::generate().unwrap(),
+    );
+    let agent = peer.agent_id();
+    let (old_machine, new_machine) = (peer.machine_id(), MachineId([0xc1; 32]));
+    friend
+        .start_peer_evidence(
+            dir.path().join("evidence"),
+            Default::default(),
+            Arc::new(move |a| Some(a == agent)),
+        )
+        .unwrap();
+    let runtime = Arc::clone(friend.peer_evidence());
+    assert!(runtime.wait(0).await);
+    let template = crate::IdentityAnnouncement {
+        self_name: None,
+        agent_id: agent,
+        machine_id: old_machine,
+        user_id: None,
+        agent_certificate: None,
+        machine_public_key: peer.machine_keypair().public_key().as_bytes().to_vec(),
+        machine_signature: vec![],
+        agent_public_key: peer.agent_keypair().public_key().as_bytes().to_vec(),
+        addresses: vec![],
+        announced_at: dm_capability::now_unix_ms() / 1000,
+        nat_type: None,
+        can_receive_direct: None,
+        is_relay: None,
+        is_coordinator: None,
+        reachable_via: vec![],
+        relay_candidates: vec![],
+    };
+    let record = mint_hello(
+        &peer,
+        template,
+        &crate::announce_blob::shared_cert_pair(None, None),
+        crate::dm::DmCapabilities::v1_gossip_ready(vec![42; 1184]),
+        None,
+        true,
+    )
+    .unwrap()
+    .into_record();
+    let store = runtime.store().unwrap();
+    let discovery = Arc::clone(&friend.identity_discovery_cache);
+    let announced = Arc::clone(&friend.announced_machine_bindings);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    hook_on_call(&runtime, 2, Arc::clone(&calls), move |_| {
+        let (store, record) = (Arc::clone(&store), record.clone());
+        let (discovery, announced) = (Arc::clone(&discovery), Arc::clone(&announced));
+        Box::pin(async move {
+            let now = crate::Agent::unix_timestamp_secs();
+            store
+                .ingest(record, IngestSource::Gossip, dm_capability::now_unix_ms())
+                .unwrap();
+            announced
+                .write()
+                .await
+                .record_announcement(agent, new_machine, now, None, None);
+            let mut entry = crate::discovered_agent_fixture(1, now, &[], None);
+            entry.agent_id = agent;
+            entry.machine_id = new_machine;
+            discovery.write().await.insert(agent, entry);
+        })
+    });
+    runtime.lookup_hints.record(agent, old_machine);
+    let sent = friend
+        .send_direct_raw_quic(&agent, b"reply", None, Duration::ZERO, None)
+        .await;
+    assert!(sent.is_ok(), "{sent:?}");
+    assert_eq!(
+        friend
+            .general_raw_standin_deliveries_for_testing()
+            .iter()
+            .filter(|(to, _, _)| *to == agent)
+            .map(|(_, machine, _)| *machine)
+            .collect::<Vec<_>>(),
+        vec![new_machine]
     );
 }
