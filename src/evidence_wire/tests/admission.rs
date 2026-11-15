@@ -389,19 +389,30 @@ async fn issue1241_unknown_group_peer_evidence_hello_is_verified_and_stored() {
         .is_none());
 }
 
-/// T-self-evidence-lookup: a Known contact (AcceptWithFlag) is more trusted
-/// than an Unknown group peer, so it gets the same EvidenceV1 admission.
+/// T-self-evidence-lookup: a Known contact (AcceptWithFlag) gains EvidenceV1
+/// admission only on a machine our agent wrote to within the window. Through
+/// the ADR 0089 relationship branch alone it is refused, as upstream rules.
 #[tokio::test]
-async fn a_known_group_peer_evidence_hello_is_verified_and_stored() {
+async fn a_known_group_peer_is_admitted_only_when_written_to() {
     let mut f = Fixture::new(true, true).await;
     f.responder
         .contact_store
         .write()
         .await
         .set_trust(&f.initiator.agent_id(), TrustLevel::Known);
-    let outcome = f.exchange(StreamProtocol::EvidenceV1, &f.hello()).await;
+    let refused = f.exchange(StreamProtocol::EvidenceV1, &f.hello()).await;
+    f.context
+        .runtime
+        .self_lookup
+        .note_sent(f.initiator.machine_id());
+    let written = f.exchange(StreamProtocol::EvidenceV1, &f.hello()).await;
     f.shutdown().await;
-    assert_eq!(outcome, Outcome::HelloVerified);
+    assert_eq!(
+        refused,
+        Outcome::BeforePrefixRefused,
+        "relationship alone does not admit a Known contact"
+    );
+    assert_eq!(written, Outcome::HelloVerified, "written to: admitted");
     assert!(f
         .store()
         .usable(
@@ -413,7 +424,7 @@ async fn a_known_group_peer_evidence_hello_is_verified_and_stored() {
 }
 
 /// The Known admission is EvidenceV1 only: every other protocol from a Known
-/// group peer stays refused.
+/// group peer on a machine our agent wrote to stays refused.
 #[tokio::test]
 async fn a_known_group_peer_non_evidence_stream_stays_gated() {
     for protocol in [
@@ -433,6 +444,10 @@ async fn a_known_group_peer_non_evidence_stream_stays_gated() {
             .write()
             .await
             .set_trust(&f.initiator.agent_id(), TrustLevel::Known);
+        f.context
+            .runtime
+            .self_lookup
+            .note_sent(f.initiator.machine_id());
         let outcome = f.exchange(protocol, &f.hello()).await;
         f.shutdown().await;
         assert!(
@@ -581,6 +596,7 @@ async fn issue1241_admitted_group_peer_forged_hello_is_not_ingested() {
 #[derive(Clone, Copy, Debug)]
 enum Denial {
     Blocked,
+    Known,
     MachinePin,
     AgentRevoked,
     MachineRevoked,
@@ -600,14 +616,14 @@ impl Fixture {
         let agent = self.initiator.agent_id();
         let machine = self.initiator.machine_id();
         match denial {
-            Denial::Blocked | Denial::MachinePin => {
+            Denial::Blocked | Denial::Known | Denial::MachinePin => {
                 let mut contacts = r.contact_store.write().await;
                 contacts.set_trust(
                     &agent,
-                    if matches!(denial, Denial::Blocked) {
-                        TrustLevel::Blocked
-                    } else {
-                        TrustLevel::Unknown
+                    match denial {
+                        Denial::Blocked => TrustLevel::Blocked,
+                        Denial::Known => TrustLevel::Known,
+                        _ => TrustLevel::Unknown,
                     },
                 );
                 if matches!(denial, Denial::MachinePin) {
@@ -715,6 +731,7 @@ impl Fixture {
 async fn issue1241_evidence_exception_preserves_and_rechecks_denials() {
     for denial in [
         Denial::Blocked,
+        Denial::Known,
         Denial::MachinePin,
         Denial::AgentRevoked,
         Denial::MachineRevoked,

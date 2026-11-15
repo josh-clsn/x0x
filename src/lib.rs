@@ -21062,9 +21062,9 @@ impl Agent {
         .await
     }
 
-    /// Shared gate with a narrow ADR 0089 mode. Only Unknown or Known
-    /// relationship peers, or machines our agent wrote to, gain evidence
-    /// admission; every other check remains unchanged.
+    /// Shared gate with a narrow ADR 0089 mode. Only Unknown relationship
+    /// peers, and Unknown or Known peers on a machine our agent wrote to,
+    /// gain evidence admission; every other check remains unchanged.
     #[allow(clippy::too_many_arguments)]
     async fn gate_peer_machine_inbound_for_evidence(
         discovery_cache: &std::sync::Arc<
@@ -21158,21 +21158,26 @@ impl Agent {
             }
             // T-self-evidence-lookup: a machine our agent wrote to within
             // the window may ask for our own evidence, as an undiscovered
-            // machine may. A Known contact gets what a stranger gets.
-            // Blocked, pin mismatch, revoked and expired still deny.
+            // machine may, and so may a Known contact on it. The ADR 0089
+            // relationship branch stays Unknown-only. Blocked, pin
+            // mismatch, revoked and expired still deny.
             let evidence_relationship = evidence_only
-                && matches!(
-                    pair.decision,
-                    trust::TrustDecision::Unknown | trust::TrustDecision::AcceptWithFlag
-                )
-                && (evidence_wire::self_lookup::wrote_to(owner_trust, machine_id)
-                    || evidence_wire::unknown_relationship(
-                        discovery_cache,
-                        owner_trust,
-                        agent_id,
-                        machine_id,
-                    )
-                    .await);
+                && match pair.decision {
+                    trust::TrustDecision::Unknown => {
+                        evidence_wire::self_lookup::wrote_to(owner_trust, machine_id)
+                            || evidence_wire::unknown_relationship(
+                                discovery_cache,
+                                owner_trust,
+                                agent_id,
+                                machine_id,
+                            )
+                            .await
+                    }
+                    trust::TrustDecision::AcceptWithFlag => {
+                        evidence_wire::self_lookup::wrote_to(owner_trust, machine_id)
+                    }
+                    _ => false,
+                };
             let trust_decision = Some(
                 pair.decision
                     .with_owner_trust(has_connect_grant || has_call_grant || evidence_relationship),
