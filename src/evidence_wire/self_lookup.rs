@@ -31,6 +31,10 @@ pub(crate) struct SelfLookup {
     flights: Arc<Flights>,
     /// Test builds: the next Lookup answer reports `reached` and waits for
     /// `resume` before it is minted.
+    /// Test builds: the transport machine of every Lookup a raw frame (or a
+    /// waiting send) started.
+    #[cfg(test)]
+    pub(crate) transports: Mutex<Vec<(AgentId, MachineId)>>,
     #[cfg(test)]
     #[allow(clippy::type_complexity)]
     pub(crate) mint_pause:

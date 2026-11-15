@@ -2098,4 +2098,26 @@ mod tests {
             Some(Grant::SelfEvidence)
         );
     }
+
+    #[test]
+    fn self_only_keys_fill_at_most_half_of_the_claim_table() {
+        let limits = Limits::default();
+        let claimant = Some(MachineId([0x64; 32]));
+        let target = |i: usize| {
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            AgentId(bytes)
+        };
+        for i in 0..SELF_ONLY_KEY_CAP {
+            assert!(limits.claim_target_for_test(target(i), claimant));
+        }
+        assert!(
+            !limits.claim_target_for_test(target(SELF_ONLY_KEY_CAP), claimant),
+            "self-only keys stop at half the table"
+        );
+        assert!(
+            limits.claim_target_for_test(target(SELF_ONLY_KEY_CAP), None),
+            "a relationship claim still succeeds"
+        );
+    }
 }

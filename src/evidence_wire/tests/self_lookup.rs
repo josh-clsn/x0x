@@ -1512,3 +1512,43 @@ async fn an_older_pin_or_attestation_clears_the_self_evidence_mark() {
         assert!(access.dm, "pin: {pin}");
     }
 }
+
+/// R2-L-4: with two connected claimants, the send starts its self-only
+/// Lookup with the newest one whose own route is not cooling.
+#[tokio::test]
+async fn the_send_asks_the_newest_claimant_that_is_not_cooling() {
+    let dir = tempfile::tempdir().unwrap();
+    let friend = offline(dir.path()).await;
+    let device = (AgentId([0xd7; 32]), MachineId([0xd8; 32]));
+    let sybil = MachineId([0xd9; 32]);
+    let runtime = Arc::clone(friend.peer_evidence());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bindings = Arc::clone(&friend.authenticated_machine_bindings);
+    let direct = Arc::clone(&friend.direct_messaging);
+    hook_on_call(&runtime, 2, Arc::clone(&calls), move |agent| {
+        let (bindings, direct) = (Arc::clone(&bindings), Arc::clone(&direct));
+        Box::pin(async move {
+            crate::dm_inbox::record_authenticated_machine_binding(
+                &bindings,
+                agent,
+                device.1,
+                crate::Agent::unix_timestamp_secs(),
+            )
+            .await;
+            direct.mark_connected(agent, device.1).await;
+        })
+    });
+    runtime.lookup_hints.record(device.0, device.1);
+    runtime.lookup_hints.record(device.0, sybil);
+    assert!(runtime
+        .wire_limits
+        .claim_target_for_test(device.0, Some(sybil)));
+    let sent = friend
+        .send_direct_raw_quic(&device.0, b"reply", None, Duration::ZERO, None)
+        .await;
+    assert!(sent.is_ok(), "{sent:?}");
+    assert_eq!(
+        *runtime.self_lookup.transports.lock().unwrap(),
+        vec![(device.0, device.1)]
+    );
+}

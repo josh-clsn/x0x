@@ -277,6 +277,10 @@ impl EvidenceRuntime {
         if let Some(machine) = machine {
             self.lookup_hints.record(agent, machine);
         }
+        #[cfg(test)]
+        if let (Some(machine), Ok(mut seen)) = (transport, self.self_lookup.transports.lock()) {
+            seen.push((agent, machine));
+        }
         let now = crate::dm_capability::now_unix_ms();
         let usable = match machine {
             Some(machine) => self.usable(agent, machine, now),
