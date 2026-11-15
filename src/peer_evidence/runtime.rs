@@ -144,6 +144,7 @@ pub struct EvidenceRuntime {
     pub(crate) lookup_context: std::sync::OnceLock<std::sync::Weak<crate::evidence_wire::Context>>,
     pub(crate) group_context: std::sync::RwLock<Option<Arc<GroupContext>>>,
     pub(crate) lookup_hints: crate::evidence_wire::lookup::RoutingHints,
+    pub(crate) self_lookup: crate::evidence_wire::self_lookup::SelfLookup,
     pub(crate) wire_limits: Arc<crate::evidence_wire::Limits>,
     store: std::sync::OnceLock<Arc<PeerEvidenceStore>>,
     ready: tokio_util::sync::CancellationToken,
@@ -167,6 +168,7 @@ impl Default for EvidenceRuntime {
             lookup_context: Default::default(),
             group_context: Default::default(),
             lookup_hints: Default::default(),
+            self_lookup: Default::default(),
             wire_limits: Arc::new(crate::evidence_wire::Limits::default()),
             store: Default::default(),
             ready: Default::default(),
@@ -268,7 +270,7 @@ impl EvidenceRuntime {
             return;
         }
         if let Some(context) = self.lookup_context.get().and_then(std::sync::Weak::upgrade) {
-            context.lookup(agent, permit).await;
+            context.lookup(agent, permit, machine.is_some()).await;
         }
     }
     /// Start exactly one background re-verification; invalid files stay untouched.
@@ -468,6 +470,7 @@ impl EvidenceRuntime {
             .into();
         value["evidence_lookup_skipped"] =
             self.evidence_lookup_skipped.load(Ordering::Relaxed).into();
+        value["evidence_own_answer_mints"] = self.self_lookup.mints.load(Ordering::Relaxed).into();
         // ADR 0089 S5: the wire counters (hello/lookup/bytes/verifies)
         // ride the same `peer_evidence` diagnostics object.
         let wire = self.wire_limits.counters.json();

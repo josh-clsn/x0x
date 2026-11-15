@@ -13414,6 +13414,9 @@ impl Agent {
                 cold,
             )
             .await?;
+        // T-self-evidence-lookup: from here this machine may ask for our
+        // own evidence even while the mesh is latched.
+        self.peer_evidence().self_lookup.note_sent(machine_id);
 
         tracing::debug!(
             target: "dm.trace",
@@ -21078,15 +21081,19 @@ impl Agent {
                     grant_only.push(*agent_id);
                 }
             }
+            // T-self-evidence-lookup: a machine our agent wrote to within
+            // the window may ask for our own evidence, as an undiscovered
+            // machine may. Blocked, revoked and expired still deny.
             let evidence_relationship = evidence_only
                 && pair.decision == trust::TrustDecision::Unknown
-                && evidence_wire::unknown_relationship(
-                    discovery_cache,
-                    owner_trust,
-                    agent_id,
-                    machine_id,
-                )
-                .await;
+                && (evidence_wire::self_lookup::wrote_to(owner_trust, machine_id)
+                    || evidence_wire::unknown_relationship(
+                        discovery_cache,
+                        owner_trust,
+                        agent_id,
+                        machine_id,
+                    )
+                    .await);
             let trust_decision = Some(
                 pair.decision
                     .with_owner_trust(has_connect_grant || has_call_grant || evidence_relationship),

@@ -202,6 +202,7 @@ impl Fixture {
             machines: Arc::clone(&responder.machine_discovery_cache),
             owner: responder.owner_trust.clone(),
             revoked: Arc::clone(&responder.revocation_set),
+            stores: responder.self_lookup_stores(),
         });
         let incoming = Arc::new(StreamAccept::new(8));
         let evidence_acceptor = incoming.register(StreamProtocol::EvidenceV1).unwrap();

@@ -20,10 +20,15 @@ use tokio::{
 
 mod decode;
 pub(crate) mod lookup;
+pub(crate) mod self_lookup;
 
 #[cfg(test)]
 #[path = "evidence_wire/tests/admission.rs"]
 mod admission_tests;
+
+#[cfg(test)]
+#[path = "evidence_wire/tests/self_lookup.rs"]
+mod self_lookup_tests;
 
 const MESSAGE_CAP: usize = 32 * 1024;
 // Reserve the frame, decoded vectors, and signed-part verification copies.
@@ -158,6 +163,10 @@ pub(crate) struct WireCounters {
     pub(crate) evidence_bytes_in: std::sync::atomic::AtomicU64,
     pub(crate) evidence_bytes_out: std::sync::atomic::AtomicU64,
     pub(crate) evidence_verifies: std::sync::atomic::AtomicU64,
+    pub(crate) evidence_self_lookup_sent: std::sync::atomic::AtomicU64,
+    pub(crate) evidence_self_lookup_served: std::sync::atomic::AtomicU64,
+    pub(crate) evidence_self_lookup_refused: std::sync::atomic::AtomicU64,
+    pub(crate) evidence_self_lookup_accepted: std::sync::atomic::AtomicU64,
 }
 
 impl WireCounters {
@@ -183,6 +192,10 @@ impl WireCounters {
             "evidence_bytes_in": self.evidence_bytes_in.load(Relaxed),
             "evidence_bytes_out": self.evidence_bytes_out.load(Relaxed),
             "evidence_verifies": self.evidence_verifies.load(Relaxed),
+            "evidence_self_lookup_sent": self.evidence_self_lookup_sent.load(Relaxed),
+            "evidence_self_lookup_served": self.evidence_self_lookup_served.load(Relaxed),
+            "evidence_self_lookup_refused": self.evidence_self_lookup_refused.load(Relaxed),
+            "evidence_self_lookup_accepted": self.evidence_self_lookup_accepted.load(Relaxed),
         })
     }
 }
@@ -750,6 +763,7 @@ pub(crate) struct Context {
     machines: Arc<tokio::sync::RwLock<HashMap<MachineId, crate::DiscoveredMachine>>>,
     owner: crate::owner_trust::OwnerTrust,
     revoked: Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>,
+    stores: self_lookup::Stores,
 }
 impl Context {
     async fn related(&self, machine: MachineId) -> bool {
@@ -871,7 +885,8 @@ impl Context {
                     let target: AgentId = codec().deserialize(&body).map_err(io::Error::other)?;
                     drop(body);
                     let context = Arc::clone(&self);
-                    let authorized = context.authorized(machine, target).await;
+                    let grant = context.grant(machine, target).await;
+                    let authorized = grant.is_some();
                     if !authorized {
                         WireCounters::bump(
                             &self
@@ -880,6 +895,15 @@ impl Context {
                                 .counters
                                 .evidence_lookup_unauthorized,
                         );
+                        if target == self.identity.agent_id() {
+                            WireCounters::bump(
+                                &self
+                                    .runtime
+                                    .wire_limits
+                                    .counters
+                                    .evidence_self_lookup_refused,
+                            );
+                        }
                     }
                     let serving_lease = Arc::clone(&lease);
                     let reply = tokio::task::spawn_blocking(move || {
@@ -911,7 +935,18 @@ impl Context {
                         }
                         None => (NOT_FOUND, Vec::new()),
                     };
-                    write_message(&mut send, &self.runtime.wire_limits, machine, kind, &body).await
+                    write_message(&mut send, &self.runtime.wire_limits, machine, kind, &body)
+                        .await?;
+                    if kind == FOUND && grant == Some(lookup::Grant::SelfEvidence) {
+                        WireCounters::bump(
+                            &self
+                                .runtime
+                                .wire_limits
+                                .counters
+                                .evidence_self_lookup_served,
+                        );
+                    }
+                    Ok(())
                 }
                 HELLO | CERTIFICATE => {
                     if kind == HELLO && !self.runtime.wire_limits.request(machine, true) {
@@ -1616,6 +1651,16 @@ impl ReadyConnections {
 }
 
 impl crate::Agent {
+    fn self_lookup_stores(&self) -> self_lookup::Stores {
+        self_lookup::Stores {
+            announced: Arc::clone(&self.announced_machine_bindings),
+            cert_events: Arc::clone(&self.verified_cert_tx),
+            direct: Arc::clone(&self.direct_messaging),
+            contacts: Arc::clone(&self.contact_store),
+            placements: Arc::clone(&self.move_state),
+        }
+    }
+
     pub(crate) fn start_evidence_wire(&self) {
         let Some(network) = &self.network else {
             return;
@@ -1651,6 +1696,7 @@ impl crate::Agent {
             machines: Arc::clone(&self.machine_discovery_cache),
             owner: self.owner_trust.clone(),
             revoked: Arc::clone(&self.revocation_set),
+            stores: self.self_lookup_stores(),
         });
         let _ = self
             .peer_evidence()
@@ -1944,6 +1990,7 @@ mod tests {
             machines: Arc::clone(&agent.machine_discovery_cache),
             owner: agent.owner_trust.clone(),
             revoked: Arc::clone(&agent.revocation_set),
+            stores: agent.self_lookup_stores(),
         })
     }
 
