@@ -419,10 +419,10 @@ async fn offline(dir: &std::path::Path) -> Agent {
     agent
 }
 
-/// The receive side has started a Lookup for `agent` on `machine`.
-async fn frame_arrived(runtime: &crate::peer_evidence::EvidenceRuntime, agent: AgentId) {
+/// The receive side's Lookup has reached the responder hook.
+async fn frame_arrived(calls: &std::sync::atomic::AtomicUsize) {
     tokio::time::timeout(Duration::from_secs(1), async {
-        while runtime.lookup_hints.machines(agent).is_empty() {
+        while calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
             tokio::task::yield_now().await;
         }
     })
@@ -441,6 +441,7 @@ async fn the_send_waits_at_most_one_and_a_half_seconds_for_a_silent_self_lookup(
     // The frame's Lookup gets no answer. An agent-only Lookup (the
     // connector's) has no route and returns at once, as in production.
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = Arc::clone(&calls);
     assert!(runtime
         .lookup_responder
         .set(Arc::new(move |_| {
@@ -453,7 +454,7 @@ async fn the_send_waits_at_most_one_and_a_half_seconds_for_a_silent_self_lookup(
         }))
         .is_ok());
     runtime.spawn_lookup(device.0, device.1);
-    frame_arrived(&runtime, device.0).await;
+    frame_arrived(&seen).await;
     let started = std::time::Instant::now();
     let sent = friend
         .send_direct_raw_quic(&device.0, b"reply", None, Duration::ZERO, None)
@@ -478,6 +479,7 @@ async fn the_send_goes_raw_once_the_self_lookup_lands() {
     let bindings = Arc::clone(&friend.authenticated_machine_bindings);
     let direct = Arc::clone(&friend.direct_messaging);
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = Arc::clone(&calls);
     assert!(runtime
         .lookup_responder
         .set(Arc::new(move |agent| {
@@ -501,7 +503,7 @@ async fn the_send_goes_raw_once_the_self_lookup_lands() {
         }))
         .is_ok());
     runtime.spawn_lookup(device.0, device.1);
-    frame_arrived(&runtime, device.0).await;
+    frame_arrived(&seen).await;
     let started = std::time::Instant::now();
     let sent = friend
         .send_direct_raw_quic(&device.0, b"reply", None, Duration::ZERO, None)

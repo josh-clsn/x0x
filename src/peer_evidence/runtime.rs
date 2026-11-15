@@ -233,8 +233,9 @@ impl EvidenceRuntime {
             return;
         };
         let runtime = Arc::clone(self);
-        // In flight from now, so a send that looks before the task runs
-        // waits for it instead of starting another.
+        // Hinted and in flight from now, so a send that looks before the
+        // task runs waits for it instead of missing it.
+        self.lookup_hints.record(agent, machine);
         let flight = self.self_lookup.begin(agent);
         tokio::spawn(async move {
             let _flight = flight;
@@ -277,7 +278,7 @@ impl EvidenceRuntime {
             return;
         }
         if let Some(context) = self.lookup_context.get().and_then(std::sync::Weak::upgrade) {
-            context.lookup(agent, permit, machine.is_some()).await;
+            context.lookup(agent, permit, machine).await;
         }
     }
     /// Start exactly one background re-verification; invalid files stay untouched.

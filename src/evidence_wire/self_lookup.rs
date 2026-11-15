@@ -14,6 +14,10 @@ const ANSWER_REUSE: Duration = Duration::from_secs(60);
 const ANSWER_SLOTS: usize = 2;
 /// The send path waits at most this long for a self-lookup to land.
 pub(crate) const SEND_WAIT: Duration = Duration::from_millis(1500);
+/// A claimant machine gets one self-only Lookup in flight and one start per
+/// interval, whatever agent ids its frames claim.
+const CLAIMANT_INTERVAL: Duration = Duration::from_secs(2);
+const CLAIMANT_CAP: usize = 4096;
 
 type AnswerKey = ([u8; 32], crate::dm::DmCapabilities);
 
@@ -23,7 +27,23 @@ pub(crate) struct SelfLookup {
     sends: Mutex<VecDeque<(MachineId, Instant)>>,
     answer: Mutex<VecDeque<(AnswerKey, Instant, lookup::Found)>>,
     pub(crate) mints: AtomicU64,
+    claimants: Mutex<HashMap<MachineId, (Instant, bool)>>,
     flights: Arc<Flights>,
+}
+
+/// One self-only Lookup to a claimant machine, in flight until dropped.
+pub(crate) struct ClaimantGuard<'a> {
+    state: &'a SelfLookup,
+    machine: MachineId,
+}
+impl Drop for ClaimantGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut claimants) = self.state.claimants.lock() {
+            if let Some((_, busy)) = claimants.get_mut(&self.machine) {
+                *busy = false;
+            }
+        }
+    }
 }
 
 struct Flights {
@@ -77,6 +97,31 @@ impl SelfLookup {
             sends
                 .iter()
                 .any(|(m, at)| *m == machine && now.duration_since(*at) < RECENT_SEND_WINDOW)
+        })
+    }
+
+    /// Start a self-only Lookup to `machine` if it has none in flight and
+    /// started none within [`CLAIMANT_INTERVAL`].
+    pub(crate) fn claim_claimant(&self, machine: MachineId) -> Option<ClaimantGuard<'_>> {
+        let mut claimants = self.claimants.lock().ok()?;
+        let now = Instant::now();
+        if let Some((started, busy)) = claimants.get(&machine) {
+            if *busy || now.duration_since(*started) < CLAIMANT_INTERVAL {
+                return None;
+            }
+        }
+        if !claimants.contains_key(&machine) && claimants.len() >= CLAIMANT_CAP {
+            claimants.retain(|_, (started, busy)| {
+                *busy || now.duration_since(*started) < CLAIMANT_INTERVAL
+            });
+            if claimants.len() >= CLAIMANT_CAP {
+                return None;
+            }
+        }
+        claimants.insert(machine, (now, true));
+        Some(ClaimantGuard {
+            state: self,
+            machine,
         })
     }
 
