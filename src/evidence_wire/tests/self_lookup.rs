@@ -1719,3 +1719,60 @@ async fn evidence_admission_still_refuses_blocked_and_pin_mismatch() {
         "a Trusted contact is admitted"
     );
 }
+
+#[derive(Clone, Default)]
+struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A refused self-only Lookup leaves one line on each side: the requester
+/// logs how its pull ended and the responder logs the admission refusal and
+/// the decision behind it. `#[tokio::test]` keeps every task on this thread,
+/// so the thread-local subscriber sees both daemons.
+#[tokio::test]
+async fn a_refused_self_lookup_is_logged_on_both_sides() {
+    let capture = LogCapture::default();
+    let writer = capture.clone();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let device = node(dir.path(), "device").await;
+    let friend = node(dir.path(), "friend").await;
+    knows(&device, &friend).await;
+    device
+        .contact_store
+        .write()
+        .await
+        .set_trust(&friend.agent_id(), crate::contacts::TrustLevel::Blocked);
+    let mut friend_rx = friend.subscribe_direct();
+    device
+        .send_direct_with_config(&friend.agent_id(), b"hello".to_vec(), raw())
+        .await
+        .expect("the device writes raw");
+    receive(&mut friend_rx).await;
+    let reply = friend
+        .send_direct_with_config(&device.agent_id(), b"reply".to_vec(), raw())
+        .await;
+    assert!(reply.is_err(), "{reply:?}");
+    let logs = String::from_utf8_lossy(&capture.0.lock().unwrap()).into_owned();
+    let line = |a: &str, b: &str| logs.lines().any(|l| l.contains(a) && l.contains(b));
+    assert!(line("stage=\"self_lookup\"", "outcome=\"reset\""), "{logs}");
+    assert!(
+        line("outcome=\"deny_evidence_gate\"", "decision=reject_blocked"),
+        "{logs}"
+    );
+}

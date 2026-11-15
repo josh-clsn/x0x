@@ -940,6 +940,13 @@ impl Context {
                                     .counters
                                     .evidence_self_lookup_refused,
                             );
+                            tracing::info!(
+                                target: "x0x::evidence",
+                                stage = "self_lookup_serve",
+                                machine_prefix = %crate::network::hex_prefix(&machine.0, 4),
+                                outcome = "unauthorized",
+                                "self-evidence Lookup refused"
+                            );
                         }
                     }
                     let serving_lease = Arc::clone(&lease);

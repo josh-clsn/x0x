@@ -21204,15 +21204,28 @@ impl Agent {
                 revoked_machine,
                 expired,
             ) {
-                tracing::info!(
-                    target: "x0x::streams",
-                    agent = %hex::encode(agent_id.as_bytes()),
-                    machine = %hex::encode(machine_id.as_bytes()),
-                    agent_count = agents.len(),
-                    outcome = "deny_gate",
-                    error = %e,
-                    "inbound traffic denied at identity gate (one agent on the machine failed)"
-                );
+                if evidence_only {
+                    tracing::info!(
+                        target: "x0x::evidence",
+                        stage = "admission",
+                        agent_prefix = %network::hex_prefix(&agent_id.0, 4),
+                        machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                        decision = %pair.decision,
+                        outcome = "deny_evidence_gate",
+                        error = %e,
+                        "stream refused at evidence-only admission"
+                    );
+                } else {
+                    tracing::info!(
+                        target: "x0x::streams",
+                        agent = %hex::encode(agent_id.as_bytes()),
+                        machine = %hex::encode(machine_id.as_bytes()),
+                        agent_count = agents.len(),
+                        outcome = "deny_gate",
+                        error = %e,
+                        "inbound traffic denied at identity gate (one agent on the machine failed)"
+                    );
+                }
                 return Err(e);
             }
             // ADR-0043 §9: B and P per (agent, machine) pairing — the

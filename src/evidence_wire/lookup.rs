@@ -667,12 +667,19 @@ impl Context {
         // responder is a stranger and shares the stranger pool, except that
         // the frame's own machine may fall back to the frame reserve.
         let limits = &self.runtime.wire_limits;
+        let started = Instant::now();
         let lease = match (route, frame) {
             (Route::Relationship, _) => limits.admit(machine, true),
             (Route::SelfOnly, true) => limits.admit_frame(machine),
             (Route::SelfOnly, false) => limits.admit(machine, false),
-        }
-        .ok_or_else(|| invalid("lookup stream budget"))?;
+        };
+        let Some(lease) = lease else {
+            if route == Route::SelfOnly {
+                self_lookup_ended(target, machine, "budget", started);
+            }
+            return Err(invalid("lookup stream budget"));
+        };
+        let mut outcome = "reset";
         let mut reset = ResetOnDrop {
             limits: Arc::clone(&self.runtime.wire_limits),
             machine,
@@ -693,8 +700,10 @@ impl Context {
             }
             let (kind, body) = read_message(&mut recv, &self.runtime.wire_limits).await?;
             if kind != FOUND {
+                outcome = "not_found";
                 return Err(invalid("lookup not found"));
             }
+            outcome = "refused";
             let record = decode::found(&body)?;
             drop(body);
             let store = self
@@ -738,6 +747,7 @@ impl Context {
                         .counters
                         .evidence_self_lookup_accepted,
                 );
+                outcome = "accepted";
                 return Ok(());
             }
             tokio::task::spawn_blocking(move || {
@@ -755,11 +765,29 @@ impl Context {
             .await
             .map_err(io::Error::other)?
         })
-        .await
-        .map_err(io::Error::other)?;
+        .await;
+        if route == Route::SelfOnly {
+            let outcome = if result.is_err() { "timeout" } else { outcome };
+            self_lookup_ended(target, machine, outcome, started);
+        }
+        let result = result.map_err(io::Error::other)?;
         reset.complete = result.is_ok();
         result
     }
+}
+
+/// One line per self-only pull, bounded by the claimant gate and the
+/// per-key cooldown.
+fn self_lookup_ended(target: AgentId, machine: MachineId, outcome: &str, started: Instant) {
+    tracing::info!(
+        target: "x0x::evidence",
+        stage = "self_lookup",
+        agent_prefix = %crate::network::hex_prefix(&target.0, 4),
+        machine_prefix = %crate::network::hex_prefix(&machine.0, 4),
+        outcome,
+        dur_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "self-only Lookup ended"
+    );
 }
 
 fn ingest_found(
