@@ -37,6 +37,8 @@ const MESSAGE_CAP: usize = 32 * 1024;
 // 32 KiB; the sum of all reservations never exceeds 1 MiB.
 const ALLOCATION_RESERVATION: usize = MESSAGE_CAP * 4;
 const TOTAL_ALLOCATION_CAP: usize = 1024 * 1024;
+// Inside the aggregate cap: reserved for self-only pulls to a frame's machine.
+const FRAME_RESERVE_SLOTS: usize = 2;
 const DEADLINE: Duration = Duration::from_secs(5);
 const HELLO_INTERVAL: Duration = Duration::from_secs(60);
 const MACHINE_CAP: usize = 4096;
@@ -145,7 +147,9 @@ struct State {
     machines: HashMap<MachineId, MachineBudget>,
     bytes: Window,
     verifies: Window,
-    targets: HashMap<AgentId, Instant>,
+    /// Lookup cooldowns: `(target, None)` for relationship routes,
+    /// `(target, Some(claimant))` for each self-only route.
+    targets: HashMap<(AgentId, Option<MachineId>), Instant>,
 }
 
 /// ADR 0089 S5 diagnostics counters for the evidence wire, surfaced via
@@ -210,6 +214,9 @@ pub(crate) struct Limits {
     lookups: Arc<tokio::sync::Semaphore>,
     // Strangers may occupy at most half of the aggregate byte reservation.
     stranger_allocations: Arc<tokio::sync::Semaphore>,
+    // T-self-evidence-lookup: a self-only pull to the machine whose raw
+    // frame started it may use these when the stranger pool is full.
+    frame_allocations: Arc<tokio::sync::Semaphore>,
     prefix: Mutex<HashMap<MachineId, usize>>,
     pub(crate) prefix_refused: std::sync::atomic::AtomicU64,
     pub(crate) counters: WireCounters,
@@ -232,6 +239,9 @@ impl Default for Limits {
             lookups: Arc::new(tokio::sync::Semaphore::new(16)),
             allocations: Arc::new(tokio::sync::Semaphore::new(TOTAL_ALLOCATION_CAP)),
             stranger_allocations: Arc::new(tokio::sync::Semaphore::new(TOTAL_ALLOCATION_CAP / 2)),
+            frame_allocations: Arc::new(tokio::sync::Semaphore::new(
+                FRAME_RESERVE_SLOTS * ALLOCATION_RESERVATION,
+            )),
             prefix: Mutex::new(HashMap::new()),
             prefix_refused: std::sync::atomic::AtomicU64::new(0),
             counters: WireCounters::default(),
@@ -299,15 +309,31 @@ impl Limits {
     }
 
     pub(crate) fn admit(self: &Arc<Self>, machine: MachineId, relationship: bool) -> Option<Lease> {
+        let pool = (!relationship).then_some(&self.stranger_allocations);
+        self.admit_from(machine, pool)
+    }
+
+    /// A self-only pull to the machine whose raw frame started the Lookup:
+    /// the stranger pool, else the frame reserve, both inside the
+    /// aggregate cap. Other strangers holding the pool cannot block it.
+    pub(crate) fn admit_frame(self: &Arc<Self>, machine: MachineId) -> Option<Lease> {
+        self.admit_from(machine, Some(&self.stranger_allocations))
+            .or_else(|| self.admit_from(machine, Some(&self.frame_allocations)))
+    }
+
+    fn admit_from(
+        self: &Arc<Self>,
+        machine: MachineId,
+        pool: Option<&Arc<tokio::sync::Semaphore>>,
+    ) -> Option<Lease> {
         let now = Instant::now();
-        let stranger_permit = if relationship {
-            None
-        } else {
-            Some(
-                Arc::clone(&self.stranger_allocations)
+        let stranger_permit = match pool {
+            None => None,
+            Some(pool) => Some(
+                Arc::clone(pool)
                     .try_acquire_many_owned(ALLOCATION_RESERVATION as u32)
                     .ok()?,
-            )
+            ),
         };
         let permit = Arc::clone(&self.allocations)
             .try_acquire_many_owned(ALLOCATION_RESERVATION as u32)

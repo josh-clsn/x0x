@@ -12754,21 +12754,24 @@ impl Agent {
         transport: &RawQuicTransport<'_>,
     ) -> bool {
         let runtime = self.peer_evidence();
-        let mut hinted = None;
+        let mut hinted = Vec::new();
         for machine in runtime.lookup_hints.machines(*agent_id).into_iter().rev() {
             if transport.is_connected(&ant_quic::PeerId(machine.0)).await {
-                hinted = Some(machine);
-                break;
+                hinted.push(machine);
             }
         }
-        let Some(machine) = hinted else {
+        if hinted.is_empty() {
             return false;
-        };
+        }
         let mut done = runtime.self_lookup.subscribe();
         if !runtime.self_lookup.in_flight(agent_id) {
-            if runtime.wire_limits.target_cooling(*agent_id) {
+            // Newest claimant whose own route is not cooling.
+            let Some(machine) = hinted
+                .into_iter()
+                .find(|m| !runtime.wire_limits.target_cooling(*agent_id, Some(*m)))
+            else {
                 return false;
-            }
+            };
             runtime.spawn_lookup(*agent_id, machine);
         }
         let deadline = tokio::time::Instant::now() + evidence_wire::self_lookup::SEND_WAIT;

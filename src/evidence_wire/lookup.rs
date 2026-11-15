@@ -11,6 +11,7 @@ const MACHINE_BINDING_LIMIT: usize = 16;
 const HINT_CAP: usize = 128;
 // One machine's claims cannot flush another machine's hints.
 const MACHINE_HINT_CAP: usize = 8;
+const SELF_ONLY_KEY_CAP: usize = MACHINE_CAP / 2;
 
 /// Untrusted, process-only raw-frame routing claims. Never read by authority paths.
 #[derive(Default)]
@@ -30,7 +31,19 @@ impl RoutingHints {
             }
         }
         if hints.len() == HINT_CAP {
-            hints.pop_front();
+            // Fair share: the oldest hint of the machine holding the most
+            // goes, so a crowd of claimants cannot flush a lone frame's hint.
+            let mut counts: HashMap<MachineId, usize> = HashMap::new();
+            for (_, m, _) in hints.iter() {
+                *counts.entry(*m).or_default() += 1;
+            }
+            let most = counts.values().copied().max().unwrap_or(0);
+            if let Some(oldest) = hints
+                .iter()
+                .position(|(_, m, _)| counts.get(m) == Some(&most))
+            {
+                hints.remove(oldest);
+            }
         }
         hints.push_back((agent, machine, now));
     }
@@ -88,7 +101,14 @@ impl Limits {
         Arc::clone(&self.lookups).try_acquire_owned().ok()
     }
 
+    #[cfg(test)]
     fn claim_target(&self, target: AgentId) -> bool {
+        self.claim((target, None))
+    }
+    /// One Lookup per key per [`LOOKUP_INTERVAL`]. A self-only key names
+    /// its claimant, so other claimants of the same agent cannot cool the
+    /// genuine host's route; self-only keys may fill only part of the table.
+    fn claim(&self, key: (AgentId, Option<MachineId>)) -> bool {
         let now = Instant::now();
         let Ok(mut state) = self.state.lock() else {
             return false;
@@ -96,28 +116,38 @@ impl Limits {
         state
             .targets
             .retain(|_, at| now.duration_since(*at) < LOOKUP_INTERVAL);
-        if state.targets.contains_key(&target) || state.targets.len() >= MACHINE_CAP {
+        if state.targets.contains_key(&key) || state.targets.len() >= MACHINE_CAP {
             return false;
         }
-        state.targets.insert(target, now);
+        if key.1.is_some()
+            && state.targets.keys().filter(|(_, c)| c.is_some()).count() >= SELF_ONLY_KEY_CAP
+        {
+            return false;
+        }
+        state.targets.insert(key, now);
         true
     }
-    /// Release a claim when no request for `target` left this node.
-    fn release_target(&self, target: AgentId) {
+    /// Release a claim when no request for it left this node.
+    fn release(&self, key: (AgentId, Option<MachineId>)) {
         if let Ok(mut state) = self.state.lock() {
-            state.targets.remove(&target);
+            state.targets.remove(&key);
         }
     }
     #[cfg(test)]
-    pub(crate) fn claim_target_for_test(&self, target: AgentId) -> bool {
-        self.claim_target(target)
+    pub(crate) fn claim_target_for_test(
+        &self,
+        target: AgentId,
+        claimant: Option<MachineId>,
+    ) -> bool {
+        self.claim((target, claimant))
     }
-    /// A Lookup for `target` started within the cooldown.
-    pub(crate) fn target_cooling(&self, target: AgentId) -> bool {
+    /// A Lookup for `target` (by `claimant`'s self-only route, or by
+    /// relationship routes for `None`) started within the cooldown.
+    pub(crate) fn target_cooling(&self, target: AgentId, claimant: Option<MachineId>) -> bool {
         self.state.lock().is_ok_and(|state| {
             state
                 .targets
-                .get(&target)
+                .get(&(target, claimant))
                 .is_some_and(|at| Instant::now().duration_since(*at) < LOOKUP_INTERVAL)
         })
     }
@@ -544,37 +574,57 @@ impl Context {
                 .collect();
             // A pre-seat send or a disconnected peer must not consume the
             // target cooldown: no Lookup has been sent yet (D30 30b).
-            if responders.is_empty() || !self.runtime.wire_limits.claim_target(target) {
+            // Relationship routes share the target's key; each self-only
+            // route has its own (target, claimant) key, and a claimant
+            // machine gets one self-only Lookup at a time, however many agent
+            // ids its frames claim.
+            let limits = &self.runtime.wire_limits;
+            let related = responders.iter().any(|(_, r)| *r == Route::Relationship)
+                && limits.claim((target, None));
+            let mut claimants = Vec::new();
+            let mut chosen = Vec::new();
+            for (machine, route) in responders {
+                let key = match route {
+                    Route::Relationship if related => (target, None),
+                    Route::Relationship => continue,
+                    Route::SelfOnly => {
+                        let key = (target, Some(machine));
+                        if !limits.claim(key) {
+                            continue;
+                        }
+                        let Some(guard) = self.runtime.self_lookup.claim_claimant(machine) else {
+                            limits.release(key);
+                            continue;
+                        };
+                        claimants.push(guard);
+                        key
+                    }
+                };
+                chosen.push((machine, route, key));
+            }
+            if chosen.is_empty() {
+                if related {
+                    limits.release((target, None));
+                }
                 return;
             }
-            // A claimant machine gets one self-only Lookup at a time, however
-            // many agent ids its frames claim.
-            let mut claimants = Vec::new();
-            let responders: Vec<_> = responders
-                .into_iter()
-                .filter(|(machine, route)| {
-                    *route == Route::Relationship
-                        || self
-                            .runtime
-                            .self_lookup
-                            .claim_claimant(*machine)
-                            .map(|guard| claimants.push(guard))
-                            .is_some()
-                })
-                .collect();
             // No task queue: at most three exchanges, each also needing the
             // shared machine stream and aggregate allocation reservations.
-            let sent = std::sync::atomic::AtomicBool::new(false);
+            let sent: Vec<_> = chosen
+                .iter()
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect();
             let mut requests = futures::stream::FuturesUnordered::new();
             let permit = Arc::new(permit);
-            for (machine, route) in responders {
+            for ((machine, route, _), sent) in chosen.iter().zip(&sent) {
                 requests.push(self.pull(
-                    machine,
-                    route,
+                    *machine,
+                    *route,
+                    transport == Some(*machine),
                     target,
                     deadline,
                     Arc::clone(&permit),
-                    &sent,
+                    sent,
                 ));
             }
             use futures::StreamExt;
@@ -584,31 +634,46 @@ impl Context {
                 }
             }
             drop(requests);
-            // Nothing left this node (local budgets, claimant gate): the
-            // target is not cooled for an attempt that never happened.
-            if !sent.load(std::sync::atomic::Ordering::Acquire) {
-                self.runtime.wire_limits.release_target(target);
+            // A key whose request never left this node (local budgets) is
+            // not cooled for an attempt that never happened.
+            let left = |i: usize| sent[i].load(std::sync::atomic::Ordering::Acquire);
+            let related_left = chosen
+                .iter()
+                .enumerate()
+                .any(|(i, (_, route, _))| *route == Route::Relationship && left(i));
+            if related && !related_left {
+                limits.release((target, None));
+            }
+            for (i, (_, route, key)) in chosen.iter().enumerate() {
+                if *route == Route::SelfOnly && !left(i) {
+                    limits.release(*key);
+                }
             }
         })
         .await;
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn pull(
         self: &Arc<Self>,
         machine: MachineId,
         route: Route,
+        frame: bool,
         target: AgentId,
         deadline: Instant,
         permit: Arc<tokio::sync::OwnedSemaphorePermit>,
         sent: &std::sync::atomic::AtomicBool,
     ) -> io::Result<()> {
-        let lease = self
-            .runtime
-            .wire_limits
-            // Relationship-context peers use the reserved pool; a self-only
-            // responder is a stranger and shares the stranger pool.
-            .admit(machine, route == Route::Relationship)
-            .ok_or_else(|| invalid("lookup stream budget"))?;
+        // Relationship-context peers use the reserved pool; a self-only
+        // responder is a stranger and shares the stranger pool, except that
+        // the frame's own machine may fall back to the frame reserve.
+        let limits = &self.runtime.wire_limits;
+        let lease = match (route, frame) {
+            (Route::Relationship, _) => limits.admit(machine, true),
+            (Route::SelfOnly, true) => limits.admit_frame(machine),
+            (Route::SelfOnly, false) => limits.admit(machine, false),
+        }
+        .ok_or_else(|| invalid("lookup stream budget"))?;
         let mut reset = ResetOnDrop {
             limits: Arc::clone(&self.runtime.wire_limits),
             machine,

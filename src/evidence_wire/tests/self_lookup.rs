@@ -847,7 +847,11 @@ async fn one_claimant_flooding_agent_ids_costs_one_lookup() {
     }
     assert_eq!(counter(&friend, "evidence_self_lookup_sent"), 1);
     let cooling = (0..100u8)
-        .filter(|i| runtime.wire_limits.target_cooling(AgentId([*i; 32])))
+        .filter(|i| {
+            runtime
+                .wire_limits
+                .target_cooling(AgentId([*i; 32]), Some(device.machine_id()))
+        })
         .count();
     assert_eq!(
         cooling, 1,
@@ -926,7 +930,9 @@ async fn the_send_does_not_wait_while_the_target_cools() {
         Box::pin(futures::future::pending())
     });
     runtime.lookup_hints.record(device.0, device.1);
-    assert!(runtime.wire_limits.claim_target_for_test(device.0));
+    assert!(runtime
+        .wire_limits
+        .claim_target_for_test(device.0, Some(device.1)));
     let started = std::time::Instant::now();
     let sent = friend
         .send_direct_raw_quic(&device.0, b"reply", None, Duration::ZERO, None)
