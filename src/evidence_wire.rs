@@ -943,7 +943,10 @@ impl Context {
                     .await
                     .map_err(io::Error::other)??;
                     // Membership/revocation may have changed while signing.
-                    let reply = if reply.is_some() && !self.authorized(machine, target).await {
+                    // The answer was minted for this grant: a relationship
+                    // that ended meanwhile must not leave with its full
+                    // answer, even if the self-evidence rule now allows one.
+                    let reply = if reply.is_some() && self.grant(machine, target).await != grant {
                         WireCounters::bump(
                             &self
                                 .runtime

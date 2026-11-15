@@ -524,14 +524,13 @@ impl Context {
             None => None,
         }
     }
-    pub(super) async fn authorized(&self, machine: MachineId, target: AgentId) -> bool {
-        self.grant(machine, target).await.is_some()
-    }
     pub(super) fn lookup_reply(
         &self,
         target: AgentId,
         grant: Option<Grant>,
     ) -> io::Result<Option<Found>> {
+        #[cfg(test)]
+        self.runtime.self_lookup.pause_mint();
         reply_material(
             target,
             self.identity.agent_id(),

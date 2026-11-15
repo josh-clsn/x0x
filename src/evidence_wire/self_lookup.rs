@@ -29,6 +29,12 @@ pub(crate) struct SelfLookup {
     pub(crate) mints: AtomicU64,
     claimants: Mutex<HashMap<MachineId, (Instant, bool)>>,
     flights: Arc<Flights>,
+    /// Test builds: the next Lookup answer reports `reached` and waits for
+    /// `resume` before it is minted.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) mint_pause:
+        Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 /// One self-only Lookup to a claimant machine, in flight until dropped.
@@ -123,6 +129,15 @@ impl SelfLookup {
             state: self,
             machine,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_mint(&self) {
+        let pause = self.mint_pause.lock().ok().and_then(|mut slot| slot.take());
+        if let Some((reached, resume)) = pause {
+            let _ = reached.send(());
+            let _ = resume.recv();
+        }
     }
 
     /// Test builds: age every recorded send by `by`.
