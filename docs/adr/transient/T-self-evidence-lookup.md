@@ -1,38 +1,32 @@
 # T-self-evidence-lookup: a node proves its own agent to the machine that asks
 
-- **Status:** Proposed
+- **Status:** Proposed (fork tail, self-lookup lane)
 - **Target slot:** A03
-- **Date:** 2026-11-14
-- **Decision owners:** David Irvine
-- **Related:** ADR 0089 §6 (EvidenceV1 Lookup), ADR 0115 §1 (authority stores), ADR 0093 bit 2
+- **Date:** 2026-11-15
+- **Decision owner:** Josh (fork design approved 2026-11-14)
+- **Upstream:** none. Amends ADR 0089 §6 and ADR 0115 §1 in the fork only.
+- **Drop at:** when upstream ships a stranger-reachable own-evidence answer. Nothing persists, so no migration.
 
 ## Context
 
-A node learns which machine hosts an agent from its announcement or from ADR 0089 evidence. Announcements leave every gossip cache after 60 s. ADR 0089 Hello and Lookup go only to relationship peers. A direct-message partner is often an x0x stranger.
-
-So a node that starts after a device announced cannot raw-send to it until the next heartbeat, up to 600 s later, or ever while the device is latched. This holds even when the device just sent a raw frame over a live, transport-authenticated connection.
-
-ADR 0089 §6 says a stranger's Hello refreshes the in-memory caches. The code only captures it for later pairing. This record does not change Hello.
+A node learns an agent's machine from its announcement or from ADR 0089 evidence. Announcements leave every gossip cache after 60 s, and ADR 0089 Hello and Lookup reach only relationship peers. So a node that starts after a device announced cannot raw-send to it until the next heartbeat, or ever while the device is latched, even right after a raw frame from it. ADR 0089 §6 says a stranger's Hello refreshes in-memory caches; the code only captures it. Hello is unchanged.
 
 ## Decision
 
-**Responder.** This amends the ADR 0089 §6 responder authorization. A node also serves a Lookup when all of these are true:
-- the target is this node's own local agent;
-- this node's agent, its machine, their binding and the requesting machine are not revoked;
-- this node announces publicly now (the mesh-off latch is not set), or this node's agent raw-sent to the requesting machine in the last 15 min.
+**Responder (ADR 0089 §6).** A relationship requester is served as before. Otherwise a node serves a Lookup for its own local agent when its agent, its machine, their binding and the requesting machine are not revoked, and the mesh-off latch is not set, or its agent raw-sent to that machine in the last 15 min. A send counts once it resolves to the machine, before transmission. The answer carries the user id and the owner certificate only when the heartbeat would (user-identity consent). One minted answer serves for 60 s.
 
-The answer is this node's own announcement and advert. One minted answer serves every ask for up to 60 s while the certificate pair and capabilities stay the same. For any other target, an unrelated machine still gets `NotFound`.
+**EvidenceV1 admission.** A discovered machine with Unknown trust may open EvidenceV1 only while this node's agent raw-sent to it in the last 15 min. Blocked, pinned-machine mismatch, revocation, expiry, ADR 0043 pairing and authority confirmation still deny. It uses the pre-identity prefix pool (32, 2 per machine) and the stranger allocation pool. Any other protocol on that admission is dropped.
 
-**Requester.** When no eligible peer names the target, the requester also asks the machines that sent a raw frame claiming the target and are connected now. It asks no other machine on this path, at most three, newest first, and none that is revoked. Each answer must name the machine it came over, and pass the target, freshness and certificate digest checks. A relationship peer's answer is stored as before. A stranger's answer is held in memory only, never written to the evidence file or any other file.
+**Requester.** Only a Lookup started by a raw frame, or by a send waiting on one, also asks the hinted, connected claimants for their own agent: the frame's machine first, at most three, none revoked, one in flight and one per 2 s per claimant. An answer must name the machine it came over and pass the freshness and digest checks. A relationship peer's answer is stored as before.
 
-**Authority.** ADR 0115 §1 names the writers of the authenticated-binding store. This adds one: verified self-evidence, a machine-signed announcement and an agent-signed advert that both name the transport-authenticated machine. It is mutual evidence for that machine. After the identity listener's trust, revocation, pairing and expiry gates, it writes what a class A announcement writes in memory: the binding, the discovery entry, the capability advert and the registry entry.
+**Authority (ADR 0115 §1).** A stranger's verified answer is mutual evidence for the transport machine and a new writer of the authenticated-binding store. After the listener's gates and move watermarks, it fills a missing binding or refreshes the same pairing, never moves the agent off a machine an authority store names, and ranks by the agent-signed advert time. It writes in memory only, with no certificate event, never to a file.
 
-**Send.** When the recipient's claimed machine is connected, a raw send that finds no machine waits at most 1.5 s for that Lookup. Then it reads authority again.
+**Send.** A raw send that finds no machine waits at most 1.5 s for that Lookup, then reads authority again.
 
 ## Consequences
 
-A stranger learns only what a public node already broadcasts. A quiet node answers only machines that it wrote to. A hostile machine can prove only an agent that signed an advert naming that machine in the last 15 min. That is the ADR 0089 §3 replay residual. Existing Lookup budgets bound each path: one Lookup per machine per 2 s, two streams per machine, the byte rates, 32 verifies per second and the stranger allocation pool. There is no new message and no global traffic.
+A stranger learns what the heartbeat publishes. A latched node answers only machines it wrote to. A former machine can prove a binding only where none exists, within the ADR 0089 §3 replay window. Existing budgets bound each path. There is no new message and no global traffic.
 
 ## Validation
 
-A late node replies raw within 2 s with no new publish. A wrong-machine answer is refused and writes nothing. Another target from an unrelated machine gets `NotFound`. A latched node answers only a machine it wrote to. A stranger's evidence is gone after a restart. Two asks in 60 s cost one signing. With no answer, the send returns after about 1.5 s. Revocation refuses at each step.
+A late node replies raw within 2 s. A wrong-machine answer, or one that would move a binding, writes nothing. An unconsented node discloses no owner. The latch closes the public rule. Admission closes after 15 min. A flood from one claimant costs one Lookup. Revocation refuses at each step.
