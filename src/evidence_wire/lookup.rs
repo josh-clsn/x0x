@@ -393,13 +393,15 @@ impl Relations {
         self.public || self.runtime.self_lookup.sent_within_window(machine)
     }
 
+    /// A relationship requester keeps its full answer; only an unrelated
+    /// one falls to the self-evidence rule and its public answer.
     pub(super) async fn grant(&self, machine: MachineId, target: AgentId) -> Option<Grant> {
-        if self.self_evidence_allowed(machine, target).await {
-            return Some(Grant::SelfEvidence);
+        if self.related_requester(machine, target).await {
+            return Some(Grant::Relationship);
         }
-        self.related_requester(machine, target)
+        self.self_evidence_allowed(machine, target)
             .await
-            .then_some(Grant::Relationship)
+            .then_some(Grant::SelfEvidence)
     }
 
     #[cfg(test)]
@@ -472,13 +474,17 @@ impl Context {
     pub(super) async fn authorized(&self, machine: MachineId, target: AgentId) -> bool {
         self.grant(machine, target).await.is_some()
     }
-    pub(super) fn lookup_reply(&self, target: AgentId) -> io::Result<Option<Found>> {
+    pub(super) fn lookup_reply(
+        &self,
+        target: AgentId,
+        grant: Option<Grant>,
+    ) -> io::Result<Option<Found>> {
         reply_material(
             target,
             self.identity.agent_id(),
             self.runtime.store().as_deref(),
             dm_capability::now_unix_ms(),
-            || self.own_answer(),
+            || self.own_answer(grant == Some(Grant::SelfEvidence)),
         )
     }
 

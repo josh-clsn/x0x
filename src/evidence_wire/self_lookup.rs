@@ -1,6 +1,7 @@
 //! T-self-evidence-lookup: a node proves only its own agent, and only to
-//! the transport-authenticated machine that asks. A stranger's answer lives
-//! in memory only; nothing about it is written to a file.
+//! the transport-authenticated machine that asks, disclosing no more than
+//! its public heartbeat. A stranger's answer lives in memory only; nothing
+//! about it is written to a file.
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -9,6 +10,8 @@ const RECENT_SEND_WINDOW: Duration = Duration::from_millis(W_MS);
 const RECENT_SEND_CAP: usize = 256;
 /// One minted own-evidence answer serves every ask for this long.
 const ANSWER_REUSE: Duration = Duration::from_secs(60);
+/// The public answer and the relationship answer are cached side by side.
+const ANSWER_SLOTS: usize = 2;
 /// The send path waits at most this long for a self-lookup to land.
 pub(crate) const SEND_WAIT: Duration = Duration::from_millis(1500);
 
@@ -18,7 +21,7 @@ type AnswerKey = ([u8; 32], crate::dm::DmCapabilities);
 #[derive(Default)]
 pub(crate) struct SelfLookup {
     sends: Mutex<VecDeque<(MachineId, Instant)>>,
-    answer: Mutex<Option<(AnswerKey, Instant, lookup::Found)>>,
+    answer: Mutex<VecDeque<(AnswerKey, Instant, lookup::Found)>>,
     pub(crate) mints: AtomicU64,
     flights: Arc<Flights>,
 }
@@ -98,7 +101,7 @@ impl SelfLookup {
         self.flights.done.subscribe()
     }
 
-    /// Reuse the minted answer while the certificate pair and capabilities
+    /// Reuse a minted answer while its certificate pair and capabilities
     /// are unchanged. The lock is held across the mint so concurrent asks
     /// share one signing.
     fn answer(
@@ -106,16 +109,21 @@ impl SelfLookup {
         key: AnswerKey,
         mint: impl FnOnce() -> io::Result<lookup::Found>,
     ) -> io::Result<lookup::Found> {
-        let mut slot = self.answer.lock().map_err(|_| invalid("answer lock"))?;
+        let mut slots = self.answer.lock().map_err(|_| invalid("answer lock"))?;
         let now = Instant::now();
-        if let Some((cached, at, found)) = slot.as_ref() {
-            if *cached == key && now.duration_since(*at) < ANSWER_REUSE {
-                return Ok(found.clone());
-            }
+        if let Some((_, _, found)) = slots
+            .iter()
+            .find(|(cached, at, _)| *cached == key && now.duration_since(*at) < ANSWER_REUSE)
+        {
+            return Ok(found.clone());
         }
         let found = mint()?;
         self.mints.fetch_add(1, Ordering::Relaxed);
-        *slot = Some((key, now, found.clone()));
+        slots.retain(|(cached, _, _)| *cached != key);
+        if slots.len() == ANSWER_SLOTS {
+            slots.pop_front();
+        }
+        slots.push_back((key, now, found.clone()));
         Ok(found)
     }
 }
@@ -130,7 +138,8 @@ pub(crate) fn wrote_to(owner: &crate::owner_trust::OwnerTrust, machine: &Machine
 /// The class A stores a stranger's self-evidence writes, held only in memory.
 pub(crate) struct Stores {
     pub(crate) announced: crate::dm_inbox::AuthenticatedMachineBindings,
-    pub(crate) cert_events: Arc<tokio::sync::broadcast::Sender<crate::VerifiedCertificate>>,
+    /// The heartbeat's user-identity consent: what a stranger may see.
+    pub(crate) consented: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) direct: Arc<crate::direct::DirectMessaging>,
     pub(crate) contacts: Arc<tokio::sync::RwLock<crate::contacts::ContactStore>>,
     pub(crate) placements: Arc<tokio::sync::RwLock<crate::key_move::MoveState>>,
@@ -191,19 +200,25 @@ pub(crate) fn verify_self_found(
 impl Context {
     /// This node's own evidence for a Lookup, minted at most once per
     /// [`ANSWER_REUSE`] for the same certificate pair and capabilities.
-    pub(super) fn own_answer(&self) -> io::Result<lookup::Found> {
-        let key = {
-            let pair = self
-                .own_cert
+    /// `public`: the answer to a self-evidence grant, which carries the user
+    /// id and the owner certificate only when the heartbeat would.
+    pub(super) fn own_answer(&self, public: bool) -> io::Result<lookup::Found> {
+        let pair = if public && !self.stores.consented.load(Ordering::Acquire) {
+            (None, None)
+        } else {
+            self.own_cert
                 .read()
-                .map_err(|_| invalid("certificate lock"))?;
-            (
-                announce_v3::cert_digest(&pair.0, &pair.1),
-                self.capabilities.borrow().clone(),
-            )
+                .map_err(|_| invalid("certificate lock"))?
+                .clone()
         };
+        let key = (
+            announce_v3::cert_digest(&pair.0, &pair.1),
+            self.capabilities.borrow().clone(),
+        );
+        let pair = Arc::new(std::sync::RwLock::new(pair));
         self.runtime.self_lookup.answer(key, || {
-            self.own(None, true).map(|hello| hello.into_record().into())
+            self.own_with_pair(None, true, &pair)
+                .map(|hello| hello.into_record().into())
         })
     }
 
@@ -304,12 +319,13 @@ impl Context {
             cert_not_after,
         )
         .await;
+        let (unheard, _) = tokio::sync::broadcast::channel(1);
         crate::cache_verified_announcement(
             &self.machines,
             &self.stores.announced,
             None,
             &self.discovery,
-            &self.stores.cert_events,
+            &unheard,
             Some(&self.bindings),
             discovered,
         )

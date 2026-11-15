@@ -909,7 +909,7 @@ impl Context {
                     let reply = tokio::task::spawn_blocking(move || {
                         let _lease = serving_lease;
                         if authorized {
-                            context.lookup_reply(target)
+                            context.lookup_reply(target, grant)
                         } else {
                             Ok(None)
                         }
@@ -1654,7 +1654,7 @@ impl crate::Agent {
     fn self_lookup_stores(&self) -> self_lookup::Stores {
         self_lookup::Stores {
             announced: Arc::clone(&self.announced_machine_bindings),
-            cert_events: Arc::clone(&self.verified_cert_tx),
+            consented: Arc::clone(&self.user_identity_consented),
             direct: Arc::clone(&self.direct_messaging),
             contacts: Arc::clone(&self.contact_store),
             placements: Arc::clone(&self.move_state),

@@ -335,7 +335,7 @@ async fn self_evidence_for_another_machine_or_a_revoked_pairing_writes_nothing()
     let dir = tempfile::tempdir().unwrap();
     let device = node(dir.path(), "device").await;
     let friend = node(dir.path(), "friend").await;
-    let answer = context(&device).own_answer().unwrap();
+    let answer = context(&device).own_answer(true).unwrap();
     let record = decode::found(&codec().serialize(&answer).unwrap()).unwrap();
     let receiver = context(&friend);
     let store = friend.peer_evidence().store().unwrap();
