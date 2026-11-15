@@ -1720,35 +1720,13 @@ async fn evidence_admission_still_refuses_blocked_and_pin_mismatch() {
     );
 }
 
-#[derive(Clone, Default)]
-struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl std::io::Write for LogCapture {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// A refused self-only Lookup leaves a line on the responder naming the
-/// admission refusal and the decision behind it; the requester's pull was
-/// sent. The requester's own line is checked in `lookup::tests`, because a
-/// thread-local subscriber does not reliably see it in a parallel run.
-#[tokio::test]
-async fn a_refused_self_lookup_is_logged_by_the_responder() {
-    let capture = LogCapture::default();
-    let writer = capture.clone();
-    let _guard = tracing::subscriber::set_default(
-        tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish(),
-    );
+/// A refused self-only Lookup is refused at the responder's admission: the
+/// requester wrote its request, the responder's gate refuses the machine it
+/// wrote to, and no byte of the request reaches the responder's acceptor.
+/// Checked by the gate and by counters, not by captured log lines, which a
+/// thread-local subscriber can miss in a parallel run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_self_lookup_stops_at_the_responders_admission() {
     let dir = tempfile::tempdir().unwrap();
     let device = node(dir.path(), "device").await;
     let friend = node(dir.path(), "friend").await;
@@ -1769,11 +1747,17 @@ async fn a_refused_self_lookup_is_logged_by_the_responder() {
         .await;
     assert!(reply.is_err(), "{reply:?}");
     assert_eq!(counter(&friend, "evidence_self_lookup_sent"), 1);
-    let logs = String::from_utf8_lossy(&capture.0.lock().unwrap()).into_owned();
     assert!(
-        logs.lines()
-            .any(|l| l.contains("outcome=\"deny_evidence_gate\"")
-                && l.contains("decision=reject_blocked")),
-        "{logs}"
+        !evidence_admitted(&device, &friend).await,
+        "the written-to Blocked machine is refused at admission"
     );
+    for name in [
+        "evidence_bytes_in",
+        "evidence_lookup_refused",
+        "evidence_lookup_unauthorized",
+        "evidence_self_lookup_refused",
+        "evidence_self_lookup_served",
+    ] {
+        assert_eq!(counter(&device, name), 0, "{name}");
+    }
 }
