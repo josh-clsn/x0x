@@ -34,10 +34,12 @@ const MESSAGE_CAP: usize = 32 * 1024;
 // Reserve the frame, decoded vectors, and signed-part verification copies.
 // All requests/replies, including outbound reads, acquire this conservative
 // reservation before reading bodies. The wire buffer itself never exceeds
-// 32 KiB; the sum of all reservations never exceeds 1 MiB.
+// 32 KiB; the sum of all reservations never exceeds 1 MiB plus the frame
+// reserve.
 const ALLOCATION_RESERVATION: usize = MESSAGE_CAP * 4;
 const TOTAL_ALLOCATION_CAP: usize = 1024 * 1024;
-// Inside the aggregate cap: reserved for self-only pulls to a frame's machine.
+// On top of the aggregate cap: only self-only pulls to a frame's machine use
+// it, so relationship peers keep their half of the 1 MiB.
 const FRAME_RESERVE_SLOTS: usize = 2;
 const DEADLINE: Duration = Duration::from_secs(5);
 const HELLO_INTERVAL: Duration = Duration::from_secs(60);
@@ -310,21 +312,24 @@ impl Limits {
 
     pub(crate) fn admit(self: &Arc<Self>, machine: MachineId, relationship: bool) -> Option<Lease> {
         let pool = (!relationship).then_some(&self.stranger_allocations);
-        self.admit_from(machine, pool)
+        self.admit_from(machine, pool, true)
     }
 
     /// A self-only pull to the machine whose raw frame started the Lookup:
-    /// the stranger pool, else the frame reserve, both inside the
-    /// aggregate cap. Other strangers holding the pool cannot block it.
+    /// the stranger pool inside the aggregate cap, else the frame reserve on
+    /// top of it. Other strangers holding the pool cannot block it, and it
+    /// never takes a relationship peer's share.
     pub(crate) fn admit_frame(self: &Arc<Self>, machine: MachineId) -> Option<Lease> {
-        self.admit_from(machine, Some(&self.stranger_allocations))
-            .or_else(|| self.admit_from(machine, Some(&self.frame_allocations)))
+        self.admit_from(machine, Some(&self.stranger_allocations), true)
+            .or_else(|| self.admit_from(machine, Some(&self.frame_allocations), false))
     }
 
+    /// `aggregate`: the lease also holds a slot of the 1 MiB aggregate.
     fn admit_from(
         self: &Arc<Self>,
         machine: MachineId,
         pool: Option<&Arc<tokio::sync::Semaphore>>,
+        aggregate: bool,
     ) -> Option<Lease> {
         let now = Instant::now();
         let stranger_permit = match pool {
@@ -335,9 +340,15 @@ impl Limits {
                     .ok()?,
             ),
         };
-        let permit = Arc::clone(&self.allocations)
-            .try_acquire_many_owned(ALLOCATION_RESERVATION as u32)
-            .ok()?;
+        let permit = if aggregate {
+            Some(
+                Arc::clone(&self.allocations)
+                    .try_acquire_many_owned(ALLOCATION_RESERVATION as u32)
+                    .ok()?,
+            )
+        } else {
+            None
+        };
         let mut s = self.state.lock().ok()?;
         let m = s.machine(machine, now)?;
         if m.open >= 2 {
@@ -562,7 +573,7 @@ pub(crate) struct Lease {
     limits: Arc<Limits>,
     machine: MachineId,
     pub(crate) deadline: Instant,
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
     _stranger_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 impl Drop for Lease {
@@ -2729,6 +2740,32 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(limits.verify());
         assert!(limits.charge(MachineId([5; 32]), 64 * 1024));
+    }
+
+    /// R2-M-1: the frame reserve sits on top of the aggregate cap, so
+    /// strangers holding their pool and the reserve leave relationship
+    /// peers their pre-lane 512 KiB.
+    #[test]
+    fn the_frame_reserve_leaves_relationship_reservations_alone() {
+        let limits = Arc::new(Limits::default());
+        let strangers: Vec<_> = (0..4u8)
+            .map(|i| limits.admit(MachineId([0x10 + i; 32]), false).unwrap())
+            .collect();
+        let frames: Vec<_> = (0..2u8)
+            .map(|i| limits.admit_frame(MachineId([0x20 + i; 32])).unwrap())
+            .collect();
+        assert!(
+            limits.admit_frame(MachineId([0x2f; 32])).is_none(),
+            "the reserve holds two slots"
+        );
+        let related: Vec<_> = (0..4u8)
+            .map(|i| limits.admit(MachineId([0x30 + i; 32]), true))
+            .collect();
+        assert!(
+            related.iter().all(Option::is_some),
+            "four relationship admissions still succeed"
+        );
+        drop((strangers, frames, related));
     }
 
     #[tokio::test(start_paused = true)]
