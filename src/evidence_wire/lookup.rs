@@ -108,6 +108,10 @@ impl Limits {
             state.targets.remove(&target);
         }
     }
+    #[cfg(test)]
+    pub(crate) fn claim_target_for_test(&self, target: AgentId) -> bool {
+        self.claim_target(target)
+    }
     /// A Lookup for `target` started within the cooldown.
     pub(crate) fn target_cooling(&self, target: AgentId) -> bool {
         self.state.lock().is_ok_and(|state| {
@@ -1934,5 +1938,100 @@ mod tests {
         let found = check(target.m(), record, now).unwrap();
         assert!(matches!(found, self_lookup::SelfFound::Stored));
         assert!(store.usable_agent(target.a(), now).is_some());
+    }
+
+    #[tokio::test]
+    async fn one_machines_claims_cannot_flush_another_machines_hints() {
+        let hints = RoutingHints::default();
+        let device = (AgentId([1; 32]), MachineId([1; 32]));
+        hints.record(device.0, device.1);
+        for i in 0..200u8 {
+            hints.record(AgentId([i.wrapping_add(10); 32]), MachineId([2; 32]));
+        }
+        assert_eq!(hints.machines(device.0), vec![device.1]);
+        assert_eq!(
+            hints
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, m, _)| *m == MachineId([2; 32]))
+                .count(),
+            MACHINE_HINT_CAP
+        );
+    }
+
+    #[tokio::test]
+    async fn the_frames_own_machine_is_asked_before_later_claimants() {
+        let requester = Node::new().await;
+        let target = AgentId([0x70; 32]);
+        let hints = &requester.relations.runtime.lookup_hints;
+        let machines: Vec<_> = (0..4u8).map(|i| MachineId([0x71 + i; 32])).collect();
+        for machine in &machines {
+            hints.record(target, *machine);
+        }
+        let connected: HashSet<_> = machines.iter().copied().collect();
+        let routes = requester
+            .relations
+            .routes(target, &connected, Some(machines[0]))
+            .await;
+        assert_eq!(routes.len(), FANOUT);
+        assert_eq!(routes[0], (machines[0], Route::SelfOnly));
+    }
+
+    #[tokio::test]
+    async fn a_revoked_agent_gets_no_route_and_no_answer() {
+        let requester = Node::new().await;
+        let target = Node::new().await;
+        requester
+            .relations
+            .runtime
+            .lookup_hints
+            .record(target.a(), target.m());
+        requester
+            .relations
+            .revoked
+            .write()
+            .await
+            .revoke_agent_for_testing(target.a());
+        assert!(requester
+            .relations
+            .routes(target.a(), &HashSet::from([target.m()]), Some(target.m()))
+            .await
+            .is_empty());
+        let mut responder = Node::new().await;
+        responder.relations.public = true;
+        let asker = MachineId([0x62; 32]);
+        assert!(responder.relations.authorized(asker, responder.a()).await);
+        responder
+            .relations
+            .revoked
+            .write()
+            .await
+            .revoke_agent_for_testing(responder.a());
+        assert!(!responder.relations.authorized(asker, responder.a()).await);
+    }
+
+    #[tokio::test]
+    async fn a_relationship_requester_keeps_the_relationship_grant() {
+        let mut responder = Node::new().await;
+        let requester = Node::new().await;
+        responder.know(&requester).await;
+        responder.group(&[responder.a(), requester.a()]);
+        responder.relations.public = true;
+        assert_eq!(
+            responder
+                .relations
+                .grant(requester.m(), responder.a())
+                .await,
+            Some(Grant::Relationship)
+        );
+        assert_eq!(
+            responder
+                .relations
+                .grant(MachineId([0x63; 32]), responder.a())
+                .await,
+            Some(Grant::SelfEvidence)
+        );
     }
 }

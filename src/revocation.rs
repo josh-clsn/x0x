@@ -960,6 +960,13 @@ impl RevocationSet {
         self.revoked_machines.insert(id);
     }
 
+    /// Test seam: mark `id` revoked without a signed record. Test builds
+    /// only.
+    #[cfg(test)]
+    pub(crate) fn revoke_agent_for_testing(&mut self, id: AgentId) {
+        self.revoked_agents.insert(id);
+    }
+
     /// Whether an `(agent, machine)` binding is retired (ADR-0043 check
     /// **B**): the grow-only union of bundle `retired_bindings` and ad-hoc
     /// v2 tombstones.

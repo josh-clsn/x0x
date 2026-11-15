@@ -125,6 +125,16 @@ impl SelfLookup {
         })
     }
 
+    /// Test builds: age every recorded send by `by`.
+    #[cfg(test)]
+    pub(crate) fn backdate_sends(&self, by: Duration) {
+        if let Ok(mut sends) = self.sends.lock() {
+            for (_, at) in sends.iter_mut() {
+                *at = at.checked_sub(by).unwrap_or(*at);
+            }
+        }
+    }
+
     pub(crate) fn begin(&self, agent: AgentId) -> Flight {
         if let Ok(mut counts) = self.flights.counts.lock() {
             *counts.entry(agent).or_default() += 1;

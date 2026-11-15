@@ -5,26 +5,37 @@ use super::*;
 use crate::{dm::DmSendConfig, Agent};
 
 async fn node(dir: &std::path::Path, name: &str) -> Agent {
+    node_with(dir, name, false, false).await
+}
+
+/// `user`: an owner key, so the agent holds an owner-signed certificate.
+/// `peers`: the bootstrap peer cache is on, in the node's directory.
+async fn node_with(dir: &std::path::Path, name: &str, user: bool, peers: bool) -> Agent {
     let path = dir.join(name);
     std::fs::create_dir_all(&path).unwrap();
-    let agent = Agent::builder()
+    let mut builder = Agent::builder()
         .with_identity_dir(&path)
         .with_machine_key(path.join("machine.key"))
         .with_agent_key_path(path.join("agent.key"))
         .with_user_key_path(path.join("user.key"))
         .with_agent_cert_path(path.join("agent.cert"))
         .with_contact_store_path(path.join("contacts.json"))
-        .with_peer_cache_disabled()
         .with_network_config(crate::network::NetworkConfig {
             bind_addr: Some("127.0.0.1:0".parse().unwrap()),
             bootstrap_nodes: Vec::new(),
             mdns_enabled: false,
             port_mapping_enabled: false,
             ..Default::default()
-        })
-        .build()
-        .await
-        .unwrap();
+        });
+    if user {
+        builder = builder.with_user_key(crate::identity::UserKeypair::generate().unwrap());
+    }
+    builder = if peers {
+        builder.with_peer_cache_dir(path.join("peers"))
+    } else {
+        builder.with_peer_cache_disabled()
+    };
+    let agent = builder.build().await.unwrap();
     // No relationship with anyone: a Noetic DM partner is an x0x stranger.
     agent
         .start_peer_evidence(
@@ -118,6 +129,9 @@ async fn a_late_daemon_answers_a_device_it_never_heard_announce() {
         .get(&device.agent_id())
         .is_none());
     let before = (publishes(&device), publishes(&friend));
+    // publish_total counts every local publish on every topic, identity
+    // and caps included; both daemons have a live gossip runtime.
+    assert!(before.0.is_some() && before.1.is_some());
 
     let mut friend_rx = friend.subscribe_direct();
     device
@@ -165,7 +179,7 @@ async fn a_late_daemon_answers_a_device_it_never_heard_announce() {
 async fn a_strangers_self_evidence_is_never_written_to_disk() {
     let dir = tempfile::tempdir().unwrap();
     let device = node(dir.path(), "device").await;
-    let friend = node(dir.path(), "friend").await;
+    let friend = node_with(dir.path(), "friend", false, true).await;
     knows(&device, &friend).await;
     let friend_dir = dir.path().join("friend");
     let files = snapshot(&friend_dir);
@@ -510,6 +524,486 @@ async fn the_send_goes_raw_once_the_self_lookup_lands() {
         .await;
     assert!(sent.is_ok(), "{sent:?}");
     assert!(started.elapsed() < Duration::from_millis(1400));
+    assert_eq!(
+        friend
+            .general_raw_standin_deliveries_for_testing()
+            .iter()
+            .filter(|(to, _, _)| *to == device.0)
+            .map(|(_, machine, _)| *machine)
+            .collect::<Vec<_>>(),
+        vec![device.1]
+    );
+}
+
+/// A minted answer as the requester decodes it.
+fn decoded(answer: &lookup::Found) -> EvidenceRecordV1 {
+    decode::found(&codec().serialize(answer).unwrap()).unwrap()
+}
+
+/// C-1: a stranger's answer carries the user id and the owner certificate
+/// only when the heartbeat would. A relationship answer is unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_self_answer_discloses_only_what_the_heartbeat_would() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = node_with(dir.path(), "device", true, false).await;
+    assert!(device.identity.agent_certificate().is_some());
+    let responder = context(&device);
+    let anonymous = crate::announce_v3::anonymous_cert_digest();
+    let public = decoded(&responder.own_answer(true).unwrap());
+    assert!(public.certificate.is_none());
+    assert_eq!(
+        crate::announce_v3::deserialize_v3(&public.announcement)
+            .unwrap()
+            .cert_digest,
+        anonymous
+    );
+    let related = decoded(&responder.own_answer(false).unwrap());
+    assert!(
+        related.certificate.is_some(),
+        "relationship answers keep it"
+    );
+    device
+        .user_identity_consented
+        .store(true, std::sync::atomic::Ordering::Release);
+    let consented = decoded(&responder.own_answer(true).unwrap());
+    assert!(consented.certificate.is_some());
+    assert_ne!(
+        crate::announce_v3::deserialize_v3(&consented.announcement)
+            .unwrap()
+            .cert_digest,
+        anonymous
+    );
+}
+
+/// C-1 end to end: an unconsented device's answer names no owner at the
+/// receiver, which still accepts it and replies raw. L-8: no verified
+/// certificate event fires for self-evidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unconsented_device_is_answered_without_its_owner() {
+    for consented in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let device = node_with(dir.path(), "device", true, false).await;
+        device
+            .user_identity_consented
+            .store(consented, std::sync::atomic::Ordering::Release);
+        let friend = node(dir.path(), "friend").await;
+        knows(&device, &friend).await;
+        let mut certificates = friend.subscribe_verified_certificates();
+        let mut friend_rx = friend.subscribe_direct();
+        device
+            .send_direct_with_config(&friend.agent_id(), b"hello".to_vec(), raw())
+            .await
+            .unwrap();
+        receive(&mut friend_rx).await;
+        let mut device_rx = device.subscribe_direct();
+        let reply = friend
+            .send_direct_with_config(&device.agent_id(), b"reply".to_vec(), raw())
+            .await;
+        assert!(reply.is_ok(), "{reply:?}");
+        assert_eq!(receive(&mut device_rx).await.payload, b"reply");
+        let entry = friend
+            .identity_discovery_cache
+            .read()
+            .await
+            .get(&device.agent_id())
+            .cloned()
+            .unwrap();
+        assert_eq!(entry.agent_certificate.is_some(), consented);
+        assert_eq!(entry.user_id.is_some(), consented);
+        assert!(
+            certificates.try_recv().is_err(),
+            "self-evidence fires no certificate event"
+        );
+    }
+}
+
+/// The record a former machine of `device`'s agent can still present: a
+/// fresh announcement signed by that machine and the agent's advert naming
+/// it, signed `advert_age` ago.
+fn former_machine_record(
+    device: &Agent,
+    machine: &crate::identity::MachineKeypair,
+    advert_age: Duration,
+) -> EvidenceRecordV1 {
+    let now = dm_capability::now_unix_ms();
+    let agent = device.agent_id();
+    let machine_id = MachineId::from_public_key(machine.public_key());
+    let v2 = crate::IdentityAnnouncement {
+        self_name: None,
+        agent_id: agent,
+        machine_id,
+        user_id: None,
+        agent_certificate: None,
+        machine_public_key: machine.public_key().as_bytes().to_vec(),
+        machine_signature: vec![],
+        agent_public_key: device
+            .identity
+            .agent_keypair()
+            .public_key()
+            .as_bytes()
+            .to_vec(),
+        addresses: vec![],
+        announced_at: now / 1000,
+        nat_type: None,
+        can_receive_direct: None,
+        is_relay: None,
+        is_coordinator: None,
+        reachable_via: vec![],
+        relay_candidates: vec![],
+    };
+    let v3 =
+        announce_v3::IdentityAnnouncementV3::build_from_v2(&v2, machine.secret_key(), 0).unwrap();
+    let signing = crate::gossip::SigningContext::from_keypair(device.identity.agent_keypair());
+    let wire = crate::dm_capability_service::build_signed_advert(
+        &signing,
+        agent,
+        machine_id,
+        crate::dm::DmCapabilities::v1_gossip_ready(vec![42; 1184]),
+    )
+    .unwrap();
+    let mut advert = crate::dm_capability::CapabilityAdvert::decode_evidence(&wire)
+        .unwrap()
+        .0;
+    advert.created_at_unix_ms = now - advert_age.as_millis() as u64;
+    advert.signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        device.identity.agent_keypair().secret_key(),
+        &advert.signed_bytes().unwrap(),
+    )
+    .unwrap()
+    .as_bytes()
+    .to_vec();
+    EvidenceRecordV1 {
+        announcement: announce_v3::serialize_v3(&v3).unwrap(),
+        advert: postcard::to_stdvec(&advert).unwrap(),
+        certificate: None,
+        relation: 0,
+        stored_at_ms: 0,
+    }
+}
+
+/// I-1: a former machine replaying a 14-minute-old advert cannot move the
+/// agent off the machine a newer class A binding names; raw sends still go
+/// to the current machine. Where nothing names a machine, the answer fills
+/// the gap, ranked by the agent-signed advert time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_former_machine_cannot_displace_the_current_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = node(dir.path(), "device").await;
+    let friend = node(dir.path(), "friend").await;
+    knows(&friend, &device).await;
+    knows(&device, &friend).await;
+    let former = crate::identity::MachineKeypair::generate().unwrap();
+    let former_id = MachineId::from_public_key(former.public_key());
+    let record = former_machine_record(&device, &former, Duration::from_secs(14 * 60));
+    let now = dm_capability::now_unix_ms();
+    let store = friend.peer_evidence().store().unwrap();
+    let self_lookup::SelfFound::Stranger(view) = self_lookup::verify_self_found(
+        &store,
+        &Limits::default(),
+        device.agent_id(),
+        former_id,
+        record.clone(),
+        now,
+    )
+    .unwrap() else {
+        panic!("a stranger's answer is not stored");
+    };
+    assert!(
+        !context(&friend)
+            .accept_self_evidence(&view, former_id)
+            .await
+    );
+    assert_eq!(
+        friend.authority_machine(&device.agent_id()).await,
+        Some(device.machine_id())
+    );
+    let mut device_rx = device.subscribe_direct();
+    friend
+        .send_direct_with_config(&device.agent_id(), b"still here".to_vec(), raw())
+        .await
+        .unwrap();
+    assert_eq!(receive(&mut device_rx).await.payload, b"still here");
+
+    let fresh = node(dir.path(), "fresh").await;
+    assert!(context(&fresh).accept_self_evidence(&view, former_id).await);
+    let binding = fresh
+        .authenticated_machine_bindings
+        .read()
+        .await
+        .peek(&device.agent_id())
+        .unwrap();
+    assert_eq!(binding.machine_id, former_id);
+    assert_eq!(binding.announced_at, view.advert.created_at_unix_ms / 1000);
+}
+
+/// M-3: the latch itself, not a hand-set flag, closes the public rule;
+/// a machine our agent wrote to is still answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_mesh_latch_closes_the_public_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = node(dir.path(), "device").await;
+    let responder = context(&device);
+    let asker = MachineId([0x61; 32]);
+    assert_eq!(
+        responder.grant(asker, device.agent_id()).await,
+        Some(lookup::Grant::SelfEvidence)
+    );
+    device.quiesce_mesh().await.unwrap();
+    assert!(device.mesh_quiesced());
+    assert_eq!(responder.grant(asker, device.agent_id()).await, None);
+    device.peer_evidence().self_lookup.note_sent(asker);
+    assert_eq!(
+        responder.grant(asker, device.agent_id()).await,
+        Some(lookup::Grant::SelfEvidence)
+    );
+}
+
+/// M-4: a revoked agent is refused at acceptance even after verification.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revoked_agent_is_refused_at_acceptance() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = node(dir.path(), "device").await;
+    let friend = node(dir.path(), "friend").await;
+    let record = decoded(&context(&device).own_answer(true).unwrap());
+    let store = friend.peer_evidence().store().unwrap();
+    let self_lookup::SelfFound::Stranger(view) = self_lookup::verify_self_found(
+        &store,
+        &Limits::default(),
+        device.agent_id(),
+        device.machine_id(),
+        record,
+        dm_capability::now_unix_ms(),
+    )
+    .unwrap() else {
+        panic!("a stranger's answer is not stored");
+    };
+    friend
+        .revocation_set
+        .write()
+        .await
+        .revoke_agent_for_testing(device.agent_id());
+    assert!(
+        !context(&friend)
+            .accept_self_evidence(&view, device.machine_id())
+            .await
+    );
+    assert!(friend
+        .authenticated_machine_bindings
+        .read()
+        .await
+        .peek(&device.agent_id())
+        .is_none());
+}
+
+/// I-2: the admission window closes again. A discovered Unknown machine is
+/// admitted for EvidenceV1 only while our agent wrote to it in the last
+/// 15 min.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn evidence_admission_for_a_written_to_machine_expires() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = node(dir.path(), "device").await;
+    let friend = node(dir.path(), "friend").await;
+    knows(&device, &friend).await;
+    let admitted = || async {
+        Agent::gate_peer_machine_inbound_for_evidence(
+            &device.identity_discovery_cache,
+            &device.contact_store,
+            &device.revocation_set,
+            &device.move_state,
+            &device.connect_policy,
+            &device.owner_trust,
+            &friend.machine_id(),
+            None,
+            true,
+        )
+        .await
+        .is_ok()
+    };
+    assert!(!admitted().await, "a discovered Unknown machine is refused");
+    let runtime = device.peer_evidence();
+    runtime.self_lookup.note_sent(friend.machine_id());
+    assert!(admitted().await, "written to within the window");
+    runtime
+        .self_lookup
+        .backdate_sends(Duration::from_millis(crate::peer_evidence::W_MS));
+    assert!(!admitted().await, "the window has closed");
+}
+
+/// M-1, M-2(c): one claimant machine claiming many agent ids costs one
+/// self-only Lookup per interval, and claims that never left this node do
+/// not cool their targets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_claimant_flooding_agent_ids_costs_one_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = node(dir.path(), "device").await;
+    let friend = node(dir.path(), "friend").await;
+    knows(&device, &friend).await;
+    device.connect_to_agent(&friend.agent_id()).await.unwrap();
+    let runtime = Arc::clone(friend.peer_evidence());
+    for i in 0..100u8 {
+        runtime
+            .lookup(AgentId([i; 32]), Some(device.machine_id()))
+            .await;
+    }
+    assert_eq!(counter(&friend, "evidence_self_lookup_sent"), 1);
+    let cooling = (0..100u8)
+        .filter(|i| runtime.wire_limits.target_cooling(AgentId([*i; 32])))
+        .count();
+    assert_eq!(
+        cooling, 1,
+        "only the claim that sent a request cools its target"
+    );
+}
+
+/// A responder hook whose `nth` call (1-based) runs `then`; every other
+/// call returns at once, as an agent-only Lookup with no route does.
+fn hook_on_call<F>(
+    runtime: &crate::peer_evidence::EvidenceRuntime,
+    nth: usize,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    then: F,
+) where
+    F: Fn(AgentId) -> futures::future::BoxFuture<'static, ()> + Send + Sync + 'static,
+{
+    assert!(runtime
+        .lookup_responder
+        .set(Arc::new(move |agent| {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if call == nth {
+                then(agent)
+            } else {
+                Box::pin(async {})
+            }
+        }))
+        .is_ok());
+}
+
+/// L-2: with a hint but no Lookup in flight and no cooldown, the send
+/// starts the self-lookup itself and goes raw once it lands.
+#[tokio::test]
+async fn the_send_starts_the_self_lookup_when_none_is_in_flight() {
+    let dir = tempfile::tempdir().unwrap();
+    let friend = offline(dir.path()).await;
+    let device = (AgentId([0xf1; 32]), MachineId([0xf2; 32]));
+    let runtime = Arc::clone(friend.peer_evidence());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bindings = Arc::clone(&friend.authenticated_machine_bindings);
+    let direct = Arc::clone(&friend.direct_messaging);
+    // Call 1 is the connector's agent-only Lookup; call 2 is the send's.
+    hook_on_call(&runtime, 2, Arc::clone(&calls), move |agent| {
+        let bindings = Arc::clone(&bindings);
+        let direct = Arc::clone(&direct);
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            crate::dm_inbox::record_authenticated_machine_binding(
+                &bindings,
+                agent,
+                device.1,
+                crate::Agent::unix_timestamp_secs(),
+            )
+            .await;
+            direct.mark_connected(agent, device.1).await;
+        })
+    });
+    runtime.lookup_hints.record(device.0, device.1);
+    let sent = friend
+        .send_direct_raw_quic(&device.0, b"reply", None, Duration::ZERO, None)
+        .await;
+    assert!(sent.is_ok(), "{sent:?}");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+/// L-2: a Lookup for the recipient within its cooldown and none in flight:
+/// the send does not wait and starts nothing.
+#[tokio::test]
+async fn the_send_does_not_wait_while_the_target_cools() {
+    let dir = tempfile::tempdir().unwrap();
+    let friend = offline(dir.path()).await;
+    let device = (AgentId([0xf3; 32]), MachineId([0xf4; 32]));
+    let runtime = Arc::clone(friend.peer_evidence());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    hook_on_call(&runtime, 2, Arc::clone(&calls), |_| {
+        Box::pin(futures::future::pending())
+    });
+    runtime.lookup_hints.record(device.0, device.1);
+    assert!(runtime.wire_limits.claim_target_for_test(device.0));
+    let started = std::time::Instant::now();
+    let sent = friend
+        .send_direct_raw_quic(&device.0, b"reply", None, Duration::ZERO, None)
+        .await;
+    assert!(
+        matches!(sent, Err(crate::error::NetworkError::AgentNotFound(_))),
+        "{sent:?}"
+    );
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// L-3: when the self-only answer comes from a relationship peer it lands
+/// in the evidence store, and the waiting send reads it there.
+#[tokio::test]
+async fn the_send_reads_evidence_stored_by_the_self_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    let friend = offline(dir.path()).await;
+    let peer = crate::identity::Identity::new(
+        crate::identity::MachineKeypair::generate().unwrap(),
+        crate::identity::AgentKeypair::generate().unwrap(),
+    );
+    let device = (peer.agent_id(), peer.machine_id());
+    friend
+        .start_peer_evidence(
+            dir.path().join("evidence"),
+            Default::default(),
+            Arc::new(move |agent| Some(agent == device.0)),
+        )
+        .unwrap();
+    let runtime = Arc::clone(friend.peer_evidence());
+    assert!(runtime.wait(0).await);
+    let template = crate::IdentityAnnouncement {
+        self_name: None,
+        agent_id: device.0,
+        machine_id: device.1,
+        user_id: None,
+        agent_certificate: None,
+        machine_public_key: peer.machine_keypair().public_key().as_bytes().to_vec(),
+        machine_signature: vec![],
+        agent_public_key: peer.agent_keypair().public_key().as_bytes().to_vec(),
+        addresses: vec![],
+        announced_at: dm_capability::now_unix_ms() / 1000,
+        nat_type: None,
+        can_receive_direct: None,
+        is_relay: None,
+        is_coordinator: None,
+        reachable_via: vec![],
+        relay_candidates: vec![],
+    };
+    let record = mint_hello(
+        &peer,
+        template,
+        &crate::announce_blob::shared_cert_pair(None, None),
+        crate::dm::DmCapabilities::v1_gossip_ready(vec![42; 1184]),
+        None,
+        true,
+    )
+    .unwrap()
+    .into_record();
+    let store = runtime.store().unwrap();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    hook_on_call(&runtime, 2, Arc::clone(&calls), move |_| {
+        let store = Arc::clone(&store);
+        let record = record.clone();
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            store
+                .ingest(record, IngestSource::Gossip, dm_capability::now_unix_ms())
+                .unwrap();
+        })
+    });
+    runtime.lookup_hints.record(device.0, device.1);
+    let sent = friend
+        .send_direct_raw_quic(&device.0, b"reply", None, Duration::ZERO, None)
+        .await;
+    assert!(sent.is_ok(), "{sent:?}");
     assert_eq!(
         friend
             .general_raw_standin_deliveries_for_testing()
