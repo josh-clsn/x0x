@@ -667,15 +667,20 @@ impl Context {
         // responder is a stranger and shares the stranger pool, except that
         // the frame's own machine may fall back to the frame reserve.
         let limits = &self.runtime.wire_limits;
-        let started = Instant::now();
+        let mut log = (route == Route::SelfOnly).then(|| SelfLookupLog {
+            target,
+            machine,
+            started: Instant::now(),
+            outcome: "cancelled",
+        });
         let lease = match (route, frame) {
             (Route::Relationship, _) => limits.admit(machine, true),
             (Route::SelfOnly, true) => limits.admit_frame(machine),
             (Route::SelfOnly, false) => limits.admit(machine, false),
         };
         let Some(lease) = lease else {
-            if route == Route::SelfOnly {
-                self_lookup_ended(target, machine, "budget", started);
+            if let Some(log) = &mut log {
+                log.outcome = "budget";
             }
             return Err(invalid("lookup stream budget"));
         };
@@ -766,9 +771,8 @@ impl Context {
             .map_err(io::Error::other)?
         })
         .await;
-        if route == Route::SelfOnly {
-            let outcome = if result.is_err() { "timeout" } else { outcome };
-            self_lookup_ended(target, machine, outcome, started);
+        if let Some(log) = &mut log {
+            log.outcome = if result.is_err() { "timeout" } else { outcome };
         }
         let result = result.map_err(io::Error::other)?;
         reset.complete = result.is_ok();
@@ -777,17 +781,27 @@ impl Context {
 }
 
 /// One line per self-only pull, bounded by the claimant gate and the
-/// per-key cooldown.
-fn self_lookup_ended(target: AgentId, machine: MachineId, outcome: &str, started: Instant) {
-    tracing::info!(
-        target: "x0x::evidence",
-        stage = "self_lookup",
-        agent_prefix = %crate::network::hex_prefix(&target.0, 4),
-        machine_prefix = %crate::network::hex_prefix(&machine.0, 4),
-        outcome,
-        dur_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        "self-only Lookup ended"
-    );
+/// per-key cooldown. Logged on drop, so a pull cut off by the Lookup's own
+/// deadline or by a faster responder still logs, as `cancelled`.
+struct SelfLookupLog {
+    target: AgentId,
+    machine: MachineId,
+    started: Instant,
+    outcome: &'static str,
+}
+
+impl Drop for SelfLookupLog {
+    fn drop(&mut self) {
+        tracing::info!(
+            target: "x0x::evidence",
+            stage = "self_lookup",
+            agent_prefix = %crate::network::hex_prefix(&self.target.0, 4),
+            machine_prefix = %crate::network::hex_prefix(&self.machine.0, 4),
+            outcome = self.outcome,
+            dur_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "self-only Lookup ended"
+        );
+    }
 }
 
 fn ingest_found(
@@ -2127,6 +2141,57 @@ mod tests {
         );
     }
 
+    #[derive(Clone, Default)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A self-only pull logs when its record drops, with the outcome last
+    /// set, so a pull cut off before it finished still leaves a line.
+    #[test]
+    fn a_self_only_pull_logs_once_when_it_ends() {
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        let started = Instant::now();
+        drop(SelfLookupLog {
+            target: AgentId([1; 32]),
+            machine: MachineId([2; 32]),
+            started,
+            outcome: "cancelled",
+        });
+        drop(SelfLookupLog {
+            target: AgentId([1; 32]),
+            machine: MachineId([2; 32]),
+            started,
+            outcome: "reset",
+        });
+        let logs = String::from_utf8_lossy(&capture.0.lock().unwrap()).into_owned();
+        let lines: Vec<_> = logs
+            .lines()
+            .filter(|l| l.contains("stage=\"self_lookup\""))
+            .collect();
+        assert_eq!(lines.len(), 2, "{logs}");
+        assert!(lines[0].contains("outcome=\"cancelled\""), "{logs}");
+        assert!(lines[1].contains("outcome=\"reset\""), "{logs}");
+        assert!(lines[1].contains("agent_prefix=01010101"), "{logs}");
+        assert!(lines[1].contains("machine_prefix=02020202"), "{logs}");
+    }
     #[test]
     fn self_only_keys_fill_at_most_half_of_the_claim_table() {
         let limits = Limits::default();
