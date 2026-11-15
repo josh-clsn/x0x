@@ -196,6 +196,7 @@ impl EvidenceRuntime {
         let Some(permit) = self.lookup_permit() else {
             return;
         };
+        let _flight = self.self_lookup.begin(agent);
         self.lookup_with_permit(agent, machine, permit).await;
     }
 
@@ -210,7 +211,9 @@ impl EvidenceRuntime {
             return;
         };
         let runtime = Arc::clone(self);
+        let flight = self.self_lookup.begin(agent);
         tokio::spawn(async move {
+            let _flight = flight;
             if runtime.wait(0).await {
                 runtime.lookup_with_permit(agent, None, permit).await;
             }
@@ -230,7 +233,11 @@ impl EvidenceRuntime {
             return;
         };
         let runtime = Arc::clone(self);
+        // In flight from now, so a send that looks before the task runs
+        // waits for it instead of starting another.
+        let flight = self.self_lookup.begin(agent);
         tokio::spawn(async move {
+            let _flight = flight;
             runtime
                 .lookup_with_permit(agent, Some(machine), permit)
                 .await;

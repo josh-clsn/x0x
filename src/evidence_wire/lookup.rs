@@ -95,6 +95,15 @@ impl Limits {
         state.targets.insert(target, now);
         true
     }
+    /// A Lookup for `target` started within the cooldown.
+    pub(crate) fn target_cooling(&self, target: AgentId) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            state
+                .targets
+                .get(&target)
+                .is_some_and(|at| Instant::now().duration_since(*at) < LOOKUP_INTERVAL)
+        })
+    }
     #[cfg(test)]
     fn begin_lookup(&self, target: AgentId) -> Option<tokio::sync::OwnedSemaphorePermit> {
         let permit = Arc::clone(&self.lookups).try_acquire_owned().ok()?;

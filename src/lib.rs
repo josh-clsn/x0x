@@ -12741,6 +12741,46 @@ impl Agent {
         Ok(binding)
     }
 
+    /// T-self-evidence-lookup: when the recipient's claimed machine is
+    /// connected (it sent us a raw frame), wait at most
+    /// [`SEND_WAIT`](evidence_wire::self_lookup::SEND_WAIT) for the
+    /// self-lookup that asks it. One already in flight is awaited; otherwise
+    /// one starts unless a Lookup for the recipient ran within its cooldown
+    /// or no Lookup permit is free. Returns whether the caller should read
+    /// authority again. No global traffic is sent.
+    async fn await_self_evidence(
+        &self,
+        agent_id: &identity::AgentId,
+        transport: &RawQuicTransport<'_>,
+    ) -> bool {
+        let runtime = self.peer_evidence();
+        let mut hinted = None;
+        for machine in runtime.lookup_hints.machines(*agent_id).into_iter().rev() {
+            if transport.is_connected(&ant_quic::PeerId(machine.0)).await {
+                hinted = Some(machine);
+                break;
+            }
+        }
+        let Some(machine) = hinted else {
+            return false;
+        };
+        let mut done = runtime.self_lookup.subscribe();
+        if !runtime.self_lookup.in_flight(agent_id) {
+            if runtime.wire_limits.target_cooling(*agent_id) {
+                return false;
+            }
+            runtime.spawn_lookup(*agent_id, machine);
+        }
+        let deadline = tokio::time::Instant::now() + evidence_wire::self_lookup::SEND_WAIT;
+        while runtime.self_lookup.in_flight(agent_id) {
+            match tokio::time::timeout_at(deadline, done.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        true
+    }
+
     /// Resolve `agent_id` to a connected machine for a raw-QUIC send:
     /// discovery cache, DM registry or peer evidence, any send-readiness
     /// repair or discovery redial, and the ADR-0043 B/P pairing check before
@@ -12864,7 +12904,14 @@ impl Agent {
                     // (a gossip fallback, if any, follows).
                     ColdResolution::Off => {
                         let _ = self.connect_to_agent(agent_id).await;
-                        match self.authorized_registry_machine(agent_id, false).await {
+                        let mut registered =
+                            self.authorized_registry_machine(agent_id, false).await;
+                        if registered.is_none()
+                            && self.await_self_evidence(agent_id, transport).await
+                        {
+                            registered = self.authorized_registry_machine(agent_id, false).await;
+                        }
+                        match registered {
                             Some(id) => (id, "post_connect"),
                             None => {
                                 tracing::warn!(

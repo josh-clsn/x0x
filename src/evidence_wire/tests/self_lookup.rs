@@ -71,6 +71,10 @@ fn counter(agent: &Agent, name: &str) -> u64 {
         .unwrap_or(0)
 }
 
+fn publishes(agent: &Agent) -> Option<u64> {
+    agent.gossip_stats().map(|stats| stats.publish_total)
+}
+
 /// Every file under `dir` with its length and modification time.
 fn snapshot(dir: &std::path::Path) -> Vec<(std::path::PathBuf, u64, std::time::SystemTime)> {
     let mut out = Vec::new();
@@ -95,6 +99,63 @@ async fn receive(rx: &mut crate::direct::DirectMessageReceiver) -> crate::direct
         .await
         .expect("a frame arrives")
         .expect("the stream is open")
+}
+
+/// The drill-x shape: the device announced before the receiver's daemon
+/// started, so the receiver holds nothing about it. The device dials and
+/// writes; the receiver's reply goes raw within two seconds, with no
+/// announcement or capability publish on either side.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_daemon_answers_a_device_it_never_heard_announce() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = node(dir.path(), "device").await;
+    let friend = node(dir.path(), "friend").await;
+    knows(&device, &friend).await;
+    assert!(friend
+        .identity_discovery_cache
+        .read()
+        .await
+        .get(&device.agent_id())
+        .is_none());
+    let before = (publishes(&device), publishes(&friend));
+
+    let mut friend_rx = friend.subscribe_direct();
+    device
+        .send_direct_with_config(&friend.agent_id(), b"hello".to_vec(), raw())
+        .await
+        .expect("the device writes raw");
+    let first = receive(&mut friend_rx).await;
+    assert!(!first.verified, "the triggering frame stays unverified");
+
+    let mut device_rx = device.subscribe_direct();
+    let started = std::time::Instant::now();
+    let reply = friend
+        .send_direct_with_config(&device.agent_id(), b"reply".to_vec(), raw())
+        .await;
+    let waited = started.elapsed();
+    assert!(reply.is_ok(), "the reply goes raw: {reply:?}");
+    assert!(waited < Duration::from_secs(2), "took {waited:?}");
+    assert_eq!(receive(&mut device_rx).await.payload, b"reply");
+
+    device
+        .send_direct_with_config(&friend.agent_id(), b"again".to_vec(), raw())
+        .await
+        .unwrap();
+    let later = receive(&mut friend_rx).await;
+    assert!(
+        later.verified,
+        "a later frame is verified by the self-evidence"
+    );
+
+    assert_eq!(
+        (publishes(&device), publishes(&friend)),
+        before,
+        "recovery publishes nothing on any topic"
+    );
+    assert_eq!(counter(&friend, "evidence_self_lookup_sent"), 1);
+    assert_eq!(counter(&friend, "evidence_self_lookup_accepted"), 1);
+    assert_eq!(counter(&device, "evidence_self_lookup_served"), 1);
+    assert_eq!(counter(&device, "evidence_own_answer_mints"), 1);
 }
 
 /// A stranger's accepted self-evidence is held in memory only: no file
@@ -180,6 +241,36 @@ async fn a_strangers_self_evidence_is_never_written_to_disk() {
         .await
         .get(&device.agent_id())
         .is_none());
+}
+
+/// A latched device still answers the machine it just wrote to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_latched_device_answers_the_machine_it_wrote_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = node(dir.path(), "device").await;
+    let friend = node(dir.path(), "friend").await;
+    knows(&device, &friend).await;
+    device.quiesce_mesh().await.unwrap();
+    let (outcome, _) = device
+        .connect_to_agent_leased(&friend.agent_id(), Duration::from_secs(120))
+        .await
+        .unwrap();
+    assert!(outcome.is_live_path(), "{outcome:?}");
+
+    let mut friend_rx = friend.subscribe_direct();
+    device
+        .send_direct_with_config(&friend.agent_id(), b"hello".to_vec(), raw())
+        .await
+        .unwrap();
+    receive(&mut friend_rx).await;
+    let mut device_rx = device.subscribe_direct();
+    let reply = friend
+        .send_direct_with_config(&device.agent_id(), b"reply".to_vec(), raw())
+        .await;
+    assert!(reply.is_ok(), "{reply:?}");
+    assert_eq!(receive(&mut device_rx).await.payload, b"reply");
+    assert!(device.mesh_quiesced());
+    assert_eq!(counter(&device, "evidence_self_lookup_served"), 1);
 }
 
 /// Revocation still applies: with the device's binding retired at the
@@ -309,5 +400,121 @@ async fn self_evidence_for_another_machine_or_a_revoked_pairing_writes_nothing()
             .peek(&device.agent_id())
             .map(|binding| binding.machine_id),
         Some(device.machine_id())
+    );
+}
+
+/// An agent with no network whose raw sends run the production resolver
+/// over the strict in-process stand-in.
+async fn offline(dir: &std::path::Path) -> Agent {
+    let agent = Agent::builder()
+        .with_identity_dir(dir)
+        .with_machine_key(dir.join("machine.key"))
+        .with_agent_key_path(dir.join("agent.key"))
+        .with_contact_store_path(dir.join("contacts.json"))
+        .with_peer_cache_disabled()
+        .build()
+        .await
+        .unwrap();
+    agent.set_pinned_standin_strict_resolution_for_testing(true);
+    agent
+}
+
+/// The receive side has started a Lookup for `agent` on `machine`.
+async fn frame_arrived(runtime: &crate::peer_evidence::EvidenceRuntime, agent: AgentId) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while runtime.lookup_hints.machines(agent).is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// A device without this change, or a lost answer: the reply comes back
+/// `recipient_undiscovered` after about 1.5 s, never later.
+#[tokio::test]
+async fn the_send_waits_at_most_one_and_a_half_seconds_for_a_silent_self_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    let friend = offline(dir.path()).await;
+    let device = (AgentId([0xd1; 32]), MachineId([0xd2; 32]));
+    let runtime = Arc::clone(friend.peer_evidence());
+    // The frame's Lookup gets no answer. An agent-only Lookup (the
+    // connector's) has no route and returns at once, as in production.
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    assert!(runtime
+        .lookup_responder
+        .set(Arc::new(move |_| {
+            let first = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            Box::pin(async move {
+                if first {
+                    futures::future::pending::<()>().await;
+                }
+            })
+        }))
+        .is_ok());
+    runtime.spawn_lookup(device.0, device.1);
+    frame_arrived(&runtime, device.0).await;
+    let started = std::time::Instant::now();
+    let sent = friend
+        .send_direct_raw_quic(&device.0, b"reply", None, Duration::ZERO, None)
+        .await;
+    let waited = started.elapsed();
+    assert!(
+        matches!(sent, Err(crate::error::NetworkError::AgentNotFound(_))),
+        "{sent:?}"
+    );
+    assert!(waited >= Duration::from_millis(1400), "{waited:?}");
+    assert!(waited < Duration::from_millis(2500), "{waited:?}");
+}
+
+/// The send re-reads authority after the self-lookup lands, and goes raw
+/// to the machine it proved.
+#[tokio::test]
+async fn the_send_goes_raw_once_the_self_lookup_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let friend = offline(dir.path()).await;
+    let device = (AgentId([0xe1; 32]), MachineId([0xe2; 32]));
+    let runtime = Arc::clone(friend.peer_evidence());
+    let bindings = Arc::clone(&friend.authenticated_machine_bindings);
+    let direct = Arc::clone(&friend.direct_messaging);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    assert!(runtime
+        .lookup_responder
+        .set(Arc::new(move |agent| {
+            let bindings = Arc::clone(&bindings);
+            let direct = Arc::clone(&direct);
+            let first = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            Box::pin(async move {
+                if !first {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                crate::dm_inbox::record_authenticated_machine_binding(
+                    &bindings,
+                    agent,
+                    device.1,
+                    crate::Agent::unix_timestamp_secs(),
+                )
+                .await;
+                direct.mark_connected(agent, device.1).await;
+            })
+        }))
+        .is_ok());
+    runtime.spawn_lookup(device.0, device.1);
+    frame_arrived(&runtime, device.0).await;
+    let started = std::time::Instant::now();
+    let sent = friend
+        .send_direct_raw_quic(&device.0, b"reply", None, Duration::ZERO, None)
+        .await;
+    assert!(sent.is_ok(), "{sent:?}");
+    assert!(started.elapsed() < Duration::from_millis(1400));
+    assert_eq!(
+        friend
+            .general_raw_standin_deliveries_for_testing()
+            .iter()
+            .filter(|(to, _, _)| *to == device.0)
+            .map(|(_, machine, _)| *machine)
+            .collect::<Vec<_>>(),
+        vec![device.1]
     );
 }

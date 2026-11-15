@@ -9,6 +9,8 @@ const RECENT_SEND_WINDOW: Duration = Duration::from_millis(W_MS);
 const RECENT_SEND_CAP: usize = 256;
 /// One minted own-evidence answer serves every ask for this long.
 const ANSWER_REUSE: Duration = Duration::from_secs(60);
+/// The send path waits at most this long for a self-lookup to land.
+pub(crate) const SEND_WAIT: Duration = Duration::from_millis(1500);
 
 type AnswerKey = ([u8; 32], crate::dm::DmCapabilities);
 
@@ -18,6 +20,39 @@ pub(crate) struct SelfLookup {
     sends: Mutex<VecDeque<(MachineId, Instant)>>,
     answer: Mutex<Option<(AnswerKey, Instant, lookup::Found)>>,
     pub(crate) mints: AtomicU64,
+    flights: Arc<Flights>,
+}
+
+struct Flights {
+    counts: Mutex<HashMap<AgentId, usize>>,
+    done: tokio::sync::watch::Sender<u64>,
+}
+impl Default for Flights {
+    fn default() -> Self {
+        Self {
+            counts: Mutex::default(),
+            done: tokio::sync::watch::channel(0).0,
+        }
+    }
+}
+
+/// Marks a Lookup for one target in flight until dropped.
+pub(crate) struct Flight {
+    flights: Arc<Flights>,
+    agent: AgentId,
+}
+impl Drop for Flight {
+    fn drop(&mut self) {
+        if let Ok(mut counts) = self.flights.counts.lock() {
+            if let Some(n) = counts.get_mut(&self.agent) {
+                *n -= 1;
+                if *n == 0 {
+                    counts.remove(&self.agent);
+                }
+            }
+        }
+        self.flights.done.send_modify(|v| *v = v.wrapping_add(1));
+    }
 }
 
 impl SelfLookup {
@@ -40,6 +75,27 @@ impl SelfLookup {
                 .iter()
                 .any(|(m, at)| *m == machine && now.duration_since(*at) < RECENT_SEND_WINDOW)
         })
+    }
+
+    pub(crate) fn begin(&self, agent: AgentId) -> Flight {
+        if let Ok(mut counts) = self.flights.counts.lock() {
+            *counts.entry(agent).or_default() += 1;
+        }
+        Flight {
+            flights: Arc::clone(&self.flights),
+            agent,
+        }
+    }
+
+    pub(crate) fn in_flight(&self, agent: &AgentId) -> bool {
+        self.flights
+            .counts
+            .lock()
+            .is_ok_and(|counts| counts.contains_key(agent))
+    }
+
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.flights.done.subscribe()
     }
 
     /// Reuse the minted answer while the certificate pair and capabilities
@@ -327,5 +383,21 @@ mod tests {
         }
         assert_eq!(state.sends.lock().unwrap().len(), RECENT_SEND_CAP);
         assert!(!state.sent_within_window(MachineId([0; 32])));
+    }
+
+    #[tokio::test]
+    async fn a_flight_ends_with_a_wakeup() {
+        let state = SelfLookup::default();
+        let agent = AgentId([3; 32]);
+        let mut done = state.subscribe();
+        let flight = state.begin(agent);
+        let second = state.begin(agent);
+        assert!(state.in_flight(&agent));
+        drop(flight);
+        assert!(state.in_flight(&agent));
+        drop(second);
+        assert!(!state.in_flight(&agent));
+        assert!(done.has_changed().unwrap());
+        done.borrow_and_update();
     }
 }
