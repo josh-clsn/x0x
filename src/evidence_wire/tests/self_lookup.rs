@@ -1449,3 +1449,66 @@ async fn a_relationship_lookup_in_flight_does_not_mask_the_send() {
     assert!(sent.is_ok(), "{sent:?}");
     held.abort();
 }
+
+/// Bindings and a share grant for `peer` held by `local`, for the
+/// share-grant access tests.
+async fn granted(local: AgentId, peer: AgentId, now: u64) -> crate::share_grant::ShareGrantStore {
+    use crate::share_grant::{Grantee, ShareCap, ShareGrant, ShareGrantStore};
+    let owner = crate::identity::UserKeypair::generate().unwrap();
+    let grants = ShareGrantStore::in_memory(local, Some(owner.user_id()));
+    grants
+        .accept(
+            ShareGrant::sign(
+                &owner,
+                [0x35; 32],
+                Grantee::Agent(peer),
+                vec![local],
+                vec![ShareCap::Dm],
+                now - 1,
+                now + 60,
+            )
+            .unwrap(),
+            now,
+        )
+        .await
+        .unwrap();
+    grants
+}
+
+/// R2-L-3: an older card pin, or an older attested write, naming the same
+/// machine clears the self-evidence mark, so share-grant access is what
+/// it was before the lane.
+#[tokio::test]
+async fn an_older_pin_or_attestation_clears_the_self_evidence_mark() {
+    let local = AgentId([0x41; 32]);
+    let peer = (AgentId([0x42; 32]), MachineId([0x43; 32]));
+    let now = crate::Agent::unix_timestamp_secs();
+    let grants = granted(local, peer.0, now).await;
+    let discovery = tokio::sync::RwLock::new(HashMap::new());
+    let revoked = tokio::sync::RwLock::new(crate::revocation::RevocationSet::new());
+    for pin in [true, false] {
+        let bindings = Arc::new(tokio::sync::RwLock::new(
+            crate::dm_inbox::AuthenticatedMachineBindingCache::default(),
+        ));
+        // The device's advert time can run ahead of our clock.
+        crate::dm_inbox::record_self_evidence_machine_binding(
+            &bindings,
+            peer.0,
+            peer.1,
+            now + 100,
+            None,
+        )
+        .await;
+        if pin {
+            crate::dm_inbox::record_local_pin_binding(&bindings, peer.0, peer.1, now).await;
+        } else {
+            crate::dm_inbox::record_authenticated_machine_binding(&bindings, peer.0, peer.1, now)
+                .await;
+        }
+        let access = crate::share_grant::evaluate_grant_access_with_evidence(
+            &grants, &bindings, &discovery, &revoked, &peer.0, &peer.1, now, None,
+        )
+        .await;
+        assert!(access.dm, "pin: {pin}");
+    }
+}

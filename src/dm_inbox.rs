@@ -391,8 +391,11 @@ impl AuthenticatedMachineBindingCache {
                 existing.announced_at = announced_at;
                 existing.cert_not_after = cert_not_after;
                 existing.cert_digest = cert_digest;
-            } else if network && same_machine {
-                existing.network_authenticated = true;
+            } else if same_machine {
+                // Any older write naming this machine that is not
+                // self-evidence (an attestation or the user's card pin)
+                // would have been the binding before this lane.
+                existing.network_authenticated |= network;
                 existing.self_evidence &= self_evidence;
             }
             self.entries.insert(agent_id, existing);
