@@ -12904,15 +12904,25 @@ impl Agent {
                     // (a gossip fallback, if any, follows).
                     ColdResolution::Off => {
                         let _ = self.connect_to_agent(agent_id).await;
-                        let mut registered =
-                            self.authorized_registry_machine(agent_id, false).await;
-                        if registered.is_none()
-                            && self.await_self_evidence(agent_id, transport).await
+                        let mut resolved = self
+                            .authorized_registry_machine(agent_id, false)
+                            .await
+                            .map(|id| (id, "post_connect"));
+                        if resolved.is_none() && self.await_self_evidence(agent_id, transport).await
                         {
-                            registered = self.authorized_registry_machine(agent_id, false).await;
+                            // A stranger's answer lands in the registry; a
+                            // relationship peer's lands in the evidence store.
+                            resolved = match self.authorized_registry_machine(agent_id, false).await
+                            {
+                                Some(id) => Some((id, "post_connect")),
+                                None => self
+                                    .peer_evidence()
+                                    .usable_agent(*agent_id, dm_capability::now_unix_ms())
+                                    .map(|view| (view.announcement.machine_id, "peer_evidence")),
+                            };
                         }
-                        match registered {
-                            Some(id) => (id, "post_connect"),
+                        match resolved {
+                            Some(resolution) => resolution,
                             None => {
                                 tracing::warn!(
                                     target: "x0x::direct",
