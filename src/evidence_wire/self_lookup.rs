@@ -194,6 +194,9 @@ pub(crate) fn verify_self_found(
             .map_err(io::Error::other)?;
         return Ok(SelfFound::Stored);
     }
+    if store.supersedes(target, &view) {
+        return Err(invalid("move watermark"));
+    }
     Ok(SelfFound::Stranger(view))
 }
 
@@ -224,8 +227,10 @@ impl Context {
 
     /// Write a stranger's verified self-evidence into the in-memory stores
     /// a class A announcement writes, after the identity listener's gates.
-    /// The contact store and the bootstrap cache, which are files, are not
-    /// written.
+    /// It fills a missing binding or refreshes the same pairing, never moves
+    /// the agent off a machine an authority store names, and ranks by the
+    /// agent-signed advert time. The contact store, the bootstrap cache and
+    /// the certificate event (whose consumer can persist) are not written.
     pub(super) async fn accept_self_evidence(
         &self,
         view: &EvidenceView,
@@ -241,6 +246,10 @@ impl Context {
         if agent == self.identity.agent_id() || announcement.machine_id != machine {
             return false;
         }
+        // The machine signs "now"; only the agent's advert time ranks.
+        announcement.announced_at = announcement
+            .announced_at
+            .min(view.advert.created_at_unix_ms / 1000);
         let now = crate::Agent::unix_timestamp_secs();
         if !crate::identity_announcement_timestamp_is_acceptable(announcement.announced_at, now)
             || announcement
@@ -264,6 +273,9 @@ impl Context {
         ) {
             return false;
         }
+        // Each authority store is read alone, before the revocation set.
+        let attested = self.bindings.read().await.peek(&agent);
+        let announced = self.stores.announced.read().await.peek(&agent);
         {
             let revoked = self.revoked.read().await;
             if revoked.is_agent_revoked(&agent)
@@ -281,6 +293,13 @@ impl Context {
             )
             .is_some()
             {
+                return false;
+            }
+            if [attested, announced].into_iter().flatten().any(|binding| {
+                binding.machine_id != machine
+                    && !revoked.is_machine_revoked(&binding.machine_id)
+                    && !revoked.is_binding_revoked(&agent, &binding.machine_id)
+            }) {
                 return false;
             }
         }

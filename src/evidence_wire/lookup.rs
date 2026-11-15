@@ -542,7 +542,7 @@ impl Context {
     }
 
     async fn pull(
-        &self,
+        self: &Arc<Self>,
         machine: MachineId,
         route: Route,
         target: AgentId,
@@ -598,10 +598,20 @@ impl Context {
                 })
                 .await
                 .map_err(io::Error::other)??;
-                if let self_lookup::SelfFound::Stranger(view) = found {
-                    if !self.accept_self_evidence(&view, machine).await {
-                        return Err(invalid("self evidence refused"));
+                let accepted = match found {
+                    self_lookup::SelfFound::Stored => true,
+                    // A deadline here must not cut the writes in half.
+                    self_lookup::SelfFound::Stranger(view) => {
+                        let context = Arc::clone(self);
+                        tokio::spawn(
+                            async move { context.accept_self_evidence(&view, machine).await },
+                        )
+                        .await
+                        .map_err(io::Error::other)?
                     }
+                };
+                if !accepted {
+                    return Err(invalid("self evidence refused"));
                 }
                 WireCounters::bump(
                     &self

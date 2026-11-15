@@ -886,6 +886,25 @@ impl PeerEvidenceStore {
             })
             .unwrap_or_default()
     }
+    /// T-self-evidence-lookup: whether a move watermark, a pending move, a
+    /// suspension or a stored record naming another machine rules out
+    /// in-memory evidence for `agent` on the view's machine.
+    pub(crate) fn supersedes(&self, agent: AgentId, view: &EvidenceView) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return true;
+        };
+        let machine = view.announcement.machine_id;
+        disqualified(&state.file.watermarks, agent, view)
+            || state
+                .pending_moves
+                .get(&agent)
+                .is_some_and(|w| w.machine != machine && w.t >= view.advert.created_at_unix_ms)
+            || state.suspended.contains(&agent)
+            || state
+                .verified
+                .get(&agent)
+                .is_some_and(|v| v.announcement.machine_id != machine)
+    }
     /// Whether a currently usable relationship record names this machine.
     pub(crate) fn has_machine(&self, machine: MachineId, now: u64) -> bool {
         let agents: Vec<_> = self
