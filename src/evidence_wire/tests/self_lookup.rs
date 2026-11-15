@@ -1552,3 +1552,170 @@ async fn the_send_asks_the_newest_claimant_that_is_not_cooling() {
         vec![(device.0, device.1)]
     );
 }
+
+/// The drill shape: the device holds the friend as a Known contact
+/// (AcceptWithFlag), as a linked desktop holds its user's DM partners.
+/// The friend's self-only Lookup is admitted and the reply goes raw.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_daemon_answers_a_device_that_holds_it_as_a_known_contact() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = node(dir.path(), "device").await;
+    let friend = node(dir.path(), "friend").await;
+    knows(&device, &friend).await;
+    device
+        .contact_store
+        .write()
+        .await
+        .set_trust(&friend.agent_id(), crate::contacts::TrustLevel::Known);
+
+    let mut friend_rx = friend.subscribe_direct();
+    device
+        .send_direct_with_config(&friend.agent_id(), b"hello".to_vec(), raw())
+        .await
+        .expect("the device writes raw");
+    assert!(!receive(&mut friend_rx).await.verified);
+
+    let mut device_rx = device.subscribe_direct();
+    let started = std::time::Instant::now();
+    let reply = friend
+        .send_direct_with_config(&device.agent_id(), b"reply".to_vec(), raw())
+        .await;
+    let waited = started.elapsed();
+    assert!(reply.is_ok(), "the reply goes raw: {reply:?}");
+    assert!(waited < Duration::from_secs(2), "took {waited:?}");
+    assert_eq!(receive(&mut device_rx).await.payload, b"reply");
+    assert_eq!(counter(&friend, "evidence_self_lookup_sent"), 1);
+    assert_eq!(counter(&friend, "evidence_self_lookup_accepted"), 1);
+    assert_eq!(counter(&device, "evidence_self_lookup_served"), 1);
+}
+
+/// The requester holds the device as a Trusted contact (Accept). Its own
+/// contact trust neither replaces nor skips the self-only Lookup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_requester_that_trusts_the_device_still_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = node(dir.path(), "device").await;
+    let friend = node(dir.path(), "friend").await;
+    knows(&device, &friend).await;
+    friend
+        .contact_store
+        .write()
+        .await
+        .set_trust(&device.agent_id(), crate::contacts::TrustLevel::Trusted);
+
+    let mut friend_rx = friend.subscribe_direct();
+    device
+        .send_direct_with_config(&friend.agent_id(), b"hello".to_vec(), raw())
+        .await
+        .expect("the device writes raw");
+    assert!(!receive(&mut friend_rx).await.verified);
+
+    let mut device_rx = device.subscribe_direct();
+    let started = std::time::Instant::now();
+    let reply = friend
+        .send_direct_with_config(&device.agent_id(), b"reply".to_vec(), raw())
+        .await;
+    let waited = started.elapsed();
+    assert!(reply.is_ok(), "the reply goes raw: {reply:?}");
+    assert!(waited < Duration::from_secs(2), "took {waited:?}");
+    assert_eq!(receive(&mut device_rx).await.payload, b"reply");
+    assert_eq!(counter(&friend, "evidence_self_lookup_accepted"), 1);
+}
+
+async fn evidence_admitted(device: &Agent, friend: &Agent) -> bool {
+    Agent::gate_peer_machine_inbound_for_evidence(
+        &device.identity_discovery_cache,
+        &device.contact_store,
+        &device.revocation_set,
+        &device.move_state,
+        &device.connect_policy,
+        &device.owner_trust,
+        &friend.machine_id(),
+        None,
+        true,
+    )
+    .await
+    .is_ok()
+}
+
+/// I-2 for a Known contact (AcceptWithFlag): admitted for EvidenceV1 while
+/// our agent wrote to its machine within the window, as a stranger is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn evidence_admission_for_a_written_to_known_contact() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = node(dir.path(), "device").await;
+    let friend = node(dir.path(), "friend").await;
+    knows(&device, &friend).await;
+    device
+        .contact_store
+        .write()
+        .await
+        .set_trust(&friend.agent_id(), crate::contacts::TrustLevel::Known);
+    assert!(
+        !evidence_admitted(&device, &friend).await,
+        "a Known contact not written to is refused"
+    );
+    let runtime = device.peer_evidence();
+    runtime.self_lookup.note_sent(friend.machine_id());
+    assert!(
+        evidence_admitted(&device, &friend).await,
+        "a Known contact written to within the window is admitted"
+    );
+    runtime
+        .self_lookup
+        .backdate_sends(Duration::from_millis(crate::peer_evidence::W_MS));
+    assert!(
+        !evidence_admitted(&device, &friend).await,
+        "the window has closed"
+    );
+}
+
+/// Controls: with the machine written to, a Blocked contact and a Known
+/// contact pinned to another machine are still refused. A Trusted contact
+/// passes the ordinary gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn evidence_admission_still_refuses_blocked_and_pin_mismatch() {
+    use crate::contacts::{MachineRecord, TrustLevel};
+    let dir = tempfile::tempdir().unwrap();
+    let device = node(dir.path(), "device").await;
+    let friend = node(dir.path(), "friend").await;
+    knows(&device, &friend).await;
+    device
+        .peer_evidence()
+        .self_lookup
+        .note_sent(friend.machine_id());
+    let contacts = &device.contact_store;
+    let other = crate::identity::MachineKeypair::generate()
+        .unwrap()
+        .machine_id();
+    {
+        let mut store = contacts.write().await;
+        store.set_trust(&friend.agent_id(), TrustLevel::Known);
+        store.add_machine(&friend.agent_id(), MachineRecord::new(other, None));
+        assert!(store.pin_machine(&friend.agent_id(), &other));
+    }
+    assert!(
+        !evidence_admitted(&device, &friend).await,
+        "a Known contact pinned to another machine is refused"
+    );
+    assert!(contacts
+        .write()
+        .await
+        .unpin_machine(&friend.agent_id(), &other));
+    contacts
+        .write()
+        .await
+        .set_trust(&friend.agent_id(), TrustLevel::Blocked);
+    assert!(
+        !evidence_admitted(&device, &friend).await,
+        "a Blocked contact is refused"
+    );
+    contacts
+        .write()
+        .await
+        .set_trust(&friend.agent_id(), TrustLevel::Trusted);
+    assert!(
+        evidence_admitted(&device, &friend).await,
+        "a Trusted contact is admitted"
+    );
+}
