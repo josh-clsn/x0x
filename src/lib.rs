@@ -12915,10 +12915,24 @@ impl Agent {
                         {
                             // A stranger's answer lands in the registry; a
                             // relationship peer's lands in the evidence store.
-                            resolved = match self.authorized_registry_machine(agent_id, false).await
-                            {
-                                Some(id) => Some((id, "post_connect")),
-                                None => self
+                            // A binding that landed meanwhile (a heartbeat)
+                            // is read first: stored authority never overrides
+                            // a known binding.
+                            let routing = self
+                                .identity_discovery_cache
+                                .read()
+                                .await
+                                .get(agent_id)
+                                .map(|d| d.machine_id)
+                                .filter(|m| m.0 != [0u8; 32]);
+                            let routed = self
+                                .authorized_routing_machine_with(agent_id, routing, false)
+                                .await;
+                            let registry = self.authorized_registry_machine(agent_id, false).await;
+                            resolved = match (registry, routed) {
+                                (Some(id), _) => Some((id, "post_connect")),
+                                (None, Some(id)) => Some((id, "cached_not_connected")),
+                                (None, None) => self
                                     .peer_evidence()
                                     .usable_agent(*agent_id, dm_capability::now_unix_ms())
                                     .map(|view| (view.announcement.machine_id, "peer_evidence")),
