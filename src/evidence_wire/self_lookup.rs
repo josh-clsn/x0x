@@ -65,7 +65,9 @@ impl Default for Flights {
     }
 }
 
-/// Marks a Lookup for one target in flight until dropped.
+/// Marks a Lookup that may take a self-only route (one a raw frame or a
+/// waiting send started) in flight until dropped. Relationship-only and
+/// agent-only Lookups are not counted, so they never hold a send back.
 pub(crate) struct Flight {
     flights: Arc<Flights>,
     agent: AgentId,

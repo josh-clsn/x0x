@@ -1399,3 +1399,53 @@ async fn a_binding_landing_during_the_wait_beats_stored_evidence() {
         vec![new_machine]
     );
 }
+
+/// R2-L-2: a relationship-only Lookup in flight (the share-grant gate's,
+/// or an agent-only one) does not stop the send from starting the
+/// self-only Lookup.
+#[tokio::test]
+async fn a_relationship_lookup_in_flight_does_not_mask_the_send() {
+    let dir = tempfile::tempdir().unwrap();
+    let friend = offline(dir.path()).await;
+    let device = (AgentId([0xd5; 32]), MachineId([0xd6; 32]));
+    let runtime = Arc::clone(friend.peer_evidence());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = Arc::clone(&calls);
+    let bindings = Arc::clone(&friend.authenticated_machine_bindings);
+    let direct = Arc::clone(&friend.direct_messaging);
+    // Call 1: the held relationship-only Lookup. Call 2: the connector's
+    // agent-only Lookup. Call 3: the send's self-only Lookup.
+    assert!(runtime
+        .lookup_responder
+        .set(Arc::new(move |agent| {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let (bindings, direct) = (Arc::clone(&bindings), Arc::clone(&direct));
+            Box::pin(async move {
+                match call {
+                    1 => futures::future::pending::<()>().await,
+                    3 => {
+                        crate::dm_inbox::record_authenticated_machine_binding(
+                            &bindings,
+                            agent,
+                            device.1,
+                            crate::Agent::unix_timestamp_secs(),
+                        )
+                        .await;
+                        direct.mark_connected(agent, device.1).await;
+                    }
+                    _ => {}
+                }
+            })
+        }))
+        .is_ok());
+    let held = {
+        let runtime = Arc::clone(&runtime);
+        tokio::spawn(async move { runtime.lookup(device.0, Some(device.1)).await })
+    };
+    frame_arrived(&seen).await;
+    let sent = friend
+        .send_direct_raw_quic(&device.0, b"reply", None, Duration::ZERO, None)
+        .await;
+    assert!(sent.is_ok(), "{sent:?}");
+    held.abort();
+}
