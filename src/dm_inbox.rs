@@ -147,7 +147,20 @@ pub(crate) struct AuthenticatedMachineBinding {
     /// False only for a card pin no such write has confirmed: the pin's
     /// machine may be an unsigned card field.
     pub(crate) network_authenticated: bool,
+    /// T-self-evidence-lookup: only a stranger's self-evidence has named
+    /// the current machine. Any other network write naming it clears the
+    /// mark. Share-grant access does not accept such a binding.
+    pub(crate) self_evidence: bool,
     last_used: (std::time::Instant, u64),
+}
+
+/// Who wrote a binding: the local user's card pin, a network-authenticated
+/// write, or a stranger's self-evidence (also network-authenticated).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BindingWrite {
+    LocalPin,
+    Network,
+    SelfEvidence,
 }
 
 /// Bounded LRU cache of authenticated agent→machine bindings.
@@ -221,7 +234,7 @@ impl AuthenticatedMachineBindingCache {
             at,
             existing.and_then(|b| b.cert_digest),
             existing.and_then(|b| b.cert_not_after),
-            false,
+            BindingWrite::LocalPin,
         );
         if let Some(entry) = self.entries.get_mut(&agent_id) {
             if entry.machine_id == machine_id && entry.announced_at == at {
@@ -316,7 +329,27 @@ impl AuthenticatedMachineBindingCache {
             announced_at,
             cert_digest,
             cert_not_after,
-            true,
+            BindingWrite::Network,
+        );
+    }
+
+    /// T-self-evidence-lookup: a stranger's verified self-evidence for the
+    /// transport-authenticated machine. A network write, marked as such.
+    pub(crate) fn record_self_evidence(
+        &mut self,
+        agent_id: AgentId,
+        machine_id: MachineId,
+        announced_at: u64,
+        cert_not_after: Option<u64>,
+    ) {
+        let cert_digest = self.entries.get(&agent_id).and_then(|b| b.cert_digest);
+        self.upsert_binding_from(
+            agent_id,
+            machine_id,
+            announced_at,
+            cert_digest,
+            cert_not_after,
+            BindingWrite::SelfEvidence,
         );
     }
 
@@ -335,8 +368,10 @@ impl AuthenticatedMachineBindingCache {
         announced_at: u64,
         cert_digest: Option<[u8; 32]>,
         cert_not_after: Option<u64>,
-        network: bool,
+        write: BindingWrite,
     ) {
+        let network = write != BindingWrite::LocalPin;
+        let self_evidence = write == BindingWrite::SelfEvidence;
         let tick = self.next_tick();
         if let Some(mut existing) = self.entries.get(&agent_id).copied() {
             self.recency
@@ -351,12 +386,14 @@ impl AuthenticatedMachineBindingCache {
                 existing.local_pin &= same_machine;
                 existing.network_authenticated =
                     network || (same_machine && existing.network_authenticated);
+                existing.self_evidence = self_evidence && (!same_machine || existing.self_evidence);
                 existing.machine_id = machine_id;
                 existing.announced_at = announced_at;
                 existing.cert_not_after = cert_not_after;
                 existing.cert_digest = cert_digest;
             } else if network && same_machine {
                 existing.network_authenticated = true;
+                existing.self_evidence &= self_evidence;
             }
             self.entries.insert(agent_id, existing);
             self.recency.insert((tick.0, tick.1, agent_id.0));
@@ -391,6 +428,7 @@ impl AuthenticatedMachineBindingCache {
                 cert_digest,
                 local_pin: false,
                 network_authenticated: network,
+                self_evidence,
                 last_used: tick,
             },
         );
@@ -460,6 +498,20 @@ pub(crate) async fn record_local_pin_binding(
         .write()
         .await
         .record_local_pin(agent_id, machine_id, pinned_at);
+}
+
+/// T-self-evidence-lookup: record a stranger's verified self-evidence.
+pub(crate) async fn record_self_evidence_machine_binding(
+    bindings: &AuthenticatedMachineBindings,
+    agent_id: AgentId,
+    machine_id: MachineId,
+    announced_at: u64,
+    cert_not_after: Option<u64>,
+) {
+    bindings
+        .write()
+        .await
+        .record_self_evidence(agent_id, machine_id, announced_at, cert_not_after);
 }
 
 /// Record the certificate lifetime from a verified identity announcement.

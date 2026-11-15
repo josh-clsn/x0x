@@ -192,12 +192,25 @@ impl EvidenceRuntime {
     }
     /// Pull missing relationship evidence over bounded connected-peer streams.
     /// Callers must re-read their authoritative sources after this await.
+    /// `machine` is recorded as a routing hint, but this Lookup never takes
+    /// a self-only route: only a raw frame ([`Self::spawn_lookup`]) does.
     pub(crate) async fn lookup(&self, agent: AgentId, machine: Option<MachineId>) {
         let Some(permit) = self.lookup_permit() else {
             return;
         };
         let _flight = self.self_lookup.begin(agent);
-        self.lookup_with_permit(agent, machine, permit).await;
+        self.lookup_with_permit(agent, machine, None, permit).await;
+    }
+
+    /// [`Self::lookup`] as a raw frame from `machine` starts it, awaited.
+    #[cfg(test)]
+    pub(crate) async fn lookup_from_frame(&self, agent: AgentId, machine: MachineId) {
+        let Some(permit) = self.lookup_permit() else {
+            return;
+        };
+        let _flight = self.self_lookup.begin(agent);
+        self.lookup_with_permit(agent, Some(machine), Some(machine), permit)
+            .await;
     }
 
     /// x0x #1207: start a Lookup for `agent` in the background (the permit
@@ -215,7 +228,7 @@ impl EvidenceRuntime {
         tokio::spawn(async move {
             let _flight = flight;
             if runtime.wait(0).await {
-                runtime.lookup_with_permit(agent, None, permit).await;
+                runtime.lookup_with_permit(agent, None, None, permit).await;
             }
         });
     }
@@ -240,7 +253,7 @@ impl EvidenceRuntime {
         tokio::spawn(async move {
             let _flight = flight;
             runtime
-                .lookup_with_permit(agent, Some(machine), permit)
+                .lookup_with_permit(agent, Some(machine), Some(machine), permit)
                 .await;
         });
     }
@@ -253,14 +266,17 @@ impl EvidenceRuntime {
         permit
     }
 
+    /// `machine`: a transport-authenticated machine claiming `agent`, kept
+    /// as a routing hint, never as evidence authority. `transport`: set only
+    /// when a raw frame from that machine started the Lookup, which alone
+    /// may ask it for its own evidence (T-self-evidence-lookup).
     async fn lookup_with_permit(
         &self,
         agent: AgentId,
         machine: Option<MachineId>,
+        transport: Option<MachineId>,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) {
-        // Only the raw receive path supplies a transport-authenticated machine.
-        // Its claimed agent is a routing hint, never evidence authority.
         if let Some(machine) = machine {
             self.lookup_hints.record(agent, machine);
         }
@@ -278,7 +294,7 @@ impl EvidenceRuntime {
             return;
         }
         if let Some(context) = self.lookup_context.get().and_then(std::sync::Weak::upgrade) {
-            context.lookup(agent, permit, machine).await;
+            context.lookup(agent, permit, transport).await;
         }
     }
     /// Start exactly one background re-verification; invalid files stay untouched.

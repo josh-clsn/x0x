@@ -385,7 +385,7 @@ impl Context {
             agent_public_key: announcement.agent_public_key.clone(),
             cert_digest: Some(view.announcement.cert_digest),
         };
-        crate::dm_inbox::record_authenticated_machine_binding_with_expiry(
+        crate::dm_inbox::record_self_evidence_machine_binding(
             &self.bindings,
             agent,
             machine,

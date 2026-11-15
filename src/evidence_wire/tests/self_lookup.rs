@@ -842,7 +842,7 @@ async fn one_claimant_flooding_agent_ids_costs_one_lookup() {
     let runtime = Arc::clone(friend.peer_evidence());
     for i in 0..100u8 {
         runtime
-            .lookup(AgentId([i; 32]), Some(device.machine_id()))
+            .lookup_from_frame(AgentId([i; 32]), device.machine_id())
             .await;
     }
     assert_eq!(counter(&friend, "evidence_self_lookup_sent"), 1);
