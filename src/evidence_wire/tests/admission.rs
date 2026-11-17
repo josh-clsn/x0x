@@ -202,6 +202,7 @@ impl Fixture {
             machines: Arc::clone(&responder.machine_discovery_cache),
             owner: responder.owner_trust.clone(),
             revoked: Arc::clone(&responder.revocation_set),
+            stores: responder.self_lookup_stores(),
         });
         let incoming = Arc::new(StreamAccept::new(8));
         let evidence_acceptor = incoming.register(StreamProtocol::EvidenceV1).unwrap();
@@ -386,6 +387,81 @@ async fn issue1241_unknown_group_peer_evidence_hello_is_verified_and_stored() {
         .await
         .get(&f.initiator.agent_id())
         .is_none());
+}
+
+/// T-self-evidence-lookup: a Known contact (AcceptWithFlag) gains EvidenceV1
+/// admission only on a machine our agent wrote to within the window. Through
+/// the ADR 0089 relationship branch alone it is refused, as upstream rules.
+#[tokio::test]
+async fn a_known_group_peer_is_admitted_only_when_written_to() {
+    let mut f = Fixture::new(true, true).await;
+    f.responder
+        .contact_store
+        .write()
+        .await
+        .set_trust(&f.initiator.agent_id(), TrustLevel::Known);
+    let refused = f.exchange(StreamProtocol::EvidenceV1, &f.hello()).await;
+    f.context
+        .runtime
+        .self_lookup
+        .note_sent(f.initiator.machine_id());
+    let written = f.exchange(StreamProtocol::EvidenceV1, &f.hello()).await;
+    f.shutdown().await;
+    assert_eq!(
+        refused,
+        Outcome::BeforePrefixRefused,
+        "relationship alone does not admit a Known contact"
+    );
+    assert_eq!(written, Outcome::HelloVerified, "written to: admitted");
+    assert!(f
+        .store()
+        .usable(
+            f.initiator.agent_id(),
+            f.initiator.machine_id(),
+            dm_capability::now_unix_ms(),
+        )
+        .is_some());
+}
+
+/// The Known admission is EvidenceV1 only: every other protocol from a Known
+/// group peer on a machine our agent wrote to stays refused.
+#[tokio::test]
+async fn a_known_group_peer_non_evidence_stream_stays_gated() {
+    for protocol in [
+        StreamProtocol::ForwardV1,
+        StreamProtocol::SocksV1,
+        StreamProtocol::ForwardV2,
+        StreamProtocol::WebRtcV1,
+        StreamProtocol::SyncV1,
+    ] {
+        let mut f = Fixture::new(true, true).await;
+        if protocol != StreamProtocol::SocksV1 {
+            drop(f.app_acceptor);
+            f.app_acceptor = f.incoming.register(protocol).unwrap();
+        }
+        f.responder
+            .contact_store
+            .write()
+            .await
+            .set_trust(&f.initiator.agent_id(), TrustLevel::Known);
+        f.context
+            .runtime
+            .self_lookup
+            .note_sent(f.initiator.machine_id());
+        let outcome = f.exchange(protocol, &f.hello()).await;
+        f.shutdown().await;
+        assert!(
+            matches!(
+                outcome,
+                Outcome::BeforePrefixRefused | Outcome::ProtocolRefused
+            ),
+            "{protocol:?} from a Known group peer: {outcome:?}"
+        );
+        assert_eq!(
+            f.context.runtime.diagnostics()["evidence_hello_received"],
+            0
+        );
+    }
 }
 
 #[tokio::test]

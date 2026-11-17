@@ -9,6 +9,9 @@ const FANOUT: usize = 3;
 // Bound each indexed source as well as fan-out; excess candidates fail closed.
 const MACHINE_BINDING_LIMIT: usize = 16;
 const HINT_CAP: usize = 128;
+// One machine's claims cannot flush another machine's hints.
+const MACHINE_HINT_CAP: usize = 8;
+const SELF_ONLY_KEY_CAP: usize = MACHINE_CAP / 2;
 
 /// Untrusted, process-only raw-frame routing claims. Never read by authority paths.
 #[derive(Default)]
@@ -22,13 +25,30 @@ impl RoutingHints {
         hints.retain(|(a, m, at)| {
             now.duration_since(*at) < Duration::from_millis(W_MS) && (*a != agent || *m != machine)
         });
+        if hints.iter().filter(|(_, m, _)| *m == machine).count() >= MACHINE_HINT_CAP {
+            if let Some(oldest) = hints.iter().position(|(_, m, _)| *m == machine) {
+                hints.remove(oldest);
+            }
+        }
         if hints.len() == HINT_CAP {
-            hints.pop_front();
+            // Fair share: the oldest hint of the machine holding the most
+            // goes, so a crowd of claimants cannot flush a lone frame's hint.
+            let mut counts: HashMap<MachineId, usize> = HashMap::new();
+            for (_, m, _) in hints.iter() {
+                *counts.entry(*m).or_default() += 1;
+            }
+            let most = counts.values().copied().max().unwrap_or(0);
+            if let Some(oldest) = hints
+                .iter()
+                .position(|(_, m, _)| counts.get(m) == Some(&most))
+            {
+                hints.remove(oldest);
+            }
         }
         hints.push_back((agent, machine, now));
     }
 
-    fn machines(&self, target: AgentId) -> Vec<MachineId> {
+    pub(crate) fn machines(&self, target: AgentId) -> Vec<MachineId> {
         let Ok(mut hints) = self.0.lock() else {
             return Vec::new();
         };
@@ -50,11 +70,21 @@ impl RoutingHints {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub(super) struct Found {
     announcement: Vec<u8>,
     advert: Vec<u8>,
     certificate: Option<Vec<u8>>,
+}
+#[cfg(test)]
+impl Found {
+    pub(super) fn for_test(announcement: Vec<u8>) -> Self {
+        Self {
+            announcement,
+            advert: Vec::new(),
+            certificate: None,
+        }
+    }
 }
 impl From<EvidenceRecordV1> for Found {
     fn from(record: EvidenceRecordV1) -> Self {
@@ -71,7 +101,14 @@ impl Limits {
         Arc::clone(&self.lookups).try_acquire_owned().ok()
     }
 
+    #[cfg(test)]
     fn claim_target(&self, target: AgentId) -> bool {
+        self.claim((target, None))
+    }
+    /// One Lookup per key per [`LOOKUP_INTERVAL`]. A self-only key names
+    /// its claimant, so other claimants of the same agent cannot cool the
+    /// genuine host's route; self-only keys may fill only part of the table.
+    fn claim(&self, key: (AgentId, Option<MachineId>)) -> bool {
         let now = Instant::now();
         let Ok(mut state) = self.state.lock() else {
             return false;
@@ -79,17 +116,62 @@ impl Limits {
         state
             .targets
             .retain(|_, at| now.duration_since(*at) < LOOKUP_INTERVAL);
-        if state.targets.contains_key(&target) || state.targets.len() >= MACHINE_CAP {
+        if state.targets.contains_key(&key) || state.targets.len() >= MACHINE_CAP {
             return false;
         }
-        state.targets.insert(target, now);
+        if key.1.is_some()
+            && state.targets.keys().filter(|(_, c)| c.is_some()).count() >= SELF_ONLY_KEY_CAP
+        {
+            return false;
+        }
+        state.targets.insert(key, now);
         true
+    }
+    /// Release a claim when no request for it left this node.
+    fn release(&self, key: (AgentId, Option<MachineId>)) {
+        if let Ok(mut state) = self.state.lock() {
+            state.targets.remove(&key);
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn claim_target_for_test(
+        &self,
+        target: AgentId,
+        claimant: Option<MachineId>,
+    ) -> bool {
+        self.claim((target, claimant))
+    }
+    /// A Lookup for `target` (by `claimant`'s self-only route, or by
+    /// relationship routes for `None`) started within the cooldown.
+    pub(crate) fn target_cooling(&self, target: AgentId, claimant: Option<MachineId>) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            state
+                .targets
+                .get(&(target, claimant))
+                .is_some_and(|at| Instant::now().duration_since(*at) < LOOKUP_INTERVAL)
+        })
     }
     #[cfg(test)]
     fn begin_lookup(&self, target: AgentId) -> Option<tokio::sync::OwnedSemaphorePermit> {
         let permit = Arc::clone(&self.lookups).try_acquire_owned().ok()?;
         self.claim_target(target).then_some(permit)
     }
+}
+
+/// How a responder was chosen, and so how its answer is accepted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    /// A relationship-context peer, possibly serving a third party.
+    Relationship,
+    /// The hinted machine itself, asked only for its own agent.
+    SelfOnly,
+}
+
+/// Why a responder serves a Lookup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Grant {
+    SelfEvidence,
+    Relationship,
 }
 
 #[derive(Clone)]
@@ -124,6 +206,8 @@ struct Relations {
     peer_checks: std::sync::atomic::AtomicUsize,
     owner: crate::owner_trust::OwnerTrust,
     revoked: Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>,
+    /// This node announces publicly now: the mesh-off latch is not set.
+    public: bool,
 }
 impl Relations {
     async fn peer(&self, agent: AgentId) -> Option<Peer> {
@@ -253,50 +337,132 @@ impl Relations {
         agents
     }
 
+    #[cfg(test)]
     async fn responders(&self, target: AgentId, connected: &HashSet<MachineId>) -> Vec<MachineId> {
+        self.routes(target, connected, Some(MachineId([0; 32])))
+            .await
+            .into_iter()
+            .map(|(machine, _)| machine)
+            .collect()
+    }
+
+    /// `transport`: the machine a raw frame (or a send waiting on one) came
+    /// from. Only such a Lookup gets self-only routes, and that machine is
+    /// asked first; an agent-only Lookup (`None`) keeps relationship routes.
+    async fn routes(
+        &self,
+        target: AgentId,
+        connected: &HashSet<MachineId>,
+        transport: Option<MachineId>,
+    ) -> Vec<(MachineId, Route)> {
         let target_peer = self.peer(target).await.unwrap_or(Peer {
             agent: target,
             machine: MachineId([0; 32]),
             cert: None,
         });
-        if !self.shared(&self.local, &target_peer) {
-            return Vec::new();
-        }
+        let related = self.shared(&self.local, &target_peer);
         let mut eligible = Vec::new();
-        for machine in connected {
-            for agent in self.machine_agents(*machine).await {
-                let Some(peer) = self.peer(agent).await else {
-                    continue;
-                };
-                if peer.machine == *machine
-                    && self.shared(&self.local, &peer)
-                    && (agent == target || self.shared(&peer, &target_peer))
-                {
-                    eligible.push((agent, *machine));
+        if related {
+            for machine in connected {
+                for agent in self.machine_agents(*machine).await {
+                    let Some(peer) = self.peer(agent).await else {
+                        continue;
+                    };
+                    if peer.machine == *machine
+                        && self.shared(&self.local, &peer)
+                        && (agent == target || self.shared(&peer, &target_peer))
+                    {
+                        eligible.push((agent, *machine));
+                    }
                 }
             }
         }
         // A claim can route ONLY a query for the claimed agent itself. It
         // neither authorizes an inbound Lookup nor vouches for the reply.
         // Untrusted claims must not displace a connected, verified own host.
+        let mut hosts = Vec::new();
         if !eligible.iter().any(|(agent, _)| *agent == target) {
-            for machine in self.runtime.lookup_hints.machines(target) {
-                if connected.contains(&machine) {
-                    let hint = Peer {
-                        agent: target,
-                        machine,
-                        cert: None,
-                    };
-                    if self.shared(&self.local, &hint) {
-                        eligible.push((target, machine));
-                    }
+            for machine in self.runtime.lookup_hints.machines(target).into_iter().rev() {
+                if !connected.contains(&machine) {
+                    continue;
+                }
+                let hint = Peer {
+                    agent: target,
+                    machine,
+                    cert: None,
+                };
+                if related && self.shared(&self.local, &hint) {
+                    eligible.push((target, machine));
+                } else if transport.is_some() && self.self_only_candidate(target, machine).await {
+                    hosts.push(machine);
                 }
             }
         }
-        select(target, eligible)
+        // Later claimants of the same agent cannot push the frame's own
+        // machine out of the fan-out.
+        if let Some(position) = hosts.iter().position(|m| Some(*m) == transport) {
+            let first = hosts.remove(position);
+            hosts.insert(0, first);
+        }
+        let mut routes: Vec<_> = select(target, eligible)
+            .into_iter()
+            .map(|machine| (machine, Route::Relationship))
+            .collect();
+        for machine in hosts {
+            if routes.len() < FANOUT && routes.iter().all(|(m, _)| *m != machine) {
+                routes.push((machine, Route::SelfOnly));
+            }
+        }
+        routes
     }
 
-    pub(super) async fn authorized(&self, machine: MachineId, target: AgentId) -> bool {
+    /// A hinted machine may be asked for its own agent's evidence alone.
+    async fn self_only_candidate(&self, target: AgentId, machine: MachineId) -> bool {
+        if target == self.local.agent || machine == self.local.machine {
+            return false;
+        }
+        let revoked = self.revoked.read().await;
+        !revoked.is_agent_revoked(&target)
+            && !revoked.is_machine_revoked(&machine)
+            && !revoked.is_binding_revoked(&target, &machine)
+    }
+
+    /// Serve our own agent's evidence to an unrelated machine only while
+    /// this node announces publicly anyway, or when our agent raw-sent to
+    /// that machine within the window.
+    async fn self_evidence_allowed(&self, machine: MachineId, target: AgentId) -> bool {
+        if target != self.local.agent {
+            return false;
+        }
+        let revoked = self.revoked.read().await;
+        if revoked.is_agent_revoked(&self.local.agent)
+            || revoked.is_machine_revoked(&self.local.machine)
+            || revoked.is_binding_revoked(&self.local.agent, &self.local.machine)
+            || revoked.is_machine_revoked(&machine)
+        {
+            return false;
+        }
+        drop(revoked);
+        self.public || self.runtime.self_lookup.sent_within_window(machine)
+    }
+
+    /// A relationship requester keeps its full answer; only an unrelated
+    /// one falls to the self-evidence rule and its public answer.
+    pub(super) async fn grant(&self, machine: MachineId, target: AgentId) -> Option<Grant> {
+        if self.related_requester(machine, target).await {
+            return Some(Grant::Relationship);
+        }
+        self.self_evidence_allowed(machine, target)
+            .await
+            .then_some(Grant::SelfEvidence)
+    }
+
+    #[cfg(test)]
+    async fn authorized(&self, machine: MachineId, target: AgentId) -> bool {
+        self.grant(machine, target).await.is_some()
+    }
+
+    async fn related_requester(&self, machine: MachineId, target: AgentId) -> bool {
         let Some(local) = self.peer(self.local.agent).await else {
             return false;
         };
@@ -349,21 +515,28 @@ impl Context {
             peer_checks: Default::default(),
             owner: self.owner.clone(),
             revoked: Arc::clone(&self.revoked),
+            public: !self.network.mesh_quiesced(),
         })
     }
-    pub(super) async fn authorized(&self, machine: MachineId, target: AgentId) -> bool {
+    pub(super) async fn grant(&self, machine: MachineId, target: AgentId) -> Option<Grant> {
         match self.relations() {
-            Some(relations) => relations.authorized(machine, target).await,
-            None => false,
+            Some(relations) => relations.grant(machine, target).await,
+            None => None,
         }
     }
-    pub(super) fn lookup_reply(&self, target: AgentId) -> io::Result<Option<Found>> {
+    pub(super) fn lookup_reply(
+        &self,
+        target: AgentId,
+        grant: Option<Grant>,
+    ) -> io::Result<Option<Found>> {
+        #[cfg(test)]
+        self.runtime.self_lookup.pause_mint();
         reply_material(
             target,
             self.identity.agent_id(),
             self.runtime.store().as_deref(),
             dm_capability::now_unix_ms(),
-            || self.own(None, true),
+            || self.own_answer(grant == Some(Grant::SelfEvidence)),
         )
     }
 
@@ -371,6 +544,7 @@ impl Context {
         self: Arc<Self>,
         target: AgentId,
         permit: tokio::sync::OwnedSemaphorePermit,
+        transport: Option<MachineId>,
     ) {
         let deadline = Instant::now() + DEADLINE;
         let _ = tokio::time::timeout_at(deadline, async {
@@ -384,13 +558,13 @@ impl Context {
                 .into_iter()
                 .map(|m| MachineId(m.0))
                 .collect();
-            let responders = relations.responders(target, &connected).await;
+            let responders = relations.routes(target, &connected, transport).await;
             // ADR 0089 S5 / ADR 0093 bit 2: never spend a Lookup on a
             // machine whose current verified advert lacks
             // `peer_evidence_v1`; unknown adverts still get the try.
             let responders: Vec<_> = responders
                 .into_iter()
-                .filter(|machine| {
+                .filter(|(machine, _)| {
                     self.caps.machine_registry_supports(
                         machine,
                         crate::dm::CapabilityRegistry::PEER_EVIDENCE_V1,
@@ -399,15 +573,58 @@ impl Context {
                 .collect();
             // A pre-seat send or a disconnected peer must not consume the
             // target cooldown: no Lookup has been sent yet (D30 30b).
-            if responders.is_empty() || !self.runtime.wire_limits.claim_target(target) {
+            // Relationship routes share the target's key; each self-only
+            // route has its own (target, claimant) key, and a claimant
+            // machine gets one self-only Lookup at a time, however many agent
+            // ids its frames claim.
+            let limits = &self.runtime.wire_limits;
+            let related = responders.iter().any(|(_, r)| *r == Route::Relationship)
+                && limits.claim((target, None));
+            let mut claimants = Vec::new();
+            let mut chosen = Vec::new();
+            for (machine, route) in responders {
+                let key = match route {
+                    Route::Relationship if related => (target, None),
+                    Route::Relationship => continue,
+                    Route::SelfOnly => {
+                        let key = (target, Some(machine));
+                        if !limits.claim(key) {
+                            continue;
+                        }
+                        let Some(guard) = self.runtime.self_lookup.claim_claimant(machine) else {
+                            limits.release(key);
+                            continue;
+                        };
+                        claimants.push(guard);
+                        key
+                    }
+                };
+                chosen.push((machine, route, key));
+            }
+            if chosen.is_empty() {
+                if related {
+                    limits.release((target, None));
+                }
                 return;
             }
             // No task queue: at most three exchanges, each also needing the
             // shared machine stream and aggregate allocation reservations.
+            let sent: Vec<_> = chosen
+                .iter()
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect();
             let mut requests = futures::stream::FuturesUnordered::new();
             let permit = Arc::new(permit);
-            for machine in responders {
-                requests.push(self.pull(machine, target, deadline, Arc::clone(&permit)));
+            for ((machine, route, _), sent) in chosen.iter().zip(&sent) {
+                requests.push(self.pull(
+                    *machine,
+                    *route,
+                    transport == Some(*machine),
+                    target,
+                    deadline,
+                    Arc::clone(&permit),
+                    sent,
+                ));
             }
             use futures::StreamExt;
             while let Some(result) = requests.next().await {
@@ -415,24 +632,59 @@ impl Context {
                     break;
                 }
             }
+            drop(requests);
+            // A key whose request never left this node (local budgets) is
+            // not cooled for an attempt that never happened.
+            let left = |i: usize| sent[i].load(std::sync::atomic::Ordering::Acquire);
+            let related_left = chosen
+                .iter()
+                .enumerate()
+                .any(|(i, (_, route, _))| *route == Route::Relationship && left(i));
+            if related && !related_left {
+                limits.release((target, None));
+            }
+            for (i, (_, route, key)) in chosen.iter().enumerate() {
+                if *route == Route::SelfOnly && !left(i) {
+                    limits.release(*key);
+                }
+            }
         })
         .await;
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn pull(
-        &self,
+        self: &Arc<Self>,
         machine: MachineId,
+        route: Route,
+        frame: bool,
         target: AgentId,
         deadline: Instant,
         permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+        sent: &std::sync::atomic::AtomicBool,
     ) -> io::Result<()> {
-        let lease = self
-            .runtime
-            .wire_limits
-            // Lookup targets are chosen only from relationship-context
-            // peers, so the pull runs in the reserved (non-stranger) pool.
-            .admit(machine, true)
-            .ok_or_else(|| invalid("lookup stream budget"))?;
+        // Relationship-context peers use the reserved pool; a self-only
+        // responder is a stranger and shares the stranger pool, except that
+        // the frame's own machine may fall back to the frame reserve.
+        let limits = &self.runtime.wire_limits;
+        let mut log = (route == Route::SelfOnly).then(|| SelfLookupLog {
+            target,
+            machine,
+            started: Instant::now(),
+            outcome: "cancelled",
+        });
+        let lease = match (route, frame) {
+            (Route::Relationship, _) => limits.admit(machine, true),
+            (Route::SelfOnly, true) => limits.admit_frame(machine),
+            (Route::SelfOnly, false) => limits.admit(machine, false),
+        };
+        let Some(lease) = lease else {
+            if let Some(log) = &mut log {
+                log.outcome = "budget";
+            }
+            return Err(invalid("lookup stream budget"));
+        };
+        let mut outcome = "reset";
         let mut reset = ResetOnDrop {
             limits: Arc::clone(&self.runtime.wire_limits),
             machine,
@@ -447,10 +699,16 @@ impl Context {
             send.write_u8(StreamProtocol::EvidenceV1.as_u8()).await?;
             let body = codec().serialize(&target).map_err(io::Error::other)?;
             write_message(&mut send, &self.runtime.wire_limits, machine, LOOKUP, &body).await?;
+            sent.store(true, std::sync::atomic::Ordering::Release);
+            if route == Route::SelfOnly {
+                WireCounters::bump(&self.runtime.wire_limits.counters.evidence_self_lookup_sent);
+            }
             let (kind, body) = read_message(&mut recv, &self.runtime.wire_limits).await?;
             if kind != FOUND {
+                outcome = "not_found";
                 return Err(invalid("lookup not found"));
             }
+            outcome = "refused";
             let record = decode::found(&body)?;
             drop(body);
             let store = self
@@ -458,6 +716,45 @@ impl Context {
                 .store()
                 .ok_or_else(|| invalid("evidence store unavailable"))?;
             let limits = Arc::clone(&self.runtime.wire_limits);
+            if route == Route::SelfOnly {
+                let found = tokio::task::spawn_blocking(move || {
+                    let (_lease, _permit) = (lease, permit);
+                    self_lookup::verify_self_found(
+                        &store,
+                        &limits,
+                        target,
+                        machine,
+                        record,
+                        dm_capability::now_unix_ms(),
+                    )
+                })
+                .await
+                .map_err(io::Error::other)??;
+                let accepted = match found {
+                    self_lookup::SelfFound::Stored => true,
+                    // A deadline here must not cut the writes in half.
+                    self_lookup::SelfFound::Stranger(view) => {
+                        let context = Arc::clone(self);
+                        tokio::spawn(
+                            async move { context.accept_self_evidence(&view, machine).await },
+                        )
+                        .await
+                        .map_err(io::Error::other)?
+                    }
+                };
+                if !accepted {
+                    return Err(invalid("self evidence refused"));
+                }
+                WireCounters::bump(
+                    &self
+                        .runtime
+                        .wire_limits
+                        .counters
+                        .evidence_self_lookup_accepted,
+                );
+                outcome = "accepted";
+                return Ok(());
+            }
             tokio::task::spawn_blocking(move || {
                 // Cancellation cannot release the reservations underneath a
                 // still-running verify or durable move write.
@@ -473,10 +770,37 @@ impl Context {
             .await
             .map_err(io::Error::other)?
         })
-        .await
-        .map_err(io::Error::other)?;
+        .await;
+        if let Some(log) = &mut log {
+            log.outcome = if result.is_err() { "timeout" } else { outcome };
+        }
+        let result = result.map_err(io::Error::other)?;
         reset.complete = result.is_ok();
         result
+    }
+}
+
+/// One line per self-only pull, bounded by the claimant gate and the
+/// per-key cooldown. Logged on drop, so a pull cut off by the Lookup's own
+/// deadline or by a faster responder still logs, as `cancelled`.
+struct SelfLookupLog {
+    target: AgentId,
+    machine: MachineId,
+    started: Instant,
+    outcome: &'static str,
+}
+
+impl Drop for SelfLookupLog {
+    fn drop(&mut self) {
+        tracing::info!(
+            target: "x0x::evidence",
+            stage = "self_lookup",
+            agent_prefix = %crate::network::hex_prefix(&self.target.0, 4),
+            machine_prefix = %crate::network::hex_prefix(&self.machine.0, 4),
+            outcome = self.outcome,
+            dur_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "self-only Lookup ended"
+        );
     }
 }
 
@@ -516,10 +840,10 @@ fn reply_material(
     local: AgentId,
     store: Option<&crate::peer_evidence::PeerEvidenceStore>,
     now: u64,
-    mint: impl FnOnce() -> io::Result<Hello>,
+    mint: impl FnOnce() -> io::Result<Found>,
 ) -> io::Result<Option<Found>> {
     if target == local {
-        return mint().map(|hello| Some(hello.into_record().into()));
+        return mint().map(Some);
     }
     // The persisted map is intentionally not consulted, even within L.
     Ok(store.and_then(|s| s.live(target, now)).map(Found::from))
@@ -865,6 +1189,7 @@ mod tests {
                 peer_checks: Default::default(),
                 owner,
                 revoked,
+                public: false,
             };
             Self {
                 dir,
@@ -926,14 +1251,24 @@ mod tests {
             .await;
         owner.know(&joiner).await;
         let connected = HashSet::from([owner.m()]);
-        assert!(joiner
-            .relations
-            .responders(owner.a(), &connected)
-            .await
-            .is_empty());
+        // Unrelated, the hinted host is asked for its own agent only.
+        assert_eq!(
+            joiner
+                .relations
+                .routes(owner.a(), &connected, Some(MachineId([0; 32])))
+                .await,
+            vec![(owner.m(), Route::SelfOnly)]
+        );
         assert!(!owner.relations.authorized(joiner.m(), owner.a()).await);
         joiner.group(&[joiner.a(), owner.a()]);
         owner.group(&[joiner.a(), owner.a()]);
+        assert_eq!(
+            joiner
+                .relations
+                .routes(owner.a(), &connected, Some(MachineId([0; 32])))
+                .await,
+            vec![(owner.m(), Route::Relationship)]
+        );
         assert!(joiner
             .store()
             .usable_agent(owner.a(), dm_capability::now_unix_ms())
@@ -948,7 +1283,7 @@ mod tests {
             owner.a(),
             Some(&owner.store()),
             dm_capability::now_unix_ms(),
-            || owner.mint(),
+            || owner.mint().map(|hello| hello.into_record().into()),
         )
         .unwrap()
         .unwrap();
@@ -1505,5 +1840,377 @@ mod tests {
         );
         drop(lease);
         assert_eq!(limits.allocations.available_permits(), TOTAL_ALLOCATION_CAP);
+    }
+
+    #[tokio::test]
+    async fn self_only_route_is_the_hinted_connected_machine_and_nothing_else() {
+        let requester = Node::new().await;
+        let target = Node::new().await;
+        let bystander = Node::new().await;
+        let hints = &requester.relations.runtime.lookup_hints;
+        // Today an unrelated target gets no responder at all.
+        assert!(requester
+            .relations
+            .routes(
+                target.a(),
+                &HashSet::from([target.m(), bystander.m()]),
+                Some(MachineId([0; 32]))
+            )
+            .await
+            .is_empty());
+        hints.record(target.a(), target.m());
+        assert_eq!(
+            requester
+                .relations
+                .routes(
+                    target.a(),
+                    &HashSet::from([target.m(), bystander.m()]),
+                    Some(MachineId([0; 32]))
+                )
+                .await,
+            vec![(target.m(), Route::SelfOnly)],
+            "a connected third machine is never asked"
+        );
+        assert!(
+            requester
+                .relations
+                .routes(target.a(), &HashSet::from([target.m()]), None)
+                .await
+                .is_empty(),
+            "an agent-only Lookup keeps today's relationship routes"
+        );
+        assert!(requester
+            .relations
+            .routes(
+                target.a(),
+                &HashSet::from([bystander.m()]),
+                Some(MachineId([0; 32]))
+            )
+            .await
+            .is_empty());
+        // Our own agent is never looked up this way.
+        hints.record(requester.a(), target.m());
+        assert!(requester
+            .relations
+            .routes(
+                requester.a(),
+                &HashSet::from([target.m()]),
+                Some(MachineId([0; 32]))
+            )
+            .await
+            .is_empty());
+        // Every hinted, connected claimant is asked about its own claim
+        // only, newest first, within the fan-out.
+        for i in 0..5u8 {
+            hints.record(target.a(), MachineId([0x40 + i; 32]));
+        }
+        let crowd: HashSet<_> = (0..5u8).map(|i| MachineId([0x40 + i; 32])).collect();
+        let routes = requester
+            .relations
+            .routes(target.a(), &crowd, Some(MachineId([0; 32])))
+            .await;
+        assert_eq!(
+            routes,
+            (2..5u8)
+                .rev()
+                .map(|i| (MachineId([0x40 + i; 32]), Route::SelfOnly))
+                .collect::<Vec<_>>()
+        );
+        requester
+            .relations
+            .revoked
+            .write()
+            .await
+            .union_bundle_retired(&[crate::revocation::AgentMachineBinding {
+                agent: target.a(),
+                machine: target.m(),
+                move_epoch: 1,
+            }]);
+        assert!(requester
+            .relations
+            .routes(
+                target.a(),
+                &HashSet::from([target.m()]),
+                Some(MachineId([0; 32]))
+            )
+            .await
+            .is_empty());
+        requester
+            .relations
+            .revoked
+            .write()
+            .await
+            .revoke_machine_for_testing(MachineId([0x44; 32]));
+        assert!(!requester
+            .relations
+            .routes(target.a(), &crowd, Some(MachineId([0; 32])))
+            .await
+            .iter()
+            .any(|(machine, _)| *machine == MachineId([0x44; 32])));
+    }
+
+    #[tokio::test]
+    async fn self_evidence_is_served_for_our_own_agent_only_and_quietly() {
+        let mut responder = Node::new().await;
+        let asker = MachineId([0x31; 32]);
+        let other = Node::new().await;
+        // Latched or quiet, nothing sent: an unrelated machine gets NotFound.
+        assert!(!responder.relations.authorized(asker, responder.a()).await);
+        assert_eq!(responder.relations.grant(asker, responder.a()).await, None);
+        // Our agent raw-sent to that machine within the window.
+        responder.relations.runtime.self_lookup.note_sent(asker);
+        assert_eq!(
+            responder.relations.grant(asker, responder.a()).await,
+            Some(Grant::SelfEvidence)
+        );
+        assert!(
+            !responder
+                .relations
+                .authorized(MachineId([0x32; 32]), responder.a())
+                .await
+        );
+        // A node that announces publicly answers any machine for its own
+        // agent, and still no one for any other agent.
+        responder.relations.public = true;
+        assert!(
+            responder
+                .relations
+                .authorized(MachineId([0x32; 32]), responder.a())
+                .await
+        );
+        assert!(!responder.relations.authorized(asker, other.a()).await);
+        assert!(
+            !responder
+                .relations
+                .authorized(MachineId([0x32; 32]), other.a())
+                .await
+        );
+        // Revocation of the asker, or of our own machine, ends it.
+        responder
+            .relations
+            .revoked
+            .write()
+            .await
+            .revoke_machine_for_testing(MachineId([0x32; 32]));
+        assert!(
+            !responder
+                .relations
+                .authorized(MachineId([0x32; 32]), responder.a())
+                .await
+        );
+        responder
+            .relations
+            .revoked
+            .write()
+            .await
+            .union_bundle_retired(&[crate::revocation::AgentMachineBinding {
+                agent: responder.a(),
+                machine: responder.m(),
+                move_epoch: 1,
+            }]);
+        assert!(!responder.relations.authorized(asker, responder.a()).await);
+    }
+
+    #[tokio::test]
+    async fn self_only_acceptance_is_strict_and_stores_nothing_for_a_stranger() {
+        let requester = Node::new().await;
+        let target = Node::new().await;
+        let now = dm_capability::now_unix_ms();
+        let record = target.mint().unwrap().into_record();
+        let store = requester.store();
+        let check = |machine, record, now| {
+            self_lookup::verify_self_found(
+                &store,
+                &Limits::default(),
+                target.a(),
+                machine,
+                record,
+                now,
+            )
+        };
+        assert!(check(MachineId([9; 32]), record.clone(), now).is_err());
+        assert!(check(target.m(), record.clone(), now + W_MS + 1001).is_err());
+        let mut tampered = record.clone();
+        let last = tampered.advert.len() - 1;
+        tampered.advert[last] ^= 1;
+        assert!(check(target.m(), tampered, now).is_err());
+        let wrong_target = requester.mint().unwrap().into_record();
+        assert!(check(requester.m(), wrong_target, now).is_err());
+        let found = check(target.m(), record.clone(), now).unwrap();
+        assert!(matches!(found, self_lookup::SelfFound::Stranger(_)));
+        assert!(store.usable_agent(target.a(), now).is_none());
+        // A relationship peer keeps the stored path.
+        requester.group(&[requester.a(), target.a()]);
+        let found = check(target.m(), record, now).unwrap();
+        assert!(matches!(found, self_lookup::SelfFound::Stored));
+        assert!(store.usable_agent(target.a(), now).is_some());
+    }
+
+    #[tokio::test]
+    async fn one_machines_claims_cannot_flush_another_machines_hints() {
+        let hints = RoutingHints::default();
+        let device = (AgentId([1; 32]), MachineId([1; 32]));
+        hints.record(device.0, device.1);
+        for i in 0..200u8 {
+            hints.record(AgentId([i.wrapping_add(10); 32]), MachineId([2; 32]));
+        }
+        assert_eq!(hints.machines(device.0), vec![device.1]);
+        assert_eq!(
+            hints
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, m, _)| *m == MachineId([2; 32]))
+                .count(),
+            MACHINE_HINT_CAP
+        );
+    }
+
+    #[tokio::test]
+    async fn the_frames_own_machine_is_asked_before_later_claimants() {
+        let requester = Node::new().await;
+        let target = AgentId([0x70; 32]);
+        let hints = &requester.relations.runtime.lookup_hints;
+        let machines: Vec<_> = (0..4u8).map(|i| MachineId([0x71 + i; 32])).collect();
+        for machine in &machines {
+            hints.record(target, *machine);
+        }
+        let connected: HashSet<_> = machines.iter().copied().collect();
+        let routes = requester
+            .relations
+            .routes(target, &connected, Some(machines[0]))
+            .await;
+        assert_eq!(routes.len(), FANOUT);
+        assert_eq!(routes[0], (machines[0], Route::SelfOnly));
+    }
+
+    #[tokio::test]
+    async fn a_revoked_agent_gets_no_route_and_no_answer() {
+        let requester = Node::new().await;
+        let target = Node::new().await;
+        requester
+            .relations
+            .runtime
+            .lookup_hints
+            .record(target.a(), target.m());
+        requester
+            .relations
+            .revoked
+            .write()
+            .await
+            .revoke_agent_for_testing(target.a());
+        assert!(requester
+            .relations
+            .routes(target.a(), &HashSet::from([target.m()]), Some(target.m()))
+            .await
+            .is_empty());
+        let mut responder = Node::new().await;
+        responder.relations.public = true;
+        let asker = MachineId([0x62; 32]);
+        assert!(responder.relations.authorized(asker, responder.a()).await);
+        responder
+            .relations
+            .revoked
+            .write()
+            .await
+            .revoke_agent_for_testing(responder.a());
+        assert!(!responder.relations.authorized(asker, responder.a()).await);
+    }
+
+    #[tokio::test]
+    async fn a_relationship_requester_keeps_the_relationship_grant() {
+        let mut responder = Node::new().await;
+        let requester = Node::new().await;
+        responder.know(&requester).await;
+        responder.group(&[responder.a(), requester.a()]);
+        responder.relations.public = true;
+        assert_eq!(
+            responder
+                .relations
+                .grant(requester.m(), responder.a())
+                .await,
+            Some(Grant::Relationship)
+        );
+        assert_eq!(
+            responder
+                .relations
+                .grant(MachineId([0x63; 32]), responder.a())
+                .await,
+            Some(Grant::SelfEvidence)
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A self-only pull logs when its record drops, with the outcome last
+    /// set, so a pull cut off before it finished still leaves a line.
+    #[test]
+    fn a_self_only_pull_logs_once_when_it_ends() {
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        let started = Instant::now();
+        drop(SelfLookupLog {
+            target: AgentId([1; 32]),
+            machine: MachineId([2; 32]),
+            started,
+            outcome: "cancelled",
+        });
+        drop(SelfLookupLog {
+            target: AgentId([1; 32]),
+            machine: MachineId([2; 32]),
+            started,
+            outcome: "reset",
+        });
+        let logs = String::from_utf8_lossy(&capture.0.lock().unwrap()).into_owned();
+        let lines: Vec<_> = logs
+            .lines()
+            .filter(|l| l.contains("stage=\"self_lookup\""))
+            .collect();
+        assert_eq!(lines.len(), 2, "{logs}");
+        assert!(lines[0].contains("outcome=\"cancelled\""), "{logs}");
+        assert!(lines[1].contains("outcome=\"reset\""), "{logs}");
+        assert!(lines[1].contains("agent_prefix=01010101"), "{logs}");
+        assert!(lines[1].contains("machine_prefix=02020202"), "{logs}");
+    }
+    #[test]
+    fn self_only_keys_fill_at_most_half_of_the_claim_table() {
+        let limits = Limits::default();
+        let claimant = Some(MachineId([0x64; 32]));
+        let target = |i: usize| {
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            AgentId(bytes)
+        };
+        for i in 0..SELF_ONLY_KEY_CAP {
+            assert!(limits.claim_target_for_test(target(i), claimant));
+        }
+        assert!(
+            !limits.claim_target_for_test(target(SELF_ONLY_KEY_CAP), claimant),
+            "self-only keys stop at half the table"
+        );
+        assert!(
+            limits.claim_target_for_test(target(SELF_ONLY_KEY_CAP), None),
+            "a relationship claim still succeeds"
+        );
     }
 }

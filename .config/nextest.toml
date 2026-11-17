@@ -184,6 +184,17 @@ max-threads = 2
 filter = "test(hs_f2_membership_cluster) | test(issue506_public_broadcast_control)"
 test-group = "membership-cluster"
 
+# T-self-evidence-lookup: this module's tests start two to five loopback
+# daemons each. In full 6-thread `cargo test --lib` runs on the lane heads,
+# wp_b_477 t7, t7b and t8b and case_1191 attempt_exit failed in two of three
+# runs. They passed in a full run at 60c0a86b, and in a full run of the lane
+# head with this module skipped. The module filter also covers future tests
+# here. The ambient-load attribution is unverified (#702). Not retries, not
+# wider deadlines (ADR 0025).
+[[profile.default.overrides]]
+filter = "test(evidence_wire::self_lookup_tests::)"
+test-group = "quic-localhost"
+
 # #501: real multi-peer controls share the existing localhost serialization.
 [[profile.default.overrides]]
 filter = "test(legacy_bus_interop_tests::)"

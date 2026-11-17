@@ -886,6 +886,25 @@ impl PeerEvidenceStore {
             })
             .unwrap_or_default()
     }
+    /// T-self-evidence-lookup: whether a move watermark, a pending move, a
+    /// suspension or a stored record naming another machine rules out
+    /// in-memory evidence for `agent` on the view's machine.
+    pub(crate) fn supersedes(&self, agent: AgentId, view: &EvidenceView) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return true;
+        };
+        let machine = view.announcement.machine_id;
+        disqualified(&state.file.watermarks, agent, view)
+            || state
+                .pending_moves
+                .get(&agent)
+                .is_some_and(|w| w.machine != machine && w.t >= view.advert.created_at_unix_ms)
+            || state.suspended.contains(&agent)
+            || state
+                .verified
+                .get(&agent)
+                .is_some_and(|v| v.announcement.machine_id != machine)
+    }
     /// Whether a currently usable relationship record names this machine.
     pub(crate) fn has_machine(&self, machine: MachineId, now: u64) -> bool {
         let agents: Vec<_> = self
@@ -2509,6 +2528,58 @@ mod tests {
         reopened.ingest(r, IngestSource::Hello, t).unwrap();
         assert!(reopened.usable(p.a(), p.m(), t).is_some());
     }
+    /// T-self-evidence-lookup: each of the four ways the store rules out
+    /// in-memory self-evidence, and the same state for the same machine or
+    /// an older move ruling nothing out.
+    #[test]
+    fn supersedes_each_move_watermark_suspension_and_stored_machine() {
+        let p = Peer::new();
+        let view = p.record(NOW, NOW).verify(NOW, W_MS).unwrap();
+        let elsewhere = MachineId([0x51; 32]);
+        let mark = |t, machine| MoveWatermarkV1 { t, machine };
+        let check = |edit: &dyn Fn(&mut State)| {
+            let (_dir, _, store) = setup(&p);
+            edit(&mut store.lock().unwrap());
+            store.supersedes(p.a(), &view)
+        };
+        assert!(!check(&|_| {}));
+        // Move watermark: a newer move to another machine.
+        assert!(check(&|s| {
+            s.file.watermarks.insert(p.a(), mark(NOW + 1, elsewhere));
+        }));
+        assert!(!check(&|s| {
+            s.file.watermarks.insert(p.a(), mark(NOW - 1, elsewhere));
+        }));
+        assert!(!check(&|s| {
+            s.file.watermarks.insert(p.a(), mark(NOW + 1, p.m()));
+        }));
+        // Pending move: one to another machine at or after the advert.
+        assert!(check(&|s| {
+            s.pending_moves.insert(p.a(), mark(NOW, elsewhere));
+        }));
+        assert!(!check(&|s| {
+            s.pending_moves.insert(p.a(), mark(NOW - 1, elsewhere));
+        }));
+        assert!(!check(&|s| {
+            s.pending_moves.insert(p.a(), mark(NOW, p.m()));
+        }));
+        // Suspension.
+        assert!(check(&|s| {
+            s.suspended.insert(p.a());
+        }));
+        // A stored record for another machine; the same machine is fine.
+        let mut moved = view.clone();
+        moved.announcement.machine_id = elsewhere;
+        let moved = Arc::new(moved);
+        assert!(check(&|s| {
+            s.verified.insert(p.a(), Arc::clone(&moved));
+        }));
+        let same = Arc::new(view.clone());
+        assert!(!check(&|s| {
+            s.verified.insert(p.a(), Arc::clone(&same));
+        }));
+    }
+
     #[test]
     fn watermark_cap_protects_records_relationships_and_young_entries() {
         let p = Peer::new();
