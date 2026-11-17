@@ -4015,13 +4015,17 @@ pub(in crate::server) fn named_group_event_delivery_result(
         .direct_delivery_drop
         .lock()
         .is_ok_and(|dropped| dropped.contains(recipient_hex));
+    // Each send future is boxed: unboxed, this future was about 0.5 MiB in a
+    // debug build and was copied onto the stack at every hand-off up to
+    // `tokio::spawn`, which overflowed an 8 MiB x0xd worker during a
+    // self-leave re-key.
     Some(async move {
         #[cfg(test)]
         if dropped_for_test {
             return Err("dropped for a test".to_string());
         }
         if payload.len() > x0x::dm::MAX_PAYLOAD_BYTES {
-            control_blob::send_reference(
+            Box::pin(control_blob::send_reference(
                 &control_blobs,
                 &agent,
                 &recipient,
@@ -4030,25 +4034,27 @@ pub(in crate::server) fn named_group_event_delivery_result(
                 None,
                 payload,
                 cold_removal,
-            )
+            ))
             .await
         } else if cold_removal {
-            agent
-                .send_direct_with_config_cold_wait(
-                    &recipient,
-                    payload,
-                    named_group_direct_delivery_config(),
-                    x0x::dm::PINNED_RESOLUTION_WAIT,
-                )
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string())
+            Box::pin(agent.send_direct_with_config_cold_wait(
+                &recipient,
+                payload,
+                named_group_direct_delivery_config(),
+                x0x::dm::PINNED_RESOLUTION_WAIT,
+            ))
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
         } else {
-            agent
-                .send_direct_with_config(&recipient, payload, named_group_direct_delivery_config())
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string())
+            Box::pin(agent.send_direct_with_config(
+                &recipient,
+                payload,
+                named_group_direct_delivery_config(),
+            ))
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
         }
     })
 }
@@ -13367,7 +13373,7 @@ async fn apply_named_group_metadata_event_with_binding(
     // Survivor re-key A12: a membership commit that lands live
     // may be the one parked events wait for.
     let lands_membership_commit = treekem_membership_event_frontier(&event).is_some();
-    let applied = Box::pin(apply_named_group_metadata_event_inner_serialized(
+    let applied = apply_named_group_metadata_event_inner_serialized(
         state,
         event,
         sender,
@@ -13381,7 +13387,7 @@ async fn apply_named_group_metadata_event_with_binding(
         false,
         false,
         None,
-    ))
+    )
     .await;
     if let Some(gid) = replay_group_id {
         replay_pending_causal_approvals(state, &gid, &mut cleared_quarantine).await;
@@ -13878,8 +13884,44 @@ pub(in crate::server) async fn resume_task_ingest_after_durable_clear(
 /// [`super::tasks::resume_group_task_ingest`] only AFTER every
 /// membership/`named_groups`/persistence guard has dropped — see the
 /// wrapper `apply_named_group_metadata_event`, which is the pattern.
+///
+/// Boxed at the source: the future is large in a debug build, and a caller
+/// that held it inline put it on every worker stack frame above the call.
 #[allow(clippy::too_many_arguments)]
-pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized(
+pub(in crate::server) fn apply_named_group_metadata_event_inner_serialized<'a>(
+    state: &'a Arc<AppState>,
+    event: NamedGroupMetadataEvent,
+    sender: AgentId,
+    verified: bool,
+    allow_queue: bool,
+    envelope_bytes: Option<&'a [u8]>,
+    predecessor_first_seen_ms: Option<u64>,
+    replay_group_id: &'a mut Option<String>,
+    cleared_quarantine: &'a mut std::collections::BTreeSet<String>,
+    bound_join_attempt: Option<&'a str>,
+    lock_already_held: bool,
+    roster_lock_already_held: bool,
+    held_gss_guard: Option<&'a tokio::sync::RwLockWriteGuard<'a, ()>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ApplyMetadataResult> + Send + 'a>> {
+    Box::pin(apply_named_group_metadata_event_inner_serialized_unboxed(
+        state,
+        event,
+        sender,
+        verified,
+        allow_queue,
+        envelope_bytes,
+        predecessor_first_seen_ms,
+        replay_group_id,
+        cleared_quarantine,
+        bound_join_attempt,
+        lock_already_held,
+        roster_lock_already_held,
+        held_gss_guard,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_named_group_metadata_event_inner_serialized_unboxed(
     state: &Arc<AppState>,
     event: NamedGroupMetadataEvent,
     sender: AgentId,
@@ -28039,7 +28081,20 @@ async fn commit_next_treekem_self_leave_rekey(
 /// Commit one removal starting from `info`, which already shows the leaver
 /// as Removed. `info` may not be the map entry yet: the self-leave apply
 /// passes its candidate so the rekey is the first durable hash.
-async fn commit_treekem_self_leave_rekey_from(
+///
+/// Boxed at the source: the future is large in a debug build, and a caller
+/// that held it inline put it on every worker stack frame above the call.
+fn commit_treekem_self_leave_rekey_from<'a>(
+    state: &'a Arc<AppState>,
+    group_key: &'a str,
+    info: x0x::groups::GroupInfo,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = SelfLeaveRekeyStep> + Send + 'a>> {
+    Box::pin(commit_treekem_self_leave_rekey_from_unboxed(
+        state, group_key, info,
+    ))
+}
+
+async fn commit_treekem_self_leave_rekey_from_unboxed(
     state: &Arc<AppState>,
     group_key: &str,
     info: x0x::groups::GroupInfo,
@@ -49342,7 +49397,23 @@ async fn cleanup_welcome_fetch_state(state: &Arc<AppState>, welcome_id: &str) {
         .remove(welcome_id);
 }
 
-async fn fetch_treekem_welcome_with_retries(
+/// Boxed at the source: the future is large in a debug build, and a caller
+/// that held it inline put it on every worker stack frame above the call.
+fn fetch_treekem_welcome_with_retries<'a>(
+    state: &'a Arc<AppState>,
+    group_id: &'a str,
+    welcome_ref: &'a WelcomeRef,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = std::result::Result<Vec<u8>, String>> + Send + 'a>,
+> {
+    Box::pin(fetch_treekem_welcome_with_retries_unboxed(
+        state,
+        group_id,
+        welcome_ref,
+    ))
+}
+
+async fn fetch_treekem_welcome_with_retries_unboxed(
     state: &Arc<AppState>,
     group_id: &str,
     welcome_ref: &WelcomeRef,
