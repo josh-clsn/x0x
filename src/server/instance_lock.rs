@@ -438,6 +438,29 @@ mod tests {
         }
     }
 
+    /// A served daemon needs over 4 MiB of stack in a debug build, more than
+    /// libtest's 2 MiB default thread. Linux CI sets `RUST_MIN_STACK`; the
+    /// Windows job runs plain `cargo test`. x0xd itself uses 8 MiB threads.
+    fn run_on_daemon_stack<F, Fut>(test: F)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let thread = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+                    .block_on(test());
+            })
+            .expect("spawn test thread");
+        if let Err(panic) = thread.join() {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
     /// #645 item 2: on Unix, ANY open failure on an existing lockfile used
     /// to be reported as `Held` — so a lockfile the daemon merely could not
     /// open (e.g. a root-owned `instance.lock` left behind by a `sudo` run)
@@ -527,8 +550,12 @@ mod tests {
     /// api.port, history.db, and the peers cache). The lock now lives in
     /// the supervisor task: a re-serve is refused while the old server is
     /// still draining, and succeeds only after the drain has finished.
-    #[tokio::test]
-    async fn reserve_during_drain_is_refused_until_the_supervisor_finishes() {
+    #[test]
+    fn reserve_during_drain_is_refused_until_the_supervisor_finishes() {
+        run_on_daemon_stack(reserve_during_drain_is_refused_until_the_supervisor_finishes_body);
+    }
+
+    async fn reserve_during_drain_is_refused_until_the_supervisor_finishes_body() {
         use tokio::io::AsyncWriteExt;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -667,8 +694,12 @@ mod tests {
     /// dir, the daemon must not contend with itself — flock'ing the same
     /// lockfile through a second open file description in one process
     /// fails. That layout must serve and stop cleanly.
-    #[tokio::test]
-    async fn serve_succeeds_when_the_configured_identity_dir_is_the_data_dir() {
+    #[test]
+    fn serve_succeeds_when_the_configured_identity_dir_is_the_data_dir() {
+        run_on_daemon_stack(serve_succeeds_when_the_configured_identity_dir_is_the_data_dir_body);
+    }
+
+    async fn serve_succeeds_when_the_configured_identity_dir_is_the_data_dir_body() {
         let dir = tempfile::tempdir().expect("tempdir");
         let handle = serve_with_options(
             hermetic_serve_config(
@@ -697,8 +728,14 @@ mod tests {
     /// `shutdown_and_wait`s and immediately re-opens finds the instance
     /// lock free AND `history.db` openable on the FIRST try — no retry
     /// window between "lock free" and "store closed".
-    #[tokio::test]
-    async fn shutdown_releases_the_exclusive_history_handle_with_the_instance_lock() {
+    #[test]
+    fn shutdown_releases_the_exclusive_history_handle_with_the_instance_lock() {
+        run_on_daemon_stack(
+            shutdown_releases_the_exclusive_history_handle_with_the_instance_lock_body,
+        );
+    }
+
+    async fn shutdown_releases_the_exclusive_history_handle_with_the_instance_lock_body() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut config = hermetic_serve_config(
             dir.path(),
