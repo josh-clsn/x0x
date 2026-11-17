@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! What the build records as `X0X_BUILD_SHA`: the environment's value when given, else the
 //! checkout's commit (`-dirty` when a tracked file differs), and nothing outside a checkout of
 //! the crate's own.

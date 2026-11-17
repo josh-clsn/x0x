@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! How many times one gossip-inbox send publishes its envelope.
 //!
 //! A default send publishes on the recipient's inbox topic, republishes on the
