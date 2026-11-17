@@ -8,6 +8,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # audiopus_sys bundles an Opus CMakeLists older than 3.5; CMake 4 on the
+  # runner refuses it without this floor.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 # Retire only an older head of the same pull request. Non-PR runs use their
 # unique run ID, so pushes to main and other independently triggered runs can
