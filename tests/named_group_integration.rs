@@ -620,7 +620,7 @@ async fn named_group_join_returns_inline_member_joined() {
         .json()
         .await
         .unwrap();
-    let group_id = create_r["group"]["id"].as_str().unwrap_or("").to_string();
+    let group_id = create_r["group_id"].as_str().unwrap_or("").to_string();
     assert!(!group_id.is_empty(), "create group: {create_r:?}");
 
     let backup_admin = fake_agent_id(0x45);
@@ -758,14 +758,54 @@ async fn apply_metadata_event_endpoint_rejects_invalid_event() {
 }
 
 /// `GET /groups/:id/join-result/:member` must answer `404` with the distinct
-/// `join_result_not_staged` reason when nothing is staged, so a relay caller
-/// polls with backoff instead of relaying a welcome-less event.
+/// `join_result_not_staged` reason when nothing is staged for an active
+/// member, so a relay caller polls with backoff instead of relaying a
+/// welcome-less event. A group this daemon does not hold is `group_unknown`.
 #[tokio::test]
 #[ignore]
 async fn join_result_inline_get_404_when_not_staged() {
     let d = daemon().await;
-    let gid = "cc".repeat(32);
-    let member = "dd".repeat(32);
+    let unknown = authed_client(&d)
+        .get(d.url(&format!(
+            "/groups/{}/join-result/{}",
+            "cc".repeat(32),
+            "dd".repeat(32)
+        )))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    let body: Value = unknown.json().await.unwrap();
+    assert_eq!(body["reason"], "group_unknown", "body: {body:?}");
+
+    // public_open, so a member can be seated by agent id alone.
+    let created: Value = authed_client(&d)
+        .post(d.url("/groups"))
+        .json(&serde_json::json!({
+            "name": "Join Result Group",
+            "description": "",
+            "preset": "public_open"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let gid = created["group_id"].as_str().unwrap_or("").to_string();
+    assert!(!gid.is_empty(), "create group: {created:?}");
+    let member = fake_agent_id(0x46);
+    let added: Value = authed_client(&d)
+        .post(d.url(&format!("/groups/{gid}/members")))
+        .json(&serde_json::json!({ "agent_id": member }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(added["ok"], true, "add member: {added:?}");
+
     let r = authed_client(&d)
         .get(d.url(&format!("/groups/{gid}/join-result/{member}")))
         .send()
