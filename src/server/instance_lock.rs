@@ -338,8 +338,12 @@ mod tests {
     /// any subsystem initialises — here: while the lock is held by
     /// "another daemon", serve must fail with the ownership error and must
     /// not have created anything in the data dir beyond the lockfile.
-    #[tokio::test]
-    async fn serve_is_refused_on_an_owned_data_dir_even_with_history_disabled() {
+    #[test]
+    fn serve_is_refused_on_an_owned_data_dir_even_with_history_disabled() {
+        run_on_daemon_stack(serve_is_refused_on_an_owned_data_dir_even_with_history_disabled_body);
+    }
+
+    async fn serve_is_refused_on_an_owned_data_dir_even_with_history_disabled_body() {
         use crate::server::{serve_with_options, DaemonConfig, ServeOptions};
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -506,8 +510,14 @@ mod tests {
     /// uncoordinated (the #601 hazard, one directory up). The configured
     /// identity dir now carries its own instance lock: the second daemon is
     /// refused before any subsystem initialises.
-    #[tokio::test]
-    async fn serve_is_refused_when_another_daemon_owns_the_configured_identity_dir() {
+    #[test]
+    fn serve_is_refused_when_another_daemon_owns_the_configured_identity_dir() {
+        run_on_daemon_stack(
+            serve_is_refused_when_another_daemon_owns_the_configured_identity_dir_body,
+        );
+    }
+
+    async fn serve_is_refused_when_another_daemon_owns_the_configured_identity_dir_body() {
         let shared_identity = tempfile::tempdir().expect("shared identity dir");
         // Simulate daemon A: hold the identity-dir lock (the same
         // `instance.lock` the daemon itself takes there).
