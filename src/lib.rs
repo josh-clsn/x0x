@@ -10427,22 +10427,16 @@ impl Agent {
         });
     }
 
-    /// Boxed at the source: the send future is large in a debug build, and
-    /// each wrapper above it held it inline on the worker stack.
-    #[allow(clippy::type_complexity)]
+    /// Boxed: the send future is large in a debug build.
     fn send_direct_with_config_inner_with_provenance<'a>(
         &'a self,
         to: &'a identity::AgentId,
         payload: Vec<u8>,
         config: dm::DmSendConfig,
         cold_wait: Option<ColdWait>,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError>,
-                > + Send
-                + 'a,
-        >,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError>,
     > {
         Box::pin(
             self.send_direct_with_config_inner_with_provenance_unboxed(

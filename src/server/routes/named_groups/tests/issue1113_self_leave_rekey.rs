@@ -254,11 +254,11 @@ async fn lowest_admin_rekey_locks_self_leaver_out_of_the_next_epoch() -> Result<
     Ok(())
 }
 
-/// x0xd runs its runtime on 8 MiB worker threads (`DAEMON_THREAD_STACK_BYTES`
-/// in `src/bin/x0xd.rs`). The lowest admin's self-leave re-key, applied from a
-/// spawned task as the metadata listener applies it, must fit one in a debug
-/// build. It needed about 9.1 MiB, and a debug x0xd aborted on every
-/// self-leave it re-keyed.
+/// The lowest admin's self-leave re-key, applied from a spawned task as the
+/// metadata listener applies it, must run on an 8 MiB x0xd worker stack
+/// (`DAEMON_THREAD_STACK_BYTES` in `src/bin/x0xd.rs`) in a debug build. The
+/// DM send chain below it is covered by `tests/named_group_integration.rs`
+/// on a debug x0xd.
 #[test]
 fn a_self_leave_rekey_fits_an_x0xd_worker_stack() {
     const X0XD_WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;

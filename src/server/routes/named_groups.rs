@@ -4015,10 +4015,8 @@ pub(in crate::server) fn named_group_event_delivery_result(
         .direct_delivery_drop
         .lock()
         .is_ok_and(|dropped| dropped.contains(recipient_hex));
-    // Each send future is boxed: unboxed, this future was about 0.5 MiB in a
-    // debug build and was copied onto the stack at every hand-off up to
-    // `tokio::spawn`, which overflowed an 8 MiB x0xd worker during a
-    // self-leave re-key.
+    // Boxed sends: the delivery future is moved through several spawn
+    // hand-offs, so it must stay small in a debug build.
     Some(async move {
         #[cfg(test)]
         if dropped_for_test {
@@ -11518,7 +11516,7 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
         // Durable (a rolled-back candidate restored its marker, so a clear
         // that did not stick must not notify).
         let mut iteration_cleared = std::collections::BTreeSet::new();
-        let applied = Box::pin(apply_named_group_metadata_event_inner_serialized(
+        let applied = apply_named_group_metadata_event_inner_serialized(
             state,
             pending.event.clone(),
             pending.sender,
@@ -11532,7 +11530,7 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
             true, // lock_already_held
             true, // roster_lock_already_held
             Some(&replay_gss_guard),
-        ))
+        )
         .await;
 
         let (group_persisted, visible_not_durable) = if applied.accepted {
@@ -13818,7 +13816,7 @@ async fn apply_named_group_metadata_event_inner(
     // #1023: as in `apply_named_group_metadata_event_with_binding`.
     let roster_sidecar = seat_cert_fetch::member_added_sidecar(&event);
     let event_group_id = named_group_metadata_event_group_id(&event).to_string();
-    let applied = Box::pin(apply_named_group_metadata_event_inner_serialized(
+    let applied = apply_named_group_metadata_event_inner_serialized(
         state,
         event,
         sender,
@@ -13832,7 +13830,7 @@ async fn apply_named_group_metadata_event_inner(
         false,
         false,
         None,
-    ))
+    )
     .await;
     if allow_queue {
         if let Some(gid) = replay_group_id {
@@ -13885,8 +13883,7 @@ pub(in crate::server) async fn resume_task_ingest_after_durable_clear(
 /// membership/`named_groups`/persistence guard has dropped — see the
 /// wrapper `apply_named_group_metadata_event`, which is the pattern.
 ///
-/// Boxed at the source: the future is large in a debug build, and a caller
-/// that held it inline put it on every worker stack frame above the call.
+/// Boxed: the future is large in a debug build.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::server) fn apply_named_group_metadata_event_inner_serialized<'a>(
     state: &'a Arc<AppState>,
@@ -13902,7 +13899,7 @@ pub(in crate::server) fn apply_named_group_metadata_event_inner_serialized<'a>(
     lock_already_held: bool,
     roster_lock_already_held: bool,
     held_gss_guard: Option<&'a tokio::sync::RwLockWriteGuard<'a, ()>>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = ApplyMetadataResult> + Send + 'a>> {
+) -> futures::future::BoxFuture<'a, ApplyMetadataResult> {
     Box::pin(apply_named_group_metadata_event_inner_serialized_unboxed(
         state,
         event,
@@ -28082,13 +28079,12 @@ async fn commit_next_treekem_self_leave_rekey(
 /// as Removed. `info` may not be the map entry yet: the self-leave apply
 /// passes its candidate so the rekey is the first durable hash.
 ///
-/// Boxed at the source: the future is large in a debug build, and a caller
-/// that held it inline put it on every worker stack frame above the call.
+/// Boxed: the future is large in a debug build.
 fn commit_treekem_self_leave_rekey_from<'a>(
     state: &'a Arc<AppState>,
     group_key: &'a str,
     info: x0x::groups::GroupInfo,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = SelfLeaveRekeyStep> + Send + 'a>> {
+) -> futures::future::BoxFuture<'a, SelfLeaveRekeyStep> {
     Box::pin(commit_treekem_self_leave_rekey_from_unboxed(
         state, group_key, info,
     ))
@@ -49397,15 +49393,12 @@ async fn cleanup_welcome_fetch_state(state: &Arc<AppState>, welcome_id: &str) {
         .remove(welcome_id);
 }
 
-/// Boxed at the source: the future is large in a debug build, and a caller
-/// that held it inline put it on every worker stack frame above the call.
+/// Boxed: the future is large in a debug build.
 fn fetch_treekem_welcome_with_retries<'a>(
     state: &'a Arc<AppState>,
     group_id: &'a str,
     welcome_ref: &'a WelcomeRef,
-) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = std::result::Result<Vec<u8>, String>> + Send + 'a>,
-> {
+) -> futures::future::BoxFuture<'a, std::result::Result<Vec<u8>, String>> {
     Box::pin(fetch_treekem_welcome_with_retries_unboxed(
         state,
         group_id,
