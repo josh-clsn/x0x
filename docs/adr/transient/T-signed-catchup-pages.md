@@ -2,6 +2,7 @@
 
 - **Status:** Proposed (fork tail, survivor re-key Task A5).
 - **Date:** 2026-10-24
+- **Target slot:** A08
 - **Builds on:** `T-any-member-delivers-signed-commits` (A3), `T-treekem-bytes-binding-everywhere` (A1), `T-treekem-committer-leaf` (A2), `T-catchup-log-on-disk` (A4)
 - **Drop at:** when upstream serves and applies catch-up for members whose transport is not verified
 

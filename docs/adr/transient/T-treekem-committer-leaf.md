@@ -2,6 +2,7 @@
 
 - **Status:** Proposed (fork tail, survivor re-key Task A2).
 - **Date:** 2026-10-24
+- **Target slot:** A09
 - **Builds on:** `T-treekem-bytes-binding-everywhere` (A1)
 - **Drop at:** when upstream ties a TreeKEM commit's committer leaf to the event's actor
 

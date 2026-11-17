@@ -2,6 +2,7 @@
 
 - **Status:** Proposed (fork tail, survivor re-key Task A6).
 - **Date:** 2026-10-24
+- **Target slot:** A09
 - **Builds on:** `T-signed-catchup-pages` (A5: signed page requests carrying `head_challenge`), `T-catchup-log-on-disk` (A4), upstream #1427's epoch-ahead catch-up (cherry-picked 40e0f5d4)
 - **Consumed by:** A7 (the trigger, GET, sign and accept routes), C3 (the anchored closure and the verdict), C4 (the confirm round)
 - **Drop at:** when upstream ships signed head evidence for TreeKEM rooms

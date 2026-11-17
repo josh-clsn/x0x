@@ -2,6 +2,7 @@
 
 - **Status:** Proposed (fork tail, leaf-quiet lane, caps part).
 - **Date:** 2026-10-25
+- **Target slot:** A06
 - **Upstream:** x0x#504 (Leaf egress tracker), E-D6 step 2 "S3: consume-only Leaves"; risk x0x#1455
 - **Drop at:** when upstream ships S1 (unicast caps) or S3 (consume-only Leaves), whichever lands first. Consume theirs and delete this arm. Nothing is on the wire, so no migration is needed.
 

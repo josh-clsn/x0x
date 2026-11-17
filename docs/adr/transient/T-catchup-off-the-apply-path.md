@@ -2,6 +2,7 @@
 
 - **Status:** Proposed (fork tail, survivor re-key A12).
 - **Date:** 2026-10-25
+- **Target slot:** A08
 - **Upstream:** none filed. Upstream's apply path asks for a gap catch-up inline in the same way, and its listener answers serially.
 - **Drop at:** when upstream moves its catch-up asks off the apply and listener paths and answers catch-up requests concurrently for proven requesters. Take theirs and delete `gap_catchup.rs` and `catchup_serve.rs`. Nothing changes on the wire, so no migration is needed.
 

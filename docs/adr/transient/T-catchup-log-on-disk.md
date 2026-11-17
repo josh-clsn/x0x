@@ -2,6 +2,7 @@
 
 - **Status:** Proposed (fork tail, survivor re-key Task A4).
 - **Date:** 2026-10-24
+- **Target slot:** A08
 - **Builds on:** `T-any-member-delivers-signed-commits` (A3)
 - **Drop at:** when upstream's S5 (fetch-by-hash of exact evidence from any holder, ADR 0088/0111) lands: move catch-up to it and drop this log. Upstream will not keep a catch-up log on disk (D54), so this record is a stopgap, not an upstream candidate as it stands (see "Relation to upstream").
 

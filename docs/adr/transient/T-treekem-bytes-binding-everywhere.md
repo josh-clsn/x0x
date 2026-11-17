@@ -2,6 +2,7 @@
 
 - **Status:** Proposed (fork tail, survivor re-key Task A1).
 - **Date:** 2026-10-23
+- **Target slot:** A09
 - **Base:** upstream v0.48.1 (#1337's `treekem_commit_binding` and relayed-removal rule; `T-self-leave-relay-commit-binding`)
 - **Ported from:** `survivor-rekey` 12d29551 (crossing to v0.48.1)
 - **Drop at:** when upstream seals every TreeKEM-bearing event under a binding that names its bytes and its unsigned fields
