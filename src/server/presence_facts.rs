@@ -212,8 +212,9 @@ impl PresenceClock for SystemClock {
             let millis = u64::try_from(now.tv_nsec()).ok()? / 1_000_000;
             secs.checked_mul(1_000)?.checked_add(millis)
         };
-        let boottime_ms = read(ClockId::CLOCK_BOOTTIME)?;
+        // M first: B counts everything M does, so B read after M is never behind it.
         let monotonic_ms = read(ClockId::CLOCK_MONOTONIC)?;
+        let boottime_ms = read(ClockId::CLOCK_BOOTTIME)?;
         Some(ClockPair {
             boottime_ms,
             monotonic_ms,
