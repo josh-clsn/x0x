@@ -8,6 +8,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # audiopus_sys bundles an Opus CMakeLists older than 3.5; CMake 4 on the
+  # runner refuses it without this floor.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 # Retire only an older head of the same pull request. Non-PR runs use their
 # unique run ID, so pushes to main and other independently triggered runs can
@@ -216,6 +219,9 @@ jobs:
     name: Signing path 100k acceptance
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      # Bound concurrent crates and LLVM workers on the standard 16 GiB runner.
+      CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@v5
 
@@ -263,6 +269,33 @@ jobs:
           mkdir -m 700 "${artifact}"
           test ! -e "${artifact}/proof.json"
 
+      # The x0x lib test unit at opt-level 3 peaked at 15.7 of 16 GB RAM
+      # and 2.9 of 3 GB swap (run 40002832571). A larger lib went past
+      # that, and the runner stopped with exit 143 before a test ran
+      # (#1533 runs 40003771420, 39995270646).
+      - name: Add build swap
+        shell: bash
+        run: |
+          sudo fallocate -l 12G /x0x-build.swap
+          sudo chmod 600 /x0x-build.swap
+          sudo mkswap /x0x-build.swap
+          sudo swapon /x0x-build.swap
+          free -m
+
+      - name: Sample signing-path build resources
+        shell: bash
+        run: |
+          artifact="${RUNNER_TEMP}/issue703-signing-test"
+          nohup bash -c '
+            while true; do
+              date -u
+              free -m
+              df -h / "$RUNNER_TEMP"
+              sleep 30
+            done
+          ' >>"${artifact}/resources.log" 2>&1 </dev/null &
+          echo "$!" >"${artifact}/resources.pid"
+
       - name: Run exact ignored 100k signing-path test
         id: signing_test
         shell: bash
@@ -272,7 +305,8 @@ jobs:
           X0X_SLOW_CONSUMER_PROOF: ${{ runner.temp }}/issue703-signing-test/proof.json
         run: |
           set +e
-          bash scripts/ci/nextest-isolated.sh --all-features --lib --cargo-profile signing-acceptance -- \
+          /usr/bin/time -v -o "${RUNNER_TEMP}/issue703-signing-test/build-and-test.time.txt" \
+            bash scripts/ci/nextest-isolated.sh --all-features --lib --cargo-profile signing-acceptance -- \
             --run-ignored ignored-only --no-tests=fail \
             -E 'test(=gossip::pubsub::tests::test_slow_subscriber_isolated_at_100k_messages)'
           status=$?
@@ -284,6 +318,21 @@ jobs:
           fi
           python3 -B scripts/ci/validate-703-signing-proof.py \
             "${RUNNER_TEMP}/issue703-signing-test/proof.json"
+
+      - name: Print signing-path resource samples
+        if: always()
+        shell: bash
+        run: |
+          artifact="${RUNNER_TEMP}/issue703-signing-test"
+          if [[ -f "${artifact}/resources.pid" ]]; then
+            kill "$(cat "${artifact}/resources.pid")" 2>/dev/null || true
+          fi
+          if [[ -f "${artifact}/resources.log" ]]; then
+            tail -n 120 "${artifact}/resources.log"
+          fi
+          if [[ -f "${artifact}/build-and-test.time.txt" ]]; then
+            cat "${artifact}/build-and-test.time.txt"
+          fi
 
       - name: Upload signing-path acceptance custody
         if: always()

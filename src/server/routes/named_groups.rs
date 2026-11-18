@@ -4015,13 +4015,15 @@ pub(in crate::server) fn named_group_event_delivery_result(
         .direct_delivery_drop
         .lock()
         .is_ok_and(|dropped| dropped.contains(recipient_hex));
+    // Boxed sends: the delivery future is moved through several spawn
+    // hand-offs, so it must stay small in a debug build.
     Some(async move {
         #[cfg(test)]
         if dropped_for_test {
             return Err("dropped for a test".to_string());
         }
         if payload.len() > x0x::dm::MAX_PAYLOAD_BYTES {
-            control_blob::send_reference(
+            Box::pin(control_blob::send_reference(
                 &control_blobs,
                 &agent,
                 &recipient,
@@ -4030,25 +4032,27 @@ pub(in crate::server) fn named_group_event_delivery_result(
                 None,
                 payload,
                 cold_removal,
-            )
+            ))
             .await
         } else if cold_removal {
-            agent
-                .send_direct_with_config_cold_wait(
-                    &recipient,
-                    payload,
-                    named_group_direct_delivery_config(),
-                    x0x::dm::PINNED_RESOLUTION_WAIT,
-                )
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string())
+            Box::pin(agent.send_direct_with_config_cold_wait(
+                &recipient,
+                payload,
+                named_group_direct_delivery_config(),
+                x0x::dm::PINNED_RESOLUTION_WAIT,
+            ))
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
         } else {
-            agent
-                .send_direct_with_config(&recipient, payload, named_group_direct_delivery_config())
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string())
+            Box::pin(agent.send_direct_with_config(
+                &recipient,
+                payload,
+                named_group_direct_delivery_config(),
+            ))
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
         }
     })
 }
@@ -11512,7 +11516,7 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
         // Durable (a rolled-back candidate restored its marker, so a clear
         // that did not stick must not notify).
         let mut iteration_cleared = std::collections::BTreeSet::new();
-        let applied = Box::pin(apply_named_group_metadata_event_inner_serialized(
+        let applied = apply_named_group_metadata_event_inner_serialized(
             state,
             pending.event.clone(),
             pending.sender,
@@ -11526,7 +11530,7 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
             true, // lock_already_held
             true, // roster_lock_already_held
             Some(&replay_gss_guard),
-        ))
+        )
         .await;
 
         let (group_persisted, visible_not_durable) = if applied.accepted {
@@ -13367,7 +13371,7 @@ async fn apply_named_group_metadata_event_with_binding(
     // Survivor re-key A12: a membership commit that lands live
     // may be the one parked events wait for.
     let lands_membership_commit = treekem_membership_event_frontier(&event).is_some();
-    let applied = Box::pin(apply_named_group_metadata_event_inner_serialized(
+    let applied = apply_named_group_metadata_event_inner_serialized(
         state,
         event,
         sender,
@@ -13381,7 +13385,7 @@ async fn apply_named_group_metadata_event_with_binding(
         false,
         false,
         None,
-    ))
+    )
     .await;
     if let Some(gid) = replay_group_id {
         replay_pending_causal_approvals(state, &gid, &mut cleared_quarantine).await;
@@ -13812,7 +13816,7 @@ async fn apply_named_group_metadata_event_inner(
     // #1023: as in `apply_named_group_metadata_event_with_binding`.
     let roster_sidecar = seat_cert_fetch::member_added_sidecar(&event);
     let event_group_id = named_group_metadata_event_group_id(&event).to_string();
-    let applied = Box::pin(apply_named_group_metadata_event_inner_serialized(
+    let applied = apply_named_group_metadata_event_inner_serialized(
         state,
         event,
         sender,
@@ -13826,7 +13830,7 @@ async fn apply_named_group_metadata_event_inner(
         false,
         false,
         None,
-    ))
+    )
     .await;
     if allow_queue {
         if let Some(gid) = replay_group_id {
@@ -13878,8 +13882,43 @@ pub(in crate::server) async fn resume_task_ingest_after_durable_clear(
 /// [`super::tasks::resume_group_task_ingest`] only AFTER every
 /// membership/`named_groups`/persistence guard has dropped — see the
 /// wrapper `apply_named_group_metadata_event`, which is the pattern.
+///
+/// Boxed: the future is large in a debug build.
 #[allow(clippy::too_many_arguments)]
-pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized(
+pub(in crate::server) fn apply_named_group_metadata_event_inner_serialized<'a>(
+    state: &'a Arc<AppState>,
+    event: NamedGroupMetadataEvent,
+    sender: AgentId,
+    verified: bool,
+    allow_queue: bool,
+    envelope_bytes: Option<&'a [u8]>,
+    predecessor_first_seen_ms: Option<u64>,
+    replay_group_id: &'a mut Option<String>,
+    cleared_quarantine: &'a mut std::collections::BTreeSet<String>,
+    bound_join_attempt: Option<&'a str>,
+    lock_already_held: bool,
+    roster_lock_already_held: bool,
+    held_gss_guard: Option<&'a tokio::sync::RwLockWriteGuard<'a, ()>>,
+) -> futures::future::BoxFuture<'a, ApplyMetadataResult> {
+    Box::pin(apply_named_group_metadata_event_inner_serialized_unboxed(
+        state,
+        event,
+        sender,
+        verified,
+        allow_queue,
+        envelope_bytes,
+        predecessor_first_seen_ms,
+        replay_group_id,
+        cleared_quarantine,
+        bound_join_attempt,
+        lock_already_held,
+        roster_lock_already_held,
+        held_gss_guard,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_named_group_metadata_event_inner_serialized_unboxed(
     state: &Arc<AppState>,
     event: NamedGroupMetadataEvent,
     sender: AgentId,
@@ -28039,7 +28078,19 @@ async fn commit_next_treekem_self_leave_rekey(
 /// Commit one removal starting from `info`, which already shows the leaver
 /// as Removed. `info` may not be the map entry yet: the self-leave apply
 /// passes its candidate so the rekey is the first durable hash.
-async fn commit_treekem_self_leave_rekey_from(
+///
+/// Boxed: the future is large in a debug build.
+fn commit_treekem_self_leave_rekey_from<'a>(
+    state: &'a Arc<AppState>,
+    group_key: &'a str,
+    info: x0x::groups::GroupInfo,
+) -> futures::future::BoxFuture<'a, SelfLeaveRekeyStep> {
+    Box::pin(commit_treekem_self_leave_rekey_from_unboxed(
+        state, group_key, info,
+    ))
+}
+
+async fn commit_treekem_self_leave_rekey_from_unboxed(
     state: &Arc<AppState>,
     group_key: &str,
     info: x0x::groups::GroupInfo,
@@ -49342,7 +49393,20 @@ async fn cleanup_welcome_fetch_state(state: &Arc<AppState>, welcome_id: &str) {
         .remove(welcome_id);
 }
 
-async fn fetch_treekem_welcome_with_retries(
+/// Boxed: the future is large in a debug build.
+fn fetch_treekem_welcome_with_retries<'a>(
+    state: &'a Arc<AppState>,
+    group_id: &'a str,
+    welcome_ref: &'a WelcomeRef,
+) -> futures::future::BoxFuture<'a, std::result::Result<Vec<u8>, String>> {
+    Box::pin(fetch_treekem_welcome_with_retries_unboxed(
+        state,
+        group_id,
+        welcome_ref,
+    ))
+}
+
+async fn fetch_treekem_welcome_with_retries_unboxed(
     state: &Arc<AppState>,
     group_id: &str,
     welcome_ref: &WelcomeRef,

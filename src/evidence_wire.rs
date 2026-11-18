@@ -20,18 +20,27 @@ use tokio::{
 
 mod decode;
 pub(crate) mod lookup;
+pub(crate) mod self_lookup;
 
 #[cfg(test)]
 #[path = "evidence_wire/tests/admission.rs"]
 mod admission_tests;
 
+#[cfg(test)]
+#[path = "evidence_wire/tests/self_lookup.rs"]
+mod self_lookup_tests;
+
 const MESSAGE_CAP: usize = 32 * 1024;
 // Reserve the frame, decoded vectors, and signed-part verification copies.
 // All requests/replies, including outbound reads, acquire this conservative
 // reservation before reading bodies. The wire buffer itself never exceeds
-// 32 KiB; the sum of all reservations never exceeds 1 MiB.
+// 32 KiB; the sum of all reservations never exceeds 1 MiB plus the frame
+// reserve.
 const ALLOCATION_RESERVATION: usize = MESSAGE_CAP * 4;
 const TOTAL_ALLOCATION_CAP: usize = 1024 * 1024;
+// On top of the aggregate cap: only self-only pulls to a frame's machine use
+// it, so relationship peers keep their half of the 1 MiB.
+const FRAME_RESERVE_SLOTS: usize = 2;
 const DEADLINE: Duration = Duration::from_secs(5);
 const HELLO_INTERVAL: Duration = Duration::from_secs(60);
 const MACHINE_CAP: usize = 4096;
@@ -140,7 +149,9 @@ struct State {
     machines: HashMap<MachineId, MachineBudget>,
     bytes: Window,
     verifies: Window,
-    targets: HashMap<AgentId, Instant>,
+    /// Lookup cooldowns: `(target, None)` for relationship routes,
+    /// `(target, Some(claimant))` for each self-only route.
+    targets: HashMap<(AgentId, Option<MachineId>), Instant>,
 }
 
 /// ADR 0089 S5 diagnostics counters for the evidence wire, surfaced via
@@ -158,6 +169,10 @@ pub(crate) struct WireCounters {
     pub(crate) evidence_bytes_in: std::sync::atomic::AtomicU64,
     pub(crate) evidence_bytes_out: std::sync::atomic::AtomicU64,
     pub(crate) evidence_verifies: std::sync::atomic::AtomicU64,
+    pub(crate) evidence_self_lookup_sent: std::sync::atomic::AtomicU64,
+    pub(crate) evidence_self_lookup_served: std::sync::atomic::AtomicU64,
+    pub(crate) evidence_self_lookup_refused: std::sync::atomic::AtomicU64,
+    pub(crate) evidence_self_lookup_accepted: std::sync::atomic::AtomicU64,
 }
 
 impl WireCounters {
@@ -183,6 +198,10 @@ impl WireCounters {
             "evidence_bytes_in": self.evidence_bytes_in.load(Relaxed),
             "evidence_bytes_out": self.evidence_bytes_out.load(Relaxed),
             "evidence_verifies": self.evidence_verifies.load(Relaxed),
+            "evidence_self_lookup_sent": self.evidence_self_lookup_sent.load(Relaxed),
+            "evidence_self_lookup_served": self.evidence_self_lookup_served.load(Relaxed),
+            "evidence_self_lookup_refused": self.evidence_self_lookup_refused.load(Relaxed),
+            "evidence_self_lookup_accepted": self.evidence_self_lookup_accepted.load(Relaxed),
         })
     }
 }
@@ -197,6 +216,9 @@ pub(crate) struct Limits {
     lookups: Arc<tokio::sync::Semaphore>,
     // Strangers may occupy at most half of the aggregate byte reservation.
     stranger_allocations: Arc<tokio::sync::Semaphore>,
+    // T-self-evidence-lookup: a self-only pull to the machine whose raw
+    // frame started it may use these when the stranger pool is full.
+    frame_allocations: Arc<tokio::sync::Semaphore>,
     prefix: Mutex<HashMap<MachineId, usize>>,
     pub(crate) prefix_refused: std::sync::atomic::AtomicU64,
     pub(crate) counters: WireCounters,
@@ -219,6 +241,9 @@ impl Default for Limits {
             lookups: Arc::new(tokio::sync::Semaphore::new(16)),
             allocations: Arc::new(tokio::sync::Semaphore::new(TOTAL_ALLOCATION_CAP)),
             stranger_allocations: Arc::new(tokio::sync::Semaphore::new(TOTAL_ALLOCATION_CAP / 2)),
+            frame_allocations: Arc::new(tokio::sync::Semaphore::new(
+                FRAME_RESERVE_SLOTS * ALLOCATION_RESERVATION,
+            )),
             prefix: Mutex::new(HashMap::new()),
             prefix_refused: std::sync::atomic::AtomicU64::new(0),
             counters: WireCounters::default(),
@@ -286,19 +311,44 @@ impl Limits {
     }
 
     pub(crate) fn admit(self: &Arc<Self>, machine: MachineId, relationship: bool) -> Option<Lease> {
+        let pool = (!relationship).then_some(&self.stranger_allocations);
+        self.admit_from(machine, pool, true)
+    }
+
+    /// A self-only pull to the machine whose raw frame started the Lookup:
+    /// the stranger pool inside the aggregate cap, else the frame reserve on
+    /// top of it. Other strangers holding the pool cannot block it, and it
+    /// never takes a relationship peer's share.
+    pub(crate) fn admit_frame(self: &Arc<Self>, machine: MachineId) -> Option<Lease> {
+        self.admit_from(machine, Some(&self.stranger_allocations), true)
+            .or_else(|| self.admit_from(machine, Some(&self.frame_allocations), false))
+    }
+
+    /// `aggregate`: the lease also holds a slot of the 1 MiB aggregate.
+    fn admit_from(
+        self: &Arc<Self>,
+        machine: MachineId,
+        pool: Option<&Arc<tokio::sync::Semaphore>>,
+        aggregate: bool,
+    ) -> Option<Lease> {
         let now = Instant::now();
-        let stranger_permit = if relationship {
-            None
-        } else {
+        let stranger_permit = match pool {
+            None => None,
+            Some(pool) => Some(
+                Arc::clone(pool)
+                    .try_acquire_many_owned(ALLOCATION_RESERVATION as u32)
+                    .ok()?,
+            ),
+        };
+        let permit = if aggregate {
             Some(
-                Arc::clone(&self.stranger_allocations)
+                Arc::clone(&self.allocations)
                     .try_acquire_many_owned(ALLOCATION_RESERVATION as u32)
                     .ok()?,
             )
+        } else {
+            None
         };
-        let permit = Arc::clone(&self.allocations)
-            .try_acquire_many_owned(ALLOCATION_RESERVATION as u32)
-            .ok()?;
         let mut s = self.state.lock().ok()?;
         let m = s.machine(machine, now)?;
         if m.open >= 2 {
@@ -523,7 +573,7 @@ pub(crate) struct Lease {
     limits: Arc<Limits>,
     machine: MachineId,
     pub(crate) deadline: Instant,
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
     _stranger_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 impl Drop for Lease {
@@ -750,6 +800,7 @@ pub(crate) struct Context {
     machines: Arc<tokio::sync::RwLock<HashMap<MachineId, crate::DiscoveredMachine>>>,
     owner: crate::owner_trust::OwnerTrust,
     revoked: Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>,
+    stores: self_lookup::Stores,
 }
 impl Context {
     async fn related(&self, machine: MachineId) -> bool {
@@ -871,7 +922,8 @@ impl Context {
                     let target: AgentId = codec().deserialize(&body).map_err(io::Error::other)?;
                     drop(body);
                     let context = Arc::clone(&self);
-                    let authorized = context.authorized(machine, target).await;
+                    let grant = context.grant(machine, target).await;
+                    let authorized = grant.is_some();
                     if !authorized {
                         WireCounters::bump(
                             &self
@@ -880,12 +932,28 @@ impl Context {
                                 .counters
                                 .evidence_lookup_unauthorized,
                         );
+                        if target == self.identity.agent_id() {
+                            WireCounters::bump(
+                                &self
+                                    .runtime
+                                    .wire_limits
+                                    .counters
+                                    .evidence_self_lookup_refused,
+                            );
+                            tracing::info!(
+                                target: "x0x::evidence",
+                                stage = "self_lookup_serve",
+                                machine_prefix = %crate::network::hex_prefix(&machine.0, 4),
+                                outcome = "unauthorized",
+                                "self-evidence Lookup refused"
+                            );
+                        }
                     }
                     let serving_lease = Arc::clone(&lease);
                     let reply = tokio::task::spawn_blocking(move || {
                         let _lease = serving_lease;
                         if authorized {
-                            context.lookup_reply(target)
+                            context.lookup_reply(target, grant)
                         } else {
                             Ok(None)
                         }
@@ -893,7 +961,10 @@ impl Context {
                     .await
                     .map_err(io::Error::other)??;
                     // Membership/revocation may have changed while signing.
-                    let reply = if reply.is_some() && !self.authorized(machine, target).await {
+                    // The answer was minted for this grant: a relationship
+                    // that ended meanwhile must not leave with its full
+                    // answer, even if the self-evidence rule now allows one.
+                    let reply = if reply.is_some() && self.grant(machine, target).await != grant {
                         WireCounters::bump(
                             &self
                                 .runtime
@@ -911,7 +982,18 @@ impl Context {
                         }
                         None => (NOT_FOUND, Vec::new()),
                     };
-                    write_message(&mut send, &self.runtime.wire_limits, machine, kind, &body).await
+                    write_message(&mut send, &self.runtime.wire_limits, machine, kind, &body)
+                        .await?;
+                    if kind == FOUND && grant == Some(lookup::Grant::SelfEvidence) {
+                        WireCounters::bump(
+                            &self
+                                .runtime
+                                .wire_limits
+                                .counters
+                                .evidence_self_lookup_served,
+                        );
+                    }
+                    Ok(())
                 }
                 HELLO | CERTIFICATE => {
                     if kind == HELLO && !self.runtime.wire_limits.request(machine, true) {
@@ -1616,6 +1698,16 @@ impl ReadyConnections {
 }
 
 impl crate::Agent {
+    fn self_lookup_stores(&self) -> self_lookup::Stores {
+        self_lookup::Stores {
+            announced: Arc::clone(&self.announced_machine_bindings),
+            consented: Arc::clone(&self.user_identity_consented),
+            direct: Arc::clone(&self.direct_messaging),
+            contacts: Arc::clone(&self.contact_store),
+            placements: Arc::clone(&self.move_state),
+        }
+    }
+
     pub(crate) fn start_evidence_wire(&self) {
         let Some(network) = &self.network else {
             return;
@@ -1651,6 +1743,7 @@ impl crate::Agent {
             machines: Arc::clone(&self.machine_discovery_cache),
             owner: self.owner_trust.clone(),
             revoked: Arc::clone(&self.revocation_set),
+            stores: self.self_lookup_stores(),
         });
         let _ = self
             .peer_evidence()
@@ -1944,6 +2037,7 @@ mod tests {
             machines: Arc::clone(&agent.machine_discovery_cache),
             owner: agent.owner_trust.clone(),
             revoked: Arc::clone(&agent.revocation_set),
+            stores: agent.self_lookup_stores(),
         })
     }
 
@@ -2653,6 +2747,32 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(limits.verify());
         assert!(limits.charge(MachineId([5; 32]), 64 * 1024));
+    }
+
+    /// R2-M-1: the frame reserve sits on top of the aggregate cap, so
+    /// strangers holding their pool and the reserve leave relationship
+    /// peers their pre-lane 512 KiB.
+    #[test]
+    fn the_frame_reserve_leaves_relationship_reservations_alone() {
+        let limits = Arc::new(Limits::default());
+        let strangers: Vec<_> = (0..4u8)
+            .map(|i| limits.admit(MachineId([0x10 + i; 32]), false).unwrap())
+            .collect();
+        let frames: Vec<_> = (0..2u8)
+            .map(|i| limits.admit_frame(MachineId([0x20 + i; 32])).unwrap())
+            .collect();
+        assert!(
+            limits.admit_frame(MachineId([0x2f; 32])).is_none(),
+            "the reserve holds two slots"
+        );
+        let related: Vec<_> = (0..4u8)
+            .map(|i| limits.admit(MachineId([0x30 + i; 32]), true))
+            .collect();
+        assert!(
+            related.iter().all(Option::is_some),
+            "four relationship admissions still succeed"
+        );
+        drop((strangers, frames, related));
     }
 
     #[tokio::test(start_paused = true)]

@@ -254,6 +254,52 @@ async fn lowest_admin_rekey_locks_self_leaver_out_of_the_next_epoch() -> Result<
     Ok(())
 }
 
+/// The lowest admin's self-leave re-key, applied from a spawned task as the
+/// metadata listener applies it, must run on an 8 MiB x0xd worker stack
+/// (`DAEMON_THREAD_STACK_BYTES` in `src/bin/x0xd.rs`) in a debug build. The
+/// DM send chain below it is covered by `tests/named_group_integration.rs`
+/// on a debug x0xd.
+#[test]
+fn a_self_leave_rekey_fits_an_x0xd_worker_stack() {
+    const X0XD_WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(X0XD_WORKER_STACK_BYTES)
+        .enable_all()
+        .build()
+        .expect("x0xd-shaped runtime");
+    let outcome = runtime.block_on(async {
+        tokio::spawn(async {
+            let fixture = two_member_treekem_group().await?;
+            let event = signed_self_leave(&fixture).await?;
+            let applied = apply_named_group_metadata_event(
+                &fixture.state,
+                event,
+                fixture.member_id,
+                true,
+                None,
+            )
+            .await;
+            anyhow::ensure!(applied.accepted, "self-leave must apply: {applied:?}");
+            let epoch_after = live_epoch(&fixture.state, &fixture.group_id).await;
+            anyhow::ensure!(
+                epoch_after > fixture.epoch_before,
+                "the lowest admin must re-key; before {}, after {epoch_after}",
+                fixture.epoch_before
+            );
+            anyhow::ensure!(
+                published_removal_commit(&fixture.state).is_some(),
+                "the re-key must publish its removal commit"
+            );
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+    });
+    outcome
+        .expect("the re-key task completes")
+        .expect("the self-leave re-key");
+}
+
 /// A higher admin updates the roster and does not rotate. The leaver keeps
 /// the current epoch until the lowest admin commits.
 #[tokio::test]

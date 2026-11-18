@@ -4109,7 +4109,7 @@ async fn handle_predecessor_relay_typed_payload_inner(
         // Only the authority (group creator) stores the relay
         // obligation. A non-authority witness just applies.
         if !is_local_authority || !is_requester_offer {
-            let apply_result = Box::pin(apply_named_group_metadata_event_inner_serialized(
+            let apply_result = apply_named_group_metadata_event_inner_serialized(
                 relay_state,
                 event.clone(),
                 sender,
@@ -4123,7 +4123,7 @@ async fn handle_predecessor_relay_typed_payload_inner(
                 true,
                 false,
                 None,
-            ))
+            )
             .await;
             replay_after = replay_group_id;
             // #942 r3 (B3): the witness tail ACKs only when its apply was
@@ -4563,7 +4563,7 @@ async fn handle_predecessor_relay_typed_payload_inner(
 
         // Now apply the request (only for New; Repair skips apply).
         let group_snapshot = if is_new_request {
-            let mut apply_result = Box::pin(apply_named_group_metadata_event_inner_serialized(
+            let mut apply_result = apply_named_group_metadata_event_inner_serialized(
                 relay_state,
                 event.clone(),
                 sender,
@@ -4577,7 +4577,7 @@ async fn handle_predecessor_relay_typed_payload_inner(
                 true, // lock_already_held
                 false,
                 None,
-            ))
+            )
             .await;
             replay_after = replay_group_id;
             if !apply_result.accepted {

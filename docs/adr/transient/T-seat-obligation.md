@@ -2,6 +2,7 @@
 
 - **Status:** Proposed (fork tail, survivor re-key A13).
 - **Date:** 2026-10-25
+- **Target slot:** A09
 - **Upstream:** none. It extends the fork's re-key obligations (`T-survivor-rekey-obligation.md`), which upstream does not have.
 - **Drop at:** with the re-key obligations.
 

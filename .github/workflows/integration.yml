@@ -10,6 +10,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # audiopus_sys bundles an Opus CMakeLists older than 3.5; CMake 4 on the
+  # runner refuses it without this floor.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 jobs:
   # ── Guardian: API coverage enforcement (every PR, ~30s) ────────────────

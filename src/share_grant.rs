@@ -1070,12 +1070,19 @@ pub(crate) async fn evaluate_grant_access_with_evidence(
     if candidates.is_empty() {
         return access;
     }
-    if crate::dm_inbox::authenticated_machine_binding(bindings, requester_agent)
-        .await
-        .is_none()
-    {
+    // T-self-evidence-lookup: a binding only a stranger's self-evidence
+    // wrote does not authorize a grant; it reads as no binding.
+    let bound = || async {
+        crate::dm_inbox::authenticated_machine_binding_evidence(bindings, requester_agent)
+            .await
+            .filter(|binding| !binding.self_evidence)
+            .map(|binding| binding.machine_id)
+    };
+    if bound().await.is_none() {
         if let Some(evidence) = evidence {
             if evidence.wait(0).await {
+                // Relationship routes only: this Lookup never asks the
+                // connecting machine for its own evidence.
                 evidence
                     .lookup(*requester_agent, Some(*requester_machine))
                     .await;
@@ -1083,7 +1090,7 @@ pub(crate) async fn evaluate_grant_access_with_evidence(
         }
     }
     let now_unix = now_unix.saturating_add(evaluated_at.elapsed().as_secs());
-    match crate::dm_inbox::authenticated_machine_binding(bindings, requester_agent).await {
+    match bound().await {
         Some(bound) if bound == *requester_machine => {}
         None if evidence
             .and_then(|e| {

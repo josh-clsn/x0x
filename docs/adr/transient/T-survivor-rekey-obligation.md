@@ -2,6 +2,7 @@
 
 - **Status:** Proposed (fork tail, survivor re-key Tasks A9 and A10).
 - **Date:** 2026-10-24
+- **Target slot:** A09
 - **Builds on:** `T-catchup-log-on-disk` (A4, the payload), `T-signed-catchup-pages` (A5, the signed requests that prove a head), `T-treekem-head-proof` (A6, the challenge requests)
 - **Drop at:** when upstream has a durable, proof-settled redelivery of a re-key to its survivors. Upstream's #1337 outbox covers only the post-leave re-key and settles on the send.
 

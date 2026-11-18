@@ -2,6 +2,7 @@
 
 - **Status:** Proposed (fork tail, survivor re-key Task A3).
 - **Date:** 2026-10-24
+- **Target slot:** A09
 - **Builds on:** upstream's `T-self-leave-catchup-author` and `T-self-leave-relay-commit-binding` (#1337), `T-treekem-bytes-binding-everywhere` (A1), `T-treekem-committer-leaf` (A2)
 - **Drop at:** when upstream applies every commit-bearing event as its verified signer from any member
 

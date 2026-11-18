@@ -208,6 +208,25 @@ async fn a_direct_ack_from_an_unconfirmed_pair_is_dropped_and_counted() {
                 .expect("real inbox");
             agent.join_network().await.expect("join actual runtime");
         }
+        // join_network re-announces once, 3 s after the join. Under load that
+        // could land after the sender connects and confirm the pair. Wait for
+        // it to go out first, while the two are not connected.
+        let own_announced_at = || async {
+            recipient
+                .identity_discovery_cache
+                .read()
+                .await
+                .get(&recipient.agent_id())
+                .map(|entry| entry.announced_at)
+        };
+        let joined_at = own_announced_at().await.expect("the join announcement");
+        tokio::time::timeout(PHASE, async {
+            while own_announced_at().await.is_some_and(|at| at <= joined_at) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("the recipient's delayed re-announcement");
         let addr = recipient
             .network()
             .expect("network")

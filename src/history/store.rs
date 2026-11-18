@@ -6207,7 +6207,7 @@ mod tests {
                     "SELECT COUNT(*), COUNT(*) FILTER (WHERE replace_key IS NOT NULL) \
                      FROM history",
                     [],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
                 )
                 .unwrap()
         };

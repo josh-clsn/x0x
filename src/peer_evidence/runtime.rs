@@ -144,6 +144,7 @@ pub struct EvidenceRuntime {
     pub(crate) lookup_context: std::sync::OnceLock<std::sync::Weak<crate::evidence_wire::Context>>,
     pub(crate) group_context: std::sync::RwLock<Option<Arc<GroupContext>>>,
     pub(crate) lookup_hints: crate::evidence_wire::lookup::RoutingHints,
+    pub(crate) self_lookup: crate::evidence_wire::self_lookup::SelfLookup,
     pub(crate) wire_limits: Arc<crate::evidence_wire::Limits>,
     store: std::sync::OnceLock<Arc<PeerEvidenceStore>>,
     ready: tokio_util::sync::CancellationToken,
@@ -167,6 +168,7 @@ impl Default for EvidenceRuntime {
             lookup_context: Default::default(),
             group_context: Default::default(),
             lookup_hints: Default::default(),
+            self_lookup: Default::default(),
             wire_limits: Arc::new(crate::evidence_wire::Limits::default()),
             store: Default::default(),
             ready: Default::default(),
@@ -190,11 +192,24 @@ impl EvidenceRuntime {
     }
     /// Pull missing relationship evidence over bounded connected-peer streams.
     /// Callers must re-read their authoritative sources after this await.
+    /// `machine` is recorded as a routing hint, but this Lookup never takes
+    /// a self-only route: only a raw frame ([`Self::spawn_lookup`]) does.
     pub(crate) async fn lookup(&self, agent: AgentId, machine: Option<MachineId>) {
         let Some(permit) = self.lookup_permit() else {
             return;
         };
-        self.lookup_with_permit(agent, machine, permit).await;
+        self.lookup_with_permit(agent, machine, None, permit).await;
+    }
+
+    /// [`Self::lookup`] as a raw frame from `machine` starts it, awaited.
+    #[cfg(test)]
+    pub(crate) async fn lookup_from_frame(&self, agent: AgentId, machine: MachineId) {
+        let Some(permit) = self.lookup_permit() else {
+            return;
+        };
+        let _flight = self.self_lookup.begin(agent);
+        self.lookup_with_permit(agent, Some(machine), Some(machine), permit)
+            .await;
     }
 
     /// x0x #1207: start a Lookup for `agent` in the background (the permit
@@ -210,7 +225,7 @@ impl EvidenceRuntime {
         let runtime = Arc::clone(self);
         tokio::spawn(async move {
             if runtime.wait(0).await {
-                runtime.lookup_with_permit(agent, None, permit).await;
+                runtime.lookup_with_permit(agent, None, None, permit).await;
             }
         });
     }
@@ -228,9 +243,14 @@ impl EvidenceRuntime {
             return;
         };
         let runtime = Arc::clone(self);
+        // Hinted and in flight from now, so a send that looks before the
+        // task runs waits for it instead of missing it.
+        self.lookup_hints.record(agent, machine);
+        let flight = self.self_lookup.begin(agent);
         tokio::spawn(async move {
+            let _flight = flight;
             runtime
-                .lookup_with_permit(agent, Some(machine), permit)
+                .lookup_with_permit(agent, Some(machine), Some(machine), permit)
                 .await;
         });
     }
@@ -243,16 +263,23 @@ impl EvidenceRuntime {
         permit
     }
 
+    /// `machine`: a transport-authenticated machine claiming `agent`, kept
+    /// as a routing hint, never as evidence authority. `transport`: set only
+    /// when a raw frame from that machine started the Lookup, which alone
+    /// may ask it for its own evidence (T-self-evidence-lookup).
     async fn lookup_with_permit(
         &self,
         agent: AgentId,
         machine: Option<MachineId>,
+        transport: Option<MachineId>,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) {
-        // Only the raw receive path supplies a transport-authenticated machine.
-        // Its claimed agent is a routing hint, never evidence authority.
         if let Some(machine) = machine {
             self.lookup_hints.record(agent, machine);
+        }
+        #[cfg(test)]
+        if let (Some(machine), Ok(mut seen)) = (transport, self.self_lookup.transports.lock()) {
+            seen.push((agent, machine));
         }
         let now = crate::dm_capability::now_unix_ms();
         let usable = match machine {
@@ -268,7 +295,7 @@ impl EvidenceRuntime {
             return;
         }
         if let Some(context) = self.lookup_context.get().and_then(std::sync::Weak::upgrade) {
-            context.lookup(agent, permit).await;
+            context.lookup(agent, permit, transport).await;
         }
     }
     /// Start exactly one background re-verification; invalid files stay untouched.
@@ -468,6 +495,7 @@ impl EvidenceRuntime {
             .into();
         value["evidence_lookup_skipped"] =
             self.evidence_lookup_skipped.load(Ordering::Relaxed).into();
+        value["evidence_own_answer_mints"] = self.self_lookup.mints.load(Ordering::Relaxed).into();
         // ADR 0089 S5: the wire counters (hello/lookup/bytes/verifies)
         // ride the same `peer_evidence` diagnostics object.
         let wire = self.wire_limits.counters.json();

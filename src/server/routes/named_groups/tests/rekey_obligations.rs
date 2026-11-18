@@ -77,13 +77,14 @@ pub(super) async fn skew(state: &AppState, ms: u64) {
     state.rekey_obligations.lock().await.skew_clock(ms);
 }
 
-/// Poll `check` for up to two seconds of real time.
+/// Poll `check` for up to ten seconds of real time: a loaded CI runner can
+/// take more than two to carry a commit between in-process daemons.
 pub(super) async fn eventually<F, Fut>(mut check: F) -> bool
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         if check().await {
             return true;

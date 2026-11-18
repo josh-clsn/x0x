@@ -10427,7 +10427,25 @@ impl Agent {
         });
     }
 
-    async fn send_direct_with_config_inner_with_provenance(
+    /// Boxed: the send future is large in a debug build.
+    fn send_direct_with_config_inner_with_provenance<'a>(
+        &'a self,
+        to: &'a identity::AgentId,
+        payload: Vec<u8>,
+        config: dm::DmSendConfig,
+        cold_wait: Option<ColdWait>,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError>,
+    > {
+        Box::pin(
+            self.send_direct_with_config_inner_with_provenance_unboxed(
+                to, payload, config, cold_wait,
+            ),
+        )
+    }
+
+    async fn send_direct_with_config_inner_with_provenance_unboxed(
         &self,
         to: &identity::AgentId,
         payload: Vec<u8>,
@@ -12741,6 +12759,49 @@ impl Agent {
         Ok(binding)
     }
 
+    /// T-self-evidence-lookup: when the recipient's claimed machine is
+    /// connected (it sent us a raw frame), wait at most
+    /// [`SEND_WAIT`](evidence_wire::self_lookup::SEND_WAIT) for the
+    /// self-lookup that asks it. One already in flight is awaited; otherwise
+    /// one starts unless a Lookup for the recipient ran within its cooldown
+    /// or no Lookup permit is free. Returns whether the caller should read
+    /// authority again. No global traffic is sent.
+    async fn await_self_evidence(
+        &self,
+        agent_id: &identity::AgentId,
+        transport: &RawQuicTransport<'_>,
+    ) -> bool {
+        let runtime = self.peer_evidence();
+        let mut hinted = Vec::new();
+        for machine in runtime.lookup_hints.machines(*agent_id).into_iter().rev() {
+            if transport.is_connected(&ant_quic::PeerId(machine.0)).await {
+                hinted.push(machine);
+            }
+        }
+        if hinted.is_empty() {
+            return false;
+        }
+        let mut done = runtime.self_lookup.subscribe();
+        if !runtime.self_lookup.in_flight(agent_id) {
+            // Newest claimant whose own route is not cooling.
+            let Some(machine) = hinted
+                .into_iter()
+                .find(|m| !runtime.wire_limits.target_cooling(*agent_id, Some(*m)))
+            else {
+                return false;
+            };
+            runtime.spawn_lookup(*agent_id, machine);
+        }
+        let deadline = tokio::time::Instant::now() + evidence_wire::self_lookup::SEND_WAIT;
+        while runtime.self_lookup.in_flight(agent_id) {
+            match tokio::time::timeout_at(deadline, done.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        true
+    }
+
     /// Resolve `agent_id` to a connected machine for a raw-QUIC send:
     /// discovery cache, DM registry or peer evidence, any send-readiness
     /// repair or discovery redial, and the ADR-0043 B/P pairing check before
@@ -12864,8 +12925,39 @@ impl Agent {
                     // (a gossip fallback, if any, follows).
                     ColdResolution::Off => {
                         let _ = self.connect_to_agent(agent_id).await;
-                        match self.authorized_registry_machine(agent_id, false).await {
-                            Some(id) => (id, "post_connect"),
+                        let mut resolved = self
+                            .authorized_registry_machine(agent_id, false)
+                            .await
+                            .map(|id| (id, "post_connect"));
+                        if resolved.is_none() && self.await_self_evidence(agent_id, transport).await
+                        {
+                            // A stranger's answer lands in the registry; a
+                            // relationship peer's lands in the evidence store.
+                            // A binding that landed meanwhile (a heartbeat)
+                            // is read first: stored authority never overrides
+                            // a known binding.
+                            let routing = self
+                                .identity_discovery_cache
+                                .read()
+                                .await
+                                .get(agent_id)
+                                .map(|d| d.machine_id)
+                                .filter(|m| m.0 != [0u8; 32]);
+                            let routed = self
+                                .authorized_routing_machine_with(agent_id, routing, false)
+                                .await;
+                            let registry = self.authorized_registry_machine(agent_id, false).await;
+                            resolved = match (registry, routed) {
+                                (Some(id), _) => Some((id, "post_connect")),
+                                (None, Some(id)) => Some((id, "cached_not_connected")),
+                                (None, None) => self
+                                    .peer_evidence()
+                                    .usable_agent(*agent_id, dm_capability::now_unix_ms())
+                                    .map(|view| (view.announcement.machine_id, "peer_evidence")),
+                            };
+                        }
+                        match resolved {
+                            Some(resolution) => resolution,
                             None => {
                                 tracing::warn!(
                                     target: "x0x::direct",
@@ -13414,6 +13506,9 @@ impl Agent {
                 cold,
             )
             .await?;
+        // T-self-evidence-lookup: from here this machine may ask for our
+        // own evidence even while the mesh is latched.
+        self.peer_evidence().self_lookup.note_sent(machine_id);
 
         tracing::debug!(
             target: "dm.trace",
@@ -20986,7 +21081,8 @@ impl Agent {
     }
 
     /// Shared gate with a narrow ADR 0089 mode. Only Unknown relationship
-    /// peers gain evidence admission; every other check remains unchanged.
+    /// peers, and Unknown or Known peers on a machine our agent wrote to,
+    /// gain evidence admission; every other check remains unchanged.
     #[allow(clippy::too_many_arguments)]
     async fn gate_peer_machine_inbound_for_evidence(
         discovery_cache: &std::sync::Arc<
@@ -21078,15 +21174,28 @@ impl Agent {
                     grant_only.push(*agent_id);
                 }
             }
+            // T-self-evidence-lookup: a machine our agent wrote to within
+            // the window may ask for our own evidence, as an undiscovered
+            // machine may, and so may a Known contact on it. The ADR 0089
+            // relationship branch stays Unknown-only. Blocked, pin
+            // mismatch, revoked and expired still deny.
             let evidence_relationship = evidence_only
-                && pair.decision == trust::TrustDecision::Unknown
-                && evidence_wire::unknown_relationship(
-                    discovery_cache,
-                    owner_trust,
-                    agent_id,
-                    machine_id,
-                )
-                .await;
+                && match pair.decision {
+                    trust::TrustDecision::Unknown => {
+                        evidence_wire::self_lookup::wrote_to(owner_trust, machine_id)
+                            || evidence_wire::unknown_relationship(
+                                discovery_cache,
+                                owner_trust,
+                                agent_id,
+                                machine_id,
+                            )
+                            .await
+                    }
+                    trust::TrustDecision::AcceptWithFlag => {
+                        evidence_wire::self_lookup::wrote_to(owner_trust, machine_id)
+                    }
+                    _ => false,
+                };
             let trust_decision = Some(
                 pair.decision
                     .with_owner_trust(has_connect_grant || has_call_grant || evidence_relationship),
@@ -21118,15 +21227,28 @@ impl Agent {
                 revoked_machine,
                 expired,
             ) {
-                tracing::info!(
-                    target: "x0x::streams",
-                    agent = %hex::encode(agent_id.as_bytes()),
-                    machine = %hex::encode(machine_id.as_bytes()),
-                    agent_count = agents.len(),
-                    outcome = "deny_gate",
-                    error = %e,
-                    "inbound traffic denied at identity gate (one agent on the machine failed)"
-                );
+                if evidence_only {
+                    tracing::info!(
+                        target: "x0x::evidence",
+                        stage = "admission",
+                        agent_prefix = %network::hex_prefix(&agent_id.0, 4),
+                        machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                        decision = %pair.decision,
+                        outcome = "deny_evidence_gate",
+                        error = %e,
+                        "stream refused at evidence-only admission"
+                    );
+                } else {
+                    tracing::info!(
+                        target: "x0x::streams",
+                        agent = %hex::encode(agent_id.as_bytes()),
+                        machine = %hex::encode(machine_id.as_bytes()),
+                        agent_count = agents.len(),
+                        outcome = "deny_gate",
+                        error = %e,
+                        "inbound traffic denied at identity gate (one agent on the machine failed)"
+                    );
+                }
                 return Err(e);
             }
             // ADR-0043 §9: B and P per (agent, machine) pairing — the
