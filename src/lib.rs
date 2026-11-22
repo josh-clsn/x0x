@@ -4882,9 +4882,9 @@ impl DiscoveredMachine {
 struct AnnouncementAssistSnapshot {
     nat_type: Option<String>,
     can_receive_direct: Option<bool>,
-    /// Whether this node listens publicly by its own setup: an active
-    /// router port mapping or the operator's relay opt-in.
-    publicly_listening: Option<bool>,
+    /// Whether the operator declared this node publicly reachable (the
+    /// relay opt-in).
+    declared_public: Option<bool>,
     relay_capable: Option<bool>,
     coordinator_capable: Option<bool>,
     relay_active: Option<bool>,
@@ -4919,7 +4919,7 @@ impl AnnouncementAssistSnapshot {
         Self {
             nat_type: Some(status.nat_type.to_string()),
             can_receive_direct: Some(status.can_receive_direct),
-            publicly_listening: Some(status.port_mapping_active || relay_opt_in_explicit()),
+            declared_public: Some(relay_opt_in_explicit()),
             relay_capable: Some(status.relay_service_enabled && plausibly_public),
             coordinator_capable: Some(status.coordinator_service_enabled && plausibly_public),
             relay_active: Some(status.is_relaying),
@@ -4929,17 +4929,20 @@ impl AnnouncementAssistSnapshot {
 
     /// Whether an announcement names the coordinators this node is connected
     /// to (`reachable_via`), the introducers a latched contact's burst dial
-    /// uses to punch through to it. Every node does, unless it listens
-    /// publicly by its own setup (a port mapping or the relay opt-in).
+    /// uses to punch through to it. Every node does, unless the operator
+    /// declared it publicly reachable (the relay opt-in).
     ///
-    /// `can_receive_direct` does not decide it: ant-quic sets it for any
-    /// fresh inbound direct connection, a LAN or loopback one included, and
-    /// for an inbound link a peer opened through the NAT mapping this node
-    /// opened toward it first. A desktop behind a home NAT therefore reads
-    /// as directly reachable while no stranger can reach it, and announced
-    /// no coordinator, so a latched phone had no introducer for it.
+    /// Neither `can_receive_direct` nor `port_mapping_active` decides it.
+    /// ant-quic sets `can_receive_direct` for any fresh inbound direct
+    /// connection, a LAN or loopback one included, and for an inbound link a
+    /// peer opened through the NAT mapping this node opened toward it first.
+    /// `port_mapping_active` only says the nearest router accepted a
+    /// mapping, which reaches nobody behind a second NAT (CGNAT, a mesh
+    /// router behind the ISP's box). A desktop behind a home NAT therefore
+    /// read as reachable while no stranger could reach it, and announced no
+    /// coordinator, so a latched phone had no introducer for it.
     fn announces_coordinator_hints(&self) -> bool {
-        self.publicly_listening != Some(true)
+        self.declared_public != Some(true)
     }
 }
 
@@ -28849,9 +28852,9 @@ mod tests {
 
         /// NAT-B: a desktop behind a home NAT that ant-quic reads as able to
         /// receive direct (a LAN inbound link, or a peer that came in
-        /// through the mapping the desktop opened) still announces its
-        /// coordinators: only a port mapping or the operator's opt-in stops
-        /// them.
+        /// through the mapping the desktop opened, or one whose router
+        /// accepted a port mapping behind a second NAT) still announces its
+        /// coordinators: only the operator's opt-in stops them.
         #[test]
         fn a_natted_desktop_that_reads_as_direct_still_announces_coordinators() {
             for scope in [
@@ -28872,11 +28875,24 @@ mod tests {
             let mapped = ant_quic::NodeStatus {
                 can_receive_direct: true,
                 port_mapping_active: true,
+                direct_reachability_scope: Some(ant_quic::ReachabilityScope::Global),
                 ..ant_quic::NodeStatus::default()
             };
-            assert!(!AnnouncementAssistSnapshot::from_node_status(&mapped)
-                .announces_coordinator_hints());
+            assert!(
+                AnnouncementAssistSnapshot::from_node_status(&mapped).announces_coordinator_hints(),
+                "a router's mapping claim does not suppress them"
+            );
             assert!(AnnouncementAssistSnapshot::default().announces_coordinator_hints());
+            // The opt-in is read through a process-wide switch other tests
+            // flip, so the declared state is set on the snapshot itself.
+            let declared = AnnouncementAssistSnapshot {
+                declared_public: Some(true),
+                ..AnnouncementAssistSnapshot::from_node_status(&mapped)
+            };
+            assert!(
+                !declared.announces_coordinator_hints(),
+                "the operator's opt-in does"
+            );
         }
 
         /// #398: peer-verified inbound reachability at GLOBAL scope is the

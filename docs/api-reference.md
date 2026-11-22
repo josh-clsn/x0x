@@ -1241,13 +1241,14 @@ relay. An unleased connect ignores them. CLI: `x0x direct connect
 --lease-secs 90 --introducer 203.0.113.7:5483`.
 
 Every node announces the coordinators it is linked to (`reachable_via`)
-unless it listens publicly by its own setup: an active router port mapping,
-or the relay opt-in (`--relay`, `X0X_RELAY_OPT_IN=1`). It no longer leaves
-them out when ant-quic reads it as able to receive direct, because ant-quic
-reads any fresh inbound direct link that way, a LAN one included, or one a
-peer opened through the mapping the node had opened toward it. A desktop
-behind a home NAT used to announce no coordinator, so a latched phone had no
-introducer for it.
+unless the operator declared it publicly reachable with the relay opt-in
+(`--relay`, `X0X_RELAY_OPT_IN=1`). It no longer leaves them out when ant-quic
+reads it as able to receive direct, because ant-quic reads any fresh inbound
+direct link that way, a LAN one included, or one a peer opened through the
+mapping the node had opened toward it. An active router port mapping does
+not leave them out either: behind a second NAT (CGNAT, a mesh router behind
+the ISP's box) the mapping reaches nobody. A desktop behind a home NAT used
+to announce no coordinator, so a latched phone had no introducer for it.
 
 With the daemon setting `relay_service_disabled = true` (TOML, default
 `false`, for a phone) the node never serves a relay session or coordinates a

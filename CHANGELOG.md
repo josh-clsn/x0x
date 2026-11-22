@@ -132,9 +132,9 @@ engine-A routes, and the four TreeKEM catch-up routes).
   `GET /agents/discovered` entries carry the target's announced
   `coordinators`, and a leased `POST /agents/connect` takes them back as
   `introducers` (at most 4). Every node now announces its coordinators unless
-  it listens publicly by its own setup (a port mapping or the relay opt-in):
-  a NAT'd desktop that ant-quic read as directly reachable used to announce
-  none.
+  the operator declared it publicly reachable (the relay opt-in): a NAT'd
+  desktop that ant-quic read as directly reachable, or whose router accepted
+  a port mapping, used to announce none.
 - **A check-in reaches a contact behind a home router.** A leased
   `POST /agents/connect` runs every step inside one 12 s budget, so a step
   that reaches the hole punch is not cut at its own 3 s or 8 s slice, and
