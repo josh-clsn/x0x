@@ -9172,6 +9172,7 @@ impl Agent {
                     }
                 }
 
+                let before = latched_peers_before_probe(network).await;
                 match tokio::time::timeout(
                     dial_probe_timeout(local_probe_timeout),
                     network.connect_addr(*addr),
@@ -9209,6 +9210,7 @@ impl Agent {
                             connected_machine_prefix = %crate::logging::LogHexId::new("machine", &network::hex_prefix(&connected_peer_id.0, 4)),
                             "verified local raw-address fallback reached unexpected peer"
                         );
+                        close_latched_stray(network, connected_peer_id, &before).await;
                     }
                     Ok(Err(e)) => {
                         tracing::debug!(
@@ -9354,6 +9356,7 @@ impl Agent {
                 if direct_probe_addrs.contains(addr) {
                     continue;
                 }
+                let before = latched_peers_before_probe(network).await;
                 match tokio::time::timeout(
                     dial_probe_timeout(dial_timeout),
                     network.connect_addr(*addr),
@@ -9386,6 +9389,7 @@ impl Agent {
                                 answered_machine_prefix = %network::hex_prefix(&real_machine_id.0, 4),
                                 "address answered by a different machine than the agent's known binding; not rebinding (#898)"
                             );
+                            close_latched_stray(network, connected_peer_id, &before).await;
                             continue;
                         }
                         // Enrich bootstrap cache with this successful address
@@ -23148,6 +23152,30 @@ tokio::task_local! {
     static DIALED_MACHINE: std::cell::Cell<Option<identity::MachineId>>;
 }
 
+/// L2: the peers a latched node is connected to before an address-only
+/// probe (empty while meshed), so [`close_latched_stray`] can tell a link
+/// the probe opened from one that was already up.
+async fn latched_peers_before_probe(network: &network::NetworkNode) -> Vec<ant_quic::PeerId> {
+    if network.mesh_quiesced() {
+        network.connected_peers().await
+    } else {
+        Vec::new()
+    }
+}
+
+/// L2: while latched, close at once the link an address-only probe opened
+/// to a machine other than the one it looked for (a reused address), unless
+/// that machine was connected before the probe.
+async fn close_latched_stray(
+    network: &network::NetworkNode,
+    answered: ant_quic::PeerId,
+    before: &[ant_quic::PeerId],
+) {
+    if network.mesh_quiesced() && !before.contains(&answered) {
+        let _ = network.disconnect(&answered).await;
+    }
+}
+
 /// M2: the end of a leased connect. While latched, every link no demand
 /// lease, other leased connect's target or held introducer covers is
 /// closed: one that came up during the connect and kept no lease (a
@@ -32304,6 +32332,49 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    }
+
+    /// L2: on a latched node, an address-only probe that another machine
+    /// answers (a reused address) leaves no link: it is closed right after
+    /// the mismatch, not only when the connect ends. Another leased connect
+    /// with an unknown target is held open so the latch guard and the
+    /// end-of-connect sweep spare everything and only the probe's own close
+    /// can act.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_latched_probe_answered_by_another_machine_leaves_no_link() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let phone = bare_agent(dir.path(), "phone").await;
+        phone.set_leaf_mode(true);
+        let other = bare_agent(dir.path(), "other").await;
+        let other_addr = bound(&other).await;
+        let network = std::sync::Arc::clone(phone.network().expect("network"));
+        let stranger = identity::AgentId([0x56; 32]);
+        let now = Agent::unix_timestamp_secs();
+        phone
+            .insert_discovered_agent_for_testing(DiscoveredAgent {
+                can_receive_direct: Some(true),
+                ..card_pin(
+                    stranger,
+                    identity::MachineId([0x57; 32]),
+                    vec![other_addr],
+                    now,
+                )
+            })
+            .await;
+        phone.quiesce_mesh().await.expect("latch");
+        let _spare_all = network.begin_leased_target(None);
+        let (outcome, leased) = phone
+            .connect_to_agent_burst(&stranger, std::time::Duration::from_secs(60), None, &[])
+            .await
+            .expect("the connect runs");
+        assert!(!leased, "{outcome:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !network
+                .is_connected(&ant_quic::PeerId(other.machine_id().0))
+                .await,
+            "the stray the probe opened to the other machine is closed"
+        );
     }
 
     /// Fix (b): a leased connect still dialling when the burst's cap trips
