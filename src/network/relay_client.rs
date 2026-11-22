@@ -76,8 +76,10 @@ pub struct RelayClientSnapshot {
     pub inbound_punch_allowed: Option<bool>,
     /// Which hole-punch coordinators ant-quic may use now: `any` (meshed),
     /// `connected_only` (latched, at rest: nothing is dialled to
-    /// coordinate) or `introducer` (latched, during a burst dial: one
-    /// introducer per target per burst, closed once the punch resolves).
+    /// coordinate) or `introducer` (latched, during a burst dial: at most one
+    /// introducer reached per target per burst, an unreachable one skipped
+    /// within 3 s while another is left, the one reached closed once the
+    /// punch resolves).
     pub coordinator_policy: Option<String>,
     /// Hole-punch introducer dials since start, each counted when it
     /// starts.

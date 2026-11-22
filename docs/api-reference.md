@@ -1232,11 +1232,17 @@ role in a punch a linked peer coordinates (its own punches still work), and
 an enabled peer relay forwards no relayed DM. In a burst, a target
 that announced no introducer of its own gets no hole punch unless the daemon
 setting `latched_seed_introducers` (TOML, default `false`) is `true`: then a
-bootstrap seed may be its one hole-punch introducer. The seed learns this
-node's address and whom it is calling, and never relays data. A dial to an
-introducer gets at most 3 s; one that cannot be reached introduced nothing,
-so the burst moves on to the target's next introducer (its own first, then
-a seed when allowed), never dialling one twice.
+bootstrap seed may be its hole-punch introducer. The seed learns this
+node's address and whom it is calling, and never relays data.
+
+The introducer rule of a burst: at most one introducer that is reached (and
+so learns the target) per target per burst. The burst tries the target's own
+named introducers first, then a seed when `latched_seed_introducers` is on
+(as on Android), also after the named ones fail. An unreachable introducer is
+skipped within 3 s while another candidate is left; the last candidate gets
+the rest of the burst's budget. None is dialled twice. An unreachable one
+still receives this node's first handshake packets, and so its address, so
+`introducer_dials` can exceed one per target. Introducers never relay.
 
 The target's announced coordinators reach this node only while the target is
 in its discovery cache. A leased `/agents/connect` may hand back ones the
@@ -1249,9 +1255,8 @@ embedder kept (for example an earlier entry's `coordinators`):
 
 `introducers` is a list of at most 4 socket addresses (`IP:PORT`); a bad
 address or a longer list answers 400. For this dial they join the coordinators
-the target announces now, after them, and the same rules apply: one
-introducer per target per burst, hung up on once the punch resolves, never a
-relay. When the connect ends the target's hints are its announced
+the target announces now, after them, and the same introducer rule applies
+(above); the one reached is hung up on once the punch resolves. When the connect ends the target's hints are its announced
 coordinators again (a connect that is itself dropped leaves them until the
 next leased connect to that agent). An unleased connect ignores them. CLI: `x0x direct connect
 --lease-secs 90 --introducer 203.0.113.7:5483`.

@@ -2215,7 +2215,7 @@ pub struct NetworkNode {
     /// switches (set once at assembly; empty on the test simulation link).
     relay_switch: Arc<OnceLock<Arc<ant_quic::P2pEndpoint>>>,
     /// Burst dials in flight ([`NetworkNode::begin_burst_dial`]). While the
-    /// mesh is latched, a burst dial may use one hole-punch introducer per
+    /// mesh is latched, a burst dial may reach one hole-punch introducer per
     /// target; outside one, nothing is dialled to coordinate.
     burst_dials: Arc<std::sync::atomic::AtomicUsize>,
     /// The target machines of the leased connects in flight, counted
@@ -5604,12 +5604,14 @@ impl NetworkNode {
     ///   of opening a MASQUE session through a cached relay or seed;
     /// - at rest, only an already-connected peer may coordinate a hole punch
     ///   (`ConnectedOnly`), and a peer-id-only connect dials no known peer;
-    /// - during a burst dial (`Introducer`), a target that needs a punch may
-    ///   use one introducer per burst, its own announced coordinators first,
-    ///   then a seed (one it cannot reach in 3 s is skipped for the next);
-    ///   ant-quic hangs up on it as soon as the punch resolves.
-    ///   Introducers only coordinate: with relay fallback off they carry no
-    ///   data;
+    /// - during a burst dial (`Introducer`), a target that needs a punch
+    ///   reaches at most one introducer per burst (the one reached learns
+    ///   the target): its own announced coordinators first, then a seed when
+    ///   allowed, also after the named ones fail. An unreachable one is
+    ///   skipped within 3 s while another candidate is left; the last gets
+    ///   the remaining budget. ant-quic hangs up on the one reached as soon
+    ///   as the punch resolves. Introducers only coordinate: with relay
+    ///   fallback off they carry no data;
     /// - relay service is off (M-1): the node serves no MASQUE relay session
     ///   and coordinates no hole punch for anyone, on any link, including a
     ///   link it dialled itself in a burst. Turning it off ends the sessions
@@ -5669,16 +5671,16 @@ impl NetworkNode {
     }
 
     /// A burst dial starts: while it is in flight (the guard lives), a
-    /// latched node may use one hole-punch introducer per target. Outside
-    /// a burst dial a latched node dials nothing to coordinate.
+    /// latched node may reach one hole-punch introducer per target (see
+    /// [`Self::sync_proactive_relay`]). Outside a burst dial a latched node
+    /// dials nothing to coordinate.
     ///
     /// The policy is endpoint-wide, not per dial: while any burst dial holds
     /// a guard, every other connect on the node runs under `Introducer` too.
     /// Only a dial a burst lease covers gets that far
     /// ([`Self::latched_dial_refusal`]): x0x's own raw-send redial to a
     /// leased machine whose link dropped, for example. Such a connect can
-    /// spend its target's one introducer for the burst; it still never
-    /// relays and never dials a seed beyond that one introducer.
+    /// spend its target's introducer for the burst; it still never relays.
     pub(crate) fn begin_burst_dial(&self) -> BurstDialGuard {
         self.burst_dials.fetch_add(1, Ordering::SeqCst);
         self.sync_switches_under_lock();

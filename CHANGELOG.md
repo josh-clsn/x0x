@@ -149,10 +149,13 @@ engine-A routes, and the four TreeKEM catch-up routes).
   lease let through; a link that comes up after the trip is closed and its
   bytes are counted. While latched, a link no lease covers is closed as soon
   as it comes up (outside a leased connect) and when a leased connect ends.
-- **A stale introducer no longer stalls a burst.** A burst's dial to an
-  introducer gets at most 3 s, and one that cannot be reached is skipped for
-  the target's next one; every attempt shows in `relay_client`, a dropped
-  one included.
+- **A stale introducer no longer stalls a burst.** The rule is now at most
+  one introducer that is reached (and so learns the target) per target per
+  burst: an unreachable one is skipped within 3 s while another candidate is
+  left, and the last candidate gets the remaining budget; with
+  `latched_seed_introducers` on (Android) a seed may be tried after the
+  target's own named introducers fail; introducers never relay. Every
+  attempt shows in `relay_client`, a dropped one included.
 - **A burst's punch outcomes are visible.** `relay_client` gains
   `introducer_punch_successes` and `introducer_punch_failures`: hole-punch
   rounds run through an introducer that reached the target or did not

@@ -8397,8 +8397,11 @@ impl Agent {
     /// the embedder kept for the target (`POST /agents/connect`
     /// `introducers`, at most [`MAX_CONNECT_INTRODUCERS`]): for this dial
     /// they join the coordinators the target announced, after them, under
-    /// the same rules (one introducer per target per burst, hung up once the
-    /// punch resolves, never a relay). When the connect ends the target's
+    /// the same rule: at most one introducer that is reached (and so learns
+    /// the target) per target per burst; an unreachable one is skipped
+    /// within 3 s while another candidate is left, and the last gets the
+    /// remaining budget; a seed may follow the named ones when allowed; the
+    /// one reached is hung up on once the punch resolves; none relays. When the connect ends the target's
     /// hints go back to its announced coordinators (a connect that is
     /// itself dropped leaves them until the next leased connect to it).
     ///
