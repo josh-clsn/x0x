@@ -8425,6 +8425,11 @@ impl Agent {
         let lease = lease.min(std::time::Duration::from_secs(MAX_DEMAND_LEASE_SECS));
         let deadline = tokio::time::Instant::now() + LEASED_DIAL_BUDGET;
         let (generation, ended) = network.demand_lease_generation_and_end();
+        // Dropped after the burst dial below, also when this connect is
+        // dropped: while latched, it then closes every link no lease covers.
+        let _end = LeasedConnectEnd {
+            network: std::sync::Arc::clone(network),
+        };
         // A leased dial is a burst dial: while latched it may use one
         // hole-punch introducer for this target, the coordinators the
         // target announced first.
@@ -23077,6 +23082,27 @@ tokio::task_local! {
     static DIALED_MACHINE: std::cell::Cell<Option<identity::MachineId>>;
 }
 
+/// M2: the end of a leased connect. While latched, once no burst dial is in
+/// flight, every link no demand lease covers is closed: one that came up
+/// during the connect and kept no lease (a refused lease, a burst that
+/// ended mid-dial, a link that won the race with the cancel). Spawned from
+/// `Drop`, so it also runs when the connect itself is dropped.
+struct LeasedConnectEnd {
+    network: std::sync::Arc<network::NetworkNode>,
+}
+
+impl Drop for LeasedConnectEnd {
+    fn drop(&mut self) {
+        if !self.network.mesh_quiesced() {
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let network = std::sync::Arc::clone(&self.network);
+            runtime.spawn(async move { network.close_unbooked_links().await });
+        }
+    }
+}
+
 /// The error a dial gets once the burst's byte cap is reached (M-5).
 fn burst_cap_reached_error() -> error::IdentityError {
     error::IdentityError::Storage(std::io::Error::other(
@@ -32085,6 +32111,38 @@ mod tests {
         assert_eq!(got.payload, b"booked", "the refused send never left");
     }
 
+    /// M2: a leased connect that keeps no lease (here the lease table is
+    /// full) does not leave its link up on a latched node: when the connect
+    /// ends, every link no lease covers is closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_latched_connect_that_keeps_no_lease_leaves_no_link() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (alice, bob, _bob_addr) = leaf_and_peer(dir.path()).await;
+        let network = std::sync::Arc::clone(alice.network().expect("network"));
+        alice.quiesce_mesh().await.expect("latch");
+        let until = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+        for i in 0..network::MAX_DEMAND_LEASES {
+            let mut bytes = [0xEDu8; 32];
+            bytes[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            assert!(network.lease_demand_peer(ant_quic::PeerId(bytes), until));
+        }
+        let (outcome, leased) = alice
+            .connect_to_agent_leased(&bob.agent_id(), std::time::Duration::from_secs(120))
+            .await
+            .expect("the connect runs");
+        assert!(outcome.is_live_path(), "{outcome:?}");
+        assert!(!leased, "the full table refused the lease");
+        let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while network.is_connected(&bob_peer).await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the unleased link is closed when the connect ends"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
     /// Fix (b): a leased connect still dialling when the burst's cap trips
     /// stops at once (409 `burst_cap_reached`) and dials nothing more.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -32463,6 +32521,9 @@ mod tests {
             })
             .await;
         alice.quiesce_mesh().await.expect("latch");
+        // A burst dial that keeps no lease: the link stays while the burst
+        // dial is in flight.
+        let _burst = alice_net.begin_burst_dial();
         let reached = network::NetworkNode::within_leased_dial(
             alice_net.demand_lease_generation(),
             tokio::time::Instant::now() + LEASED_DIAL_BUDGET,

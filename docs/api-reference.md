@@ -1167,7 +1167,12 @@ to an unleased machine answers `503 no_connectivity`, an unleased
 `/agents/connect` or `/machines/connect` answers `Unreachable`, and the
 reconnect, repair and peer-evidence dials do not run. A send over a live link
 is not affected. A `POST /mesh/quiesce` also stops a leased connect that is
-still dialling: it answers `Unreachable` with no lease.
+still dialling: it answers `Unreachable` with no lease. It also ends any
+other dial a lease let through (a raw-send repair, say), so no handshake
+finishes after the burst it belonged to. While quiesced, a link that comes
+up with no live lease and no leased connect in flight is closed as soon as
+it is up, and when a leased connect ends every link no lease covers is
+closed (its bytes count toward an armed byte cap first).
 
 #### Burst byte cap
 

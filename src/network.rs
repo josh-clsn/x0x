@@ -2553,6 +2553,35 @@ impl NetworkShutdownCoordinator {
 
 /// The error a dial reports when network teardown abandons it (see
 /// [`NetworkNode::dial_until_teardown`]).
+/// Run `dial` until it finishes or, for a dial a latched node let through
+/// (`burst_end` is the token of its demand-lease generation), until that
+/// generation ends: a latch call or a tripped burst cap. `None` when the
+/// burst ended first; dropping the dial drops its handshakes.
+async fn until_burst_ends<F: std::future::Future>(
+    burst_end: Option<tokio_util::sync::CancellationToken>,
+    dial: F,
+) -> Option<F::Output> {
+    match burst_end {
+        None => Some(dial.await),
+        Some(end) => tokio::select! {
+            biased;
+            () = end.cancelled() => None,
+            out = dial => Some(out),
+        },
+    }
+}
+
+fn burst_ended(origin: &'static str) -> NetworkError {
+    tracing::info!(
+        target: "x0x::connect",
+        origin,
+        "latched dial ended: the burst it belonged to ended"
+    );
+    NetworkError::LatchedNoLease(format!(
+        "mesh quiesced: the burst this dial belonged to ended ({origin})"
+    ))
+}
+
 fn dial_abandoned(origin: &'static str) -> NetworkError {
     tracing::debug!(
         target: "x0x::connect",
@@ -2917,6 +2946,11 @@ impl NetworkNode {
             Arc::clone(&network_node.churn).spawn_observer(node);
             Arc::clone(&network_node.relay_client)
                 .spawn_observer(node, Arc::clone(&network_node.mesh_quiesced));
+            let link_guard = network_node.spawn_latched_link_guard(node);
+            match network_node.background_tasks.lock() {
+                Ok(mut tasks) => tasks.push(link_guard),
+                Err(poisoned) => poisoned.into_inner().push(link_guard),
+            }
             let _ = network_node
                 .relay_switch
                 .set(Arc::clone(node.inner_endpoint()));
@@ -4142,7 +4176,7 @@ impl NetworkNode {
         // suppressed cache entry, refuse pre-socket so the handshake
         // cannot write cache success (shared ant-quic BootstrapCache).
         self.dial_gated_cached_addr(addr, origin).await?;
-        self.latched_dial_refusal(None, origin).await?;
+        let burst_end = self.latched_dial_refusal(None, origin).await?;
         let node = self.require_node().await?;
         let family = if addr.is_ipv4() { "v4" } else { "v6" };
         tracing::debug!(
@@ -4153,8 +4187,14 @@ impl NetworkNode {
             "starting direct dial"
         );
         let start = std::time::Instant::now();
-        let Some(result) = self.dial_until_teardown(node.connect_addr(addr)).await else {
+        let Some(result) = self
+            .dial_until_teardown(until_burst_ends(burst_end, node.connect_addr(addr)))
+            .await
+        else {
             return Err(dial_abandoned(origin));
+        };
+        let Some(result) = result else {
+            return Err(burst_ended(origin));
         };
         let dur_ms = start.elapsed().as_millis() as u64;
 
@@ -4237,13 +4277,14 @@ impl NetworkNode {
     pub async fn connect_peer(&self, peer_id: AntPeerId) -> NetworkResult<(SocketAddr, AntPeerId)> {
         // Issue #292 invariant C: refuse pre-socket when the id is known.
         self.dial_gated(&peer_id, "peer").await?;
-        self.latched_dial_refusal(Some(&peer_id), "peer").await?;
+        let burst_end = self.latched_dial_refusal(Some(&peer_id), "peer").await?;
         let node = self.require_node().await?;
         let start = std::time::Instant::now();
         let peer_conn = self
-            .dial_until_teardown(node.connect_peer(peer_id))
+            .dial_until_teardown(until_burst_ends(burst_end, node.connect_peer(peer_id)))
             .await
             .ok_or_else(|| dial_abandoned("peer"))?
+            .ok_or_else(|| burst_ended("peer"))?
             .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
 
         // Issue #292 invariant C: a tombstone that landed mid-handshake
@@ -4314,7 +4355,8 @@ impl NetworkNode {
     ) -> NetworkResult<(SocketAddr, AntPeerId)> {
         // Issue #292 invariant C: refuse pre-socket when the id is known.
         self.dial_gated(&peer_id, "peer_with_addrs").await?;
-        self.latched_dial_refusal(Some(&peer_id), "peer_with_addrs")
+        let burst_end = self
+            .latched_dial_refusal(Some(&peer_id), "peer_with_addrs")
             .await?;
         // #484 (code review r1 item 4): normalize v4-mapped addresses at
         // this shared boundary — verified-announcement auto-connect and
@@ -4346,10 +4388,16 @@ impl NetworkNode {
 
         let start = std::time::Instant::now();
         let Some(peer_conn_res) = self
-            .dial_until_teardown(node.connect_peer_with_addrs(peer_id, addrs))
+            .dial_until_teardown(until_burst_ends(
+                burst_end,
+                node.connect_peer_with_addrs(peer_id, addrs),
+            ))
             .await
         else {
             return Err(dial_abandoned("peer_with_addrs"));
+        };
+        let Some(peer_conn_res) = peer_conn_res else {
+            return Err(burst_ended("peer_with_addrs"));
         };
         let dur_ms = start.elapsed().as_millis() as u64;
 
@@ -4951,25 +4999,30 @@ impl NetworkNode {
     /// flight in the current demand-lease generation, or to a peer whose
     /// demand lease is live; a peer it is already connected to costs no new
     /// connection and is never refused here. Meshed, nothing is refused.
+    ///
+    /// A dial let through while latched gets the token of the demand-lease
+    /// generation it was let through in: the seams end it when that
+    /// generation ends (a latch call or a tripped cap), whatever let it
+    /// through. Meshed, `None`.
     pub(crate) async fn latched_dial_refusal(
         &self,
         peer: Option<&AntPeerId>,
         origin: &'static str,
-    ) -> NetworkResult<()> {
+    ) -> NetworkResult<Option<tokio_util::sync::CancellationToken>> {
         if !self.mesh_quiesced.load(Ordering::Relaxed) {
-            return Ok(());
+            return Ok(None);
         }
-        let generation = self.demand_lease_generation();
+        let (generation, end) = self.demand_lease_generation_and_end();
         let now = tokio::time::Instant::now();
         if LEASED_DIAL
             .try_with(|dial| dial.generation == generation && dial.deadline > now)
             .unwrap_or(false)
         {
-            return Ok(());
+            return Ok(Some(end));
         }
         if let Some(peer) = peer {
             if self.demand_leased(peer, now) || self.is_connected(peer).await {
-                return Ok(());
+                return Ok(Some(end));
             }
         }
         tracing::info!(
@@ -4981,6 +5034,64 @@ impl NetworkNode {
         Err(NetworkError::LatchedNoLease(format!(
             "mesh quiesced: no burst lease covers this dial ({origin})"
         )))
+    }
+
+    /// M2: while latched, close a link no burst booked as soon as it comes
+    /// up: no live demand lease covers its peer and no burst dial is in
+    /// flight (a leased connect's link comes up before its lease is
+    /// recorded). Such a link is one a dial finished after its burst ended
+    /// (a latch call or a trip landed mid-handshake), one ant-quic completed
+    /// after its connect was dropped, or one a re-sweep raced. Its bytes are
+    /// counted toward an armed burst cap first.
+    pub(crate) async fn close_unbooked_link(&self, peer: AntPeerId) {
+        if !self.mesh_quiesced.load(Ordering::Relaxed)
+            || self.burst_dials.load(Ordering::SeqCst) > 0
+            || self.demand_leased(&peer, tokio::time::Instant::now())
+        {
+            return;
+        }
+        self.observe_burst_cap_links().await;
+        if self
+            .disconnect_with_reason(&peer, DisconnectReason::Quiesce)
+            .await
+            .is_ok()
+        {
+            tracing::info!(
+                target: "x0x::connect",
+                peer_id_prefix = %hex_prefix(&peer.0, 4),
+                "latched: closed a link no burst lease covers"
+            );
+        }
+    }
+
+    /// [`Self::close_unbooked_link`] for every connected peer: run when a
+    /// leased connect ends while latched, and when the guard's event stream
+    /// lagged.
+    pub(crate) async fn close_unbooked_links(&self) {
+        for peer in self.connected_peers().await {
+            self.close_unbooked_link(peer).await;
+        }
+    }
+
+    /// M2: watch the endpoint's connections and close each one a latched
+    /// node did not book ([`Self::close_unbooked_link`]).
+    fn spawn_latched_link_guard(&self, node: &ant_quic::Node) -> tokio::task::JoinHandle<()> {
+        let mut events = node.inner_endpoint().subscribe();
+        let guard = self.clone();
+        tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(ant_quic::P2pEvent::PeerConnected { peer_id, .. }) => {
+                        guard.close_unbooked_link(peer_id).await;
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        guard.close_unbooked_links().await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        })
     }
 
     fn demand_leases_guard(&self) -> std::sync::MutexGuard<'_, DemandLeases> {
@@ -5208,6 +5319,28 @@ impl NetworkNode {
         links
     }
 
+    /// Count every live link's bytes toward the armed cap, if any.
+    async fn observe_burst_cap_links(&self) {
+        let generation = self.burst_cap_guard().generation;
+        let _ = self.observe_burst_cap_links_of(generation).await;
+    }
+
+    /// Count every live link's bytes toward the cap of `generation`.
+    /// Returns false when that cap is no longer the current one.
+    async fn observe_burst_cap_links_of(&self, generation: u64) -> bool {
+        let links = self.link_byte_counters().await;
+        let mut state = self.burst_cap_guard();
+        if state.generation != generation {
+            return false;
+        }
+        if let Some(count) = state.count.as_mut() {
+            for (link, total) in links {
+                count.observe(link, total);
+            }
+        }
+        true
+    }
+
     /// M-5: whether the tripped cap of `generation` still owns a latched
     /// node, so its task may close links.
     fn burst_cap_may_close(&self, generation: u64) -> bool {
@@ -5278,17 +5411,8 @@ impl NetworkNode {
             if tripped {
                 // A link that came up after the trip still moved bytes:
                 // count them before closing it.
-                let links = self.link_byte_counters().await;
-                {
-                    let mut state = self.burst_cap_guard();
-                    if state.generation != generation {
-                        return;
-                    }
-                    if let Some(count) = state.count.as_mut() {
-                        for (link, total) in links {
-                            count.observe(link, total);
-                        }
-                    }
+                if !self.observe_burst_cap_links_of(generation).await {
+                    return;
                 }
                 self.close_links_for_burst_cap(generation).await;
                 continue;
@@ -9712,6 +9836,94 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert!(phone.burst_cap_snapshot().tripped);
+        let _ = peer.try_shutdown().await;
+        let _ = phone.try_shutdown().await;
+    }
+
+    /// M2: a dial a latched node let through on a live lease ends at the
+    /// next latch call, which ends that burst, instead of finishing its
+    /// handshake after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_latch_call_ends_a_dial_its_lease_let_through() {
+        let phone = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("phone");
+        phone.latch_mesh_quiesced().expect("fresh latch");
+        let peer = ant_quic::PeerId([0x5d; 32]);
+        assert!(
+            phone.lease_demand_peer(peer, tokio::time::Instant::now() + Duration::from_secs(60))
+        );
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind silent");
+        let silent_addr = silent.local_addr().expect("silent addr");
+        let dial = tokio::spawn({
+            let phone = phone.clone();
+            async move { phone.connect_peer_with_addrs(peer, vec![silent_addr]).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!dial.is_finished(), "the leased dial is under way");
+        assert!(phone.latch_mesh_quiesced().is_none(), "the burst ends");
+        let ended = tokio::time::timeout(Duration::from_secs(1), dial)
+            .await
+            .expect("the dial ends with the burst")
+            .expect("dial task");
+        assert!(
+            matches!(ended, Err(NetworkError::LatchedNoLease(_))),
+            "{ended:?}"
+        );
+        drop(silent);
+        let _ = phone.try_shutdown().await;
+    }
+
+    /// M2: while latched, a link that comes up with no lease and no burst
+    /// dial in flight (a handshake that finished after its burst ended) is
+    /// closed at once; one a lease covers, or one that comes up during a
+    /// burst dial, stays.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_latched_node_closes_a_link_no_burst_booked() {
+        let phone = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("phone");
+        let peer = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("peer");
+        let peer_addr = peer.bound_addr().await.expect("peer bound");
+        let peer_id = peer.peer_id();
+        phone.latch_mesh_quiesced().expect("fresh latch");
+        let link_gone = |phone: NetworkNode| async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+            while phone.is_connected(&peer_id).await {
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            true
+        };
+
+        let _ = phone.connect_beneath_gates_for_test(peer_addr).await;
+        assert!(link_gone(phone.clone()).await, "an unbooked link is closed");
+
+        assert!(phone.lease_demand_peer(
+            peer_id,
+            tokio::time::Instant::now() + Duration::from_secs(60)
+        ));
+        let _ = phone.connect_beneath_gates_for_test(peer_addr).await;
+        assert!(!link_gone(phone.clone()).await, "a leased link stays");
+        let _ = phone.disconnect(&peer_id).await;
+        phone.clear_demand_leases();
+        let gone = tokio::time::Instant::now() + Duration::from_secs(5);
+        while phone.is_connected(&peer_id).await {
+            assert!(tokio::time::Instant::now() < gone, "the link closed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let burst = phone.begin_burst_dial();
+        let _ = phone.connect_beneath_gates_for_test(peer_addr).await;
+        assert!(
+            !link_gone(phone.clone()).await,
+            "a link that comes up during a burst dial stays"
+        );
+        drop(burst);
         let _ = peer.try_shutdown().await;
         let _ = phone.try_shutdown().await;
     }
