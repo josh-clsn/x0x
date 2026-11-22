@@ -8821,7 +8821,13 @@ impl Agent {
                         .await
                         .is_some();
                     if !before.contains(&other) && !claimed_after {
-                        let _ = network.disconnect(&other).await;
+                        if network.mesh_quiesced() {
+                            // Latched: by the latch guard's rule, so a link
+                            // another leased connect booked meanwhile stays.
+                            network.close_unbooked_link(other, Some(addr)).await;
+                        } else {
+                            let _ = network.disconnect(&other).await;
+                        }
                     }
                     tracing::debug!(
                         target: "x0x::connect",
@@ -9213,7 +9219,7 @@ impl Agent {
                             connected_machine_prefix = %crate::logging::LogHexId::new("machine", &network::hex_prefix(&connected_peer_id.0, 4)),
                             "verified local raw-address fallback reached unexpected peer"
                         );
-                        close_latched_stray(network, connected_peer_id, &before).await;
+                        close_latched_stray(network, connected_peer_id, *addr, &before).await;
                     }
                     Ok(Err(e)) => {
                         tracing::debug!(
@@ -9392,7 +9398,7 @@ impl Agent {
                                 answered_machine_prefix = %network::hex_prefix(&real_machine_id.0, 4),
                                 "address answered by a different machine than the agent's known binding; not rebinding (#898)"
                             );
-                            close_latched_stray(network, connected_peer_id, &before).await;
+                            close_latched_stray(network, connected_peer_id, *addr, &before).await;
                             continue;
                         }
                         // Enrich bootstrap cache with this successful address
@@ -23168,14 +23174,18 @@ async fn latched_peers_before_probe(network: &network::NetworkNode) -> Vec<ant_q
 
 /// L2: while latched, close at once the link an address-only probe opened
 /// to a machine other than the one it looked for (a reused address), unless
-/// that machine was connected before the probe.
+/// that machine was connected before the probe. It closes by the latch
+/// guard's own rule ([`network::NetworkNode::close_unbooked_link`]): a link
+/// a lease, another leased connect's target or a held introducer covers
+/// stays, and the probe's bytes count toward an armed cap first.
 async fn close_latched_stray(
     network: &network::NetworkNode,
     answered: ant_quic::PeerId,
+    addr: std::net::SocketAddr,
     before: &[ant_quic::PeerId],
 ) {
     if network.mesh_quiesced() && !before.contains(&answered) {
-        let _ = network.disconnect(&answered).await;
+        network.close_unbooked_link(answered, Some(addr)).await;
     }
 }
 
@@ -32339,10 +32349,8 @@ mod tests {
 
     /// L2: on a latched node, an address-only probe that another machine
     /// answers (a reused address) leaves no link: it is closed right after
-    /// the mismatch, not only when the connect ends. Another leased connect
-    /// with an unknown target is held open so the latch guard and the
-    /// end-of-connect sweep spare everything and only the probe's own close
-    /// can act.
+    /// the mismatch (the latch guard, by the same rule, would close it when
+    /// its event is handled).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_latched_probe_answered_by_another_machine_leaves_no_link() {
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -32365,7 +32373,6 @@ mod tests {
             })
             .await;
         phone.quiesce_mesh().await.expect("latch");
-        let _spare_all = network.begin_leased_target(None);
         let (outcome, leased) = phone
             .connect_to_agent_burst(&stranger, std::time::Duration::from_secs(60), None, &[])
             .await
@@ -32377,6 +32384,48 @@ mod tests {
                 .is_connected(&ant_quic::PeerId(other.machine_id().0))
                 .await,
             "the stray the probe opened to the other machine is closed"
+        );
+    }
+
+    /// R2: a probe's stray close follows the latch guard's rule: a link a
+    /// lease covers stays although a probe of another connect reached its
+    /// machine at a reused address.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_probe_never_closes_a_link_a_lease_covers() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let phone = bare_agent(dir.path(), "phone").await;
+        phone.set_leaf_mode(true);
+        let other = bare_agent(dir.path(), "other").await;
+        let other_addr = bound(&other).await;
+        let network = std::sync::Arc::clone(phone.network().expect("network"));
+        let stranger = identity::AgentId([0x58; 32]);
+        let now = Agent::unix_timestamp_secs();
+        phone
+            .insert_discovered_agent_for_testing(DiscoveredAgent {
+                can_receive_direct: Some(true),
+                ..card_pin(
+                    stranger,
+                    identity::MachineId([0x59; 32]),
+                    vec![other_addr],
+                    now,
+                )
+            })
+            .await;
+        phone.quiesce_mesh().await.expect("latch");
+        let other_peer = ant_quic::PeerId(other.machine_id().0);
+        assert!(network.lease_demand_peer(
+            other_peer,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(60)
+        ));
+        let (outcome, leased) = phone
+            .connect_to_agent_burst(&stranger, std::time::Duration::from_secs(60), None, &[])
+            .await
+            .expect("the connect runs");
+        assert!(!leased, "{outcome:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            network.is_connected(&other_peer).await,
+            "the leased machine's link stays"
         );
     }
 
