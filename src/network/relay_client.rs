@@ -85,8 +85,10 @@ pub struct RelayClientSnapshot {
     /// starts.
     pub introducer_dials: u64,
     /// Of those, dials to a seed: a known peer taken because the target
-    /// announced no introducer of its own (M-3). The seed learns this
-    /// node's address and whom it is calling.
+    /// announced no introducer of its own, or (with
+    /// `latched_seed_introducers`, as on Android) after its named ones could
+    /// not be reached (M-3). The seed learns this node's address and whom it
+    /// is calling.
     pub introducer_seed_dials: u64,
     /// Introducer dials in the last 24 hours (each stamped when a sample
     /// first saw it: at the end of a burst dial, at a latch call or at a

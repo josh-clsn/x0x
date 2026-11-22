@@ -106,10 +106,13 @@ engine-A routes, and the four TreeKEM catch-up routes).
   Latching closes any client relay session the node holds, whenever and on
   whichever network it was opened, withdrawing the advertised relay address
   from peers. At rest a latched node dials nothing to coordinate a hole
-  punch. A burst dial (`connect_to_agent_leased`) may use one hole-punch
-  introducer per target per burst: first a coordinator the target announced
-  in `reachable_via`, then a seed. The introducer connection is closed as
-  soon as the punch resolves. A contact that only a relay reaches is not
+  punch. A burst dial (`connect_to_agent_leased`) reaches at most one
+  hole-punch introducer (which so learns the target) per target per burst:
+  first the coordinators the target announced in `reachable_via`, then a seed
+  when allowed, also after the named ones fail; an unreachable one is skipped
+  within 3 s while another candidate is left, and the last gets the
+  remaining time. The introducer connection is closed as soon as the punch
+  resolves. A contact that only a relay reaches is not
   reached in a burst. Lifting the latch allows all of it again.
   `relay_client` adds `relay_fallback_allowed`, `coordinator_policy`
   (`any`, `connected_only` or `introducer`), `introducer_dials`,

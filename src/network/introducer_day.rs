@@ -1,9 +1,12 @@
 //! M-3: how many hole-punch introducers a latched node dialled in the last
 //! day, and how many of them were a seed.
 //!
-//! In a burst a target that needs a hole punch may use one introducer: one
-//! it named for itself, or, failing that, a known peer (a bootstrap seed).
-//! A seed so used learns this node's address and whom it is calling. ant-quic
+//! In a burst a target that needs a hole punch reaches at most one
+//! introducer (the one reached learns the target): the ones it named for
+//! itself first, then a known peer (a bootstrap seed) when allowed, also
+//! after the named ones fail. An unreachable one is skipped within 3 s while
+//! another candidate is left, so a target can count more than one dial. A
+//! seed so used learns this node's address and whom it is calling. ant-quic
 //! counts both kinds since start (`IntroducerStats::dials` and
 //! `known_peer_dials`); this window turns the counts into the last 24 hours
 //! for `GET /diagnostics/connectivity`.
@@ -20,8 +23,9 @@ use tokio::time::Instant;
 /// How far back the counts reach.
 pub(crate) const INTRODUCER_DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Bound on the dials remembered. Bursts cap introducers at one per target,
-/// so a real day stays far below this.
+/// Bound on the dials remembered. A burst reaches at most one introducer
+/// per target and dials only the few it has, so a real day stays far below
+/// this.
 const MAX_REMEMBERED_DIALS: usize = 4096;
 
 /// Introducer dials in the last [`INTRODUCER_DAY`].

@@ -1138,7 +1138,7 @@ latest, whatever it waits on (an evidence load, a lookup), answering
 evidence, step 3 and step 5) runs until that budget ends, not to its own
 3 s or 8 s slice. A step that dials by address (steps 1, 2 and 4) keeps its
 slice inside the budget. In a leased connect step 2 dials by address only, so
-a LAN address never spends the target's one introducer of the burst.
+a LAN address never spends the target's introducer budget for the burst.
 
 The import still pins the card's machine as an authority source at the
 import time (ADR 0115). A card leads or moves an announced entry only when an
@@ -1240,7 +1240,9 @@ so learns the target) per target per burst. The burst tries the target's own
 named introducers first, then a seed when `latched_seed_introducers` is on
 (as on Android), also after the named ones fail. An unreachable introducer is
 skipped within 3 s while another candidate is left; the last candidate gets
-the rest of the burst's budget. None is dialled twice. An unreachable one
+the punch stage's remaining time, within the burst's budget. None is dialled
+twice for the same target in one connect (another target's connect in the
+same burst may dial the same one again). An unreachable one
 still receives this node's first handshake packets, and so its address, so
 `introducer_dials` can exceed one per target. Introducers never relay.
 

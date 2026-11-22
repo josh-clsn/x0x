@@ -9101,7 +9101,7 @@ impl Agent {
         // the reachable LAN path is attempted.
         // Inside a leased connect a LAN probe goes by address only: a
         // peer-authenticated dial could reach ant-quic's punch and spend the
-        // target's one introducer of the burst on a LAN address.
+        // target's introducer budget for the burst on a LAN address.
         let leased = network::leased_dial_deadline().is_some();
         for addr in &direct_probe_addrs {
             if let Some(peer_id_hint) = peer_id_hint {
