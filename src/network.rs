@@ -2443,6 +2443,23 @@ struct DemandLeases {
     until: HashMap<AntPeerId, tokio::time::Instant>,
 }
 
+tokio::task_local! {
+    /// The leased connect this task dials for
+    /// ([`NetworkNode::within_leased_dial`]).
+    static LEASED_DIAL: LeasedDial;
+}
+
+/// A leased connect in flight: its overall deadline.
+#[derive(Debug, Clone, Copy)]
+struct LeasedDial {
+    deadline: tokio::time::Instant,
+}
+
+/// The deadline of the leased connect the current task dials for, if any.
+pub(crate) fn leased_dial_deadline() -> Option<tokio::time::Instant> {
+    LEASED_DIAL.try_with(|dial| dial.deadline).ok()
+}
+
 /// #1277 test seam: the worker reports on the sender that it cleared the
 /// session registry, then waits on the receiver before it shuts the
 /// transport down.
@@ -4885,6 +4902,15 @@ impl NetworkNode {
         let mut leases = self.demand_leases_guard();
         leases.generation = leases.generation.wrapping_add(1);
         leases.until.clear();
+    }
+
+    /// Run `dial`, a leased connect for one target, with its overall
+    /// `deadline` ([`leased_dial_deadline`]).
+    pub(crate) async fn within_leased_dial<F: std::future::Future>(
+        deadline: tokio::time::Instant,
+        dial: F,
+    ) -> F::Output {
+        LEASED_DIAL.scope(LeasedDial { deadline }, dial).await
     }
 
     fn demand_leases_guard(&self) -> std::sync::MutexGuard<'_, DemandLeases> {

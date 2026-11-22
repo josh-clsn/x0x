@@ -135,6 +135,11 @@ engine-A routes, and the four TreeKEM catch-up routes).
   it listens publicly by its own setup (a port mapping or the relay opt-in):
   a NAT'd desktop that ant-quic read as directly reachable used to announce
   none.
+- **A check-in reaches a contact behind a home router.** A leased
+  `POST /agents/connect` runs every step inside one 12 s budget, so a step
+  that reaches the hole punch is not cut at its own 3 s or 8 s slice, and
+  ant-quic keeps a burst's direct pre-pass to 2 s, so the introducer and the
+  punch come in time.
 - **A burst's punch outcomes are visible.** `relay_client` gains
   `introducer_punch_successes` and `introducer_punch_failures`: hole-punch
   rounds run through an introducer that reached the target or did not

@@ -1130,6 +1130,14 @@ until one step connects:
 A later card for the same machine replaces the earlier card's lead, so card
 addresses never total more than 4 ahead of the announced ones.
 
+A leased connect (`lease_secs` above 0) runs all of its steps inside one
+budget of 12 s (`LEASED_DIAL_BUDGET`), under the 15 s an embedder waits for a
+check-in connect. A step that can reach the hole punch (the dial from peer
+evidence, step 3 and step 5) runs until that budget ends, not to its own
+3 s or 8 s slice. A step that dials by address (steps 1, 2 and 4) keeps its
+slice inside the budget. In a leased connect step 2 dials by address only, so
+a LAN address never spends the target's one introducer of the burst.
+
 The import still pins the card's machine as an authority source at the
 import time (ADR 0115). A card leads or moves an announced entry only when an
 authority store then confirms its machine; a fresher binding for another

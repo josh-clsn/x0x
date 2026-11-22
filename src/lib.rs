@@ -8384,6 +8384,9 @@ impl Agent {
     /// the same rules (one introducer per target per burst, hung up once the
     /// punch resolves, never a relay).
     ///
+    /// The whole connect, every step of it, shares one budget of
+    /// [`LEASED_DIAL_BUDGET`].
+    ///
     /// # Errors
     ///
     /// As [`Self::connect_to_agent_leased_capped`].
@@ -8402,6 +8405,7 @@ impl Agent {
             return Err(burst_cap_reached_error());
         }
         let lease = lease.min(std::time::Duration::from_secs(MAX_DEMAND_LEASE_SECS));
+        let deadline = tokio::time::Instant::now() + LEASED_DIAL_BUDGET;
         let generation = network.demand_lease_generation();
         // A leased dial is a burst dial: while latched it may use one
         // hole-punch introducer for this target, the coordinators the
@@ -8417,6 +8421,7 @@ impl Agent {
             let outcome = self.connect_to_agent(agent_id).await;
             (outcome, DIALED_MACHINE.with(std::cell::Cell::get))
         });
+        let dial = network::NetworkNode::within_leased_dial(deadline, dial);
         let (outcome, machine) = dial.await;
         let outcome = outcome?;
         let leased = record_demand_lease(network, generation, &outcome, machine, lease);
@@ -8653,7 +8658,7 @@ impl Agent {
             allow_local_discovery_addresses(network.config()),
         );
         let result = tokio::time::timeout(
-            EVIDENCE_CONNECT_DIAL_TIMEOUT,
+            dial_step_timeout(EVIDENCE_CONNECT_DIAL_TIMEOUT),
             network.connect_peer_with_addrs(peer, addrs),
         )
         .await;
@@ -8729,7 +8734,12 @@ impl Agent {
             // Taken right before each dial: a peer some other path connected
             // meanwhile is never closed here.
             let before = network.connected_peers().await;
-            match tokio::time::timeout(LOOPBACK_PROBE_TIMEOUT, network.connect_addr(addr)).await {
+            match tokio::time::timeout(
+                dial_probe_timeout(LOOPBACK_PROBE_TIMEOUT),
+                network.connect_addr(addr),
+            )
+            .await
+            {
                 Ok(Ok(connected)) if connected == peer_id => return Some(addr),
                 Ok(Ok(other)) => {
                     let claimed_after = self
@@ -9016,15 +9026,26 @@ impl Agent {
         // that may be stale or firewalled. Probe local IPv4 first so a bad
         // multi-address peer dial cannot consume the full API timeout before
         // the reachable LAN path is attempted.
+        // Inside a leased connect a LAN probe goes by address only: a
+        // peer-authenticated dial could reach ant-quic's punch and spend the
+        // target's one introducer of the burst on a LAN address.
+        let leased = network::leased_dial_deadline().is_some();
         for addr in &direct_probe_addrs {
             if let Some(peer_id_hint) = peer_id_hint {
-                match tokio::time::timeout(
-                    local_probe_timeout,
-                    network.connect_peer_with_addrs(peer_id_hint, vec![*addr]),
-                )
-                .await
-                {
-                    Ok(Ok((selected_addr, connected_peer_id)))
+                let authenticated = if leased {
+                    None
+                } else {
+                    Some(
+                        tokio::time::timeout(
+                            local_probe_timeout,
+                            network.connect_peer_with_addrs(peer_id_hint, vec![*addr]),
+                        )
+                        .await,
+                    )
+                };
+                match authenticated {
+                    None => {}
+                    Some(Ok(Ok((selected_addr, connected_peer_id))))
                         if connected_peer_id == peer_id_hint =>
                     {
                         let real_machine_id = identity::MachineId(connected_peer_id.0);
@@ -9047,7 +9068,7 @@ impl Agent {
                         );
                         return Ok(connectivity::ConnectOutcome::Direct(selected_addr));
                     }
-                    Ok(Ok((selected_addr, connected_peer_id))) => {
+                    Some(Ok(Ok((selected_addr, connected_peer_id)))) => {
                         tracing::warn!(
                             target: "x0x::connect",
                             stage = "connect_to_agent",
@@ -9059,7 +9080,7 @@ impl Agent {
                             "local peer-authenticated dial reached unexpected peer"
                         );
                     }
-                    Ok(Err(e)) => {
+                    Some(Ok(Err(e))) => {
                         tracing::debug!(
                             target: "x0x::connect",
                             %agent_prefix,
@@ -9069,7 +9090,7 @@ impl Agent {
                             "local peer-authenticated dial failed; trying verified raw-address fallback"
                         );
                     }
-                    Err(_) => {
+                    Some(Err(_)) => {
                         tracing::debug!(
                             target: "x0x::connect",
                             %agent_prefix,
@@ -9081,7 +9102,12 @@ impl Agent {
                     }
                 }
 
-                match tokio::time::timeout(local_probe_timeout, network.connect_addr(*addr)).await {
+                match tokio::time::timeout(
+                    dial_probe_timeout(local_probe_timeout),
+                    network.connect_addr(*addr),
+                )
+                .await
+                {
                     Ok(Ok(connected_peer_id)) if connected_peer_id == peer_id_hint => {
                         let real_machine_id = identity::MachineId(connected_peer_id.0);
                         if let Some(ref bc) = self.bootstrap_cache {
@@ -9136,7 +9162,12 @@ impl Agent {
                     }
                 }
             } else {
-                match tokio::time::timeout(local_probe_timeout, network.connect_addr(*addr)).await {
+                match tokio::time::timeout(
+                    dial_probe_timeout(local_probe_timeout),
+                    network.connect_addr(*addr),
+                )
+                .await
+                {
                     Ok(Ok(connected_peer_id)) => {
                         let real_machine_id = identity::MachineId(connected_peer_id.0);
                         if let Some(ref bc) = self.bootstrap_cache {
@@ -9196,7 +9227,7 @@ impl Agent {
                 })?;
 
             match tokio::time::timeout(
-                dial_timeout,
+                dial_step_timeout(dial_timeout),
                 network.connect_peer_with_addrs(peer_id_hint, info.addresses.clone()),
             )
             .await
@@ -9253,7 +9284,12 @@ impl Agent {
                 if direct_probe_addrs.contains(addr) {
                     continue;
                 }
-                match tokio::time::timeout(dial_timeout, network.connect_addr(*addr)).await {
+                match tokio::time::timeout(
+                    dial_probe_timeout(dial_timeout),
+                    network.connect_addr(*addr),
+                )
+                .await
+                {
                     Ok(Ok(connected_peer_id)) => {
                         // Use the real PeerId from the QUIC handshake (may differ
                         // from a zeroed placeholder in the discovery cache).
@@ -9395,7 +9431,7 @@ impl Agent {
                     )))
                 })?;
             let coordinated_result = tokio::time::timeout(
-                dial_timeout,
+                dial_step_timeout(dial_timeout),
                 network.connect_peer_with_addrs(peer_id_hint, info.addresses.clone()),
             )
             .await;
@@ -22953,8 +22989,32 @@ fn announcement_should_auto_connect(
 /// Longest demand lease [`Agent::connect_to_agent_leased`] grants.
 pub const MAX_DEMAND_LEASE_SECS: u64 = 300;
 
+/// The one budget every step of a leased connect shares
+/// ([`Agent::connect_to_agent_burst`]): under the 15 s an embedder waits
+/// for a check-in connect, and long enough for ant-quic's short direct
+/// pre-pass, its direct stage, the introducer dial and the punch.
+pub const LEASED_DIAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(12);
+
 /// Most hole-punch introducers one `POST /agents/connect` may hand over.
 pub const MAX_CONNECT_INTRODUCERS: usize = 4;
+
+/// How long one connector step may run. Outside a leased connect, its own
+/// `slice`; inside one, whatever is left of the connect's one budget, so a
+/// step that reaches the punch is not cut at its own slice.
+fn dial_step_timeout(slice: std::time::Duration) -> std::time::Duration {
+    network::leased_dial_deadline().map_or(slice, |deadline| {
+        deadline.saturating_duration_since(tokio::time::Instant::now())
+    })
+}
+
+/// [`dial_step_timeout`] for a probe that cannot punch (a LAN or loopback
+/// address dialled by address): its own `slice`, and inside a leased
+/// connect never past the connect's budget.
+fn dial_probe_timeout(slice: std::time::Duration) -> std::time::Duration {
+    network::leased_dial_deadline().map_or(slice, |deadline| {
+        slice.min(deadline.saturating_duration_since(tokio::time::Instant::now()))
+    })
+}
 
 tokio::task_local! {
     /// The peer-authenticated machine the enclosing
@@ -31780,6 +31840,105 @@ mod tests {
             network.peer_introducers(&ant_quic::PeerId(card.machine_id.0)),
             vec![kept]
         );
+    }
+
+    /// A loopback agent with its direct listener and no discovery entries.
+    async fn bare_agent(dir: &std::path::Path, name: &str) -> Agent {
+        let agent = Agent::builder()
+            .with_machine_key(dir.join(format!("{name}-machine.key")))
+            .with_agent_key_path(dir.join(format!("{name}-agent.key")))
+            .with_contact_store_path(dir.join(format!("{name}-contacts.json")))
+            .with_peer_cache_dir(dir.join(format!("{name}-peers")))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("agent");
+        agent.start_direct_listener();
+        agent
+    }
+
+    async fn bound(agent: &Agent) -> std::net::SocketAddr {
+        let network = std::sync::Arc::clone(agent.network().expect("network"));
+        normalize_loopback_addr(network.bound_addr().await.expect("bound"))
+    }
+
+    /// NAT-A2: inside a leased connect, a step runs until the connect's one
+    /// budget ends, not to its own 3 s or 8 s slice; a probe keeps its
+    /// slice within the budget. Outside, every step keeps its slice.
+    #[tokio::test(start_paused = true)]
+    async fn a_leased_connect_shares_one_budget_across_its_steps() {
+        let three = std::time::Duration::from_secs(3);
+        let eight = std::time::Duration::from_secs(8);
+        assert_eq!(dial_step_timeout(three), three);
+        assert_eq!(dial_probe_timeout(three), three);
+        let deadline = tokio::time::Instant::now() + LEASED_DIAL_BUDGET;
+        network::NetworkNode::within_leased_dial(deadline, async {
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            assert_eq!(dial_step_timeout(three), std::time::Duration::from_secs(11));
+            assert_eq!(dial_step_timeout(eight), std::time::Duration::from_secs(11));
+            assert_eq!(dial_probe_timeout(three), three);
+            tokio::time::advance(std::time::Duration::from_secs(10)).await;
+            assert_eq!(dial_step_timeout(eight), std::time::Duration::from_secs(1));
+            assert_eq!(dial_probe_timeout(three), std::time::Duration::from_secs(1));
+        })
+        .await;
+        assert!(LEASED_DIAL_BUDGET < std::time::Duration::from_secs(15));
+    }
+
+    /// The check-in field case: a latched phone dials a desktop whose
+    /// announced address is silent (a home NAT) and that is linked to a
+    /// public node. With that node handed back as an introducer, the
+    /// leased connect reaches the desktop through the punch inside the
+    /// connect's budget, and diagnostics show the introducer and the punch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_burst_reaches_a_desktop_behind_a_home_nat_through_an_introducer() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let phone = bare_agent(dir.path(), "phone").await;
+        phone.set_leaf_mode(true);
+        let desktop = bare_agent(dir.path(), "desktop").await;
+        let public = bare_agent(dir.path(), "public").await;
+        let public_addr = bound(&public).await;
+        desktop
+            .network()
+            .expect("network")
+            .connect_addr(public_addr)
+            .await
+            .expect("the desktop links to the public node");
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("silent");
+        let silent_addr = silent.local_addr().expect("silent addr");
+        let now = Agent::unix_timestamp_secs();
+        phone
+            .insert_discovered_agent_for_testing(DiscoveredAgent {
+                can_receive_direct: Some(false),
+                ..card_pin(
+                    desktop.agent_id(),
+                    desktop.machine_id(),
+                    vec![silent_addr],
+                    now,
+                )
+            })
+            .await;
+        phone.quiesce_mesh().await.expect("latch");
+
+        let started = std::time::Instant::now();
+        let (outcome, leased) = phone
+            .connect_to_agent_burst(
+                &desktop.agent_id(),
+                std::time::Duration::from_secs(120),
+                None,
+                &[public_addr],
+            )
+            .await
+            .expect("the connect runs");
+        let took = started.elapsed();
+        assert!(outcome.is_live_path(), "{outcome:?} after {took:?}");
+        assert!(leased, "the lease was recorded");
+        assert!(took < LEASED_DIAL_BUDGET, "{took:?}");
+        let snap = phone.network().expect("network").relay_client_snapshot();
+        assert_eq!(snap.introducer_dials, 1, "{snap:?}");
+        assert_eq!(snap.introducer_seed_dials, 0, "{snap:?}");
+        assert_eq!(snap.introducer_punch_successes, 1, "{snap:?}");
+        drop(silent);
     }
 
     /// A zero lease records nothing.
