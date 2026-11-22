@@ -8432,6 +8432,9 @@ impl Agent {
         let _end = LeasedConnectEnd {
             network: std::sync::Arc::clone(network),
         };
+        // While latched, the link to the target stays up until its lease is
+        // recorded; any other link this connect opens is a stray.
+        let _target = network.begin_leased_target(self.leased_connect_target(agent_id).await);
         // A leased dial is a burst dial: while latched it may use one
         // hole-punch introducer for this target, the coordinators the
         // target announced first.
@@ -8467,6 +8470,32 @@ impl Agent {
         let outcome = outcome?;
         let leased = record_demand_lease(network, generation, &outcome, machine, lease);
         Ok((outcome, leased))
+    }
+
+    /// The machine a leased connect to `agent_id` dials: its discovery
+    /// entry's, else the one its peer evidence names. `None` when neither
+    /// knows one (a card with no machine): such a connect spares every link
+    /// while it runs.
+    async fn leased_connect_target(
+        &self,
+        agent_id: &identity::AgentId,
+    ) -> Option<ant_quic::PeerId> {
+        let routed = {
+            let cache = self.identity_discovery_cache.read().await;
+            cache
+                .get(agent_id)
+                .map(|entry| entry.machine_id)
+                .filter(|machine| machine.0 != [0u8; 32])
+        };
+        routed
+            .or_else(|| {
+                self.peer_evidence()
+                    .try_usable_agent(*agent_id, dm_capability::now_unix_ms())
+                    .ok()
+                    .flatten()
+                    .map(|view| view.announcement.machine_id)
+            })
+            .map(|machine| ant_quic::PeerId(machine.0))
     }
 
     /// M-2: name this account's own devices (by agent id, by machine id or
@@ -23119,11 +23148,14 @@ tokio::task_local! {
     static DIALED_MACHINE: std::cell::Cell<Option<identity::MachineId>>;
 }
 
-/// M2: the end of a leased connect. While latched, once no burst dial is in
-/// flight, every link no demand lease covers is closed: one that came up
-/// during the connect and kept no lease (a refused lease, a burst that
-/// ended mid-dial, a link that won the race with the cancel). Spawned from
-/// `Drop`, so it also runs when the connect itself is dropped.
+/// M2: the end of a leased connect. While latched, every link no demand
+/// lease, other leased connect's target or held introducer covers is
+/// closed: one that came up during the connect and kept no lease (a
+/// refused lease, a burst that ended mid-dial, a link that won the race
+/// with the cancel, a stray a probe reached). The connect's own target is
+/// unregistered before this runs, so another leased connect in flight does
+/// not spare its strays. Spawned from `Drop`, so it also runs when the
+/// connect itself is dropped.
 struct LeasedConnectEnd {
     network: std::sync::Arc<network::NetworkNode>,
 }
@@ -32652,9 +32684,10 @@ mod tests {
             })
             .await;
         alice.quiesce_mesh().await.expect("latch");
-        // A burst dial that keeps no lease: the link stays while the burst
-        // dial is in flight.
+        // A leased connect whose target is unknown, still in flight, that
+        // keeps no lease: the link stays while it runs.
         let _burst = alice_net.begin_burst_dial();
+        let _target = alice_net.begin_leased_target(None);
         let reached = network::NetworkNode::within_leased_dial(
             alice_net.demand_lease_generation(),
             tokio::time::Instant::now() + LEASED_DIAL_BUDGET,

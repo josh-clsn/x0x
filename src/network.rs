@@ -2218,6 +2218,12 @@ pub struct NetworkNode {
     /// mesh is latched, a burst dial may use one hole-punch introducer per
     /// target; outside one, nothing is dialled to coordinate.
     burst_dials: Arc<std::sync::atomic::AtomicUsize>,
+    /// The target machines of the leased connects in flight, counted
+    /// ([`NetworkNode::begin_leased_target`]). `None` stands for a connect
+    /// whose target machine is unknown, which spares every link while it
+    /// runs. While latched, only these links (and leased ones, and a held
+    /// introducer's) stay up.
+    burst_targets: Arc<Mutex<HashMap<Option<AntPeerId>, usize>>>,
     /// M-2: the own peers the embedder named (`PUT /mesh/own-peers`), kept
     /// so agent ids not yet resolved to a machine can be resolved later.
     own_peer_request: Arc<Mutex<OwnPeerRequest>>,
@@ -2871,6 +2877,7 @@ impl NetworkNode {
             relay_client: Arc::new(RelayClientCounters::default()),
             relay_switch: Arc::new(OnceLock::new()),
             burst_dials: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            burst_targets: Arc::new(Mutex::new(HashMap::new())),
             own_peer_request: Arc::new(Mutex::new(OwnPeerRequest::default())),
             burst_hint_machines: Arc::new(Mutex::new(HashMap::new())),
             introducer_day: Arc::new(Mutex::new(introducer_day::IntroducerDay::default())),
@@ -5038,18 +5045,57 @@ impl NetworkNode {
         )))
     }
 
-    /// M2: while latched, close a link no burst booked as soon as it comes
-    /// up: no live demand lease covers its peer and no burst dial is in
-    /// flight (a leased connect's link comes up before its lease is
-    /// recorded). Such a link is one a dial finished after its burst ended
-    /// (a latch call or a trip landed mid-handshake), one ant-quic completed
-    /// after its connect was dropped, or one a re-sweep raced. Its bytes are
-    /// counted toward an armed burst cap first.
-    pub(crate) async fn close_unbooked_link(&self, peer: AntPeerId) {
+    /// Register `target`, the machine a leased connect is dialling (`None`
+    /// when it is unknown), until the guard drops. While latched, a link to
+    /// it stays up although its lease is recorded only when the connect
+    /// ends.
+    pub(crate) fn begin_leased_target(&self, target: Option<AntPeerId>) -> LeasedTargetGuard {
+        *self.burst_targets_guard().entry(target).or_insert(0) += 1;
+        LeasedTargetGuard {
+            node: self.clone(),
+            target,
+        }
+    }
+
+    fn burst_targets_guard(&self) -> std::sync::MutexGuard<'_, HashMap<Option<AntPeerId>, usize>> {
+        match self.burst_targets.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Whether a latched node keeps the link to `peer` (at `addr`, when
+    /// known): the mesh is on, a live demand lease covers the peer, it is
+    /// the target of a leased connect in flight (or one in flight has an
+    /// unknown target), or the link is to the introducer a burst connect
+    /// holds for its punch.
+    fn link_is_booked(&self, peer: &AntPeerId, addr: Option<SocketAddr>) -> bool {
         if !self.mesh_quiesced.load(Ordering::Relaxed)
-            || self.burst_dials.load(Ordering::SeqCst) > 0
-            || self.demand_leased(&peer, tokio::time::Instant::now())
+            || self.demand_leased(peer, tokio::time::Instant::now())
         {
+            return true;
+        }
+        {
+            let targets = self.burst_targets_guard();
+            if targets.contains_key(&None) || targets.contains_key(&Some(*peer)) {
+                return true;
+            }
+        }
+        addr.is_some_and(|addr| {
+            self.relay_switch
+                .get()
+                .is_some_and(|endpoint| endpoint.holds_introducer_at(addr))
+        })
+    }
+
+    /// M2: while latched, close a link no burst booked as soon as it comes
+    /// up ([`Self::link_is_booked`]). Such a link is a stray an address-only
+    /// probe reached, one a dial finished after its burst ended (a latch
+    /// call or a trip landed mid-handshake), one ant-quic completed after
+    /// its connect was dropped, or one a re-sweep raced. Its bytes are
+    /// counted toward an armed burst cap first.
+    pub(crate) async fn close_unbooked_link(&self, peer: AntPeerId, addr: Option<SocketAddr>) {
+        if self.link_is_booked(&peer, addr) {
             return;
         }
         self.observe_burst_cap_links().await;
@@ -5070,8 +5116,15 @@ impl NetworkNode {
     /// leased connect ends while latched, and when the guard's event stream
     /// lagged.
     pub(crate) async fn close_unbooked_links(&self) {
-        for peer in self.connected_peers().await {
-            self.close_unbooked_link(peer).await;
+        let Some(node) = self.node.read().await.as_ref().cloned() else {
+            return;
+        };
+        for conn in node.connected_peers().await {
+            let addr = match conn.remote_addr {
+                TransportAddr::Udp(addr) => Some(addr),
+                _ => None,
+            };
+            self.close_unbooked_link(conn.peer_id, addr).await;
         }
     }
 
@@ -5083,8 +5136,12 @@ impl NetworkNode {
         tokio::spawn(async move {
             loop {
                 match events.recv().await {
-                    Ok(ant_quic::P2pEvent::PeerConnected { peer_id, .. }) => {
-                        guard.close_unbooked_link(peer_id).await;
+                    Ok(ant_quic::P2pEvent::PeerConnected { peer_id, addr, .. }) => {
+                        let addr = match addr {
+                            TransportAddr::Udp(addr) => Some(addr),
+                            _ => None,
+                        };
+                        guard.close_unbooked_link(peer_id, addr).await;
                     }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -8598,6 +8655,25 @@ pub(crate) struct BurstDialGuard {
     node: NetworkNode,
 }
 
+/// A leased connect's target, registered while the connect runs
+/// ([`NetworkNode::begin_leased_target`]).
+pub(crate) struct LeasedTargetGuard {
+    node: NetworkNode,
+    target: Option<AntPeerId>,
+}
+
+impl Drop for LeasedTargetGuard {
+    fn drop(&mut self) {
+        let mut targets = self.node.burst_targets_guard();
+        if let Some(count) = targets.get_mut(&self.target) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                targets.remove(&self.target);
+            }
+        }
+    }
+}
+
 impl Drop for BurstDialGuard {
     fn drop(&mut self) {
         self.node.burst_dials.fetch_sub(1, Ordering::SeqCst);
@@ -9268,6 +9344,7 @@ mod tests {
     /// so the latched dial seams let it through.
     async fn as_burst_dial<F: std::future::Future>(phone: &NetworkNode, dial: F) -> F::Output {
         let _burst = phone.begin_burst_dial();
+        let _target = phone.begin_leased_target(None);
         let generation = phone.demand_lease_generation();
         NetworkNode::within_leased_dial(
             generation,
@@ -9920,13 +9997,21 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        let burst = phone.begin_burst_dial();
+        // While a leased connect to another machine runs, the link is a
+        // stray and is closed; the link to that connect's own target stays.
+        let other = phone.begin_leased_target(Some(ant_quic::PeerId([0x5e; 32])));
+        let _ = phone.connect_beneath_gates_for_test(peer_addr).await;
+        assert!(
+            link_gone(phone.clone()).await,
+            "a stray is closed while another leased connect runs"
+        );
+        let target = phone.begin_leased_target(Some(peer_id));
         let _ = phone.connect_beneath_gates_for_test(peer_addr).await;
         assert!(
             !link_gone(phone.clone()).await,
-            "a link that comes up during a burst dial stays"
+            "the link to a leased connect's target stays"
         );
-        drop(burst);
+        drop((other, target));
         let _ = peer.try_shutdown().await;
         let _ = phone.try_shutdown().await;
     }
@@ -10039,13 +10124,21 @@ mod tests {
             .await
             .expect("phone");
         phone.latch_mesh_quiesced().expect("fresh latch");
-        let burst = phone.begin_burst_dial();
         let peer_addr = peer.bound_addr().await.expect("peer bound");
-        as_burst_dial(&phone, phone.connect_addr(peer_addr))
+        // A short lease admits the dial and keeps the link through the
+        // latch guard; once it ends the link stays up, unleased.
+        assert!(phone.lease_demand_peer(
+            peer.peer_id(),
+            tokio::time::Instant::now() + Duration::from_millis(200),
+        ));
+        phone
+            .connect_peer_with_addrs(peer.peer_id(), vec![peer_addr])
             .await
             .expect("the phone reaches the peer");
+        let burst = phone.begin_burst_dial();
         assert!(phone.arm_burst_cap(1 << 30).await);
         drop(burst);
+        tokio::time::sleep(Duration::from_millis(250)).await;
         (phone, peer)
     }
 
