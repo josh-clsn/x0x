@@ -8454,7 +8454,10 @@ impl Agent {
                 }
                 return Ok((connectivity::ConnectOutcome::Unreachable, false));
             }
-            dialled = dial => dialled,
+            dialled = within_leased_budget(deadline, dial) => match dialled {
+                Some(dialled) => dialled,
+                None => return Ok((connectivity::ConnectOutcome::Unreachable, false)),
+            },
         };
         let outcome = outcome?;
         let leased = record_demand_lease(network, generation, &outcome, machine, lease);
@@ -23054,6 +23057,23 @@ pub const MAX_DEMAND_LEASE_SECS: u64 = 300;
 /// pre-pass, its direct stage, the introducer dial and the punch.
 pub const LEASED_DIAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(12);
 
+/// What a leased connect may run past [`LEASED_DIAL_BUDGET`] for the
+/// bookkeeping after a dial that answered at the last moment.
+const LEASED_CONNECT_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// L1: the whole leased connect, not only its dial steps, ends at its
+/// budget plus [`LEASED_CONNECT_GRACE`]: an evidence load barrier, a lookup
+/// or an authority check cannot keep the answer past the embedder's wait.
+/// `None` when the budget ran out.
+async fn within_leased_budget<F: std::future::Future>(
+    deadline: tokio::time::Instant,
+    connect: F,
+) -> Option<F::Output> {
+    tokio::time::timeout_at(deadline + LEASED_CONNECT_GRACE, connect)
+        .await
+        .ok()
+}
+
 /// Most hole-punch introducers one `POST /agents/connect` may hand over.
 pub const MAX_CONNECT_INTRODUCERS: usize = 4;
 
@@ -32011,6 +32031,21 @@ mod tests {
         })
         .await;
         assert!(LEASED_DIAL_BUDGET < std::time::Duration::from_secs(15));
+    }
+
+    /// L1: the whole leased connect ends at its budget plus a short grace,
+    /// even when it is waiting on something that is not a dial step.
+    #[tokio::test(start_paused = true)]
+    async fn a_leased_connect_never_outlives_its_budget() {
+        let deadline = tokio::time::Instant::now() + LEASED_DIAL_BUDGET;
+        let started = tokio::time::Instant::now();
+        assert!(within_leased_budget(deadline, std::future::pending::<()>())
+            .await
+            .is_none());
+        assert_eq!(started.elapsed(), LEASED_DIAL_BUDGET + LEASED_CONNECT_GRACE);
+        let deadline = tokio::time::Instant::now() + LEASED_DIAL_BUDGET;
+        assert_eq!(within_leased_budget(deadline, async { 7 }).await, Some(7));
+        assert!(LEASED_DIAL_BUDGET + LEASED_CONNECT_GRACE < std::time::Duration::from_secs(15));
     }
 
     /// The check-in field case: a latched phone dials a desktop whose
