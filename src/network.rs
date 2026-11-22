@@ -2224,6 +2224,10 @@ pub struct NetworkNode {
     /// runs. While latched, only these links (and leased ones, and a held
     /// introducer's) stay up.
     burst_targets: Arc<Mutex<HashMap<Option<AntPeerId>, usize>>>,
+    /// Test seam: the latch guard parks here after counting a link's bytes
+    /// and before its last check.
+    #[cfg(test)]
+    unbooked_close_pause_for_test: Arc<Mutex<Option<RegistryClearPause>>>,
     /// M-2: the own peers the embedder named (`PUT /mesh/own-peers`), kept
     /// so agent ids not yet resolved to a machine can be resolved later.
     own_peer_request: Arc<Mutex<OwnPeerRequest>>,
@@ -2878,6 +2882,8 @@ impl NetworkNode {
             relay_switch: Arc::new(OnceLock::new()),
             burst_dials: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             burst_targets: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            unbooked_close_pause_for_test: Arc::new(Mutex::new(None)),
             own_peer_request: Arc::new(Mutex::new(OwnPeerRequest::default())),
             burst_hint_machines: Arc::new(Mutex::new(HashMap::new())),
             introducer_day: Arc::new(Mutex::new(introducer_day::IntroducerDay::default())),
@@ -5093,12 +5099,28 @@ impl NetworkNode {
     /// probe reached, one a dial finished after its burst ended (a latch
     /// call or a trip landed mid-handshake), one ant-quic completed after
     /// its connect was dropped, or one a re-sweep raced. Its bytes are
-    /// counted toward an armed burst cap first.
+    /// counted toward an armed burst cap first, and the decision is checked
+    /// again after that count, so a link a leased connect took over and
+    /// leased meanwhile stays.
     pub(crate) async fn close_unbooked_link(&self, peer: AntPeerId, addr: Option<SocketAddr>) {
         if self.link_is_booked(&peer, addr) {
             return;
         }
         self.observe_burst_cap_links().await;
+        #[cfg(test)]
+        {
+            let pause = match self.unbooked_close_pause_for_test.lock() {
+                Ok(mut guard) => guard.take(),
+                Err(poisoned) => poisoned.into_inner().take(),
+            };
+            if let Some((reached, release)) = pause {
+                let _ = reached.send(());
+                let _ = release.await;
+            }
+        }
+        if self.link_is_booked(&peer, addr) {
+            return;
+        }
         if self
             .disconnect_with_reason(&peer, DisconnectReason::Quiesce)
             .await
@@ -5126,6 +5148,24 @@ impl NetworkNode {
             };
             self.close_unbooked_link(conn.peer_id, addr).await;
         }
+    }
+
+    /// Test seam: park the latch guard after it counted a link's bytes
+    /// and before its last check; the receiver fires when it parks.
+    #[cfg(test)]
+    pub(crate) fn pause_unbooked_close_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        match self.unbooked_close_pause_for_test.lock() {
+            Ok(mut guard) => *guard = Some((reached_tx, release_rx)),
+            Err(poisoned) => *poisoned.into_inner() = Some((reached_tx, release_rx)),
+        }
+        (reached_rx, release_tx)
     }
 
     /// M2: watch the endpoint's connections and close each one a latched
@@ -10012,6 +10052,39 @@ mod tests {
             "the link to a leased connect's target stays"
         );
         drop((other, target));
+        let _ = peer.try_shutdown().await;
+        let _ = phone.try_shutdown().await;
+    }
+
+    /// N3: the latch guard checks again after counting the link's bytes,
+    /// so a link a leased connect took over and leased in that gap stays.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_latch_guard_spares_a_link_leased_while_it_decided() {
+        let phone = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("phone");
+        let peer = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("peer");
+        let peer_addr = peer.bound_addr().await.expect("peer bound");
+        let peer_id = peer.peer_id();
+        phone.latch_mesh_quiesced().expect("fresh latch");
+        let (parked, release) = phone.pause_unbooked_close_for_test();
+        let _ = phone.connect_beneath_gates_for_test(peer_addr).await;
+        tokio::time::timeout(Duration::from_secs(5), parked)
+            .await
+            .expect("the guard parks before its last check")
+            .expect("pause sender kept");
+        assert!(phone.lease_demand_peer(
+            peer_id,
+            tokio::time::Instant::now() + Duration::from_secs(60)
+        ));
+        let _ = release.send(());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            phone.is_connected(&peer_id).await,
+            "the link leased in the gap stays"
+        );
         let _ = peer.try_shutdown().await;
         let _ = phone.try_shutdown().await;
     }
