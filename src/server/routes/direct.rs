@@ -55,6 +55,37 @@ pub(in crate::server) struct ConnectAgentRequest {
     /// mesh is on; 0 is refused with 400 (omit it for no cap).
     #[serde(default)]
     max_bytes: Option<u64>,
+    /// Hole-punch introducers the embedder kept for the target (socket
+    /// addresses, at most `x0x::MAX_CONNECT_INTRODUCERS`), for example the
+    /// `coordinators` of an earlier `GET /agents/discovered/:agent_id`. A
+    /// leased connect uses them after the coordinators the target announces
+    /// now, under the same rules; an unleased connect ignores them.
+    #[serde(default)]
+    introducers: Option<Vec<String>>,
+}
+
+/// Parse a `POST /agents/connect` `introducers` list: each a socket
+/// address, at most [`x0x::MAX_CONNECT_INTRODUCERS`] of them.
+fn parse_connect_introducers(
+    given: Option<&[String]>,
+) -> Result<Vec<std::net::SocketAddr>, String> {
+    let given = given.unwrap_or_default();
+    if given.len() > x0x::MAX_CONNECT_INTRODUCERS {
+        return Err(format!(
+            "introducers: at most {} addresses",
+            x0x::MAX_CONNECT_INTRODUCERS
+        ));
+    }
+    let mut addrs = Vec::with_capacity(given.len());
+    for text in given {
+        let addr: std::net::SocketAddr = text
+            .parse()
+            .map_err(|_| format!("introducers: {text:?} is not a socket address"))?;
+        if !addrs.contains(&addr) {
+            addrs.push(addr);
+        }
+    }
+    Ok(addrs)
 }
 
 /// The `lease_secs` a `POST /agents/connect` answers with: the granted
@@ -263,6 +294,10 @@ pub(in crate::server) async fn connect_agent(
             "max_bytes must be at least 1 (omit it for no cap)",
         );
     }
+    let introducers = match parse_connect_introducers(req.introducers.as_deref()) {
+        Ok(introducers) => introducers,
+        Err(e) => return api_error(StatusCode::BAD_REQUEST, e),
+    };
     if state
         .agent
         .network()
@@ -282,10 +317,11 @@ pub(in crate::server) async fn connect_agent(
             Some(secs) => {
                 state
                     .agent
-                    .connect_to_agent_leased_capped(
+                    .connect_to_agent_burst(
                         &agent_id,
                         std::time::Duration::from_secs(secs),
                         req.max_bytes,
+                        &introducers,
                     )
                     .await
             }
@@ -758,6 +794,40 @@ mod tests {
         assert!(!max_bytes_is_valid(Some(0)));
         assert!(max_bytes_is_valid(Some(1)));
         assert!(max_bytes_is_valid(None));
+    }
+
+    /// NAT-B: `introducers` are socket addresses, at most four; duplicates
+    /// collapse, a bad address or a fifth one is refused.
+    #[test]
+    fn connect_introducers_are_checked_and_bounded() {
+        use super::parse_connect_introducers;
+        let list = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(parse_connect_introducers(None), Ok(Vec::new()));
+        assert_eq!(
+            parse_connect_introducers(Some(&list(&[
+                "203.0.113.7:5483",
+                "[2001:db8::1]:9000",
+                "203.0.113.7:5483"
+            ]))),
+            Ok(vec![
+                "203.0.113.7:5483".parse().unwrap(),
+                "[2001:db8::1]:9000".parse().unwrap()
+            ])
+        );
+        assert!(parse_connect_introducers(Some(&list(&["seed.example:5483"]))).is_err());
+        assert!(parse_connect_introducers(Some(&list(&["203.0.113.7"]))).is_err());
+        let five = list(&[
+            "203.0.113.1:1",
+            "203.0.113.2:1",
+            "203.0.113.3:1",
+            "203.0.113.4:1",
+            "203.0.113.5:1",
+        ]);
+        assert!(parse_connect_introducers(Some(&five)).is_err());
+        assert_eq!(
+            parse_connect_introducers(Some(&five[..4])).map(|addrs| addrs.len()),
+            Ok(4)
+        );
     }
 
     #[test]

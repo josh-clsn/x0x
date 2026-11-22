@@ -128,6 +128,13 @@ engine-A routes, and the four TreeKEM catch-up routes).
   further leased connects 409 `burst_cap_reached` until the next
   `POST /mesh/quiesce`. `GET /diagnostics/connectivity` `burst_cap` reports
   it. CLI `x0x direct connect --max-bytes`.
+- **An embedder can keep a target's coordinators and hand them back.**
+  `GET /agents/discovered` entries carry the target's announced
+  `coordinators`, and a leased `POST /agents/connect` takes them back as
+  `introducers` (at most 4). Every node now announces its coordinators unless
+  it listens publicly by its own setup (a port mapping or the relay opt-in):
+  a NAT'd desktop that ant-quic read as directly reachable used to announce
+  none.
 - **A burst's punch outcomes are visible.** `relay_client` gains
   `introducer_punch_successes` and `introducer_punch_failures`: hole-punch
   rounds run through an introducer that reached the target or did not

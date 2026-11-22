@@ -25,6 +25,11 @@ pub(in crate::server) struct DiscoveredAgentEntry {
     /// ADR-0036 agent self-name from the V3 announce, when the peer set one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(in crate::server) self_name: Option<String>,
+    /// The addresses of the coordinators the agent announced it is reachable
+    /// through (`reachable_via`), the ones a burst dial would use as its
+    /// hole-punch introducers. Omitted when none is known.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(in crate::server) coordinators: Vec<String>,
 }
 
 /// Discovered machine endpoint entry from machine announcements.
@@ -73,7 +78,25 @@ pub(in crate::server) fn discovered_agent_entry(
         last_seen: agent.last_seen,
         // Some("") is the internal explicit-clear marker — never display it.
         self_name: agent.self_name.filter(|n| !n.is_empty()),
+        coordinators: Vec::new(),
     }
+}
+
+/// [`discovered_agent_entry`] for each agent, with the coordinator
+/// addresses each announced.
+pub(in crate::server) async fn discovered_agent_entries(
+    state: &AppState,
+    agents: Vec<x0x::DiscoveredAgent>,
+) -> Vec<DiscoveredAgentEntry> {
+    let coordinators = state.agent.announced_coordinator_addrs(&agents).await;
+    agents
+        .into_iter()
+        .zip(coordinators)
+        .map(|(agent, coordinators)| DiscoveredAgentEntry {
+            coordinators: coordinators.iter().map(ToString::to_string).collect(),
+            ..discovered_agent_entry(agent)
+        })
+        .collect()
 }
 
 pub(in crate::server) fn discovered_machine_entry(
@@ -116,8 +139,7 @@ pub(in crate::server) async fn discovered_agents(
     };
     match result {
         Ok(agents) => {
-            let entries: Vec<DiscoveredAgentEntry> =
-                agents.into_iter().map(discovered_agent_entry).collect();
+            let entries = discovered_agent_entries(&state, agents).await;
             (
                 StatusCode::OK,
                 Json(serde_json::json!({ "ok": true, "agents": entries })),
@@ -154,7 +176,7 @@ pub(in crate::server) async fn discovered_agent(
                         StatusCode::OK,
                         Json(serde_json::json!({
                             "ok": true,
-                            "agent": discovered_agent_entry(agent),
+                            "agent": discovered_agent_entries(&state, vec![agent]).await.pop(),
                         })),
                     ),
                     _ => (
@@ -183,7 +205,7 @@ pub(in crate::server) async fn discovered_agent(
             StatusCode::OK,
             Json(serde_json::json!({
                 "ok": true,
-                "agent": discovered_agent_entry(agent),
+                "agent": discovered_agent_entries(&state, vec![agent]).await.pop(),
             })),
         ),
         Ok(None) => not_found("agent not found"),
@@ -238,8 +260,7 @@ pub(in crate::server) async fn agents_by_user_handler(
     let user_id = x0x::identity::UserId(user_id_bytes);
     match state.agent.find_agents_by_user(user_id).await {
         Ok(agents) => {
-            let entries: Vec<DiscoveredAgentEntry> =
-                agents.into_iter().map(discovered_agent_entry).collect();
+            let entries = discovered_agent_entries(&state, agents).await;
             (
                 StatusCode::OK,
                 Json(serde_json::json!({

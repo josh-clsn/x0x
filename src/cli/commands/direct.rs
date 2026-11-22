@@ -10,6 +10,7 @@ pub async fn connect(
     agent_id: &str,
     lease_secs: Option<u64>,
     max_bytes: Option<u64>,
+    introducers: &[String],
 ) -> Result<()> {
     client.ensure_running().await?;
     let mut body = serde_json::json!({ "agent_id": agent_id });
@@ -18,6 +19,9 @@ pub async fn connect(
     }
     if let Some(max_bytes) = max_bytes {
         body["max_bytes"] = serde_json::json!(max_bytes);
+    }
+    if !introducers.is_empty() {
+        body["introducers"] = serde_json::json!(introducers);
     }
     let resp = client.post("/agents/connect", &body).await?;
     print_value(client.format(), &resp);
@@ -148,7 +152,14 @@ mod tests {
         let mock_resp = serde_json::json!({"outcome": "Connected"});
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
-        let result = connect(&client, &"aa".repeat(32), Some(60), Some(1_048_576)).await;
+        let result = connect(
+            &client,
+            &"aa".repeat(32),
+            Some(60),
+            Some(1_048_576),
+            &["203.0.113.7:5483".to_string()],
+        )
+        .await;
         assert!(result.is_ok(), "connect should succeed: {:?}", result);
     }
 

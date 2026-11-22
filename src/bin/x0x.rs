@@ -1344,6 +1344,11 @@ enum DirectSub {
         /// next mesh quiesce.
         #[arg(long)]
         max_bytes: Option<u64>,
+        /// With a lease: a hole-punch introducer kept for the target
+        /// (IP:PORT, repeatable, at most 4), used after the coordinators
+        /// the target announces.
+        #[arg(long = "introducer")]
+        introducers: Vec<String>,
     },
     /// Send a direct message to an agent.
     Send {
@@ -2842,7 +2847,11 @@ async fn run(
                 agent_id,
                 lease_secs,
                 max_bytes,
-            } => commands::direct::connect(&client, &agent_id, lease_secs, max_bytes).await,
+                introducers,
+            } => {
+                commands::direct::connect(&client, &agent_id, lease_secs, max_bytes, &introducers)
+                    .await
+            }
             DirectSub::Send {
                 agent_id,
                 message,

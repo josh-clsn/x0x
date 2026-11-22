@@ -1023,6 +1023,20 @@ Query params:
 `wait` is a **boolean**: the daemon waits its fixed discovery window when
 `true` (a numeric value such as `wait=5` is a query-deserialize 400).
 
+An agent entry from `GET /agents/discovered`, `GET /agents/discovered/:agent_id`
+and `GET /users/:user_id/agents` carries `coordinators`: the addresses of the
+coordinators the agent announced it is reachable through (`reachable_via`),
+the two this node saw most recently for each, in the agent's order. They are
+the hole-punch introducers a burst dial uses for the agent. The field is left
+out when none is known. An embedder can keep them and hand them back as
+`introducers` on a later leased `POST /agents/connect` (see
+[Latched dials and seeds](#latched-dials-and-seeds)):
+
+```json
+{ "agent_id": "<64 hex>", "machine_id": "<64 hex>", "addresses": ["198.51.100.4:5483"],
+  "coordinators": ["203.0.113.7:5483", "[2001:db8::7]:5483"], "...": "..." }
+```
+
 ## Contacts, machines, and trust
 
 ### Contacts
@@ -1188,6 +1202,31 @@ that announced no introducer of its own gets no hole punch unless the daemon
 setting `latched_seed_introducers` (TOML, default `false`) is `true`: then a
 bootstrap seed may be its one hole-punch introducer. The seed learns this
 node's address and whom it is calling, and never relays data.
+
+The target's announced coordinators reach this node only while the target is
+in its discovery cache. A leased `/agents/connect` may hand back ones the
+embedder kept (for example an earlier entry's `coordinators`):
+
+```json
+{ "agent_id": "<64 hex>", "lease_secs": 90, "max_bytes": 1048576,
+  "introducers": ["203.0.113.7:5483", "[2001:db8::7]:5483"] }
+```
+
+`introducers` is a list of at most 4 socket addresses (`IP:PORT`); a bad
+address or a longer list answers 400. For this dial they join the coordinators
+the target announces now, after them, and the same rules apply: one
+introducer per target per burst, hung up on once the punch resolves, never a
+relay. An unleased connect ignores them. CLI: `x0x direct connect
+--lease-secs 90 --introducer 203.0.113.7:5483`.
+
+Every node announces the coordinators it is linked to (`reachable_via`)
+unless it listens publicly by its own setup: an active router port mapping,
+or the relay opt-in (`--relay`, `X0X_RELAY_OPT_IN=1`). It no longer leaves
+them out when ant-quic reads it as able to receive direct, because ant-quic
+reads any fresh inbound direct link that way, a LAN one included, or one a
+peer opened through the mapping the node had opened toward it. A desktop
+behind a home NAT used to announce no coordinator, so a latched phone had no
+introducer for it.
 
 With the daemon setting `relay_service_disabled = true` (TOML, default
 `false`, for a phone) the node never serves a relay session or coordinates a

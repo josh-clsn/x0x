@@ -1674,6 +1674,12 @@
             "in": "body",
             "name": "max_bytes",
             "required": false
+          },
+          {
+            "cli": "--introducer",
+            "in": "body",
+            "name": "introducers",
+            "required": false
           }
         ],
         "kind": "fields"

@@ -4882,6 +4882,9 @@ impl DiscoveredMachine {
 struct AnnouncementAssistSnapshot {
     nat_type: Option<String>,
     can_receive_direct: Option<bool>,
+    /// Whether this node listens publicly by its own setup: an active
+    /// router port mapping or the operator's relay opt-in.
+    publicly_listening: Option<bool>,
     relay_capable: Option<bool>,
     coordinator_capable: Option<bool>,
     relay_active: Option<bool>,
@@ -4916,11 +4919,27 @@ impl AnnouncementAssistSnapshot {
         Self {
             nat_type: Some(status.nat_type.to_string()),
             can_receive_direct: Some(status.can_receive_direct),
+            publicly_listening: Some(status.port_mapping_active || relay_opt_in_explicit()),
             relay_capable: Some(status.relay_service_enabled && plausibly_public),
             coordinator_capable: Some(status.coordinator_service_enabled && plausibly_public),
             relay_active: Some(status.is_relaying),
             coordinator_active: Some(status.is_coordinating),
         }
+    }
+
+    /// Whether an announcement names the coordinators this node is connected
+    /// to (`reachable_via`), the introducers a latched contact's burst dial
+    /// uses to punch through to it. Every node does, unless it listens
+    /// publicly by its own setup (a port mapping or the relay opt-in).
+    ///
+    /// `can_receive_direct` does not decide it: ant-quic sets it for any
+    /// fresh inbound direct connection, a LAN or loopback one included, and
+    /// for an inbound link a peer opened through the NAT mapping this node
+    /// opened toward it first. A desktop behind a home NAT therefore reads
+    /// as directly reachable while no stranger can reach it, and announced
+    /// no coordinator, so a latched phone had no introducer for it.
+    fn announces_coordinator_hints(&self) -> bool {
+        self.publicly_listening != Some(true)
     }
 }
 
@@ -6162,10 +6181,9 @@ impl HeartbeatContext {
         let relay_capable = assist_snapshot.relay_capable;
         let coordinator_capable = assist_snapshot.coordinator_capable;
 
-        // Only emit coordinator / relay hints when we believe remote peers
-        // cannot reach us directly. Directly-reachable peers don't need
-        // help, and advertising hints we don't need just bloats gossip.
-        let (reachable_via, relay_candidates) = if can_receive_direct == Some(true) {
+        // Coordinator / relay hints, unless this node listens publicly by
+        // its own setup ([`AnnouncementAssistSnapshot::announces_coordinator_hints`]).
+        let (reachable_via, relay_candidates) = if !assist_snapshot.announces_coordinator_hints() {
             (Vec::new(), Vec::new())
         } else {
             collect_coordinator_hints(
@@ -8355,44 +8373,53 @@ impl Agent {
         lease: std::time::Duration,
         max_bytes: Option<u64>,
     ) -> error::Result<(connectivity::ConnectOutcome, bool)> {
-        if self
-            .network
-            .as_ref()
-            .is_some_and(|network| network.burst_cap_tripped())
-        {
+        self.connect_to_agent_burst(agent_id, lease, max_bytes, &[])
+            .await
+    }
+
+    /// [`Self::connect_to_agent_leased_capped`] with hole-punch introducers
+    /// the embedder kept for the target (`POST /agents/connect`
+    /// `introducers`, at most [`MAX_CONNECT_INTRODUCERS`]): for this dial
+    /// they join the coordinators the target announced, after them, under
+    /// the same rules (one introducer per target per burst, hung up once the
+    /// punch resolves, never a relay).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::connect_to_agent_leased_capped`].
+    pub async fn connect_to_agent_burst(
+        &self,
+        agent_id: &identity::AgentId,
+        lease: std::time::Duration,
+        max_bytes: Option<u64>,
+        introducers: &[std::net::SocketAddr],
+    ) -> error::Result<(connectivity::ConnectOutcome, bool)> {
+        let Some(network) = self.network.as_ref() else {
+            let outcome = self.connect_to_agent(agent_id).await?;
+            return Ok((outcome, false));
+        };
+        if network.burst_cap_tripped() {
             return Err(burst_cap_reached_error());
         }
         let lease = lease.min(std::time::Duration::from_secs(MAX_DEMAND_LEASE_SECS));
-        let generation = self
-            .network
-            .as_ref()
-            .map(|network| network.demand_lease_generation());
+        let generation = network.demand_lease_generation();
         // A leased dial is a burst dial: while latched it may use one
         // hole-punch introducer for this target, the coordinators the
         // target announced first.
-        let _burst = self
-            .network
-            .as_ref()
-            .map(|network| network.begin_burst_dial());
+        let _burst = network.begin_burst_dial();
         // Armed inside the burst dial, so the cap's idle check sees the dial.
-        if let (Some(network), Some(max_bytes)) = (self.network.as_ref(), max_bytes) {
+        if let Some(max_bytes) = max_bytes {
             network.arm_burst_cap(max_bytes).await;
         }
-        self.note_burst_introducers(agent_id).await;
+        self.note_burst_introducers(agent_id, introducers).await;
         self.refresh_own_peers().await;
-        let (outcome, machine) = DIALED_MACHINE
-            .scope(std::cell::Cell::new(None), async {
-                let outcome = self.connect_to_agent(agent_id).await;
-                (outcome, DIALED_MACHINE.with(std::cell::Cell::get))
-            })
-            .await;
+        let dial = DIALED_MACHINE.scope(std::cell::Cell::new(None), async {
+            let outcome = self.connect_to_agent(agent_id).await;
+            (outcome, DIALED_MACHINE.with(std::cell::Cell::get))
+        });
+        let (outcome, machine) = dial.await;
         let outcome = outcome?;
-        let leased = match (self.network.as_ref(), generation) {
-            (Some(network), Some(generation)) => {
-                record_demand_lease(network, generation, &outcome, machine, lease)
-            }
-            _ => false,
-        };
+        let leased = record_demand_lease(network, generation, &outcome, machine, lease);
         Ok((outcome, leased))
     }
 
@@ -8472,9 +8499,29 @@ impl Agent {
         }
     }
 
+    /// For each agent, the addresses of the coordinators it announced it is
+    /// reachable through (`reachable_via`): the introducers a burst dial
+    /// would hand ant-quic for it. Empty for an agent whose coordinators are
+    /// unknown to this node.
+    pub async fn announced_coordinator_addrs(
+        &self,
+        agents: &[DiscoveredAgent],
+    ) -> Vec<Vec<std::net::SocketAddr>> {
+        let machines = self.machine_discovery_cache.read().await;
+        agents
+            .iter()
+            .map(|agent| burst_introducer_addrs(&agent.reachable_via, &machines))
+            .collect()
+    }
+
     /// Hand ant-quic the coordinators `agent_id`'s machine announced it is
-    /// reachable through (`reachable_via`), as that target's introducers.
-    async fn note_burst_introducers(&self, agent_id: &identity::AgentId) {
+    /// reachable through (`reachable_via`), then the `given` introducers the
+    /// embedder kept for it, as that target's introducers.
+    async fn note_burst_introducers(
+        &self,
+        agent_id: &identity::AgentId,
+        given: &[std::net::SocketAddr],
+    ) {
         let Some(network) = self.network.as_ref() else {
             return;
         };
@@ -8482,7 +8529,27 @@ impl Agent {
             let cache = self.identity_discovery_cache.read().await;
             cache.get(agent_id).cloned()
         };
-        let Some(entry) = entry else {
+        let (machine_id, mut introducers) = match entry {
+            Some(entry) => {
+                let machines = self.machine_discovery_cache.read().await;
+                (
+                    Some(entry.machine_id),
+                    burst_introducer_addrs(&entry.reachable_via, &machines),
+                )
+            }
+            // An agent gone from discovery is dialled from peer evidence;
+            // only the embedder's own introducers apply to it.
+            None if !given.is_empty() => (
+                self.peer_evidence()
+                    .try_usable_agent(*agent_id, dm_capability::now_unix_ms())
+                    .ok()
+                    .flatten()
+                    .map(|view| view.announcement.machine_id),
+                Vec::new(),
+            ),
+            None => (None, Vec::new()),
+        };
+        let Some(machine_id) = machine_id.filter(|machine| machine.0 != [0u8; 32]) else {
             // L-7 (review): an agent gone from discovery leaves no hints
             // behind: a stale hint would let whoever holds its address now
             // coordinate.
@@ -8491,11 +8558,12 @@ impl Agent {
             }
             return;
         };
-        let introducers = {
-            let machines = self.machine_discovery_cache.read().await;
-            burst_introducer_addrs(&entry.reachable_via, &machines)
-        };
-        let machine = ant_quic::PeerId(entry.machine_id.0);
+        for addr in given {
+            if !introducers.contains(addr) {
+                introducers.push(*addr);
+            }
+        }
+        let machine = ant_quic::PeerId(machine_id.0);
         if let Some(previous) = network.take_burst_hint_machine(&agent_id.0) {
             if previous != machine {
                 network.set_peer_introducers(previous, Vec::new());
@@ -14440,10 +14508,9 @@ impl Agent {
         // partitions may publish LAN/loopback hints for same-partition peers.
         addresses = filter_discovery_announcement_addrs(addresses, allow_local_scope);
 
-        // Emit coordinator / relay hints only when direct inbound is not
-        // known to work. See HeartbeatContext::announce() for rationale.
-        let (reachable_via, relay_candidates) = if assist_snapshot.can_receive_direct == Some(true)
-        {
+        // Coordinator / relay hints, unless this node listens publicly by
+        // its own setup ([`AnnouncementAssistSnapshot::announces_coordinator_hints`]).
+        let (reachable_via, relay_candidates) = if !assist_snapshot.announces_coordinator_hints() {
             (Vec::new(), Vec::new())
         } else if let Some(network) = self.network.as_ref() {
             collect_coordinator_hints(
@@ -22886,6 +22953,9 @@ fn announcement_should_auto_connect(
 /// Longest demand lease [`Agent::connect_to_agent_leased`] grants.
 pub const MAX_DEMAND_LEASE_SECS: u64 = 300;
 
+/// Most hole-punch introducers one `POST /agents/connect` may hand over.
+pub const MAX_CONNECT_INTRODUCERS: usize = 4;
+
 tokio::task_local! {
     /// The peer-authenticated machine the enclosing
     /// [`Agent::connect_to_agent_leased`] call reached, set by each success
@@ -28684,6 +28754,38 @@ mod tests {
             );
         }
 
+        /// NAT-B: a desktop behind a home NAT that ant-quic reads as able to
+        /// receive direct (a LAN inbound link, or a peer that came in
+        /// through the mapping the desktop opened) still announces its
+        /// coordinators: only a port mapping or the operator's opt-in stops
+        /// them.
+        #[test]
+        fn a_natted_desktop_that_reads_as_direct_still_announces_coordinators() {
+            for scope in [
+                Some(ant_quic::ReachabilityScope::LocalNetwork),
+                Some(ant_quic::ReachabilityScope::Loopback),
+                Some(ant_quic::ReachabilityScope::Global),
+                None,
+            ] {
+                let status = ant_quic::NodeStatus {
+                    can_receive_direct: true,
+                    direct_reachability_scope: scope,
+                    port_mapping_active: false,
+                    ..ant_quic::NodeStatus::default()
+                };
+                let snapshot = AnnouncementAssistSnapshot::from_node_status(&status);
+                assert!(snapshot.announces_coordinator_hints(), "{scope:?}");
+            }
+            let mapped = ant_quic::NodeStatus {
+                can_receive_direct: true,
+                port_mapping_active: true,
+                ..ant_quic::NodeStatus::default()
+            };
+            assert!(!AnnouncementAssistSnapshot::from_node_status(&mapped)
+                .announces_coordinator_hints());
+            assert!(AnnouncementAssistSnapshot::default().announces_coordinator_hints());
+        }
+
         /// #398: peer-verified inbound reachability at GLOBAL scope is the
         /// primary honest signal — a public node (VPS) may advertise both.
         #[test]
@@ -31602,14 +31704,81 @@ mod tests {
             .await;
         let target_peer = ant_quic::PeerId(target_machine.0);
 
-        alice.note_burst_introducers(&target).await;
+        alice.note_burst_introducers(&target, &[]).await;
         assert_eq!(network.peer_introducers(&target_peer), vec![relay_addr]);
 
         alice.identity_discovery_cache.write().await.remove(&target);
-        alice.note_burst_introducers(&target).await;
+        alice.note_burst_introducers(&target, &[]).await;
         assert!(
             network.peer_introducers(&target_peer).is_empty(),
             "the stale hints are forgotten"
+        );
+    }
+
+    /// NAT-B: discovery hands out a target's announced coordinator
+    /// addresses, and a leased connect's `introducers` join them for the
+    /// dial, after them. A card import (no `reachable_via`) gets its
+    /// introducers from the embedder alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_embedder_can_read_and_hand_back_a_targets_coordinators() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (alice, _bob, _bob_addr) = leaf_and_peer(dir.path()).await;
+        let network = std::sync::Arc::clone(alice.network().expect("network"));
+        let now = Agent::unix_timestamp_secs();
+        let relay_machine = identity::MachineId([0x82; 32]);
+        let relay_addr: std::net::SocketAddr = "127.0.0.1:9211".parse().expect("addr");
+        alice
+            .insert_discovered_agent_for_testing(card_pin(
+                identity::AgentId([0x81; 32]),
+                relay_machine,
+                vec![relay_addr],
+                now,
+            ))
+            .await;
+        let target = identity::AgentId([0x83; 32]);
+        let target_machine = identity::MachineId([0x84; 32]);
+        let announced = DiscoveredAgent {
+            reachable_via: vec![relay_machine],
+            ..card_pin(
+                target,
+                target_machine,
+                vec!["127.0.0.1:9212".parse().expect("addr")],
+                now,
+            )
+        };
+        alice
+            .insert_discovered_agent_for_testing(announced.clone())
+            .await;
+        let card = card_pin(
+            identity::AgentId([0x85; 32]),
+            identity::MachineId([0x86; 32]),
+            Vec::new(),
+            now,
+        );
+        assert_eq!(
+            alice
+                .announced_coordinator_addrs(&[announced, card.clone()])
+                .await,
+            vec![vec![relay_addr], Vec::new()]
+        );
+
+        let kept: std::net::SocketAddr = "203.0.113.9:5483".parse().expect("addr");
+        alice
+            .note_burst_introducers(&target, &[kept, relay_addr])
+            .await;
+        assert_eq!(
+            network.peer_introducers(&ant_quic::PeerId(target_machine.0)),
+            vec![relay_addr, kept],
+            "announced first, then the embedder's, once each"
+        );
+
+        alice
+            .insert_discovered_agent_for_testing(card.clone())
+            .await;
+        alice.note_burst_introducers(&card.agent_id, &[kept]).await;
+        assert_eq!(
+            network.peer_introducers(&ant_quic::PeerId(card.machine_id.0)),
+            vec![kept]
         );
     }
 
