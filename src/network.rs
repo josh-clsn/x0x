@@ -10190,8 +10190,12 @@ mod tests {
     }
 
     /// A latched phone with a live, unleased link to a peer and an armed cap
-    /// (no burst dial in flight, no lease).
-    async fn latched_phone_with_live_link_and_cap() -> (NetworkNode, NetworkNode) {
+    /// (no burst dial in flight, no lease). The returned guard keeps the
+    /// peer registered as a leased connect's target, so the latch guard
+    /// leaves the link up however late it handles the link's event; hold it
+    /// for the test's length.
+    async fn latched_phone_with_live_link_and_cap() -> (NetworkNode, NetworkNode, LeasedTargetGuard)
+    {
         let peer = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
             .await
             .expect("peer");
@@ -10200,21 +10204,18 @@ mod tests {
             .expect("phone");
         phone.latch_mesh_quiesced().expect("fresh latch");
         let peer_addr = peer.bound_addr().await.expect("peer bound");
-        // A short lease admits the dial and keeps the link through the
-        // latch guard; once it ends the link stays up, unleased.
-        assert!(phone.lease_demand_peer(
-            peer.peer_id(),
-            tokio::time::Instant::now() + Duration::from_millis(200),
-        ));
-        phone
-            .connect_peer_with_addrs(peer.peer_id(), vec![peer_addr])
-            .await
-            .expect("the phone reaches the peer");
+        let target = phone.begin_leased_target(Some(peer.peer_id()));
+        NetworkNode::within_leased_dial(
+            phone.demand_lease_generation(),
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            phone.connect_peer_with_addrs(peer.peer_id(), vec![peer_addr]),
+        )
+        .await
+        .expect("the phone reaches the peer");
         let burst = phone.begin_burst_dial();
         assert!(phone.arm_burst_cap(1 << 30).await);
         drop(burst);
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        (phone, peer)
+        (phone, peer, target)
     }
 
     /// M-5 (re-review N-1): the idle end waits for the burst's links. With a
@@ -10222,7 +10223,7 @@ mod tests {
     /// the cap stays armed; once the link is gone it ends.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_idle_end_waits_for_live_links() {
-        let (phone, peer) = latched_phone_with_live_link_and_cap().await;
+        let (phone, peer, _target) = latched_phone_with_live_link_and_cap().await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(phone.is_connected(&peer.peer_id()).await);
         assert!(
@@ -10254,7 +10255,7 @@ mod tests {
     /// the task itself from ending the cap meanwhile.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_idle_end_never_clears_a_cap_armed_after_its_read() {
-        let (phone, peer) = latched_phone_with_live_link_and_cap().await;
+        let (phone, peer, _target) = latched_phone_with_live_link_and_cap().await;
         let (generation, seen) = {
             let state = phone.burst_cap_guard();
             (state.generation, state.arm_seq)
