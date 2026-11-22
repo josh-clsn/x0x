@@ -145,8 +145,14 @@ engine-A routes, and the four TreeKEM catch-up routes).
   opens a connection; a raw send with no live link fails as
   `no_connectivity`, and reconnect, repair and evidence dials do not run.
 - **A burst's end stops its dials.** A latch call or a tripped burst cap
-  stops a leased connect that is still dialling, and a link that comes up
-  after the trip is closed and its bytes are counted.
+  stops a leased connect that is still dialling, and every other dial a
+  lease let through; a link that comes up after the trip is closed and its
+  bytes are counted. While latched, a link no lease covers is closed as soon
+  as it comes up (outside a leased connect) and when a leased connect ends.
+- **A stale introducer no longer stalls a burst.** A burst's dial to an
+  introducer gets at most 3 s, and one that cannot be reached is skipped for
+  the target's next one; every attempt shows in `relay_client`, a dropped
+  one included.
 - **A burst's punch outcomes are visible.** `relay_client` gains
   `introducer_punch_successes` and `introducer_punch_failures`: hole-punch
   rounds run through an introducer that reached the target or did not

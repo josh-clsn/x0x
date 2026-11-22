@@ -79,7 +79,8 @@ pub struct RelayClientSnapshot {
     /// coordinate) or `introducer` (latched, during a burst dial: one
     /// introducer per target per burst, closed once the punch resolves).
     pub coordinator_policy: Option<String>,
-    /// Hole-punch introducer connections dialled since start.
+    /// Hole-punch introducer dials since start, each counted when it
+    /// starts.
     pub introducer_dials: u64,
     /// Of those, dials to a seed: a known peer taken because the target
     /// announced no introducer of its own (M-3). The seed learns this
@@ -106,8 +107,8 @@ pub struct RelayClientSnapshot {
     /// the target.
     pub introducer_punch_successes: u64,
     /// Hole-punch rounds run through an introducer since start that did
-    /// not: the coordination was refused or timed out, or the introducer
-    /// could not be reached.
+    /// not: the coordination was refused or timed out, the introducer could
+    /// not be reached, or the connect was dropped before the round resolved.
     pub introducer_punch_failures: u64,
     /// Client relay sessions open now, of any kind (proactive or opened by
     /// a relay fallback dial).

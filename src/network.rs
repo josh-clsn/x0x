@@ -5507,7 +5507,8 @@ impl NetworkNode {
     ///   (`ConnectedOnly`), and a peer-id-only connect dials no known peer;
     /// - during a burst dial (`Introducer`), a target that needs a punch may
     ///   use one introducer per burst, its own announced coordinators first,
-    ///   then a seed; ant-quic hangs up on it as soon as the punch resolves.
+    ///   then a seed (one it cannot reach in 3 s is skipped for the next);
+    ///   ant-quic hangs up on it as soon as the punch resolves.
     ///   Introducers only coordinate: with relay fallback off they carry no
     ///   data;
     /// - relay service is off (M-1): the node serves no MASQUE relay session

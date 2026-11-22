@@ -1229,7 +1229,10 @@ an enabled peer relay forwards no relayed DM. In a burst, a target
 that announced no introducer of its own gets no hole punch unless the daemon
 setting `latched_seed_introducers` (TOML, default `false`) is `true`: then a
 bootstrap seed may be its one hole-punch introducer. The seed learns this
-node's address and whom it is calling, and never relays data.
+node's address and whom it is calling, and never relays data. A dial to an
+introducer gets at most 3 s; one that cannot be reached introduced nothing,
+so the burst moves on to the target's next introducer (its own first, then
+a seed when allowed), never dialling one twice.
 
 The target's announced coordinators reach this node only while the target is
 in its discovery cache. A leased `/agents/connect` may hand back ones the
@@ -1276,8 +1279,10 @@ embedder that builds `NetworkConfig` itself sets `relay_service_disabled`.
 introducer use reads from `introducer_dials`, `introducer_bytes_sent`,
 `introducer_bytes_received` and how its punches ended:
 `introducer_punch_successes` and `introducer_punch_failures` (hole-punch
-rounds run through an introducer since start; a round whose introducer
-could not be reached counts as a failure).
+rounds run through an introducer since start). A dial counts when it starts,
+and a round counts as a failure unless it reaches the target: when the
+introducer could not be reached, the coordination failed, or the connect was
+dropped before the round resolved.
 
 With `defer_mesh_join = true` the daemon starts latched: the node is
 quiesced, with the switches above set, from its first moment, before any
