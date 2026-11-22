@@ -2551,8 +2551,6 @@ impl NetworkShutdownCoordinator {
     }
 }
 
-/// The error a dial reports when network teardown abandons it (see
-/// [`NetworkNode::dial_until_teardown`]).
 /// Run `dial` until it finishes or, for a dial a latched node let through
 /// (`burst_end` is the token of its demand-lease generation), until that
 /// generation ends: a latch call or a tripped burst cap. `None` when the
@@ -2571,6 +2569,8 @@ async fn until_burst_ends<F: std::future::Future>(
     }
 }
 
+/// The error a latched dial reports when the burst it belonged to ended
+/// under it ([`until_burst_ends`]).
 fn burst_ended(origin: &'static str) -> NetworkError {
     tracing::info!(
         target: "x0x::connect",
@@ -2582,6 +2582,8 @@ fn burst_ended(origin: &'static str) -> NetworkError {
     ))
 }
 
+/// The error a dial reports when network teardown abandons it (see
+/// [`NetworkNode::dial_until_teardown`]).
 fn dial_abandoned(origin: &'static str) -> NetworkError {
     tracing::debug!(
         target: "x0x::connect",
