@@ -140,6 +140,10 @@ engine-A routes, and the four TreeKEM catch-up routes).
   that reaches the hole punch is not cut at its own 3 s or 8 s slice, and
   ant-quic keeps a burst's direct pre-pass to 2 s, so the introducer and the
   punch come in time.
+- **A latched node dials only under a lease.** While quiesced, only a leased
+  connect of the current burst, or a dial to a machine whose lease is live,
+  opens a connection; a raw send with no live link fails as
+  `no_connectivity`, and reconnect, repair and evidence dials do not run.
 - **A burst's punch outcomes are visible.** `relay_client` gains
   `introducer_punch_successes` and `introducer_punch_failures`: hole-punch
   rounds run through an introducer that reached the target or did not

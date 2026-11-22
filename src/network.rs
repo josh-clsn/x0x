@@ -2351,8 +2351,9 @@ pub struct NetworkNode {
     /// never-seen peers) and [`GossipTransport::send_to_peer`] drops all
     /// gossip-plane frames, silencing SWIM probes, shuffles, presence
     /// beacons, identity announces, and anti-entropy in one place. The DM
-    /// plane ([`Self::send_with_receive_ack`], [`Self::probe_peer`]) is
-    /// deliberately untouched: explicit per-send demand dials still work.
+    /// plane ([`Self::send_with_receive_ack`], [`Self::probe_peer`]) still
+    /// works over a live link, but no dial opens a new connection unless a
+    /// burst lease covers it ([`Self::latched_dial_refusal`]).
     /// Cleared by `Agent::dial_bootstrap` (the `/mesh/join` path).
     mesh_quiesced: Arc<AtomicBool>,
     /// Mesh-transition epoch, bumped on every latch/unlatch transition.
@@ -2449,10 +2450,12 @@ tokio::task_local! {
     static LEASED_DIAL: LeasedDial;
 }
 
-/// A leased connect in flight: its overall deadline.
+/// A leased connect in flight: its overall deadline and the demand-lease
+/// generation it started in.
 #[derive(Debug, Clone, Copy)]
 struct LeasedDial {
     deadline: tokio::time::Instant,
+    generation: u64,
 }
 
 /// The deadline of the leased connect the current task dials for, if any.
@@ -4136,6 +4139,7 @@ impl NetworkNode {
         // suppressed cache entry, refuse pre-socket so the handshake
         // cannot write cache success (shared ant-quic BootstrapCache).
         self.dial_gated_cached_addr(addr, origin).await?;
+        self.latched_dial_refusal(None, origin).await?;
         let node = self.require_node().await?;
         let family = if addr.is_ipv4() { "v4" } else { "v6" };
         tracing::debug!(
@@ -4230,6 +4234,7 @@ impl NetworkNode {
     pub async fn connect_peer(&self, peer_id: AntPeerId) -> NetworkResult<(SocketAddr, AntPeerId)> {
         // Issue #292 invariant C: refuse pre-socket when the id is known.
         self.dial_gated(&peer_id, "peer").await?;
+        self.latched_dial_refusal(Some(&peer_id), "peer").await?;
         let node = self.require_node().await?;
         let start = std::time::Instant::now();
         let peer_conn = self
@@ -4306,6 +4311,8 @@ impl NetworkNode {
     ) -> NetworkResult<(SocketAddr, AntPeerId)> {
         // Issue #292 invariant C: refuse pre-socket when the id is known.
         self.dial_gated(&peer_id, "peer_with_addrs").await?;
+        self.latched_dial_refusal(Some(&peer_id), "peer_with_addrs")
+            .await?;
         // #484 (code review r1 item 4): normalize v4-mapped addresses at
         // this shared boundary — verified-announcement auto-connect and
         // every other addrs caller route through here.
@@ -4904,13 +4911,61 @@ impl NetworkNode {
         leases.until.clear();
     }
 
-    /// Run `dial`, a leased connect for one target, with its overall
-    /// `deadline` ([`leased_dial_deadline`]).
+    /// Run `dial`, a leased connect for one target, as a burst dial of the
+    /// demand-lease `generation`: while latched, the dial seams let it open
+    /// connections until `deadline` or until that generation ends.
     pub(crate) async fn within_leased_dial<F: std::future::Future>(
+        generation: u64,
         deadline: tokio::time::Instant,
         dial: F,
     ) -> F::Output {
-        LEASED_DIAL.scope(LeasedDial { deadline }, dial).await
+        LEASED_DIAL
+            .scope(
+                LeasedDial {
+                    deadline,
+                    generation,
+                },
+                dial,
+            )
+            .await
+    }
+
+    /// Fix (a): whether a latched node refuses to open a new connection to
+    /// `peer` (`None` for an address-only dial, whose peer is unknown before
+    /// the handshake). A latched node dials only for a leased connect in
+    /// flight in the current demand-lease generation, or to a peer whose
+    /// demand lease is live; a peer it is already connected to costs no new
+    /// connection and is never refused here. Meshed, nothing is refused.
+    pub(crate) async fn latched_dial_refusal(
+        &self,
+        peer: Option<&AntPeerId>,
+        origin: &'static str,
+    ) -> NetworkResult<()> {
+        if !self.mesh_quiesced.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let generation = self.demand_lease_generation();
+        let now = tokio::time::Instant::now();
+        if LEASED_DIAL
+            .try_with(|dial| dial.generation == generation && dial.deadline > now)
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        if let Some(peer) = peer {
+            if self.demand_leased(peer, now) || self.is_connected(peer).await {
+                return Ok(());
+            }
+        }
+        tracing::info!(
+            target: "x0x::connect",
+            origin,
+            peer_id_prefix = ?peer.map(|peer| hex_prefix(&peer.0, 4)),
+            "dial refused: the mesh is latched and no burst lease covers it"
+        );
+        Err(NetworkError::LatchedNoLease(format!(
+            "mesh quiesced: no burst lease covers this dial ({origin})"
+        )))
     }
 
     fn demand_leases_guard(&self) -> std::sync::MutexGuard<'_, DemandLeases> {
@@ -5332,13 +5387,11 @@ impl NetworkNode {
     ///
     /// The policy is endpoint-wide, not per dial: while any burst dial holds
     /// a guard, every other connect on the node runs under `Introducer` too.
-    /// That includes x0x's own raw-send redial (`resolve_raw_quic_target`
-    /// reaching `connect_to_agent` when a burst link drops before a
-    /// `/direct/send`). Such a connect can spend its target's one introducer
-    /// for the burst; it still never relays and never dials a seed beyond
-    /// that one introducer. A connect while latched with no burst dial in
-    /// flight runs under `ConnectedOnly` and dials only the target's own
-    /// addresses.
+    /// Only a dial a burst lease covers gets that far
+    /// ([`Self::latched_dial_refusal`]): x0x's own raw-send redial to a
+    /// leased machine whose link dropped, for example. Such a connect can
+    /// spend its target's one introducer for the burst; it still never
+    /// relays and never dials a seed beyond that one introducer.
     pub(crate) fn begin_burst_dial(&self) -> BurstDialGuard {
         self.burst_dials.fetch_add(1, Ordering::SeqCst);
         self.sync_switches_under_lock();
@@ -9020,6 +9073,20 @@ mod tests {
             .contains("release failed after caller cancellation"));
     }
 
+    /// `dial` as a leased connect runs it: inside a burst dial (the
+    /// `Introducer` policy) and the leased-dial scope of the current burst,
+    /// so the latched dial seams let it through.
+    async fn as_burst_dial<F: std::future::Future>(phone: &NetworkNode, dial: F) -> F::Output {
+        let _burst = phone.begin_burst_dial();
+        let generation = phone.demand_lease_generation();
+        NetworkNode::within_leased_dial(
+            generation,
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            dial,
+        )
+        .await
+    }
+
     fn loopback_quic_config(bootstrap: Vec<SocketAddr>) -> NetworkConfig {
         NetworkConfig {
             bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
@@ -9103,7 +9170,9 @@ mod tests {
             contact.peer_id(),
             tokio::time::Instant::now() + Duration::from_secs(30),
         );
-        let _ = phone.connect_addr(contact_addr).await;
+        let _ = phone
+            .connect_peer_with_addrs(contact.peer_id(), vec![contact_addr])
+            .await;
         assert!(
             !relay_sessions_within(&phone, 1, Duration::from_millis(1500)).await,
             "no relay session may open while latched or during a burst"
@@ -9152,7 +9221,7 @@ mod tests {
             tokio::time::Instant::now() + Duration::from_secs(30),
         ));
         phone
-            .connect_addr(peer_addr)
+            .connect_peer_with_addrs(peer.peer_id(), vec![peer_addr])
             .await
             .expect("the phone dials the peer");
         force_symmetric_nat(&peer).await;
@@ -9203,7 +9272,10 @@ mod tests {
             tokio::time::Instant::now() + Duration::from_secs(60),
         ));
         phone
-            .connect_addr(contact_a.bound_addr().await.expect("A bound"))
+            .connect_peer_with_addrs(
+                contact_a.peer_id(),
+                vec![contact_a.bound_addr().await.expect("A bound")],
+            )
             .await
             .expect("the phone reaches contact A");
         (phone, contact_a, introducer)
@@ -9214,11 +9286,13 @@ mod tests {
     async fn burst_dial_unreachable(phone: &NetworkNode, b: AntPeerId, introducer: SocketAddr) {
         let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind silent");
         let silent_addr = silent.local_addr().expect("silent addr");
-        let _burst = phone.begin_burst_dial();
         phone.set_peer_introducers(b, vec![introducer]);
-        let result = tokio::time::timeout(
-            Duration::from_secs(60),
-            phone.connect_peer_with_addrs(b, vec![silent_addr]),
+        let result = as_burst_dial(
+            phone,
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                phone.connect_peer_with_addrs(b, vec![silent_addr]),
+            ),
         )
         .await;
         assert!(
@@ -9254,7 +9328,10 @@ mod tests {
         ));
         if !phone.is_connected(&contact_a.peer_id()).await {
             phone
-                .connect_addr(contact_a.bound_addr().await.expect("A bound"))
+                .connect_peer_with_addrs(
+                    contact_a.peer_id(),
+                    vec![contact_a.bound_addr().await.expect("A bound")],
+                )
                 .await
                 .expect("the phone reaches its own device");
         }
@@ -9291,10 +9368,12 @@ mod tests {
         let burst_dial = |phone: &NetworkNode, contact: AntPeerId| {
             let phone = phone.clone();
             async move {
-                let _burst = phone.begin_burst_dial();
-                let result = tokio::time::timeout(
-                    Duration::from_secs(60),
-                    phone.connect_peer_with_addrs(contact, vec![silent_addr]),
+                let result = as_burst_dial(
+                    &phone,
+                    tokio::time::timeout(
+                        Duration::from_secs(60),
+                        phone.connect_peer_with_addrs(contact, vec![silent_addr]),
+                    ),
                 )
                 .await;
                 assert!(
@@ -9378,9 +9457,9 @@ mod tests {
         ));
         assert!(phone.arm_burst_cap(CAP).await, "armed while latched");
         phone
-            .connect_addr(peer_addr)
+            .connect_peer_with_addrs(peer.peer_id(), vec![peer_addr])
             .await
-            .expect("the phone dials the peer");
+            .expect("the phone dials the leased peer");
 
         // The phone reads every byte the peer sends.
         let received = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -9478,9 +9557,12 @@ mod tests {
             !phone.arm_burst_cap(CAP).await,
             "no new cap in the same burst"
         );
-        // A link that comes up after the cap tripped is closed within a tick
-        // or two.
-        let _ = phone.connect_addr(peer_addr).await;
+        // A dial after the trip is refused at the seams (fix (a)): the trip
+        // ended every lease.
+        assert!(matches!(
+            phone.connect_addr(peer_addr).await,
+            Err(NetworkError::LatchedNoLease(_))
+        ));
         let redial_deadline = tokio::time::Instant::now() + Duration::from_millis(100);
         while phone.is_connected(&peer.peer_id()).await {
             assert!(
@@ -9527,6 +9609,104 @@ mod tests {
         let _ = node.try_shutdown().await;
     }
 
+    /// Fix (a): while latched, a dial opens no connection unless a live
+    /// lease covers its peer or it belongs to a leased connect of the
+    /// current burst; an address-only dial (peer unknown) only the latter.
+    /// Meshed, nothing is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_latched_node_dials_only_under_a_lease() {
+        let phone = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("phone");
+        let peer = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("peer");
+        let peer_addr = peer.bound_addr().await.expect("peer bound");
+        let peer_id = peer.peer_id();
+        phone.latch_mesh_quiesced().expect("fresh latch");
+
+        assert!(matches!(
+            phone
+                .connect_peer_with_addrs(peer_id, vec![peer_addr])
+                .await,
+            Err(NetworkError::LatchedNoLease(_))
+        ));
+        assert!(matches!(
+            phone.connect_peer(peer_id).await,
+            Err(NetworkError::LatchedNoLease(_))
+        ));
+        assert!(matches!(
+            phone.connect_addr(peer_addr).await,
+            Err(NetworkError::LatchedNoLease(_))
+        ));
+        assert!(matches!(
+            phone.connect_cached_peer(peer_id).await,
+            Err(NetworkError::LatchedNoLease(_))
+        ));
+        assert!(
+            !phone.is_connected(&peer_id).await,
+            "no connection was opened"
+        );
+
+        // A leased connect of this burst may dial, by address too.
+        let generation = phone.demand_lease_generation();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let reached = NetworkNode::within_leased_dial(generation, deadline, async {
+            phone.connect_addr(peer_addr).await
+        })
+        .await
+        .expect("a leased connect dials");
+        assert_eq!(reached, peer_id);
+        let _ = phone.disconnect(&peer_id).await;
+        let gone = tokio::time::Instant::now() + Duration::from_secs(5);
+        while phone.is_connected(&peer_id).await {
+            assert!(tokio::time::Instant::now() < gone, "the link closed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // One that started before a latch call is refused after it.
+        phone.latch_mesh_quiesced();
+        let stale = NetworkNode::within_leased_dial(generation, deadline, async {
+            phone.connect_addr(peer_addr).await
+        })
+        .await;
+        assert!(
+            matches!(stale, Err(NetworkError::LatchedNoLease(_))),
+            "{stale:?}"
+        );
+
+        // A live lease lets its peer be dialled by id.
+        assert!(phone.lease_demand_peer(
+            peer_id,
+            tokio::time::Instant::now() + Duration::from_secs(60)
+        ));
+        phone
+            .connect_peer_with_addrs(peer_id, vec![peer_addr])
+            .await
+            .expect("a leased peer is dialled");
+        // Over the live link, a lookup costs no new connection.
+        phone.clear_demand_leases();
+        assert!(phone.is_connected(&peer_id).await);
+        phone
+            .connect_peer_with_addrs(peer_id, vec![peer_addr])
+            .await
+            .expect("the live link is reused");
+
+        assert!(phone.unlatch_mesh_if_current(phone.mesh_transition_epoch()));
+        let _ = phone.disconnect(&peer_id).await;
+        let gone = tokio::time::Instant::now() + Duration::from_secs(5);
+        while phone.is_connected(&peer_id).await {
+            assert!(tokio::time::Instant::now() < gone, "the link closed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        phone
+            .connect_addr(peer_addr)
+            .await
+            .expect("meshed, nothing is refused");
+        let _ = peer.try_shutdown().await;
+        let _ = phone.try_shutdown().await;
+    }
+
     /// A latched phone with a live, unleased link to a peer and an armed cap
     /// (no burst dial in flight, no lease).
     async fn latched_phone_with_live_link_and_cap() -> (NetworkNode, NetworkNode) {
@@ -9538,8 +9718,8 @@ mod tests {
             .expect("phone");
         phone.latch_mesh_quiesced().expect("fresh latch");
         let burst = phone.begin_burst_dial();
-        phone
-            .connect_addr(peer.bound_addr().await.expect("peer bound"))
+        let peer_addr = peer.bound_addr().await.expect("peer bound");
+        as_burst_dial(&phone, phone.connect_addr(peer_addr))
             .await
             .expect("the phone reaches the peer");
         assert!(phone.arm_burst_cap(1 << 30).await);
@@ -9801,9 +9981,14 @@ mod tests {
             tokio::time::Instant::now() + Duration::from_secs(120),
         ));
         phone
-            .connect_addr(a_addr)
+            .connect_peer_with_addrs(contact_a.peer_id(), vec![a_addr])
             .await
             .expect("the phone reaches A");
+        // A lease for B lets the phone dial it outside a burst.
+        assert!(phone.lease_demand_peer(
+            contact_b.peer_id(),
+            tokio::time::Instant::now() + Duration::from_secs(120),
+        ));
         let snap = phone.relay_client_snapshot();
         assert_eq!(snap.coordinator_policy.as_deref(), Some("connected_only"));
         assert_eq!(snap.inbound_punch_allowed, Some(false));
@@ -9930,9 +10115,12 @@ mod tests {
                 let _burst = phone.begin_burst_dial();
                 let policy = phone.relay_client_snapshot().coordinator_policy;
                 phone.set_peer_introducers(contact, vec![introducer_addr]);
-                let result = tokio::time::timeout(
-                    Duration::from_secs(60),
-                    phone.connect_peer_with_addrs(contact, vec![silent_addr]),
+                let result = as_burst_dial(
+                    &phone,
+                    tokio::time::timeout(
+                        Duration::from_secs(60),
+                        phone.connect_peer_with_addrs(contact, vec![silent_addr]),
+                    ),
                 )
                 .await;
                 assert!(
@@ -11026,10 +11214,12 @@ mod tests {
         let a = NetworkNode::new(config(1), None, None).await.unwrap();
         let b = NetworkNode::new(config(2), None, None).await.unwrap();
         assert!(a.latch_mesh_quiesced().is_some());
-        let peer_b = a
-            .connect_addr(SocketAddr::from(([198, 18, subnet, 2], 5483)))
-            .await
-            .unwrap();
+        let peer_b = as_burst_dial(
+            &a,
+            a.connect_addr(SocketAddr::from(([198, 18, subnet, 2], 5483))),
+        )
+        .await
+        .unwrap();
         a.lease_demand_peer(
             peer_b,
             tokio::time::Instant::now() + Duration::from_secs(300),

@@ -8421,7 +8421,7 @@ impl Agent {
             let outcome = self.connect_to_agent(agent_id).await;
             (outcome, DIALED_MACHINE.with(std::cell::Cell::get))
         });
-        let dial = network::NetworkNode::within_leased_dial(deadline, dial);
+        let dial = network::NetworkNode::within_leased_dial(generation, deadline, dial);
         let (outcome, machine) = dial.await;
         let outcome = outcome?;
         let leased = record_demand_lease(network, generation, &outcome, machine, lease);
@@ -12578,6 +12578,16 @@ impl Agent {
             ));
         }
         let mut connected = transport.is_connected(&ant_peer_id).await;
+        // Fix (a): a latched node opens no connection a burst lease does not
+        // cover (see the raw resolver).
+        if !connected {
+            if let Some(network) = self.network.as_ref() {
+                network
+                    .latched_dial_refusal(Some(&ant_peer_id), "pinned_send")
+                    .await
+                    .map_err(Self::map_raw_quic_dm_error)?;
+            }
+        }
         let mut repair_outcome: Option<&'static str> = None;
         if !connected {
             const REPAIR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -13161,6 +13171,16 @@ impl Agent {
         // Skip when resolution == "post_connect" (last-resort branch already
         // invoked connect_to_agent above).
         let mut repair_outcome: Option<&'static str> = None;
+        // Fix (a): a latched node opens no connection a burst lease does not
+        // cover, so a send with no live link to an unleased machine fails
+        // here as no connectivity, before any repair or redial dials.
+        if !connected {
+            if let Some(network) = self.network.as_ref() {
+                network
+                    .latched_dial_refusal(Some(&ant_peer_id), "raw_send")
+                    .await?;
+            }
+        }
         // A cold binding may be repaired, but never redialled to another
         // discovery machine. Its repair shares the resolution deadline.
         if !connected && resolution != "post_connect" {
@@ -14052,7 +14072,8 @@ impl Agent {
             error::NetworkError::PayloadTooLarge { size, max } => {
                 dm::DmError::PayloadTooLarge { len: size, max }
             }
-            error::NetworkError::NodeCreation(reason) => dm::DmError::NoConnectivity(reason),
+            error::NetworkError::NodeCreation(reason)
+            | error::NetworkError::LatchedNoLease(reason) => dm::DmError::NoConnectivity(reason),
             other => dm::DmError::PublishFailed(other.to_string()),
         }
     }
@@ -17028,9 +17049,9 @@ impl Agent {
     /// - every call, including one while already latched, clears all leases
     ///   and sweeps every peer: that is how a caller ends a check-in burst;
     /// - leaf-mode gates already stop announcement and proactive redials;
-    /// - contacts still return via explicit demand (per-send dials — the DM
-    ///   plane is not gated), and a full re-join is one
-    ///   [`dial_bootstrap`](Agent::dial_bootstrap) away.
+    /// - contacts return only through a leased connect (no dial opens a new
+    ///   connection unless a burst lease covers it), and a full re-join is
+    ///   one [`dial_bootstrap`](Agent::dial_bootstrap) away.
     ///
     /// Returns the number of peers disconnected. Individual disconnect
     /// failures are logged and skipped — the sweep never aborts.
@@ -31508,8 +31529,18 @@ mod tests {
             .await
             .expect("c");
         let epoch = a.latch_mesh_quiesced().expect("fresh latch");
-        let peer_b = a.connect_addr(addr(2)).await.expect("dial b");
-        let peer_c = a.connect_addr(addr(3)).await.expect("dial c");
+        // Both dials are a burst's leased connects; only b's lease is
+        // recorded below.
+        let generation = a.demand_lease_generation();
+        let deadline = tokio::time::Instant::now() + LEASED_DIAL_BUDGET;
+        let (peer_b, peer_c) =
+            network::NetworkNode::within_leased_dial(generation, deadline, async {
+                (
+                    a.connect_addr(addr(2)).await.expect("dial b"),
+                    a.connect_addr(addr(3)).await.expect("dial c"),
+                )
+            })
+            .await;
         (fabric, a, [b, c], [peer_b, peer_c], epoch)
     }
 
@@ -31534,10 +31565,13 @@ mod tests {
         assert!(a.is_connected(&peer_b).await, "leased: survives tick 1");
         assert!(!a.is_connected(&peer_c).await, "unleased: swept at tick 1");
 
-        let redialed = a
-            .connect_addr(std::net::SocketAddr::from(([198, 18, 6, 3], 5483)))
-            .await
-            .expect("redial c");
+        let redialed = network::NetworkNode::within_leased_dial(
+            a.demand_lease_generation(),
+            tokio::time::Instant::now() + LEASED_DIAL_BUDGET,
+            a.connect_addr(std::net::SocketAddr::from(([198, 18, 6, 3], 5483))),
+        )
+        .await
+        .expect("redial c");
         assert_eq!(redialed, peer_c);
         tokio::time::sleep(period).await;
         assert!(a.is_connected(&peer_b).await, "leased: survives tick 2");
@@ -31872,7 +31906,7 @@ mod tests {
         assert_eq!(dial_step_timeout(three), three);
         assert_eq!(dial_probe_timeout(three), three);
         let deadline = tokio::time::Instant::now() + LEASED_DIAL_BUDGET;
-        network::NetworkNode::within_leased_dial(deadline, async {
+        network::NetworkNode::within_leased_dial(0, deadline, async {
             tokio::time::advance(std::time::Duration::from_secs(1)).await;
             assert_eq!(dial_step_timeout(three), std::time::Duration::from_secs(11));
             assert_eq!(dial_step_timeout(eight), std::time::Duration::from_secs(11));
@@ -31939,6 +31973,48 @@ mod tests {
         assert_eq!(snap.introducer_seed_dials, 0, "{snap:?}");
         assert_eq!(snap.introducer_punch_successes, 1, "{snap:?}");
         drop(silent);
+    }
+
+    /// Fix (a): latched with no lease, a raw `/direct/send` to a known
+    /// peer opens no connection and fails as no connectivity; after a
+    /// leased connect it goes over the leased link.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_latched_raw_send_without_a_lease_dials_nothing() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (alice, bob, _bob_addr) = leaf_and_peer(dir.path()).await;
+        alice.start_direct_listener();
+        let network = std::sync::Arc::clone(alice.network().expect("network"));
+        let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+        alice.quiesce_mesh().await.expect("latch");
+        let raw_first = dm::DmSendConfig {
+            prefer_raw_quic_if_connected: true,
+            ..bookkeeping_config()
+        };
+        let mut bob_rx = bob.subscribe_direct();
+        let sent = alice
+            .send_direct_with_config(&bob.agent_id(), b"unbooked".to_vec(), raw_first.clone())
+            .await;
+        assert!(
+            matches!(sent, Err(dm::DmError::NoConnectivity(_))),
+            "{sent:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!network.is_connected(&bob_peer).await, "no dial was made");
+
+        let (outcome, leased) = alice
+            .connect_to_agent_leased(&bob.agent_id(), std::time::Duration::from_secs(120))
+            .await
+            .expect("the connect runs");
+        assert!(outcome.is_live_path() && leased, "{outcome:?}");
+        alice
+            .send_direct_with_config(&bob.agent_id(), b"booked".to_vec(), raw_first)
+            .await
+            .expect("the send goes over the leased link");
+        let got = tokio::time::timeout(std::time::Duration::from_secs(10), bob_rx.recv())
+            .await
+            .expect("bob receives it")
+            .expect("bob's stream is open");
+        assert_eq!(got.payload, b"booked", "the refused send never left");
     }
 
     /// A zero lease records nothing.
@@ -32263,10 +32339,13 @@ mod tests {
             })
             .await;
         alice.quiesce_mesh().await.expect("latch");
-        let reached = alice_net
-            .connect_addr(carol_addr)
-            .await
-            .expect("dial carol");
+        let reached = network::NetworkNode::within_leased_dial(
+            alice_net.demand_lease_generation(),
+            tokio::time::Instant::now() + LEASED_DIAL_BUDGET,
+            alice_net.connect_addr(carol_addr),
+        )
+        .await
+        .expect("dial carol");
         assert_eq!(reached.0, carol.machine_id().0);
 
         let mut alice_rx = alice.subscribe_direct();

@@ -541,8 +541,9 @@ fn test_direct_messaging_decode_too_short() {
 // - Network layer drops oversized direct messages (>16MB + 32 bytes)
 // - Sender AgentId is self-asserted (security documentation)
 
-/// Raw-QUIC DMs keep working in both directions with a quiesced node: the
-/// latch silences the gossip plane, not the DM lane.
+/// Raw-QUIC DMs keep working in both directions with a quiesced node over
+/// the link its leased connect opened: the latch silences the gossip plane,
+/// and a quiesced node dials only under a lease.
 async fn quiesced_node_exchanges_raw_dms(leaf: bool) -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = TempDir::new().unwrap();
     let Some(alice) = create_loopback_test_agent(&temp_dir, "alice").await? else {
@@ -571,6 +572,10 @@ async fn quiesced_node_exchanges_raw_dms(leaf: bool) -> Result<(), Box<dyn std::
 
     alice.quiesce_mesh().await?;
     assert!(alice.mesh_quiesced());
+    let (outcome, leased) = alice
+        .connect_to_agent_leased(&bob.agent_id(), Duration::from_secs(120))
+        .await?;
+    assert!(outcome.is_live_path() && leased, "{outcome:?}");
 
     let mut bob_rx = bob.subscribe_direct();
     let to_bob = b"quiesced-to-bob".to_vec();

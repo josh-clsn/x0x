@@ -204,6 +204,12 @@ pub enum NetworkError {
     #[error("connection failed: {0}")]
     ConnectionFailed(String),
 
+    /// The mesh is latched and no burst lease covers the dial: a latched
+    /// node opens a new connection only for a leased connect in flight or
+    /// to a peer whose demand lease is live.
+    #[error("no connectivity: {0}")]
+    LatchedNoLease(String),
+
     /// Remote receive pipeline is alive but currently unable to admit payloads.
     #[error("remote receive pipeline backpressured: {0}")]
     RemoteReceiveBackpressured(String),

@@ -1159,6 +1159,15 @@ table) and a non-live outcome echo `null`. The next
 and sweeps every peer. A lease changes nothing else: inbound links are still
 refused and gossip frames are still dropped on the leased link.
 
+While quiesced, the daemon opens a new connection only for a leased
+`/agents/connect` still dialling in the current burst (since the last
+`POST /mesh/quiesce`), or to a machine whose lease is live. Every other dial
+is refused before any packet goes out: a raw `/direct/send` with no live link
+to an unleased machine answers `503 no_connectivity`, an unleased
+`/agents/connect` or `/machines/connect` answers `Unreachable`, and the
+reconnect, repair and peer-evidence dials do not run. A send over a live link
+is not affected.
+
 #### Burst byte cap
 
 A leased `/agents/connect` may also carry `max_bytes`, the burst's byte cap:
