@@ -2442,6 +2442,9 @@ pub struct OwnPeerRequest {
 struct DemandLeases {
     generation: u64,
     until: HashMap<AntPeerId, tokio::time::Instant>,
+    /// Cancelled by the clear that ends this generation (a latch call or a
+    /// tripped burst cap), so a leased connect still dialling stops.
+    ended: tokio_util::sync::CancellationToken,
 }
 
 tokio::task_local! {
@@ -4904,11 +4907,23 @@ impl NetworkNode {
             .is_some_and(|end| *end > now)
     }
 
-    /// Drop every demand lease and start a new generation.
+    /// Drop every demand lease and start a new generation. A leased connect
+    /// still dialling for the old generation is told to stop: the token it
+    /// took when it started is cancelled.
     pub fn clear_demand_leases(&self) {
         let mut leases = self.demand_leases_guard();
         leases.generation = leases.generation.wrapping_add(1);
         leases.until.clear();
+        std::mem::take(&mut leases.ended).cancel();
+    }
+
+    /// The current demand-lease generation and the token its end cancels.
+    /// A leased connect reads both before it dials.
+    pub(crate) fn demand_lease_generation_and_end(
+        &self,
+    ) -> (u64, tokio_util::sync::CancellationToken) {
+        let leases = self.demand_leases_guard();
+        (leases.generation, leases.ended.clone())
     }
 
     /// Run `dial`, a leased connect for one target, as a burst dial of the
@@ -5111,6 +5126,40 @@ impl NetworkNode {
         self.burst_cap_guard().tripped_at.is_some()
     }
 
+    /// Test seam: trip the armed cap now, as its task does when the bytes
+    /// reach it (the task then keeps closing links). Returns false when no
+    /// cap is armed.
+    #[cfg(test)]
+    pub(crate) fn trip_burst_cap_for_test(&self) -> bool {
+        {
+            let mut state = self.burst_cap_guard();
+            if state.count.is_none() || state.tripped_at.is_some() {
+                return false;
+            }
+            state.tripped_at = Some(tokio::time::Instant::now());
+            if let Some(wake) = state.wake.as_ref() {
+                wake.notify_one();
+            }
+        }
+        self.clear_demand_leases();
+        true
+    }
+
+    /// Test seam: a dial straight on the transport, beneath every x0x dial
+    /// gate, as a handshake ant-quic finishes on its own (a punch that
+    /// lands after its connect was dropped) would come up.
+    #[cfg(test)]
+    pub(crate) async fn connect_beneath_gates_for_test(
+        &self,
+        addr: SocketAddr,
+    ) -> NetworkResult<AntPeerId> {
+        let node = self.require_node().await?;
+        node.connect_addr(addr)
+            .await
+            .map(|conn| conn.peer_id)
+            .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))
+    }
+
     /// M-5: the current burst's cap.
     #[must_use]
     pub fn burst_cap_snapshot(&self) -> BurstCapSnapshot {
@@ -5227,6 +5276,20 @@ impl NetworkNode {
                 return;
             }
             if tripped {
+                // A link that came up after the trip still moved bytes:
+                // count them before closing it.
+                let links = self.link_byte_counters().await;
+                {
+                    let mut state = self.burst_cap_guard();
+                    if state.generation != generation {
+                        return;
+                    }
+                    if let Some(count) = state.count.as_mut() {
+                        for (link, total) in links {
+                            count.observe(link, total);
+                        }
+                    }
+                }
                 self.close_links_for_burst_cap(generation).await;
                 continue;
             }
@@ -9563,6 +9626,9 @@ mod tests {
             phone.connect_addr(peer_addr).await,
             Err(NetworkError::LatchedNoLease(_))
         ));
+        // A link that comes up after the cap tripped anyway (beneath the
+        // seams) is closed within a tick or two.
+        let _ = phone.connect_beneath_gates_for_test(peer_addr).await;
         let redial_deadline = tokio::time::Instant::now() + Duration::from_millis(100);
         while phone.is_connected(&peer.peer_id()).await {
             assert!(
@@ -9607,6 +9673,47 @@ mod tests {
             "the latch lifting clears it"
         );
         let _ = node.try_shutdown().await;
+    }
+
+    /// Fix (b): a link that comes up after the cap tripped (a handshake
+    /// that finished just after the trip) is closed at once, and its bytes
+    /// still count toward the trip's accounting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_link_up_after_the_trip_is_closed_and_counted() {
+        let phone = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("phone");
+        let peer = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("peer");
+        let peer_addr = peer.bound_addr().await.expect("peer bound");
+        phone.latch_mesh_quiesced().expect("fresh latch");
+        assert!(phone.lease_demand_peer(
+            peer.peer_id(),
+            tokio::time::Instant::now() + Duration::from_secs(60),
+        ));
+        assert!(phone.arm_burst_cap(u64::MAX / 2).await, "armed");
+        assert!(phone.trip_burst_cap_for_test());
+        let at_trip = phone.burst_cap_snapshot().counted_bytes;
+
+        let _ = phone.connect_beneath_gates_for_test(peer_addr).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            let counted = phone.burst_cap_snapshot().counted_bytes;
+            if counted > at_trip && !phone.is_connected(&peer.peer_id()).await {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the late link must be closed and counted: {:?}, connected {}",
+                phone.burst_cap_snapshot(),
+                phone.is_connected(&peer.peer_id()).await
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(phone.burst_cap_snapshot().tripped);
+        let _ = peer.try_shutdown().await;
+        let _ = phone.try_shutdown().await;
     }
 
     /// Fix (a): while latched, a dial opens no connection unless a live

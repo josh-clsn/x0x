@@ -365,6 +365,14 @@ pub(in crate::server) async fn connect_agent(
                 })),
             )
         }
+        Ok(Err(e)) if e.to_string().contains("burst_cap_reached") => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "burst_cap_reached",
+                "detail": "the burst byte cap was reached; connects resume after POST /mesh/quiesce"
+            })),
+        ),
         Ok(Err(e)) => {
             tracing::error!("connect_agent failed: {e}");
             api_error(StatusCode::INTERNAL_SERVER_ERROR, "connection failed")

@@ -1166,7 +1166,8 @@ is refused before any packet goes out: a raw `/direct/send` with no live link
 to an unleased machine answers `503 no_connectivity`, an unleased
 `/agents/connect` or `/machines/connect` answers `Unreachable`, and the
 reconnect, repair and peer-evidence dials do not run. A send over a live link
-is not affected.
+is not affected. A `POST /mesh/quiesce` also stops a leased connect that is
+still dialling: it answers `Unreachable` with no lease.
 
 #### Burst byte cap
 
@@ -1187,8 +1188,11 @@ cap, up to 250 ms far from it. Above the 10 ms floor a link at the assumed
 worst case of 1 Gbit/s cannot pass the cap between two reads, so overshoot
 is bounded by the link rate times one 10 ms tick plus the counter read and
 the close, plus what the peer already had in flight. Once the sum reaches the cap it
-ends every lease and closes every link. Until the cap is cleared it keeps
-closing any link that comes up within a tick, and every connect, leased or
+ends every lease and closes every link. A leased connect still dialling stops
+at once and answers 409 `burst_cap_reached`. Until the cap is cleared the
+daemon keeps closing any link that comes up within a tick (a handshake that
+finished just after the trip), and keeps counting the bytes such a link moved:
+`counted_bytes` can grow after `tripped`. Every connect, leased or
 not (the raw-send redial of `/direct/send` included), is refused with
 `409 {"ok": false, "error": "burst_cap_reached"}`. The answer echoes the cap
 in force as `max_bytes` (else `null`). Without a lease, or while the mesh is

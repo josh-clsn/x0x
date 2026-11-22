@@ -8385,7 +8385,9 @@ impl Agent {
     /// punch resolves, never a relay).
     ///
     /// The whole connect, every step of it, shares one budget of
-    /// [`LEASED_DIAL_BUDGET`].
+    /// [`LEASED_DIAL_BUDGET`]. It ends at once, dialling nothing more, when
+    /// the burst ends under it: a latch call (the outcome is then
+    /// `Unreachable`) or the burst's byte cap tripping (an error).
     ///
     /// # Errors
     ///
@@ -8406,7 +8408,7 @@ impl Agent {
         }
         let lease = lease.min(std::time::Duration::from_secs(MAX_DEMAND_LEASE_SECS));
         let deadline = tokio::time::Instant::now() + LEASED_DIAL_BUDGET;
-        let generation = network.demand_lease_generation();
+        let (generation, ended) = network.demand_lease_generation_and_end();
         // A leased dial is a burst dial: while latched it may use one
         // hole-punch introducer for this target, the coordinators the
         // target announced first.
@@ -8422,7 +8424,17 @@ impl Agent {
             (outcome, DIALED_MACHINE.with(std::cell::Cell::get))
         });
         let dial = network::NetworkNode::within_leased_dial(generation, deadline, dial);
-        let (outcome, machine) = dial.await;
+        let (outcome, machine) = tokio::select! {
+            biased;
+            () = ended.cancelled() => {
+                // Dropping the dial drops every handshake it had open.
+                if network.burst_cap_tripped() {
+                    return Err(burst_cap_reached_error());
+                }
+                return Ok((connectivity::ConnectOutcome::Unreachable, false));
+            }
+            dialled = dial => dialled,
+        };
         let outcome = outcome?;
         let leased = record_demand_lease(network, generation, &outcome, machine, lease);
         Ok((outcome, leased))
@@ -32015,6 +32027,62 @@ mod tests {
             .expect("bob receives it")
             .expect("bob's stream is open");
         assert_eq!(got.payload, b"booked", "the refused send never left");
+    }
+
+    /// Fix (b): a leased connect still dialling when the burst's cap trips
+    /// stops at once (409 `burst_cap_reached`) and dials nothing more.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_leased_connect_in_flight_stops_when_the_cap_trips() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let phone = std::sync::Arc::new(bare_agent(dir.path(), "phone").await);
+        phone.set_leaf_mode(true);
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("silent");
+        let silent_addr = silent.local_addr().expect("silent addr");
+        let target = identity::AgentId([0x91; 32]);
+        let now = Agent::unix_timestamp_secs();
+        phone
+            .insert_discovered_agent_for_testing(DiscoveredAgent {
+                can_receive_direct: Some(false),
+                ..card_pin(
+                    target,
+                    identity::MachineId([0x92; 32]),
+                    vec![silent_addr],
+                    now,
+                )
+            })
+            .await;
+        phone.quiesce_mesh().await.expect("latch");
+        let network = std::sync::Arc::clone(phone.network().expect("network"));
+        let dial = tokio::spawn({
+            let phone = std::sync::Arc::clone(&phone);
+            async move {
+                phone
+                    .connect_to_agent_burst(
+                        &target,
+                        std::time::Duration::from_secs(120),
+                        Some(u64::MAX / 2),
+                        &[],
+                    )
+                    .await
+            }
+        });
+        let armed_by = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !network.burst_cap_snapshot().armed {
+            assert!(tokio::time::Instant::now() < armed_by, "the cap is armed");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!dial.is_finished(), "the dial is still running");
+        assert!(network.trip_burst_cap_for_test());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), dial)
+            .await
+            .expect("the dial stops at once")
+            .expect("dial task");
+        assert!(
+            matches!(&result, Err(e) if e.to_string().contains("burst_cap_reached")),
+            "{result:?}"
+        );
+        drop(silent);
     }
 
     /// A zero lease records nothing.
