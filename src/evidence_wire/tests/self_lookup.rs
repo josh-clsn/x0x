@@ -1761,3 +1761,153 @@ async fn a_refused_self_lookup_stops_at_the_responders_admission() {
         assert_eq!(counter(&device, name), 0, "{name}");
     }
 }
+
+/// M4, the field path of NAT-B: the desktop is gone from the phone's
+/// discovery cache and known only by peer evidence (a relationship
+/// record whose address is now silent), the engine hands back the
+/// coordinator it kept, and the latched phone's leased connect reaches the
+/// desktop through the punch. The punch lands after the evidence dial's own
+/// 3 s slice, so the dial must run on the connect's budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_reaches_a_contact_known_only_by_evidence_through_a_handed_back_introducer() {
+    let dir = tempfile::tempdir().unwrap();
+    let desktop = node(dir.path(), "desktop").await;
+    let public = node(dir.path(), "public").await;
+    let mut public_addr = public.network().unwrap().bound_addr().await.unwrap();
+    if public_addr.ip().is_unspecified() {
+        public_addr.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
+    }
+    desktop
+        .network()
+        .unwrap()
+        .connect_addr(public_addr)
+        .await
+        .expect("the desktop links to the public node");
+
+    // The phone keeps a relationship record for the desktop.
+    let path = dir.path().join("phone");
+    std::fs::create_dir_all(&path).unwrap();
+    let phone = Agent::builder()
+        .with_identity_dir(&path)
+        .with_machine_key(path.join("machine.key"))
+        .with_agent_key_path(path.join("agent.key"))
+        .with_user_key_path(path.join("user.key"))
+        .with_agent_cert_path(path.join("agent.cert"))
+        .with_contact_store_path(path.join("contacts.json"))
+        .with_network_config(crate::network::NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..Default::default()
+        })
+        .with_peer_cache_disabled()
+        .build()
+        .await
+        .unwrap();
+    let desktop_id = desktop.agent_id();
+    phone
+        .start_peer_evidence(
+            path.join("evidence"),
+            Default::default(),
+            Arc::new(move |agent| Some(agent == desktop_id)),
+        )
+        .unwrap();
+    assert!(phone.peer_evidence().wait(0).await);
+    phone.set_leaf_mode(true);
+
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let silent_addr = silent.local_addr().unwrap();
+    let now = dm_capability::now_unix_ms();
+    let template = crate::IdentityAnnouncement {
+        self_name: None,
+        agent_id: desktop.agent_id(),
+        machine_id: desktop.machine_id(),
+        user_id: None,
+        agent_certificate: None,
+        machine_public_key: desktop
+            .identity
+            .machine_keypair()
+            .public_key()
+            .as_bytes()
+            .to_vec(),
+        machine_signature: vec![],
+        agent_public_key: desktop
+            .identity
+            .agent_keypair()
+            .public_key()
+            .as_bytes()
+            .to_vec(),
+        addresses: vec![silent_addr],
+        announced_at: now / 1000,
+        nat_type: None,
+        can_receive_direct: None,
+        is_relay: None,
+        is_coordinator: None,
+        reachable_via: vec![],
+        relay_candidates: vec![],
+    };
+    let record = mint_hello(
+        &desktop.identity,
+        template,
+        &crate::announce_blob::shared_cert_pair(None, None),
+        crate::dm::DmCapabilities::v1_gossip_ready(vec![42; 1184]),
+        None,
+        true,
+    )
+    .unwrap()
+    .into_record();
+    phone
+        .peer_evidence()
+        .store()
+        .unwrap()
+        .ingest(record, IngestSource::Gossip, now)
+        .unwrap();
+    assert!(phone
+        .identity_discovery_cache
+        .read()
+        .await
+        .get(&desktop.agent_id())
+        .is_none());
+    assert!(phone
+        .peer_evidence()
+        .usable_agent(desktop.agent_id(), now)
+        .is_some());
+    phone.quiesce_mesh().await.unwrap();
+
+    let started = std::time::Instant::now();
+    let (result, steps) = crate::DIAL_STEPS
+        .scope(std::cell::RefCell::new(Vec::new()), async {
+            let result = phone
+                .connect_to_agent_burst(
+                    &desktop.agent_id(),
+                    Duration::from_secs(120),
+                    None,
+                    &[public_addr],
+                )
+                .await;
+            (
+                result,
+                crate::DIAL_STEPS.with(|steps| steps.borrow().clone()),
+            )
+        })
+        .await;
+    let took = started.elapsed();
+    let (outcome, leased) = result.unwrap();
+    assert!(outcome.is_live_path(), "{outcome:?} after {took:?}");
+    assert!(leased, "the lease was recorded");
+    assert!(
+        steps
+            .iter()
+            .any(|(step, got)| *step == "evidence" && *got > crate::EVIDENCE_CONNECT_DIAL_TIMEOUT),
+        "the evidence dial ran on the budget: {steps:?}"
+    );
+    assert!(
+        took > crate::EVIDENCE_CONNECT_DIAL_TIMEOUT && took < crate::LEASED_DIAL_BUDGET,
+        "the punch landed past the evidence slice, inside the budget: {took:?}"
+    );
+    let snap = phone.network().unwrap().relay_client_snapshot();
+    assert_eq!(snap.introducer_dials, 1, "{snap:?}");
+    assert_eq!(snap.introducer_punch_successes, 1, "{snap:?}");
+    drop(silent);
+}

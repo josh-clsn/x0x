@@ -8699,7 +8699,7 @@ impl Agent {
             allow_local_discovery_addresses(network.config()),
         );
         let result = tokio::time::timeout(
-            dial_step_timeout(EVIDENCE_CONNECT_DIAL_TIMEOUT),
+            dial_step_timeout("evidence", EVIDENCE_CONNECT_DIAL_TIMEOUT),
             network.connect_peer_with_addrs(peer, addrs),
         )
         .await;
@@ -9268,7 +9268,7 @@ impl Agent {
                 })?;
 
             match tokio::time::timeout(
-                dial_step_timeout(dial_timeout),
+                dial_step_timeout("hinted", dial_timeout),
                 network.connect_peer_with_addrs(peer_id_hint, info.addresses.clone()),
             )
             .await
@@ -9472,7 +9472,7 @@ impl Agent {
                     )))
                 })?;
             let coordinated_result = tokio::time::timeout(
-                dial_step_timeout(dial_timeout),
+                dial_step_timeout("coordinated", dial_timeout),
                 network.connect_peer_with_addrs(peer_id_hint, info.addresses.clone()),
             )
             .await;
@@ -23082,13 +23082,25 @@ async fn within_leased_budget<F: std::future::Future>(
 /// Most hole-punch introducers one `POST /agents/connect` may hand over.
 pub const MAX_CONNECT_INTRODUCERS: usize = 4;
 
-/// How long one connector step may run. Outside a leased connect, its own
-/// `slice`; inside one, whatever is left of the connect's one budget, so a
-/// step that reaches the punch is not cut at its own slice.
-fn dial_step_timeout(slice: std::time::Duration) -> std::time::Duration {
-    network::leased_dial_deadline().map_or(slice, |deadline| {
+/// How long one connector step (named `step`) may run. Outside a leased
+/// connect, its own `slice`; inside one, whatever is left of the connect's
+/// one budget, so a step that reaches the punch is not cut at its own slice.
+fn dial_step_timeout(step: &'static str, slice: std::time::Duration) -> std::time::Duration {
+    let timeout = network::leased_dial_deadline().map_or(slice, |deadline| {
         deadline.saturating_duration_since(tokio::time::Instant::now())
-    })
+    });
+    #[cfg(test)]
+    let _ = DIAL_STEPS.try_with(|steps| steps.borrow_mut().push((step, timeout)));
+    #[cfg(not(test))]
+    let _ = step;
+    timeout
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Test seam: the connector steps a connect ran through
+    /// [`dial_step_timeout`] and the time each got.
+    pub(crate) static DIAL_STEPS: std::cell::RefCell<Vec<(&'static str, std::time::Duration)>>;
 }
 
 /// [`dial_step_timeout`] for a probe that cannot punch (a LAN or loopback
@@ -32048,20 +32060,73 @@ mod tests {
     async fn a_leased_connect_shares_one_budget_across_its_steps() {
         let three = std::time::Duration::from_secs(3);
         let eight = std::time::Duration::from_secs(8);
-        assert_eq!(dial_step_timeout(three), three);
+        assert_eq!(dial_step_timeout("test", three), three);
         assert_eq!(dial_probe_timeout(three), three);
         let deadline = tokio::time::Instant::now() + LEASED_DIAL_BUDGET;
         network::NetworkNode::within_leased_dial(0, deadline, async {
             tokio::time::advance(std::time::Duration::from_secs(1)).await;
-            assert_eq!(dial_step_timeout(three), std::time::Duration::from_secs(11));
-            assert_eq!(dial_step_timeout(eight), std::time::Duration::from_secs(11));
+            assert_eq!(
+                dial_step_timeout("test", three),
+                std::time::Duration::from_secs(11)
+            );
+            assert_eq!(
+                dial_step_timeout("test", eight),
+                std::time::Duration::from_secs(11)
+            );
             assert_eq!(dial_probe_timeout(three), three);
             tokio::time::advance(std::time::Duration::from_secs(10)).await;
-            assert_eq!(dial_step_timeout(eight), std::time::Duration::from_secs(1));
+            assert_eq!(
+                dial_step_timeout("test", eight),
+                std::time::Duration::from_secs(1)
+            );
             assert_eq!(dial_probe_timeout(three), std::time::Duration::from_secs(1));
         })
         .await;
         assert!(LEASED_DIAL_BUDGET < std::time::Duration::from_secs(15));
+    }
+
+    /// M4: a leased connect's hinted dial (step 3) and coordinated dial
+    /// (step 5) run on the connect's budget, not on their own 8 s slice. A
+    /// call site that went back to its slice would not be recorded at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_leased_connect_runs_steps_3_and_5_on_its_budget() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let phone = bare_agent(dir.path(), "phone").await;
+        phone.set_leaf_mode(true);
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("silent");
+        let silent_addr = silent.local_addr().expect("silent addr");
+        let target = identity::AgentId([0x93; 32]);
+        let now = Agent::unix_timestamp_secs();
+        phone
+            .insert_discovered_agent_for_testing(DiscoveredAgent {
+                can_receive_direct: Some(false),
+                ..card_pin(
+                    target,
+                    identity::MachineId([0x94; 32]),
+                    vec![silent_addr],
+                    now,
+                )
+            })
+            .await;
+        phone.quiesce_mesh().await.expect("latch");
+        let steps = DIAL_STEPS
+            .scope(std::cell::RefCell::new(Vec::new()), async {
+                let _ = phone
+                    .connect_to_agent_burst(&target, std::time::Duration::from_secs(60), None, &[])
+                    .await;
+                DIAL_STEPS.with(|steps| steps.borrow().clone())
+            })
+            .await;
+        let hinted = steps.iter().find(|(step, _)| *step == "hinted");
+        assert!(
+            hinted.is_some_and(|(_, got)| *got > std::time::Duration::from_secs(8)),
+            "step 3 runs on the budget: {steps:?}"
+        );
+        assert!(
+            steps.iter().any(|(step, _)| *step == "coordinated"),
+            "step 5 runs on the budget: {steps:?}"
+        );
+        drop(silent);
     }
 
     /// L1: the whole leased connect ends at its budget plus a short grace,
