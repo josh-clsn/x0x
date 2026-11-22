@@ -102,6 +102,13 @@ pub struct RelayClientSnapshot {
     /// UDP bytes received on introducer connections, counted as each
     /// closed.
     pub introducer_bytes_received: u64,
+    /// Hole-punch rounds run through an introducer since start that reached
+    /// the target.
+    pub introducer_punch_successes: u64,
+    /// Hole-punch rounds run through an introducer since start that did
+    /// not: the coordination was refused or timed out, or the introducer
+    /// could not be reached.
+    pub introducer_punch_failures: u64,
     /// Client relay sessions open now, of any kind (proactive or opened by
     /// a relay fallback dial).
     pub active_sessions: usize,
@@ -218,6 +225,8 @@ impl RelayClientCounters {
             latched_seed_introducers,
             introducer_bytes_sent: introducers.bytes_sent,
             introducer_bytes_received: introducers.bytes_received,
+            introducer_punch_successes: introducers.punch_successes,
+            introducer_punch_failures: introducers.punch_failures,
             active_sessions: stats.active_sessions,
             relay_servers: stats
                 .relay_servers
@@ -261,6 +270,43 @@ mod tests {
         assert_eq!(snap.established_while_quiesced, 1);
         assert_eq!(snap.last_relay_addr.as_deref(), Some("203.0.113.7:4001"));
         assert!(snap.last_established_ago_ms.is_some());
+    }
+
+    /// A burst's introducer use and punch outcomes reach the snapshot.
+    #[test]
+    fn introducer_dials_and_punch_outcomes_are_reported() {
+        let transport = TransportRelay {
+            proactive_relay_allowed: false,
+            relay_fallback_allowed: false,
+            relay_service_allowed: false,
+            inbound_punch_allowed: false,
+            known_peer_introducers_allowed: true,
+            coordinator_policy: ant_quic::CoordinatorPolicy::Introducer,
+            stats: ant_quic::RelayClientStats::default(),
+            introducers: ant_quic::IntroducerStats {
+                dials: 2,
+                known_peer_dials: 1,
+                bytes_sent: 900,
+                bytes_received: 1200,
+                punch_successes: 1,
+                punch_failures: 3,
+            },
+        };
+        let snap =
+            RelayClientCounters::default().snapshot(Some(transport), Default::default(), true);
+        assert_eq!(snap.coordinator_policy.as_deref(), Some("introducer"));
+        assert_eq!((snap.introducer_dials, snap.introducer_seed_dials), (2, 1));
+        assert_eq!(
+            (snap.introducer_bytes_sent, snap.introducer_bytes_received),
+            (900, 1200)
+        );
+        assert_eq!(
+            (
+                snap.introducer_punch_successes,
+                snap.introducer_punch_failures
+            ),
+            (1, 3)
+        );
     }
 
     #[test]

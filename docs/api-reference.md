@@ -1199,7 +1199,12 @@ embedder that builds `NetworkConfig` itself sets `relay_service_disabled`.
 `GET /diagnostics/connectivity` → `relay_client` reports
 `relay_service_allowed`, `inbound_punch_allowed`, `seed_introducers_allowed`,
 `latched_seed_introducers`, `introducer_seed_dials` (since start),
-`introducer_dials_24h` and `introducer_seed_dials_24h`.
+`introducer_dials_24h` and `introducer_seed_dials_24h`. A burst's
+introducer use reads from `introducer_dials`, `introducer_bytes_sent`,
+`introducer_bytes_received` and how its punches ended:
+`introducer_punch_successes` and `introducer_punch_failures` (hole-punch
+rounds run through an introducer since start; a round whose introducer
+could not be reached counts as a failure).
 
 With `defer_mesh_join = true` the daemon starts latched: the node is
 quiesced, with the switches above set, from its first moment, before any

@@ -128,6 +128,10 @@ engine-A routes, and the four TreeKEM catch-up routes).
   further leased connects 409 `burst_cap_reached` until the next
   `POST /mesh/quiesce`. `GET /diagnostics/connectivity` `burst_cap` reports
   it. CLI `x0x direct connect --max-bytes`.
+- **A burst's punch outcomes are visible.** `relay_client` gains
+  `introducer_punch_successes` and `introducer_punch_failures`: hole-punch
+  rounds run through an introducer that reached the target or did not
+  (ant-quic `IntroducerStats::punch_successes` / `punch_failures`).
 - **Seed introducer dials are counted, and off unless asked for (M-3).**
   `relay_client` gains `introducer_seed_dials`, `introducer_dials_24h`,
   `introducer_seed_dials_24h`, `seed_introducers_allowed` and
