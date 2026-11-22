@@ -4944,6 +4944,14 @@ impl AnnouncementAssistSnapshot {
     fn announces_coordinator_hints(&self) -> bool {
         self.declared_public != Some(true)
     }
+
+    /// Whether an announcement names relay candidates (`relay_candidates`):
+    /// only while direct inbound is not known to work, as before. Meshed
+    /// relay selection reads them, and the latched burst needs only the
+    /// coordinators.
+    fn announces_relay_candidates(&self) -> bool {
+        self.can_receive_direct != Some(true)
+    }
 }
 
 /// Metered-leaf suppression of the #398 relay opt-in.
@@ -6196,6 +6204,11 @@ impl HeartbeatContext {
                 &self.selection_skew,
             )
             .await
+        };
+        let relay_candidates = if assist_snapshot.announces_relay_candidates() {
+            relay_candidates
+        } else {
+            Vec::new()
         };
 
         // Include user identity ONLY if the user has previously consented
@@ -14594,6 +14607,11 @@ impl Agent {
             .await
         } else {
             (Vec::new(), Vec::new())
+        };
+        let relay_candidates = if assist_snapshot.announces_relay_candidates() {
+            relay_candidates
+        } else {
+            Vec::new()
         };
 
         let announcement =
@@ -28893,6 +28911,28 @@ mod tests {
                 !declared.announces_coordinator_hints(),
                 "the operator's opt-in does"
             );
+        }
+
+        /// Relay candidates keep their old gate: left out while direct
+        /// inbound is known to work, so meshed relay selection sees the same
+        /// inputs as before the coordinator change.
+        #[test]
+        fn relay_candidates_keep_the_direct_inbound_gate() {
+            let direct = ant_quic::NodeStatus {
+                can_receive_direct: true,
+                ..ant_quic::NodeStatus::default()
+            };
+            let snapshot = AnnouncementAssistSnapshot::from_node_status(&direct);
+            assert!(snapshot.announces_coordinator_hints());
+            assert!(!snapshot.announces_relay_candidates());
+            let natted = ant_quic::NodeStatus {
+                can_receive_direct: false,
+                ..ant_quic::NodeStatus::default()
+            };
+            assert!(
+                AnnouncementAssistSnapshot::from_node_status(&natted).announces_relay_candidates()
+            );
+            assert!(AnnouncementAssistSnapshot::default().announces_relay_candidates());
         }
 
         /// #398: peer-verified inbound reachability at GLOBAL scope is the

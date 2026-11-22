@@ -1249,6 +1249,9 @@ mapping the node had opened toward it. An active router port mapping does
 not leave them out either: behind a second NAT (CGNAT, a mesh router behind
 the ISP's box) the mapping reaches nobody. A desktop behind a home NAT used
 to announce no coordinator, so a latched phone had no introducer for it.
+Relay candidates (`relay_candidates`) keep their old rule: they are left out
+while ant-quic reads the node as able to receive direct, so meshed relay
+selection sees the same inputs as before.
 
 With the daemon setting `relay_service_disabled = true` (TOML, default
 `false`, for a phone) the node never serves a relay session or coordinates a
