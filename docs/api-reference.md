@@ -1244,7 +1244,9 @@ embedder kept (for example an earlier entry's `coordinators`):
 address or a longer list answers 400. For this dial they join the coordinators
 the target announces now, after them, and the same rules apply: one
 introducer per target per burst, hung up on once the punch resolves, never a
-relay. An unleased connect ignores them. CLI: `x0x direct connect
+relay. When the connect ends the target's hints are its announced
+coordinators again (a connect that is itself dropped leaves them until the
+next leased connect to that agent). An unleased connect ignores them. CLI: `x0x direct connect
 --lease-secs 90 --introducer 203.0.113.7:5483`.
 
 Every node announces the coordinators it is linked to (`reachable_via`)

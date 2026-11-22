@@ -8398,7 +8398,9 @@ impl Agent {
     /// `introducers`, at most [`MAX_CONNECT_INTRODUCERS`]): for this dial
     /// they join the coordinators the target announced, after them, under
     /// the same rules (one introducer per target per burst, hung up once the
-    /// punch resolves, never a relay).
+    /// punch resolves, never a relay). When the connect ends the target's
+    /// hints go back to its announced coordinators (a connect that is
+    /// itself dropped leaves them until the next leased connect to it).
     ///
     /// The whole connect, every step of it, shares one budget of
     /// [`LEASED_DIAL_BUDGET`]. It ends at once, dialling nothing more, when
@@ -8445,19 +8447,22 @@ impl Agent {
             (outcome, DIALED_MACHINE.with(std::cell::Cell::get))
         });
         let dial = network::NetworkNode::within_leased_dial(generation, deadline, dial);
-        let (outcome, machine) = tokio::select! {
+        // `None`: the burst ended under the dial; `Some(None)`: the budget ran
+        // out. Dropping the dial drops every handshake it had open.
+        let dialled = tokio::select! {
             biased;
-            () = ended.cancelled() => {
-                // Dropping the dial drops every handshake it had open.
-                if network.burst_cap_tripped() {
-                    return Err(burst_cap_reached_error());
-                }
-                return Ok((connectivity::ConnectOutcome::Unreachable, false));
-            }
-            dialled = within_leased_budget(deadline, dial) => match dialled {
-                Some(dialled) => dialled,
-                None => return Ok((connectivity::ConnectOutcome::Unreachable, false)),
-            },
+            () = ended.cancelled() => None,
+            dialled = within_leased_budget(deadline, dial) => Some(dialled),
+        };
+        if !introducers.is_empty() {
+            // The embedder's introducers were for this dial only.
+            self.note_burst_introducers(agent_id, &[]).await;
+        }
+        let (outcome, machine) = match dialled {
+            Some(Some(dialled)) => dialled,
+            Some(None) => return Ok((connectivity::ConnectOutcome::Unreachable, false)),
+            None if network.burst_cap_tripped() => return Err(burst_cap_reached_error()),
+            None => return Ok((connectivity::ConnectOutcome::Unreachable, false)),
         };
         let outcome = outcome?;
         let leased = record_demand_lease(network, generation, &outcome, machine, lease);
@@ -31987,6 +31992,32 @@ mod tests {
         assert_eq!(
             network.peer_introducers(&ant_quic::PeerId(card.machine_id.0)),
             vec![kept]
+        );
+    }
+
+    /// L3: a leased connect's handed-back introducers last for that dial
+    /// only: once it ends, the target's hints are its announced ones again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn handed_back_introducers_last_for_the_dial_only() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let (alice, bob, _bob_addr) = leaf_and_peer(dir.path()).await;
+        let network = std::sync::Arc::clone(alice.network().expect("network"));
+        let kept: std::net::SocketAddr = "203.0.113.9:5483".parse().expect("addr");
+        let (outcome, _) = alice
+            .connect_to_agent_burst(
+                &bob.agent_id(),
+                std::time::Duration::from_secs(60),
+                None,
+                &[kept],
+            )
+            .await
+            .expect("the connect runs");
+        assert!(outcome.is_live_path(), "{outcome:?}");
+        assert!(
+            network
+                .peer_introducers(&ant_quic::PeerId(bob.machine_id().0))
+                .is_empty(),
+            "bob announced no coordinator, and the handed-back one is gone"
         );
     }
 

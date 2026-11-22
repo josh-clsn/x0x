@@ -59,7 +59,8 @@ pub(in crate::server) struct ConnectAgentRequest {
     /// addresses, at most `x0x::MAX_CONNECT_INTRODUCERS`), for example the
     /// `coordinators` of an earlier `GET /agents/discovered/:agent_id`. A
     /// leased connect uses them after the coordinators the target announces
-    /// now, under the same rules; an unleased connect ignores them.
+    /// now, under the same rules, for that dial only; an unleased connect
+    /// ignores them.
     #[serde(default)]
     introducers: Option<Vec<String>>,
 }
