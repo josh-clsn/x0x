@@ -8730,9 +8730,12 @@ impl Agent {
             view.announcement.addresses.clone(),
             allow_local_discovery_addresses(network.config()),
         );
+        if leased_budget_spent("evidence") {
+            return Some(connectivity::ConnectOutcome::Unreachable);
+        }
         let result = tokio::time::timeout(
             dial_step_timeout("evidence", EVIDENCE_CONNECT_DIAL_TIMEOUT),
-            network.connect_peer_with_addrs(peer, addrs),
+            network.connect_peer_with_addrs_with_origin(peer, addrs, "evidence"),
         )
         .await;
         let now = dm_capability::now_unix_ms();
@@ -8804,12 +8807,15 @@ impl Agent {
     ) -> Option<std::net::SocketAddr> {
         const LOOPBACK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
         for addr in addresses.iter().copied().filter(|a| a.ip().is_loopback()) {
+            if leased_budget_spent("loopback_first") {
+                return None;
+            }
             // Taken right before each dial: a peer some other path connected
             // meanwhile is never closed here.
             let before = network.connected_peers().await;
             match tokio::time::timeout(
                 dial_probe_timeout(LOOPBACK_PROBE_TIMEOUT),
-                network.connect_addr(addr),
+                network.connect_addr_with_origin(addr, "loopback_first"),
             )
             .await
             {
@@ -9110,6 +9116,9 @@ impl Agent {
         // target's introducer budget for the burst on a LAN address.
         let leased = network::leased_dial_deadline().is_some();
         for addr in &direct_probe_addrs {
+            if leased_budget_spent("local_direct_first") {
+                return Ok(connectivity::ConnectOutcome::Unreachable);
+            }
             if let Some(peer_id_hint) = peer_id_hint {
                 let authenticated = if leased {
                     None
@@ -9117,7 +9126,11 @@ impl Agent {
                     Some(
                         tokio::time::timeout(
                             local_probe_timeout,
-                            network.connect_peer_with_addrs(peer_id_hint, vec![*addr]),
+                            network.connect_peer_with_addrs_with_origin(
+                                peer_id_hint,
+                                vec![*addr],
+                                "local_direct_first",
+                            ),
                         )
                         .await,
                     )
@@ -9184,7 +9197,7 @@ impl Agent {
                 let before = latched_peers_before_probe(network).await;
                 match tokio::time::timeout(
                     dial_probe_timeout(local_probe_timeout),
-                    network.connect_addr(*addr),
+                    network.connect_addr_with_origin(*addr, "local_direct_raw_fallback"),
                 )
                 .await
                 {
@@ -9245,7 +9258,7 @@ impl Agent {
             } else {
                 match tokio::time::timeout(
                     dial_probe_timeout(local_probe_timeout),
-                    network.connect_addr(*addr),
+                    network.connect_addr_with_origin(*addr, "local_direct_first"),
                 )
                 .await
                 {
@@ -9297,6 +9310,9 @@ impl Agent {
         // 3. If we know the peer's machine ID, prefer a peer-authenticated dial
         //    with explicit address hints first. This is more reliable for agent
         //    cards and other out-of-band discoveries than a raw address dial.
+        if leased_budget_spent("hinted_peer") {
+            return Ok(connectivity::ConnectOutcome::Unreachable);
+        }
         if agent.machine_id.0 != [0u8; 32] {
             let peer_id_hint = ant_quic::PeerId(agent.machine_id.0);
             self.seed_transport_peer_hints_for_target(network, &agent)
@@ -9309,7 +9325,11 @@ impl Agent {
 
             match tokio::time::timeout(
                 dial_step_timeout("hinted", dial_timeout),
-                network.connect_peer_with_addrs(peer_id_hint, info.addresses.clone()),
+                network.connect_peer_with_addrs_with_origin(
+                    peer_id_hint,
+                    info.addresses.clone(),
+                    "hinted_peer",
+                ),
             )
             .await
             {
@@ -9365,10 +9385,13 @@ impl Agent {
                 if direct_probe_addrs.contains(addr) {
                     continue;
                 }
+                if leased_budget_spent("direct_per_addr") {
+                    return Ok(connectivity::ConnectOutcome::Unreachable);
+                }
                 let before = latched_peers_before_probe(network).await;
                 match tokio::time::timeout(
                     dial_probe_timeout(dial_timeout),
-                    network.connect_addr(*addr),
+                    network.connect_addr_with_origin(*addr, "direct_per_addr"),
                 )
                 .await
                 {
@@ -9513,9 +9536,16 @@ impl Agent {
                         "failed to seed transport peer hints: {e}"
                     )))
                 })?;
+            if leased_budget_spent("coordinated") {
+                return Ok(connectivity::ConnectOutcome::Unreachable);
+            }
             let coordinated_result = tokio::time::timeout(
                 dial_step_timeout("coordinated", dial_timeout),
-                network.connect_peer_with_addrs(peer_id_hint, info.addresses.clone()),
+                network.connect_peer_with_addrs_with_origin(
+                    peer_id_hint,
+                    info.addresses.clone(),
+                    "coordinated",
+                ),
             )
             .await;
             match coordinated_result {
@@ -23145,6 +23175,24 @@ tokio::task_local! {
     pub(crate) static DIAL_STEPS: std::cell::RefCell<Vec<(&'static str, std::time::Duration)>>;
 }
 
+/// Whether the leased connect this task dials for has spent its budget
+/// before its step `next_step`. The connector then stops stepping and the
+/// connect answers `Unreachable`: a later step would only be refused by the
+/// latch, or, meshed, run past the budget. Always false outside a leased
+/// connect.
+fn leased_budget_spent(next_step: &'static str) -> bool {
+    let spent = network::leased_dial_deadline()
+        .is_some_and(|deadline| tokio::time::Instant::now() >= deadline);
+    if spent {
+        tracing::info!(
+            target: "x0x::connect",
+            next_step,
+            "leased connect budget spent; no further step"
+        );
+    }
+    spent
+}
+
 /// [`dial_step_timeout`] for a probe that cannot punch (a LAN or loopback
 /// address dialled by address): its own `slice`, and inside a leased
 /// connect never past the connect's budget.
@@ -32161,6 +32209,9 @@ mod tests {
     /// M4: a leased connect's hinted dial (step 3) and coordinated dial
     /// (step 5) run on the connect's budget, not on their own 8 s slice. A
     /// call site that went back to its slice would not be recorded at all.
+    /// Step 3 to a silent address spends the whole budget, so no step runs
+    /// after it; step 5 is checked on a target that skips step 3 (no
+    /// machine known).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_leased_connect_runs_steps_3_and_5_on_its_budget() {
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -32168,36 +32219,91 @@ mod tests {
         phone.set_leaf_mode(true);
         let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("silent");
         let silent_addr = silent.local_addr().expect("silent addr");
-        let target = identity::AgentId([0x93; 32]);
+        let hinted_target = identity::AgentId([0x93; 32]);
+        let coordinated_target = identity::AgentId([0x97; 32]);
         let now = Agent::unix_timestamp_secs();
-        phone
-            .insert_discovered_agent_for_testing(DiscoveredAgent {
-                can_receive_direct: Some(false),
-                ..card_pin(
-                    target,
-                    identity::MachineId([0x94; 32]),
-                    vec![silent_addr],
-                    now,
-                )
-            })
-            .await;
+        for (target, machine) in [
+            (hinted_target, identity::MachineId([0x94; 32])),
+            (coordinated_target, identity::MachineId([0u8; 32])),
+        ] {
+            phone
+                .insert_discovered_agent_for_testing(DiscoveredAgent {
+                    can_receive_direct: Some(false),
+                    ..card_pin(target, machine, vec![silent_addr], now)
+                })
+                .await;
+        }
         phone.quiesce_mesh().await.expect("latch");
-        let steps = DIAL_STEPS
-            .scope(std::cell::RefCell::new(Vec::new()), async {
+        let steps_of = |target: identity::AgentId| {
+            let phone = &phone;
+            DIAL_STEPS.scope(std::cell::RefCell::new(Vec::new()), async move {
                 let _ = phone
                     .connect_to_agent_burst(&target, std::time::Duration::from_secs(60), None, &[])
                     .await;
                 DIAL_STEPS.with(|steps| steps.borrow().clone())
             })
-            .await;
+        };
+        let steps = steps_of(hinted_target).await;
         let hinted = steps.iter().find(|(step, _)| *step == "hinted");
         assert!(
             hinted.is_some_and(|(_, got)| *got > std::time::Duration::from_secs(8)),
             "step 3 runs on the budget: {steps:?}"
         );
         assert!(
-            steps.iter().any(|(step, _)| *step == "coordinated"),
+            !steps.iter().any(|(step, _)| *step == "coordinated"),
+            "step 3 spent the budget, so step 5 does not run: {steps:?}"
+        );
+        let steps = steps_of(coordinated_target).await;
+        let coordinated = steps.iter().find(|(step, _)| *step == "coordinated");
+        assert!(
+            coordinated.is_some_and(|(_, got)| *got > std::time::Duration::from_secs(8)),
             "step 5 runs on the budget: {steps:?}"
+        );
+        drop(silent);
+    }
+
+    /// train-1123 item 6: once a leased connect's budget is spent, the
+    /// connector takes no further step. No later step reaches a dial seam
+    /// (the latch refuses none, under any origin label), and the connect
+    /// answers `Unreachable`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spent_leased_connect_makes_no_further_dial() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let phone = bare_agent(dir.path(), "phone").await;
+        phone.set_leaf_mode(true);
+        let silent: Vec<std::net::UdpSocket> = (0..2)
+            .map(|_| std::net::UdpSocket::bind("127.0.0.1:0").expect("silent"))
+            .collect();
+        let silent_addrs = silent
+            .iter()
+            .map(|socket| socket.local_addr().expect("silent addr"))
+            .collect();
+        let target = identity::AgentId([0x95; 32]);
+        let now = Agent::unix_timestamp_secs();
+        phone
+            .insert_discovered_agent_for_testing(DiscoveredAgent {
+                can_receive_direct: Some(true),
+                ..card_pin(target, identity::MachineId([0x96; 32]), silent_addrs, now)
+            })
+            .await;
+        phone.quiesce_mesh().await.expect("latch");
+        let network = std::sync::Arc::clone(phone.network().expect("network"));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let outcome = network::NetworkNode::within_leased_dial(
+            network.demand_lease_generation(),
+            deadline,
+            phone.connect_to_agent(&target),
+        )
+        .await
+        .expect("the connect runs");
+        assert!(
+            matches!(outcome, connectivity::ConnectOutcome::Unreachable),
+            "{outcome:?}"
+        );
+        assert!(
+            network.latched_refusals_for_test().is_empty(),
+            "no step dialled after the budget: {:?}",
+            network.latched_refusals_for_test()
         );
         drop(silent);
     }

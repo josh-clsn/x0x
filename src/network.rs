@@ -2229,6 +2229,9 @@ pub struct NetworkNode {
     /// and before its last check.
     #[cfg(test)]
     unbooked_close_pause_for_test: Arc<Mutex<Option<RegistryClearPause>>>,
+    /// Test seam: the origin of every dial the latch refused.
+    #[cfg(test)]
+    latched_refusals_for_test: Arc<Mutex<Vec<&'static str>>>,
     /// M-2: the own peers the embedder named (`PUT /mesh/own-peers`), kept
     /// so agent ids not yet resolved to a machine can be resolved later.
     own_peer_request: Arc<Mutex<OwnPeerRequest>>,
@@ -2887,6 +2890,8 @@ impl NetworkNode {
             burst_targets: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             unbooked_close_pause_for_test: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            latched_refusals_for_test: Arc::new(Mutex::new(Vec::new())),
             own_peer_request: Arc::new(Mutex::new(OwnPeerRequest::default())),
             burst_hint_machines: Arc::new(Mutex::new(HashMap::new())),
             introducer_day: Arc::new(Mutex::new(introducer_day::IntroducerDay::default())),
@@ -4371,11 +4376,21 @@ impl NetworkNode {
         peer_id: AntPeerId,
         addrs: Vec<SocketAddr>,
     ) -> NetworkResult<(SocketAddr, AntPeerId)> {
+        self.connect_peer_with_addrs_with_origin(peer_id, addrs, "peer_with_addrs")
+            .await
+    }
+
+    /// [`Self::connect_peer_with_addrs`] carrying the refusal-log origin
+    /// (the connect step that dials).
+    pub(crate) async fn connect_peer_with_addrs_with_origin(
+        &self,
+        peer_id: AntPeerId,
+        addrs: Vec<SocketAddr>,
+        origin: &'static str,
+    ) -> NetworkResult<(SocketAddr, AntPeerId)> {
         // Issue #292 invariant C: refuse pre-socket when the id is known.
-        self.dial_gated(&peer_id, "peer_with_addrs").await?;
-        let burst_end = self
-            .latched_dial_refusal(Some(&peer_id), "peer_with_addrs")
-            .await?;
+        self.dial_gated(&peer_id, origin).await?;
+        let burst_end = self.latched_dial_refusal(Some(&peer_id), origin).await?;
         // #484 (code review r1 item 4): normalize v4-mapped addresses at
         // this shared boundary — verified-announcement auto-connect and
         // every other addrs caller route through here.
@@ -4412,10 +4427,10 @@ impl NetworkNode {
             ))
             .await
         else {
-            return Err(dial_abandoned("peer_with_addrs"));
+            return Err(dial_abandoned(origin));
         };
         let Some(peer_conn_res) = peer_conn_res else {
-            return Err(burst_ended("peer_with_addrs"));
+            return Err(burst_ended(origin));
         };
         let dur_ms = start.elapsed().as_millis() as u64;
 
@@ -4454,7 +4469,7 @@ impl NetworkNode {
         // Issue #292 invariant C: re-check the answered id after the
         // handshake and before any bookkeeping so a tombstone that landed
         // mid-dial never admits.
-        self.dial_gated_answered(&node, &peer_conn.peer_id, "peer_with_addrs")
+        self.dial_gated_answered(&node, &peer_conn.peer_id, origin)
             .await?;
 
         // Identity gate — verify the responding peer is the one we requested
@@ -5049,6 +5064,11 @@ impl NetworkNode {
             peer_id_prefix = ?peer.map(|peer| hex_prefix(&peer.0, 4)),
             "dial refused: the mesh is latched and no burst lease covers it"
         );
+        #[cfg(test)]
+        match self.latched_refusals_for_test.lock() {
+            Ok(mut refusals) => refusals.push(origin),
+            Err(poisoned) => poisoned.into_inner().push(origin),
+        }
         Err(NetworkError::LatchedNoLease(format!(
             "mesh quiesced: no burst lease covers this dial ({origin})"
         )))
@@ -5150,6 +5170,15 @@ impl NetworkNode {
                 _ => None,
             };
             self.close_unbooked_link(conn.peer_id, addr).await;
+        }
+    }
+
+    /// Test seam: the origins of the dials the latch refused so far.
+    #[cfg(test)]
+    pub(crate) fn latched_refusals_for_test(&self) -> Vec<&'static str> {
+        match self.latched_refusals_for_test.lock() {
+            Ok(refusals) => refusals.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
         }
     }
 
