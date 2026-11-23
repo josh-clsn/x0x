@@ -341,8 +341,9 @@ pub struct DaemonConfig {
     pub latched_seed_introducers: bool,
 
     /// OQ5 (audit): never serve a relay session or coordinate a hole punch
-    /// for any peer, meshed or latched; this node's own dials and punches
-    /// are unaffected. For a phone. Not implied by `leaf_mode`, because a
+    /// for any peer, and never set up or advertise a proactive relay session
+    /// of its own, meshed or latched; this node's own dials and punches are
+    /// unaffected. For a phone. Not implied by `leaf_mode`, because a
     /// desktop leaf coordinates its own phone's punches. Default `false`.
     #[serde(default)]
     pub relay_service_disabled: bool,

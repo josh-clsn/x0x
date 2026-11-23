@@ -637,10 +637,11 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub start_quiesced: bool,
     /// OQ5 (audit): never serve a relay session or coordinate a hole punch
-    /// for anyone, meshed or latched; the node's own dials and punches are
-    /// unaffected. For a phone, not for a desktop leaf, which coordinates its
-    /// own phone's punches. The daemon's `relay_service_disabled` sets it.
-    /// Default `false`.
+    /// for anyone, and never set up or advertise a proactive relay session
+    /// of its own through a seed or peer, meshed or latched; the node's own
+    /// dials and punches are unaffected. For a phone, not for a desktop
+    /// leaf, which coordinates its own phone's punches. The daemon's
+    /// `relay_service_disabled` sets it. Default `false`.
     #[serde(default)]
     pub relay_service_disabled: bool,
 }
@@ -2784,6 +2785,7 @@ impl NetworkNode {
         // few statements between `Node::with_config` returning and here.
         if config.relay_service_disabled {
             node.inner_endpoint().set_relay_service_allowed(false);
+            node.inner_endpoint().set_proactive_relay_allowed(false);
         }
         if config.start_quiesced {
             let endpoint = node.inner_endpoint();
@@ -5634,8 +5636,10 @@ impl NetworkNode {
     ///   the ones it dials: a hole punch's link is this node's own half (the
     ///   target's half still opens the target's NAT on its way here).
     ///
-    /// Everything is allowed again (`Any`) when the latch lifts, except
-    /// relay service with `relay_service_disabled` (OQ5), which stays off.
+    /// Everything is allowed again (`Any`) when the latch lifts, except,
+    /// with `relay_service_disabled` (OQ5, a phone), relay service and
+    /// proactive relay, which stay off: such a node never relays for others
+    /// and never has a public node relay for it.
     fn sync_proactive_relay(&self) {
         if let Some(endpoint) = self.relay_switch.get() {
             let latched = self.mesh_quiesced.load(Ordering::Relaxed);
@@ -5646,7 +5650,7 @@ impl NetworkNode {
                 (true, true) => ant_quic::CoordinatorPolicy::Introducer,
                 (true, false) => ant_quic::CoordinatorPolicy::ConnectedOnly,
             });
-            endpoint.set_proactive_relay_allowed(!latched);
+            endpoint.set_proactive_relay_allowed(!latched && !self.config.relay_service_disabled);
             endpoint.set_relay_service_allowed(!latched && !self.config.relay_service_disabled);
             endpoint.set_inbound_punch_allowed(!latched);
             endpoint.set_inbound_connections_allowed(!latched);
@@ -10297,6 +10301,80 @@ mod tests {
             .expect("meshed again, the phone answers");
         let _ = peer.try_shutdown().await;
         let _ = phone.try_shutdown().await;
+    }
+
+    /// A node with `relay_service_disabled` (a phone) never sets up or
+    /// advertises a proactive relay, meshed or latched: with its seed
+    /// linked and a symmetric NAT reported, no relay session opens. A node
+    /// without the setting opens one through the same seed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_node_with_relay_service_disabled_never_holds_a_proactive_relay() {
+        let seed = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("seed");
+        let seed_addr = seed.bound_addr().await.expect("seed bound");
+        let phone = NetworkNode::new(
+            NetworkConfig {
+                relay_service_disabled: true,
+                ..loopback_quic_config(vec![seed_addr])
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("phone");
+        phone
+            .connect_addr(seed_addr)
+            .await
+            .expect("phone reaches its seed");
+        assert!(!phone.mesh_quiesced(), "meshed");
+        force_symmetric_nat(&phone).await;
+        assert!(
+            !relay_sessions_within(&phone, 1, Duration::from_secs(3)).await,
+            "meshed: no proactive relay through the seed"
+        );
+        assert_eq!(
+            phone.relay_client_snapshot().proactive_relay_allowed,
+            Some(false),
+            "off from the start"
+        );
+
+        phone.latch_mesh_quiesced().expect("fresh latch");
+        assert_eq!(
+            phone.relay_client_snapshot().proactive_relay_allowed,
+            Some(false)
+        );
+        assert!(phone.unlatch_mesh_if_current(phone.mesh_transition_epoch()));
+        assert_eq!(
+            phone.relay_client_snapshot().proactive_relay_allowed,
+            Some(false),
+            "lifting the latch does not turn it on"
+        );
+        force_symmetric_nat(&phone).await;
+        assert!(
+            !relay_sessions_within(&phone, 1, Duration::from_secs(3)).await,
+            "meshed again: still none"
+        );
+        let snap = phone.relay_client_snapshot();
+        assert_eq!(snap.sessions_established, 0, "{snap:?}");
+        assert!(snap.relay_servers.is_empty());
+
+        let desktop = NetworkNode::new(loopback_quic_config(vec![seed_addr]), None, None)
+            .await
+            .expect("desktop");
+        desktop
+            .connect_addr(seed_addr)
+            .await
+            .expect("desktop reaches the seed");
+        force_symmetric_nat(&desktop).await;
+        assert!(
+            relay_sessions_within(&desktop, 1, Duration::from_secs(10)).await,
+            "without the setting the same trigger opens a session"
+        );
+
+        let _ = desktop.try_shutdown().await;
+        let _ = phone.try_shutdown().await;
+        let _ = seed.try_shutdown().await;
     }
 
     /// A latched phone with a live, unleased link to a peer and an armed cap
