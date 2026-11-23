@@ -331,10 +331,10 @@ pub struct DaemonConfig {
     pub defer_mesh_join: bool,
 
     /// M-3: whether a burst dial made while the mesh is latched may use a
-    /// bootstrap seed as its hole-punch introducer when the target announced
-    /// no introducer of its own. The seed then learns this node's address and
-    /// whom it is calling; it never relays data. With `false` such a target
-    /// gets no hole punch while latched. Default `false`: a seed learns whom
+    /// bootstrap seed as its hole-punch introducer when the target named no
+    /// introducer of its own or none of them could be reached. The seed then
+    /// learns this node's address and whom it is calling; it never relays
+    /// data. With `false` such a target gets no hole punch while latched. Default `false`: a seed learns whom
     /// the node calls, so the person turns this on. Meshed dials are not
     /// affected.
     #[serde(default = "default_latched_seed_introducers")]

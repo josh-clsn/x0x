@@ -1230,7 +1230,8 @@ While quiesced, the node serves nobody: a CONNECT-UDP request on any link is
 refused, no hole punch is coordinated for anyone, the node plays no target
 role in a punch a linked peer coordinates (its own punches still work), and
 an enabled peer relay forwards no relayed DM. In a burst, a target
-that announced no introducer of its own gets no hole punch unless the daemon
+that announced no introducer of its own, or whose introducers cannot be
+reached, gets no hole punch unless the daemon
 setting `latched_seed_introducers` (TOML, default `false`) is `true`: then a
 bootstrap seed may be its hole-punch introducer. The seed learns this
 node's address and whom it is calling, and never relays data.

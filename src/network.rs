@@ -5642,8 +5642,9 @@ impl NetworkNode {
     }
 
     /// M-3: allow or refuse a seed as the hole-punch introducer of a
-    /// latched burst dial (a target that announced no introducer of its own
-    /// then gets no punch). Refused by default. Takes effect at once.
+    /// latched burst dial, tried after the target's own introducers (refused:
+    /// a target that named none, or whose introducers could not be reached,
+    /// gets no punch). Refused by default. Takes effect at once.
     pub fn set_latched_seed_introducers_allowed(&self, allowed: bool) {
         self.latched_seed_introducers
             .store(allowed, Ordering::SeqCst);
