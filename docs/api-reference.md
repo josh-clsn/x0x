@@ -1139,6 +1139,14 @@ evidence, step 3 and step 5) runs until that budget ends, not to its own
 3 s or 8 s slice. A step that dials by address (steps 1, 2 and 4) keeps its
 slice inside the budget. In a leased connect step 2 dials by address only, so
 a LAN address never spends the target's introducer budget for the burst.
+Once the budget is spent no further step runs (none would be let through
+while quiesced), and the connect answers `Unreachable`.
+
+When a live link to the contact's machine comes up by another path while the
+connect is still dialling (the contact dialled this node meanwhile), the
+connect uses it: it gives its own step 0.5 s to finish, then answers
+`AlreadyConnected`, as the first check would have. As in that check, only a
+machine an authority store confirms counts.
 
 The import still pins the card's machine as an authority source at the
 import time (ADR 0115). A card leads or moves an announced entry only when an
@@ -1158,8 +1166,21 @@ echoes the granted `lease_secs` only when the lease was recorded; a refused
 lease (an unauthenticated machine, a quiesce during the dial, or a full lease
 table) and a non-live outcome echo `null`. The next
 `POST /mesh/quiesce`, including one while already quiesced, ends every lease
-and sweeps every peer. A lease changes nothing else: inbound links are still
-refused and gossip frames are still dropped on the leased link.
+and sweeps every peer. A lease changes nothing else: inbound connection
+attempts are still left unanswered (below) and gossip frames are still
+dropped on the leased link.
+
+While quiesced, the node answers no inbound connection attempt, leases or
+not: the first packet of each attempt is dropped before any handshake work
+and nothing goes back, so the dialler's attempt times out (it sees no close
+or refusal) and the NAT mapping it aimed at lapses. A seed that redials the
+node after a burst used it as an introducer therefore costs the node no
+handshake. A burst's links are the ones it dials; a hole punch's link is
+this node's own half. `GET /diagnostics/connectivity` → `relay_client`
+reports `inbound_connections_allowed`, `inbound_connections_ignored`
+(packets dropped since start, each retransmission counted) and
+`inbound_connections_answered` (inbound handshakes started since start; a
+quiesced node adds none).
 
 While quiesced, the daemon opens a new connection only for a leased
 `/agents/connect` still dialling in the current burst (since the last
@@ -1280,7 +1301,11 @@ selection sees the same inputs as before.
 With the daemon setting `relay_service_disabled = true` (TOML, default
 `false`, for a phone) the node never serves a relay session or coordinates a
 hole punch for anyone, meshed or latched, so no peer can use it as an
-introducer. Its own dials and punches still work, and while meshed it still
+introducer. Nor does it set up or advertise a proactive relay session of its
+own through a seed or peer when it reads its NAT as symmetric, so no public
+node relays data to it that way (`relay_client` → `proactive_relay_allowed`
+stays `false`). Meshed behind a symmetric NAT it is then reachable only by
+the peers that can hole-punch to it, and through the Noetic relay. Its own dials and punches still work, and while meshed it still
 answers a punch another node coordinates to reach it. `leaf_mode` does not
 imply it: a desktop leaf coordinates its own phone's punches. A library
 embedder that builds `NetworkConfig` itself sets `relay_service_disabled`.

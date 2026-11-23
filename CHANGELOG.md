@@ -309,6 +309,24 @@ engine-A routes, and the four TreeKEM catch-up routes).
 - **A target gone from discovery leaves no introducer hints (review L-7).**
 - **A latched peer relay forwards nothing (review L-9).** The `peer_relay`
   forward arm refuses while the mesh-off latch holds.
+- **A latched node answers no inbound connection attempt (train-1123).**
+  While quiesced, bursts and leases included, the first packet of every
+  inbound attempt is dropped before any handshake work and nothing goes
+  back (ant-quic `set_inbound_connections_allowed`). A seed that redialled a
+  latched phone after a burst used it as an introducer no longer costs a
+  full handshake per redial, and the phone's silence lets the NAT mapping
+  lapse, so the loop ends. The accept loop already closed every such link.
+  `relay_client` adds `inbound_connections_allowed`,
+  `inbound_connections_ignored` and `inbound_connections_answered`.
+- **`relay_service_disabled` also keeps proactive relay off.** A phone never
+  sets up or advertises a MASQUE relay through a seed, meshed or latched.
+- **A spent leased connect takes no further step.** Once its 12 s budget is
+  spent the connector stops and answers `Unreachable`; each step's dial now
+  carries its own origin in the latch's refusal log, not `manual`.
+- **A connect takes a link its target opened meanwhile.** When the target's
+  machine links to the node by another path while the connect is still
+  dialling, the connect answers `AlreadyConnected` within 0.5 s instead of
+  finishing its stale dials.
 
 ### Carried patches
 
@@ -321,7 +339,9 @@ engine-A routes, and the four TreeKEM catch-up routes).
   commits on top add `set_relay_service_allowed`, `set_own_peers`,
   `set_known_peer_introducers_allowed`, `IntroducerStats::known_peer_dials`,
   `set_inbound_punch_allowed`, `peer_introducers` and an introducer hint
-  table that evicts its oldest target. The patch replaces
+  table that evicts its oldest target. The beta-inbound commit adds
+  `set_inbound_connections_allowed` (with `inbound_connections_ignored` and
+  `inbound_connections_answered`). The patch replaces
   ant-quic for the whole graph, the saorsa-gossip crates included. A
   `[patch]` applies only in the root workspace that declares it, so
   `crates/fetchit-ffi` must carry the same entry at the same rev.
