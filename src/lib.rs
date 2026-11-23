@@ -8437,7 +8437,7 @@ impl Agent {
         };
         // While latched, the link to the target stays up until its lease is
         // recorded; any other link this connect opens is a stray.
-        let _target = network.begin_leased_target(self.leased_connect_target(agent_id).await);
+        let _target = network.begin_leased_target(self.connect_target_machine(agent_id).await);
         // A leased dial is a burst dial: while latched it may use one
         // hole-punch introducer for this target, the coordinators the
         // target announced first.
@@ -8475,11 +8475,11 @@ impl Agent {
         Ok((outcome, leased))
     }
 
-    /// The machine a leased connect to `agent_id` dials: its discovery
-    /// entry's, else the one its peer evidence names. `None` when neither
-    /// knows one (a card with no machine): such a connect spares every link
+    /// The machine a connect to `agent_id` dials: its discovery entry's,
+    /// else the one its peer evidence names. `None` when neither knows one
+    /// (a card with no machine): a leased connect to it spares every link
     /// while it runs.
-    async fn leased_connect_target(
+    async fn connect_target_machine(
         &self,
         agent_id: &identity::AgentId,
     ) -> Option<ant_quic::PeerId> {
@@ -8670,11 +8670,79 @@ impl Agent {
         {
             return Err(burst_cap_reached_error());
         }
-        let outcome = self.connect_to_agent_inner(agent_id, cold).await?;
+        let outcome = self.connect_or_take_live_link(agent_id, cold).await?;
         if outcome.is_live_path() {
             self.maybe_warm_reverse_ack_topics(agent_id).await;
         }
         Ok(outcome)
+    }
+
+    /// [`Self::connect_to_agent_inner`], ended once a live link to the
+    /// agent's machine comes up by another path while it is still dialling
+    /// (the agent dialled this node meanwhile, as a phone's check-in does):
+    /// that link is used at once, as the connect's first check would have
+    /// used it, instead of after the dials to stale addresses. The
+    /// connect's own step gets [`LIVE_LINK_TAKEOVER_GRACE`] to finish
+    /// first, since its own dial raises the same event. As in that check,
+    /// only a machine an authority store confirms counts (ADR 0115 §2).
+    async fn connect_or_take_live_link(
+        &self,
+        agent_id: &identity::AgentId,
+        cold: ColdResolution,
+    ) -> error::Result<connectivity::ConnectOutcome> {
+        let target = match self.network.as_ref() {
+            Some(network) => self
+                .connect_target_machine(agent_id)
+                .await
+                .map(|machine| (network, machine)),
+            None => None,
+        };
+        let Some((network, machine)) = target else {
+            return self.connect_to_agent_inner(agent_id, cold).await;
+        };
+        let mut events = network.subscribe();
+        let connect = self.connect_to_agent_inner(agent_id, cold);
+        tokio::pin!(connect);
+        loop {
+            let event = tokio::select! {
+                biased;
+                outcome = &mut connect => return outcome,
+                event = events.recv() => event,
+            };
+            let linked = match event {
+                Ok(network::NetworkEvent::PeerConnected { peer_id, .. }) => peer_id == machine.0,
+                Ok(_) => false,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    network.is_connected(&machine).await
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return connect.await,
+            };
+            if !linked {
+                continue;
+            }
+            if let Ok(outcome) = tokio::time::timeout(LIVE_LINK_TAKEOVER_GRACE, &mut connect).await
+            {
+                return outcome;
+            }
+            let machine_id = identity::MachineId(machine.0);
+            if network.is_connected(&machine).await
+                && self
+                    .authority_confirms_with(agent_id, &machine_id, cold.opted_in())
+                    .await
+            {
+                self.record_dialed_machine(agent_id, machine_id, cold.opted_in())
+                    .await;
+                tracing::info!(
+                    target: "x0x::connect",
+                    stage = "connect_to_agent",
+                    agent_prefix = %network::hex_prefix(&agent_id.0, 4),
+                    strategy = "link_came_up",
+                    outcome = "already_connected",
+                    "a link to the agent's machine came up during the connect; using it"
+                );
+                return Ok(connectivity::ConnectOutcome::AlreadyConnected);
+            }
+        }
     }
 
     /// Dial from a freshly checked evidence view, without creating any agent
@@ -23151,6 +23219,11 @@ async fn within_leased_budget<F: std::future::Future>(
         .ok()
 }
 
+/// How long a connect that sees its target's machine link up by another
+/// path still waits for its own step to finish before it takes that link
+/// ([`Agent::connect_or_take_live_link`]).
+const LIVE_LINK_TAKEOVER_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Most hole-punch introducers one `POST /agents/connect` may hand over.
 pub const MAX_CONNECT_INTRODUCERS: usize = 4;
 
@@ -32306,6 +32379,50 @@ mod tests {
             network.latched_refusals_for_test()
         );
         drop(silent);
+    }
+
+    /// train-1123 item 4: a connect still dialling an agent's stale
+    /// addresses ends as soon as the agent's machine dials this node: that
+    /// link is used at once, not after the stale dials.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_connect_takes_the_link_its_target_opened_meanwhile() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let contact = bare_agent(dir.path(), "contact").await;
+        let phone = bare_agent(dir.path(), "phone").await;
+        let contact_addr = bound(&contact).await;
+        let stale: Vec<std::net::UdpSocket> = (0..6)
+            .map(|_| std::net::UdpSocket::bind("127.0.0.1:0").expect("stale"))
+            .collect();
+        let stale_addrs = stale
+            .iter()
+            .map(|socket| socket.local_addr().expect("stale addr"))
+            .collect();
+        let now = Agent::unix_timestamp_secs();
+        contact
+            .insert_discovered_agent_for_testing(DiscoveredAgent {
+                can_receive_direct: Some(true),
+                ..card_pin(phone.agent_id(), phone.machine_id(), stale_addrs, now)
+            })
+            .await;
+        let phone_network = std::sync::Arc::clone(phone.network().expect("network"));
+        let started = std::time::Instant::now();
+        let dial_in = async {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            phone_network
+                .connect_addr(contact_addr)
+                .await
+                .expect("the phone dials the contact");
+        };
+        let phone_agent = phone.agent_id();
+        let (outcome, ()) = tokio::join!(contact.connect_to_agent(&phone_agent), dial_in);
+        let elapsed = started.elapsed();
+        let outcome = outcome.expect("the connect runs");
+        assert!(outcome.is_live_path(), "{outcome:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the phone's link is used at once, not after the stale dials: {elapsed:?}"
+        );
+        drop(stale);
     }
 
     /// L1: the whole leased connect ends at its budget plus a short grace,
