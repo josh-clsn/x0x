@@ -2789,6 +2789,7 @@ impl NetworkNode {
             let endpoint = node.inner_endpoint();
             endpoint.set_relay_service_allowed(false);
             endpoint.set_inbound_punch_allowed(false);
+            endpoint.set_inbound_connections_allowed(false);
             endpoint.set_proactive_relay_allowed(false);
             endpoint.set_relay_fallback_allowed(false);
             endpoint.set_coordinator_policy(ant_quic::CoordinatorPolicy::ConnectedOnly);
@@ -5583,6 +5584,9 @@ impl NetworkNode {
                 relay_fallback_allowed: endpoint.relay_fallback_allowed(),
                 relay_service_allowed: endpoint.relay_service_allowed(),
                 inbound_punch_allowed: endpoint.inbound_punch_allowed(),
+                inbound_connections_allowed: endpoint.inbound_connections_allowed(),
+                inbound_connections_ignored: endpoint.inbound_connections_ignored(),
+                inbound_connections_answered: endpoint.inbound_connections_answered(),
                 known_peer_introducers_allowed: endpoint.known_peer_introducers_allowed(),
                 coordinator_policy: endpoint.coordinator_policy(),
                 stats: endpoint.relay_client_stats(),
@@ -5619,7 +5623,16 @@ impl NetworkNode {
     /// - inbound punches are off: the node plays no target role in a hole
     ///   punch a linked peer coordinates (no offer answered, no initiator
     ///   dialled, no PUNCH_ME_NOW acted on unless it is for a punch the node
-    ///   asked for). Its own burst punches still work.
+    ///   asked for). Its own burst punches still work;
+    /// - inbound connections are not answered, leases or not: the first
+    ///   packet of every new inbound attempt is dropped before any
+    ///   handshake work and nothing goes back, so a peer redialling the
+    ///   node (a seed's proactive reconnect after a burst used it as the
+    ///   introducer) times out and the NAT mapping it aimed at lapses. The
+    ///   accept loop closed every inbound link while latched anyway, leased
+    ///   or not, so answering one only cost a handshake. A burst's links are
+    ///   the ones it dials: a hole punch's link is this node's own half (the
+    ///   target's half still opens the target's NAT on its way here).
     ///
     /// Everything is allowed again (`Any`) when the latch lifts, except
     /// relay service with `relay_service_disabled` (OQ5), which stays off.
@@ -5636,6 +5649,7 @@ impl NetworkNode {
             endpoint.set_proactive_relay_allowed(!latched);
             endpoint.set_relay_service_allowed(!latched && !self.config.relay_service_disabled);
             endpoint.set_inbound_punch_allowed(!latched);
+            endpoint.set_inbound_connections_allowed(!latched);
             let seeds_allowed = self.latched_seed_introducers.load(Ordering::SeqCst);
             endpoint.set_known_peer_introducers_allowed(!latched || seeds_allowed);
         }
@@ -10186,6 +10200,101 @@ mod tests {
             .connect_addr(peer_addr)
             .await
             .expect("meshed, nothing is refused");
+        let _ = peer.try_shutdown().await;
+        let _ = phone.try_shutdown().await;
+    }
+
+    /// A latched node answers no inbound connection attempt, leased or not.
+    /// A peer that knows it and dials it sees its own timeout (no close, no
+    /// refusal), no link comes up, and the attempt's packets count as
+    /// ignored. The node's own leased dial to that peer still connects, and
+    /// meshed again the peer's dial is answered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_latched_node_answers_no_inbound_connection_attempt() {
+        let phone = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("phone");
+        let peer = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("peer");
+        let phone_addr = phone.bound_addr().await.expect("phone bound");
+        let peer_addr = peer.bound_addr().await.expect("peer bound");
+        let (phone_id, peer_id) = (phone.peer_id(), peer.peer_id());
+        let link_gone = |node: NetworkNode, other: AntPeerId| async move {
+            let _ = node.disconnect(&other).await;
+            let gone = tokio::time::Instant::now() + Duration::from_secs(5);
+            while node.is_connected(&other).await {
+                assert!(
+                    tokio::time::Instant::now() < gone,
+                    "{:?}: the link to {:?} closed",
+                    node.peer_id(),
+                    other
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+
+        // Meshed, the peer reaches the phone, so it knows where to redial.
+        peer.connect_addr(phone_addr)
+            .await
+            .expect("meshed, the phone answers");
+        link_gone(phone.clone(), peer_id).await;
+        link_gone(peer.clone(), phone_id).await;
+
+        phone.latch_mesh_quiesced().expect("fresh latch");
+        let at_latch = phone.relay_client_snapshot();
+        let attempt =
+            tokio::time::timeout(Duration::from_secs(3), peer.connect_addr(phone_addr)).await;
+        assert!(
+            attempt.is_err(),
+            "the dialler sees its own timeout, not a close: {attempt:?}"
+        );
+        assert!(!phone.is_connected(&peer_id).await, "no link came up");
+        let latched = phone.relay_client_snapshot();
+        assert_eq!(
+            latched.inbound_connections_answered, at_latch.inbound_connections_answered,
+            "no handshake answered"
+        );
+        assert!(
+            latched.inbound_connections_ignored > at_latch.inbound_connections_ignored,
+            "the attempt was dropped unanswered"
+        );
+        assert_eq!(latched.inbound_connections_allowed, Some(false));
+        let ignored = latched.inbound_connections_ignored;
+
+        // A live lease for the peer does not open the door: only the
+        // phone's own dial makes a burst's link.
+        assert!(phone.lease_demand_peer(
+            peer_id,
+            tokio::time::Instant::now() + Duration::from_secs(60)
+        ));
+        let attempt =
+            tokio::time::timeout(Duration::from_secs(3), peer.connect_addr(phone_addr)).await;
+        assert!(attempt.is_err(), "leased, still unanswered: {attempt:?}");
+        let leased = phone.relay_client_snapshot();
+        assert!(leased.inbound_connections_ignored > ignored);
+        assert_eq!(
+            leased.inbound_connections_answered,
+            at_latch.inbound_connections_answered
+        );
+        phone
+            .connect_peer_with_addrs(peer_id, vec![peer_addr])
+            .await
+            .expect("the phone's own leased dial connects");
+        assert!(phone.is_connected(&peer_id).await);
+        link_gone(phone.clone(), peer_id).await;
+        link_gone(peer.clone(), phone_id).await;
+        phone.clear_demand_leases();
+
+        assert!(phone.unlatch_mesh_if_current(phone.mesh_transition_epoch()));
+        assert_eq!(
+            phone.relay_client_snapshot().inbound_connections_allowed,
+            Some(true)
+        );
+        tokio::time::timeout(Duration::from_secs(10), peer.connect_addr(phone_addr))
+            .await
+            .expect("the dial does not time out")
+            .expect("meshed again, the phone answers");
         let _ = peer.try_shutdown().await;
         let _ = phone.try_shutdown().await;
     }

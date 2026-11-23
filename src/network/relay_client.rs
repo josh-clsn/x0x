@@ -40,6 +40,9 @@ pub(crate) struct TransportRelay {
     pub(crate) relay_fallback_allowed: bool,
     pub(crate) relay_service_allowed: bool,
     pub(crate) inbound_punch_allowed: bool,
+    pub(crate) inbound_connections_allowed: bool,
+    pub(crate) inbound_connections_ignored: u64,
+    pub(crate) inbound_connections_answered: u64,
     pub(crate) known_peer_introducers_allowed: bool,
     pub(crate) coordinator_policy: ant_quic::CoordinatorPolicy,
     pub(crate) stats: ant_quic::RelayClientStats,
@@ -74,6 +77,16 @@ pub struct RelayClientSnapshot {
     /// peer coordinates (false while latched, bursts included; its own
     /// punches still work).
     pub inbound_punch_allowed: Option<bool>,
+    /// Whether this node answers new inbound connection attempts now
+    /// (false while latched, bursts and leases included: the first packet
+    /// of each attempt is dropped and nothing is sent back).
+    pub inbound_connections_allowed: Option<bool>,
+    /// Packets of inbound connection attempts dropped unanswered since
+    /// start (a dialler's retransmissions count one each).
+    pub inbound_connections_ignored: u64,
+    /// Inbound connection attempts answered since start: each one this
+    /// node started a handshake for. A latched node adds none.
+    pub inbound_connections_answered: u64,
     /// Which hole-punch coordinators ant-quic may use now: `any` (meshed),
     /// `connected_only` (latched, at rest: nothing is dialled to
     /// coordinate) or `introducer` (latched, during a burst dial: at most one
@@ -208,6 +221,13 @@ impl RelayClientCounters {
             .as_ref()
             .map(|t| t.introducers)
             .unwrap_or_default();
+        let inbound = transport.as_ref().map(|t| {
+            (
+                t.inbound_connections_allowed,
+                t.inbound_connections_ignored,
+                t.inbound_connections_answered,
+            )
+        });
         let stats = transport.map(|t| t.stats).unwrap_or_default();
         let last = match self.last.lock() {
             Ok(last) => *last,
@@ -221,6 +241,9 @@ impl RelayClientCounters {
             relay_fallback_allowed: switches.map(|s| s.1),
             relay_service_allowed: switches.map(|s| s.2),
             inbound_punch_allowed: switches.map(|s| s.4),
+            inbound_connections_allowed: inbound.map(|(allowed, _, _)| allowed),
+            inbound_connections_ignored: inbound.map_or(0, |(_, ignored, _)| ignored),
+            inbound_connections_answered: inbound.map_or(0, |(_, _, answered)| answered),
             coordinator_policy: switches.map(|s| s.5.to_string()),
             introducer_dials: introducers.dials,
             introducer_seed_dials: introducers.known_peer_dials,
@@ -285,6 +308,9 @@ mod tests {
             relay_fallback_allowed: false,
             relay_service_allowed: false,
             inbound_punch_allowed: false,
+            inbound_connections_allowed: false,
+            inbound_connections_ignored: 0,
+            inbound_connections_answered: 0,
             known_peer_introducers_allowed: true,
             coordinator_policy: ant_quic::CoordinatorPolicy::Introducer,
             stats: ant_quic::RelayClientStats::default(),

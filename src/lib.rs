@@ -35853,6 +35853,91 @@ mod tests {
         );
     }
 
+    /// train-1123's seed-redial loop: once a burst has touched a seed, the
+    /// seed's proactive reconnect redials the latched phone. The phone used
+    /// to finish every redial's handshake and then close it, and its replies
+    /// kept the NAT mapping open, so the loop fed itself. Now the phone
+    /// answers none: no connection comes up on its side, every attempt is
+    /// dropped unanswered, and the seed still tries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_seeds_redials_cost_the_latched_phone_no_handshake() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let seed = Agent::builder()
+            .with_machine_key(dir.path().join("seed-machine.key"))
+            .with_agent_key_path(dir.path().join("seed-agent.key"))
+            .with_contact_store_path(dir.path().join("seed-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("seed-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("seed");
+        seed.start_network_event_listener();
+        let seed_network = seed.network().expect("seed network");
+        let seed_peer = ant_quic::PeerId(seed.machine_id().0);
+
+        let phone = Agent::builder()
+            .with_machine_key(dir.path().join("phone-machine.key"))
+            .with_agent_key_path(dir.path().join("phone-agent.key"))
+            .with_contact_store_path(dir.path().join("phone-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("phone-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("phone");
+        let phone_network = phone.network().expect("phone net");
+        let phone_addr =
+            normalize_loopback_addr(phone_network.bound_addr().await.expect("phone bound"));
+        let phone_id = phone.machine_id().0;
+        let phone_peer = ant_quic::PeerId(phone_id);
+
+        seed_network
+            .connect_addr(phone_addr)
+            .await
+            .expect("the seed links to the phone");
+        await_quiesced_connection(
+            seed_network,
+            &phone_peer,
+            std::time::Duration::from_secs(1) * test_time_multiplier(),
+        )
+        .await;
+        let dials = || {
+            let phase1 = RECONNECT_PHASE1_DIALS
+                .lock()
+                .expect("phase1 dial counter lock")
+                .get(&phone_id)
+                .copied()
+                .unwrap_or(0);
+            let phase2 = RECONNECT_PHASE2_DIALS
+                .lock()
+                .expect("phase2 dial counter lock")
+                .get(&phone_id)
+                .copied()
+                .unwrap_or(0);
+            phase1 + phase2
+        };
+        let before = dials();
+        // The phone latches and drops the seed, as the latch guard does once
+        // a burst's introducer link is no longer booked.
+        phone.quiesce_mesh().await.expect("phone latches");
+        let at_latch = phone_network.relay_client_snapshot();
+        tokio::time::sleep(std::time::Duration::from_secs(11)).await;
+
+        assert!(
+            dials() > before,
+            "the seed's proactive reconnect still redials the phone"
+        );
+        let after = phone_network.relay_client_snapshot();
+        assert_eq!(
+            after.inbound_connections_answered, at_latch.inbound_connections_answered,
+            "the latched phone answered no handshake for the seed's redials"
+        );
+        assert!(
+            after.inbound_connections_ignored > at_latch.inbound_connections_ignored,
+            "the redials reached the phone and were dropped unanswered"
+        );
+        assert!(!phone_network.is_connected(&seed_peer).await);
+    }
+
     /// Admin teardown, revocation, and shutdown must suppress proactive
     /// reconnect. For each reason: alice connects bob (so bob is in alice's
     /// bootstrap cache — the Phase-2 fallback path that restored rejected
