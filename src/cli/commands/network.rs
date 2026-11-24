@@ -113,6 +113,15 @@ pub async fn mesh_own_peers(
     Ok(())
 }
 
+/// `x0x mesh relay-fallback` — PUT /mesh/relay-fallback
+pub async fn mesh_relay_fallback(client: &DaemonClient, enabled: bool) -> Result<()> {
+    client.ensure_running().await?;
+    let body = serde_json::json!({ "enabled": enabled });
+    let resp = client.put("/mesh/relay-fallback", &body).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
 /// `x0x diagnostics connectivity` — GET /diagnostics/connectivity
 ///
 /// Prints the ant-quic NodeStatus snapshot as JSON. Includes UPnP port-mapping

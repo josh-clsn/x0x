@@ -646,6 +646,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         request: RequestSpec::Fields(&[RequestField::body_as("agent_ids", false, "--agent"), RequestField::body_as("machine_ids", false, "--machine")]),
     },
     EndpointDef {
+        method: Method::Put,
+        path: "/mesh/relay-fallback",
+        cli_name: "mesh relay-fallback",
+        description: "Let a relay_service_disabled node (a phone) use the relay fallback while its own relay is down",
+        category: "network",
+        request: RequestSpec::Fields(&[RequestField::body_as("enabled", true, "BOOL")]),
+    },
+    EndpointDef {
         method: Method::Get,
         path: "/diagnostics/connectivity",
         cli_name: "diagnostics connectivity",

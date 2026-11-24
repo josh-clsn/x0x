@@ -221,9 +221,10 @@ The Home Suite campaign (ADRs 0036–0043, plus the 0044–0058 backfills) added
   `GET /diagnostics/ws`.
 
 Open issues for this release are listed in the README's *Known limitations*
-table (#446–#451). `x0x routes` prints 213 endpoints: upstream's 203 plus ten
-this fork adds. This reference documents the two runtime mesh flips, the
-own-peers list and the four TreeKEM catch-up routes among them. The other three are the engine-A
+table (#446–#451). `x0x routes` prints 214 endpoints: upstream's 203 plus
+eleven this fork adds. This reference documents the two runtime mesh flips,
+the own-peers list, the relay fallback switch and the four TreeKEM catch-up
+routes among them. The other three are the engine-A
 control-plane routes (`POST /groups/:id/apply-metadata-event` and
 `GET`/`POST /groups/:id/join-result/:member`), which client apps bridge and no
 browser calls. Two further served paths sit outside the registry:
@@ -949,6 +950,7 @@ or an illegal placement; `501` ceremony disabled.
 | POST | `/mesh/join` | `x0x mesh join` | Dial the gossip mesh (bootstrap phases); returns immediately with `status: "dialing"` |
 | POST | `/mesh/quiesce` | `x0x mesh quiesce` | Disconnect all mesh peers and latch the mesh off (inbound rejected, gossip sends dropped, reappearing peers re-swept except [leased](#demand-leases) ones) until `/mesh/join`; ends every demand lease; returns `disconnected` count |
 | PUT | `/mesh/own-peers` | `x0x mesh own-peers [--agent ID]... [--machine ID]...` | Name this account's own devices (replaces the list); while latched only they, or the target's own coordinators, coordinate a hole punch. See [Own peers](#own-peers) |
+| PUT | `/mesh/relay-fallback` | `x0x mesh relay-fallback <true\|false>` | On a `relay_service_disabled` node (a phone), allow the relay fallback for its own connects while meshed: on while the embedder's own relay is down. See [Relay fallback switch](#relay-fallback-switch) |
 | GET | `/peers/:peer_id/health` | `x0x peer health <peer_id>` | Connection health snapshot for a peer |
 | POST | `/peers/:peer_id/probe` | `x0x peer probe <peer_id>` | Active `probe_peer` liveness + RTT check |
 | GET | `/peers/events` | `x0x peer events` | SSE stream of peer lifecycle events |
@@ -1301,12 +1303,21 @@ selection sees the same inputs as before.
 With the daemon setting `relay_service_disabled = true` (TOML, default
 `false`, for a phone) the node never serves a relay session or coordinates a
 hole punch for anyone, meshed or latched, so no peer can use it as an
-introducer. Nor does it set up or advertise a proactive relay session of its
-own through a seed or peer when it reads its NAT as symmetric, so no public
-node relays data to it that way (`relay_client` → `proactive_relay_allowed`
-stays `false`). Meshed behind a symmetric NAT it is then reachable only by
-the peers that can hole-punch to it, and through the Noetic relay. Its own dials and punches still work, and while meshed it still
-answers a punch another node coordinates to reach it. `leaf_mode` does not
+introducer. It never sends through a public node either, unless its
+embedder says its own relay is down:
+
+- It never sets up or advertises a proactive relay session through a seed or
+  peer when it reads its NAT as symmetric (`relay_client` →
+  `proactive_relay_allowed` stays `false`). Meshed behind a symmetric NAT it
+  is then reachable only by the peers that can hole-punch to it, and through
+  the Noetic relay.
+- Its own connects skip the MASQUE relay fallback stage: one whose direct and
+  punch stages fail answers `Unreachable`. The embedder may allow the
+  fallback while its own relay is unreachable
+  ([Relay fallback switch](#relay-fallback-switch)).
+
+Its own dials and punches still work, and while meshed it still answers a
+punch another node coordinates to reach it. `leaf_mode` does not
 imply it: a desktop leaf coordinates its own phone's punches. A library
 embedder that builds `NetworkConfig` itself sets `relay_service_disabled`.
 `GET /diagnostics/connectivity` → `relay_client` reports
@@ -1324,6 +1335,38 @@ dropped before the round resolved.
 With `defer_mesh_join = true` the daemon starts latched: the node is
 quiesced, with the switches above set, from its first moment, before any
 `POST /mesh/quiesce`. `POST /mesh/join` lifts it as usual.
+
+### Relay fallback switch
+
+`PUT /mesh/relay-fallback` is the embedder's switch for a node with
+`relay_service_disabled` (a phone). The engine turns it on when its own
+relay goes unreachable and off when the relay is back:
+
+```json
+{ "enabled": true }
+```
+
+Answer: `{"ok": true, "enabled": true, "relay_fallback_allowed": true}`.
+`relay_fallback_allowed` is what is in force now. A body without `enabled`
+is refused (4xx). CLI: `x0x mesh relay-fallback true|false`.
+
+- **Off (the default):** the node's own connects never use the relay
+  fallback stage. A connect whose direct and hole-punch stages fail answers
+  `Unreachable`.
+- **On, meshed:** a connect whose direct and hole-punch stages fail may open
+  a MASQUE session through a seed or peer and connect through it. The
+  change takes effect at the next connect.
+- **Latched, bursts included:** the fallback stays off whatever the switch
+  says. The switch is kept and applies again at the next `POST /mesh/join`.
+- **Turning it off** opens no new relayed connection. A connection already
+  relayed is left to end on its own; the next `POST /mesh/quiesce` closes
+  it, as before.
+- Proactive relay and an advertised relay address stay off in every state.
+- A node without `relay_service_disabled` (a desktop) keeps its relay
+  fallback while meshed, whatever the switch says.
+
+`GET /diagnostics/connectivity` → `relay_client` reports the switch as
+`relay_fallback_enabled` and what is in force as `relay_fallback_allowed`.
 
 ### Own peers
 

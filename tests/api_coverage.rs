@@ -139,6 +139,11 @@ const COVERED: &[CoveredEndpoint] = &[
         mesh_own_peers_sets_and_reports_own_machines
     ),
     covered!(
+        Put,
+        "/mesh/relay-fallback",
+        mesh_relay_fallback_sets_the_switch
+    ),
+    covered!(
         Get,
         "/diagnostics/connectivity",
         daemon_api_diagnostics_connectivity

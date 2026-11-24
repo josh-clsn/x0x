@@ -638,10 +638,12 @@ pub struct NetworkConfig {
     pub start_quiesced: bool,
     /// OQ5 (audit): never serve a relay session or coordinate a hole punch
     /// for anyone, and never set up or advertise a proactive relay session
-    /// of its own through a seed or peer, meshed or latched; the node's own
-    /// dials and punches are unaffected. For a phone, not for a desktop
-    /// leaf, which coordinates its own phone's punches. The daemon's
-    /// `relay_service_disabled` sets it. Default `false`.
+    /// of its own through a seed or peer, meshed or latched. The node's own
+    /// connects use the relay fallback stage only while the embedder allows
+    /// it ([`NetworkNode::set_relay_fallback_enabled`]: its own relay is
+    /// down); its direct dials and punches are unaffected. For a phone, not
+    /// for a desktop leaf, which coordinates its own phone's punches. The
+    /// daemon's `relay_service_disabled` sets it. Default `false`.
     #[serde(default)]
     pub relay_service_disabled: bool,
 }
@@ -2244,6 +2246,11 @@ pub struct NetworkNode {
     /// M-3: whether a latched burst dial may fall back to a seed as its
     /// hole-punch introducer (daemon setting `latched_seed_introducers`).
     latched_seed_introducers: Arc<AtomicBool>,
+    /// Whether the embedder lets a `relay_service_disabled` node (a phone)
+    /// use the relay fallback stage for its own connects while meshed: on
+    /// only while the embedder's own relay is unreachable
+    /// ([`NetworkNode::set_relay_fallback_enabled`]). Off by default.
+    relay_fallback_enabled: Arc<AtomicBool>,
     /// M-5: the byte cap of the current burst, enforced by the daemon.
     burst_cap: Arc<Mutex<BurstCapState>>,
     /// Receiver channel for direct messages (separate from gossip).
@@ -2789,6 +2796,7 @@ impl NetworkNode {
         if config.relay_service_disabled {
             node.inner_endpoint().set_relay_service_allowed(false);
             node.inner_endpoint().set_proactive_relay_allowed(false);
+            node.inner_endpoint().set_relay_fallback_allowed(false);
         }
         if config.start_quiesced {
             let endpoint = node.inner_endpoint();
@@ -2896,6 +2904,7 @@ impl NetworkNode {
             burst_hint_machines: Arc::new(Mutex::new(HashMap::new())),
             introducer_day: Arc::new(Mutex::new(introducer_day::IntroducerDay::default())),
             latched_seed_introducers: Arc::new(AtomicBool::new(false)),
+            relay_fallback_enabled: Arc::new(AtomicBool::new(false)),
             burst_cap: Arc::new(Mutex::new(BurstCapState::default())),
             direct_tx,
             direct_rx: Arc::new(tokio::sync::Mutex::new(direct_rx)),
@@ -5627,6 +5636,7 @@ impl NetworkNode {
             transport,
             day,
             self.latched_seed_introducers.load(Ordering::SeqCst),
+            self.relay_fallback_enabled.load(Ordering::SeqCst),
         )
     }
 
@@ -5668,12 +5678,16 @@ impl NetworkNode {
     /// Everything is allowed again (`Any`) when the latch lifts, except,
     /// with `relay_service_disabled` (OQ5, a phone), relay service and
     /// proactive relay, which stay off: such a node never relays for others
-    /// and never has a public node relay for it.
+    /// and never sets up or advertises a relay address. Its own connects
+    /// use the relay fallback stage only while the embedder says its own
+    /// relay is unreachable ([`Self::set_relay_fallback_enabled`]).
     fn sync_proactive_relay(&self) {
         if let Some(endpoint) = self.relay_switch.get() {
             let latched = self.mesh_quiesced.load(Ordering::Relaxed);
             let bursting = self.burst_dials.load(Ordering::SeqCst) > 0;
-            endpoint.set_relay_fallback_allowed(!latched);
+            let fallback_enabled = !self.config.relay_service_disabled
+                || self.relay_fallback_enabled.load(Ordering::SeqCst);
+            endpoint.set_relay_fallback_allowed(!latched && fallback_enabled);
             endpoint.set_coordinator_policy(match (latched, bursting) {
                 (false, _) => ant_quic::CoordinatorPolicy::Any,
                 (true, true) => ant_quic::CoordinatorPolicy::Introducer,
@@ -5694,6 +5708,30 @@ impl NetworkNode {
             let seeds_allowed = self.latched_seed_introducers.load(Ordering::SeqCst);
             endpoint.set_known_peer_introducers_allowed(!latched || seeds_allowed);
         }
+    }
+
+    /// Allow or refuse the relay fallback stage of this node's own connects
+    /// while meshed, for a node with `relay_service_disabled` (a phone):
+    /// the embedder turns it on while its own relay is unreachable and off
+    /// when it is back. Off by default. While latched the fallback stays
+    /// off whatever this says, and a node without `relay_service_disabled`
+    /// is not affected. Turning it off opens no new relayed connection and
+    /// leaves one already relayed to end on its own; turning it on takes
+    /// effect at the next connect. Returns whether the fallback is allowed
+    /// now.
+    pub fn set_relay_fallback_enabled(&self, enabled: bool) -> bool {
+        self.relay_fallback_enabled.store(enabled, Ordering::SeqCst);
+        self.sync_switches_under_lock();
+        self.relay_switch
+            .get()
+            .is_some_and(|endpoint| endpoint.relay_fallback_allowed())
+    }
+
+    /// The embedder's relay fallback switch
+    /// ([`Self::set_relay_fallback_enabled`]).
+    #[must_use]
+    pub fn relay_fallback_enabled(&self) -> bool {
+        self.relay_fallback_enabled.load(Ordering::SeqCst)
     }
 
     /// M-3: allow or refuse a seed as the hole-punch introducer of a
@@ -10461,6 +10499,7 @@ mod tests {
         )
         .await
         .expect("phone");
+        assert!(phone.set_relay_fallback_enabled(true), "its relay is down");
         open_fallback_relay_session(&phone, seed_addr).await;
         assert!(
             relay_sessions_within(&phone, 1, Duration::from_secs(5)).await,
@@ -10483,6 +10522,87 @@ mod tests {
             "the latch closes it"
         );
         let _ = phone.try_shutdown().await;
+        let _ = seed.try_shutdown().await;
+    }
+
+    /// Josh's relay rule (2026-11-23): a `relay_service_disabled` node (a
+    /// phone) uses the relay fallback stage for its own connects only while
+    /// its embedder says its own relay is down. Switch off (the default):
+    /// a connect whose direct stage fails makes no relay attempt. On: it
+    /// makes one. Latched with it on: none. Switched off mid-session: the
+    /// live session stays and no new one opens. A desktop is not affected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_opt_out_node_relays_only_while_its_embedder_says_its_relay_is_down() {
+        let seed = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("seed");
+        let seed_addr = seed.bound_addr().await.expect("seed bound");
+        let second_seed = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("second seed");
+        let second_addr = second_seed.bound_addr().await.expect("second seed bound");
+        let phone = NetworkNode::new(
+            NetworkConfig {
+                relay_service_disabled: true,
+                ..loopback_quic_config(vec![seed_addr])
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("phone");
+        open_fallback_relay_session(&phone, seed_addr).await;
+        assert!(
+            !relay_sessions_within(&phone, 1, Duration::from_secs(2)).await,
+            "switch off: no relay attempt"
+        );
+        let snap = phone.relay_client_snapshot();
+        assert!(!snap.relay_fallback_enabled, "off by default");
+        assert_eq!(snap.relay_fallback_allowed, Some(false));
+
+        phone.latch_mesh_quiesced().expect("fresh latch");
+        assert!(!phone.set_relay_fallback_enabled(true), "latched wins");
+        assert!(phone.relay_client_snapshot().relay_fallback_enabled);
+        open_fallback_relay_session(&phone, seed_addr).await;
+        assert!(
+            !relay_sessions_within(&phone, 1, Duration::from_secs(2)).await,
+            "latched with the switch on: no relay attempt"
+        );
+
+        assert!(phone.unlatch_mesh_if_current(phone.mesh_transition_epoch()));
+        assert_eq!(
+            phone.relay_client_snapshot().relay_fallback_allowed,
+            Some(true),
+            "meshed with the switch on"
+        );
+        open_fallback_relay_session(&phone, seed_addr).await;
+        assert!(
+            relay_sessions_within(&phone, 1, Duration::from_secs(5)).await,
+            "switch on: the fallback relays through the seed"
+        );
+
+        assert!(!phone.set_relay_fallback_enabled(false));
+        let snap = phone.relay_client_snapshot();
+        assert_eq!(snap.active_sessions, 1, "the live session is left alone");
+        assert_eq!(snap.proactive_relay_allowed, Some(false));
+        open_fallback_relay_session(&phone, second_addr).await;
+        let snap = phone.relay_client_snapshot();
+        assert_eq!(snap.active_sessions, 1, "no new relayed dial: {snap:?}");
+        assert_eq!(snap.relay_servers.len(), 1, "{snap:?}");
+
+        let desktop = NetworkNode::new(loopback_quic_config(vec![seed_addr]), None, None)
+            .await
+            .expect("desktop");
+        assert!(desktop.set_relay_fallback_enabled(false), "not affected");
+        open_fallback_relay_session(&desktop, seed_addr).await;
+        assert!(
+            relay_sessions_within(&desktop, 1, Duration::from_secs(5)).await,
+            "a desktop keeps its relay fallback"
+        );
+
+        let _ = desktop.try_shutdown().await;
+        let _ = phone.try_shutdown().await;
+        let _ = second_seed.try_shutdown().await;
         let _ = seed.try_shutdown().await;
     }
 

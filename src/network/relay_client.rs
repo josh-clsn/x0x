@@ -115,6 +115,10 @@ pub struct RelayClientSnapshot {
     /// The daemon setting `latched_seed_introducers`: whether a latched
     /// burst dial may fall back to a seed as its introducer.
     pub latched_seed_introducers: bool,
+    /// The embedder's relay fallback switch (`PUT /mesh/relay-fallback`):
+    /// whether a `relay_service_disabled` node may use the relay fallback
+    /// stage while meshed. `relay_fallback_allowed` is what is in force.
+    pub relay_fallback_enabled: bool,
     /// UDP bytes sent on introducer connections, counted as each closed.
     pub introducer_bytes_sent: u64,
     /// UDP bytes received on introducer connections, counted as each
@@ -202,6 +206,7 @@ impl RelayClientCounters {
         transport: Option<TransportRelay>,
         day: super::introducer_day::IntroducerDayCounts,
         latched_seed_introducers: bool,
+        relay_fallback_enabled: bool,
     ) -> RelayClientSnapshot {
         let switches = transport.as_ref().map(|t| {
             (
@@ -251,6 +256,7 @@ impl RelayClientCounters {
             introducer_seed_dials_24h: day.seed_dials,
             seed_introducers_allowed: switches.map(|s| s.3),
             latched_seed_introducers,
+            relay_fallback_enabled,
             introducer_bytes_sent: introducers.bytes_sent,
             introducer_bytes_received: introducers.bytes_received,
             introducer_punch_successes: introducers.punch_successes,
@@ -283,7 +289,7 @@ mod tests {
     #[test]
     fn nothing_recorded_before_a_session() {
         assert_eq!(
-            RelayClientCounters::default().snapshot(None, Default::default(), false),
+            RelayClientCounters::default().snapshot(None, Default::default(), false, false),
             RelayClientSnapshot::default()
         );
     }
@@ -293,7 +299,7 @@ mod tests {
         let counters = RelayClientCounters::default();
         counters.observe(&relay(4000), false);
         counters.observe(&relay(4001), true);
-        let snap = counters.snapshot(None, Default::default(), false);
+        let snap = counters.snapshot(None, Default::default(), false, false);
         assert_eq!(snap.sessions_established, 2);
         assert_eq!(snap.established_while_quiesced, 1);
         assert_eq!(snap.last_relay_addr.as_deref(), Some("203.0.113.7:4001"));
@@ -323,8 +329,12 @@ mod tests {
                 punch_failures: 3,
             },
         };
-        let snap =
-            RelayClientCounters::default().snapshot(Some(transport), Default::default(), true);
+        let snap = RelayClientCounters::default().snapshot(
+            Some(transport),
+            Default::default(),
+            true,
+            false,
+        );
         assert_eq!(snap.coordinator_policy.as_deref(), Some("introducer"));
         assert_eq!((snap.introducer_dials, snap.introducer_seed_dials), (2, 1));
         assert_eq!(
@@ -346,7 +356,7 @@ mod tests {
         counters.note_lag(12);
         assert_eq!(
             counters
-                .snapshot(None, Default::default(), false)
+                .snapshot(None, Default::default(), false, false)
                 .events_lagged,
             1
         );
@@ -362,7 +372,7 @@ mod tests {
             true,
         );
         assert_eq!(
-            counters.snapshot(None, Default::default(), false),
+            counters.snapshot(None, Default::default(), false, false),
             RelayClientSnapshot::default()
         );
     }

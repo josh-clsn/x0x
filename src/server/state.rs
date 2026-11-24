@@ -342,7 +342,9 @@ pub struct DaemonConfig {
 
     /// OQ5 (audit): never serve a relay session or coordinate a hole punch
     /// for any peer, and never set up or advertise a proactive relay session
-    /// of its own, meshed or latched; this node's own dials and punches are
+    /// of its own, meshed or latched. Its own connects use the relay
+    /// fallback only while the embedder allows it (`PUT /mesh/relay-fallback`,
+    /// while its own relay is down); its direct dials and punches are
     /// unaffected. For a phone. Not implied by `leaf_mode`, because a
     /// desktop leaf coordinates its own phone's punches. Default `false`.
     #[serde(default)]

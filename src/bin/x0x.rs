@@ -851,6 +851,14 @@ enum MeshSub {
         #[arg(long = "machine", value_name = "MACHINE_ID")]
         machines: Vec<String>,
     },
+    /// Let this node, when it runs with relay_service_disabled (a phone),
+    /// use the relay fallback for its own connects while meshed: on while
+    /// the embedder's own relay is unreachable, off when it is back.
+    RelayFallback {
+        /// true or false.
+        #[arg(value_name = "BOOL", action = clap::ArgAction::Set)]
+        enabled: bool,
+    },
 }
 
 /// Peer subcommands (ant-quic 0.27 surface).
@@ -2601,6 +2609,9 @@ async fn run(
             MeshSub::Quiesce => commands::network::mesh_quiesce(&client).await,
             MeshSub::OwnPeers { agents, machines } => {
                 commands::network::mesh_own_peers(&client, agents, machines).await
+            }
+            MeshSub::RelayFallback { enabled } => {
+                commands::network::mesh_relay_fallback(&client, enabled).await
             }
         },
         Commands::Peer { sub } => match sub {

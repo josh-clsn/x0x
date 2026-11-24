@@ -344,6 +344,40 @@ pub(in crate::server) async fn mesh_own_peers(
     )
 }
 
+/// PUT /mesh/relay-fallback request body.
+#[derive(Debug, serde::Deserialize)]
+pub(in crate::server) struct RelayFallbackRequest {
+    /// Whether a `relay_service_disabled` node (a phone) may use the relay
+    /// fallback stage for its own connects while meshed. The embedder sets
+    /// it while its own relay is unreachable.
+    enabled: bool,
+}
+
+/// PUT /mesh/relay-fallback — the embedder's relay fallback switch for a
+/// node with `relay_service_disabled` (a phone): on while the embedder's
+/// own relay is unreachable, off when it is back. While latched the
+/// fallback stays off whatever this says, and a node without
+/// `relay_service_disabled` keeps its fallback either way. Turning it off
+/// opens no new relayed connection and leaves a live one alone. Answers
+/// with the switch and whether the fallback is allowed now.
+pub(in crate::server) async fn mesh_relay_fallback(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RelayFallbackRequest>,
+) -> impl IntoResponse {
+    let Some(network) = state.agent.network() else {
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, "network not initialized");
+    };
+    let allowed = network.set_relay_fallback_enabled(req.enabled);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "enabled": req.enabled,
+            "relay_fallback_allowed": allowed,
+        })),
+    )
+}
+
 /// GET /network/bootstrap-cache — bootstrap peer cache statistics.
 pub(in crate::server) async fn bootstrap_cache_stats(
     State(state): State<Arc<AppState>>,
@@ -1821,5 +1855,80 @@ mod own_peers_tests {
             .collect();
         let (status, _) = put_own_peers(&app, serde_json::json!({"machine_ids": too_many})).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// `PUT /mesh/relay-fallback` sets the embedder's relay fallback switch
+    /// of a `relay_service_disabled` node and answers with what is in force;
+    /// a body without `enabled` is refused.
+    #[tokio::test]
+    async fn mesh_relay_fallback_sets_the_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = Arc::new(
+            x0x::Agent::builder()
+                .with_identity_dir(dir.path().join("identity"))
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key(x0x::identity::AgentKeypair::generate().unwrap())
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .with_network_config(x0x::network::NetworkConfig {
+                    bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+                    bootstrap_nodes: Vec::new(),
+                    mdns_enabled: false,
+                    port_mapping_enabled: false,
+                    relay_service_disabled: true,
+                    ..Default::default()
+                })
+                .build()
+                .await
+                .unwrap(),
+        );
+        let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+            dir.path(),
+            Arc::clone(&agent),
+        )
+        .await
+        .unwrap();
+        let app = Router::new()
+            .route("/mesh/relay-fallback", put(mesh_relay_fallback))
+            .with_state(state);
+        let put_switch = |body: serde_json::Value| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::put("/mesh/relay-fallback")
+                            .header("content-type", "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_default(),
+                )
+            }
+        };
+        let network = agent.network().unwrap();
+        assert!(!network.relay_fallback_enabled(), "off by default");
+
+        let (status, json) = put_switch(serde_json::json!({"enabled": true})).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["enabled"], true);
+        assert_eq!(json["relay_fallback_allowed"], true, "meshed: in force");
+        assert!(network.relay_client_snapshot().relay_fallback_enabled);
+
+        let (status, json) = put_switch(serde_json::json!({"enabled": false})).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["relay_fallback_allowed"], false);
+        assert!(!network.relay_fallback_enabled());
+
+        let (status, _) = put_switch(serde_json::json!({})).await;
+        assert!(status.is_client_error(), "{status}");
     }
 }

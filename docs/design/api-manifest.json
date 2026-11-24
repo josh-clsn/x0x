@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 213,
+  "endpoint_count": 214,
   "endpoints": [
     {
       "category": "status",
@@ -874,6 +874,24 @@
             "in": "body",
             "name": "machine_ids",
             "required": false
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "network",
+      "cli_name": "mesh relay-fallback",
+      "description": "Let a relay_service_disabled node (a phone) use the relay fallback while its own relay is down",
+      "method": "PUT",
+      "path": "/mesh/relay-fallback",
+      "request": {
+        "fields": [
+          {
+            "cli": "BOOL",
+            "in": "body",
+            "name": "enabled",
+            "required": true
           }
         ],
         "kind": "fields"

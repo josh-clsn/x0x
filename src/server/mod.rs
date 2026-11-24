@@ -85,7 +85,7 @@ use routes::{
     list_task_lists, list_tasks, listener_restart_context, load_causal_approval_queue,
     load_join_result_staging, load_named_groups_merged, load_predecessor_relay_outbox,
     load_requester_offer_outbox, load_treekem_member_key_packages, machine_for_agent_handler,
-    machines_by_user_handler, mesh_join, mesh_own_peers, mesh_quiesce,
+    machines_by_user_handler, mesh_join, mesh_own_peers, mesh_quiesce, mesh_relay_fallback,
     migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
     named_group_metadata_event_group_id, network_status, now_millis_u64, owner_agents,
     owner_agents_issue, owner_agents_revoke, owner_riders_issue, owner_riders_list,
@@ -2991,6 +2991,7 @@ pub async fn serve_with_options(
         .route("/mesh/join", post(mesh_join))
         .route("/mesh/quiesce", post(mesh_quiesce))
         .route("/mesh/own-peers", put(mesh_own_peers))
+        .route("/mesh/relay-fallback", put(mesh_relay_fallback))
         // Network diagnostics
         .route("/network/bootstrap-cache", get(bootstrap_cache_stats))
         .route("/diagnostics/connectivity", get(connectivity_diagnostics))

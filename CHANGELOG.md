@@ -5,9 +5,9 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 The josh-clsn fork's tail on v0.48.1. Everything below is in addition to
-upstream's v0.48.1 notes. The registry lists 213 endpoints: upstream's 203
-plus ten this fork adds (`POST /mesh/join`, `POST /mesh/quiesce`,
-`PUT /mesh/own-peers`, the three
+upstream's v0.48.1 notes. The registry lists 214 endpoints: upstream's 203
+plus eleven this fork adds (`POST /mesh/join`, `POST /mesh/quiesce`,
+`PUT /mesh/own-peers`, `PUT /mesh/relay-fallback`, the three
 engine-A routes, and the four TreeKEM catch-up routes).
 
 ### Added
@@ -320,6 +320,15 @@ engine-A routes, and the four TreeKEM catch-up routes).
   `inbound_connections_ignored` and `inbound_connections_answered`.
 - **`relay_service_disabled` also keeps proactive relay off.** A phone never
   sets up or advertises a MASQUE relay through a seed, meshed or latched.
+- **A phone relays through a public node only while its own relay is down.**
+  With `relay_service_disabled`, a node's own connects skip the MASQUE relay
+  fallback stage unless the embedder turns it on with the new
+  `PUT /mesh/relay-fallback {"enabled": true}` (CLI
+  `x0x mesh relay-fallback true|false`) while its own relay is unreachable.
+  Latched, the fallback stays off whatever the switch says; a desktop is
+  not affected. Turning it off leaves a live relayed connection alone.
+  `relay_client` adds `relay_fallback_enabled`. A meshed switch sync no
+  longer closes a live fallback session.
 - **A spent leased connect takes no further step.** Once its 12 s budget is
   spent the connector stops and answers `Unreachable`; each step's dial now
   carries its own origin in the latch's refusal log, not `manual`.
