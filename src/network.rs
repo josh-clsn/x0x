@@ -29,6 +29,7 @@ mod churn;
 mod introducer_day;
 mod redial_flaps;
 mod relay_client;
+mod relay_fallback_close;
 use self::churn::ChurnCounters;
 pub use self::churn::ChurnSnapshot;
 pub(crate) use self::redial_flaps::LadderStart;
@@ -210,17 +211,7 @@ fn clear_session_registry(registry: &Mutex<AuthenticatedSessions>) {
 /// ant-quic stamps constrained/non-QUIC ingress with this sentinel.
 const STALE_GENERATION_SENTINEL: u64 = u64::MAX;
 
-/// How long a relayed connection of a `relay_service_disabled` node may run
-/// on after the embedder turns the relay fallback off, to finish a send in
-/// flight. 30 s covers several direct-send rounds with their receive ACK
-/// (8 s each) and is about the life of a carrier NAT's UDP mapping, past
-/// which the seed's path to the phone is unlikely to hold anyway.
-pub const RELAY_FALLBACK_OFF_GRACE: Duration = Duration::from_secs(30);
-
-/// After [`RELAY_FALLBACK_OFF_GRACE`], the relayed connections close at the
-/// first window this long in which their relay moved no byte, so a send
-/// still under way is never cut.
-const RELAY_FALLBACK_QUIET_WINDOW: Duration = Duration::from_secs(1);
+pub use relay_fallback_close::{RELAY_FALLBACK_OFF_CAP, RELAY_FALLBACK_OFF_GRACE};
 
 fn source_generation_matches(source: u64, current: Option<u64>) -> bool {
     source != STALE_GENERATION_SENTINEL && current == Some(source)
@@ -2268,8 +2259,11 @@ pub struct NetworkNode {
     /// closes the relayed connections after a switch-off stops when it
     /// changes.
     relay_fallback_epoch: Arc<AtomicU64>,
-    /// [`RELAY_FALLBACK_OFF_GRACE`], shortened by tests.
-    relay_fallback_off_grace: Arc<Mutex<Duration>>,
+    /// The timings of the close after a switch-off, shortened by tests.
+    relay_fallback_close_times: Arc<Mutex<relay_fallback_close::CloseTimes>>,
+    /// The one close task after a switch-off, if any: a new switch change
+    /// aborts it.
+    relay_fallback_close_task: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
     /// M-5: the byte cap of the current burst, enforced by the daemon.
     burst_cap: Arc<Mutex<BurstCapState>>,
     /// Receiver channel for direct messages (separate from gossip).
@@ -2958,7 +2952,10 @@ impl NetworkNode {
             latched_seed_introducers: Arc::new(AtomicBool::new(false)),
             relay_fallback_enabled: Arc::new(AtomicBool::new(false)),
             relay_fallback_epoch: Arc::new(AtomicU64::new(0)),
-            relay_fallback_off_grace: Arc::new(Mutex::new(RELAY_FALLBACK_OFF_GRACE)),
+            relay_fallback_close_times: Arc::new(Mutex::new(
+                relay_fallback_close::CloseTimes::default(),
+            )),
+            relay_fallback_close_task: Arc::new(Mutex::new(None)),
             burst_cap: Arc::new(Mutex::new(BurstCapState::default())),
             direct_tx,
             direct_rx: Arc::new(tokio::sync::Mutex::new(direct_rx)),
@@ -5823,21 +5820,43 @@ impl NetworkNode {
     /// the embedder turns it on while its own relay is unreachable and off
     /// when it is back. Off by default. While latched the fallback stays
     /// off whatever this says, and a node without `relay_service_disabled`
-    /// is not affected. Turning it off opens no new relayed connection, and
-    /// a connection already relayed gets [`RELAY_FALLBACK_OFF_GRACE`] to
-    /// finish what it is sending; it is then closed at the first second its
-    /// relay moves no byte, never mid-send. Turning it on takes effect at
-    /// the next connect (and cancels a pending close). Returns whether the
-    /// fallback is allowed now.
+    /// is not affected. Turning it off opens no new relayed connection; a
+    /// connection already relayed (or one whose relay connect was under way)
+    /// gets [`RELAY_FALLBACK_OFF_GRACE`] to finish what it is sending, is
+    /// then closed at the first second its relay moves no byte, and is cut
+    /// at [`RELAY_FALLBACK_OFF_CAP`] after the switch-off whatever it
+    /// carries. Turning it on takes effect at the next connect and cancels a
+    /// pending close. Repeating the current setting changes nothing (the
+    /// grace is not restarted). Returns whether the fallback is allowed now.
     pub fn set_relay_fallback_enabled(&self, enabled: bool) -> bool {
-        self.relay_fallback_enabled.store(enabled, Ordering::SeqCst);
-        let epoch = self
-            .relay_fallback_epoch
-            .fetch_add(1, Ordering::SeqCst)
-            .wrapping_add(1);
-        self.sync_switches_under_lock();
-        if !enabled && self.config.relay_service_disabled {
-            self.spawn_relay_fallback_close(epoch);
+        let changed = {
+            let _transitions = match self.mesh_transitions.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let previous = self.relay_fallback_enabled.swap(enabled, Ordering::SeqCst);
+            if previous == enabled {
+                None
+            } else {
+                let epoch = self
+                    .relay_fallback_epoch
+                    .fetch_add(1, Ordering::SeqCst)
+                    .wrapping_add(1);
+                self.sync_proactive_relay();
+                Some(epoch)
+            }
+        };
+        if let Some(epoch) = changed {
+            let previous_task = match self.relay_fallback_close_task.lock() {
+                Ok(mut task) => task.take(),
+                Err(poisoned) => poisoned.into_inner().take(),
+            };
+            if let Some(task) = previous_task {
+                task.abort();
+            }
+            if !enabled && self.config.relay_service_disabled {
+                self.spawn_relay_fallback_close(epoch);
+            }
         }
         self.relay_switch
             .get()
@@ -5845,18 +5864,17 @@ impl NetworkNode {
     }
 
     /// After a switch-off (`epoch`), close this node's relayed connections
-    /// once their grace is over and their relay is quiet. Nothing to do
-    /// when no client relay session is open. The task stops if the switch
-    /// changes again or the node latches (the latch closes them itself).
+    /// ([`relay_fallback_close::run_close`]). Spawned whether or not a
+    /// session is open now, so a relay connect that was under way at the
+    /// switch-off is closed too. The close re-checks the switch and the
+    /// latch under the transition lock, so a switch-on or a latch landing
+    /// first always wins.
     fn spawn_relay_fallback_close(&self, epoch: u64) {
         let Some(endpoint) = self.relay_switch.get().map(Arc::clone) else {
             return;
         };
-        if endpoint.relay_client_stats().active_sessions == 0 {
-            return;
-        }
-        let grace = match self.relay_fallback_off_grace.lock() {
-            Ok(grace) => *grace,
+        let times = match self.relay_fallback_close_times.lock() {
+            Ok(times) => *times,
             Err(poisoned) => *poisoned.into_inner(),
         };
         let switch_epoch = Arc::clone(&self.relay_fallback_epoch);
@@ -5864,48 +5882,69 @@ impl NetworkNode {
         let current = move || {
             switch_epoch.load(Ordering::SeqCst) == epoch && !latched.load(Ordering::Relaxed)
         };
-        let task = tokio::spawn(async move {
-            tokio::time::sleep(grace).await;
-            loop {
-                if !current() {
-                    return;
-                }
-                let before = endpoint.relay_client_stats();
-                if before.active_sessions == 0 {
-                    return;
-                }
-                tokio::time::sleep(RELAY_FALLBACK_QUIET_WINDOW).await;
-                let after = endpoint.relay_client_stats();
-                if !current() {
-                    return;
-                }
-                if after.bytes_sent == before.bytes_sent
-                    && after.bytes_received == before.bytes_received
-                {
-                    // Proactive relay is already off on this node; turning
-                    // it off again closes every client relay session.
-                    endpoint.set_proactive_relay_allowed(false);
-                    tracing::info!(
-                        target: "x0x::connect",
-                        sessions = after.active_sessions,
-                        "relay fallback off: closed the relayed connections after their grace"
-                    );
-                    return;
-                }
+        let activity = {
+            let endpoint = Arc::clone(&endpoint);
+            let current = current.clone();
+            move || {
+                current().then(|| {
+                    let stats = endpoint.relay_client_stats();
+                    (
+                        stats.active_sessions,
+                        stats.bytes_sent.saturating_add(stats.bytes_received),
+                    )
+                })
             }
-        });
+        };
+        let transitions = Arc::clone(&self.mesh_transitions);
+        let close = move |reason: relay_fallback_close::CloseReason| {
+            let _transitions = match transitions.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if !current() {
+                return false;
+            }
+            // Proactive relay is already off on this node; turning it off
+            // again closes every client relay session.
+            endpoint.set_proactive_relay_allowed(false);
+            match reason {
+                relay_fallback_close::CloseReason::Quiet => tracing::info!(
+                    target: "x0x::connect",
+                    "relay fallback off: closed the relayed connections after their grace"
+                ),
+                relay_fallback_close::CloseReason::Cap => tracing::info!(
+                    target: "x0x::connect",
+                    cap_secs = times.cap.as_secs(),
+                    "relay fallback off: cut the relayed connections at the cap"
+                ),
+            }
+            true
+        };
+        let task = tokio::spawn(relay_fallback_close::run_close(times, activity, close));
+        match self.relay_fallback_close_task.lock() {
+            Ok(mut slot) => *slot = Some(task.abort_handle()),
+            Err(poisoned) => *poisoned.into_inner() = Some(task.abort_handle()),
+        }
         match self.background_tasks.lock() {
-            Ok(mut tasks) => tasks.push(task),
+            Ok(mut tasks) => {
+                tasks.retain(|task| !task.is_finished());
+                tasks.push(task);
+            }
             Err(poisoned) => poisoned.into_inner().push(task),
         }
     }
 
-    /// Test seam: shorten [`RELAY_FALLBACK_OFF_GRACE`].
+    /// Test seam: shorten the close after a switch-off.
     #[cfg(test)]
-    pub(crate) fn set_relay_fallback_off_grace_for_test(&self, grace: Duration) {
-        match self.relay_fallback_off_grace.lock() {
-            Ok(mut current) => *current = grace,
-            Err(poisoned) => *poisoned.into_inner() = grace,
+    pub(crate) fn set_relay_fallback_close_times_for_test(&self, grace: Duration, cap: Duration) {
+        let times = relay_fallback_close::CloseTimes {
+            grace,
+            cap,
+            ..relay_fallback_close::CloseTimes::default()
+        };
+        match self.relay_fallback_close_times.lock() {
+            Ok(mut current) => *current = times,
+            Err(poisoned) => *poisoned.into_inner() = times,
         }
     }
 
@@ -10889,7 +10928,10 @@ mod tests {
         )
         .await
         .expect("phone");
-        phone.set_relay_fallback_off_grace_for_test(Duration::from_secs(1));
+        phone.set_relay_fallback_close_times_for_test(
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+        );
         assert!(phone.set_relay_fallback_enabled(true), "its relay is down");
         open_fallback_relay_session(&phone, seed_addr).await;
         assert!(
@@ -10918,6 +10960,93 @@ mod tests {
 
         let _ = phone.try_shutdown().await;
         let _ = second_seed.try_shutdown().await;
+        let _ = seed.try_shutdown().await;
+    }
+
+    /// An opt-out phone with a seed and the close after a switch-off
+    /// shortened to `grace` (cap 60 s).
+    async fn phone_and_seed_with_grace(grace: Duration) -> (NetworkNode, NetworkNode, SocketAddr) {
+        let seed = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("seed");
+        let seed_addr = seed.bound_addr().await.expect("seed bound");
+        let phone = NetworkNode::new(
+            NetworkConfig {
+                relay_service_disabled: true,
+                ..loopback_quic_config(vec![seed_addr])
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("phone");
+        phone.set_relay_fallback_close_times_for_test(grace, Duration::from_secs(60));
+        (phone, seed, seed_addr)
+    }
+
+    /// Review R3-M1: repeating "off" inside the grace neither restarts the
+    /// grace nor spawns another close: the relayed connection still closes
+    /// at the first deadline (grace 3 s plus a quiet second).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn repeating_off_does_not_restart_the_grace() {
+        let (phone, seed, seed_addr) = phone_and_seed_with_grace(Duration::from_secs(3)).await;
+        assert!(phone.set_relay_fallback_enabled(true), "its relay is down");
+        open_fallback_relay_session(&phone, seed_addr).await;
+        assert!(
+            relay_sessions_within(&phone, 1, Duration::from_secs(5)).await,
+            "the fallback relays through the seed"
+        );
+
+        let first_off = tokio::time::Instant::now();
+        assert!(!phone.set_relay_fallback_enabled(false));
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(!phone.set_relay_fallback_enabled(false), "off again");
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert!(!phone.set_relay_fallback_enabled(false), "and again");
+        let by_first_deadline = Duration::from_millis(5500).saturating_sub(first_off.elapsed());
+        assert!(
+            relay_sessions_within(&phone, 0, by_first_deadline).await,
+            "closed at the first deadline, not one grace after the last off"
+        );
+
+        let _ = phone.try_shutdown().await;
+        let _ = seed.try_shutdown().await;
+    }
+
+    /// Review R3-L1: the close is set up at the switch-off even with no
+    /// session open yet, so a relay connect that passed its check just
+    /// before the switch-off and finishes after it is closed too. The
+    /// in-flight connect is simulated by allowing ant-quic's fallback for
+    /// one dial after the switch-off.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_relay_connect_in_flight_at_the_switch_off_is_closed_too() {
+        // The grace outlasts the late session's setup, as the real 30 s does.
+        let (phone, seed, seed_addr) = phone_and_seed_with_grace(Duration::from_secs(4)).await;
+        assert!(phone.set_relay_fallback_enabled(true));
+        assert!(
+            !phone.set_relay_fallback_enabled(false),
+            "off, nothing open"
+        );
+        assert_eq!(phone.relay_client_snapshot().active_sessions, 0);
+
+        let endpoint = Arc::clone(phone.relay_switch.get().expect("a QUIC endpoint"));
+        endpoint.set_relay_fallback_allowed(true);
+        let dial = tokio::spawn({
+            let phone = phone.clone();
+            async move { open_fallback_relay_session(&phone, seed_addr).await }
+        });
+        assert!(
+            relay_sessions_within(&phone, 1, Duration::from_secs(5)).await,
+            "the late session came up"
+        );
+        endpoint.set_relay_fallback_allowed(false);
+        assert!(
+            relay_sessions_within(&phone, 0, Duration::from_secs(20)).await,
+            "the late relayed connection is closed as well"
+        );
+        let _ = dial.await;
+
+        let _ = phone.try_shutdown().await;
         let _ = seed.try_shutdown().await;
     }
 
