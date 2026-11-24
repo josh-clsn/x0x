@@ -5146,11 +5146,13 @@ impl NetworkNode {
             .try_with(|dial| dial.generation == generation && dial.deadline > now)
             .unwrap_or(false)
         {
+            #[cfg(test)]
             self.note_latched_dial_for_test(origin, true);
             return Ok(Some(end));
         }
         if let Some(peer) = peer {
             if self.demand_leased(peer, now) || self.is_connected(peer).await {
+                #[cfg(test)]
                 self.note_latched_dial_for_test(origin, true);
                 return Ok(Some(end));
             }
@@ -5161,6 +5163,7 @@ impl NetworkNode {
             peer_id_prefix = ?peer.map(|peer| hex_prefix(&peer.0, 4)),
             "dial refused: the mesh is latched and no burst lease covers it"
         );
+        #[cfg(test)]
         self.note_latched_dial_for_test(origin, false);
         Err(NetworkError::LatchedNoLease(format!(
             "mesh quiesced: no burst lease covers this dial ({origin})"
@@ -5267,15 +5270,12 @@ impl NetworkNode {
     }
 
     /// Test seam: record a dial the latch judged.
-    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    #[cfg(test)]
     fn note_latched_dial_for_test(&self, origin: &'static str, let_through: bool) {
-        #[cfg(test)]
         match self.latched_dials_for_test.lock() {
             Ok(mut dials) => dials.push((origin, let_through)),
             Err(poisoned) => poisoned.into_inner().push((origin, let_through)),
         }
-        #[cfg(not(test))]
-        let _ = (origin, let_through);
     }
 
     /// Test seam: the origins of the dials the latch let through so far,

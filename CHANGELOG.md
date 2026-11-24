@@ -359,7 +359,8 @@ engine-A routes, and the four TreeKEM catch-up routes).
   `set_inbound_connections_allowed` (with `inbound_connections_ignored`,
   `EndpointStats::ignored_inbound_packets` and
   `inbound_connections_answered`), no stateless reset and no answer to a
-  queued attempt while inbound is off, and `abandon_handshakes`. The patch replaces
+  queued attempt while inbound is off, and `abandon_handshakes` (which also
+  retires the punch sessions of the dials it abandons). The patch replaces
   ant-quic for the whole graph, the saorsa-gossip crates included. A
   `[patch]` applies only in the root workspace that declares it, so
   `crates/fetchit-ffi` must carry the same entry at the same rev.
