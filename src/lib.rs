@@ -8683,8 +8683,11 @@ impl Agent {
     /// that link is used at once, as the connect's first check would have
     /// used it, instead of after the dials to stale addresses. The
     /// connect's own step gets [`LIVE_LINK_TAKEOVER_GRACE`] to finish
-    /// first, since its own dial raises the same event. As in that check,
-    /// only a machine an authority store confirms counts (ADR 0115 §2).
+    /// first, since its own dial raises the same event. Then the connector
+    /// is told to stop at its next step (and given
+    /// [`LIVE_LINK_STOP_WAIT`]): its dial in flight is cut, and the cleanup
+    /// after a dial that answered still runs. As in that check, only a
+    /// machine an authority store confirms counts (ADR 0115 §2).
     async fn connect_or_take_live_link(
         &self,
         agent_id: &identity::AgentId,
@@ -8701,7 +8704,11 @@ impl Agent {
             return self.connect_to_agent_inner(agent_id, cold).await;
         };
         let mut events = network.subscribe();
-        let connect = self.connect_to_agent_inner(agent_id, cold);
+        let stop = tokio_util::sync::CancellationToken::new();
+        let connect = network::NetworkNode::within_connect_stop(
+            stop.clone(),
+            self.connect_to_agent_inner(agent_id, cold),
+        );
         tokio::pin!(connect);
         loop {
             let event = tokio::select! {
@@ -8730,6 +8737,18 @@ impl Agent {
                     .authority_confirms_with(agent_id, &machine_id, cold.opted_in())
                     .await
             {
+                // Stop the connector at its next step rather than drop it
+                // mid-step: a dial in flight is cut (it has no link yet),
+                // and the cleanup after a dial that answered still runs
+                // (a stray another machine answered with is closed).
+                stop.cancel();
+                if let Ok(Ok(outcome)) =
+                    tokio::time::timeout(LIVE_LINK_STOP_WAIT, &mut connect).await
+                {
+                    if outcome.is_live_path() {
+                        return Ok(outcome);
+                    }
+                }
                 self.record_dialed_machine(agent_id, machine_id, cold.opted_in())
                     .await;
                 tracing::info!(
@@ -8798,7 +8817,7 @@ impl Agent {
             view.announcement.addresses.clone(),
             allow_local_discovery_addresses(network.config()),
         );
-        if leased_budget_spent("evidence") {
+        if connector_should_stop("evidence") {
             return Some(connectivity::ConnectOutcome::Unreachable);
         }
         let result = tokio::time::timeout(
@@ -8875,7 +8894,7 @@ impl Agent {
     ) -> Option<std::net::SocketAddr> {
         const LOOPBACK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
         for addr in addresses.iter().copied().filter(|a| a.ip().is_loopback()) {
-            if leased_budget_spent("loopback_first") {
+            if connector_should_stop("loopback_first") {
                 return None;
             }
             // Taken right before each dial: a peer some other path connected
@@ -8889,6 +8908,13 @@ impl Agent {
             {
                 Ok(Ok(connected)) if connected == peer_id => return Some(addr),
                 Ok(Ok(other)) => {
+                    #[cfg(test)]
+                    if let Ok(Some((reached, release))) =
+                        STRAY_CLOSE_PAUSE.try_with(|pause| pause.borrow_mut().take())
+                    {
+                        let _ = reached.send(());
+                        let _ = release.await;
+                    }
                     let claimed_after = self
                         .direct_messaging
                         .lookup_agent(&identity::MachineId(other.0))
@@ -9184,7 +9210,7 @@ impl Agent {
         // target's introducer budget for the burst on a LAN address.
         let leased = network::leased_dial_deadline().is_some();
         for addr in &direct_probe_addrs {
-            if leased_budget_spent("local_direct_first") {
+            if connector_should_stop("local_direct_first") {
                 return Ok(connectivity::ConnectOutcome::Unreachable);
             }
             if let Some(peer_id_hint) = peer_id_hint {
@@ -9379,7 +9405,7 @@ impl Agent {
         //    with explicit address hints first. This is more reliable for agent
         //    cards and other out-of-band discoveries than a raw address dial.
         if agent.machine_id.0 != [0u8; 32] {
-            if leased_budget_spent("hinted_peer") {
+            if connector_should_stop("hinted_peer") {
                 return Ok(connectivity::ConnectOutcome::Unreachable);
             }
             let peer_id_hint = ant_quic::PeerId(agent.machine_id.0);
@@ -9453,7 +9479,7 @@ impl Agent {
                 if direct_probe_addrs.contains(addr) {
                     continue;
                 }
-                if leased_budget_spent("direct_per_addr") {
+                if connector_should_stop("direct_per_addr") {
                     return Ok(connectivity::ConnectOutcome::Unreachable);
                 }
                 let before = latched_peers_before_probe(network).await;
@@ -9604,7 +9630,7 @@ impl Agent {
                         "failed to seed transport peer hints: {e}"
                     )))
                 })?;
-            if leased_budget_spent("coordinated") {
+            if connector_should_stop("coordinated") {
                 return Ok(connectivity::ConnectOutcome::Unreachable);
             }
             let coordinated_result = tokio::time::timeout(
@@ -23224,6 +23250,10 @@ async fn within_leased_budget<F: std::future::Future>(
 /// ([`Agent::connect_or_take_live_link`]).
 const LIVE_LINK_TAKEOVER_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How long a connect that took its target's new link waits for its
+/// connector to stop at its next step ([`Agent::connect_or_take_live_link`]).
+const LIVE_LINK_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Most hole-punch introducers one `POST /agents/connect` may hand over.
 pub const MAX_CONNECT_INTRODUCERS: usize = 4;
 
@@ -23243,17 +23273,34 @@ fn dial_step_timeout(step: &'static str, slice: std::time::Duration) -> std::tim
 
 #[cfg(test)]
 tokio::task_local! {
+    /// Test seam: `dial_loopback_first` parks here after a probe that
+    /// another machine answered, before it closes the stray.
+    pub(crate) static STRAY_CLOSE_PAUSE: std::cell::RefCell<
+        Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>,
+    >;
+}
+
+#[cfg(test)]
+tokio::task_local! {
     /// Test seam: the connector steps a connect ran through
     /// [`dial_step_timeout`] and the time each got.
     pub(crate) static DIAL_STEPS: std::cell::RefCell<Vec<(&'static str, std::time::Duration)>>;
 }
 
-/// Whether the leased connect this task dials for has spent its budget
-/// before its step `next_step`. The connector then stops stepping and the
-/// connect answers `Unreachable`: a later step would only be refused by the
-/// latch, or, meshed, run past the budget. Always false outside a leased
-/// connect.
-fn leased_budget_spent(next_step: &'static str) -> bool {
+/// Whether the connector stops before its step `next_step`, answering
+/// `Unreachable`: the leased connect this task dials for has spent its
+/// budget (a later step would only be refused by the latch, or, meshed, run
+/// past the budget), or the connect took a link to its target that came up
+/// by another path ([`Agent::connect_or_take_live_link`]).
+fn connector_should_stop(next_step: &'static str) -> bool {
+    if network::connect_stopped() {
+        tracing::debug!(
+            target: "x0x::connect",
+            next_step,
+            "connect took a link that came up meanwhile; no further step"
+        );
+        return true;
+    }
     let spent = network::leased_dial_deadline()
         .is_some_and(|deadline| tokio::time::Instant::now() >= deadline);
     if spent {
@@ -32428,6 +32475,67 @@ mod tests {
             "the phone's link is used at once, not after the stale dials: {elapsed:?}"
         );
         drop(stale);
+    }
+
+    /// Review L7: a connect that takes its target's new link stops its
+    /// connector at the next step instead of dropping it mid-step, so the
+    /// cleanup after a probe another machine answered still runs: that
+    /// stray link is closed, not left up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_connect_taking_a_new_link_still_closes_its_probe_stray() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let contact = bare_agent(dir.path(), "contact").await;
+        let phone = bare_agent(dir.path(), "phone").await;
+        let stranger = bare_agent(dir.path(), "stranger").await;
+        let contact_addr = bound(&contact).await;
+        let stranger_addr = bound(&stranger).await;
+        let now = Agent::unix_timestamp_secs();
+        // The contact's only address for the phone now belongs to another
+        // machine (the stranger).
+        contact
+            .insert_discovered_agent_for_testing(DiscoveredAgent {
+                can_receive_direct: Some(true),
+                ..card_pin(
+                    phone.agent_id(),
+                    phone.machine_id(),
+                    vec![stranger_addr],
+                    now,
+                )
+            })
+            .await;
+        let contact_network = std::sync::Arc::clone(contact.network().expect("network"));
+        let phone_network = std::sync::Arc::clone(phone.network().expect("network"));
+        let stranger_peer = ant_quic::PeerId(stranger.machine_id().0);
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let phone_agent = phone.agent_id();
+        let connect = STRAY_CLOSE_PAUSE.scope(
+            std::cell::RefCell::new(Some((reached_tx, release_rx))),
+            contact.connect_to_agent(&phone_agent),
+        );
+        let drive = async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), reached_rx)
+                .await
+                .expect("the probe reached the stranger")
+                .expect("pause sender kept");
+            phone_network
+                .connect_addr(contact_addr)
+                .await
+                .expect("the phone dials the contact");
+            tokio::time::sleep(LIVE_LINK_TAKEOVER_GRACE * 3).await;
+            let _ = release_tx.send(());
+        };
+        let (outcome, ()) = tokio::join!(connect, drive);
+        let outcome = outcome.expect("the connect runs");
+        assert!(outcome.is_live_path(), "{outcome:?}");
+        let gone = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while contact_network.is_connected(&stranger_peer).await {
+            assert!(
+                tokio::time::Instant::now() < gone,
+                "the stray link to the stranger is closed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     /// L1: the whole leased connect ends at its budget plus a short grace,

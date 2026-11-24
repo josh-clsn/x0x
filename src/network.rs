@@ -2488,6 +2488,29 @@ pub(crate) fn leased_dial_deadline() -> Option<tokio::time::Instant> {
     LEASED_DIAL.try_with(|dial| dial.deadline).ok()
 }
 
+tokio::task_local! {
+    /// The stop token of the connect the current task dials for
+    /// ([`NetworkNode::within_connect_stop`]).
+    static CONNECT_STOP: tokio_util::sync::CancellationToken;
+}
+
+/// Whether the connect the current task dials for was told to stop
+/// ([`NetworkNode::within_connect_stop`]).
+pub(crate) fn connect_stopped() -> bool {
+    CONNECT_STOP
+        .try_with(tokio_util::sync::CancellationToken::is_cancelled)
+        .unwrap_or(false)
+}
+
+/// Resolves when the connect the current task dials for is told to stop;
+/// never outside such a connect.
+async fn connect_stop_requested() {
+    match CONNECT_STOP.try_with(Clone::clone) {
+        Ok(stop) => stop.cancelled().await,
+        Err(_) => std::future::pending().await,
+    }
+}
+
 /// #1277 test seam: the worker reports on the sender that it cleared the
 /// session registry, then waits on the receiver before it shuts the
 /// transport down.
@@ -2607,6 +2630,16 @@ fn burst_ended(origin: &'static str) -> NetworkError {
 /// The error a dial reports when network teardown abandons it (see
 /// [`NetworkNode::dial_until_teardown`]).
 fn dial_abandoned(origin: &'static str) -> NetworkError {
+    if connect_stopped() {
+        tracing::debug!(
+            target: "x0x::connect",
+            origin,
+            "dial abandoned: its connect took a link that came up meanwhile"
+        );
+        return NetworkError::ConnectionFailed(
+            "dial abandoned: the connect stopped stepping".to_string(),
+        );
+    }
     tracing::debug!(
         target: "x0x::connect",
         origin,
@@ -5032,6 +5065,18 @@ impl NetworkNode {
         (leases.generation, leases.ended.clone())
     }
 
+    /// Run `connect` with `stop` as its stop token: once it is cancelled,
+    /// a dial of `connect` still in flight is dropped (it has no link yet)
+    /// and the connector takes no further step, while the work after a dial
+    /// that already answered (closing a stray another machine answered
+    /// with) still runs.
+    pub(crate) async fn within_connect_stop<F: std::future::Future>(
+        stop: tokio_util::sync::CancellationToken,
+        connect: F,
+    ) -> F::Output {
+        CONNECT_STOP.scope(stop, connect).await
+    }
+
     /// Run `dial`, a leased connect for one target, as a burst dial of the
     /// demand-lease `generation`: while latched, the dial seams let it open
     /// connections until `deadline` or until that generation ends.
@@ -6547,6 +6592,7 @@ impl NetworkNode {
         tokio::select! {
             biased;
             () = teardown.cancelled() => None,
+            () = connect_stop_requested() => None,
             output = dial => Some(output),
         }
     }
