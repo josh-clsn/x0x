@@ -331,8 +331,10 @@ engine-A routes, and the four TreeKEM catch-up routes).
   `x0x mesh relay-fallback true|false`) while its own relay is unreachable.
   Latched, the fallback stays off whatever the switch says; a desktop is
   not affected. Turning it off opens no new relayed connection; one already
-  relayed gets 30 s to finish what it is sending and is then closed at the
-  first quiet second, never mid-send. `relay_client` adds
+  relayed gets 30 s to finish what it is sending, is then closed at the
+  first quiet second, and is cut 120 s after the switch-off whatever it
+  carries. Repeating the current setting changes nothing (the grace is not
+  restarted). `relay_client` adds
   `relay_fallback_enabled`. A meshed switch sync no longer closes a live
   fallback session.
 - **A spent leased connect takes no further step.** Once its 12 s budget is

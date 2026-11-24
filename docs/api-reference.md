@@ -1365,10 +1365,15 @@ is refused (4xx). CLI: `x0x mesh relay-fallback true|false`.
 - **Latched, bursts included:** the fallback stays off whatever the switch
   says. The switch is kept and applies again at the next `POST /mesh/join`.
 - **Turning it off** opens no new relayed connection. A connection already
-  relayed gets 30 s (`RELAY_FALLBACK_OFF_GRACE`) to finish what it is
-  sending, and is then closed at the first second in which its relay moves
-  no byte, so a send under way is never cut. Turning the switch on again
-  before then keeps it. A `POST /mesh/quiesce` still closes it at once.
+  relayed (or one whose relay connect was under way) gets 30 s
+  (`RELAY_FALLBACK_OFF_GRACE`) to finish what it is sending, and is then
+  closed at the first second in which its relay moves no byte. It is cut
+  120 s (`RELAY_FALLBACK_OFF_CAP`) after the switch-off whatever it
+  carries; a send cut there is re-sent over the embedder's relay, which is
+  back by then. Turning the switch on again before then keeps it. A
+  `POST /mesh/quiesce` still closes it at once.
+- **Repeating** the current setting changes nothing: a second
+  `{"enabled": false}` does not restart the grace.
 - Proactive relay and an advertised relay address stay off in every state.
 - A node without `relay_service_disabled` (a desktop) keeps its relay
   fallback while meshed, whatever the switch says.
