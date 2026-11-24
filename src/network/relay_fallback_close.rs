@@ -156,10 +156,13 @@ mod tests {
     /// Traffic that never pauses is cut at the hard cap.
     #[tokio::test(start_paused = true)]
     async fn traffic_that_never_pauses_is_cut_at_the_cap() {
-        assert_eq!(
-            close_with(|elapsed| u64::try_from(elapsed.as_millis()).unwrap()).await,
-            Some((Duration::from_secs(120), CloseReason::Cap))
-        );
+        let closed = tokio::time::timeout(
+            Duration::from_secs(300),
+            close_with(|elapsed| u64::try_from(elapsed.as_millis()).unwrap()),
+        )
+        .await
+        .expect("the cap ends the close");
+        assert_eq!(closed, Some((Duration::from_secs(120), CloseReason::Cap)));
     }
 
     /// A close that no longer applies stops the task, and nothing open
