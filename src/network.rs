@@ -4912,6 +4912,18 @@ impl NetworkNode {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
+        let fresh = !self.mesh_quiesced.load(Ordering::Relaxed);
+        if fresh {
+            self.mesh_quiesced.store(true, Ordering::Relaxed);
+        }
+        // The switches (inbound off; every call closes the client relay
+        // again, so a session a burst's relay fallback opened ends with the
+        // burst) and the handshake drop come before the leases are cleared:
+        // a handshake dropped here belongs to the generation this call
+        // ends, never to the next burst's first connect, which reads the
+        // new generation only after the clear.
+        self.sync_proactive_relay();
+        self.abandon_handshakes();
         self.clear_demand_leases();
         // Every latch call ends a burst: the next burst gets a fresh
         // introducer budget (one per target).
@@ -4920,17 +4932,10 @@ impl NetworkNode {
         if let Some(endpoint) = self.relay_switch.get() {
             endpoint.reset_introducer_budget();
         }
-        if self.mesh_quiesced.load(Ordering::Relaxed) {
-            // Every call closes the client relay again: a session a burst's
-            // relay fallback opened ends with the burst.
-            self.sync_proactive_relay();
-            self.abandon_handshakes();
+        if !fresh {
             return None;
         }
         *epoch += 1;
-        self.mesh_quiesced.store(true, Ordering::Relaxed);
-        self.sync_proactive_relay();
-        self.abandon_handshakes();
         Some(*epoch)
     }
 
