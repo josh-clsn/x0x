@@ -5679,7 +5679,15 @@ impl NetworkNode {
                 (true, true) => ant_quic::CoordinatorPolicy::Introducer,
                 (true, false) => ant_quic::CoordinatorPolicy::ConnectedOnly,
             });
-            endpoint.set_proactive_relay_allowed(!latched && !self.config.relay_service_disabled);
+            // Turning proactive relay off closes every client relay
+            // session, one a relay fallback dial opened included. Only the
+            // latch, or a real change from on, may do that: a meshed sync
+            // (a burst dial's start or end, a settings change) must not cut
+            // a live fallback session.
+            let proactive = !latched && !self.config.relay_service_disabled;
+            if proactive || latched || endpoint.proactive_relay_allowed() {
+                endpoint.set_proactive_relay_allowed(proactive);
+            }
             endpoint.set_relay_service_allowed(!latched && !self.config.relay_service_disabled);
             endpoint.set_inbound_punch_allowed(!latched);
             endpoint.set_inbound_connections_allowed(!latched);
@@ -10402,6 +10410,78 @@ mod tests {
         );
 
         let _ = desktop.try_shutdown().await;
+        let _ = phone.try_shutdown().await;
+        let _ = seed.try_shutdown().await;
+    }
+
+    /// Open a client relay session through `relay` the way a relay
+    /// fallback dial does: a connect to a silent target whose direct stage
+    /// fails falls back to `relay`, which hosts the session. The dial
+    /// itself never reaches the target.
+    async fn open_fallback_relay_session(node: &NetworkNode, relay: SocketAddr) {
+        let endpoint = Arc::clone(node.relay_switch.get().expect("a QUIC endpoint"));
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("silent");
+        let silent_addr = silent.local_addr().expect("silent addr");
+        let strategy = ant_quic::StrategyConfig {
+            relay_addrs: vec![relay],
+            coordinator: None,
+            ipv4_timeout: Duration::from_millis(500),
+            ..ant_quic::StrategyConfig::default()
+        };
+        let _ = tokio::time::timeout(
+            Duration::from_secs(10),
+            endpoint.connect_with_fallback(
+                Some(silent_addr),
+                None,
+                Some(strategy),
+                Some(ant_quic::PeerId([0x5a; 32])),
+            ),
+        )
+        .await;
+        drop(silent);
+    }
+
+    /// Review M1: a meshed node that does not run proactive relay (here a
+    /// phone, `relay_service_disabled`) keeps a live relay fallback
+    /// session across switch syncs (a burst dial's start and end, a
+    /// settings change). Only the latch closes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_switch_sync_never_cuts_a_live_relay_fallback_session() {
+        let seed = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("seed");
+        let seed_addr = seed.bound_addr().await.expect("seed bound");
+        let phone = NetworkNode::new(
+            NetworkConfig {
+                relay_service_disabled: true,
+                ..loopback_quic_config(vec![seed_addr])
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("phone");
+        open_fallback_relay_session(&phone, seed_addr).await;
+        assert!(
+            relay_sessions_within(&phone, 1, Duration::from_secs(5)).await,
+            "the fallback opened a session through the seed"
+        );
+
+        drop(phone.begin_burst_dial());
+        phone.set_latched_seed_introducers_allowed(true);
+        phone.set_latched_seed_introducers_allowed(false);
+        assert_eq!(
+            phone.relay_client_snapshot().active_sessions,
+            1,
+            "a meshed sync leaves the live session up"
+        );
+
+        phone.latch_mesh_quiesced().expect("fresh latch");
+        assert_eq!(
+            phone.relay_client_snapshot().active_sessions,
+            0,
+            "the latch closes it"
+        );
         let _ = phone.try_shutdown().await;
         let _ = seed.try_shutdown().await;
     }
