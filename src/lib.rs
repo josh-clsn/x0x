@@ -9378,10 +9378,10 @@ impl Agent {
         // 3. If we know the peer's machine ID, prefer a peer-authenticated dial
         //    with explicit address hints first. This is more reliable for agent
         //    cards and other out-of-band discoveries than a raw address dial.
-        if leased_budget_spent("hinted_peer") {
-            return Ok(connectivity::ConnectOutcome::Unreachable);
-        }
         if agent.machine_id.0 != [0u8; 32] {
+            if leased_budget_spent("hinted_peer") {
+                return Ok(connectivity::ConnectOutcome::Unreachable);
+            }
             let peer_id_hint = ant_quic::PeerId(agent.machine_id.0);
             self.seed_transport_peer_hints_for_target(network, &agent)
                 .await
@@ -32336,9 +32336,10 @@ mod tests {
     }
 
     /// train-1123 item 6: once a leased connect's budget is spent, the
-    /// connector takes no further step. No later step reaches a dial seam
-    /// (the latch refuses none, under any origin label), and the connect
-    /// answers `Unreachable`.
+    /// connector takes no further step. A step dialled inside the budget
+    /// (the latch let it through), no later step reaches a dial seam (the
+    /// latch refuses none, under any origin label), and the connect answers
+    /// `Unreachable`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_spent_leased_connect_makes_no_further_dial() {
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -32373,10 +32374,14 @@ mod tests {
             matches!(outcome, connectivity::ConnectOutcome::Unreachable),
             "{outcome:?}"
         );
+        let (let_through, refused) = network.latched_dials_for_test();
         assert!(
-            network.latched_refusals_for_test().is_empty(),
-            "no step dialled after the budget: {:?}",
-            network.latched_refusals_for_test()
+            !let_through.is_empty(),
+            "a step dialled inside the budget (positive control)"
+        );
+        assert!(
+            refused.is_empty(),
+            "no step dialled after the budget: {refused:?} (let through: {let_through:?})"
         );
         drop(silent);
     }

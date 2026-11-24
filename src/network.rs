@@ -2231,9 +2231,10 @@ pub struct NetworkNode {
     /// and before its last check.
     #[cfg(test)]
     unbooked_close_pause_for_test: Arc<Mutex<Option<RegistryClearPause>>>,
-    /// Test seam: the origin of every dial the latch refused.
+    /// Test seam: the origin of every dial the latch judged, and whether
+    /// it was let through.
     #[cfg(test)]
-    latched_refusals_for_test: Arc<Mutex<Vec<&'static str>>>,
+    latched_dials_for_test: Arc<Mutex<Vec<(&'static str, bool)>>>,
     /// M-2: the own peers the embedder named (`PUT /mesh/own-peers`), kept
     /// so agent ids not yet resolved to a machine can be resolved later.
     own_peer_request: Arc<Mutex<OwnPeerRequest>>,
@@ -2899,7 +2900,7 @@ impl NetworkNode {
             #[cfg(test)]
             unbooked_close_pause_for_test: Arc::new(Mutex::new(None)),
             #[cfg(test)]
-            latched_refusals_for_test: Arc::new(Mutex::new(Vec::new())),
+            latched_dials_for_test: Arc::new(Mutex::new(Vec::new())),
             own_peer_request: Arc::new(Mutex::new(OwnPeerRequest::default())),
             burst_hint_machines: Arc::new(Mutex::new(HashMap::new())),
             introducer_day: Arc::new(Mutex::new(introducer_day::IntroducerDay::default())),
@@ -5060,10 +5061,12 @@ impl NetworkNode {
             .try_with(|dial| dial.generation == generation && dial.deadline > now)
             .unwrap_or(false)
         {
+            self.note_latched_dial_for_test(origin, true);
             return Ok(Some(end));
         }
         if let Some(peer) = peer {
             if self.demand_leased(peer, now) || self.is_connected(peer).await {
+                self.note_latched_dial_for_test(origin, true);
                 return Ok(Some(end));
             }
         }
@@ -5073,11 +5076,7 @@ impl NetworkNode {
             peer_id_prefix = ?peer.map(|peer| hex_prefix(&peer.0, 4)),
             "dial refused: the mesh is latched and no burst lease covers it"
         );
-        #[cfg(test)]
-        match self.latched_refusals_for_test.lock() {
-            Ok(mut refusals) => refusals.push(origin),
-            Err(poisoned) => poisoned.into_inner().push(origin),
-        }
+        self.note_latched_dial_for_test(origin, false);
         Err(NetworkError::LatchedNoLease(format!(
             "mesh quiesced: no burst lease covers this dial ({origin})"
         )))
@@ -5182,13 +5181,37 @@ impl NetworkNode {
         }
     }
 
-    /// Test seam: the origins of the dials the latch refused so far.
-    #[cfg(test)]
-    pub(crate) fn latched_refusals_for_test(&self) -> Vec<&'static str> {
-        match self.latched_refusals_for_test.lock() {
-            Ok(refusals) => refusals.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
+    /// Test seam: record a dial the latch judged.
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn note_latched_dial_for_test(&self, origin: &'static str, let_through: bool) {
+        #[cfg(test)]
+        match self.latched_dials_for_test.lock() {
+            Ok(mut dials) => dials.push((origin, let_through)),
+            Err(poisoned) => poisoned.into_inner().push((origin, let_through)),
         }
+        #[cfg(not(test))]
+        let _ = (origin, let_through);
+    }
+
+    /// Test seam: the origins of the dials the latch let through so far,
+    /// and of those it refused.
+    #[cfg(test)]
+    pub(crate) fn latched_dials_for_test(&self) -> (Vec<&'static str>, Vec<&'static str>) {
+        let dials = match self.latched_dials_for_test.lock() {
+            Ok(dials) => dials.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let through = dials
+            .iter()
+            .filter(|(_, ok)| *ok)
+            .map(|(o, _)| *o)
+            .collect();
+        let refused = dials
+            .iter()
+            .filter(|(_, ok)| !*ok)
+            .map(|(o, _)| *o)
+            .collect();
+        (through, refused)
     }
 
     /// Test seam: park the latch guard after it counted a link's bytes
