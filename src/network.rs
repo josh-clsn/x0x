@@ -4891,12 +4891,27 @@ impl NetworkNode {
             // Every call closes the client relay again: a session a burst's
             // relay fallback opened ends with the burst.
             self.sync_proactive_relay();
+            self.abandon_handshakes();
             return None;
         }
         *epoch += 1;
         self.mesh_quiesced.store(true, Ordering::Relaxed);
         self.sync_proactive_relay();
+        self.abandon_handshakes();
         Some(*epoch)
+    }
+
+    /// The latch tail: at every latch call, drop each connection still in
+    /// its handshake, inbound or outbound, sending nothing more. No lease
+    /// covers one (the call has just ended them all), and an inbound
+    /// handshake answered just before the latch would otherwise re-send its
+    /// padded flight for about 30 s when the dialler's path died at the
+    /// network move. A leased dial still in flight was ended by the call
+    /// anyway. Established links are left to the sweep and the latch guard.
+    fn abandon_handshakes(&self) {
+        if let Some(endpoint) = self.relay_switch.get() {
+            endpoint.abandon_handshakes();
+        }
     }
 
     /// The current mesh-transition epoch. Mesh-on requesters capture this at
@@ -10627,6 +10642,81 @@ mod tests {
         let _ = phone.try_shutdown().await;
         let _ = second_seed.try_shutdown().await;
         let _ = seed.try_shutdown().await;
+    }
+
+    /// The latch tail (drill-harness review, round 2): a peer's handshake
+    /// the phone answered just before it latched, whose replies never
+    /// reach the peer (its path died at the network move), used to re-send
+    /// the phone's padded handshake flight for about 30 s. The latch now
+    /// drops it: nothing is sent after the latch and no link is left.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_latch_drops_an_inbound_handshake_in_flight() {
+        let phone = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("phone");
+        let peer = NetworkNode::new(loopback_quic_config(Vec::new()), None, None)
+            .await
+            .expect("peer");
+        let phone_addr = phone.bound_addr().await.expect("phone bound");
+        let front = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind relay front");
+        let back = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind relay back");
+        let relay_addr = front.local_addr().expect("relay addr");
+        let sent_by_phone = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // The peer's packets reach the phone; the phone's replies are lost.
+        let relay = tokio::spawn({
+            let sent_by_phone = Arc::clone(&sent_by_phone);
+            async move {
+                let mut up = vec![0u8; 65_536];
+                let mut down = vec![0u8; 65_536];
+                loop {
+                    tokio::select! {
+                        Ok((len, _)) = front.recv_from(&mut up) => {
+                            let _ = back.send_to(&up[..len], phone_addr).await;
+                        }
+                        Ok(_) = back.recv_from(&mut down) => {
+                            sent_by_phone.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                }
+            }
+        });
+        let dial = tokio::spawn({
+            let peer = peer.clone();
+            async move {
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(20), peer.connect_addr(relay_addr))
+                        .await;
+            }
+        });
+        let answered = tokio::time::Instant::now() + Duration::from_secs(10);
+        while sent_by_phone.load(Ordering::SeqCst) == 0 {
+            assert!(
+                tokio::time::Instant::now() < answered,
+                "the phone answered the handshake"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        phone.latch_mesh_quiesced().expect("fresh latch");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let at_latch = sent_by_phone.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert_eq!(
+            sent_by_phone.load(Ordering::SeqCst),
+            at_latch,
+            "nothing sent after the latch"
+        );
+        assert!(!phone.is_connected(&peer.peer_id()).await, "no link left");
+        assert!(phone.connected_peers().await.is_empty());
+
+        dial.abort();
+        relay.abort();
+        let _ = peer.try_shutdown().await;
+        let _ = phone.try_shutdown().await;
     }
 
     /// A latched phone with a live, unleased link to a peer and an armed cap
