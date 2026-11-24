@@ -330,9 +330,11 @@ engine-A routes, and the four TreeKEM catch-up routes).
   `PUT /mesh/relay-fallback {"enabled": true}` (CLI
   `x0x mesh relay-fallback true|false`) while its own relay is unreachable.
   Latched, the fallback stays off whatever the switch says; a desktop is
-  not affected. Turning it off leaves a live relayed connection alone.
-  `relay_client` adds `relay_fallback_enabled`. A meshed switch sync no
-  longer closes a live fallback session.
+  not affected. Turning it off opens no new relayed connection; one already
+  relayed gets 30 s to finish what it is sending and is then closed at the
+  first quiet second, never mid-send. `relay_client` adds
+  `relay_fallback_enabled`. A meshed switch sync no longer closes a live
+  fallback session.
 - **A spent leased connect takes no further step.** Once its 12 s budget is
   spent the connector stops and answers `Unreachable`; each step's dial now
   carries its own origin in the latch's refusal log, not `manual`.

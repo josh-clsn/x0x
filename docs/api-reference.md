@@ -1365,8 +1365,10 @@ is refused (4xx). CLI: `x0x mesh relay-fallback true|false`.
 - **Latched, bursts included:** the fallback stays off whatever the switch
   says. The switch is kept and applies again at the next `POST /mesh/join`.
 - **Turning it off** opens no new relayed connection. A connection already
-  relayed is left to end on its own; the next `POST /mesh/quiesce` closes
-  it, as before.
+  relayed gets 30 s (`RELAY_FALLBACK_OFF_GRACE`) to finish what it is
+  sending, and is then closed at the first second in which its relay moves
+  no byte, so a send under way is never cut. Turning the switch on again
+  before then keeps it. A `POST /mesh/quiesce` still closes it at once.
 - Proactive relay and an advertised relay address stay off in every state.
 - A node without `relay_service_disabled` (a desktop) keeps its relay
   fallback while meshed, whatever the switch says.
