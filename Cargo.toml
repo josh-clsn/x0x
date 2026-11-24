@@ -259,4 +259,4 @@ split-debuginfo = "off"
 # embed) must carry the same entry at the same rev. The desktop x0xd and
 # noetic-agent build from this checkout, where this entry applies.
 [patch.crates-io]
-ant-quic = { git = "https://github.com/josh-clsn/ant-quic", rev = "533e020337874e14ecd290ffa595c954b969a64d" }
+ant-quic = { git = "https://github.com/josh-clsn/ant-quic", rev = "581ff6a37d66a8982c27faae69543ebb05ffd248" }
