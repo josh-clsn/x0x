@@ -1146,9 +1146,11 @@ while quiesced), and the connect answers `Unreachable`.
 
 When a live link to the contact's machine comes up by another path while the
 connect is still dialling (the contact dialled this node meanwhile), the
-connect uses it: it gives its own step 0.5 s to finish, then answers
-`AlreadyConnected`, as the first check would have. As in that check, only a
-machine an authority store confirms counts.
+connect uses it: it gives its own step 0.5 s to finish, then stops its
+dialling at the next step (a dial in flight is cut; a stray link a probe
+opened to another machine is still closed) and answers `AlreadyConnected`,
+as the first check would have. As in that check, only a machine an
+authority store confirms counts.
 
 The import still pins the card's machine as an authority source at the
 import time (ADR 0115). A card leads or moves an announced entry only when an
@@ -1177,12 +1179,16 @@ not: the first packet of each attempt is dropped before any handshake work
 and nothing goes back, so the dialler's attempt times out (it sees no close
 or refusal) and the NAT mapping it aimed at lapses. A seed that redials the
 node after a burst used it as an introducer therefore costs the node no
-handshake. A burst's links are the ones it dials; a hole punch's link is
-this node's own half. `GET /diagnostics/connectivity` → `relay_client`
-reports `inbound_connections_allowed`, `inbound_connections_ignored`
-(packets dropped since start, each retransmission counted) and
-`inbound_connections_answered` (inbound handshakes started since start; a
-quiesced node adds none).
+handshake. Nor does it send a stateless reset for a packet to a connection
+it has forgotten. Every `POST /mesh/quiesce` also drops each connection
+still in its handshake, inbound or outbound, with nothing more sent, so an
+attempt answered just before the latch does not go on re-sending its
+handshake flight. A burst's links are the ones it dials; a hole punch's
+link is this node's own half. `GET /diagnostics/connectivity` →
+`relay_client` reports `inbound_connections_allowed`,
+`inbound_connections_ignored` (packets dropped since start, each
+retransmission counted) and `inbound_connections_answered` (inbound
+handshakes started since start; a quiesced node adds none).
 
 While quiesced, the daemon opens a new connection only for a leased
 `/agents/connect` still dialling in the current burst (since the last
